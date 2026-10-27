@@ -146,6 +146,16 @@ pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// setting), on the models initialize says take it.
 const FAST: &str = "fast";
 
+/// Fast mode as a speed (`Meta::speeds`, and each model that takes it in `Meta::models`).
+fn fast_speed() -> super::model::ControlOption {
+    super::model::ControlOption {
+        id: FAST.to_owned(),
+        label: "Fast".to_owned(),
+        description: "Up to 2.5x faster, at a higher price per token. Turned on part-way, the conversation so far is billed once at that price".to_owned(),
+        dangerous: false,
+    }
+}
+
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,11 +438,7 @@ impl Claude {
         // else the ones the CLI knows.
         core.meta.efforts = self.effort_levels(&core.state.model).iter().map(|e| opt(e, &capitalize(e), "")).collect();
         // Fast mode, where the model in use takes it.
-        core.meta.speeds = if self.fast_on(&core.state.model) {
-            vec![opt(FAST, "Fast", "Up to 2.5x faster, at a higher price per token. Turned on part-way, the conversation so far is billed once at that price")]
-        } else {
-            Vec::new()
-        };
+        core.meta.speeds = if self.fast_on(&core.state.model) { vec![fast_speed()] } else { Vec::new() };
         core.touch_meta();
     }
 
@@ -1584,6 +1590,11 @@ impl Claude {
         super::pause::sent_from_queue(core, &id);
     }
 
+    /// There may be room on its machine for it to go to work: kiln's queue goes, as after a turn.
+    pub fn room(&mut self, core: &mut Core) {
+        self.drain_queue(core);
+    }
+
     // ------------------------------------------------------------------ messages to subagents
 
     /// How a person's message reaches subagent `t` now. Claude Code takes none for a subagent
@@ -1635,10 +1646,12 @@ impl Claude {
     /// What waits for its subagents goes, to each that finished, one message each: it's resumed
     /// with it (and the next waits until it finishes again).
     pub fn drain_subagents(&mut self, core: &mut Core) {
-        if !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+        // Room on its machine is asked for only with something to send.
+        let waiting = super::subagent::waiting(core);
+        if waiting.is_empty() || matches!(core.state.status, Status::Exited | Status::Starting) || !super::pause::open(core) {
             return;
         }
-        for task in super::subagent::waiting(core) {
+        for task in waiting {
             let Some(t) = core.state.tasks.iter().find(|t| t.id == task).cloned() else { continue };
             if t.live() || self.waking.contains(&t.id) || self.takes(core, &t).0.is_empty() {
                 continue;
@@ -1862,6 +1875,8 @@ impl Claude {
                                 description: str_of(m, "description").unwrap_or("").to_owned(),
                                 efforts: m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
                                 default: false,
+                                // Whether it goes faster, kept with the machine's models for a new agent.
+                                speeds: if m.get("supportsFastMode").and_then(Value::as_bool).unwrap_or(false) { vec![fast_speed()] } else { Vec::new() },
                             })
                         })
                         .collect();
@@ -5651,6 +5666,9 @@ mod tests {
         );
         let speeds = |core: &Core| core.meta.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
         let applied = |reqs: &[(String, String, Value)]| reqs.iter().filter(|r| r.1 == "apply_flag_settings").filter_map(|r| r.2.pointer("/settings/fastMode").and_then(Value::as_bool)).collect::<Vec<_>>();
+        // Each listed model says whether it goes faster: the machine keeps that for a new agent.
+        let listed = |core: &Core| core.meta.models.iter().map(|m| (m.id.clone(), m.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>())).collect::<Vec<_>>();
+        assert_eq!(listed(&core), [("default".to_owned(), vec!["fast".to_owned()]), ("sonnet".to_owned(), vec![]), ("claude-opus-4-7".to_owned(), vec![])]);
         // No model yet: the default model's. A session not opted in yet has nothing in its way.
         assert_eq!(speeds(&core), ["fast"]);
         assert_eq!((core.state.speed.as_str(), core.state.speed_blocked.as_deref()), ("", None));

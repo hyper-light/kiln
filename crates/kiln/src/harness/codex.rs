@@ -245,6 +245,20 @@ fn service_tier(speed: &str) -> &str {
     if speed.is_empty() { "default" } else { speed }
 }
 
+/// A model's service tiers past standard, as model/list lists them ("flex" is slower).
+fn tiers_of(m: &Value) -> Vec<ControlOption> {
+    m.get("serviceTiers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let id = t.get("id").and_then(Value::as_str).filter(|id| !matches!(*id, "" | "default" | "flex"))?;
+            let label = t.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(id);
+            Some(ControlOption { id: id.to_owned(), label: label.to_owned(), description: t.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), dangerous: false })
+        })
+        .collect()
+}
+
 /// The efforts a new Codex session can start at, before its model/list answers: its default
 /// model's, as Codex on this machine last listed them, else the newest model kiln knows of
 /// (`kinds::models_of`).
@@ -906,7 +920,9 @@ impl Codex {
     /// Subagent `thread` is between turns: a message sent now goes first, then what waits for it.
     fn drain_child(&mut self, core: &mut Core, thread: &str) {
         let Some(child) = self.children.get(thread) else { return };
-        if child.turn.is_some() || child.relaying || child.closed || !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+        // Room on its machine is asked for only with something to send.
+        let has = child.now.is_some() || super::subagent::waiting(core).iter().any(|t| t.as_str() == thread);
+        if child.turn.is_some() || child.relaying || child.closed || !has || matches!(core.state.status, Status::Exited | Status::Starting) || !super::pause::open(core) {
             return;
         }
         if self.pending.values().any(|p| matches!(p, Pending::ChildTurn { thread: t, .. } if t == thread)) {
@@ -2026,6 +2042,16 @@ impl Codex {
         }
     }
 
+    /// There may be room on its machine for it to go to work: what waits goes, as between turns.
+    pub fn room(&mut self, core: &mut Core) {
+        self.next(core);
+    }
+
+    /// It holds messages till its thread can take them.
+    pub fn holds(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
     /// The account reached its usage limit (`usageLimitExceeded`): the session pauses until it
     /// resets, its turn noted as cut off. Said once.
     fn limit_reached(&mut self, core: &mut Core, said: &str) {
@@ -2501,18 +2527,7 @@ impl Codex {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // Its tiers past standard ("flex" is slower).
-                    let tiers: Vec<ControlOption> = m
-                        .get("serviceTiers")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|t| {
-                            let id = t.get("id").and_then(Value::as_str).filter(|id| !matches!(*id, "" | "default" | "flex"))?;
-                            let label = t.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(id);
-                            Some(ControlOption { id: id.to_owned(), label: label.to_owned(), description: t.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), dangerous: false })
-                        })
-                        .collect();
+                    let tiers = tiers_of(m);
                     for key in [m.get("model"), m.get("id")].into_iter().flatten().filter_map(Value::as_str) {
                         self.efforts.insert(key.to_owned(), levels.clone());
                         self.speeds.insert(key.to_owned(), tiers.clone());
@@ -2555,6 +2570,8 @@ impl Codex {
                                         .map(|l| l.iter().filter_map(|e| e.get("reasoningEffort").and_then(Value::as_str).or_else(|| e.as_str()).map(str::to_owned)).collect())
                                         .unwrap_or_default(),
                                     default: m.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
+                                    // Its tiers past standard, kept with the machine's models for a new agent.
+                                    speeds: tiers_of(m),
                                 })
                             })
                             .collect()
@@ -6040,6 +6057,9 @@ mod tests {
         // None chosen here: the thread opens on the person's own configuration.
         assert!(w.iter().filter(|v| v.get("method") == Some(&json!("thread/start"))).all(|v| v.pointer("/params/serviceTier").is_none()));
         respond(&mut c, &mut core, &w, "model/list", models);
+        // Each listed model carries its tiers: the machine keeps them for a new agent.
+        let listed = |core: &Core| core.meta.models.iter().map(|m| (m.id.clone(), m.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>())).collect::<Vec<_>>();
+        assert_eq!(listed(&core), [("gpt-6.1-sol".to_owned(), vec!["priority".to_owned(), "ultrafast".to_owned()]), ("gpt-6-sol".to_owned(), vec!["priority".to_owned()]), ("o-mini".to_owned(), vec![])]);
         respond(&mut c, &mut core, &w, "thread/start", json!({"thread": {"id": "th1", "turns": []}, "model": "gpt-6.1-sol", "cwd": "/work", "serviceTier": "priority"}));
         let ids = |core: &Core| core.meta.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&core), ["priority", "ultrafast"]);

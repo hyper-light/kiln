@@ -36,6 +36,7 @@ const TAIL = "#7f6ca6";
 /** W05-R13's wait reasons, as the queue breakdown names them. */
 const REASONS: Record<string, string> = {
   capacity: "Runners busy",
+  oversized: "Too big for any runner",
   "no-runner": "No runner connected",
   unroutable: "No runner could run it",
   capability: "Runners lack a capability",

@@ -73,6 +73,8 @@ fn agent_key(agent: &str) -> String {
 
 /// An attachment, as kiln keeps it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentAttachment"))]
 #[serde(default)]
 pub struct Attachment {
     pub id: String,
@@ -86,23 +88,29 @@ pub struct Attachment {
     /// On a repository: only these workflows' runs wake it (a path, a file name or its stem:
     /// `ci`, `ci.yml`, `.github/workflows/ci.yml`; none: any).
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
     pub workflows: Vec<String>,
     /// On a repository: only deployments to these environments wake it (none: any).
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
     pub environments: Vec<String>,
     /// Where it's kept when not in kiln: `<owner>/<repo>:.kiln/agents.yaml` (changed there, by a
     /// change to that repository's trunk).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub source: Option<String>,
     /// A new agent for each incident…
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub harness: Option<Harness>,
     /// …or a live one, told of each.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub session: Option<String>,
     pub wake: Vec<String>,
     /// When it wakes on `schedule`: five-field cron, UTC.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub schedule: Option<String>,
     pub can: Vec<String>,
     pub limits: Limits,
@@ -119,26 +127,35 @@ pub struct Attachment {
 
 /// The agent an attachment starts for each incident.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AttachHarness"))]
 #[serde(default)]
 pub struct Harness {
     /// `claude`, `codex`, `gemini`, …
     pub kind: String,
     /// A machine's name, or what it needs (`linux/amd64`, `+gpu`), as `agents.start` takes it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub on: Option<String>,
     /// The folder it starts in there (a checkout of the repository, for one that looks after code).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub mode: Option<String>,
 }
 
 /// What keeps an attachment from running away.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AttachLimits"))]
 #[serde(default)]
 pub struct Limits {
     /// Incidents it takes on in a day (UTC): past them, an incident waits for a person.
@@ -207,13 +224,17 @@ pub struct Incident {
 
 /// One time an incident happened.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "IncidentSeen"))]
 #[serde(default)]
 pub struct Seen {
     pub at: i64,
     pub what: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub run: Option<String>,
 }
 
@@ -471,7 +492,7 @@ async fn put(hub: &Hub, a: &Attachment) {
     if let Ok(t) = serde_json::to_string(a) {
         let _ = hub.store.kv_set(akey(&a.id), t).await;
     }
-    hub.emit(&json!({"type": "attachment", "attachment": a}));
+    hub.emit(&crate::wire::events::ServerEvent::Attachment(crate::wire::events::AttachmentChange::Saved { attachment: Box::new(a.clone()) }));
 }
 
 /// Incidents, newest first.
@@ -489,11 +510,17 @@ async fn put_incident(hub: &Hub, i: &Incident) {
     if let Ok(t) = serde_json::to_string(i) {
         let _ = hub.store.kv_set(ikey(&i.id), t).await;
     }
-    hub.emit(&json!({"type": "incident", "incident": brief(i)}));
+    hub.emit(&crate::wire::events::ServerEvent::Incident { incident: Box::new(crate::wire::events::IncidentBrief::of(i)) });
 }
 
 /// An incident as lists show it (without its bundle).
 pub fn brief(i: &Incident) -> Value {
+    serde_json::to_value(crate::wire::events::IncidentBrief::of(i)).unwrap_or(Value::Null)
+}
+
+/// [`brief`] as it was built before [`crate::wire::events::IncidentBrief`], for its test.
+#[cfg(test)]
+fn brief_was(i: &Incident) -> Value {
     json!({
         "id": i.id, "attachment": i.attachment, "name": i.name, "on": i.on, "wake": i.wake, "title": i.title, "repo": i.repo, "runner": i.runner,
         "state": i.state, "agent": i.agent, "class": i.class, "report": i.report, "links": i.links, "why": i.why,
@@ -1294,7 +1321,7 @@ async fn stuck(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
                 // its current wait.
                 "SELECT j.id, j.display, j.labels, r.id, p.name, COALESCE(r.workflow_id, ''), r.number, COALESCE(j.wait_since, j.queued_at) FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
                  WHERE j.status = 'queued' AND COALESCE(j.wait_since, j.queued_at) < ?1
-                   AND (j.wait_reason IS NULL OR json_extract(j.wait_reason, '$.reason') IN ('capacity', 'no-runner', 'unroutable', 'capability', 'scaling', 'reservation', 'other-runner'))
+                   AND (j.wait_reason IS NULL OR json_extract(j.wait_reason, '$.reason') IN ('capacity', 'oversized', 'no-runner', 'unroutable', 'capability', 'scaling', 'reservation', 'other-runner'))
                  ORDER BY COALESCE(j.wait_since, j.queued_at) LIMIT 50",
             )?;
             let rows = st.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?;
@@ -1606,7 +1633,7 @@ async fn remove(cx: Cx, v: Value) -> Out {
     may_attach(&cx.caller, &a.on)?;
     kept_elsewhere(&a)?;
     let _ = cx.hub.store.kv_delete(akey(&a.id)).await;
-    cx.hub.emit(&json!({"type": "attachment", "removed": a.id}));
+    cx.hub.emit(&crate::wire::events::ServerEvent::Attachment(crate::wire::events::AttachmentChange::Removed { removed: a.id.clone() }));
     cx.hub.store.audit(cx.caller.name.clone(), "attachment.remove".into(), format!("{} on {}", a.name, a.on)).await;
     Ok(json!({"removed": a.id}))
 }
@@ -1634,7 +1661,7 @@ async fn pause(cx: Cx, v: Value) -> Out {
             a.paused = paused;
             if a.source.is_some() {
                 let _ = if paused { cx.hub.store.kv_set(paused_key(&a.id), "1".to_owned()).await } else { cx.hub.store.kv_delete(paused_key(&a.id)).await };
-                cx.hub.emit(&json!({"type": "attachment", "attachment": a}));
+                cx.hub.emit(&crate::wire::events::ServerEvent::Attachment(crate::wire::events::AttachmentChange::Saved { attachment: Box::new(a.clone()) }));
             } else {
                 a.updated_at = crate::util::now_unix();
                 put(&cx.hub, &a).await;
@@ -1837,6 +1864,18 @@ mod tests {
 
     fn doctor(on: &str) -> Attachment {
         Attachment { name: "CI-Doctor".into(), on: on.into(), harness: Some(Harness { kind: "claude".into(), ..Harness::default() }), ..Attachment::default() }
+    }
+
+    /// An incident's brief is the JSON it was before it was a type (`wire::events::IncidentBrief`).
+    #[test]
+    fn brief_is_what_it_was() -> anyhow::Result<()> {
+        let mut i = Incident { id: "i1".into(), name: "ci-doctor".into(), title: "CI failed".into(), state: "open".into(), links: vec!["D13".into()], at: 5, updated_at: 6, ..Incident::default() };
+        anyhow::ensure!(brief(&i) == brief_was(&i), "{}", brief(&i));
+        i.repo = Some("acme/app".into());
+        i.agent = Some("a1".into());
+        i.seen = vec![Seen { at: 5, what: "run.failed".into(), ..Seen::default() }];
+        anyhow::ensure!(brief(&i) == brief_was(&i), "{}", brief(&i));
+        Ok(())
     }
 
     #[test]
@@ -2207,8 +2246,22 @@ mod end_to_end {
         })
     }
 
-    fn failed(n: i64, workflow: &str) -> Value {
-        json!({"type": "run.failed", "repo": {"id": "r1", "name": "acme/app"}, "run": {"repo": "acme/app", "id": format!("run{n}"), "number": n, "workflow": workflow, "name": "CI", "branch": "main", "sha": "0123456789abcdef", "actor": "ada", "conclusion": "failure", "url": format!("https://kiln.example/runs/run{n}")}, "environments": []})
+    fn failed(n: i64, workflow: &str) -> crate::wire::events::ServerEvent {
+        use crate::wire::events::{NoticeKind, NoticeRun, RepoRef, RunNotice, ServerEvent};
+        let run = NoticeRun {
+            repo: "acme/app".into(),
+            id: format!("run{n}"),
+            number: n,
+            workflow: workflow.into(),
+            name: "CI".into(),
+            branch: "main".into(),
+            sha: "0123456789abcdef".into(),
+            actor: "ada".into(),
+            conclusion: "failure".into(),
+            url: format!("https://kiln.example/runs/run{n}"),
+            ..NoticeRun::default()
+        };
+        ServerEvent::RunNotice(Box::new(RunNotice { kind: NoticeKind::RunFailed, repo: RepoRef { id: "r1".into(), name: "acme/app".into() }, run, environments: Vec::new() }))
     }
 
     #[test]
@@ -2276,7 +2329,7 @@ mod end_to_end {
             call(cx.clone(), "attachments.pause", json!({"attachment": "ci-doctor", "paused": false})).await.map_err(fail)?;
 
             // A mention calls the one it names.
-            hub.emit(&json!({"type": "comment", "diff": "D9", "author": "user:ada", "body": "@ci-doctor why is this red?"}));
+            hub.emit(&crate::wire::events::ServerEvent::Comment(Box::new(crate::wire::events::Comment { diff: "D9".into(), author: "user:ada".into(), body: "@ci-doctor why is this red?".into(), ..Default::default() })));
             let called = wait_for(&hub, "for the mention", |i| i.wake == "mention").await?;
             anyhow::ensure!(called.agent.is_some() && called.bundle.contains("why is this red?"), "{called:?}");
 
@@ -2289,7 +2342,7 @@ mod end_to_end {
             call(cx.clone(), "attachments.save", json!({"name": "runner-doctor", "on": "runners", "harness": {"kind": "claude", "on": "local", "cwd": cwd}, "can": ["diagnose", "manage-runners"]}))
                 .await
                 .map_err(fail)?;
-            hub.emit(&json!({"type": "runner.offline", "runner": {"name": "metal-1", "labels": ["linux"], "gone_for": 180}}));
+            hub.emit(&crate::wire::events::ServerEvent::RunnerOffline { runner: crate::wire::events::OfflineRunner { name: "metal-1".into(), labels: vec!["linux".into()], gone_for: 180 } });
             let gone = wait_for(&hub, "for the runner", |i| i.name == "runner-doctor").await?;
             anyhow::ensure!(gone.title == "Runner metal-1 is offline" && gone.agent.is_some() && gone.wake == "offline", "{gone:?}");
             let doc = crate::mcp::session_caller(&hub, gone.agent.as_deref().unwrap_or_default(), None).await.map_err(anyhow::Error::msg)?;

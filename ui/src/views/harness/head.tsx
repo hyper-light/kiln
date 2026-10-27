@@ -18,20 +18,21 @@ import { machineName } from "./parts";
 import { modelIn, RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
-import { subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
+import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
+import { harnessSessionsRes, useRes } from "@/lib/data";
 import "./console.css";
 
 type BorderState = "active" | "stopped" | "finished" | "ready" | "disconnected";
 
-function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null): { tone: BorderState; label: string } {
+function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null, kiln: number): { tone: BorderState; label: string } {
   if (status === "disconnected" || (conn !== "open" && status !== "exited")) return { tone: "disconnected", label: conn === "reconnecting" ? "Reconnecting…" : "Disconnected" };
   if (state?.pause ?? info?.pause) return { tone: "stopped", label: "Paused at a usage limit" };
   if (status === "exited") return { tone: "stopped", label: "Stopped" };
   if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "ready", label: "Waiting for you" };
   if (status === "starting") return { tone: "active", label: state?.harness_session ? "Resuming…" : "Starting…" };
   if (status === "running") return { tone: "active", label: "Working" };
-  // Its turn over, a subagent it sent off still works.
-  const subs = state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info?.subagents).length;
+  // Its turn over, a subagent it sent off still works (its harness's own, or one kiln started for its goals: `kiln`).
+  const subs = (state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info?.subagents).length) + kiln;
   if (workingThrough(status, subs)) return { tone: "active", label: `Working · ${subs} subagent${subs === 1 ? "" : "s"}` };
   if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
   return { tone: "ready", label: "Ready" };
@@ -121,7 +122,10 @@ export function AgentHeader({
   const running = status === "running" || status === "waiting";
   const plan = state?.plan ?? info?.plan;
   const unavailable = status === "disconnected" || conn !== "open";
-  const signal = turnSignal(status, conn, state, info);
+  // The subagents kiln started for its goals or plan steps at work, beside its harness's own.
+  const everyone = useRes(harnessSessionsRes).data;
+  const kiln = info ? kilnAtWork(kilnSubagentsOf(everyone, info.id)).length : 0;
+  const signal = turnSignal(status, conn, state, info, kiln);
   // Stop can use HTTP while its socket reconnects; keep that escape available.
   const canStop = running && features.includes("interrupt");
   const canRestart = status === "exited" && features.includes("resume");

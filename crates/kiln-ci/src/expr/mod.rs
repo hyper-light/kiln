@@ -115,6 +115,12 @@ pub trait Contexts {
         let _ = globs;
         Err(ExprError::new("KCI2011", "changed() needs the trigger's changed files, which are not known here", None))
     }
+    /// `affected(ecosystem)`, kiln dialect (W24-R17): the packages the changed files can affect,
+    /// by name, sorted.
+    fn affected(&self, ecosystem: &str) -> Result<Vec<String>, ExprError> {
+        let _ = ecosystem;
+        Err(ExprError::new("KCI2013", "affected() needs the repository's package graph, which is not known here", None))
+    }
 }
 
 /// Plain contexts in a list, for tests and simple callers.

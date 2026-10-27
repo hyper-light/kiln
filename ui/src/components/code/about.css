@@ -1,0 +1,281 @@
+/* About this code (components/code/about.tsx): the card that opens under a tapped line, in the
+   page's flow (no floating panel), and what was tapped marked. */
+
+[data-asked] {
+  box-shadow: inset 2px 0 #bab0e3;
+  background-image: linear-gradient(rgb(186 176 227 / 7%), rgb(186 176 227 / 7%));
+}
+
+.hx-about {
+  margin: 4px 10px 8px;
+  border: 1px solid #34324a;
+  border-radius: 7px;
+  background: #111018;
+  color: #d7d9de;
+  font: 13px/1.6 var(--font-sans, Geist, system-ui, sans-serif);
+  white-space: normal;
+  cursor: auto;
+  grid-column: 1 / -1;
+  animation: hx-about-open 0.2s ease-out;
+}
+@keyframes hx-about-open {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+.hx-about .hx-about-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 0 12px;
+  min-width: 0;
+}
+.hx-about .hx-about-subject {
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 7px;
+  border: 1px solid #2a2d38;
+  border-radius: 5px;
+  background: #1a1c23;
+  color: #ededee;
+  font: 12px var(--font-mono, monospace);
+}
+.hx-about .hx-about-where {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #797c84;
+  font: 11px var(--font-mono, monospace);
+}
+.hx-about .hx-about-x {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  margin-left: auto;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: #797c84;
+  font-size: 18px;
+  line-height: 1;
+}
+.hx-about .hx-about-x:hover {
+  background: #1b1d24;
+  color: #ededee;
+}
+.hx-about .hx-about-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+.hx-about .hx-about-btn {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 13px;
+  border: 1px solid #343844;
+  border-radius: 999px;
+  background: transparent;
+  color: #d3d6dc;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.hx-about .hx-about-btn:hover {
+  border-color: #55596a;
+  color: #fff;
+}
+.hx-about .hx-about-btn[data-primary] {
+  border-color: #e9eaee;
+  background: #e9eaee;
+  color: #0b0c0f;
+  font-weight: 500;
+}
+.hx-about .hx-about-note {
+  margin: 0;
+  padding: 0 12px 12px;
+  color: #797c84;
+  font-size: 11.5px;
+}
+.hx-about .hx-about-said {
+  padding-top: 10px;
+  color: #c9ccd3;
+}
+.hx-about .hx-about-ask {
+  display: flex;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+.hx-about .hx-about-ask input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid #343844;
+  border-radius: 7px;
+  background: #0d0e12;
+  color: #ededee;
+  font-size: 12.5px;
+}
+.hx-about .hx-about-choose {
+  padding: 10px 0 0;
+  margin-top: 10px;
+  border-top: 1px solid #23252e;
+}
+.hx-about .hx-about-choose > p:first-child {
+  margin: 0 12px;
+}
+.hx-about .hx-about-who {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px 8px;
+  border-top: 1px solid #23252e;
+  color: #97999f;
+  font-size: 12px;
+}
+.hx-about .hx-about-who b {
+  color: #e2e3e7;
+  font-weight: 500;
+}
+.hx-about .hx-about-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #bab0e3;
+  animation: hx-about-breathe 1.4s ease-in-out infinite;
+}
+.hx-about .hx-about-dot[data-done] {
+  background: rgb(168 201 188);
+  animation: none;
+}
+@keyframes hx-about-breathe {
+  50% {
+    opacity: 0.35;
+  }
+}
+.hx-about .hx-about-q {
+  margin: 0 12px 6px;
+  color: #e4e5e7;
+  font-size: 12.5px;
+}
+.hx-about .hx-about-trail {
+  margin: 0;
+  padding: 0 12px 6px;
+  list-style: none;
+  color: #797c84;
+  font: 11px/1.8 var(--font-mono, monospace);
+}
+.hx-about .hx-about-trail li {
+  list-style: none;
+}
+.hx-about .hx-about-trail li + li {
+  margin-top: 0;
+}
+.hx-about .hx-about-trail li::before {
+  content: "› ";
+  color: #565a64;
+}
+.hx-about .hx-about-answer {
+  max-height: min(60vh, 520px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 2px 12px 4px;
+}
+.hx-about .hx-about-part {
+  margin: 0 0 12px;
+}
+.hx-about .hx-about-part h4 {
+  margin: 0 0 3px;
+  color: #797c84;
+  font: 400 10px var(--font-mono, monospace);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.hx-about .hx-about-part p,
+.hx-about .hx-about-part ul {
+  margin: 0 0 6px;
+}
+.hx-about .hx-about-part ul {
+  padding-left: 18px;
+}
+.hx-about .hx-about-part code {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: #1a1c23;
+  color: #e3e0f0;
+  font: 11.5px var(--font-mono, monospace);
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+.hx-about .hx-about-sk {
+  margin: 0 0 14px;
+}
+.hx-about .hx-about-sk i {
+  display: block;
+  height: 9px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #191b21 0%, #262931 45%, #191b21 90%) 0 0 / 300% 100%;
+  animation: hx-about-sheen 1.5s ease-in-out infinite;
+}
+.hx-about .hx-about-sk i + i {
+  margin-top: 7px;
+}
+.hx-about .hx-about-sk i:first-child {
+  width: 84px;
+  height: 7px;
+  margin-bottom: 9px;
+  opacity: 0.7;
+}
+.hx-about .hx-about-sk i:nth-child(2) {
+  width: 92%;
+}
+.hx-about .hx-about-sk i:nth-child(3) {
+  width: 64%;
+}
+.hx-about .hx-about-sk[data-refs] i:not(:first-child) {
+  width: 100%;
+  height: 30px;
+  border-radius: 6px;
+}
+@keyframes hx-about-sheen {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+.hx-about .hx-about-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 12px;
+  border-top: 1px solid #23252e;
+}
+.hx-about .hx-about-meta {
+  flex: 1;
+  color: #797c84;
+  font: 11px var(--font-mono, monospace);
+}
+@media (prefers-reduced-motion: reduce) {
+  .hx-about,
+  .hx-about .hx-about-dot,
+  .hx-about .hx-about-sk i {
+    animation: none;
+  }
+}
+@media (max-width: 639px) {
+  .hx-about {
+    margin: 4px 6px 8px;
+  }
+  .hx-about .hx-about-btn {
+    height: 36px;
+  }
+}

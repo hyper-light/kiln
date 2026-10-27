@@ -28,7 +28,7 @@ import "./run-settings.css";
 type Kind = "mode" | "model" | "effort";
 
 /** One choice. */
-interface Word {
+export interface Word {
   id: string;
   /** What it shows, kept short ("Edits", "Opus 5.5"). */
   text: string;
@@ -219,7 +219,7 @@ function glide(b: HTMLElement | null) {
 }
 
 /** A few short choices as words: a radiogroup (arrow keys move, Enter or Space picks). */
-function WordRow({ label, words, value, onPick }: { label: string; words: Word[]; value: string; onPick: (w: Word) => void }) {
+export function WordRow({ label, words, value, onPick }: { label: string; words: Word[]; value: string; onPick: (w: Word) => void }) {
   const [focus, setFocus] = React.useState<string | null>(null);
   // One stop in the tab order: the word with focus, else the current one, else the first.
   const stop = [focus, value, words[0]?.id].find((id) => id != null && words.some((w) => w.id === id));
@@ -280,7 +280,7 @@ function WordRow({ label, words, value, onPick }: { label: string; words: Word[]
  * Tap a stop or slide along the track (the name follows the finger; it applies where it's let go);
  * arrow keys, Home and End move a stop at a time.
  */
-function Scale({ label, words, value, armed, onPick }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void }) {
+export function Scale({ label, words, value, armed, onPick }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void }) {
   const rail = React.useRef<HTMLDivElement>(null);
   const [drag, setDrag] = React.useState<number | null>(null);
   const n = words.length;
@@ -500,6 +500,8 @@ export interface RunSettingsProps {
   className?: string;
   /** Related controls on the same line, divided from the run settings. */
   trailing?: React.ReactNode;
+  /** What choosing another harness's model does, said under its models (by default: the agent goes on there, its conversation carried over). */
+  switchWords?: (name: string) => React.ReactNode;
 }
 
 /** A change just made: what the line shows until the agent reports otherwise, and what Undo restores. */
@@ -544,6 +546,7 @@ export function RunSettings({
   running = false,
   className,
   trailing,
+  switchWords,
 }: RunSettingsProps) {
   const [open, setOpen] = React.useState<Kind | null>(null);
   const [change, setChange] = React.useState<Change | null>(null);
@@ -720,8 +723,14 @@ export function RunSettings({
               <p className="rs-elsewhere-name">{g.name}</p>
               <ModelChoice words={g.words} value={shown(k)} onPick={pick} />
               <p className="rs-desc">
-                Switches to {g.name}
-                {running ? " at the end of this turn" : ""} — the conversation carries over
+                {switchWords ? (
+                  switchWords(g.name)
+                ) : (
+                  <>
+                    Switches to {g.name}
+                    {running ? " at the end of this turn" : ""} — the conversation carries over
+                  </>
+                )}
               </p>
             </div>
           ))}

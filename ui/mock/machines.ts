@@ -45,8 +45,8 @@ const claude: KindInfo = {
   available: true,
   switch: true,
   models: [
-    { id: "claude-opus-5-5", label: "Opus 5.5" },
-    { id: "claude-sonnet-5-5", label: "Sonnet 5.5" },
+    { id: "claude-opus-5-5", label: "Opus 5.5", description: "" },
+    { id: "claude-sonnet-5-5", label: "Sonnet 5.5", description: "" },
   ],
 };
 const codex: KindInfo = {
@@ -56,8 +56,8 @@ const codex: KindInfo = {
   available: true,
   switch: true,
   models: [
-    { id: "gpt-6.1-sol", label: "GPT-6.1 Sol" },
-    { id: "gpt-6.1-sol-mini", label: "GPT-6.1 Sol mini" },
+    { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", description: "" },
+    { id: "gpt-6.1-sol-mini", label: "GPT-6.1 Sol mini", description: "" },
   ],
 };
 const devin: KindInfo = {
@@ -67,11 +67,18 @@ const devin: KindInfo = {
   available: true,
   switch: true,
   models: [
-    { id: "swe-2", label: "SWE 2" },
-    { id: "claude-opus-5-5", label: "Opus 5.5" },
+    { id: "swe-2", label: "SWE 2", description: "" },
+    { id: "claude-opus-5-5", label: "Opus 5.5", description: "" },
   ],
 };
-const antigravity: KindInfo = { id: "antigravity", name: "Antigravity CLI", verified: true, available: true, switch: true, models: [{ id: "gemini-3.8-pro", label: "Gemini 3.8 Pro" }] };
+const antigravity: KindInfo = {
+  id: "antigravity",
+  name: "Antigravity CLI",
+  verified: true,
+  available: true,
+  switch: true,
+  models: [{ id: "gemini-3.8-pro", label: "Gemini 3.8 Pro", description: "" }],
+};
 /** A harness none of whose sessions ran here yet: it lists no models. */
 const gemini: KindInfo = { id: "gemini", name: "Gemini CLI", verified: false, available: true, switch: true };
 const kindsOf = (hs: string[]) => [claude, codex, devin, antigravity, gemini].filter((k) => hs.includes(k.id));

@@ -122,7 +122,11 @@ steps (`only`, `split`) or in another mode, it's refused (409), saying so.
 Each step is held to as a goal (as with **Goals**) by an agent of its own, started for it on the
 machine, harness and folder chosen for the run, or for the step; the run has a page of its own
 (each step with its agent, where it stands, what it waits for and what it changed) and Mission
-Control groups its agents under it.
+Control groups its agents under it. A run an agent runs (`plans_run` from an agent, or a goal's
+plan readied with `then: agents`) gives each step's agent to that agent as its subagent
+(docs/goals.md, "A plan's steps side by side"): in its chat and on its row rather than a row of its
+own, and, where the run says nothing else, on its machine, in its folder and harness, with its
+model, effort, speed, mode and settings.
 
 The run's page draws its steps as their graph, in rounds (each step after the latest step it waits
 for), with a bar of where each stands, the way an agent's
@@ -141,6 +145,11 @@ waits for instead (**after 2, 3**).
   once; an agent that runs a plan also has at most as many subagents at work at once as its
   Subagents setting says (one pool, whatever each does; none set, no limit), and further steps
   wait for room.
+- **Where each step runs.** Before the run starts, each step's machine is found as its agent's
+  will be (its own `on`, else the run's, else the machine of the agent that ran the plan): a step
+  whose machine can't take it (none by that name or none that suits, or one kiln knows hasn't
+  its harness) refuses the whole run, naming the step, and the machines that have the harness.
+  Asked for again under its key, a run started then is the run it started, as it stands.
 - **One folder.** Steps side by side in one folder share it, and the run says so: brief each
   step to keep to its own files, or give steps folders or machines of their own (`steps`). Until
   agents have workspaces of their own (docs/agentic.md, W: held with Slates), nothing keeps them

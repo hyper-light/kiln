@@ -476,7 +476,7 @@ struct Seen {
 }
 
 /// What a leg waits for, in words, and whether that can't change on a server of this machine
-/// alone; `None` for waits that end by themselves (a busy runner, a retry's delay).
+/// alone; `None` for waits that end by themselves unsaid (any busy runner, a retry's delay).
 fn waiting(w: &Value) -> Option<(String, bool)> {
     let o = match w {
         Value::String(s) if !s.is_empty() => return Some((s.clone(), false)),
@@ -488,10 +488,21 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
     Some(match o.get("reason").and_then(Value::as_str).unwrap_or_default() {
         "capacity" | "retry" | "" => return None,
         "unroutable" => (format!("no runner meets its requirements ({})", list("failing")), true),
+        "oversized" => (format!("a runner with {} ({})", text("asked"), list("short")), true),
         "capability" => (format!("{} can't run what it uses (Docker, or actions)", list("runners")), true),
         "no-runner" => ("no runner that can take it is connected".to_owned(), false),
         "other-runner" if o.get("refused").and_then(Value::as_bool) == Some(true) => (format!("a runner other than {}, which refused it", text("avoided")), true),
         "other-runner" => (format!("a runner other than {}, as its retry asks (`runner: different`)", text("avoided")), true),
+        "load" => (format!("a runner whose disk isn't under pressure or nearly full: it's heavy on I/O ({})", held(o)), false),
+        "warm" => (
+            format!(
+                "{}, busy, where it runs warm: about {} s sooner, until {} at most",
+                text("runner"),
+                o.get("saves_s").and_then(Value::as_u64).unwrap_or(0),
+                super::cli::when(o.get("until").and_then(Value::as_i64).map(|ms| ms / 1000))
+            ),
+            false,
+        ),
         "approval" => (format!("a reviewer's approval to deploy to {} ({})", text("environment"), list("reviewers")), true),
         "wait-timer" => (format!("the wait timer of {}", text("environment")), false),
         "window" => (format!("a deploy window of {}: {}", text("environment"), text("window")), false),
@@ -500,6 +511,28 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
         "concurrency" => (format!("its concurrency group {}", text("group")), false),
         other => (other.replace('-', " "), false),
     })
+}
+
+/// The runners a heavy leg is held off by their load (docs/ci.md W24-R19), each with what's past
+/// its limit.
+fn held(o: &serde_json::Map<String, Value>) -> String {
+    let gib = |b: u64| format!("{:.1} GiB", b as f64 / f64::from(1u32 << 30));
+    let each = o.get("held").and_then(Value::as_array).into_iter().flatten().map(|h| {
+        let n = |k: &str| h.get(k).and_then(Value::as_u64);
+        let mut why = Vec::new();
+        if let (Some(p), Some(l)) = (n("pressure"), n("limit"))
+            && p > l
+        {
+            why.push(format!("I/O pressure {:.1} %, past {:.1} %", p as f64 / 100.0, l as f64 / 100.0));
+        }
+        if let (Some(f), Some(floor)) = (n("free"), n("floor"))
+            && f < floor
+        {
+            why.push(format!("{} free, under {}", gib(f), gib(floor)));
+        }
+        format!("{}: {}", h.get("runner").and_then(Value::as_str).unwrap_or("?"), why.join(", "))
+    });
+    each.collect::<Vec<_>>().join("; ")
 }
 
 /// Prints the runs' logs as they come and what happens to them, until they end. The exit code:
@@ -653,5 +686,24 @@ mod tests {
         assert_eq!(env.get("QUOTED").map(String::as_str), Some("a b"));
         assert_eq!(env.get("SINGLE").map(String::as_str), Some("x=y"));
         assert_eq!(env.get("MULTI").map(String::as_str), Some("one\ntwo"));
+    }
+
+    /// W24-R19: a leg held off runners by their load says which, and what's past each limit.
+    #[test]
+    fn w24_r19_a_wait_for_load_in_words() -> anyhow::Result<()> {
+        let held = kiln_ci::sched::load::Held { runner: "fedora".into(), pressure: Some(5_550), limit: 4_000, free: 500 << 30, floor: 20 << 30 };
+        let full = kiln_ci::sched::load::Held { runner: "jupiter".into(), pressure: None, limit: 4_000, free: 5 << 30, floor: 20 << 30 };
+        let w = serde_json::to_value(kiln_ci::sched::state::WaitReason::Load { held: vec![held, full] })?;
+        let said = waiting(&w).map(|(s, _)| s).unwrap_or_default();
+        anyhow::ensure!(said == "a runner whose disk isn't under pressure or nearly full: it's heavy on I/O (fedora: I/O pressure 55.5 %, past 40.0 %; jupiter: 5.0 GiB free, under 20.0 GiB)", "{said}");
+        Ok(())
+    }
+
+    /// W24-R18: a leg waiting for a busy warm runner says for which, what it saves, and until
+    /// when; a wait that ends by itself, not one that stops a run here.
+    #[test]
+    fn w24_r18_a_warm_wait_in_words() {
+        let said = waiting(&json!({ "reason": "warm", "runner": "fedora", "saves_s": 100, "until": 1_798_761_600_000_i64 }));
+        assert_eq!(said, Some(("fedora, busy, where it runs warm: about 100 s sooner, until 2027-01-01T00:00:00Z at most".to_owned(), false)));
     }
 }

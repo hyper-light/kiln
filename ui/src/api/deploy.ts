@@ -5,77 +5,13 @@
  */
 import { ApiError, request } from "./client";
 import type { CdDiff, CdResourceKey } from "./types";
+import type { Artifact, JsonValue, Move, Registration, Release, ReleaseState } from "./wire";
+export type { Artifact, DeployApproval, GateResult, Move, MovedRegistration, MovePhase, Registration, Release, ReleaseKind, ReleaseState } from "./wire";
 
-export type ReleaseState = "waiting" | "waiting_approval" | "committing" | "delivering" | "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded";
-export type ReleaseKind = "deploy" | "config" | "rollback" | "enable" | "disable" | "revert";
-
-export interface Artifact {
-  repository: string;
-  tag: string;
-  digest: string;
-}
-
-/** A gate's result on a release, with its evidence. */
-export interface GateResult {
-  gate: string;
-  passed: boolean;
-  detail: string;
-  evidence?: Record<string, unknown> | null;
-}
-
-/** A person's answer to a release waiting for approval. */
-export interface Approval {
-  by: string;
-  at: number;
-  approved: boolean;
-  note?: string;
-}
-
-export interface Release {
-  id: number;
-  app: string;
-  environment: string;
-  kind: ReleaseKind;
-  state: ReleaseState;
-  origin: "api" | "git" | "kiln";
-  version?: string;
-  artifacts?: Record<string, Artifact>;
-  values?: string;
-  commit?: string;
-  requested_by: string;
-  message?: string;
-  rollback_of?: number;
-  rolled_back_by?: number;
-  keep?: boolean;
-  provider?: Record<string, unknown> | null;
-  gates?: GateResult[];
-  approvals?: Approval[];
-  promoted_from?: number;
-  created_at: number;
-  committed_at?: number;
-  ended_at?: number;
-  /** Secrets' changes it delivers (docs/deploy-api.md §3.5): a secrets release's reason (`DB_PASSWORD v4`), or ones it took on while it waited. */
-  secrets?: string | null;
-  /** Failed after its commit, it isn't reverted: it's held for a person (§8.1). */
-  no_revert?: boolean;
-  /** A revert: the release it puts back what ran before. */
-  reverts?: number | null;
-  /** The revert that puts back what ran before it. */
-  reverted_by?: number | null;
-  /** What it runs on its way in that a revert couldn't undo (a migration's hook): failed, it's held rather than reverted. */
-  irreversible?: string | null;
-}
-
-export interface Registration {
-  app: string;
-  environment: string;
-  enabled: boolean;
-  paused: boolean;
-  running?: number;
-  created_at: number;
-  /** Why what runs here needs a person (docs/deploy-api.md §8.1): a release failed and wasn't put back, or putting it back didn't land. The next release that lands clears it. */
-  degraded?: string | null;
-}
+/** Where a move's registration disagrees, object by object: KilnCD's diff of the app (`CdDiff`), or
+ *  Argo CD's disagreement read the same way. The wire leaves them untyped
+ *  (`deploy::moves::Moved::differences`, two providers' JSON): this is the shape the page reads. */
+export const diffsOf = (d: readonly JsonValue[] | undefined): CdDiff[] => (d ?? []) as unknown as CdDiff[];
 
 /** A check a release passes (§9.1): one built in, by its name, or one described: a URL kiln asks, or a workflow it runs. */
 export type Check = string | CheckSpec;
@@ -148,39 +84,6 @@ export interface Environment {
   owners?: { release: boolean };
   /** On Argo CD: kiln writes each Application itself, rather than through the environment's ApplicationSet. */
   argocd?: { applications: boolean };
-}
-
-export type MovePhase = "comparing" | "compared" | "handing_over" | "moved" | "failed" | "cancelled";
-
-/** One app's part in an environment's move between providers (docs/deploy-api.md §8.4). */
-export interface MovedRegistration {
-  app: string;
-  /** The new provider would change nothing of what runs but its own tracking marks. */
-  agrees?: boolean;
-  /** Where it disagrees: each object it would change. */
-  differences?: CdDiff[];
-  /** Each object's uid as the handover began. */
-  uids?: Record<string, string>;
-  /** Objects made again by the handover (their uid changed): none, if it went as it should. */
-  remade?: string[];
-  message?: string;
-}
-
-/** An environment's move between providers: compared in shadow, then handed over with nothing made again. */
-export interface Move {
-  environment: string;
-  from: string;
-  to: string;
-  argocd: { applications: boolean };
-  phase: MovePhase;
-  by: string;
-  started_at: number;
-  ended_at?: number;
-  handover: boolean;
-  force: boolean;
-  handing_over: boolean;
-  registrations: MovedRegistration[];
-  message?: string;
 }
 
 /** What can be done to an object a registration runs: its provider's action, whether it can be now, what it takes. */

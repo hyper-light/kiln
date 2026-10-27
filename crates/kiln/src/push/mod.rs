@@ -165,7 +165,7 @@ async fn probe(hub: Arc<Hub>) {
         tracing::warn!(error = %e, "the push services can't be reached from this server: devices won't get notifications");
     }
     *hub.push.reached.lock() = Reached { ok: Some(ok), error, checked_at: crate::util::now_unix(), checking: false };
-    hub.emit(&json!({ "type": "push" }));
+    hub.emit(&crate::wire::events::ServerEvent::Push);
 }
 
 /// Whom agent `id` acts for (`crate::mcp::opener_key`): `user:<id>`, else the owner.
@@ -249,15 +249,18 @@ async fn tell(hub: &Arc<Hub>, n: watch::Note) {
     let opener = opener_of(hub, &id).await;
     let machine = n.info.target.strip_prefix("agent:").unwrap_or("server").to_owned();
     let url = format!("{}/agents/{id}", hub.cfg.server.public_url.trim_end_matches('/'));
-    let ev = json!({
-        "type": event,
-        "agent": { "id": id, "name": title, "harness": n.info.kind, "harness_name": n.info.kind_name, "machine": machine, "cwd": n.info.cwd, "opener": opener },
-        "title": title,
-        "text": text,
-        "url": url,
-    });
+    let agent = crate::wire::events::NoticeAgent {
+        id: id.clone(),
+        name: title.clone(),
+        harness: n.info.kind.clone(),
+        harness_name: n.info.kind_name.clone(),
+        machine,
+        cwd: n.info.cwd.clone(),
+        opener: opener.clone(),
+    };
+    let ev = crate::wire::events::ServerEvent::AgentNotice(Box::new(crate::wire::events::AgentNotice { kind: n.kind.notice(), agent, title: title.clone(), text: text.clone(), url }));
     hub.emit(&ev);
-    crate::rt::spawn(crate::ci::notify::agent_event(Arc::clone(hub), ev));
+    crate::rt::spawn(crate::ci::notify::agent_event(Arc::clone(hub), ev.value()));
     if !hub.cfg.push.enabled || handled(hub, &opener, &n).await {
         return;
     }
@@ -372,7 +375,7 @@ async fn deliver(hub: &Arc<Hub>, d: &store::Device, body: &[u8], urgency: &'stat
             send::Outcome::Failed(why) => store::failed(c, &id, why, now),
         })
         .await;
-    hub.emit(&json!({ "type": "push" }));
+    hub.emit(&crate::wire::events::ServerEvent::Push);
     outcome
 }
 

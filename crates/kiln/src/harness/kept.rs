@@ -36,6 +36,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 /// A file a message mentioned, as it was when the message was done.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "KeptFile"))]
 pub struct Kept {
     /// As the message says it, in the session's folder when it was relative.
     pub path: String,
@@ -43,13 +45,16 @@ pub struct Kept {
     /// an entry of its own, so each shows the file as it was.
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub meta: Option<Meta>,
     /// Its content's SHA-256 when a copy is kept (none: too big or over a budget; it's read from
     /// its machine when someone looks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub sha: Option<String>,
     /// Why it couldn't be read (gone already, a secret, a type kiln doesn't show).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub error: Option<String>,
 }
 
@@ -111,7 +116,7 @@ impl Keeper {
     /// The frame that tells a viewer what's kept (`None`: nothing yet).
     pub fn frame(&self, session: &str) -> Option<String> {
         let l = self.list(session);
-        (!l.is_empty()).then(|| serde_json::json!({"t": "files", "files": l}).to_string())
+        (!l.is_empty()).then(|| crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Files { files: l }).text())
     }
 
     pub fn enqueue(&self, job: Job) {

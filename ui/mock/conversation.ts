@@ -29,6 +29,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { crc32, deflateSync, gzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
 import type { AgentInfo, HEvent, KeptFile, Meta, SaidHit, State } from "../src/api/harness.ts";
+import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 
 const ID = "demo-long";
 /** A fixed start, so the history is the same on every run. */
@@ -481,6 +482,11 @@ const limits = (): State["limits"] =>
           { id: "seven_day_fable", label: "Weekly · Fable", used_percent: 0, resets_at: Date.now() + 5 * 86_400_000 + 13 * 3_600_000, window: "7d" },
         ]
       : [{ id: "seven_day", label: "Weekly", used_percent: 62, resets_at: LIVE_AT + 3 * 86_400_000, window: "7d" }];
+// MOCK_SEND_MS: how long a message takes to show once sent (a slow link, a busy store), and to be
+// answered: the page shows it sending meanwhile. MOCK_SEND_REFUSED=1: every message is refused for
+// good, as the server refuses one for a session that's gone.
+const SEND_MS = Number(process.env.MOCK_SEND_MS ?? 0);
+const SEND_REFUSED = process.env.MOCK_SEND_REFUSED === "1";
 // MOCK_OFFLINE_MS: its machine is away that long from the start, then back.
 let offlineUntil = Date.now() + Number(process.env.MOCK_OFFLINE_MS ?? 0);
 const offline = () => Date.now() < offlineUntil;
@@ -494,6 +500,7 @@ let movePlan: { to?: string; kind?: string; model?: string } = {};
 const OLD_RUNNER = process.env.MOCK_OLD_RUNNER === "1";
 
 const info: AgentInfo = {
+  ...defaultInfo(),
   id: ID,
   kind: "claude",
   kind_name: "Claude Code",
@@ -516,6 +523,7 @@ const info: AgentInfo = {
 };
 
 const meta: Meta = {
+  ...defaultMeta(),
   version: "2.3.1",
   modes: [
     { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
@@ -524,13 +532,13 @@ const meta: Meta = {
   ],
   models: [
     { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
-    { id: "claude-opus-5-5", label: "claude-opus-5-5" },
-    { id: "claude-sonnet-5", label: "claude-sonnet-5" },
+    { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
+    { id: "claude-sonnet-5", label: "claude-sonnet-5", description: "" },
   ],
   efforts: ["low", "medium", "high", "max"].map((id) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1) })),
   commands: [
-    { name: "compact", description: "Summarize the conversation to free context", group: "Context", args: "optional", route: { kind: "prompt" } },
-    { name: "login", description: "Sign in to Claude Code on this machine", group: "Account", args: "none", route: { kind: "view", view: "login" } },
+    { name: "compact", description: "Summarize the conversation to free context", hint: "", group: "Context", args: "optional", route: { kind: "prompt" } },
+    { name: "login", description: "Sign in to Claude Code on this machine", hint: "", group: "Account", args: "none", route: { kind: "view", view: "login" } },
   ],
   agents: [],
   features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments", "switch_harness"],
@@ -551,6 +559,7 @@ let lastTurn: State["last_turn"];
 let compactingSince: number | undefined;
 let compactions = 0;
 const state = (): State => ({
+  ...defaultState(),
   status: offline() ? "disconnected" : running ? "running" : "idle",
   compacting: compactingSince === undefined ? undefined : { since: compactingSince, tokens: 967_000 },
   pause_at: pauseAt,
@@ -785,15 +794,26 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
   };
   go(0);
   ws.on("message", (raw) => {
-    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; count?: number | null; on?: boolean; to?: string; kind?: string };
+    type Cmd = { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; count?: number | null; on?: boolean; to?: string; kind?: string };
+    let m: Cmd & { t?: string; c?: Cmd };
     try {
-      c = JSON.parse(raw.toString()) as typeof c;
+      m = JSON.parse(raw.toString()) as typeof m;
     } catch {
       return;
     }
-    // Its machine is away: the server can't hand it anything (it says so; the message is lost).
+    // Under its client's id (docs/wire.md, "The UI's sockets"): answered under it, `ack` or `nack`,
+    // as the server answers it. A bare one (clients from before ids) is told only refusals.
+    const under = m.t === "cmd" && typeof m.id === "string" ? m.id : undefined;
+    const c: Cmd = (under ? m.c : m) ?? {};
+    const ack = () => under && send(ws, { t: "ack", id: under, outcome: "taken" });
+    const refuse = (code: string, why: string, again = false) => send(ws, under ? { t: "nack", id: under, code, why, again } : { t: "error", error: why });
+    // Its machine is away: a message waits for it (the page sends it again in a while).
     if (offline() && c.type === "send") {
-      send(ws, { t: "error", error: "its machine is away" });
+      refuse("unreachable", "its machine is away", true);
+      return;
+    }
+    if (SEND_REFUSED && c.type === "send") {
+      refuse("no_session", "this session is gone");
       return;
     }
     if (c.type === "pause_at") {
@@ -828,17 +848,27 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
       running = false;
       lastTurn = { at: Date.now(), how: "stopped", kept: 0 };
     } else if (c.type === "send" && c.text) {
-      const e = add({ id: `L-sent-${seq}`, at: Date.now(), kind: "user", text: c.text, client_id: c.id });
-      if (!running) {
-        running = true;
-        doing = "Thinking";
-        turnStarted = Date.now();
-        broadcast({ t: "state", state: state() });
-      }
-      // Steered and sent-now messages show where they went in; a queued one would wait (not modeled).
-      broadcast({ t: "events", events: [e] });
+      const [text, id] = [c.text, c.id];
+      const take = () => {
+        const e = add({ id: `L-sent-${seq}`, at: Date.now(), kind: "user", text, client_id: id });
+        if (!running) {
+          running = true;
+          doing = "Thinking";
+          turnStarted = Date.now();
+          broadcast({ t: "state", state: state() });
+        }
+        // Steered and sent-now messages show where they went in; a queued one would wait (not modeled).
+        broadcast({ t: "events", events: [e] });
+        ack();
+      };
+      if (SEND_MS > 0) setTimeout(take, SEND_MS);
+      else take();
       return;
-    } else return;
+    } else {
+      ack();
+      return;
+    }
+    ack();
     broadcast({ t: "state", state: state() });
   });
   ws.on("close", () => viewers.delete(ws));

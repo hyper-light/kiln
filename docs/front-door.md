@@ -152,9 +152,12 @@ letting go.
 ## One-time setup on a Linux runner
 
 The runner runs as you, not as root. The front door shows what is missing in its status lines,
-with the commands, and never runs them itself. For a Linux runner serving `kiln.dev` on ports 53
-and 443 (and 80 for the redirect), do this once. The examples use the runner's LAN address
-`192.168.1.77` and the LAN `192.168.1.0/24`: use yours.
+with the commands, and never runs them itself. `kiln setup` does steps 1 to 3 for the kiln on its
+own machine: it shows the commands and runs them with sudo once you say so (`--unattended`, only
+with `--sudo`), then turns the front door on (`kiln.internal` unless you choose another name).
+For a Linux runner serving `kiln.dev` on ports 53 and 443 (and 80 for the redirect), do this
+once. The examples use the runner's LAN address `192.168.1.77` and the LAN `192.168.1.0/24`: use
+yours.
 
 **1. Let kiln bind ports below 1024** (now, and after every reboot):
 
