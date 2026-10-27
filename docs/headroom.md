@@ -118,11 +118,11 @@ decides.
 | Harm | a sample, or a probe still out, at the tolerance |
 | A new regime | a fall below the calm the lower CUSUM detects with the same calibration, or an alarm with kiln quiet that outlasts the longest a cut of kiln's ever took to show |
 | The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), never under the probe's own measured cost, and for a served target never under its service time / load share |
-| The write budget | bisection between the highest rate held calm and the lowest rate trouble began at; doubling while there is no unsafe rate; halving the gap is the only step |
+| The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause); each is raised on its own where it limits |
 | How long a level must hold | the slowest target's expected detection time plus the longest measured lag |
-| A run's demand | its peak unslowed write rate and memory, and its duration, recorded when it ends; the mean per kind of work, with the mean over everything as the prior |
+| A run's demand | its peak unslowed write rate, CPU cores and memory, and its duration (a session's turn, a build's unit), recorded when it ends; the mean per kind of work, with the mean over everything as the prior |
 | Who starts | class, then response ratio ((wait + run) / run); every waiting item a reservation on the time profile of when running work is expected to free room (conservative backfilling); with nothing learned, one at a time |
-| Each running group's share | the budget water-filled class by class, max-min fair within a class |
+| Each running group's share | each budget water-filled class by class, max-min fair within a class; a group runs at the smaller of its two shares, so work is slowed only for the resource that's short |
 | When shares change | only when the budget or the set of running work does |
 
 Representation limits are not tuning: estimates are exact counts, sums and extremes, so none has a

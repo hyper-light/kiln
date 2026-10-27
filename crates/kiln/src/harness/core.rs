@@ -805,12 +805,17 @@ impl Core {
 
     /// Recompute the status from what is pending: an open approval means the agent waits.
     pub fn settle_status(&mut self, running: bool) {
+        let was = self.state.status == Status::Running;
         let s = match self.state.status {
             Status::Exited | Status::Disconnected | Status::Starting if !running => self.state.status,
             _ if !self.state.approvals.is_empty() => Status::Waiting,
             _ if running => Status::Running,
             _ => Status::Idle,
         };
+        // A turn ended: headroom learns what it took, and the session asks again for its next.
+        if was && matches!(s, Status::Idle | Status::Exited) {
+            crate::headroom::turn_ended(&self.session_id);
+        }
         self.set_status(s);
     }
 

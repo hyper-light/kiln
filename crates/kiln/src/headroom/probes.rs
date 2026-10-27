@@ -1,6 +1,8 @@
-//! Probes: each target checked on a thread of its own, again and again, so one that hangs (an
-//! fsync stuck behind a whole file system's writeback) is seen hanging while it hangs, by how long
-//! it's been in flight, instead of holding up the others or the control.
+//! Probes: each target checked on a thread of its own, at the interval the engine derives for it
+//! (`kiln_ci::headroom::detect::interval_us`), so one that hangs (an fsync stuck behind a whole file
+//! system's writeback) is seen hanging while it hangs, by how long it's been out, instead of
+//! holding up the others or the engine. A probe gives up at its target's tolerance: by then it
+//! is harm already, and the next one starts.
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpStream, ToSocketAddrs as _};
@@ -10,94 +12,96 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use super::settings::{Probe, Target};
+use super::settings::Probe;
+use kiln_ci::headroom::Answer;
 
-/// Between one probe of a target ending and the next starting.
-const EVERY: Duration = Duration::from_millis(250);
-/// The longest one probe may take before it's given up (it has long been counted as missing).
-const GIVE_UP: Duration = Duration::from_secs(30);
-
-/// What a target's probes say now.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(rename_all = "lowercase", tag = "state")]
-pub enum Verdict {
-    /// Not probed yet.
-    Unknown,
-    /// Answered within its goal.
-    Met { ms: u64 },
-    /// Slower than its goal, or still in flight past it.
-    Missed { ms: u64 },
-    /// Refused or failed: down for its own reasons, not slowness (not counted).
-    Unavailable { why: String },
+/// One target to probe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spec {
+    pub name: String,
+    pub probe: Probe,
+    pub tolerance: Duration,
 }
 
-#[derive(Default)]
 struct Slot {
-    /// When the probe in flight started (ms since `base`), 0 when none is.
+    name: String,
+    /// When the probe out now started (µs since `base`), 0 when none is.
     inflight: AtomicU64,
-    last: Mutex<Option<Result<u64, String>>>,
+    /// How long to wait between probes (µs), as the engine last said.
+    every_us: AtomicU64,
+    answers: Mutex<Vec<Answer>>,
 }
 
 /// The probes of one set of targets; dropping it stops them.
 pub struct Probes {
-    pub targets: Vec<Target>,
+    pub specs: Vec<Spec>,
     slots: Vec<Arc<Slot>>,
     stop: Arc<AtomicBool>,
     base: Instant,
 }
 
 impl Probes {
-    /// Starts a thread per target; `wake` is called whenever one finishes.
-    pub fn start(targets: Vec<Target>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+    /// A thread per target, each probing at once and then at its interval (until the engine
+    /// says, once per tolerance); `wake` is called when one answers.
+    pub fn start(specs: Vec<Spec>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let base = Instant::now();
         let mut slots = Vec::new();
-        for t in &targets {
-            let slot = Arc::new(Slot::default());
+        for spec in &specs {
+            let slot = Arc::new(Slot { name: spec.name.clone(), inflight: AtomicU64::new(0), every_us: AtomicU64::new(spec.tolerance.as_micros() as u64), answers: Mutex::new(Vec::new()) });
             slots.push(Arc::clone(&slot));
-            let (probe, stop, wake) = (t.probe.clone(), Arc::clone(&stop), Arc::clone(&wake));
-            let name = format!("kiln-probe-{}", t.name.chars().take(8).collect::<String>());
-            let spawned = std::thread::Builder::new().name(name).spawn(move || {
+            let (probe, tolerance, stop, wake) = (spec.probe.clone(), spec.tolerance, Arc::clone(&stop), Arc::clone(&wake));
+            let spawned = std::thread::Builder::new().name(format!("kiln-probe-{}", spec.name.chars().take(8).collect::<String>())).spawn(move || {
                 let mut seq: u64 = 0;
                 while !stop.load(Ordering::Relaxed) {
-                    let started = base.elapsed().as_millis() as u64;
-                    slot.inflight.store(started.max(1), Ordering::Release);
+                    slot.inflight.store((base.elapsed().as_micros() as u64).max(1), Ordering::Release);
                     let at = Instant::now();
-                    let res = once(&probe, &mut seq).map(|()| at.elapsed().as_millis() as u64);
+                    let answer = match once(&probe, tolerance, &mut seq) {
+                        // Out its tolerance is an answer too: that long.
+                        Ok(()) | Err(Failed::Slow) => Answer::Took(at.elapsed().as_micros() as f64),
+                        Err(Failed::Down) => Answer::Unavailable,
+                    };
                     slot.inflight.store(0, Ordering::Release);
-                    *slot.last.lock() = Some(res);
+                    slot.answers.lock().push(answer);
                     wake();
-                    std::thread::sleep(EVERY);
+                    std::thread::sleep(Duration::from_micros(slot.every_us.load(Ordering::Acquire)));
                 }
             });
             if let Err(e) = spawned {
-                tracing::warn!(error = %e, target = %t.name, "headroom: a probe couldn't start");
+                tracing::warn!(error = %e, target = %spec.name, "headroom: a probe couldn't start");
             }
         }
-        Self { targets, slots, stop, base }
+        Self { specs, slots, stop, base }
     }
 
-    /// Each target's verdict now, in `targets`' order.
-    pub fn verdicts(&self) -> Vec<Verdict> {
-        let now = self.base.elapsed().as_millis() as u64;
-        self.targets
-            .iter()
-            .zip(&self.slots)
-            .map(|(t, s)| {
-                let goal = u64::from(t.goal_ms);
-                let inflight = s.inflight.load(Ordering::Acquire);
-                if inflight > 0 && now.saturating_sub(inflight) > goal {
-                    return Verdict::Missed { ms: now.saturating_sub(inflight) };
-                }
-                match s.last.lock().clone() {
-                    None => Verdict::Unknown,
-                    Some(Ok(ms)) if ms <= goal => Verdict::Met { ms },
-                    Some(Ok(ms)) => Verdict::Missed { ms },
-                    Some(Err(why)) if why == SLOW => Verdict::Missed { ms: GIVE_UP.as_millis() as u64 },
-                    Some(Err(why)) => Verdict::Unavailable { why },
-                }
-            })
-            .collect()
+    /// The answers since the last call, and how long each probe out now has been out (µs).
+    pub fn drain(&self) -> (Vec<(String, Answer)>, Vec<(String, f64)>) {
+        let now = self.base.elapsed().as_micros() as u64;
+        let mut answers = Vec::new();
+        let mut out = Vec::new();
+        for s in &self.slots {
+            answers.extend(std::mem::take(&mut *s.answers.lock()).into_iter().map(|a| (s.name.clone(), a)));
+            let since = s.inflight.load(Ordering::Acquire);
+            if since > 0 {
+                out.push((s.name.clone(), now.saturating_sub(since) as f64));
+            }
+        }
+        (answers, out)
+    }
+
+    /// Probe `name` every `every_us` from now.
+    pub fn set_interval(&self, name: &str, every_us: f64) {
+        if let Some(s) = self.slots.iter().find(|s| s.name == name)
+            && every_us.is_finite()
+            && every_us >= 1.0
+        {
+            s.every_us.store(every_us as u64, Ordering::Release);
+        }
+    }
+
+    /// The shortest interval any target is probed at (µs).
+    pub fn fastest_us(&self) -> u64 {
+        self.slots.iter().map(|s| s.every_us.load(Ordering::Acquire)).min().unwrap_or(1_000_000).max(1)
     }
 }
 
@@ -107,41 +111,46 @@ impl Drop for Probes {
     }
 }
 
-/// A probe that ran out of time: slowness, not a failure.
-const SLOW: &str = "no answer in time";
+/// Why a probe got no answer.
+enum Failed {
+    /// It ran out its target's tolerance: slowness (harm), not a failure.
+    Slow,
+    /// Refused or failed: down for its own reasons.
+    Down,
+}
 
-fn once(probe: &Probe, seq: &mut u64) -> Result<(), String> {
+fn once(probe: &Probe, tolerance: Duration, seq: &mut u64) -> Result<(), Failed> {
     match probe {
-        Probe::Fsync { path } => fsync(path, seq),
-        Probe::Http { url } => http(url),
-        Probe::Tcp { addr } => connect(addr).map(drop),
+        Probe::Fsync { path } => fsync(path, seq).map_err(|_| Failed::Down),
+        Probe::Http { url } => http(url, tolerance),
+        Probe::Tcp { addr } => connect(addr, tolerance).map(drop),
     }
 }
 
 /// A few bytes written to a file of kiln's own in `dir`, then made durable.
-fn fsync(dir: &str, seq: &mut u64) -> Result<(), String> {
+fn fsync(dir: &str, seq: &mut u64) -> std::io::Result<()> {
     *seq = seq.wrapping_add(1);
     let path = std::path::Path::new(dir).join(".kiln-headroom-probe");
-    let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    f.write_all(&seq.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.sync_data().map_err(|e| e.to_string())
+    let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path)?;
+    f.write_all(&seq.to_le_bytes())?;
+    f.sync_data()
 }
 
-fn connect(addr: &str) -> Result<TcpStream, String> {
-    let to = addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or_else(|| format!("{addr}: no address"))?;
-    let s = TcpStream::connect_timeout(&to, GIVE_UP).map_err(|e| if e.kind() == std::io::ErrorKind::TimedOut { SLOW.to_owned() } else { e.to_string() })?;
-    let _ = s.set_read_timeout(Some(GIVE_UP));
-    let _ = s.set_write_timeout(Some(GIVE_UP));
+fn connect(addr: &str, tolerance: Duration) -> Result<TcpStream, Failed> {
+    let to = addr.to_socket_addrs().map_err(|_| Failed::Down)?.next().ok_or(Failed::Down)?;
+    let s = TcpStream::connect_timeout(&to, tolerance).map_err(|e| if e.kind() == std::io::ErrorKind::TimedOut { Failed::Slow } else { Failed::Down })?;
+    let _ = s.set_read_timeout(Some(tolerance));
+    let _ = s.set_write_timeout(Some(tolerance));
     Ok(s)
 }
 
 /// `GET` an `http://` URL: an answer under 500 is healthy, 500 and up is the target failing.
-fn http(url: &str) -> Result<(), String> {
-    let rest = url.strip_prefix("http://").ok_or("only http:// is probed")?;
+fn http(url: &str, tolerance: Duration) -> Result<(), Failed> {
+    let rest = url.strip_prefix("http://").ok_or(Failed::Down)?;
     let (host, path) = rest.split_once('/').map_or((rest, "/".to_owned()), |(h, p)| (h, format!("/{p}")));
     let addr = if host.contains(':') && !host.ends_with(']') { host.to_owned() } else { format!("{host}:80") };
-    let mut s = connect(&addr)?;
-    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: kiln-headroom\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+    let mut s = connect(&addr, tolerance)?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: kiln-headroom\r\nConnection: close\r\n\r\n").map_err(|_| Failed::Down)?;
     let mut head = [0u8; 16];
     let mut n = 0;
     while n < head.len() {
@@ -149,60 +158,63 @@ fn http(url: &str) -> Result<(), String> {
         match s.read(rest) {
             Ok(0) => break,
             Ok(k) => n += k,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err(SLOW.to_owned()),
-            Err(e) => return Err(e.to_string()),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err(Failed::Slow),
+            Err(_) => return Err(Failed::Down),
         }
     }
     let line = String::from_utf8_lossy(head.get(..n).unwrap_or_default());
-    let code: u16 = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| format!("not an HTTP answer: {line:?}"))?;
-    if code >= 500 { Err(format!("HTTP {code}")) } else { Ok(()) }
+    let code: u16 = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or(Failed::Down)?;
+    if code >= 500 { Err(Failed::Down) } else { Ok(()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn wait_for(p: &Probes, f: impl Fn(&[Verdict]) -> bool) -> Vec<Verdict> {
-        for _ in 0..200 {
-            let v = p.verdicts();
-            if f(&v) {
-                return v;
+    fn wait_for(p: &Probes, f: impl Fn(&[(String, Answer)], &[(String, f64)]) -> bool) -> (Vec<(String, Answer)>, Vec<(String, f64)>) {
+        let mut seen = Vec::new();
+        for _ in 0..300 {
+            let (a, o) = p.drain();
+            seen.extend(a);
+            if f(&seen, &o) {
+                return (seen, o);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        p.verdicts()
+        (seen, Vec::new())
     }
 
     #[test]
-    fn an_fsync_meets_a_generous_goal_and_a_refused_port_is_unavailable_not_slow() -> anyhow::Result<()> {
+    fn an_fsync_answers_and_a_refused_port_is_unavailable_not_slow() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let closed = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = closed.local_addr()?.to_string();
         drop(closed);
-        let targets = vec![
-            Target { name: "disk".into(), probe: Probe::Fsync { path: dir.path().display().to_string() }, goal_ms: 60_000 },
-            Target { name: "gone".into(), probe: Probe::Tcp { addr }, goal_ms: 60_000 },
+        let specs = vec![
+            Spec { name: "disk".into(), probe: Probe::Fsync { path: dir.path().display().to_string() }, tolerance: Duration::from_secs(60) },
+            Spec { name: "gone".into(), probe: Probe::Tcp { addr }, tolerance: Duration::from_secs(60) },
         ];
-        let p = Probes::start(targets, Arc::new(|| {}));
-        let v = wait_for(&p, |v| v.iter().all(|x| *x != Verdict::Unknown));
-        anyhow::ensure!(matches!(v.first(), Some(Verdict::Met { .. })), "{v:?}");
-        anyhow::ensure!(matches!(v.get(1), Some(Verdict::Unavailable { .. })), "{v:?}");
+        let p = Probes::start(specs, Arc::new(|| {}));
+        let (a, _) = wait_for(&p, |a, _| a.iter().any(|(n, _)| n == "disk") && a.iter().any(|(n, _)| n == "gone"));
+        anyhow::ensure!(a.iter().any(|(n, x)| n == "disk" && matches!(x, Answer::Took(_))), "{a:?}");
+        anyhow::ensure!(a.iter().any(|(n, x)| n == "gone" && *x == Answer::Unavailable), "{a:?}");
         Ok(())
     }
 
     #[test]
-    fn a_server_that_answers_late_is_missing_while_it_hangs() -> anyhow::Result<()> {
-        // Accepts and never answers: the probe hangs, and is seen missing by how long it's been out.
+    fn a_server_that_never_answers_is_out_while_it_hangs_and_answers_at_its_tolerance() -> anyhow::Result<()> {
         let l = std::net::TcpListener::bind("127.0.0.1:0")?;
         let url = format!("http://{}/healthz", l.local_addr()?);
         let _keep = std::thread::spawn(move || {
-            let held: Vec<_> = l.incoming().take(1).collect();
+            let held: Vec<_> = l.incoming().take(2).collect();
             std::thread::sleep(Duration::from_secs(5));
             drop(held);
         });
-        let p = Probes::start(vec![Target { name: "slow".into(), probe: Probe::Http { url }, goal_ms: 50 }], Arc::new(|| {}));
-        let v = wait_for(&p, |v| matches!(v.first(), Some(Verdict::Missed { .. })));
-        anyhow::ensure!(matches!(v.first(), Some(Verdict::Missed { .. })), "{v:?}");
+        let p = Probes::start(vec![Spec { name: "slow".into(), probe: Probe::Http { url }, tolerance: Duration::from_millis(200) }], Arc::new(|| {}));
+        let (_, out) = wait_for(&p, |_, o| o.iter().any(|(_, age)| *age > 50_000.0));
+        anyhow::ensure!(!out.is_empty(), "never seen out");
+        let (a, _) = wait_for(&p, |a, _| !a.is_empty());
+        anyhow::ensure!(matches!(a.first(), Some((_, Answer::Took(us))) if *us >= 200_000.0), "{a:?}");
         Ok(())
     }
 }

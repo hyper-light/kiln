@@ -3,7 +3,8 @@
 //!
 //! - [`detect`]: whether each protected target is in trouble (CUSUM, calibrated on the machine's
 //!   own record), and how often to probe it;
-//! - [`knee`]: the write budget, bisected between the last safe and the last unsafe rate;
+//! - [`knee`]: the write and CPU budgets, each bisected between the last safe and the last unsafe
+//!   level of kiln's own work (what headroom controls);
 //! - [`admit`]: which waiting work starts, by learned demand, class and response ratio, with
 //!   conservative backfilling;
 //! - [`pace`]: each running group's share of time, water-filling the budget by class.
@@ -44,7 +45,11 @@ pub struct Target {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Learned {
     pub detectors: BTreeMap<String, detect::Detector>,
+    /// kiln's own writes a second.
     pub knee: knee::Knee,
+    /// kiln's own CPU cores.
+    #[serde(default)]
+    pub cpu_knee: knee::Knee,
     pub demand: admit::Learned,
 }
 
@@ -58,6 +63,9 @@ pub struct Group {
     pub protected: bool,
     /// Bytes written a second, as measured (slowed or not).
     pub write_bps: f64,
+    /// CPU cores used, as measured (slowed or not).
+    #[serde(default)]
+    pub cpu_cores: f64,
     pub mem_bytes: f64,
     /// Its share of time when measured (1: full speed).
     pub share: f64,
@@ -84,6 +92,9 @@ pub struct Observation {
     pub mem_free: f64,
     pub running: Vec<Group>,
     pub waiting: Vec<Waiting>,
+    /// Groups whose run ended though the group goes on (a session's turn): learned from, and
+    /// their next run starts from nothing.
+    pub ended: Vec<String>,
 }
 
 /// What to do now.
@@ -116,9 +127,15 @@ pub struct Status {
     pub budget_bps: Option<f64>,
     pub safe_bps: Option<f64>,
     pub unsafe_bps: Option<f64>,
+    pub cpu_budget: Option<f64>,
+    pub cpu_safe: Option<f64>,
+    pub cpu_unsafe: Option<f64>,
     pub lag_us: Option<f64>,
+    /// The whole machine's write rate, when the system says (kiln's and everyone else's).
     pub delivered_bps: Option<f64>,
+    /// What kiln's running work wants unslowed: writes a second, and CPU cores.
     pub wanted_bps: f64,
+    pub wanted_cpu: f64,
 }
 
 /// A running group's history, for what's learned when it ends.
@@ -127,9 +144,12 @@ struct Run {
     key: String,
     since_us: u64,
     peak_write: f64,
+    peak_cpu: f64,
     peak_mem: f64,
-    /// What it writes a second unslowed, as last seen at full speed or scaled from its share.
+    /// What it writes a second and the cores it uses unslowed, as last seen at full speed or
+    /// scaled from its share.
     demand: f64,
+    demand_cpu: f64,
 }
 
 pub struct Engine {
@@ -140,7 +160,7 @@ pub struct Engine {
     runs: HashMap<String, Run>,
     /// Shares in force, and what they were decided from (they change only when that does).
     shares: Vec<Pace>,
-    decided_from: Option<(Option<u64>, Vec<String>)>,
+    decided_from: Option<(Option<u64>, Option<u64>, Vec<String>)>,
 }
 
 impl Engine {
@@ -179,29 +199,42 @@ impl Engine {
         let now = o.now_us;
         let budget_per_day = self.policy.false_alarms_per_day;
         let mut events = Vec::new();
-        let delivered = o.delivered_bps.unwrap_or(0.0);
 
         // Unslowed demand of what runs: measured at full speed, or scaled up from its share.
         for g in &o.running {
-            let r = self.runs.entry(g.id.clone()).or_insert_with(|| Run { key: g.key.clone(), since_us: now, peak_write: 0.0, peak_mem: 0.0, demand: 0.0 });
+            let r = self.runs.entry(g.id.clone()).or_insert_with(|| Run { key: g.key.clone(), since_us: now, peak_write: 0.0, peak_cpu: 0.0, peak_mem: 0.0, demand: 0.0, demand_cpu: 0.0 });
             if g.share >= 1.0 {
                 r.demand = g.write_bps;
+                r.demand_cpu = g.cpu_cores;
             } else if g.share > 0.0 {
                 r.demand = g.write_bps / g.share;
+                r.demand_cpu = g.cpu_cores / g.share;
             }
             r.peak_write = r.peak_write.max(r.demand);
+            r.peak_cpu = r.peak_cpu.max(r.demand_cpu);
             r.peak_mem = r.peak_mem.max(g.mem_bytes);
+        }
+        // Runs that ended in groups that go on (a session's turn).
+        for id in &o.ended {
+            if let Some(r) = self.runs.get_mut(id) {
+                self.learned.demand.record(&r.key, Demand { write_bps: r.peak_write, mem_bytes: r.peak_mem, duration_us: now.saturating_sub(r.since_us) as f64, cpu_cores: r.peak_cpu });
+                *r = Run { key: r.key.clone(), since_us: now, peak_write: 0.0, peak_cpu: 0.0, peak_mem: 0.0, demand: r.demand, demand_cpu: r.demand_cpu };
+            }
         }
         // What ended: learned from, and its promise kept no longer.
         let ended: Vec<String> = self.runs.keys().filter(|id| !o.running.iter().any(|g| &g.id == *id)).cloned().collect();
         for id in ended {
             if let Some(r) = self.runs.remove(&id) {
-                self.learned.demand.record(&r.key, Demand { write_bps: r.peak_write, mem_bytes: r.peak_mem, duration_us: now.saturating_sub(r.since_us) as f64 });
+                self.learned.demand.record(&r.key, Demand { write_bps: r.peak_write, mem_bytes: r.peak_mem, duration_us: now.saturating_sub(r.since_us) as f64, cpu_cores: r.peak_cpu });
             }
         }
         self.promises.retain(|p| p.until_us > now && !o.running.iter().any(|g| g.id == p.id));
-        let quiet = o.running.iter().filter(|g| !g.protected).all(|g| g.write_bps <= 0.0);
+        let quiet = o.running.iter().filter(|g| !g.protected).all(|g| g.write_bps <= 0.0 && g.cpu_cores <= 0.0);
         let wanted: f64 = o.running.iter().filter_map(|g| self.runs.get(&g.id)).map(|r| r.demand).sum();
+        let wanted_cpu: f64 = o.running.iter().filter_map(|g| self.runs.get(&g.id)).map(|r| r.demand_cpu).sum();
+        // What kiln's own work writes and uses now: what its budgets are measured against.
+        let ours_w: f64 = o.running.iter().filter(|g| !g.protected).map(|g| g.write_bps).sum();
+        let ours_c: f64 = o.running.iter().filter(|g| !g.protected).map(|g| g.cpu_cores).sum();
 
         // Detection.
         let was = self.alarmed();
@@ -217,6 +250,7 @@ impl Engine {
                 detect::Event::Regime(why) => {
                     events.push(format!("{name}: {why}"));
                     self.learned.knee.regime();
+                    self.learned.cpu_knee.regime();
                 }
                 detect::Event::Same => {}
             }
@@ -239,37 +273,47 @@ impl Engine {
             }
         }
 
-        // The budget.
+        // The budgets: both cut when trouble begins (either may be the cause), each raised again on
+        // its own as it holds calm where it limits.
         let hold = self.hold_us();
         let now_alarmed = self.alarmed();
+        use knee::Unit;
         if now_alarmed && !was {
-            events.push(self.learned.knee.alarm(now, delivered));
+            events.push(self.learned.knee.alarm(now, ours_w, Unit::Writes));
+            events.push(self.learned.cpu_knee.alarm(now, ours_c, Unit::Cpu));
         } else if now_alarmed {
-            if let Some(why) = self.learned.knee.persisting(now, delivered, hold) {
-                events.push(why);
-            }
+            events.extend(self.learned.knee.persisting(now, ours_w, hold, Unit::Writes));
+            events.extend(self.learned.cpu_knee.persisting(now, ours_c, hold, Unit::Cpu));
         } else {
             if was {
                 self.learned.knee.clear(now);
+                self.learned.cpu_knee.clear(now);
             }
             let limited = self.learned.knee.budget.is_some_and(|b| wanted > b);
-            if let Some(why) = self.learned.knee.calm(now, delivered, limited, hold) {
-                events.push(why);
-            }
+            events.extend(self.learned.knee.calm(now, ours_w, limited, hold, Unit::Writes));
+            let limited_cpu = self.learned.cpu_knee.budget.is_some_and(|b| wanted_cpu > b);
+            events.extend(self.learned.cpu_knee.calm(now, ours_c, limited_cpu, hold, Unit::Cpu));
         }
         let budget = self.learned.knee.budget;
+        let cpu_budget = self.learned.cpu_knee.budget;
 
         // Shares: decided again only when the budget or the work running changed.
         let mut ids: Vec<String> = o.running.iter().map(|g| g.id.clone()).collect();
         ids.sort();
-        let from = (budget.map(f64::to_bits), ids);
+        let from = (budget.map(f64::to_bits), cpu_budget.map(f64::to_bits), ids);
         if self.decided_from.as_ref() != Some(&from) {
             let running: Vec<pace::Running> = o
                 .running
                 .iter()
-                .map(|g| pace::Running { id: g.id.clone(), class: g.class, demand_bps: self.runs.get(&g.id).map_or(g.write_bps, |r| r.demand), protected: g.protected })
+                .map(|g| pace::Running {
+                    id: g.id.clone(),
+                    class: g.class,
+                    demand_bps: self.runs.get(&g.id).map_or(g.write_bps, |r| r.demand),
+                    demand_cpu: self.runs.get(&g.id).map_or(g.cpu_cores, |r| r.demand_cpu),
+                    protected: g.protected,
+                })
                 .collect();
-            self.shares = pace::plan(budget, &running);
+            self.shares = pace::plan(budget, cpu_budget, &running);
             self.decided_from = Some(from);
         }
 
@@ -280,10 +324,10 @@ impl Engine {
             .filter_map(|g| {
                 let r = self.runs.get(&g.id)?;
                 let d = self.learned.demand.demand(&r.key)?;
-                Some(admit::Free { at_us: r.since_us.saturating_add(d.duration_us as u64), write_bps: r.demand, mem_bytes: g.mem_bytes })
+                Some(admit::Free { at_us: r.since_us.saturating_add(d.duration_us as u64), write_bps: r.demand, mem_bytes: g.mem_bytes, cpu_cores: r.demand_cpu })
             })
             .collect();
-        let room = admit::Room { write_budget: budget, write_used: wanted, mem_free: o.mem_free, frees };
+        let room = admit::Room { write_budget: budget, write_used: wanted, mem_free: o.mem_free, frees, cpu_budget, cpu_used: wanted_cpu };
         let decisions = admit::decide(now, &room, &self.promises, &o.waiting, &self.learned.demand);
         for d in decisions.iter().filter(|d| d.start) {
             let key = o.waiting.iter().find(|w| w.id == d.id).map(|w| w.key.clone()).unwrap_or_default();
@@ -313,9 +357,13 @@ impl Engine {
             budget_bps: budget,
             safe_bps: self.learned.knee.safe,
             unsafe_bps: self.learned.knee.unsafe_at,
+            cpu_budget,
+            cpu_safe: self.learned.cpu_knee.safe,
+            cpu_unsafe: self.learned.cpu_knee.unsafe_at,
             lag_us: self.learned.knee.lag_us,
             delivered_bps: o.delivered_bps,
             wanted_bps: wanted,
+            wanted_cpu,
         };
         Plan { shares: self.shares.clone(), decisions, probe_every_us, events, status }
     }
@@ -336,7 +384,7 @@ mod tests {
     }
 
     fn group(id: &str, w: f64, share: f64) -> Group {
-        Group { id: id.into(), key: id.into(), class: Class::Agent, protected: false, write_bps: w, mem_bytes: 1e9, share }
+        Group { id: id.into(), key: id.into(), class: Class::Agent, protected: false, write_bps: w, cpu_cores: 1.0, mem_bytes: 1e9, share }
     }
 
     #[test]
@@ -373,11 +421,12 @@ mod tests {
                     ..Observation::default()
                 });
                 let shares: Vec<f64> = p.shares.iter().map(|s| s.share).collect();
+                let budgets = (p.status.budget_bps, p.status.cpu_budget);
                 if let Some(prev) = &last && *prev != shares {
-                    prop_assert!(last_budget != p.status.budget_bps, "shares moved with the budget still {:?}", p.status.budget_bps);
+                    prop_assert!(last_budget != Some(budgets), "shares moved with the budgets still {budgets:?}");
                 }
                 last = Some(shares);
-                last_budget = p.status.budget_bps;
+                last_budget = Some(budgets);
             }
         }
     }

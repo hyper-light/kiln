@@ -46,6 +46,8 @@ pub struct Load {
     pub cpu_pct: f64,
     /// Bytes written a second.
     pub write_rate: f64,
+    /// Bytes of memory it holds now.
+    pub mem_bytes: f64,
 }
 
 /// Turns counters into rates, between one look and the next.
@@ -60,13 +62,13 @@ impl Meter {
         let out = groups
             .iter()
             .map(|g| {
-                let (cpu, written) = imp::counters(&g.dir);
+                let (cpu, written, mem) = imp::counters(&g.dir);
                 let load = match self.prev.get(&g.dir) {
                     Some((at, c0, w0)) => {
-                        let secs = now.duration_since(*at).as_secs_f64().max(0.001);
-                        Load { cpu_pct: cpu.saturating_sub(*c0) as f64 / 1e4 / secs, write_rate: written.saturating_sub(*w0) as f64 / secs }
+                        let secs = now.duration_since(*at).as_secs_f64().max(f64::MIN_POSITIVE);
+                        Load { cpu_pct: cpu.saturating_sub(*c0) as f64 / 1e4 / secs, write_rate: written.saturating_sub(*w0) as f64 / secs, mem_bytes: mem as f64 }
                     }
-                    None => Load::default(),
+                    None => Load { mem_bytes: mem as f64, ..Load::default() },
                 };
                 self.prev.insert(g.dir.clone(), (now, cpu, written));
                 load
@@ -238,19 +240,34 @@ mod imp {
         ["app-", "dbus-", "xdg-", "flatpak-", "snap."].iter().any(|p| name.starts_with(p))
     }
 
-    /// CPU time (µs) and bytes written, by the group and everything under it.
-    pub fn counters(dir: &Path) -> (u64, u64) {
+    /// CPU time (µs), bytes written and memory held, by the group and everything under it.
+    pub fn counters(dir: &Path) -> (u64, u64, u64) {
         let cpu = fs::read_to_string(dir.join("cpu.stat")).ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("usage_usec ")).and_then(|v| v.trim().parse().ok())).unwrap_or(0);
         // The kernel's own count, where the group has the io controller; else its processes' own.
+        // The kernel's own counts where the group has the controllers; else its processes' own.
+        let mut pids: Option<Vec<u32>> = None;
+        let mut pids_of = |dir: &Path| {
+            pids.get_or_insert_with(|| {
+                let mut v = Vec::new();
+                pids_under(dir, usize::MAX, &mut v);
+                v
+            })
+            .clone()
+        };
         let written = match fs::read_to_string(dir.join("io.stat")) {
             Ok(t) if !t.trim().is_empty() => t.split_whitespace().filter_map(|w| w.strip_prefix("wbytes=")).filter_map(|v| v.parse::<u64>().ok()).sum(),
-            _ => {
-                let mut pids = Vec::new();
-                pids_under(dir, 6, &mut pids);
-                pids.iter().filter_map(|p| fs::read_to_string(format!("/proc/{p}/io")).ok()).filter_map(|t| t.lines().find_map(|l| l.strip_prefix("write_bytes:")).and_then(|v| v.trim().parse::<u64>().ok())).sum()
-            }
+            _ => pids_of(dir).iter().filter_map(|p| fs::read_to_string(format!("/proc/{p}/io")).ok()).filter_map(|t| t.lines().find_map(|l| l.strip_prefix("write_bytes:")).and_then(|v| v.trim().parse::<u64>().ok())).sum(),
         };
-        (cpu, written)
+        let mem = match fs::read_to_string(dir.join("memory.current")).ok().and_then(|t| t.trim().parse::<u64>().ok()) {
+            Some(m) => m,
+            None => pids_of(dir)
+                .iter()
+                .filter_map(|p| fs::read_to_string(format!("/proc/{p}/status")).ok())
+                .filter_map(|t| t.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u64>().ok()))
+                .map(|kib| kib * 1024)
+                .sum(),
+        };
+        (cpu, written, mem)
     }
 
     fn pids_under(dir: &Path, depth: usize, out: &mut Vec<u32>) {
@@ -288,8 +305,8 @@ mod imp {
         Vec::new()
     }
 
-    pub fn counters(_dir: &Path) -> (u64, u64) {
-        (0, 0)
+    pub fn counters(_dir: &Path) -> (u64, u64, u64) {
+        (0, 0, 0)
     }
 
     pub fn freeze(_dir: &Path, _stop: bool) -> std::io::Result<()> {

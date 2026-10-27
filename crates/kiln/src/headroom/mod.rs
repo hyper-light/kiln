@@ -1,65 +1,58 @@
 //! Headroom (docs/headroom.md): a machine never gets so busy that what matters on it stops
-//! working. kiln measures what it protects directly (its targets: a small fsync where they write,
-//! their health answers), keeps a window of how much heavy work may run at full speed (grown while
-//! every target meets its goal, halved when one misses), holds new work past it before it starts,
-//! and paces the work already running past it: stopped part of every period, the lowest class and
-//! the heaviest writer first. It only ever slows what the runner itself started, so it needs no
-//! privileges, and it runs on the runner alone: with the server away, with settings it kept.
-//!
-//! A runner restarted starts the window small, so what it was running resumes a few at a time.
+//! working. The decisions are `kiln_ci::headroom`'s, pure code; this is the runner's side of them:
+//! probing the targets at the intervals the engine derives, reading the machine (its disks'
+//! counters, its free memory, each group of work's CPU, writes and memory), holding sessions'
+//! next turns until the engine lets them start, pacing running groups to the shares it gives, and
+//! keeping what it learned so a restart starts from it. It only ever slows what the runner itself
+//! started (or what the user's service manager runs for agents), so it needs no privileges, and it
+//! runs on the runner alone: with the server away, from settings it kept.
 
 pub mod control;
 mod pace;
 mod probes;
 pub mod settings;
-pub mod window;
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use kiln_ci::headroom::{Engine, Group, Learned, Observation, Target, Waiting};
 use parking_lot::{Condvar, Mutex};
 use serde::Serialize;
 
+pub use kiln_ci::headroom::Class;
 pub use settings::{Push, Settings};
-pub use window::Class;
 
-/// The control's beat: how often targets are looked at (a probe finishing wakes it sooner).
-const BEAT: Duration = Duration::from_millis(250);
-/// How often groups of work are found and measured.
-const MEASURE: Duration = Duration::from_secs(1);
 /// The settings file in the runner's headroom folder.
 const SETTINGS: &str = "settings.json";
+/// What the engine learned, kept between runs.
+const LEARNED: &str = "learned.json";
 
-/// What sessions consult: how much heavy work runs, and who holds a place.
+/// Who may start their next turn.
 #[derive(Default)]
 struct Admit {
-    allowed: usize,
-    /// Agent sessions whose work is heavy now.
-    heavy: HashSet<String>,
-    /// Heavy groups that are no session (a build run outside its session's group).
-    heavy_others: usize,
-    /// Sessions let in whose work hasn't shown yet, until when (ms).
-    reserved: HashMap<String, i64>,
-    /// Sessions held, since when (ms).
-    waiting: HashMap<String, i64>,
+    /// Sessions let in, until when (µs since the epoch; their turn's end lets go sooner).
+    granted: HashMap<String, u64>,
+    /// Sessions held, since when (µs since the epoch).
+    waiting: HashMap<String, u64>,
+    /// Sessions whose turn ended since the engine last looked.
+    ended: Vec<String>,
 }
 
 struct Shared {
     /// A runner started headroom in this process (else every session is let in, as before).
     running: AtomicBool,
     enabled: AtomicBool,
-    hold_ms: Mutex<i64>,
+    /// Another process of this machine paces; this one only holds work back.
+    standby: AtomicBool,
     max_sessions: Mutex<Option<usize>>,
     admit: Mutex<Admit>,
-    /// Held sessions wait on this; the control notifies it when there's room.
+    /// Held sessions wait on this; the engine notifies it when one may start.
     room: event_listener::Event,
     kick: (Mutex<bool>, Condvar),
     pushed: Mutex<Option<Settings>>,
-    /// Another process of this machine paces; this one only holds work back.
-    standby: AtomicBool,
     latest: Mutex<Option<String>>,
     changed: crate::rt::Notify,
     restoring: AtomicBool,
@@ -68,13 +61,12 @@ struct Shared {
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     running: AtomicBool::new(false),
     enabled: AtomicBool::new(true),
-    hold_ms: Mutex::new(30_000),
+    standby: AtomicBool::new(false),
     max_sessions: Mutex::new(None),
     admit: Mutex::new(Admit::default()),
     room: event_listener::Event::new(),
     kick: (Mutex::new(false), Condvar::new()),
     pushed: Mutex::new(None),
-    standby: AtomicBool::new(false),
     latest: Mutex::new(None),
     changed: crate::rt::Notify::new(),
     restoring: AtomicBool::new(false),
@@ -86,38 +78,44 @@ fn kick() {
     cv.notify_one();
 }
 
-/// May agent session `session` start new work now (a turn, its queue's next message)? A person's
-/// own message always may. When it may not, it's held: [`room`] completes when it's worth asking
-/// again. Cheap, and always yes where no runner started headroom.
+fn now_us() -> u64 {
+    u64::try_from(crate::util::now_ms()).unwrap_or(0).saturating_mul(1000)
+}
+
+/// May agent session `session` start its next turn now? A person's own message always may. When
+/// it may not, it's held, and [`room`] completes when the engine lets it start. Cheap, and always
+/// yes where no runner started headroom.
 pub fn admit(session: &str, class: Class) -> bool {
     let s = &*SHARED;
     if !s.running.load(Ordering::Acquire) || !s.enabled.load(Ordering::Acquire) || class == Class::Person {
         return true;
     }
-    let now = crate::util::now_ms();
+    let now = now_us();
     let mut a = s.admit.lock();
-    if a.heavy.contains(session) || a.reserved.contains_key(session) {
+    if a.granted.get(session).is_some_and(|until| *until > now) {
         return true;
     }
-    let used = a.heavy.len() + a.heavy_others + a.reserved.len();
-    if used < a.allowed {
-        let hold = *s.hold_ms.lock();
-        a.reserved.insert(session.to_owned(), now + hold);
-        a.waiting.remove(session);
-        true
-    } else {
-        let first = !a.waiting.contains_key(session);
-        a.waiting.entry(session.to_owned()).or_insert(now);
-        drop(a);
-        if first {
-            tracing::debug!(session, "headroom: new work held: the machine is at its window");
-            kick();
-        }
-        false
+    a.granted.remove(session);
+    let first = !a.waiting.contains_key(session);
+    a.waiting.entry(session.to_owned()).or_insert(now);
+    drop(a);
+    if first {
+        kick();
     }
+    false
 }
 
-/// Completes when held work is worth asking about again (room opened, or settings changed).
+/// A session's turn ended: its place goes, and what the turn took is learned.
+pub fn turn_ended(session: &str) {
+    if session.is_empty() || !SHARED.running.load(Ordering::Acquire) {
+        return;
+    }
+    let mut a = SHARED.admit.lock();
+    a.granted.remove(session);
+    a.ended.push(session.to_owned());
+}
+
+/// Completes when held work may be worth asking about again.
 pub async fn room() {
     SHARED.room.listen().await;
 }
@@ -141,11 +139,11 @@ pub fn restoring(on: bool) {
 /// What a runner's headroom works from.
 #[derive(Clone, Debug)]
 pub struct Ctx {
-    /// `<state>/headroom`: its settings and its note of what it paced.
+    /// `<state>/headroom`: its settings, what it learned, its note of what it paced.
     pub dir: PathBuf,
     /// The server the runner reports to: its health is a target (`Settings::automatic`).
     pub server_url: String,
-    /// The runner's data folder: an fsync there is a target (`Settings::automatic`).
+    /// The runner's data folder: a sync there is a target (`Settings::automatic`).
     pub data_dir: PathBuf,
 }
 
@@ -182,7 +180,7 @@ pub fn start(ctx: Ctx) -> Handle {
     if SHARED.running.swap(true, Ordering::AcqRel) {
         return Handle;
     }
-    let settings = load(&ctx.dir).unwrap_or_default();
+    let settings = read_json::<Settings>(&ctx.dir.join(SETTINGS)).and_then(|s| s.validated().ok()).unwrap_or_default();
     apply_shared(&settings);
     let spawned = std::thread::Builder::new().name("kiln-headroom".into()).spawn(move || run(ctx, settings));
     if let Err(e) = spawned {
@@ -192,42 +190,29 @@ pub fn start(ctx: Ctx) -> Handle {
     Handle
 }
 
-fn load(dir: &std::path::Path) -> Option<Settings> {
-    let raw = std::fs::read(dir.join(SETTINGS)).ok()?;
-    serde_json::from_slice::<Settings>(&raw).ok().and_then(|s| s.validated().ok())
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 fn apply_shared(s: &Settings) {
     SHARED.enabled.store(s.enabled, Ordering::Release);
-    *SHARED.hold_ms.lock() = i64::from(s.admit_hold_secs) * 1000;
     *SHARED.max_sessions.lock() = s.max_sessions.map(|n| n as usize);
-    SHARED.admit.lock().allowed = s.window.start as usize;
 }
 
 /// The targets probed: the settings' own, and kiln's when `automatic`.
 fn targets(s: &Settings, ctx: &Ctx) -> Vec<settings::Target> {
     let mut out = Vec::new();
     if s.automatic {
-        out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, goal_ms: 1000 });
+        out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None });
         if ctx.server_url.starts_with("http://") {
-            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{}/healthz", ctx.server_url.trim_end_matches('/')) }, goal_ms: 2000 });
+            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{}/healthz", ctx.server_url.trim_end_matches('/')) }, tolerance_ms: None });
         }
     }
     out.extend(s.targets.iter().cloned());
     out
 }
 
-/// One target, as the status shows it.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct TargetStatus {
-    pub name: String,
-    pub probe: settings::Probe,
-    pub goal_ms: u32,
-    #[serde(flatten)]
-    pub verdict: probes::Verdict,
-}
-
-/// One group of work, as the status shows it (heavy or paced ones only).
+/// One group of work, as the status shows it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GroupStatus {
     pub label: String,
@@ -235,9 +220,20 @@ pub struct GroupStatus {
     pub session: Option<String>,
     pub cpu_pct: u32,
     pub write_mb_s: u32,
-    pub heavy: bool,
-    /// Its share of time, in percent (100: not paced).
+    pub mem_mb: u64,
+    /// Its share of time, in percent (100: full speed).
     pub share: u8,
+    pub why: String,
+}
+
+/// A session held, as the status shows it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct HeldStatus {
+    pub session: String,
+    pub since_ms: i64,
+    pub why: String,
+    /// When it's expected to start (ms since the epoch), when known.
+    pub at_ms: Option<i64>,
 }
 
 /// What a runner reports (`AgentMsg::HeadroomStatus`).
@@ -246,41 +242,87 @@ pub struct Status {
     /// The fingerprint of the settings in use ([`Settings::fingerprint`]).
     pub settings: String,
     pub enabled: bool,
-    /// How this machine paces work: `cgroup`, or `none` (work past the window only waits).
+    /// How this machine paces work: `cgroup`, or `none` (work only waits to start).
     pub pacing: &'static str,
-    pub window: f64,
-    pub allowed: usize,
-    pub healthy: bool,
-    pub targets: Vec<TargetStatus>,
+    #[serde(flatten)]
+    pub engine: kiln_ci::headroom::Status,
+    pub probe_every_ms: BTreeMap<String, f64>,
     pub groups: Vec<GroupStatus>,
-    /// Sessions whose new work waits for room.
-    pub held: usize,
-    /// Sessions let in whose work hasn't shown yet.
-    pub starting: usize,
+    pub held: Vec<HeldStatus>,
+    /// What changed last, and why.
+    pub events: Vec<String>,
+}
+
+/// The machine's write rate from its disks' own counters (/proc/diskstats: sectors written, of
+/// whole physical devices), between two reads.
+#[derive(Default)]
+struct Disks {
+    last: Option<(std::time::Instant, u64)>,
+}
+
+impl Disks {
+    fn sectors_written() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/diskstats").ok()?;
+        let mut total = 0u64;
+        let mut any = false;
+        for line in text.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (Some(name), Some(sectors)) = (f.get(2), f.get(9).and_then(|v| v.parse::<u64>().ok())) else { continue };
+            // Whole physical devices only: a partition or a mapper would count the same writes twice.
+            if Path::new("/sys/block").join(name).join("device").exists() {
+                total += sectors;
+                any = true;
+            }
+        }
+        any.then_some(total)
+    }
+
+    /// Bytes written a second since the last read (none on the first, or where the system can't say).
+    fn rate(&mut self) -> Option<f64> {
+        let now = std::time::Instant::now();
+        let s = Self::sectors_written()?;
+        let r = self.last.map(|(at, s0)| s.saturating_sub(s0) as f64 * 512.0 / now.duration_since(at).as_secs_f64().max(f64::MIN_POSITIVE));
+        self.last = Some((now, s));
+        r
+    }
+}
+
+/// Memory the machine has free for new work (MemAvailable), in bytes.
+fn mem_free() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()))
+        .map_or(0.0, |kib| kib * 1024.0)
 }
 
 fn run(ctx: Ctx, mut settings: Settings) {
     let _ = std::fs::create_dir_all(&ctx.dir);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(kick);
-    let mut probes = probes::Probes::start(targets(&settings, &ctx), Arc::clone(&wake));
+    let specs = |s: &Settings| -> Vec<probes::Spec> { targets(s, &ctx).into_iter().map(|t| probes::Spec { tolerance: Duration::from_millis(u64::from(t.tolerance_ms())), name: t.name, probe: t.probe }).collect() };
+    let engine_targets = |s: &Settings| -> Vec<Target> { targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, served: t.probe.served(), name: t.name }).collect() };
+    let learned_path = ctx.dir.join(LEARNED);
+    let learned: Learned = read_json(&learned_path).unwrap_or_default();
+    let mut engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
+    let mut probes = probes::Probes::start(specs(&settings), Arc::clone(&wake));
     let pacer = pace::Pacer::start(&ctx.dir);
-    let mut control = window::Control::new(&settings);
     let mut meter = pace::Meter::default();
+    let mut disks = Disks::default();
     let mut groups: Vec<pace::Group> = Vec::new();
     let mut loads: Vec<pace::Load> = Vec::new();
-    let mut shares: HashMap<PathBuf, u8> = HashMap::new();
-    let mut measured: Option<Instant> = None;
-    let base = Instant::now();
-    let mut last_status: Option<Status> = None;
-    let mut reported = Instant::now();
-    let stop = AtomicBool::new(false);
-    tracing::info!(pacing = pace::how(), targets = probes.targets.len(), window = control.window(), "headroom: watching this machine");
-    while !stop.load(Ordering::Relaxed) {
+    let mut measured_at: Option<std::time::Instant> = None;
+    let mut delivered: Option<f64> = None;
+    let mut shares: HashMap<PathBuf, f64> = HashMap::new();
+    let mut events: Vec<String> = Vec::new();
+    let mut last_status: Option<String> = None;
+    tracing::info!(pacing = pace::how(), targets = probes.specs.len(), "headroom: watching this machine");
+    loop {
         {
             let (lock, cv) = &SHARED.kick;
             let mut k = lock.lock();
             if !*k {
-                cv.wait_for(&mut k, BEAT);
+                // Woken by a probe's answer, a held session, new settings, or by the soonest a probe
+                // may be out long enough to matter.
+                cv.wait_for(&mut k, Duration::from_micros(probes.fastest_us()));
             }
             *k = false;
         }
@@ -293,89 +335,130 @@ fn run(ctx: Ctx, mut settings: Settings) {
             tracing::info!(enabled = new.enabled, fingerprint = %new.fingerprint(), "headroom: settings from the server");
             settings = new;
             apply_shared(&settings);
-            probes = probes::Probes::start(targets(&settings, &ctx), Arc::clone(&wake));
-            control.reset(&settings);
+            probes = probes::Probes::start(specs(&settings), Arc::clone(&wake));
+            let learned = std::mem::take(&mut engine.learned);
+            engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
             SHARED.room.notify(usize::MAX);
         }
-        let now = base.elapsed().as_millis() as u64;
-        let verdicts = probes.verdicts();
-        let healthy = !verdicts.iter().any(|v| matches!(v, probes::Verdict::Missed { .. }));
-        let before = control.window();
-        if control.observe(&settings, now, healthy) && control.window() < before {
-            tracing::info!(window = control.window(), missed = ?probes.targets.iter().zip(&verdicts).filter(|(_, v)| matches!(v, probes::Verdict::Missed { .. })).map(|(t, _)| t.name.as_str()).collect::<Vec<_>>(), "headroom: a target missed its goal; the window halves");
-        }
-        if measured.is_none_or(|m| m.elapsed() >= MEASURE) {
-            measured = Some(Instant::now());
+        // The machine and its groups, measured as often as the fastest probe: the time scale the
+        // engine decides at.
+        if measured_at.is_none_or(|m| m.elapsed() >= Duration::from_micros(probes.fastest_us())) {
+            measured_at = Some(std::time::Instant::now());
             groups = pace::groups(settings.escapes);
             loads = meter.load(&groups);
+            delivered = disks.rate();
         }
-        let heavy_of = |l: &pace::Load| l.cpu_pct >= f64::from(settings.heavy.cpu_pct) || l.write_rate >= f64::from(settings.heavy.write_mb_s) * 1e6;
-        let seen: Vec<window::Seen> = groups
+        let (answers, inflight) = probes.drain();
+        let now = now_us();
+        let (waiting, ended) = {
+            let mut a = SHARED.admit.lock();
+            a.granted.retain(|_, until| *until > now);
+            let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: Class::Agent, since_us: *since }).collect();
+            (waiting, std::mem::take(&mut a.ended))
+        };
+        let running: Vec<Group> = groups
             .iter()
             .zip(&loads)
-            .map(|(g, l)| window::Seen { class: Class::Agent, heavy: heavy_of(l), write_rate: l.write_rate, duty: shares.get(&g.dir).copied().unwrap_or(100) })
+            .map(|(g, l)| Group {
+                id: g.dir.display().to_string(),
+                key: g.session.clone().unwrap_or_else(|| g.label.clone()),
+                class: Class::Agent,
+                protected: false,
+                write_bps: l.write_rate,
+                cpu_cores: l.cpu_pct / 100.0,
+                mem_bytes: l.mem_bytes,
+                share: shares.get(&g.dir).copied().unwrap_or(1.0),
+            })
             .collect();
-        let planned = window::plan(&settings, &control, now, &seen);
-        let before = shares.len();
-        shares = if SHARED.standby.load(Ordering::Acquire) { HashMap::new() } else { groups.iter().zip(&planned).filter(|(_, d)| **d < 100).map(|(g, d)| (g.dir.clone(), *d)).collect() };
-        if shares.len() != before {
-            tracing::info!(paced = shares.len(), window = control.window(), "headroom: work paced");
+        let ended_ids: Vec<String> = groups.iter().filter(|g| g.session.as_ref().is_some_and(|s| ended.contains(s))).map(|g| g.dir.display().to_string()).collect();
+        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended: ended_ids };
+        let plan = engine.step(&obs);
+        for (name, every) in &plan.probe_every_us {
+            probes.set_interval(name, *every);
         }
-        pacer.set(shares.clone(), Duration::from_millis(u64::from(settings.pacing.period_ms)));
-        // Admission: what's heavy now, and who holds a place.
-        let wall = crate::util::now_ms();
-        let (room, held, starting) = {
-            let mut a = SHARED.admit.lock();
-            a.allowed = control.allowed();
-            a.heavy = groups.iter().zip(&seen).filter(|(_, s)| s.heavy).filter_map(|(g, _)| g.session.clone()).collect();
-            a.heavy_others = groups.iter().zip(&seen).filter(|(g, s)| s.heavy && g.session.is_none()).count();
-            let heavy = a.heavy.clone();
-            a.reserved.retain(|sess, until| *until > wall && !heavy.contains(sess));
-            let used = a.heavy.len() + a.heavy_others + a.reserved.len();
-            let room = !a.waiting.is_empty() && used < a.allowed && healthy;
-            // Held sessions are asked again on the next room; ones gone quiet are let go.
-            a.waiting.retain(|_, since| wall - *since < 600_000);
-            (room, a.waiting.len(), a.reserved.len())
+        // Pacing: the engine's shares, unless off or another process of this machine paces.
+        let pacing = settings.enabled && !SHARED.standby.load(Ordering::Acquire);
+        shares = if pacing {
+            plan.shares.iter().filter(|p| p.share < 1.0).filter_map(|p| groups.iter().find(|g| g.dir.display().to_string() == p.id).map(|g| (g.dir.clone(), p.share))).collect()
+        } else {
+            HashMap::new()
         };
-        if room {
+        pacer.set(shares.iter().map(|(d, s)| (d.clone(), (s * 100.0).floor().clamp(0.0, 99.0) as u8)).collect(), Duration::from_micros(probes.fastest_us()));
+        // Admission: who the engine let start.
+        let started: Vec<(String, u64)> = plan
+            .decisions
+            .iter()
+            .filter(|d| d.start)
+            .map(|d| {
+                let until = engine.learned.demand.demand(&d.id).map_or(u64::MAX, |x| now.saturating_add(x.duration_us as u64));
+                (d.id.clone(), until)
+            })
+            .collect();
+        if !started.is_empty() {
+            let mut a = SHARED.admit.lock();
+            for (s, until) in &started {
+                a.waiting.remove(s);
+                a.granted.insert(s.clone(), *until);
+            }
+            drop(a);
             SHARED.room.notify(usize::MAX);
         }
+        if !plan.events.is_empty() {
+            for e in &plan.events {
+                tracing::info!(event = %e, "headroom");
+            }
+            // The status says what changed last; the server keeps the history.
+            events.clone_from(&plan.events);
+            // What was learned is kept whenever something changed what it decides.
+            if let Err(e) = crate::util::write_secret_unsynced(&learned_path, &serde_json::to_vec(&engine.learned).unwrap_or_default(), 0o644) {
+                tracing::warn!(error = %e, "headroom: couldn't keep what it learned");
+            }
+        }
+        let held: Vec<HeldStatus> = {
+            let a = SHARED.admit.lock();
+            plan.decisions
+                .iter()
+                .filter(|d| !d.start)
+                .map(|d| HeldStatus {
+                    session: d.id.clone(),
+                    since_ms: a.waiting.get(&d.id).map_or(0, |s| i64::try_from(s / 1000).unwrap_or(0)),
+                    why: d.why.clone(),
+                    at_ms: d.at_us.map(|t| i64::try_from(t / 1000).unwrap_or(0)),
+                })
+                .collect()
+        };
         let status = Status {
             settings: settings.fingerprint(),
             enabled: settings.enabled,
             pacing: pace::how(),
-            window: (control.window() * 10.0).round() / 10.0,
-            allowed: control.allowed(),
-            healthy,
-            targets: probes.targets.iter().zip(&verdicts).map(|(t, v)| TargetStatus { name: t.name.clone(), probe: t.probe.clone(), goal_ms: t.goal_ms, verdict: v.clone() }).collect(),
+            probe_every_ms: plan.probe_every_us.iter().map(|(k, v)| (k.clone(), (v / 1e3).round())).collect(),
             groups: groups
                 .iter()
                 .zip(&loads)
-                .zip(&seen)
-                .filter(|((g, _), s)| s.heavy || shares.contains_key(&g.dir))
-                .map(|((g, l), s)| GroupStatus {
+                .filter(|(g, l)| l.write_rate > 0.0 || shares.contains_key(&g.dir))
+                .map(|(g, l)| GroupStatus {
                     label: g.label.clone(),
                     session: g.session.clone(),
                     cpu_pct: l.cpu_pct.round() as u32,
                     write_mb_s: (l.write_rate / 1e6).round() as u32,
-                    heavy: s.heavy,
-                    share: shares.get(&g.dir).copied().unwrap_or(100),
+                    mem_mb: (l.mem_bytes / 1e6).round() as u64,
+                    share: shares.get(&g.dir).map_or(100, |s| (s * 100.0).floor() as u8),
+                    why: plan.shares.iter().find(|p| p.id == g.dir.display().to_string()).map(|p| p.why.clone()).unwrap_or_default(),
                 })
                 .collect(),
             held,
-            starting,
+            events: events.clone(),
+            engine: plan.status,
         };
-        // Told at once when what it decides changes; latencies at most once a second.
-        let decided = |s: &Status| (s.enabled, s.allowed, s.healthy, s.held, s.groups.iter().map(|g| (g.label.clone(), g.share)).collect::<Vec<_>>());
-        let new_decision = last_status.as_ref().is_none_or(|l| decided(l) != decided(&status));
-        if new_decision || (reported.elapsed() >= Duration::from_secs(1) && last_status.as_ref() != Some(&status)) {
-            reported = Instant::now();
-            *SHARED.latest.lock() = serde_json::to_string(&status).ok();
+        // Told when what it says changes.
+        if let Ok(json) = serde_json::to_string(&status)
+            && last_status.as_deref() != Some(json.as_str())
+        {
+            *SHARED.latest.lock() = Some(json.clone());
             SHARED.changed.notify();
-            last_status = Some(status);
+            last_status = Some(json);
         }
     }
-    drop(pacer);
 }
 
 #[cfg(test)]
@@ -384,7 +467,6 @@ mod tests {
 
     #[test]
     fn without_a_runner_every_session_is_let_in() {
-        // No `start` in this test process: as before headroom.
         if !SHARED.running.load(Ordering::Acquire) {
             assert!(admit("s1", Class::Agent));
         }
@@ -396,7 +478,19 @@ mod tests {
         let t = targets(&Settings::default(), &ctx);
         assert_eq!(t.len(), 2);
         assert_eq!(t.get(1).map(|t| &t.probe), Some(&settings::Probe::Http { url: "http://192.168.49.2:30070/healthz".into() }));
+        assert!(t.iter().all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
         let off = Settings { automatic: false, ..Settings::default() };
         assert!(targets(&off, &ctx).is_empty());
+    }
+
+    #[test]
+    fn the_disks_counters_read_on_linux() {
+        if cfg!(target_os = "linux") && Path::new("/proc/diskstats").exists() {
+            let mut d = Disks::default();
+            assert_eq!(d.rate(), None);
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(d.rate().is_some_and(|r| r >= 0.0));
+            assert!(mem_free() > 0.0);
+        }
     }
 }

@@ -1,9 +1,10 @@
 //! How fast running work may go (docs/headroom.md, "Pacing"): when what kiln's running work wants
 //! to write is more than the budget, the budget is shared out class by class, highest first, and
 //! within a class max-min fairly (water-filling): every group gets what it wants up to one level,
-//! the level that spends what's left. A group's share of time is what it gets over what it wants.
-//! A person's work and a protected target are never slowed, and work that doesn't write is never
-//! touched: only the resource that's short is rationed.
+//! the level that spends what's left. A group's share of time is what it gets over what it wants,
+//! in each resource that has a budget (writes, CPU), the smaller of the two. A person's work and a
+//! protected target are never slowed, and work that doesn't use a short resource isn't slowed for
+//! it: only what's short is rationed.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,9 @@ pub struct Running {
     pub class: Class,
     /// What it writes a second when not slowed.
     pub demand_bps: f64,
+    /// The CPU cores it uses when not slowed.
+    #[serde(default)]
+    pub demand_cpu: f64,
     /// A protected target's own processes (never slowed).
     pub protected: bool,
 }
@@ -49,21 +53,18 @@ fn level(demands: &[f64], left: f64) -> f64 {
     f64::INFINITY
 }
 
-/// Each running group's share under `budget` (none: no limit).
-pub fn plan(budget: Option<f64>, groups: &[Running]) -> Vec<Pace> {
-    let wanted: f64 = groups.iter().map(|g| g.demand_bps.max(0.0)).sum();
-    let Some(budget) = budget.filter(|b| wanted > *b) else {
-        let why = if budget.is_some() { "all of kiln's work fits the write budget" } else { "no write budget: nothing has been in trouble" };
-        return groups.iter().map(|g| Pace { id: g.id.clone(), share: 1.0, why: why.into() }).collect();
-    };
-    let exempt = |g: &Running| g.protected || g.class == Class::Person || g.demand_bps <= 0.0;
-    let mut left = budget - groups.iter().filter(|g| exempt(g)).map(|g| g.demand_bps.max(0.0)).sum::<f64>();
+/// One resource's shares: `budget` water-filled class by class over `demand` (none: no limit).
+fn fill(budget: Option<f64>, groups: &[Running], demand: impl Fn(&Running) -> f64) -> Vec<f64> {
+    let wanted: f64 = groups.iter().map(|g| demand(g).max(0.0)).sum();
+    let Some(budget) = budget.filter(|b| wanted > *b) else { return vec![1.0; groups.len()] };
+    let exempt = |g: &Running| g.protected || g.class == Class::Person || demand(g) <= 0.0;
+    let mut left = budget - groups.iter().filter(|g| exempt(g)).map(|g| demand(g).max(0.0)).sum::<f64>();
     let mut levels: Vec<(Class, f64)> = Vec::new();
     let mut classes: Vec<Class> = groups.iter().filter(|g| !exempt(g)).map(|g| g.class).collect();
     classes.sort();
     classes.dedup();
     for c in classes.into_iter().rev() {
-        let demands: Vec<f64> = groups.iter().filter(|g| !exempt(g) && g.class == c).map(|g| g.demand_bps).collect();
+        let demands: Vec<f64> = groups.iter().filter(|g| !exempt(g) && g.class == c).map(&demand).collect();
         let l = level(&demands, left);
         left -= demands.iter().map(|d| d.min(l)).sum::<f64>();
         levels.push((c, l));
@@ -71,24 +72,37 @@ pub fn plan(budget: Option<f64>, groups: &[Running]) -> Vec<Pace> {
     groups
         .iter()
         .map(|g| {
-            if g.protected {
-                return Pace { id: g.id.clone(), share: 1.0, why: "a protected target's: never slowed".into() };
-            }
-            if g.class == Class::Person {
-                return Pace { id: g.id.clone(), share: 1.0, why: "a person's: never slowed".into() };
-            }
-            if g.demand_bps <= 0.0 {
-                return Pace { id: g.id.clone(), share: 1.0, why: "writes nothing: the disk is what's short".into() };
+            if exempt(g) {
+                return 1.0;
             }
             let l = levels.iter().find(|(c, _)| *c == g.class).map_or(0.0, |(_, l)| *l);
-            let got = g.demand_bps.min(l);
-            let share = (got / g.demand_bps).clamp(0.0, 1.0);
-            let why = if share >= 1.0 {
-                format!("writes {}/s, within its class's fair level", mb(g.demand_bps))
+            (demand(g).min(l) / demand(g)).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// Each running group's share under the write budget and the CPU budget (none: no limit): the
+/// smaller of what each resource leaves it.
+pub fn plan(write_budget: Option<f64>, cpu_budget: Option<f64>, groups: &[Running]) -> Vec<Pace> {
+    let w = fill(write_budget, groups, |g| g.demand_bps);
+    let c = fill(cpu_budget, groups, |g| g.demand_cpu);
+    groups
+        .iter()
+        .zip(w.iter().zip(&c))
+        .map(|(g, (sw, sc))| {
+            let share = sw.min(*sc);
+            let why = if g.protected {
+                "a protected target's: never slowed".to_owned()
+            } else if g.class == Class::Person {
+                "a person's: never slowed".to_owned()
+            } else if share >= 1.0 {
+                "within its fair part of every budget".to_owned()
             } else if share <= 0.0 {
-                format!("stopped: higher classes take all {}/s of the write budget", mb(budget))
+                "stopped: higher classes take the whole budget it needs".to_owned()
+            } else if sw <= sc {
+                format!("slowed to {:.0}%: wants {}/s of writes, its fair part of the {}/s budget is {}/s", share * 100.0, mb(g.demand_bps), mb(write_budget.unwrap_or_default()), mb(g.demand_bps * share))
             } else {
-                format!("slowed to {:.0}%: wants {}/s, its fair part of the {}/s budget is {}/s", share * 100.0, mb(g.demand_bps), mb(budget), mb(got))
+                format!("slowed to {:.0}%: wants {:.1} CPU cores, its fair part of the {:.1}-core budget is {:.1}", share * 100.0, g.demand_cpu, cpu_budget.unwrap_or_default(), g.demand_cpu * share)
             };
             Pace { id: g.id.clone(), share, why }
         })
@@ -101,13 +115,13 @@ mod tests {
     use proptest::prelude::*;
 
     fn g(id: &str, class: Class, d: f64) -> Running {
-        Running { id: id.into(), class, demand_bps: d, protected: false }
+        Running { id: id.into(), class, demand_bps: d, demand_cpu: 0.0, protected: false }
     }
 
     #[test]
     fn the_lowest_class_is_slowed_first_and_people_and_readers_never() {
         let groups = [g("person", Class::Person, 500e6), g("a1", Class::Agent, 100e6), g("a2", Class::Agent, 400e6), g("bench", Class::Background, 300e6), g("reader", Class::Agent, 0.0)];
-        let p = plan(Some(800e6), &groups);
+        let p = plan(Some(800e6), None, &groups);
         let share = |id: &str| p.iter().find(|x| x.id == id).map_or(-1.0, |x| x.share);
         assert_eq!(share("person"), 1.0);
         assert_eq!(share("reader"), 1.0);
@@ -120,8 +134,24 @@ mod tests {
     #[test]
     fn a_budget_of_zero_stops_every_writer_and_no_budget_slows_nothing() {
         let groups = [g("a", Class::Agent, 1e6), g("b", Class::Background, 1e6)];
-        assert!(plan(Some(0.0), &groups).iter().all(|p| p.share == 0.0));
-        assert!(plan(None, &groups).iter().all(|p| p.share == 1.0));
+        assert!(plan(Some(0.0), None, &groups).iter().all(|p| p.share == 0.0));
+        assert!(plan(None, None, &groups).iter().all(|p| p.share == 1.0));
+    }
+
+    #[test]
+    fn a_cpu_budget_slows_only_what_uses_cpu_and_the_smaller_share_wins() {
+        let mut busy = g("compile", Class::Agent, 0.0);
+        busy.demand_cpu = 16.0;
+        let mut linker = g("link", Class::Agent, 400e6);
+        linker.demand_cpu = 1.0;
+        let reader = g("idle", Class::Agent, 0.0);
+        let p = plan(Some(200e6), Some(8.0), &[busy, linker, reader]);
+        let share = |id: &str| p.iter().find(|x| x.id == id).map_or(-1.0, |x| x.share);
+        // CPU: 8 cores over 16 + 1: the linker's 1 fits, the compile gets 7 of 16.
+        assert!((share("compile") - 7.0 / 16.0).abs() < 1e-9);
+        // Writes: 200 of 400 MB/s; its CPU share is whole, the smaller is the write share.
+        assert!((share("link") - 0.5).abs() < 1e-9);
+        assert_eq!(share("idle"), 1.0);
     }
 
     proptest! {
@@ -132,9 +162,9 @@ mod tests {
         ) {
             let classes = [Class::Background, Class::Agent, Class::Person];
             let gs: Vec<Running> = groups.iter().enumerate().map(|(i, (c, d, p))| Running {
-                id: format!("g{i}"), class: classes.get(usize::from(*c)).copied().unwrap_or(Class::Agent), demand_bps: *d, protected: *p,
+                id: format!("g{i}"), class: classes.get(usize::from(*c)).copied().unwrap_or(Class::Agent), demand_bps: *d, demand_cpu: 0.0, protected: *p,
             }).collect();
-            let p = plan(Some(budget), &gs);
+            let p = plan(Some(budget), None, &gs);
             let got = |r: &Running| p.iter().find(|x| x.id == r.id).map_or(0.0, |x| x.share * r.demand_bps);
             let exempt = |r: &Running| r.protected || r.class == Class::Person || r.demand_bps <= 0.0;
             let exempt_sum: f64 = gs.iter().filter(|r| exempt(r)).map(|r| r.demand_bps).sum();

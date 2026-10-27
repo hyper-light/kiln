@@ -1,8 +1,8 @@
 //! Who starts next (docs/headroom.md, "Admission"): work waiting to start (a session's next turn,
 //! a heavy command) has a class, how long it has waited, and a demand learned from its own past
-//! (writes a second, peak memory, how long it runs) with the mean over everything as the prior.
-//! It starts when that demand fits what's left: the write budget less what runs and what is
-//! promised, and the memory free less what is promised. Order: class, then highest response
+//! (writes a second, CPU cores, peak memory, how long it runs) with the mean over everything as the
+//! prior. It starts when that demand fits what's left: the write and CPU budgets less what runs and
+//! what is promised, and the memory free less what is promised. Order: class, then highest response
 //! ratio ((wait + run time) / run time), so short work goes first and long work never starves.
 //! Work behind one that doesn't fit starts only if it delays no waiting work (conservative
 //! backfilling). With nothing learned at all, one unknown at a time starts, until its demand shows.
@@ -29,6 +29,8 @@ pub struct Demand {
     pub write_bps: f64,
     pub mem_bytes: f64,
     pub duration_us: f64,
+    #[serde(default)]
+    pub cpu_cores: f64,
 }
 
 /// What's been seen of one kind of work (a session, a command's shape): sums for exact means.
@@ -38,6 +40,8 @@ pub struct Seen {
     pub write_bps: f64,
     pub mem_bytes: f64,
     pub duration_us: f64,
+    #[serde(default)]
+    pub cpu_cores: f64,
 }
 
 /// Demands learned per kind of work.
@@ -55,6 +59,7 @@ impl Learned {
             s.write_bps += d.write_bps;
             s.mem_bytes += d.mem_bytes;
             s.duration_us += d.duration_us;
+            s.cpu_cores += d.cpu_cores;
         }
     }
 
@@ -63,7 +68,7 @@ impl Learned {
     pub fn demand(&self, key: &str) -> Option<Demand> {
         let s = self.by_key.get(key).filter(|s| s.runs > 0).copied().or_else(|| (self.all.runs > 0).then_some(self.all))?;
         let n = s.runs as f64;
-        Some(Demand { write_bps: s.write_bps / n, mem_bytes: s.mem_bytes / n, duration_us: s.duration_us / n })
+        Some(Demand { write_bps: s.write_bps / n, mem_bytes: s.mem_bytes / n, duration_us: s.duration_us / n, cpu_cores: s.cpu_cores / n })
     }
 }
 
@@ -92,6 +97,8 @@ pub struct Free {
     pub at_us: u64,
     pub write_bps: f64,
     pub mem_bytes: f64,
+    #[serde(default)]
+    pub cpu_cores: f64,
 }
 
 /// What there is to share now, and when more frees.
@@ -104,6 +111,11 @@ pub struct Room {
     pub mem_free: f64,
     /// What running work gives back as it's expected to end.
     pub frees: Vec<Free>,
+    /// The CPU budget in cores (none: no limit), and the cores kiln's running work wants.
+    #[serde(default)]
+    pub cpu_budget: Option<f64>,
+    #[serde(default)]
+    pub cpu_used: f64,
 }
 
 /// A decision about one waiting piece of work.
@@ -131,21 +143,23 @@ fn mb(b: f64) -> String {
 
 /// What's free from each time on: a step function, its steps by time.
 struct Profile {
-    steps: Vec<(u64, f64, f64)>,
+    /// (from, writes, memory, cores) free.
+    steps: Vec<(u64, f64, f64, f64)>,
 }
 
 impl Profile {
-    fn new(now_us: u64, write: f64, mem: f64, frees: &[Free]) -> Self {
+    fn new(now_us: u64, write: f64, mem: f64, cpu: f64, frees: &[Free]) -> Self {
         let mut frees: Vec<Free> = frees.iter().copied().filter(|f| f.at_us > now_us).collect();
         frees.sort_by_key(|f| f.at_us);
-        let mut steps = vec![(now_us, write, mem)];
-        let (mut w, mut m) = (write, mem);
+        let mut steps = vec![(now_us, write, mem, cpu)];
+        let (mut w, mut m, mut c) = (write, mem, cpu);
         for f in frees {
             w += f.write_bps;
             m += f.mem_bytes;
+            c += f.cpu_cores;
             match steps.last_mut() {
-                Some(last) if last.0 == f.at_us => *last = (f.at_us, w, m),
-                _ => steps.push((f.at_us, w, m)),
+                Some(last) if last.0 == f.at_us => *last = (f.at_us, w, m, c),
+                _ => steps.push((f.at_us, w, m, c)),
             }
         }
         Self { steps }
@@ -157,16 +171,16 @@ impl Profile {
             let end = run.map(|r| start.saturating_add(r));
             // The step in force at `start`, and every one that begins before `end`.
             let at = self.steps.iter().rposition(|s| s.0 <= start).unwrap_or_default();
-            self.steps.iter().skip(at).take_while(|s| s.0 == start || s.0 > start && end.is_none_or(|e| s.0 < e)).all(|s| d.write_bps <= s.1 + 1e-9 && d.mem_bytes <= s.2 + 1e-9)
+            self.steps.iter().skip(at).take_while(|s| s.0 == start || s.0 > start && end.is_none_or(|e| s.0 < e)).all(|s| d.write_bps <= s.1 + 1e-9 && d.mem_bytes <= s.2 + 1e-9 && d.cpu_cores <= s.3 + 1e-9)
         })
     }
 
     fn split(&mut self, t: u64) {
         if let Some(i) = self.steps.iter().rposition(|s| s.0 <= t)
             && self.steps.get(i).is_some_and(|s| s.0 != t)
-            && let Some(&(_, w, m)) = self.steps.get(i)
+            && let Some(&(_, w, m, c)) = self.steps.get(i)
         {
-            self.steps.insert(i + 1, (t, w, m));
+            self.steps.insert(i + 1, (t, w, m, c));
         }
     }
 
@@ -180,6 +194,7 @@ impl Profile {
         for s in self.steps.iter_mut().filter(|s| s.0 >= start && end.is_none_or(|e| s.0 < e)) {
             s.1 -= d.write_bps;
             s.2 -= d.mem_bytes;
+            s.3 -= d.cpu_cores;
         }
     }
 }
@@ -189,8 +204,10 @@ impl Profile {
 pub fn decide(now_us: u64, room: &Room, promised: &[Promise], waiting: &[Waiting], learned: &Learned) -> Vec<Decision> {
     let held: f64 = promised.iter().filter_map(|p| p.demand).map(|d| d.write_bps).sum();
     let held_mem: f64 = promised.iter().filter_map(|p| p.demand).map(|d| d.mem_bytes).sum();
+    let held_cpu: f64 = promised.iter().filter_map(|p| p.demand).map(|d| d.cpu_cores).sum();
     let write_now = room.write_budget.map_or(f64::INFINITY, |b| b - room.write_used - held);
-    let mut profile = Profile::new(now_us, write_now, room.mem_free - held_mem, &room.frees);
+    let cpu_now = room.cpu_budget.map_or(f64::INFINITY, |b| b - room.cpu_used - held_cpu);
+    let mut profile = Profile::new(now_us, write_now, room.mem_free - held_mem, cpu_now, &room.frees);
     // With nothing learned anywhere, one unknown at a time.
     let mut unknown_out = promised.iter().any(|p| p.demand.is_none());
 
@@ -222,6 +239,8 @@ pub fn decide(now_us: u64, room: &Room, promised: &[Promise], waiting: &[Waiting
                     "fits now without delaying any work waiting ahead of it".to_owned()
                 } else if write_now.is_finite() && d.write_bps > write_now {
                     format!("needs {}/s of writes, {}/s left now; expected to start in {:.0} s", mb(d.write_bps), mb(write_now.max(0.0)), at.saturating_sub(now_us) as f64 / 1e6)
+                } else if cpu_now.is_finite() && d.cpu_cores > cpu_now {
+                    format!("needs {:.1} CPU cores, {:.1} left now; expected to start in {:.0} s", d.cpu_cores, cpu_now.max(0.0), at.saturating_sub(now_us) as f64 / 1e6)
                 } else {
                     format!("waits for room held by work ahead of it; expected to start in {:.0} s", at.saturating_sub(now_us) as f64 / 1e6)
                 };
@@ -231,7 +250,7 @@ pub fn decide(now_us: u64, room: &Room, promised: &[Promise], waiting: &[Waiting
                 id: w.id.clone(),
                 start: false,
                 at_us: None,
-                why: format!("needs more than this machine gives it: {}/s of writes, {} of memory", mb(d.write_bps), mb(d.mem_bytes)),
+                why: format!("needs more than this machine gives it: {}/s of writes, {:.1} CPU cores, {} of memory", mb(d.write_bps), d.cpu_cores, mb(d.mem_bytes)),
             }),
         }
     }
@@ -250,7 +269,7 @@ mod tests {
     fn learned(items: &[(&str, f64, f64, f64)]) -> Learned {
         let mut l = Learned::default();
         for (k, wr, mem, dur) in items {
-            l.record(k, Demand { write_bps: *wr, mem_bytes: *mem, duration_us: *dur });
+            l.record(k, Demand { write_bps: *wr, mem_bytes: *mem, duration_us: *dur, cpu_cores: 0.0 });
         }
         l
     }
@@ -258,7 +277,7 @@ mod tests {
     #[test]
     fn short_work_goes_first_people_always_and_long_work_ages_past_it() {
         let l = learned(&[("short", 10e6, 1e9, 1e6), ("long", 10e6, 1e9, 1e9)]);
-        let room = Room { write_budget: Some(10e6), write_used: 0.0, mem_free: 64e9, frees: Vec::new() };
+        let room = Room { write_budget: Some(10e6), write_used: 0.0, mem_free: 64e9, frees: Vec::new(), cpu_budget: None, cpu_used: 0.0 };
         let q = [w("L", "long", Class::Agent, 0), w("S", "short", Class::Agent, 0), w("P", "short", Class::Person, 0)];
         let d = decide(1_000_000, &room, &[], &q, &l);
         let started: Vec<&str> = d.iter().filter(|d| d.start).map(|d| d.id.as_str()).collect();
@@ -273,7 +292,7 @@ mod tests {
     fn with_nothing_learned_one_starts_at_a_time_in_arrival_order() {
         let l = Learned::default();
         let q = [w("b", "k2", Class::Agent, 5), w("a", "k1", Class::Agent, 1)];
-        let open = Room { write_budget: None, write_used: 0.0, mem_free: 1e12, frees: Vec::new() };
+        let open = Room { write_budget: None, write_used: 0.0, mem_free: 1e12, frees: Vec::new(), cpu_budget: None, cpu_used: 0.0 };
         let d = decide(10, &open, &[], &q, &l);
         assert_eq!(d.iter().filter(|d| d.start).map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
         let out = [Promise { id: "a".into(), demand: None, until_us: 100 }];
@@ -292,14 +311,16 @@ mod tests {
             let mut q = Vec::new();
             for (i, (wr, m, dur, since)) in items.iter().enumerate() {
                 let key = format!("k{i}");
-                l.record(&key, Demand { write_bps: *wr, mem_bytes: *m, duration_us: *dur });
+                l.record(&key, Demand { write_bps: *wr, mem_bytes: *m, duration_us: *dur, cpu_cores: 0.0 });
                 q.push(w(&format!("w{i}"), &key, Class::Agent, *since));
             }
             let room = Room {
                 write_budget: Some(budget),
                 write_used: used,
                 mem_free: mem,
-                frees: frees.iter().map(|(at, wr, m)| Free { at_us: 2_000_000 + at, write_bps: *wr, mem_bytes: *m }).collect(),
+                frees: frees.iter().map(|(at, wr, m)| Free { at_us: 2_000_000 + at, write_bps: *wr, mem_bytes: *m, cpu_cores: 0.0 }).collect(),
+                cpu_budget: None,
+                cpu_used: 0.0,
             };
             let d = decide(2_000_000, &room, &[], &q, &l);
             let demand = |id: &str| q.iter().find(|x| x.id == id).and_then(|x| l.demand(&x.key)).unwrap_or_default();
@@ -321,7 +342,7 @@ mod tests {
             let mut q: Vec<Waiting> = Vec::new();
             for (i, dur) in durs.iter().enumerate() {
                 let key = format!("k{i}");
-                l.record(&key, Demand { write_bps: 1.0, mem_bytes: 1.0, duration_us: *dur as f64 * 1e6 });
+                l.record(&key, Demand { write_bps: 1.0, mem_bytes: 1.0, duration_us: *dur as f64 * 1e6, cpu_cores: 1.0 });
                 q.push(w(&format!("w{i}"), &key, Class::Agent, 0));
             }
             let mut running: Option<(String, u64)> = None;
@@ -334,7 +355,9 @@ mod tests {
                     write_budget: Some(1.0),
                     write_used: if running.is_some() { 1.0 } else { 0.0 },
                     mem_free: if running.is_some() { 0.0 } else { 1.0 },
-                    frees: running.iter().map(|(_, until)| Free { at_us: *until, write_bps: 1.0, mem_bytes: 1.0 }).collect(),
+                    frees: running.iter().map(|(_, until)| Free { at_us: *until, write_bps: 1.0, mem_bytes: 1.0, cpu_cores: 1.0 }).collect(),
+                    cpu_budget: Some(1.0),
+                    cpu_used: if running.is_some() { 1.0 } else { 0.0 },
                 };
                 let d = decide(t, &room, &[], &q, &l);
                 if let Some(s) = d.iter().find(|d| d.start) {

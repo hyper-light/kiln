@@ -1,6 +1,6 @@
-//! How much the machine may write (docs/headroom.md, "The knee"): a budget on the write rate kiln's
-//! own work is admitted and paced to, found by bisection between the highest rate it held calm
-//! and the lowest rate an alarm began at. With no alarm seen it doubles from the highest calm
+//! How much kiln's own work may use of a resource (docs/headroom.md, "The knee"): a budget on its
+//! write rate, or on its CPU cores, that its work is admitted and paced to, found by bisection
+//! between the highest level it held calm and the lowest level an alarm began at. With no alarm seen it doubles from the highest calm
 //! rate; a level counts as held once it stayed calm as long as a shift takes to be detected; a new
 //! regime forgets both bounds. No gain, step or window: halving the gap is all it does.
 
@@ -26,7 +26,7 @@ pub struct Knee {
 impl Knee {
     /// An alarm began with `delivered` bytes a second being written: that rate is unsafe; the
     /// budget drops to the highest rate held calm below it, or to half of it when there's none.
-    pub fn alarm(&mut self, now_us: u64, delivered: f64) -> String {
+    pub fn alarm(&mut self, now_us: u64, delivered: f64, unit: Unit) -> String {
         let r = delivered.max(0.0);
         self.unsafe_at = Some(self.unsafe_at.map_or(r, |u| u.min(r)));
         if self.safe.is_some_and(|s| s >= r) {
@@ -38,17 +38,17 @@ impl Knee {
         self.held_since = None;
         self.held_max = 0.0;
         self.cut_at = Some(now_us);
-        format!("writes cut to {}/s: trouble began at {}/s{}", mb(to), mb(r), self.safe.map(|s| format!(", {}/s held calm before", mb(s))).unwrap_or_default())
+        format!("{} cut to {}: trouble began at {}{}", unit.what(), unit.fmt(to), unit.fmt(r), self.safe.map(|s| format!(", {} held calm before", unit.fmt(s))).unwrap_or_default())
     }
 
     /// Still in trouble after a cut has had `hold_us` to show: the rate now is unsafe too, and it
     /// is cut again.
-    pub fn persisting(&mut self, now_us: u64, delivered: f64, hold_us: f64) -> Option<String> {
+    pub fn persisting(&mut self, now_us: u64, delivered: f64, hold_us: f64, unit: Unit) -> Option<String> {
         let since = self.cut_at?;
         if (now_us.saturating_sub(since) as f64) < hold_us {
             return None;
         }
-        Some(self.alarm(now_us, delivered))
+        Some(self.alarm(now_us, delivered, unit))
     }
 
     /// The alarm cleared: how long the cut took to show is noted.
@@ -62,7 +62,7 @@ impl Knee {
     /// Calm now, `delivered` bytes a second being written; `limited`: kiln's work wants more than
     /// the budget; `hold_us`: how long a level must stay calm to count as held. Says what it
     /// raised the budget to, when it did.
-    pub fn calm(&mut self, now_us: u64, delivered: f64, limited: bool, hold_us: f64) -> Option<String> {
+    pub fn calm(&mut self, now_us: u64, delivered: f64, limited: bool, hold_us: f64, unit: Unit) -> Option<String> {
         let since = *self.held_since.get_or_insert(now_us);
         self.held_max = self.held_max.max(delivered.max(0.0));
         if (now_us.saturating_sub(since) as f64) < hold_us {
@@ -89,7 +89,7 @@ impl Knee {
             return None;
         }
         self.budget = Some(to);
-        Some(format!("writes raised to {}/s: {}/s held calm{}", mb(to), mb(safe), self.unsafe_at.map(|u| format!(", trouble at {}/s", mb(u))).unwrap_or_default()))
+        Some(format!("{} raised to {}: {} held calm{}", unit.what(), unit.fmt(to), unit.fmt(safe), self.unsafe_at.map(|u| format!(", trouble at {}", unit.fmt(u))).unwrap_or_default()))
     }
 
     /// A new regime: what was learned about this machine's rates no longer holds.
@@ -99,8 +99,29 @@ impl Knee {
     }
 }
 
-fn mb(bytes_per_s: f64) -> String {
-    format!("{:.0} MB", bytes_per_s / 1e6)
+/// What a knee budgets, for what it says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    /// Bytes written a second.
+    Writes,
+    /// CPU cores.
+    Cpu,
+}
+
+impl Unit {
+    fn what(self) -> &'static str {
+        match self {
+            Unit::Writes => "kiln's writes",
+            Unit::Cpu => "kiln's CPU",
+        }
+    }
+
+    pub fn fmt(self, v: f64) -> String {
+        match self {
+            Unit::Writes => format!("{:.0} MB/s", v / 1e6),
+            Unit::Cpu => format!("{v:.1} cores"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,9 +139,9 @@ mod tests {
             let delivered = k.budget.map_or(want, |b| want.min(b));
             if delivered > knee {
                 if alarmed {
-                    k.persisting(now, delivered, 1e6);
+                    k.persisting(now, delivered, 1e6, Unit::Writes);
                 } else {
-                    k.alarm(now, delivered);
+                    k.alarm(now, delivered, Unit::Writes);
                     alarmed = true;
                 }
             } else {
@@ -128,7 +149,7 @@ mod tests {
                     k.clear(now);
                     alarmed = false;
                 }
-                k.calm(now, delivered, true, 1e6);
+                k.calm(now, delivered, true, 1e6, Unit::Writes);
             }
             want = want.max(delivered * 2.0);
         }
@@ -148,10 +169,10 @@ mod tests {
     #[test]
     fn work_under_the_budget_never_raises_it_and_a_new_regime_forgets() {
         let mut k = Knee::default();
-        k.alarm(0, 400e6);
+        k.alarm(0, 400e6, Unit::Writes);
         assert_eq!(k.budget, Some(200e6));
-        assert_eq!(k.calm(5_000_000, 50e6, false, 1e6), None);
-        assert_eq!(k.calm(7_000_000, 50e6, false, 1e6), None);
+        assert_eq!(k.calm(5_000_000, 50e6, false, 1e6, Unit::Writes), None);
+        assert_eq!(k.calm(7_000_000, 50e6, false, 1e6, Unit::Writes), None);
         assert_eq!(k.budget, Some(200e6));
         k.clear(1_500_000);
         assert_eq!(k.lag_us, Some(1.5e6));
@@ -162,8 +183,8 @@ mod tests {
     #[test]
     fn nothing_wrong_yet_means_no_limit() {
         let mut k = Knee::default();
-        assert_eq!(k.calm(10_000_000, 900e6, true, 1e6), None);
-        assert_eq!(k.calm(20_000_000, 900e6, true, 1e6), None);
+        assert_eq!(k.calm(10_000_000, 900e6, true, 1e6, Unit::Writes), None);
+        assert_eq!(k.calm(20_000_000, 900e6, true, 1e6, Unit::Writes), None);
         assert_eq!(k.budget, None);
     }
 }
