@@ -6,8 +6,10 @@
 //! |---|---|
 //! | [`sync`] | a synced repo's copies and the server's member: `sync::Copy`, `Feed`, `Index`, `take_steps`, hyper-durable replicas, the runner's and server's shells |
 //! | [`moves`] | the same, with an agent session moving between the machines: `sync::runner`'s `look_now_at`, `left_at` and `arrived`, as `harness::session` moves one |
+//! | [`sched`] | the CI engine (`kiln_ci::sched::Scheduler`) on the server, runners taking or refusing its assignments by their own admission (`agent::admits`), as the dispatcher and hub carry them |
 //! | `goals::sim` | the goal driver: `goals`' `adopt` and `step` on the seeded scheduler (beside the driver, whose private parts it runs) |
 
 pub mod fs;
 pub mod moves;
+pub mod sched;
 pub mod sync;

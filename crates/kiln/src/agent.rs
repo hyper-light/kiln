@@ -247,7 +247,7 @@ fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
 /// Whether this runner takes one more job or leg (docs/ci.md W05-R03), by the rule its dispatchers
 /// use, counting what its jobs and legs from either hold (`jobs`: each one's pooled and holds); a
 /// pool's leg runs in its executor, beside the runner's slots. Why not, when it doesn't.
-fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
+pub(crate) fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
     use kiln_ci::sched::state::{Incoming, Resources, room};
     let (mut held, mut whole, mut ordinary, mut running) = (Resources::default(), false, 0, 0);
     for (p, h) in jobs {
