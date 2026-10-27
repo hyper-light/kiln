@@ -3044,6 +3044,48 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+/* A runner's agent limit (runners.tsx AgentLimit): what holds, a number and its actions in a row,
+   then what became of it, a line that keeps its place whatever it says. */
+.runner-limit-line {
+  margin: 0;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.runner-limit-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.runner-limit-field {
+  width: 7rem;
+  min-height: 32px;
+}
+.runner-limit-field input {
+  min-height: 30px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.runner-limit-field:has([aria-invalid="true"]) {
+  border-color: #9c7178;
+}
+.runner-limit-msg {
+  min-height: 1.6em;
+  margin: 6px 0 0;
+  color: #8f939e;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.runner-limit-msg[data-tone="ok"] {
+  color: #a8c9bc;
+}
+.runner-limit-msg[data-tone="error"] {
+  color: #d1aaad;
+}
 .runner-up {
   display: grid;
   gap: 6px;

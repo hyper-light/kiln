@@ -21,6 +21,10 @@ pub struct Declared {
     /// The most `kiln/cache@v1`'s local tier keeps in `<work>/_cache` (`cache_max = "20G"`; 10G
     /// when unset, docs/ci.md W08-R09).
     pub cache_max: Option<String>,
+    /// The most agent sessions this machine has at work at once (`max_agent_sessions = 128`; from 1
+    /// to 4096, kiln's default of 64 when unset): finished, paused and ended ones don't count.
+    /// What's set for it on the server's Runners page wins over it (`crate::harness::limit`).
+    pub max_agent_sessions: Option<usize>,
 }
 
 impl Declared {
@@ -368,7 +372,12 @@ mod tests {
         std::fs::write(&path, "[server]\nhttp_addr = \"0.0.0.0:1\"\n\n[agent.facts]\nlocation = \"rack-2\"\n\n[agent.probes]\ncuda = \"nvcc --version\"\n")?;
         let d = Declared::from_file(&path);
         assert_eq!((d.facts.get("location").map(String::as_str), d.probes.get("cuda").map(String::as_str)), (Some("rack-2"), Some("nvcc --version")));
+        assert_eq!(d.max_agent_sessions, None);
         assert_eq!(Declared::from_file(&dir.path().join("none.toml")), Declared::default());
+        // Beside them, how many agent sessions it has at work at once (docs/agents.md).
+        std::fs::write(&path, "[agent]\nmax_agent_sessions = 128\n\n[agent.facts]\nlocation = \"rack-2\"\n")?;
+        let d = Declared::from_file(&path);
+        assert_eq!((d.max_agent_sessions, d.facts.get("location").map(String::as_str)), (Some(128), Some("rack-2")));
         Ok(())
     }
 
