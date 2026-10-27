@@ -4443,10 +4443,12 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
-    // Who started an agent, and the plan run it works for, are kiln's to say (`agents.start`,
-    // `plans.run`), never what's asked.
+    // Who started an agent, the plan run it works for, and whether it's that agent's subagent are
+    // kiln's to say (`agents.start`, `plans.run`, a goal stack's steps side by side), never what's
+    // asked.
     body.spec.parent = None;
     body.spec.plan_run = None;
+    body.spec.subagent = false;
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {

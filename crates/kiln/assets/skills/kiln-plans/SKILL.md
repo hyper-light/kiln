@@ -204,8 +204,9 @@ acceptance criteria and tests, a goal each, before the step itself is checked.
 
 **Steps side by side on your stack** (a plan whose steps say what they wait for, run as goals or
 planned from your goal): where more than one step can be under way at once, kiln starts a subagent
-of yours for each ready step (your child, named "Step 3: …", held to the step on its own stack), as
-many at once as your Subagents setting lets, and gives you the steps there's no room for. Don't do
+of yours for each ready step (named "Step 3: …", held to the step on its own stack; in your chat,
+on your machine, in your folder, with your harness and settings), as many at once as your
+Subagents setting lets, and gives you the steps there's no room for. Don't do
 a step a subagent has (`goals_get` shows its `subagent`): kiln marks it met when its subagent meets
 it, or gives it back to you if it doesn't. When you're told to run steps side by side yourself (one
 message, or a step a turn), give each a subagent of your own (your Agent or Task tool; without one,
