@@ -778,6 +778,9 @@ pub struct Scheduler {
     members: HashMap<String, HashMap<String, usize>>,
     /// What each runner holds warm, by runner (W24-R18).
     warm: BTreeMap<String, WarmHeld>,
+    /// While a runner's loss is handled: the legs it lost that came back to the queue, offered once
+    /// it's handled, in queue order with the others whose place changed (W05-R04).
+    requeued: Option<Vec<String>>,
     /// The time of the last input: explanations reckon waits from it.
     now: i64,
 }
@@ -1256,13 +1259,29 @@ impl Scheduler {
             self.cadenced.insert(id.to_owned());
             self.refresh_drains();
         }
+        if let Some(back) = self.requeued.as_mut() {
+            back.push(id.to_owned());
+            return;
+        }
+        self.offer(id, false, now, out);
+    }
+
+    /// Offers a queued leg to the runners with room, best first: each takes the best legs it has
+    /// room for, this one among them. `alone`: the leg goes to the best of them, which takes no
+    /// other, as when several legs' places changed at once and each goes in turn. Then its pool
+    /// scales for it, or it says why it waits.
+    fn offer(&mut self, id: &str, alone: bool, now: i64, out: &mut Vec<Command>) {
         // The runners with room, best first; none once it waits for a busy warm one (W24-R18).
         let candidates = self.candidates(id);
         for r in candidates {
             if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
                 break;
             }
-            self.try_runner(&r, now, out);
+            if !alone {
+                self.try_runner(&r, now, out);
+            } else if !self.hold_for_warm(id, &r, now, out) {
+                self.assign(id, &r, now, out);
+            }
         }
         if let Some(pool) = self.legs.get(id).filter(|l| l.state == State::Queued).and_then(|l| l.req.pool.clone()) {
             self.scale(&pool, now, out);
@@ -1282,6 +1301,16 @@ impl Scheduler {
             l.key = Some((l.input.priority, fair, seq));
             l.state = State::Queued;
         }
+    }
+
+    /// A queued leg's place as legs are picked ([`Self::try_runner`]): its level's effective
+    /// priority (from the wait of its signature's next leg at its priority), its fair-share start,
+    /// its arrival; the highest first, then the earliest.
+    fn pick_key(&self, l: &Leg, now: i64) -> Option<(i128, u128, u64)> {
+        let (p, f, q) = l.key?;
+        let (_, _, head) = self.sigs.get(&l.sig)?.queue.get(&p)?.iter().next()?;
+        let waited = self.legs.get(head).map_or(0, |h| now.saturating_sub(h.queued_at).max(0));
+        Some((effective(p, self.config().aging_per_minute, waited), f, q))
     }
 
     fn insert_queue(&mut self, id: &str) {
@@ -1580,10 +1609,8 @@ impl Scheduler {
                 }
                 for (p, sub) in s.queue.iter().rev() {
                     let Some((_, _, head)) = sub.iter().next() else { continue };
-                    // Its effective priority, `priority + aging × minutes waited`, in thousandths of
-                    // a priority per millisecond: exact, whatever the wait.
                     let waited = self.legs.get(head).map_or(0, |l| now.saturating_sub(l.queued_at).max(0));
-                    let e = i128::from(*p).saturating_mul(60_000 * 1000).saturating_add(i128::from(aging).saturating_mul(i128::from(waited)));
+                    let e = effective(*p, aging, waited);
                     for (f, q, id) in sub {
                         if best.as_ref().is_some_and(|(k, _)| !ahead((e, *f, *q), *k)) {
                             break;
@@ -2085,17 +2112,31 @@ impl Scheduler {
         };
         self.refresh_eligibility(runner);
         self.release_holds(now, out);
-        // The legs that stayed off another runner only while this one could take them go there
-        // first: they waited longer than the legs this one loses now.
-        self.try_avoided(now, out);
         // Its pools' executors went with it.
         let gone: Vec<String> = self.executors.values().filter(|e| e.runner == runner && !matches!(e.state, ExecState::Busy { .. })).map(|e| e.id.clone()).collect();
         for e in gone {
             self.drop_executor(&e);
         }
+        // The legs it ran come back to the queue together (W05-R16's retry). Then every leg whose
+        // place changed goes, in queue order, to the best runner it has room on (W05-R04, R23):
+        // those, and the legs that stayed off another runner only while this one could take them.
+        // One lost here takes no runner before a leg ahead of it in the queue, nor one that leg
+        // would rather have.
+        self.requeued = Some(Vec::new());
         for leg in legs {
             let attempt = self.legs.get(&leg).map_or(0, |l| l.attempt);
             self.finished(&leg, attempt, Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }), now, out);
+        }
+        let mut changed = self.requeued.take().unwrap_or_default();
+        changed.extend(self.legs.iter().filter(|(_, l)| l.state == State::Queued && l.avoid.as_ref().is_some_and(|(_, off)| *off == Off::Lost)).map(|(id, _)| id.clone()));
+        let mut changed: Vec<(std::cmp::Reverse<i128>, u128, u64, String)> =
+            changed.into_iter().filter_map(|id| self.legs.get(&id).and_then(|l| self.pick_key(l, now)).map(|(e, f, q)| (std::cmp::Reverse(e), f, q, id))).collect();
+        changed.sort();
+        changed.dedup();
+        for (_, _, _, id) in changed {
+            if self.legs.get(&id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
+                self.offer(&id, true, now, out);
+            }
         }
         self.scale_all(now, out);
         self.refresh_reasons(out);
@@ -2816,6 +2857,27 @@ impl Scheduler {
     pub fn queued(&self) -> usize {
         self.sigs.values().map(Sig::len).sum()
     }
+
+    /// What runs where (each assigned leg's runner and attempt), each runner's legs as it counts
+    /// them, and the legs queued: the reference engine's differential test compares and checks
+    /// them (docs/needs.md E1.5).
+    #[cfg(test)]
+    pub(super) fn placement(&self) -> (BTreeMap<String, (String, u32)>, BTreeMap<String, Vec<String>>, BTreeSet<String>) {
+        let (mut running, mut queued) = (BTreeMap::new(), BTreeSet::new());
+        for (id, l) in self.legs.iter() {
+            match &l.state {
+                State::Assigned { runner } => {
+                    running.insert(id.clone(), (runner.clone(), l.attempt));
+                }
+                State::Queued => {
+                    queued.insert(id.clone());
+                }
+                _ => {}
+            }
+        }
+        let on = self.runners.iter().map(|(id, r)| (id.clone(), r.running.clone())).collect();
+        (running, on, queued)
+    }
 }
 
 /// Where a leg stands among those waiting ([`Scheduler::standing`]).
@@ -2883,9 +2945,16 @@ fn sub(a: &mut Resources, b: &Resources) {
     a.gpu = a.gpu.saturating_sub(b.gpu);
 }
 
+/// A priority's effective priority after `waited` milliseconds, aging `aging` thousandths of a
+/// priority a minute (W05-R09): `priority + aging × minutes waited`, in thousandths of a priority
+/// per millisecond, exact whatever the wait.
+fn effective(priority: u8, aging: PerMille, waited: i64) -> i128 {
+    i128::from(priority).saturating_mul(60_000 * 1000).saturating_add(i128::from(aging).saturating_mul(i128::from(waited)))
+}
+
 /// Whether `a` goes before `b`: the higher effective priority (in thousandths of a priority per
-/// millisecond waited, [`Scheduler::try_runner`]), then the earlier fair-share start, then the
-/// earlier arrival.
+/// millisecond waited, [`effective`]), then the earlier fair-share start, then the earlier
+/// arrival.
 fn ahead(a: (i128, u128, u64), b: (i128, u128, u64)) -> bool {
     match a.0.cmp(&b.0) {
         std::cmp::Ordering::Greater => true,

@@ -39,6 +39,8 @@ pub mod units;
 pub mod warm;
 
 #[cfg(test)]
+mod reference;
+#[cfg(test)]
 mod replay;
 #[cfg(test)]
 mod tests;

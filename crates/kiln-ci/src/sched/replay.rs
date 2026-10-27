@@ -59,6 +59,8 @@ fn line(c: &Command) -> String {
         Command::Wait { leg, reason } => format!("wait {} {}", q(leg), serde_json::to_string(reason).unwrap_or_default()),
         Command::Settled { leg, outcome: o, reason } => format!("settled {} {} reason={}", q(leg), outcome(o), opt(reason)),
         Command::Timer { at } => format!("timer at={at}"),
+        Command::Demand { leg, decision } => format!("demand {} {}", q(leg), serde_json::to_string(decision).unwrap_or_default()),
+        Command::Adopted { leg, from, outcome: o } => format!("adopted {} from {} {}", q(leg), q(from), outcome(o)),
     }
 }
 
