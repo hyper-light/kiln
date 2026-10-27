@@ -29,11 +29,14 @@ export interface Acts {
   exited: AgentInfo[];
   /** Not ended: End. */
   live: AgentInfo[];
-  /** Can go on on another machine: Move to. */
+  /** Not ended, and can go on on another machine: Move to. */
   movable: AgentInfo[];
   /** On a runner: where its commands run can change. */
   onRunner: AgentInfo[];
 }
+
+/** As its menu has it: the kiln server's agents stay there once started, and one that ended goes nowhere. */
+const canMove = (a: AgentInfo) => a.status !== "exited" && movable(a);
 
 export function actsOf(agents: readonly AgentInfo[], stacks?: Stacks): Acts {
   return {
@@ -47,7 +50,7 @@ export function actsOf(agents: readonly AgentInfo[], stacks?: Stacks): Acts {
     working: agents.filter((a) => a.status === "running" || a.status === "waiting"),
     exited: agents.filter((a) => a.status === "exited"),
     live: agents.filter((a) => a.status !== "exited"),
-    movable: agents.filter(movable),
+    movable: agents.filter(canMove),
     onRunner: agents.filter((a) => a.target.startsWith("agent:")),
   };
 }
@@ -83,7 +86,7 @@ export function placesFor(agents: readonly AgentInfo[], byTarget: Record<string,
   const stuck = new Map<string, string>();
   const older = new Set<string>();
   const closed = new Set<string>();
-  for (const a of agents.filter(movable)) {
+  for (const a of agents.filter(canMove)) {
     const here = runners.find((r) => `agent:${r.name}` === a.target);
     if (here && !here.fingerprint) {
       stuck.set(a.id, `${here.name} runs an older kiln that can't hand agents over`);

@@ -5,9 +5,10 @@ from a Mac, a test on the machine with the GPU, `uptime` on a box by name — ov
 encrypted link the kiln server only relays.
 
 ```text
-kiln run --on linux/amd64 -- cargo test      # this machine if it is one, else the idlest; this repo synced over first
-kiln run --on adacachy --no-sync -- uptime   # a runner by name, in its home folder
-kiln runners linux                           # the Linux runners, best first, and why others don't suit
+kiln run --needs linux/amd64 -- cargo test           # this machine if it is one, else the idlest; this repo synced over first
+kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free
+kiln run --on adacachy --no-sync -- uptime           # a runner by name, in its home folder
+kiln runners linux                                   # the Linux runners, best first, and why others don't suit
 ```
 
 Agents get the same through kiln's MCP server (§7): one command at a time (`runners`, `run`,
@@ -31,13 +32,26 @@ on their own lane (`LANE_REACH`, interactive class, so output never queues behin
 
 ## 2. Picking a runner
 
-`--on` (or the tool's `on`) is a runner's name or what it must be: `linux/amd64`, `macos`,
-`arm64`, `+gpu` (a label), `cpus>=16`, `mem>=32g`, `harness=codex`, `-name` to exclude one; words
-separated by commas or spaces. Aliases are understood (`amd64`, `x64` → `x86_64`; `arm64` →
-`aarch64`; `darwin`, `mac` → `macos`).
+`--needs` (or the tools' `needs`) says what the work needs, in the spelling CI's jobs use too
+(`kiln_ci::sched::needs`): what the runner must be and have — `linux/amd64`, `macos`, `arm64`,
+`+gpu` (a label), `tool:cargo`, `executor:docker`, `flag:avx2`, `binfmt:linux/arm64`, `cpus>=16`
+(cores in all), `mem>=32g` (memory free), any fact routing knows (`disk.free>=50Gi`,
+`custom.rack==a3`) — and the room it asks for, idle and free on the runner as it's picked:
+`cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive` takes a runner with no CI work on it. Reach
+holds nothing for the work: the room is what's idle then. Words are separated by commas or spaces,
+and one that isn't a need is an error that names it (`memm=4g: no such need`). Aliases are
+understood (`amd64`, `x64` → `x86_64`; `arm64` → `aarch64`; `darwin`, `mac` → `macos`). The
+constraints are checked against the facts each runner reports (docs/ci.md W13-R01), its platform,
+cores and memory from its latest sample; one that hasn't reported facts (an older runner) meets
+only those.
+
+`--on` (or the tools' `on`) names a runner, for work that has to happen on that machine; it must
+still meet `--needs`. It takes what `--needs` does too, as it did before needs, and `harness=codex`
+and `-name` to exclude one. A runner older than the needs spelling reads a word it doesn't know as a
+runner's name, so it refuses such a run rather than running it where it doesn't suit.
 
 Of the connected runners that take reach links and suit, the asking machine itself comes first
-while it has 4 GiB of memory free and isn't overloaded (nothing crosses the network — it then runs
+while it has 4 GiB of memory free beyond what the work asks and isn't overloaded (nothing crosses the network — it then runs
 locally — and another machine's resources stay its own): work goes elsewhere only when it asks for
 what this machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others,
 the one with the most idle cores wins (by its busy share or its load average, whichever leaves
@@ -315,7 +329,7 @@ the MCP server's resources too.
 The timeline shows a `run` as the command itself, with its output, its exit code and "on beta", and a
 program by its first line.
 
-Per agent (New agents → More → Commands; `Spec.reach`): any runner it needs (the default), a
+Per agent (Mission control's composer → More options → Commands; `Spec.reach`): any runner it needs (the default), a
 runner or platform it prefers (`run` goes there unless the agent says otherwise), or only its own
 machine (no tools). An agent's **Where commands run…** changes it while it lives (the `reach`
 control): its harness takes the tools when it starts, so it starts again once its turn is over, the

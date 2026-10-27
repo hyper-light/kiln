@@ -155,7 +155,7 @@ impl Bitbucket {
         self.name_of(repo).ok_or_else(|| anyhow!("{} isn't on {}", repo.name, self.web))
     }
 
-    fn api_auth(&self) -> String {
+    pub(crate) fn api_auth(&self) -> String {
         match &self.cred {
             Cred::Token(t) => format!("Bearer {t}"),
             Cred::Basic { user, password } => format!("Basic {}", B64.encode(format!("{user}:{password}"))),

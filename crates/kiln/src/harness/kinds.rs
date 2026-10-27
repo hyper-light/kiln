@@ -748,8 +748,9 @@ mod tests {
         let (own, users) = (dir.path().join("usr/bin"), dir.path().join("home/.local/bin"));
         std::fs::create_dir_all(&own)?;
         std::fs::create_dir_all(&users)?;
-        let claude = users.join("claude");
-        std::fs::write(&claude, "#!/bin/sh\n")?;
+        // As it's installed: a script on Unix, a batch file on Windows (which starts no shell script).
+        let claude = users.join(if cfg!(windows) { "claude.cmd" } else { "claude" });
+        std::fs::write(&claude, if cfg!(windows) { "@echo off\r\n" } else { "#!/bin/sh\n" })?;
         crate::os::make_executable(&claude)?;
         let runner = std::env::join_paths([&own])?;
         assert_eq!(crate::os::which_in("claude", &runner), None);

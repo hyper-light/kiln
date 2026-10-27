@@ -1118,3 +1118,289 @@ html[data-motion="paused"] .ms-pick {
   width: 120px;
   height: 10px;
 }
+
+/* ---------------------------------------------------------------- the composer, starting an agent (new-agent.tsx): no dialog, no button */
+/* Turning between starting an agent and messaging those selected: the same lines in the same places, crossfaded. */
+.mc-mode {
+  animation: mc-in 0.14s ease-out;
+}
+@keyframes mc-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+}
+/* In the box's top slot (the To line's, when messaging): the agent, its machine, its folder, how many, in the folder line's voice. */
+.mc-slot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 2px;
+  min-height: 34px;
+  padding: 8px 12px 0;
+}
+.mc-slot .ip-line {
+  flex: none;
+  align-items: center;
+  width: auto;
+  min-height: 26px;
+  padding: 0;
+}
+/* The folder line is one of the slot's parts; what it opens takes the slot's whole width, under it. */
+.mc-slot > .ip {
+  display: contents;
+}
+.mc-slot .ip-panel,
+.mc-slot .mc-slot-panel {
+  flex-basis: 100%;
+  order: 10;
+}
+.mc-slot .rs-panel.mc-slot-panel {
+  max-width: none;
+  padding: 2px 0 0;
+}
+.mc-slot .mc-part[aria-expanded="true"] .ip-seg[data-last] {
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2) 0 100% / 100% 1px no-repeat;
+}
+.mc-dot {
+  padding: 0 10px;
+  color: #5d6068;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 16px;
+}
+.mc-looking {
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.ms-to .mc-clear {
+  margin-left: auto;
+  font-size: 12px;
+}
+/* Under the box: More options and past sessions, each a dropdown that opens in place below. */
+.mc-under {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 26px;
+  min-height: 34px;
+  margin-top: 6px;
+  padding: 0 4px;
+}
+.mc-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 0;
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.mc-toggle .mc-chev {
+  color: #7b7e88;
+  transition: transform 0.15s;
+}
+.mc-toggle[aria-expanded="true"] {
+  color: #ededee;
+}
+.mc-toggle[aria-expanded="true"] .mc-chev {
+  transform: rotate(180deg);
+}
+@media (hover: hover) {
+  .mc-toggle:hover {
+    color: #ededee;
+  }
+}
+.mc-sum {
+  color: #ededee;
+}
+.mc-sum::before {
+  margin: 0 8px 0 2px;
+  color: #5d6068;
+  content: "·";
+}
+.mc-from {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.mc-from .ms-link {
+  font-size: 12.5px;
+}
+/* More options, open: one quiet row each, two to a line where there's room. */
+.mc-opts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 48px;
+  max-width: 960px;
+  margin: 2px 0 14px;
+  padding: 0 4px;
+  animation: rs-fade 0.12s ease-out;
+}
+.mc-opt {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: center;
+  min-height: 44px;
+  border-top: 1px solid #17191d;
+}
+.mc-opt-key {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.mc-opt-val {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.mc-inline-input {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #ededee;
+  font-size: 13px;
+  outline: none;
+}
+.mc-inline-input::placeholder {
+  color: #6d7078;
+}
+.mc-seg {
+  display: inline-flex;
+  gap: 18px;
+}
+.mc-seg button {
+  padding: 6px 0 5px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.mc-seg button[aria-checked="true"] {
+  color: #ededee;
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2) 0 100% / 100% 1px no-repeat;
+}
+.mc-seg button:disabled {
+  color: #5d6068;
+  cursor: default;
+}
+.mc-pick {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #ededee;
+  font-size: 13px;
+}
+.mc-pick .mc-chev {
+  color: #7b7e88;
+}
+.mc-pick select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+.mc-past {
+  margin: 0 4px 12px;
+}
+.mc-note {
+  margin: 4px 4px 10px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.mc-note code {
+  color: #ededee;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.mc-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #d9b3b6;
+  font-size: 13px;
+}
+.mc-ok {
+  color: #b9d6ca;
+}
+.mc-ok svg {
+  color: #a8c9bc;
+}
+@container (max-width: 520px) {
+  .mc-opts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mc-under {
+    gap: 0 18px;
+  }
+}
+/* A phone: at the top as on a desktop, one line (the field and Start) until it's used. */
+.mc[data-quiet] .mc-how,
+.mc[data-quiet] .mc-slot,
+.mc[data-quiet] .mc-under,
+.mc[data-quiet] .cp-icon,
+.mc[data-quiet] .cp-gap {
+  display: none;
+}
+.mc[data-quiet] .hx-compose-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 6px;
+}
+.mc[data-quiet] .hx-compose-input {
+  flex: 1;
+  min-height: 44px;
+}
+.mc[data-quiet] .cp-bar {
+  padding: 0;
+}
+.mc[data-quiet] .cp-send {
+  width: 34px;
+  padding: 0;
+  justify-content: center;
+}
+.mc[data-quiet] .cp-send > span {
+  display: none;
+}
+/* Opening the agent it started: one view transition, each part landing where it goes on the agent's page (console.css names those). */
+:root[data-opening] .mc .mc-how {
+  view-transition-name: kiln-run;
+}
+:root[data-opening] .mc .hx-compose-box {
+  view-transition-name: kiln-composer;
+}
+:root[data-opening] .mc-slot {
+  view-transition-name: kiln-where;
+}
+::view-transition-group(*) {
+  animation-duration: 0.22s;
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .mc-mode,
+  .mc-opts {
+    animation: none;
+  }
+  .mc-toggle .mc-chev {
+    transition: none;
+  }
+}
+:root[data-motion="paused"] .mc-mode,
+:root[data-motion="paused"] .mc-opts {
+  animation: none;
+}
+:root[data-motion="paused"] .mc-toggle .mc-chev {
+  transition: none;
+}

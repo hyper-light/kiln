@@ -21,7 +21,7 @@ import { actsOf, count, outcomeLine, placesFor, resumable, startedBy, topmost, w
 import { agentLabel } from "./derive";
 import { askPlaces, inWords } from "./move";
 import { machineName } from "./parts";
-import { reachChoices } from "./spawn";
+import { reachChoices } from "./spawn-setup";
 
 /** What came of an action: its line, each agent's outcome. */
 interface Result {

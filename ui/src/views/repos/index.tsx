@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
+import { ReapPolicy } from "../reap";
 import { EmptyState, FilterBar, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
@@ -191,13 +192,24 @@ function ReposBody() {
 
   return (
     <>
-      <ReposToolbar q={q} onQ={setQ} view={view} onView={setView} facets={facets} count={filtered ? `${list.length} of ${entries.length}` : `${entries.length} ${entries.length === 1 ? "repository" : "repositories"}`} />
+      <ReposToolbar
+        q={q}
+        onQ={setQ}
+        view={view}
+        onView={setView}
+        facets={facets}
+        count={filtered ? `${list.length} of ${entries.length}` : `${entries.length} ${entries.length === 1 ? "repository" : "repositories"}`}
+      />
       {notice && (
         <p role="status" className="notice" data-tone={notice.tone}>
           {notice.text}
         </p>
       )}
-      {sync.data.error && <p className="notice" data-tone="fail">{sync.data.error}</p>}
+      {sync.data.error && (
+        <p className="notice" data-tone="fail">
+          {sync.data.error}
+        </p>
+      )}
       {adding && (
         <AddRepoForm
           onAdded={(r) => {
@@ -284,7 +296,15 @@ function ReposBody() {
             <ReposHead />
             <tbody>
               {list.map((e) => (
-                <Row key={e.key} entry={e} machines={machines} open={open?.key === e.key ? open.what : null} polling={e.built ? polling.has(e.built.id) : false} onToggle={(what) => toggle(e.key, what)} onPoll={() => void poll(e)}>
+                <Row
+                  key={e.key}
+                  entry={e}
+                  machines={machines}
+                  open={open?.key === e.key ? open.what : null}
+                  polling={e.built ? polling.has(e.built.id) : false}
+                  onToggle={(what) => toggle(e.key, what)}
+                  onPoll={() => void poll(e)}
+                >
                   {open?.key === e.key && (
                     <Details
                       entry={e}
@@ -315,7 +335,21 @@ function ReposBody() {
   );
 }
 
-function ReposToolbar({ q, onQ, view, onView, facets, count }: { q: string; onQ: (v: string) => void; view: ListView; onView: (v: ListView) => void; facets: React.ComponentProps<typeof FacetBox>["facets"]; count: string }) {
+function ReposToolbar({
+  q,
+  onQ,
+  view,
+  onView,
+  facets,
+  count,
+}: {
+  q: string;
+  onQ: (v: string) => void;
+  view: ListView;
+  onView: (v: ListView) => void;
+  facets: React.ComponentProps<typeof FacetBox>["facets"];
+  count: string;
+}) {
   return (
     <FilterBar className="repos-tools" aside={<span className="label tabular-nums">{count}</span>}>
       <FacetBox
@@ -481,7 +515,14 @@ function Row({
               </Tip>
             )}
             <Tip content="Put it on machines: clone or sync">
-              <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Put ${e.name} on machines`} aria-expanded={open === "clone" || open === "sync"} onClick={() => onToggle(e.synced ? "sync" : "clone")}>
+              <button
+                className="icon-btn"
+                data-variant="bare"
+                data-size="sm"
+                aria-label={`Put ${e.name} on machines`}
+                aria-expanded={open === "clone" || open === "sync"}
+                onClick={() => onToggle(e.synced ? "sync" : "clone")}
+              >
                 <HardDriveDownload size={14} />
               </button>
             </Tip>
@@ -591,6 +632,15 @@ function Details({
         <section className="repo-section" aria-label="Its secrets and variables">
           <Loadable label="its secrets and variables" fallback={<Hold height={120} />}>
             <ScopeSecrets scope={`repo:${r.name}`} of="Its" />
+          </Loadable>
+        </section>
+      )}
+      {r && (
+        // What its caches keep (W24-R31): its own rules over the system's.
+        <section className="repo-section" aria-label="What its caches keep">
+          <h4 className="field-label">What its caches keep</h4>
+          <Loadable label="its cache policy" fallback={<Hold height={450} />}>
+            <ReapPolicy scope="repo" target={r.name} at={{ repo: r.name }} />
           </Loadable>
         </section>
       )}

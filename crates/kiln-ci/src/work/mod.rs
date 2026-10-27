@@ -9,6 +9,8 @@
 //! - [`tests`]: test binaries' results as units of work, and which run or replay (W24-R10).
 //! - [`queue`]: what a land candidate and its bisection reuse (W24-R20).
 //! - [`evict`]: what a domain keeps under quota pressure (W24-R15, R21, AC12).
+//! - [`reap`]: the reaper: each cache within its volume's limits and its scopes' policies, when
+//!   free space, a write or the schedule calls for it (W24-R31, AC15).
 //! - [`eclass`]: equivalence classes over keys, as an e-graph's: union-find, congruence, rewrite
 //!   rules with witnesses, splits (W24-R30).
 //! - [`why`]: what each unit did, and why one ran: fingerprints compared (W24-R28).
@@ -30,6 +32,7 @@ pub mod memo;
 pub mod ops;
 pub mod pathset;
 pub mod queue;
+pub mod reap;
 pub mod seal;
 pub mod slots;
 pub mod tests;

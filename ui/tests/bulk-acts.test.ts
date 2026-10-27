@@ -53,8 +53,8 @@ test("each action takes the selected agents one agent's own would: its row's but
   assert.deepEqual(ids(acts.atLimit), ["at-limit"]);
   assert.deepEqual(ids(acts.exited), ["crashed", "never-started"]);
   assert.deepEqual(ids(acts.live), ["working", "asks", "at-limit", "limit-mid-turn", "limit-away", "on-server", "held"]);
-  // The kiln server's agents stay there once started; one that never started can still go elsewhere.
-  assert.deepEqual(ids(acts.movable), ["working", "asks", "at-limit", "limit-mid-turn", "limit-away", "crashed", "never-started", "held"]);
+  // The kiln server's agents stay there once started, and one that ended goes nowhere.
+  assert.deepEqual(ids(acts.movable), ["working", "asks", "at-limit", "limit-mid-turn", "limit-away", "held"]);
   assert.deepEqual(ids(acts.onRunner), ["working", "asks", "at-limit", "limit-mid-turn", "limit-away", "crashed", "held"]);
   // Before any goal stack is read, goals it paused for you are the only goals known paused, and none running.
   assert.deepEqual(ids(acts.goalsPaused), ["held"]);
@@ -132,14 +132,14 @@ test("the machines the agents can move to: each that takes some of them, which, 
   const onFedora = agent("on-fedora");
   const codexOnMac = agent("codex-on-mac", { target: "agent:mac", kind: "codex", kind_name: "Codex" });
   const onAncient = agent("on-ancient", { target: "agent:ancient" });
-  const neverStarted = agent("never-started", { target: "local", status: "exited" });
+  const ended = agent("ended", { target: "agent:mac", status: "exited" });
   const onServer = agent("on-server", { target: "local", harness_session: "s1" });
-  const plan = placesFor([onFedora, codexOnMac, onAncient, neverStarted, onServer], byTarget, runners);
+  const plan = placesFor([onFedora, codexOnMac, onAncient, ended, onServer], byTarget, runners);
   assert.deepEqual(
     plan.places.map((p) => [p.name, p.platform, ids(p.takes)]),
     [
-      ["fedora", "linux/x86_64", ["codex-on-mac", "never-started"]],
-      ["mac", "macos/aarch64", ["on-fedora", "never-started"]],
+      ["fedora", "linux/x86_64", ["codex-on-mac"]],
+      ["mac", "macos/aarch64", ["on-fedora"]],
       ["pi", "linux/x86_64", ["codex-on-mac"]],
     ],
   );
