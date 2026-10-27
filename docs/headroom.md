@@ -19,53 +19,46 @@ counts as IO wait.
 
 ## How it works
 
-kiln protects outcomes, not resource levels. It measures what matters directly, decides how much
-of its own work runs, and only ever slows down what it started itself, which needs no privileges.
+kiln protects outcomes, not resource levels. It measures what matters directly, learns how much
+of its own work the machine takes before that suffers, and only ever slows down what it started
+itself, which needs no privileges. Headroom is on by default (the exception in `docs/ci.md` §0.3),
+and every decision it makes says why.
 
-**Targets.** What must stay healthy, each with a goal (milliseconds):
+**Targets.** What must stay healthy, each with a tolerance: how slow it may get before it's
+harmed. A target that declares none takes the platform's default, Kubernetes' 1 s probe timeout.
 - `fsync`: a few bytes written and made durable in a folder. A database commit or a container's
   teardown waits for the same thing on that file system.
 - `http`: `GET` an `http://` URL. A 5xx or a refused connection means the target is down for its
   own reasons, not slow, and isn't counted.
 - `tcp`: connect to `host:port`.
 
-kiln adds its own targets unless `automatic` is off: an fsync in the runner's data folder (goal
-1 s) and the health of the server the runner reports to (goal 2 s). Each target is probed on a
-thread of its own every 250 ms. A probe still in flight past its goal counts as a miss while it
-hangs, so a stalled sync is seen within the goal, not when it finally returns.
+kiln adds its own unless `automatic` is off: a sync in the runner's data folder and the health of
+the server the runner reports to. Each target is probed on a thread of its own, at an interval the
+engine derives; a probe still out counts while it hangs.
 
-**The window.** How many heavy groups of work may run at full speed, controlled like TCP's
-congestion window: while every target meets its goal it grows by one every `grow_secs`; a miss
-halves it (at most once per `cooldown_ms`). It starts at `start`, so a restarted runner's sessions
-come back a few at a time. Nothing has to be tuned per machine: the window finds each machine's
-capacity and follows it.
+**Detection.** A CUSUM on each target's log-latency against its calm, looking for a shift toward
+its tolerance, calibrated on the machine's own record against the false-alarm budget. A sample at
+the tolerance is harm, at once.
 
-**Holding.** Before a session sends its next queued message, starts a turn kiln continues after a
-restart, or takes a goal, it asks for room. Past the window it waits in kiln's queue and goes out
-the moment there's room (the runner wakes held sessions; nothing polls). A message a person sends
-"now" never waits. A session let in holds its place for `admit_hold_secs` until its work shows.
+**Budgets.** For kiln's own work, a budget of writes a second and one of CPU cores, each bisected
+between the highest level held calm and the lowest level trouble began at.
 
-**Pacing.** Groups of work past the window are slowed: each runs the first part of every
-`period_ms` and is stopped for the rest. That's continuous throttling built from nothing but the
-right to pause your own processes. The lowest class and the heaviest writer are slowed first. While
-targets miss, paced work runs `min_duty_pct`; after `freeze_after_secs` of misses with the window
-at its least, it stops outright. It runs at full speed again only once targets have been healthy
-for `release_after_secs`.
+**Holding.** A session's next turn, a turn kiln continues after a restart, or a goal starts only
+when its learned demand fits the budgets and free memory: highest response ratio first, with
+conservative backfilling, so short work goes first and nothing starves. It waits in kiln's queue
+and goes the moment the engine lets it (held sessions are woken; nothing polls). A message a
+person sends "now" never waits.
 
-A group is heavy when it uses `heavy.cpu_pct` of one CPU or writes `heavy.write_mb_s`. Groups are:
-- each agent session's cgroup (`kiln-agents/<session>`);
-- with `escapes` on, every transient unit the user's service manager runs (`systemd-run --user`),
-  which is how agents start gates that outlive their commands. Units the desktop starts for a
-  person (`app-…`, `dbus-…`, `xdg-…`: an app, a terminal window) are never paced.
+**Pacing.** When running work wants more than a budget, the budget is water-filled class by class,
+max-min fair within a class, and each group runs that share of every period (`cgroup.freeze`):
+only for the resource that's short. Groups are each agent session's cgroup and, with `escapes`
+on, the user's transient units (`systemd-run --user`: agents' builds). Units the desktop starts
+for a person (`app-…`, `dbus-…`, `xdg-…`) are never paced.
 
-On Linux, groups are paced with `cgroup.freeze` in the user's own cgroups. Elsewhere there is
-nothing to pace yet, and work past the window still waits to start (the status says
-`pacing: none`).
-
-**Failing safe.** Everything paced is noted in `<state>/headroom/paced.json`: a runner that dies
-with work stopped starts it again when it next starts, and on a clean stop it starts everything
-before it goes. Headroom runs on its own threads, from settings it kept, with the server away.
-`max_sessions` never turns away sessions a restart continues.
+**Failing safe.** What's paced is noted in `<state>/headroom/paced.json` and started again on the
+next start; what was learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own
+threads, from settings it kept, with the server away. `max_sessions` never turns away sessions a
+restart continues.
 
 ## Settings
 
@@ -77,18 +70,14 @@ Per runner, in the UI (Runners → Headroom) or the API:
 The server keeps them (`kv` key `headroom/<runner>`) and sends them when the runner connects and
 when they change (`ServerMsg::Headroom`, to runners announcing `CAP_HEADROOM`). The runner keeps
 them in `<state>/headroom/settings.json` and applies them at start, before any session resumes.
-It reports `AgentMsg::HeadroomStatus` when what it decides changes, and latencies at most once a
-second.
 
 ```json
 {
   "enabled": true,
   "automatic": true,
-  "targets": [{ "name": "production", "probe": { "kind": "http", "url": "http://192.168.49.2:30070/healthz" }, "goal_ms": 1000 }],
-  "window": { "min": 1, "max": 16, "start": 2, "grow_secs": 10, "cooldown_ms": 2000 },
-  "pacing": { "enabled": true, "period_ms": 1000, "min_duty_pct": 10, "freeze_after_secs": 20, "release_after_secs": 30 },
-  "heavy": { "cpu_pct": 50, "write_mb_s": 5 },
-  "admit_hold_secs": 30,
+  "targets": [{ "name": "production", "probe": { "kind": "http", "url": "http://192.168.49.2:30070/healthz" }, "tolerance_ms": 3000 }],
+  "false_alarms_per_day": 1,
+  "probe_load_share": 0.1,
   "escapes": true,
   "max_sessions": null
 }

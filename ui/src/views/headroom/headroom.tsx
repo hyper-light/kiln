@@ -1,13 +1,15 @@
 /**
- * Runners → Headroom (docs/headroom.md): what a runner keeps healthy on its machine, how much heavy
- * work it lets run at full speed, and how it slows the rest. The live part says each target's
- * latency against its goal, the window, what waits and what is paced; the form below edits the
- * runner's settings, which the server keeps and sends it (it keeps them too, server or not).
+ * Runners → Headroom (docs/headroom.md): what a runner keeps healthy on its machine, what it
+ * learned of it, and what it is doing about it. The live part shows each target's calm latency
+ * against its tolerance, the write and CPU budgets between the levels learned safe and unsafe,
+ * the work waiting to start and the work slowed, each with its reason. The form edits only what a
+ * person decides (the false-alarm budget, tolerances, what headroom may touch): everything else
+ * is measured.
  */
 import * as React from "react";
 import { headroomApi } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, HeadroomSettings, HeadroomTarget, HeadroomTargetStatus, HeadroomView } from "@/api/types";
+import type { Agent, HeadroomSettings, HeadroomStatus, HeadroomTarget, HeadroomView } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -30,9 +32,9 @@ export function HeadroomSection({ agents, index }: { agents: Agent[]; index: str
     <section className="fd" aria-labelledby="hr-title">
       <SectionHeading index={index} label="Headroom" title={<span id="hr-title">Keep machines responsive</span>} />
       <p className="fd-lead">
-        Each runner checks what must stay healthy on its machine (its disk&apos;s syncs, the kiln server, anything you add) and keeps a window of how much heavy work runs at full speed: it grows
-        while every target meets its goal and halves when one misses. New work past the window waits to start; work already running past it is paced, stopped part of every second. A message you
-        send &quot;now&quot; never waits.
+        Each runner checks what must stay healthy on its machine and learns how much of kiln&apos;s own work the machine takes before that suffers: how many writes a second, how many CPU cores. New
+        work waits to start when it wouldn&apos;t fit, shortest first; work already running is slowed only for the resource that&apos;s short. Every number is measured; you only decide how many false
+        alarms a day you&apos;ll accept and how slow each target may get. A message you send &quot;now&quot; never waits.
       </p>
       {runners.length === 0 ? (
         <p className="empty-line">No runners yet: add a machine first.</p>
@@ -99,7 +101,6 @@ function HeadroomPanel({ runner }: { runner: string }) {
       setSaving(false);
     }
   };
-  const num = (s: string) => (s.trim() === "" ? NaN : Number(s));
 
   return (
     <div className="fd-body">
@@ -114,49 +115,44 @@ function HeadroomPanel({ runner }: { runner: string }) {
         <fieldset className="fd-group">
           <legend className="fd-key">On</legend>
           <Toggle checked={d.enabled} onChange={(enabled) => set({ enabled })} label="Headroom on">
-            Hold and pace work on this machine to keep its targets healthy (off: targets are still checked and shown)
+            Hold and slow kiln&apos;s work on this machine to keep its targets healthy (off: targets are still checked and shown)
           </Toggle>
           <Toggle checked={d.automatic} onChange={(automatic) => set({ automatic })} label="kiln's own targets">
-            Also keep kiln&apos;s own targets healthy: a small sync on the runner&apos;s disk, and the kiln server&apos;s health
+            Also keep kiln&apos;s own targets healthy: a small sync in the runner&apos;s data folder, and the kiln server&apos;s health
           </Toggle>
           <Toggle checked={d.escapes} onChange={(escapes) => set({ escapes })} label="Pace escaped work">
-            Pace work started outside kiln&apos;s groups too (a build an agent ran with <code>systemd-run --user</code>)
+            Slow work an agent started outside kiln&apos;s groups too (a build run with <code>systemd-run --user</code>); your own apps and terminals are never touched
           </Toggle>
         </fieldset>
-        <Targets targets={d.targets} onChange={(targets) => set({ targets })} />
         <fieldset className="fd-group">
-          <legend className="fd-key">Window</legend>
+          <legend className="fd-key">What you decide</legend>
           <div className="fd-grid">
-            <NumField label="Least" hint="Heavy groups always let run at full speed." value={d.window.min} onChange={(min) => set({ window: { ...d.window, min } })} />
-            <NumField label="Most" value={d.window.max} onChange={(max) => set({ window: { ...d.window, max } })} />
-            <NumField label="Start" hint="Where a restart starts: its work resumes a few at a time." value={d.window.start} onChange={(start) => set({ window: { ...d.window, start } })} />
-            <NumField label="Grow every (s)" hint="One more while every target is healthy." value={d.window.grow_secs} onChange={(grow_secs) => set({ window: { ...d.window, grow_secs } })} />
-            <NumField label="Cut at most every (ms)" value={d.window.cooldown_ms} onChange={(cooldown_ms) => set({ window: { ...d.window, cooldown_ms } })} />
-            <NumField label="Hold a place (s)" hint="How long work let in has to show before its place goes." value={d.admit_hold_secs} onChange={(admit_hold_secs) => set({ admit_hold_secs })} />
-          </div>
-        </fieldset>
-        <fieldset className="fd-group">
-          <legend className="fd-key">Pacing</legend>
-          <Toggle checked={d.pacing.enabled} onChange={(enabled) => set({ pacing: { ...d.pacing, enabled } })} label="Pace running work">
-            Slow work already running past the window (off: it only waits to start)
-          </Toggle>
-          <div className="fd-grid">
-            <NumField label="Period (ms)" value={d.pacing.period_ms} onChange={(period_ms) => set({ pacing: { ...d.pacing, period_ms } })} />
-            <NumField label="Least share (%)" value={d.pacing.min_duty_pct} onChange={(min_duty_pct) => set({ pacing: { ...d.pacing, min_duty_pct } })} />
-            <NumField label="Stop after (s)" hint="Missing this long at the least window: paced work stops outright." value={d.pacing.freeze_after_secs} onChange={(freeze_after_secs) => set({ pacing: { ...d.pacing, freeze_after_secs } })} />
-            <NumField label="Release after (s)" hint="Healthy this long: paced work runs at full speed again." value={d.pacing.release_after_secs} onChange={(release_after_secs) => set({ pacing: { ...d.pacing, release_after_secs } })} />
-          </div>
-        </fieldset>
-        <fieldset className="fd-group">
-          <legend className="fd-key">Heavy work</legend>
-          <div className="fd-grid">
-            <NumField label="CPU (% of one)" value={d.heavy.cpu_pct} onChange={(cpu_pct) => set({ heavy: { ...d.heavy, cpu_pct } })} />
-            <NumField label="Writes (MB/s)" value={d.heavy.write_mb_s} onChange={(write_mb_s) => set({ heavy: { ...d.heavy, write_mb_s } })} />
+            <NumField
+              label="False alarms a day"
+              hint="How often headroom may hold or slow work when nothing would have gone wrong. Fewer means it waits for clearer trouble."
+              value={d.false_alarms_per_day}
+              onChange={(false_alarms_per_day) => set({ false_alarms_per_day })}
+            />
+            <NumField
+              label="Probe share (%)"
+              hint="How much of a served target's time its checks may take. The platform's own default is 10%."
+              value={Math.round(d.probe_load_share * 1000) / 10}
+              onChange={(pct) => set({ probe_load_share: pct / 100 })}
+            />
             <Field label="Most agent sessions" hint="Empty: the runner's own limit. Sessions a restart continues are never turned away.">
-              {(id) => <input id={id} className="fd-input" inputMode="numeric" value={d.max_sessions ?? ""} onChange={(e) => set({ max_sessions: e.target.value.trim() === "" ? null : num(e.target.value) })} />}
+              {(id) => (
+                <input
+                  id={id}
+                  className="fd-input"
+                  inputMode="numeric"
+                  value={d.max_sessions ?? ""}
+                  onChange={(e) => set({ max_sessions: e.target.value.trim() === "" ? null : Number(e.target.value) })}
+                />
+              )}
             </Field>
           </div>
         </fieldset>
+        <Targets targets={d.targets} onChange={(targets) => set({ targets })} />
         <div className="fd-actions">
           <Button type="submit" size="xs" className="fd-btn" disabled={saving || !dirty}>
             {saving ? "Saving…" : "Save"}
@@ -183,7 +179,15 @@ function appliedWords(v: HeadroomView): string {
 function NumField({ label, hint, value, onChange }: { label: string; hint?: string; value: number; onChange: (v: number) => void }) {
   return (
     <Field label={label} hint={hint}>
-      {(id) => <input id={id} className="fd-input" inputMode="numeric" value={Number.isFinite(value) ? String(value) : ""} onChange={(e) => onChange(e.target.value.trim() === "" ? NaN : Number(e.target.value))} />}
+      {(id) => (
+        <input
+          id={id}
+          className="fd-input"
+          inputMode="decimal"
+          value={Number.isFinite(value) ? String(value) : ""}
+          onChange={(e) => onChange(e.target.value.trim() === "" ? NaN : Number(e.target.value))}
+        />
+      )}
     </Field>
   );
 }
@@ -195,7 +199,10 @@ function Targets({ targets, onChange }: { targets: HeadroomTarget[]; onChange: (
   return (
     <fieldset className="fd-group">
       <legend className="fd-key">Targets</legend>
-      <p className="fd-hint">What must stay healthy beyond kiln&apos;s own: a folder another service writes to (a small sync there), an HTTP health URL, or a TCP port, each with how fast it must answer.</p>
+      <p className="fd-hint">
+        What must stay healthy beyond kiln&apos;s own: a folder another service writes to (a small sync there), an HTTP health URL, or a TCP port, and how slow it may get before it&apos;s harmed
+        (empty: the platform&apos;s default, 1 s).
+      </p>
       {targets.map((t, i) => (
         <div className="fd-grid" key={i}>
           <Field label="Name">{(id) => <input id={id} className="fd-input" value={t.name} onChange={(e) => put(i, { ...t, name: e.target.value })} />}</Field>
@@ -231,78 +238,121 @@ function Targets({ targets, onChange }: { targets: HeadroomTarget[]; onChange: (
               />
             )}
           </Field>
-          <NumField label="Goal (ms)" value={t.goal_ms} onChange={(goal_ms) => put(i, { ...t, goal_ms })} />
+          <Field label="Tolerance (ms)">
+            {(id) => (
+              <input
+                id={id}
+                className="fd-input"
+                inputMode="numeric"
+                placeholder="1000"
+                value={t.tolerance_ms ?? ""}
+                onChange={(e) => put(i, { ...t, tolerance_ms: e.target.value.trim() === "" ? null : Number(e.target.value) })}
+              />
+            )}
+          </Field>
           <Button type="button" size="xs" variant="ghost" className="fd-btn" onClick={() => onChange(targets.filter((_, j) => j !== i))}>
             Remove
           </Button>
         </div>
       ))}
-      <Button type="button" size="xs" variant="ghost" className="fd-btn" onClick={() => onChange([...targets, { name: "", probe: { kind: "http", url: "http://" }, goal_ms: 1000 }])}>
+      <Button type="button" size="xs" variant="ghost" className="fd-btn" onClick={() => onChange([...targets, { name: "", probe: { kind: "http", url: "http://" }, tolerance_ms: null }])}>
         Add a target
       </Button>
     </fieldset>
   );
 }
 
-function targetLine(t: HeadroomTargetStatus): { state: string; text: string } {
-  switch (t.state) {
-    case "met":
-      return { state: "on", text: `${t.ms} ms (goal ${t.goal_ms} ms)` };
-    case "missed":
-      return { state: "error", text: `${t.ms} ms: over its goal of ${t.goal_ms} ms` };
-    case "unavailable":
-      return { state: "warn", text: `not answering (${t.why}): not counted` };
-    default:
-      return { state: "waiting", text: "not checked yet" };
-  }
+const ms = (us: number | null | undefined) => (us == null ? "?" : us >= 1e6 ? `${(us / 1e6).toFixed(1)} s` : `${(us / 1e3).toFixed(us < 1e4 ? 1 : 0)} ms`);
+const mbs = (b: number | null | undefined) => (b == null ? "no limit" : `${Math.round(b / 1e6)} MB/s`);
+const cores = (c: number | null | undefined) => (c == null ? "no limit" : `${c.toFixed(1)} cores`);
+
+function budgetLine(label: string, budget: string, safe: string | null, bad: string | null, wanted: string) {
+  return `${budget} (wanted ${wanted}${safe ? `; held calm at ${safe}` : ""}${bad ? `; trouble at ${bad}` : ""})${label}`;
 }
 
 function Live({ v }: { v: HeadroomView }) {
-  const s = v.status;
-  const paced = s?.groups.filter((g) => g.share < 100) ?? [];
+  const s: HeadroomStatus | null = v.status;
   return (
     <div className="fd-live">
       <div className="fd-live-head">
         <span className="fd-key">Live</span>
-        <span className="fd-when">{v.status_at ? <>reported <RelTime ts={v.status_at} /></> : !v.connected ? "runner offline" : " "}</span>
+        <span className="fd-when">
+          {v.status_at ? (
+            <>
+              reported <RelTime ts={v.status_at} />
+            </>
+          ) : !v.connected ? (
+            "runner offline"
+          ) : (
+            " "
+          )}
+        </span>
       </div>
       {!s ? (
         <p className="fd-hint">{v.supported === false ? "This runner's kiln is too old for headroom." : "Nothing reported yet."}</p>
       ) : (
         <ul className="fd-lines" aria-label="How headroom is doing">
-          <li className="fd-line" data-state={!s.enabled ? "off" : s.healthy ? "on" : "error"}>
-            <i className="fd-dot" data-state={!s.enabled ? "off" : s.healthy ? "on" : "error"} aria-hidden="true" />
-            <span className="fd-name">Window</span>
-            <span className="fd-text">
-              {!s.enabled ? "off" : `${s.allowed} heavy at full speed (${s.window}); ${s.held} waiting, ${s.starting} starting${s.pacing === "none" ? "; this machine can't pace, only hold" : ""}`}
-            </span>
-          </li>
           {s.targets.map((t) => {
-            const l = targetLine(t);
+            const state = t.alarm ? (t.alarm.harm ? "error" : "warn") : t.calm_us == null ? "waiting" : "on";
+            const text =
+              t.calm_us == null
+                ? "learning its calm"
+                : `calm ${ms(t.calm_us)}, tolerance ${ms(t.tolerance_us)}${t.alarm ? (t.alarm.harm ? ": harmed" : ": rising toward its tolerance") : ""}; checked every ${s.probe_every_ms[t.name] ?? "?"} ms`;
             return (
-              <li key={t.name} className="fd-line" data-state={l.state}>
-                <i className="fd-dot" data-state={l.state} aria-hidden="true" />
+              <li key={t.name} className="fd-line" data-state={state}>
+                <i className="fd-dot" data-state={state} aria-hidden="true" />
                 <span className="fd-name">{t.name}</span>
-                <span className="fd-text">{l.text}</span>
+                <span className="fd-text">{text}</span>
               </li>
             );
           })}
-          {s.groups.map((g) => (
-            <li key={g.label} className="fd-line" data-state={g.share < 100 ? "warn" : "on"}>
-              <i className="fd-dot" data-state={g.share < 100 ? "warn" : "on"} aria-hidden="true" />
-              <span className="fd-name">{g.session ? `session ${g.label.slice(0, 8)}` : g.label}</span>
-              <span className="fd-text">
-                {g.cpu_pct}% CPU, {g.write_mb_s} MB/s written{g.share < 100 ? (g.share === 0 ? ": stopped" : `: paced to ${g.share}%`) : ""}
+          <li className="fd-line" data-state={!s.enabled ? "off" : "on"}>
+            <i className="fd-dot" data-state={!s.enabled ? "off" : "on"} aria-hidden="true" />
+            <span className="fd-name">Writes</span>
+            <span className="fd-text">{budgetLine("", mbs(s.budget_bps), s.safe_bps != null ? mbs(s.safe_bps) : null, s.unsafe_bps != null ? mbs(s.unsafe_bps) : null, mbs(s.wanted_bps))}</span>
+          </li>
+          <li className="fd-line" data-state={!s.enabled ? "off" : "on"}>
+            <i className="fd-dot" data-state={!s.enabled ? "off" : "on"} aria-hidden="true" />
+            <span className="fd-name">CPU</span>
+            <span className="fd-text">
+              {budgetLine(
+                s.pacing === "none" ? "; this machine can't slow work, only hold it" : "",
+                cores(s.cpu_budget),
+                s.cpu_safe != null ? cores(s.cpu_safe) : null,
+                s.cpu_unsafe != null ? cores(s.cpu_unsafe) : null,
+                cores(s.wanted_cpu),
+              )}
+            </span>
+          </li>
+          {s.held.map((h) => (
+            <li key={h.session} className="fd-line" data-state="waiting">
+              <i className="fd-dot" data-state="waiting" aria-hidden="true" />
+              <span className="fd-name">waits: {h.session.slice(0, 8)}</span>
+              <span className="fd-text" title={h.why}>
+                {h.why}
               </span>
             </li>
           ))}
-          {s.enabled && s.groups.length === 0 && paced.length === 0 && (
-            <li className="fd-line" data-state="off">
+          {s.groups
+            .filter((g) => g.share < 100)
+            .map((g) => (
+              <li key={g.label} className="fd-line" data-state="warn">
+                <i className="fd-dot" data-state="warn" aria-hidden="true" />
+                <span className="fd-name">{g.session ? `session ${g.label.slice(0, 8)}` : g.label}</span>
+                <span className="fd-text" title={g.why}>
+                  {g.why}
+                </span>
+              </li>
+            ))}
+          {s.events.map((e, i) => (
+            <li key={`e${i}`} className="fd-line" data-state="off">
               <i className="fd-dot" data-state="off" aria-hidden="true" />
-              <span className="fd-name">Work</span>
-              <span className="fd-text">nothing heavy running</span>
+              <span className="fd-name">last change</span>
+              <span className="fd-text" title={e}>
+                {e}
+              </span>
             </li>
-          )}
+          ))}
         </ul>
       )}
     </div>

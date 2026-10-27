@@ -132,7 +132,9 @@ These hold for every line written under this spec.
 - **Opt-in automation.** Anything kiln decides on its own (routing preferences, retries beyond
   runner loss, quarantine, cancelling superseded runs, notifications, cache tiers, reuse of earlier
   results) is off until declared. Every such decision is explainable through the API and the UI:
-  "routed to X because…", "retried because…", "skipped because…".
+  "routed to X because…", "retried because…", "skipped because…". One exception, decided by the
+  user (2026-10-27): headroom (docs/headroom.md) is on by default, since its decisions keep a
+  machine from harming what runs on it; each of them says why, and Runners → Headroom turns it off.
 - **Tests and checks before handing over:**
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and in `ui/`
   `npm run typecheck && npm run lint && npm run build`. A workstream adds its own scenario suites

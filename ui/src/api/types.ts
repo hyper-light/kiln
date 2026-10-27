@@ -2156,45 +2156,73 @@ export type HeadroomProbe = { kind: "fsync"; path: string } | { kind: "http"; ur
 export interface HeadroomTarget {
   name: string;
   probe: HeadroomProbe;
-  goal_ms: number;
+  /** Slower than this harms it; null: the platform's default (1 s). */
+  tolerance_ms: number | null;
 }
 
+/** Only what a person decides: everything else headroom measures. */
 export interface HeadroomSettings {
   enabled: boolean;
   targets: HeadroomTarget[];
   automatic: boolean;
-  window: { min: number; max: number; start: number; grow_secs: number; cooldown_ms: number };
-  pacing: { enabled: boolean; period_ms: number; min_duty_pct: number; freeze_after_secs: number; release_after_secs: number };
-  heavy: { cpu_pct: number; write_mb_s: number };
-  admit_hold_secs: number;
+  false_alarms_per_day: number;
+  probe_load_share: number;
   escapes: boolean;
   max_sessions: number | null;
 }
 
-export type HeadroomVerdict = { state: "unknown" } | { state: "met"; ms: number } | { state: "missed"; ms: number } | { state: "unavailable"; why: string };
+export interface HeadroomAlarm {
+  since_us: number;
+  harm: boolean;
+  quiet: boolean;
+}
 
-export type HeadroomTargetStatus = HeadroomTarget & HeadroomVerdict;
+export interface HeadroomTargetStatus {
+  name: string;
+  tolerance_us: number;
+  calm_us: number | null;
+  level: number;
+  threshold: number;
+  alarm: HeadroomAlarm | null;
+  regime_since_us: number;
+}
 
 export interface HeadroomGroup {
   label: string;
   session?: string;
   cpu_pct: number;
   write_mb_s: number;
-  heavy: boolean;
+  mem_mb: number;
   share: number;
+  why: string;
+}
+
+export interface HeadroomHeld {
+  session: string;
+  since_ms: number;
+  why: string;
+  at_ms: number | null;
 }
 
 export interface HeadroomStatus {
   settings: string;
   enabled: boolean;
   pacing: "cgroup" | "none";
-  window: number;
-  allowed: number;
-  healthy: boolean;
   targets: HeadroomTargetStatus[];
+  budget_bps: number | null;
+  safe_bps: number | null;
+  unsafe_bps: number | null;
+  cpu_budget: number | null;
+  cpu_safe: number | null;
+  cpu_unsafe: number | null;
+  lag_us: number | null;
+  delivered_bps: number | null;
+  wanted_bps: number;
+  wanted_cpu: number;
+  probe_every_ms: Record<string, number>;
   groups: HeadroomGroup[];
-  held: number;
-  starting: number;
+  held: HeadroomHeld[];
+  events: string[];
 }
 
 export interface HeadroomView {
