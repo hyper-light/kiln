@@ -27,27 +27,29 @@ test("Files and the Conversation are the dropdown's first sections", async ({ pa
 });
 
 test("reply, resolve, change a kind, delete", async ({ page }) => {
+  // The mock keeps what each project writes, so each project's words are its own.
+  const tag = test.info().project.name;
   const row = await open(page, "pipeline: dynamic matrices");
   // Reply on kim's thread.
   const thread = row.locator(".rv-thread").first();
   await thread.locator(".rv-btn", { hasText: "Reply" }).click();
-  await thread.locator("textarea").fill("I'll name the axis in the error.");
+  await thread.locator("textarea").fill(`I'll name the axis in the error (${tag}).`);
   await thread.locator(".cp-send").click();
-  await expect(thread.locator(".rv-m", { hasText: "I'll name the axis" })).toBeVisible();
+  await expect(thread.locator(".rv-m", { hasText: `I'll name the axis in the error (${tag})` })).toBeVisible();
   // Change the thread's kind through the ⋯ menu (your own thread is needed: make one).
   const line = row.locator(".rv-ln").nth(3);
   await line.click();
   const composer = row.locator(".rv-thread .rvc").last();
   await composer.locator(".rv-kind[data-k='nit']").click();
-  await composer.locator("textarea").fill("a nit of mine");
+  await composer.locator("textarea").fill(`a nit of mine (${tag})`);
   await composer.locator(".cp-send").click();
-  const mine = row.locator(".rv-thread", { hasText: "a nit of mine" });
+  const mine = row.locator(".rv-thread", { hasText: `a nit of mine (${tag})` });
   await expect(mine.locator(".rv-k[data-k='nit']")).toBeVisible();
   // ⋯: copy, quote, edit, delete, kind. Delete it.
   await mine.locator(".rv-dots").first().click();
   await mine.locator(".rv-menu .rv-ib[aria-label='Delete']").click();
   await mine.locator(".rv-btn", { hasText: "Delete" }).click();
-  await expect(row.locator(".rv-thread", { hasText: "a nit of mine" })).toHaveCount(0);
+  await expect(row.locator(".rv-thread", { hasText: `a nit of mine (${tag})` })).toHaveCount(0);
   // Resolve kim's thread is disabled (blocking is its author's), then kind change through ⋯ on your own comment is shown.
   const resolve = thread.locator(".rv-btn", { hasText: "Resolve" });
   await expect(resolve).toBeDisabled();
