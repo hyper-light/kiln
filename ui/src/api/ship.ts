@@ -66,6 +66,18 @@ export interface ShipPage {
   next_cursor: number | null;
 }
 
+/** A build part's state (`Part` in kiln_cd::journey). */
+export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded";
+
+/** A commit with every record its stand came from: `GET /api/ship/commits/{repo}/{sha}`. */
+export interface ShipDetail extends ShipCommit {
+  checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string }[] }[];
+  build?: { platforms: { name: string; state: ShipPart }[]; image: { state: ShipPart; digest: string | null } };
+  deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
+  releases?: { state: string; message: string | null; rolled_back: boolean }[];
+  replant?: { name: string; state: string; why: string }[];
+}
+
 /** What a list asks for: a repository, the facets (W26-R02), a page. */
 export interface ShipQuery {
   repo?: string;
@@ -86,6 +98,9 @@ export function shipSearch(q: ShipQuery): string {
 
 export const shipApi = {
   commits: (q: ShipQuery, signal?: AbortSignal) => request<ShipPage>("GET", apiPath(`/api/ship/commits${shipSearch(q)}`), undefined, { signal }),
+  /** One commit and its records; `repo` is `owner/name` or its id, `sha` seven characters or more. */
+  commit: (repo: string, sha: string, signal?: AbortSignal) =>
+    request<ShipDetail>("GET", apiPath(`/api/ship/commits/${repo.split("/").map(encodeURIComponent).join("/")}/${encodeURIComponent(sha)}`), undefined, { signal }),
   /** A row's action, through the endpoint it names. */
   act: (a: ShipAction) => request<unknown>(a.method, apiPath(a.path), a.method === "GET" ? undefined : (a.body ?? {})),
 };

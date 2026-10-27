@@ -6,6 +6,7 @@
  * does.
  */
 import type http from "node:http";
+import type { ShipChange, ShipCommit, ShipPage, ShipPip } from "../src/api/ship.ts";
 
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
@@ -14,7 +15,7 @@ interface Ctx {
 const REPO = "hyper-light/kiln";
 const now = () => Math.floor(Date.now() / 1000);
 const sha = (p: string) => p.repeat(40).slice(0, 40);
-const pips = (review: string, land: string, checks: string, build = "none", staging = "none", production = "none", replant = "none") =>
+const pips = (review: string, land: string, checks: string, build = "none", staging = "none", production = "none", replant = "none"): ShipPip[] =>
   [
     ["review", review],
     ["land", land],
@@ -25,9 +26,12 @@ const pips = (review: string, land: string, checks: string, build = "none", stag
     ["replant", replant],
   ].map(([stage, state]) => ({ stage, state }));
 
-function commits() {
+/** The fields every row gives; the rest default as a plain commit's. */
+type Row = Pick<ShipCommit, "sha" | "short" | "message" | "author" | "at" | "stand" | "line" | "pips" | "cursor"> & Partial<ShipCommit>;
+
+function commits(): ShipCommit[] {
   const t = now();
-  const change = (name: string, kind: string, host: string, title: string, state: string, turn: string[], open = { question: 0, nit: 0, issue: 0, blocking: 0 }) => ({
+  const change = (name: string, kind: ShipChange["kind"], host: string, title: string, state: string, turn: string[], open = { question: 0, nit: 0, issue: 0, blocking: 0 }): ShipChange => ({
     name,
     kind,
     host,
@@ -39,7 +43,7 @@ function commits() {
     open,
     superseded_by: null,
   });
-  const row = (o: Record<string, unknown>) => ({ repo: REPO, branch: "main", environments: [], tags: [], runs: [], kind: "commit", host: null, change: null, fold_under: null, actions: [], ...o });
+  const row = (o: Row): ShipCommit => ({ repo: REPO, branch: "main", environments: [], tags: [], runs: [], kind: "commit", host: null, change: null, fold_under: null, actions: [], ...o });
   return [
     row({
       sha: sha("4"),
@@ -182,6 +186,7 @@ export function handleShip(req: http.IncomingMessage, res: http.ServerResponse, 
   if (url.pathname !== "/api/ship/commits" || (req.method ?? "GET") !== "GET") return false;
   const q = url.searchParams;
   const list = commits().filter((c) => (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"));
-  ctx.json(res, 200, { commits: list, next_cursor: null });
+  const page: ShipPage = { commits: list, next_cursor: null };
+  ctx.json(res, 200, page);
   return true;
 }
