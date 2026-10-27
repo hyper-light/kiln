@@ -547,6 +547,46 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
     }
 }
 
+async fn lacks(hub: &Hub, target: &str, kind: &'static Kind) -> bool {
+    if !hub.harness.lacks(target, kind.id) {
+        return false;
+    }
+    if target != "local" {
+        return true;
+    }
+    crate::reach::serve::login_env().await;
+    !crate::rt::blocking(move || kind.available()).await.unwrap_or(false)
+}
+
+fn harness(id: &str) -> Result<&'static Kind, Refused> {
+    let kind = Kind::get(id).ok_or_else(|| bad(format!("unknown harness {id:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity")))?;
+    if !kind.structured() {
+        return Err(bad(format!("{} has no structured mode", kind.name)));
+    }
+    Ok(kind)
+}
+
+pub async fn placed(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str) -> Result<String, Refused> {
+    let kind = harness(kind)?;
+    let default_target = parent.map(|p| if p.target.is_empty() { "local".to_owned() } else { p.target.clone() });
+    let target = pick(hub, on, kind.id, default_target.as_deref())?;
+    if lacks(hub, &target, kind).await {
+        return Err(not_installed(hub, &target, kind));
+    }
+    Ok(target)
+}
+
+fn not_installed(hub: &Hub, target: &str, kind: &Kind) -> Refused {
+    let machine = target.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), str::to_owned);
+    let (with, _) = candidates(hub, &crate::reach::directory::Want { harness: Some(kind.id.to_owned()), ..Default::default() });
+    let why = if with.is_empty() {
+        format!("{} isn't installed on {machine}, nor on any other connected machine", kind.name)
+    } else {
+        format!("{} isn't installed on {machine}: pick a machine that has it with `on`: {}", kind.name, with.join(", "))
+    };
+    (StatusCode::CONFLICT, why)
+}
+
 /// Whether agents on `target` (`local`, `agent:<machine>`) can have workspaces of their own: its
 /// kiln asks its machine about folders, and its machine has Slates and can mount a volume.
 pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
@@ -745,10 +785,7 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
-    let kind = Kind::get(&ask.kind).ok_or_else(|| bad(format!("unknown harness {:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity", ask.kind)))?;
-    if !kind.structured() {
-        return Err(bad(format!("{} has no structured mode", kind.name)));
-    }
+    let kind = harness(&ask.kind)?;
     let volume = match ask.workspace.as_deref().map(str::trim) {
         None | Some("" | "folder") => false,
         Some("volume") => true,
@@ -759,6 +796,9 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     let target = pick(hub, ask.on.as_deref(), kind.id, default_target.as_deref())?;
     if let Some(asker) = &by.asker {
         may_run_on(asker, &target, "start an agent there")?;
+    }
+    if lacks(hub, &target, kind).await {
+        return Err(not_installed(hub, &target, kind));
     }
     if volume {
         workspaces_on(hub, &target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
@@ -974,6 +1014,46 @@ mod tests {
             held.sort();
             anyhow::ensure!(held == ["next", "on"], "{held:?}");
             anyhow::ensure!(on_goals(&hub, Vec::new()).await.is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_agent_never_starts_on_a_machine_kiln_knows_lacks_its_harness() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let offering = |ids: &[&str]| {
+                super::super::kinds::offered()
+                    .into_iter()
+                    .map(|mut k| {
+                        k.available = ids.contains(&k.id.as_str());
+                        k
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (name, os, arch) in [("box", "linux", "x86_64"), ("studio", "macos", "aarch64"), ("new", "linux", "x86_64")] {
+                hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, os, arch));
+            }
+            hub.harness.set_kinds("local", offering(&["claude"]));
+            hub.harness.set_kinds("agent:box", offering(&["claude", "devin"]));
+            hub.harness.set_kinds("agent:studio", offering(&["claude"]));
+            let person = Starter { actor: "admin".into(), ..Starter::default() };
+            let ask = |kind: &str, on: Option<&str>| Ask { kind: kind.into(), on: on.map(str::to_owned), ..Ask::default() };
+            for on in ["studio", "agent:studio"] {
+                let (code, why) = start(&hub, &person, ask("devin", Some(on))).await.err().ok_or_else(|| anyhow::anyhow!("started on {on}"))?;
+                anyhow::ensure!(code == StatusCode::CONFLICT && why == "Devin isn't installed on studio: pick a machine that has it with `on`: box", "{on}: {why}");
+            }
+            let parent = Info { id: "p".into(), kind: "claude".into(), target: "agent:studio".into(), mode: "bypassPermissions".into(), ..Info::default() };
+            let child = Starter { parent: Some(parent), actor: "agent:p".into(), ..Starter::default() };
+            let why = start(&hub, &child, ask("devin", None)).await.err().map(|(_, w)| w).unwrap_or_default();
+            anyhow::ensure!(why == "Devin isn't installed on studio: pick a machine that has it with `on`: box", "{why}");
+            for on in ["local", "server"] {
+                let why = start(&hub, &person, ask("amp", Some(on))).await.err().map(|(_, w)| w).unwrap_or_default();
+                anyhow::ensure!(why == "Amp isn't installed on the kiln server (`local`), nor on any other connected machine", "{on}: {why}");
+            }
+            anyhow::ensure!(!hub.harness.lacks("agent:new", "devin") && !hub.harness.lacks("agent:box", "devin") && hub.harness.lacks("agent:box", "codex"));
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            anyhow::ensure!(!hub.harness.lacks("agent:studio", "devin"), "tests' sessions run no harness, whatever the machine has");
             Ok(())
         })
     }

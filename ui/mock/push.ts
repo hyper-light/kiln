@@ -10,6 +10,7 @@
 import type http from "node:http";
 import { createECDH, randomBytes } from "node:crypto";
 import type { AgentInfo } from "../src/api/harness.ts";
+import { defaultInfo } from "./defaults.ts";
 
 type Kind = "agent.needs_you" | "agent.finished" | "agent.stopped" | "agent.paused" | "machine.battery_low";
 
@@ -121,6 +122,7 @@ export function pushHeard(ev: unknown) {
 const FLEET = process.env.MOCK_PUSH_FLEET === "1";
 const t0 = Date.now();
 const base = (id: string, name: string, target: string, kind: "claude" | "codex", ago: number): AgentInfo => ({
+  ...defaultInfo(),
   id,
   kind,
   kind_name: kind === "claude" ? "Claude Code" : "Codex",

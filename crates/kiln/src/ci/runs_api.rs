@@ -106,7 +106,8 @@ async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> R
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
                 let json_col = |i: usize| -> rusqlite::Result<Value> { Ok(r.get::<_, Option<String>>(i)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)) };
-                Ok(json!({
+                let work = reused_report(r.get(17)?, r.get(20)?, r.get(21)?, r.get(7)?, r.get(12)?, r.get(13)?);
+                let mut leg = json!({
                     "id": r.get::<_, String>(0)?, "key": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?, "job": r.get::<_, Option<String>>(3)?,
                     "matrix": json_col(4)?, "status": r.get::<_, String>(5)?, "conclusion": r.get::<_, Option<String>>(6)?, "runner": r.get::<_, Option<String>>(7)?,
                     "executor": r.get::<_, Option<String>>(8)?, "attempt": r.get::<_, i64>(9)?, "wait_reason": json_col(10)?, "queued_at": r.get::<_, Option<i64>>(11)?,
@@ -119,12 +120,32 @@ async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> R
                     // Whose result it took over: an earlier attempt's of this run, or another
                     // run's with the same inputs (W08-R10).
                     "reused_run": r.get::<_, Option<String>>(20)?, "reused_number": r.get::<_, Option<i64>>(21)?,
-                }))
+                });
+                // What it did, as W24-R28 reports it: a reused leg says whose result, from where.
+                if let (Some(work), Some(o)) = (work, leg.as_object_mut()) {
+                    o.insert("work".into(), work);
+                }
+                Ok(leg)
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
         .map_err(internal)
+}
+
+/// A reused leg's report (W24-R28), from its row: the leg and run it took its result from, the
+/// runner that ran that (a copy keeps its source's runner and times), and the time it saved, what
+/// its source ran; with the report in a sentence. `None` for a leg that wasn't reused.
+fn reused_report(from: Option<String>, run: Option<String>, number: Option<i64>, runner: Option<String>, started: Option<i64>, finished: Option<i64>) -> Option<Value> {
+    use kiln_ci::work::why::{How, Report};
+    let leg = from?;
+    let saved_s = started.zip(finished).map(|(s, f)| f.saturating_sub(s)).filter(|s| *s > 0).map(|s| s as f64);
+    let report = Report { how: How::Reused { run: run.unwrap_or_default(), number: number.and_then(|n| u64::try_from(n).ok()), leg: Some(leg), runner }, hits: None, saved_s, why: Vec::new() };
+    let mut v = serde_json::to_value(&report).ok()?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("summary".into(), Value::String(report.summary()));
+    }
+    Some(v)
 }
 
 /// `GET /api/ci/runs/:id`: the run and its legs.
@@ -528,10 +549,12 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
     } else {
         None
     };
-    // "Run anyway" (W08-R10): no leg takes an earlier result over.
-    let no_reuse = body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
+    // "Run anyway" (W08-R10): no leg takes an earlier result over. Run cold (W24-R23): nor does
+    // any start from kept folders or restore a cache.
+    let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);
+    let no_reuse = cold || body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, by: by.to_owned(), reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),
@@ -784,4 +807,69 @@ pub async fn caches(hub: &Hub, repo: &str, delete: Option<&str>) -> Result<Respo
         .map_err(internal)?;
     let total: i64 = rows.iter().filter_map(|c| c.get("size_in_bytes").and_then(Value::as_i64)).sum();
     Ok(srv::json(StatusCode::OK, &json!({ "total_count": rows.len(), "total_size_in_bytes": total, "caches": rows })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W24-R28 on the leg API: a reused leg's report names its source, its runner and the time it
+    /// saved; a leg that ran has none (yet).
+    #[test]
+    fn w24_r28_a_reused_legs_report() {
+        let v = reused_report(Some("l1".into()), Some("r1".into()), Some(12), Some("fedora".into()), Some(100), Some(943));
+        assert_eq!(
+            v,
+            Some(json!({ "how": "reused", "run": "r1", "number": 12, "leg": "l1", "runner": "fedora", "saved_s": 843.0, "summary": "reused from run #12 on fedora, 14 m 3 s saved" }))
+        );
+        let unknown = reused_report(Some("l1".into()), Some("r1".into()), None, None, None, None);
+        assert_eq!(unknown, Some(json!({ "how": "reused", "run": "r1", "leg": "l1", "summary": "reused from run r1" })));
+        assert_eq!(reused_report(None, None, None, Some("fedora".into()), Some(1), Some(2)), None);
+    }
+
+    /// The same through the legs `GET /api/ci/runs/:id` and `/api/ci/legs/:id` show: the copy
+    /// that took a leg's result carries the report, naming the run and leg it came from; that leg,
+    /// which ran, carries none.
+    #[test]
+    fn w24_r28_the_leg_api_reports_a_reused_leg() -> anyhow::Result<()> {
+        let store = crate::store::Store::in_memory()?;
+        crate::rt::block_on(async move {
+            let repo = crate::store::Repo {
+                id: "r1".into(),
+                name: "acme/app".into(),
+                clone_url: "https://example.com/acme/app.git".into(),
+                branches: Vec::new(),
+                poll_seconds: 60,
+                enabled: true,
+                created_at: 0,
+                last_polled_at: None,
+                last_error: None,
+                mode: "upstream".into(),
+                default_branch: None,
+                mirror: None,
+            };
+            let repo_id = store.upsert_repo(repo).await?.id;
+            store
+                .call(move |c| {
+                    c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run1', ?1, 11, 'ci', 'push', 'main', 'abc', 'completed', 0), ('run2', ?1, 12, 'ci', 'push', 'main', 'def', 'completed', 0)", params![repo_id])?;
+                    for (id, run, from) in [("src", "run1", None), ("copy", "run2", Some("src"))] {
+                        c.execute(
+                            "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, job_id, agent, started_at, finished_at, reused_from) VALUES (?1, ?2, 'build', 'build', 'succeeded', '[]', '[]', '{}', 'build', 'fedora', 100, 943, ?3)",
+                            params![id, run, from],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            let first = |ls: Vec<Value>| ls.into_iter().next().unwrap_or(Value::Null);
+            let copy = first(legs(&store, "run2", None).await.map_err(|e| anyhow::anyhow!("{e:?}"))?);
+            anyhow::ensure!(
+                copy.get("work") == Some(&json!({ "how": "reused", "run": "run1", "number": 11, "leg": "src", "runner": "fedora", "saved_s": 843.0, "summary": "reused from run #11 on fedora, 14 m 3 s saved" })),
+                "{copy}"
+            );
+            let source = first(legs(&store, "run1", None).await.map_err(|e| anyhow::anyhow!("{e:?}"))?);
+            anyhow::ensure!(source.get("id") == Some(&json!("src")) && source.get("work").is_none(), "{source}");
+            Ok(())
+        })
+    }
 }

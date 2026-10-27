@@ -135,7 +135,8 @@ fn command_schema(waits: bool) -> Value {
         "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
         "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
         "shell": {"type": "string", "description": "A named shell over there: its folder and exported variables carry over between runs that name it."},
-        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment for the command."}
+        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment for the command."},
+        "reuse": {"type": "boolean", "description": "Give back the result of an identical earlier run instead of running again (the same command, folder, environment and machine, over an identical tree; only successes are kept)."}
     });
     if waits && let Some(p) = props.as_object_mut() {
         p.insert("wait_s".into(), json!({"type": "number", "description": "Return after this many seconds even if it is still running (it keeps running in the background; default 600)."}));
@@ -506,7 +507,12 @@ impl Server {
         let cwd = s("cwd").unwrap_or_else(|| self.cwd.clone());
         let in_repo = std::process::Command::new("git").arg("-C").arg(&cwd).args(["rev-parse", "--is-inside-work-tree"]).output().is_ok_and(|o| o.status.success());
         let sync = args.get("sync").and_then(Value::as_bool).unwrap_or(in_repo);
-        let env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
+        let mut env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
+        // The copy of its tree over there is this agent's, for the rules that keep copies
+        // (docs/reach.md §5.1).
+        if sync && !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
+            env.push((super::keeper::AGENT_ENV.to_owned(), self.session.clone()));
+        }
         let req = RunReq {
             target: s("on").or_else(|| self.prefer.clone()).unwrap_or_default(),
             command,
@@ -520,7 +526,8 @@ impl Server {
             detach: false,
         };
         let mut client = Client::connect(&self.sock).map_err(|e| format!("{e:#}"))?;
-        client.send(&Req::Run(Box::new(req))).map_err(|e| format!("{e:#}"))?;
+        let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(false);
+        client.send(&if reuse { Req::RunReuse(Box::new(req)) } else { Req::Run(Box::new(req)) }).map_err(|e| format!("{e:#}"))?;
         let id = {
             let mut n = self.next.lock().map_err(|_| "busy".to_owned())?;
             *n += 1;

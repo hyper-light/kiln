@@ -61,6 +61,7 @@ fn schema(props: Value, required: &[&str]) -> Value {
 
 const RUN: &str = "The run's id.";
 const LEG: &str = "The leg's id (a job of a run, one matrix combination of it).";
+const LEG_OR_JOB: &str = "The leg's id (a job of a run, one matrix combination of it), or a `.kiln/` pipeline job's.";
 const REPO: &str = "The repository, `owner/name`.";
 
 /// A handler's response as an operation's answer.
@@ -209,7 +210,8 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({
                     "run": {"type": "string", "description": RUN}, "mode": {"type": "string", "enum": ["all", "failed", "job"]},
                     "job": {"type": "string", "description": "With mode `job`."}, "debug": {"type": "boolean"},
-                    "keep_failed": {"type": "integer", "description": "Minutes a failed leg is kept to look into (W17-R02)."}
+                    "keep_failed": {"type": "integer", "description": "Minutes a failed leg is kept to look into (W17-R02)."},
+                    "cold": {"type": "boolean", "description": "Run cold (W24-R23): no reuse, no kept folders, no cache restored."}
                 }), &["run"]),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &v, &cx.caller.name).await).await }),
@@ -260,6 +262,18 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"leg": {"type": "string", "description": LEG}}), &["leg"]),
                 route: |v| Ok((Method::POST, path(&["legs", &text(v, "leg")?, "release"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::release(&cx.hub, &text(&v, "leg")?, &by(&cx)).await).await }),
+            op!("ci.legs.runners", "Where a finished leg, or a `.kiln/` pipeline's job, could run again (W05-R28): every runner of its own, able to run it or why not; the one its last attempt ran on (`ran_on`) and whether that one can be avoided (`elsewhere`); and whether it can be retried now (`retry`).", ro: true, destructive: false,
+                input: || schema(json!({"leg": {"type": "string", "description": LEG_OR_JOB}}), &["leg"]),
+                route: |v| Ok((Method::GET, path(&["legs", &text(v, "leg")?, "runners"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::retry::runners(&cx.hub, &text(&v, "leg")?).await).await }),
+            op!("ci.legs.retry", "Run a finished leg, or a `.kiln/` pipeline's job, again (W05-R28): on any runner that can run it, on any but the one its last attempt ran on (`elsewhere`), or on one you name that can (`runner`, from ci.legs.runners). A leg of the CI engine is a new attempt of its run (the leg, and the jobs that need it); a pipeline's job runs again in its run, with the jobs that need it; another provider's job is rerun by that provider.", ro: false, destructive: false,
+                input: || schema(json!({
+                    "leg": {"type": "string", "description": LEG_OR_JOB},
+                    "runner": {"type": "string", "description": "The runner to run it on: one ci.legs.runners says is able to."},
+                    "elsewhere": {"type": "boolean", "description": "On any runner able to but the one its last attempt ran on."}
+                }), &["leg"]),
+                route: |v| Ok((Method::POST, path(&["legs", &text(v, "leg")?, "retry"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::retry::retry(&cx.hub, &text(&v, "leg")?, &v, &by(&cx)).await).await }),
             op!("ci.workflows.list", "A repository's workflows at a ref, each with whether it runs and its diagnostics.", ro: true, destructive: false,
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}, "ref": {"type": "string"}}), &["repo"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "workflows"]), query(v, &["ref"]))),

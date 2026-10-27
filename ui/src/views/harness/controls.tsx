@@ -6,12 +6,16 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { ArrowDownToLine, MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
-import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type Meta, type State } from "@/api/harness";
+import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type JsonValue, type Meta, type State } from "@/api/harness";
 import { formatBytes } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { Loadable } from "@/components/ui/loading";
 import { AtLimit } from "./elsewhere";
+
+/** Its copies on other runners and its rules for them (docs/reach.md §5.1), loaded with the sheet's group. */
+const AgentKeep = React.lazy(() => import("../keep/agent").then((m) => ({ default: m.AgentKeep })));
 
 type Send = (c: Command) => void;
 
@@ -50,7 +54,7 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
   const v = valueOf(c, state);
   const [text, setText] = React.useState(typeof v === "string" ? v : "");
   const [option, setOption] = React.useState("");
-  const set = (value: unknown, dangerous?: boolean) =>
+  const set = (value: JsonValue, dangerous?: boolean) =>
     confirm(dangerous ?? c.dangerous, `${c.label}?`, c.description ?? "This can't be undone from kiln.", () => send({ type: "control", id: c.id, value }));
   return (
     <div className="hx-ctl">
@@ -101,7 +105,7 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
             onSubmit={(e) => {
               e.preventDefault();
               const chosen = c.options?.find((o) => o.id === option) ?? c.options?.[0];
-              set(c.options?.length ? { option: chosen?.id, text } : text, chosen?.dangerous);
+              set(c.options?.length ? (chosen ? { option: chosen.id, text } : { text }) : text, chosen?.dangerous);
               setText("");
             }}
           >
@@ -256,6 +260,11 @@ export function SettingsSheet({
           <div className="hx-ctls">
             <LimitRows agent={agent} state={state} send={send} />
             <SubagentRows agent={agent} state={state} send={send} />
+            {agent && (
+              <Loadable label="its copies on other runners" fallback={null}>
+                <AgentKeep id={agent.id} />
+              </Loadable>
+            )}
             {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">

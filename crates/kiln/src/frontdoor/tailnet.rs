@@ -565,7 +565,7 @@ pub async fn sync_once(hub: &Hub) {
                 before != (g.last.ok, g.last.routes.clone(), g.last.error.clone()) || !plan.is_empty()
             };
             if changed {
-                hub.emit(&json!({ "type": "tailscale" }));
+                hub.emit(&crate::wire::events::ServerEvent::Tailscale);
             }
         }
         Err(e) => {
@@ -582,7 +582,7 @@ pub async fn sync_once(hub: &Hub) {
                 changed
             };
             if changed {
-                hub.emit(&json!({ "type": "tailscale" }));
+                hub.emit(&crate::wire::events::ServerEvent::Tailscale);
             }
         }
     }
@@ -644,7 +644,7 @@ pub async fn put(hub: &Hub, req: crate::http::server::Request) -> super::control
     }
     hub.store.audit("admin".into(), "tailnet.credential".into(), format!("Tailscale API: {} {}", cred.kind(), cred.public())).await;
     sync_once(hub).await;
-    hub.emit(&json!({ "type": "tailscale" }));
+    hub.emit(&crate::wire::events::ServerEvent::Tailscale);
     Ok(crate::http::server::json(StatusCode::OK, &view(hub)))
 }
 
@@ -663,7 +663,7 @@ pub async fn delete(hub: &Hub) -> super::control::Answer {
         g.last = Sync::default();
     }
     hub.store.audit("admin".into(), "tailnet.credential".into(), "Tailscale API: forgotten".into()).await;
-    hub.emit(&json!({ "type": "tailscale" }));
+    hub.emit(&crate::wire::events::ServerEvent::Tailscale);
     Ok(crate::http::server::json(StatusCode::OK, &view(hub)))
 }
 

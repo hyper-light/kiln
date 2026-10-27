@@ -1996,6 +1996,298 @@ jobs:
     Ok(())
 }
 
+/// W08-R08: v1's `artifacts:` on the engine are an artifact of each leg (`artifacts-<key>`), so
+/// every leg of a job list that keeps them uploads its own, as release.yaml's three platforms do
+/// (W28 step 3); one name for all of them refused the second leg's.
+#[test]
+fn w08_r08_each_legs_artifacts_are_its_own() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/rel", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "rel\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/rel.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".kiln/release.yaml"),
+        r#"name: release
+on: push
+jobs:
+  linux:
+    runs-on: local
+    checkout: false
+    steps:
+      - run: mkdir -p dist && echo linux > dist/kiln-x86_64-unknown-linux-musl
+    artifacts: ["dist/*"]
+  windows:
+    runs-on: local
+    checkout: false
+    steps:
+      - run: mkdir -p dist && echo windows > dist/kiln-x86_64-pc-windows-msvc.exe
+    artifacts: ["dist/*"]
+"#,
+    )?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "release"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let run = loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/rel&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        if let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null()) && text(r, "workflow").ends_with("release.yaml")) {
+            break r.clone();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the run didn't finish: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let (_, listed) = http(s.port, "GET", &format!("/api/ci/runs/{}/artifacts", text(&run, "id")), &s.admin, None)?;
+    assert_eq!(text(&run, "conclusion"), "success", "{listed}\n{}", s.log());
+    let names: Vec<String> = serde_json::from_str::<Value>(&listed)?.get("artifacts").and_then(Value::as_array).into_iter().flatten().map(|a| text(a, "name").to_owned()).collect();
+    assert_eq!(names.len(), 2, "{listed}");
+    assert!(names.contains(&"artifacts-linux".to_owned()) && names.contains(&"artifacts-windows".to_owned()), "{listed}");
+    Ok(())
+}
+
+/// W02-R06 through W24-R11: a v1 `cache:` folder is kept on the runner between legs of the same
+/// job: the second run reads what the first wrote.
+#[test]
+fn w24_r11_v1_cache_dirs_persist_between_legs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/kept", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "kept\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "init"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/kept.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::write(
+        work.join(".kiln/keep.yaml"),
+        "on: push\njobs:\n  build:\n    runs-on: local\n    checkout: false\n    cache: [kept]\n    steps:\n      - run: |\n          echo \"saw=$(cat kept/f 2>/dev/null || echo none)\"\n          echo \"run-${{ github.run_number }}\" > kept/f\n",
+    )?;
+    let finished = |n: usize| -> anyhow::Result<Vec<Value>> {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/kept&limit=10", &s.admin, None)?;
+            let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+            let done: Vec<Value> = list.into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
+            if done.len() >= n {
+                return Ok(done);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{n} runs didn't finish: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..4 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    for (n, what) in [(1, "first"), (2, "second")] {
+        std::fs::write(work.join("README.md"), format!("{what}\n"))?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", what]), "commit")?;
+        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+        finished(n)?;
+    }
+    let runs = finished(2)?;
+    let logs: Vec<String> = runs.iter().map(log_of).collect::<anyhow::Result<_>>()?;
+    assert!(runs.iter().all(|r| text(r, "conclusion") == "success"), "{runs:?}\n{}", s.log());
+    assert!(logs.iter().any(|l| l.contains("saw=none")), "the first leg starts empty: {logs:?}");
+    assert!(logs.iter().any(|l| l.contains("saw=run-1")), "the second leg reads what the first wrote: {logs:?}");
+    Ok(())
+}
+
+/// W24-R11: a job's warm workspace (`work: { warm: [target] }`). Its second run, on the same
+/// runner, works in the workspace the first left: the new commit checked out in place, `target`
+/// kept with what the first run built, and an untracked file the first run left gone.
+#[test]
+fn w24_r11_a_warm_jobs_next_run_sees_the_last_ones_build() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/warm", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "warm\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "init"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/warm.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::write(
+        work.join(".kiln/warm.yaml"),
+        "on: push\njobs:\n  build:\n    runs-on: local\n    work: { warm: [target] }\n    steps:\n      - run: |\n          echo \"saw=$(cat target/f 2>/dev/null || echo none)\"\n          echo \"readme=$(cat README.md)\"\n          test -e stray || echo no-stray\n          mkdir -p target && echo \"run-${{ github.run_number }}\" > target/f && touch stray\n",
+    )?;
+    let finished = |n: usize| -> anyhow::Result<Vec<Value>> {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/warm&limit=10", &s.admin, None)?;
+            let list: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+            let done: Vec<Value> = list.into_iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).collect();
+            if done.len() >= n {
+                return Ok(done);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{n} runs didn't finish: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..4 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    for (n, what) in [(1, "first"), (2, "second")] {
+        std::fs::write(work.join("README.md"), format!("{what}\n"))?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", what]), "commit")?;
+        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+        finished(n)?;
+    }
+    let runs = finished(2)?;
+    let logs: Vec<String> = runs.iter().map(log_of).collect::<anyhow::Result<_>>()?;
+    assert!(runs.iter().all(|r| text(r, "conclusion") == "success"), "{runs:?}\n{logs:?}\n{}", s.log());
+    let first = logs.iter().find(|l| l.contains("readme=first")).ok_or_else(|| anyhow::anyhow!("no first run: {logs:?}"))?;
+    assert!(first.contains("a new slot 0") && first.contains("saw=none") && first.contains("no-stray"), "the first run starts a slot, empty: {first}");
+    let second = logs.iter().find(|l| l.contains("readme=second")).ok_or_else(|| anyhow::anyhow!("no second run: {logs:?}"))?;
+    assert!(second.contains("slot 0 of the job's lane") && second.contains("in place"), "the second takes the first's slot, checked out in place: {second}");
+    assert!(second.contains("saw=run-1"), "the second run sees the first run's build: {second}");
+    assert!(second.contains("no-stray"), "and not the untracked file it left: {second}");
+    Ok(())
+}
+
+/// W24-R18 through the server: a warm job that prefers warm runners (`prefer: [{ warm: true }]`).
+/// Once its first run is done, the runner tells the server what it holds warm
+/// (`AgentMsg::WorkState`), and the second run's leg, explained (`ci.legs.routing`), says which
+/// workspace it starts from there, how warm, and the finish that makes of the first run's cold
+/// time.
+#[test]
+fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
+    /// What `f` gives once it gives something, within `secs` seconds.
+    fn wait_for<T>(secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Result<Option<T>>) -> anyhow::Result<T> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(t) = f()? {
+                return Ok(t);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{what}: not within {secs} s");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/placed", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    // The checkout pushed from: not the runner's work directory (`work`), whose files would be
+    // pushed with it.
+    let work = dir.path().join("tree");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "placed\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "init"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/placed.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    // Each leg takes a couple of seconds (a leg that takes none gains nothing from a warm
+    // workspace), and the second runs a while: long enough to be asked where it runs warm.
+    std::fs::write(
+        work.join(".kiln/placed.yaml"),
+        "on: push\njobs:\n  build:\n    runs-on: local\n    work: { warm: [target] }\n    prefer: [{ warm: true }]\n    steps:\n      - run: |\n          mkdir -p target && echo built > target/f\n          sleep 2\n          case \"$(cat README.md)\" in second) sleep 40;; esac\n",
+    )?;
+    let runs = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/placed&limit=10", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let push = |what: &str| -> anyhow::Result<()> {
+        std::fs::write(work.join("README.md"), format!("{what}\n"))?;
+        must(git(&home, &work, &["add", "."]), "add")?;
+        must(git(&home, &work, &["commit", "-qm", what]), "commit")?;
+        must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+        Ok(())
+    };
+    push("first")?;
+    wait_for(300, "the first run", || Ok(runs()?.iter().any(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).then_some(())))?;
+    push("second")?;
+    let leg = wait_for(120, "the second run's leg", || {
+        let list = runs()?;
+        let Some(run) = list.iter().find(|r| r.get("finished_at").is_none_or(Value::is_null)) else { return Ok(None) };
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).map(str::to_owned))
+    })?;
+    let lane = kiln_ci::work::slots::placement(&kiln_ci::work::slots::lane_for("acme/placed", ".kiln/placed.yaml", "build", &json!({}), String::new())).hex();
+    // The runner says it again once the leg leased the workspace: the first run's checkout, now
+    // a commit behind trunk's newest, README.md changed between them.
+    // What the repository and the leg said, should this fail.
+    let said = || -> anyhow::Result<String> {
+        let mut all = must(git(&home, &work, &["log", "--format=%H %s", "--stat"]), "log")?;
+        for step in 0..3 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    let mut last = String::new();
+    let warm = wait_for(35, "the leg's runner warm for it", || {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/routing"), &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body)?;
+        let runners = v.get("runners").and_then(Value::as_array).cloned().unwrap_or_default();
+        last = body;
+        Ok(runners.iter().filter_map(|r| r.get("warm")).find(|w| w.get("lane").and_then(Value::as_str) == Some(lane.as_str()) && w.get("behind").and_then(Value::as_u64) == Some(1)).cloned())
+    });
+    let warm = warm.map_err(|e| anyhow::anyhow!("{e}: {last}\n{}", said().unwrap_or_default()))?;
+    let num = |k: &str| warm.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101).
+    assert!(warm.get("files").and_then(Value::as_u64) == Some(1), "{warm}\n{}", said()?);
+    assert!((num("warmth") - 0.5 * 100.0 / 101.0).abs() < 1e-9 && num("run_s") > 0.0 && num("fetch_s") == 0.0 && num("finish_s") >= num("run_s"), "{warm}");
+    wait_for(120, "the second run", || Ok((runs()?.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).count() >= 2).then_some(())))?;
+    let list = runs()?;
+    assert!(list.iter().all(|r| text(r, "conclusion") == "success"), "{list:?}\n{}", s.log());
+    Ok(())
+}
+
 /// W08-R09's `kiln/cache@v1` with its local tier: a first run misses and saves every chunk; a
 /// second restores the first's entry by a restore key with nothing downloaded (the runner kept
 /// the chunks), changes a little of it, and saves only the chunks that changed.
@@ -3441,5 +3733,197 @@ jobs:
     let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
     let (_, leg_json) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
     assert!(leg_json.contains("GraphQL API for something kiln doesn't answer yet (query field `licenses`)"), "{leg_json}");
+    Ok(())
+}
+
+/// W24-R20, R21 end to end: the land queue's candidate takes trusted results for the crates its
+/// diff left alone and runs the crate the diff touched itself, after the trunk moved under the
+/// diff. Three crates (beta depends on alpha; gamma on neither), one `tests:` step in a warm
+/// workspace. D1 changes gamma, and its own run passes gamma's tests: a diff's work, untrusted.
+/// The trunk then moves (beta changes) and D1 lands: its candidate replays alpha's and beta's
+/// passes from the trunk's runs, and runs gamma's binary itself rather than take D1's pass.
+#[test]
+fn w24_r20_a_land_candidate_reuses_trusted_results_and_runs_what_its_diff_touched() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/lands.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/lands", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/lands"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/lands"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/lands"])?;
+    // Not the runner's work folder, whose files would go with each commit.
+    must(git(&home, dir.path(), &["clone", "-q", &url(&lead), "tree"]), "clone")?;
+    let work = dir.path().join("tree");
+    std::fs::write(work.join("README.md"), "lands\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let owner = url(&s.admin);
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    let lib = |value: &str| format!("pub fn value() -> u32 {{ {value} }}\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn positive() {{ assert!(super::value() > 0); }}\n}}\n");
+    let krate = |name: &str, deps: &str, value: &str| -> anyhow::Result<()> {
+        std::fs::create_dir_all(work.join(name).join("src"))?;
+        std::fs::write(work.join(name).join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"))?;
+        std::fs::write(work.join(name).join("src/lib.rs"), lib(value))?;
+        Ok(())
+    };
+    std::fs::write(work.join("Cargo.toml"), "[workspace]\nmembers = [\"alpha\", \"beta\", \"gamma\"]\nresolver = \"2\"\n")?;
+    std::fs::write(work.join(".gitignore"), "target/\nCargo.lock\n")?;
+    krate("alpha", "", "1")?;
+    krate("beta", "alpha = { path = \"../alpha\" }\n", "alpha::value() + 1")?;
+    krate("gamma", "", "3")?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n")?;
+    std::fs::write(work.join(".kiln/ci.yaml"), "on: [push, diff, land]\njobs:\n  test:\n    runs-on: local\n    work: { warm: [target] }\n    steps:\n      - name: tests\n        tests: { cargo: [--workspace] }\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "crates"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let trunk = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let runs = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/lands&limit=50", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let finished = |pick: &dyn Fn(&Value) -> bool, what: &str| -> anyhow::Result<Value> {
+        let mut last = Value::Null;
+        until(300, what, || {
+            last = runs()?.into_iter().find(|r| pick(r) && r.get("finished_at").is_some_and(|f| !f.is_null())).unwrap_or(Value::Null);
+            Ok(last.is_null().then(|| s.log()))
+        })?;
+        Ok(last)
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..4 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    let a = finished(&|r| text(r, "sha") == trunk, "the trunk's first run")?;
+    let a_log = log_of(&a)?;
+    anyhow::ensure!(text(&a, "conclusion") == "success" && ["alpha", "beta", "gamma"].iter().all(|c| a_log.contains(&format!("tests: running {c}/lib"))), "{a}\n{a_log}");
+    // D1 changes gamma; its own run passes, as a diff's work.
+    let d1 = commit(&home, &work, "gamma/src/lib.rs", &lib("2 + 1"), "Gamma, computed", &format!("I{}", "5".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", &url(&dev), "HEAD:refs/for/main"]), "submit")?;
+    let own = finished(&|r| text(r, "sha") == d1, "D1's run")?;
+    let own_log = log_of(&own)?;
+    anyhow::ensure!(text(&own, "conclusion") == "success" && own_log.contains("tests: running gamma/lib"), "{own}\n{own_log}");
+    // The trunk moves under it: beta changes.
+    must(git(&home, &work, &["checkout", "-q", &trunk]), "checkout")?;
+    std::fs::write(work.join("beta/src/lib.rs"), lib("alpha::value() + 2"))?;
+    must(git(&home, &work, &["commit", "-qam", "beta, bigger"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let moved = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let b = finished(&|r| text(r, "sha") == moved, "the trunk's second run")?;
+    let b_log = log_of(&b)?;
+    anyhow::ensure!(text(&b, "conclusion") == "success" && b_log.contains("tests: running beta/lib"), "{b}\n{b_log}");
+    let b_number = b.get("number").and_then(Value::as_i64).unwrap_or_default();
+    // D1 lands: its candidate is the moved trunk with D1 on it.
+    let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    anyhow::ensure!(st == 200, "accept: {r}");
+    let (st, e) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    anyhow::ensure!(st == 200, "land: {e}");
+    let candidate = finished(&|r| text(r, "event") == "land", "the candidate's run")?;
+    let c_log = log_of(&candidate)?;
+    anyhow::ensure!(text(&candidate, "conclusion") == "success", "{candidate}\n{c_log}");
+    anyhow::ensure!(c_log.contains("tests: running gamma/lib") && !c_log.contains("tests: gamma/lib replayed"), "the diff's own pass isn't taken: {c_log}");
+    anyhow::ensure!(c_log.contains("tests: alpha/lib replayed from run #") && c_log.contains(&format!("tests: beta/lib replayed from run #{b_number}")), "untouched crates take the trunk's trusted passes: {c_log}");
+    anyhow::ensure!(!c_log.contains("tests: running alpha/lib") && !c_log.contains("tests: running beta/lib"), "{c_log}");
+    Ok(())
+}
+
+/// W25 on W24-R29, R21 end to end: a step calls the work service's `ops` routes as an SDK would,
+/// with its leg's token. The trunk's first run records a container operation's result; a diff's
+/// run records another result for the very same operation, in its own (untrusted) domain; the
+/// trunk's next run looks the operation up and gets the trunk's result, from its first run.
+#[test]
+fn w25_container_operations_through_the_work_service_stay_in_their_domain() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/ops.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/ops", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/ops"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/ops"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&lead), "tree"]), "clone")?;
+    let work = dir.path().join("tree");
+    std::fs::write(work.join("README.md"), "ops\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let owner = url(&s.admin);
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    // The step: look the operation up, then record what this commit says it made.
+    let script = r#"origin=$(printf '%s' "$ACTIONS_RESULTS_URL" | sed -E 's#^(https?://[^/]+).*#\1#')
+auth="Authorization: Bearer $ACTIONS_RUNTIME_TOKEN"
+op='"op":{"mkfile":{"path":"/f","mode":420,"data":"x","owner":null}},"inputs":{}'
+echo "lookup: $(curl -s -X POST -H "$auth" -H 'content-type: application/json' "$origin/_kiln/work/v1/ops/lookup" -d "{$op}")"
+d=$(sha256sum made.txt | cut -d' ' -f1)
+curl -s -o /dev/null -X PUT -H "$auth" --data-binary @made.txt "$origin/_kiln/work/v1/blobs/$d"
+echo "record: $(curl -s -X POST -H "$auth" -H 'content-type: application/json' "$origin/_kiln/work/v1/ops/record" -d "{$op,\"outputs\":{\"tree\":\"sha256:$d\"}}")"
+"#;
+    let wf = format!("on: [push, diff]\njobs:\n  op:\n    runs-on: local\n    steps:\n      - name: op\n        run: |\n{}", script.lines().map(|l| format!("          {l}\n")).collect::<String>());
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/ci.yaml"), wf)?;
+    std::fs::write(work.join("made.txt"), "the trunk's\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "the op"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let trunk = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let runs = || -> anyhow::Result<Vec<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/ops&limit=50", &s.admin, None)?;
+        Ok(serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let finished = |sha: &str, what: &str| -> anyhow::Result<Value> {
+        let mut last = Value::Null;
+        until(240, what, || {
+            last = runs()?.into_iter().find(|r| text(r, "sha") == sha && r.get("finished_at").is_some_and(|f| !f.is_null())).unwrap_or(Value::Null);
+            Ok(last.is_null().then(|| s.log()))
+        })?;
+        Ok(last)
+    };
+    let log_of = |run: &Value| -> anyhow::Result<String> {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(run, "id")), &s.admin, None)?;
+        let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut all = String::new();
+        for step in 0..3 {
+            let (_, t) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+            all.push_str(&t);
+        }
+        Ok(all)
+    };
+    let a = finished(&trunk, "the trunk's first run")?;
+    let a_log = log_of(&a)?;
+    anyhow::ensure!(text(&a, "conclusion") == "success" && a_log.contains("lookup: {\"hit\":false}") && a_log.contains("record: {\"key\":"), "{a}\n{a_log}");
+    // A diff records another result for the same operation.
+    let d1 = commit(&home, &work, "made.txt", "the diff's\n", "Another result", &format!("I{}", "6".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", &url(&dev), "HEAD:refs/for/main"]), "submit")?;
+    let d = finished(&d1, "D1's run")?;
+    let d_log = log_of(&d)?;
+    anyhow::ensure!(text(&d, "conclusion") == "success" && d_log.contains("record: {\"key\":"), "{d}\n{d_log}");
+    // The trunk's next run gets the trunk's result, from its first run.
+    must(git(&home, &work, &["checkout", "-q", &trunk]), "checkout")?;
+    std::fs::write(work.join("README.md"), "ops, again\n")?;
+    must(git(&home, &work, &["commit", "-qam", "again"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &owner, "HEAD:main"]), "push")?;
+    let again = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    let b = finished(&again, "the trunk's next run")?;
+    let b_log = log_of(&b)?;
+    let trunks = format!("sha256:{}", hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"the trunk's\n")));
+    let number = a.get("number").and_then(Value::as_i64).unwrap_or_default();
+    anyhow::ensure!(b_log.contains("lookup: {\"hit\":true") && b_log.contains(&trunks) && b_log.contains(&format!("\"number\":{number}")), "the trunk's result, never the diff's: {b_log}");
     Ok(())
 }

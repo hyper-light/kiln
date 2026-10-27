@@ -35,6 +35,14 @@ fn join(path: &str, rel: &str) -> String {
     if rel.is_empty() { path.to_owned() } else { format!("{}/{rel}", path.trim_end_matches('/')) }
 }
 
+fn homed(path: &str, home: Option<&str>) -> String {
+    match home.and_then(|h| within(path, h)) {
+        Some(rel) if rel.is_empty() => "~".to_owned(),
+        Some(rel) => format!("~/{rel}"),
+        None => path.to_owned(),
+    }
+}
+
 /// Start moving session `id` to runner `to`: Ok once it is under way (what it does next shows in
 /// its timeline), or why it can't. `now`: the turn under way doesn't finish here; it is
 /// interrupted once the other runner is ready, and picked up there. `kind`: it goes on there in
@@ -42,9 +50,12 @@ fn join(path: &str, rel: &str) -> String {
 pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<serde_json::Value, String> {
     let to = to.strip_prefix("agent:").unwrap_or(to).to_owned();
     let info = hub.harness.list().into_iter().find(|i| i.id == id).ok_or_else(|| "no such agent".to_owned())?;
-    let from = match hub.harness.location(id) {
+    let location = hub.harness.location(id);
+    let local = location == Some(Location::Local);
+    let from = match location {
         Some(Location::Machine(m)) => m,
-        _ => return Err("only an agent on a runner moves (this one runs on the kiln server)".into()),
+        Some(Location::Local) if hub.harness.never_started(id) => "the kiln server".to_owned(),
+        _ => return Err("the kiln server keeps the agents it runs once they've started: only one whose harness never started there moves".into()),
     };
     if from == to {
         return Err(format!("it runs on {to} already"));
@@ -70,6 +81,14 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     let installed = hub.harness.kinds().get(&format!("agent:{to}")).is_some_and(|ks| ks.iter().any(|k| k.id == goes_on_in && k.available));
     if !installed {
         return Err(format!("{named} is not installed on {to}"));
+    }
+    if local {
+        if kind.is_some() {
+            return Err(format!("from the kiln server it goes on in {} alone", info.kind_name));
+        }
+        let there = homed(&info.cwd, Some(&crate::os::home_dir().to_string_lossy()));
+        hub.harness.move_local(hub, id, &to, &there).await?;
+        return Ok(serde_json::json!({ "moving": to, "from_server": true }));
     }
     // Its machine is away: it can't hand the session over, so it goes on from the server's copy of
     // its conversation (`docs/conversations.md`, "Resuming on another machine").
@@ -169,11 +188,7 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away:
     let view = crate::sync::places::now(hub).await.map_err(|e| format!("{e:#}"))?;
     let home = hub.places.of(from).map(|h| h.home).filter(|h| !h.is_empty());
     // `~/…` for a path under `from`'s home: the same place under `to`'s.
-    let mapped = |path: &str| match home.as_deref().and_then(|h| within(path, h)) {
-        Some(rel) if rel.is_empty() => "~".to_owned(),
-        Some(rel) => format!("~/{rel}"),
-        None => path.to_owned(),
-    };
+    let mapped = |path: &str| homed(path, home.as_deref());
     let found: Option<(&Row, &Place)> = view.repos.iter().find_map(|r| r.places.iter().find(|p| p.machine == from && within(cwd, &p.path).is_some()).map(|p| (r, p)));
     let Some((row, place)) = found else {
         return Ok((mapped(cwd), Some(format!("Its folder isn't a git repository kiln knows, so its files stay on {from}."))));
@@ -244,5 +259,9 @@ mod tests {
         assert_eq!(within("/Users/ada/Projects/kiln-old", "/Users/ada/Projects/kiln"), None);
         assert_eq!(join("/home/ada/Projects/kiln", "crates/kiln"), "/home/ada/Projects/kiln/crates/kiln");
         assert_eq!(join("~/Projects/kiln", ""), "~/Projects/kiln");
+        assert_eq!(homed("/home/kiln/work/app", Some("/home/kiln")), "~/work/app");
+        assert_eq!(homed("/tmp", Some("/tmp")), "~");
+        assert_eq!(homed("/srv/app", Some("/home/kiln")), "/srv/app");
+        assert_eq!(homed("/srv/app", None), "/srv/app");
     }
 }

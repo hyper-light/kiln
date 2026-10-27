@@ -224,7 +224,6 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
     spec.program = None;
     spec.takeover_pid = None;
     spec.takeover_stop = false;
-    spec.prompt = None;
     spec.resume_at = None;
     spec.fork = false;
     match &carry {
@@ -388,6 +387,8 @@ mod tests {
         assert_eq!((p.spec.model.as_deref(), p.spec.mode.as_deref(), p.spec.effort.as_deref()), (Some("claude-opus-5-5"), Some("acceptEdits"), Some("high")));
         assert_eq!(p.spec.env, vec![("ANTHROPIC_BASE_URL".to_owned(), "http://mock".to_owned())]);
         assert!(p.spec.shell.is_none() && p.spec.program.is_none());
+        let never = pack("k2", Spec { kind: "claude".into(), prompt: Some("fix the flaky test".into()), ..Spec::default() }, "~", "mac", "/w", Carry::Nothing, Vec::new(), State::default());
+        assert_eq!(never.spec.prompt.as_deref(), Some("fix the flaky test"));
         let again: Package = serde_json::from_slice(&serde_json::to_vec(&p)?)?;
         assert_eq!(again.carry, p.carry);
         // A package from a runner that never interrupts a turn to move picks nothing up.

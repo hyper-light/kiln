@@ -18,7 +18,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
+import { EmptyState, FilterBar, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
@@ -33,6 +33,7 @@ import { PlaceList, TaskList, taskLine } from "./places";
 import { PutForm, type PutMode } from "./put";
 import { SyncActivity } from "./sync-activity";
 import { ScopeSecrets } from "../settings-ci";
+import { RepoKeep } from "../keep/repo";
 import { Providers } from "./providers";
 import "./repos.css";
 
@@ -316,9 +317,8 @@ function ReposBody() {
 
 function ReposToolbar({ q, onQ, view, onView, facets, count }: { q: string; onQ: (v: string) => void; view: ListView; onView: (v: ListView) => void; facets: React.ComponentProps<typeof FacetBox>["facets"]; count: string }) {
   return (
-    <div className="repos-tools">
+    <FilterBar className="repos-tools" aside={<span className="label tabular-nums">{count}</span>}>
       <FacetBox
-        className="repos-filter"
         label="Filter repositories"
         placeholder="Filter by name, machine, OS, architecture, kind, state…"
         query={q}
@@ -327,9 +327,8 @@ function ReposToolbar({ q, onQ, view, onView, facets, count }: { q: string; onQ:
         chosen={view.facets}
         onChosen={(f) => onView({ ...view, facets: f })}
       />
-      <SelectField className="repos-sort" label="Sort repositories" hideLabel value={view.sort} onChange={(v) => onView({ ...view, sort: v as SortId })} options={SORTS} />
-      <span className="label repos-count tabular-nums">{count}</span>
-    </div>
+      <SelectField label="Sort repositories" hideLabel value={view.sort} onChange={(v) => onView({ ...view, sort: v as SortId })} options={SORTS} />
+    </FilterBar>
   );
 }
 
@@ -579,6 +578,12 @@ function Details({
         // What runs its CI (W23-R07), when its host makes a choice possible.
         <Loadable label="what runs its CI" fallback={<></>}>
           <Providers repo={r.name} />
+        </Loadable>
+      )}
+      {!e.key.startsWith("here:") && (
+        // The copies of its trees runners keep for others, and its rules for them (docs/reach.md §5.1).
+        <Loadable label="its copies on runners" fallback={<Hold height={160} />}>
+          <RepoKeep repoKey={e.key} />
         </Loadable>
       )}
       {r && (

@@ -7,7 +7,7 @@
 import * as React from "react";
 import type { AgentInfo } from "@/api/harness";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { SelectField } from "@/components/ui/misc";
+import { FilterBar, SelectField } from "@/components/ui/misc";
 import { modelLabel, tildify } from "./derive";
 import { machineName } from "./parts";
 
@@ -195,9 +195,8 @@ function facetsOf(rows: ViewRow[], q: string, chosen: Chosen): Facet[] {
 export function ListBar({ rows, q, onQuery, view, onView }: { rows: ViewRow[]; q: string; onQuery: (q: string) => void; view: ListView; onView: (v: ListView) => void }) {
   const facets = React.useMemo(() => facetsOf(rows, q, view.facets), [rows, q, view.facets]);
   return (
-    <div className="ms-bar">
+    <FilterBar className="ms-bar">
       <FacetBox
-        className="ms-filter"
         label="Filter agents"
         placeholder="Filter by name, runner, harness, state…"
         query={q}
@@ -206,8 +205,8 @@ export function ListBar({ rows, q, onQuery, view, onView }: { rows: ViewRow[]; q
         chosen={view.facets}
         onChosen={(facets) => onView({ ...view, facets })}
       />
-      <SelectField className="ms-sort" label="Sort agents" hideLabel value={view.sort} onChange={(v) => onView({ ...view, sort: v as SortId })} options={SORTS} />
-    </div>
+      <SelectField label="Sort agents" hideLabel value={view.sort} onChange={(v) => onView({ ...view, sort: v as SortId })} options={SORTS} />
+    </FilterBar>
   );
 }
 

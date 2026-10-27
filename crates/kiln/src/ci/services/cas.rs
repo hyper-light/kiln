@@ -286,13 +286,15 @@ pub struct Collected {
 }
 
 /// What refers to an object: a cache entry, an artifact, a release asset, a test report, a registry
-/// blob or a proxied one.
+/// blob or a proxied one, or the work ledger (a step's kept files, `work.object` keyed
+/// `<scope><digest>`: W24-R07).
 const UNREFERENCED: &str = "digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)
    AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)
    AND digest NOT IN (SELECT object FROM ci_release_assets)
    AND digest NOT IN (SELECT object FROM test_reports)
    AND 'sha256:' || digest NOT IN (SELECT digest FROM registry_blobs)
-   AND digest NOT IN (SELECT digest FROM proxy_cache)";
+   AND digest NOT IN (SELECT digest FROM proxy_cache)
+   AND digest NOT IN (SELECT substr(key, -64) FROM work_records WHERE family = 'work.object')";
 
 /// Lets go of objects nothing refers to, unused for an hour (an upload in progress may be about to
 /// refer to one): each one's record, then its bytes, under its digest's lock.

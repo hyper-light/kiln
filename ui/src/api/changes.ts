@@ -4,34 +4,8 @@
  */
 import type { Res } from "@/lib/data";
 import { request } from "./client";
-
-export interface AgentChange {
-  agent: string;
-  /** The repository as kiln knows it (`owner/name`). */
-  repo?: string;
-  /** `kiln`, `github`, `gitlab`, `bitbucket`, or `git` (a remote kiln has no integration with). */
-  provider: string;
-  /** `CR12`, `#34`, or none: the branch is pushed, the pull request not opened yet. */
-  change?: string;
-  /** Its page, or where to open it. */
-  url: string;
-  branch: string;
-  trunk: string;
-  sha: string;
-  version: number;
-  files: string[];
-  title: string;
-  /** `open`, `landed` or `closed`. */
-  state: string;
-  /** kiln's own review state (`needs-review`, `approved`, `changes-requested`, …). */
-  review?: string;
-  /** How its newest version's checks went (`passed`, `failed`, …). */
-  checks?: string;
-  /** Failing checks go to the agent to fix. */
-  fix_checks: boolean;
-  opened_at: number;
-  updated_at: number;
-}
+import type { AgentChange } from "./wire";
+export type { AgentChange } from "./wire";
 
 export interface OpenChange {
   title?: string;

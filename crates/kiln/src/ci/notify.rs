@@ -325,7 +325,24 @@ pub struct Subject {
 
 impl Subject {
     fn run_value(&self) -> Value {
-        json!({ "repo": self.repo, "id": self.run, "number": self.number, "workflow": self.workflow, "name": self.name, "branch": self.branch, "sha": self.sha, "message": self.message, "actor": self.actor, "conclusion": self.conclusion, "url": self.url })
+        serde_json::to_value(self.run_ref()).unwrap_or(Value::Null)
+    }
+
+    /// The run (or diff) it's about, as rules and the events socket read it (`run`).
+    fn run_ref(&self) -> crate::wire::events::NoticeRun {
+        crate::wire::events::NoticeRun {
+            repo: self.repo.clone(),
+            id: self.run.clone(),
+            number: self.number,
+            workflow: self.workflow.clone(),
+            name: self.name.clone(),
+            branch: self.branch.clone(),
+            sha: self.sha.clone(),
+            message: self.message.clone(),
+            actor: self.actor.clone(),
+            conclusion: self.conclusion.clone(),
+            url: self.url.clone(),
+        }
     }
 }
 
@@ -749,7 +766,12 @@ async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about:
 /// Sends `event` about `s` through every rule of `repo` that takes it.
 pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
     // For outgoing webhooks' subscribers too (W19-R07), and the UI.
-    hub.emit(&json!({ "type": event, "repo": { "id": repo.id, "name": repo.name }, "run": s.run_value(), "environments": s.environments }));
+    use crate::wire::events::{NoticeKind, RepoRef, RunNotice, ServerEvent};
+    match NoticeKind::of(event) {
+        Some(kind) => hub.emit(&ServerEvent::RunNotice(Box::new(RunNotice { kind, repo: RepoRef { id: repo.id.clone(), name: repo.name.clone() }, run: s.run_ref(), environments: s.environments.clone() }))),
+        // Every name this is called with is a [`NoticeKind`] (`wire::events`' tests).
+        None => tracing::warn!(%event, "a notice that isn't one of the events socket's: not sent to it"),
+    }
     let m = Msg::of_run(event, s);
     for (name, rule) in rules_for(hub, repo).await {
         if !takes(&rule, event, s) {
@@ -1288,8 +1310,9 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
         // Gone from the live runners: the labels it has on record.
         None => hub.store.agents().await.unwrap_or_default().into_iter().find(|a| a.name == name).map(|a| a.labels).unwrap_or_default(),
     };
-    let runner = json!({ "name": name, "labels": labels, "gone_for": gone_for });
-    hub.emit(&json!({ "type": "runner.offline", "runner": runner }));
+    let offline = crate::wire::events::OfflineRunner { name: name.clone(), labels: labels.clone(), gone_for };
+    let runner = serde_json::to_value(&offline).unwrap_or(Value::Null);
+    hub.emit(&crate::wire::events::ServerEvent::RunnerOffline { runner: offline });
     let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
     let title = format!("⚠ runner {name} is offline");
     let line = format!("gone {} min · {} · {url}", gone_for / 60, if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") });
@@ -1324,8 +1347,10 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
 /// that finishes its record: `deploy.held` (a check that holds failed; it was kept),
 /// `deploy.rolled_back`, or `deploy.rollback_failed` (the version put back couldn't start).
 /// Server rules see `deploy`: its `app`, `from`, `to` and `revision`.
-pub async fn self_deploy(hub: Arc<Hub>, event: &'static str, deploy: Value, message: String) {
-    hub.emit(&json!({ "type": event, "deploy": deploy, "message": message }));
+pub async fn self_deploy(hub: Arc<Hub>, kind: crate::wire::events::SelfDeployKind, deploy: crate::wire::events::SelfDeploy, message: String) {
+    let event = kind.as_str();
+    hub.emit(&crate::wire::events::ServerEvent::SelfDeploy(crate::wire::events::SelfDeployNotice { kind, deploy: deploy.clone(), message: message.clone() }));
+    let deploy = serde_json::to_value(&deploy).unwrap_or(Value::Null);
     let url = format!("{}/deployments", hub.cfg.server.public_url.trim_end_matches('/'));
     let app = deploy.get("app").and_then(Value::as_str).unwrap_or("kiln").to_owned();
     let title = match event {

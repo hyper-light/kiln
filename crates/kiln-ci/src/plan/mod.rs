@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::expr::{self, Budget, Condition, Contexts, Dialect, ExprError, ParseOptions, StatusView, Template, Value};
 use crate::trigger::pattern::Patterns;
 use crate::wf::ir::{Axis, Job, JobSecrets, Matrix, Need, RunsOn, Tpl, Workflow, YVal};
+use crate::work::graph::{self, Ecosystem, Graph};
 use matrix::Combo;
 
 /// How a leg, a job or a run ended.
@@ -73,7 +74,8 @@ pub struct RunInput {
     pub inputs: serde_json::Value,
     /// `vars`.
     pub vars: serde_json::Value,
-    /// The event's changed files, for `changed()` (W03-R12); `None` when not known.
+    /// The event's changed files, for `changed()` (W03-R12) and `affected()` (W24-R17); `None`
+    /// when not known.
     pub changed: Option<Arc<Vec<String>>>,
     /// Untrusted runs (W03-R08) get read-only permissions.
     pub trusted: bool,
@@ -122,6 +124,11 @@ pub trait PlanSource {
     fn files(&self, pattern: &str) -> Vec<String> {
         let _ = pattern;
         Vec::new()
+    }
+    /// The package graph at the run's commit, for `affected()` (W24-R16, R17), asked for once as
+    /// the run starts; `None` when it isn't read, and `affected()` then says so.
+    fn graph(&self) -> Option<Arc<Graph>> {
+        None
     }
 }
 
@@ -231,6 +238,12 @@ pub struct LegSpec {
     /// The most its cache mode may be, when it's in a called workflow: its caller's (W08-R14).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_cap: Option<String>,
+    /// Why the plan would have skipped it, when only what the change didn't touch kept its `if`
+    /// (or `when`) from holding and its job opts in to reuse: it's queued to finish reused, naming
+    /// the result it takes, and with none to take it's skipped for this (W24-R06). Not part of
+    /// what a leg is, so not of its reuse key.
+    #[serde(skip)]
+    pub unaffected: Option<String>,
     /// The workflow file that defines its job (W06-R03's `job.workflow_*`, the OIDC token's
     /// `job_workflow_ref`).
     pub defined_in: DefinedIn,
@@ -393,6 +406,8 @@ pub struct RunPlan {
     pub name: Option<String>,
     /// The workflow's concurrency group.
     pub concurrency: Option<GroupSpec>,
+    /// The workflow's `coalesce:` and `cadence:`, in seconds (W28-R61, R62).
+    pub admission: crate::sched::admit::Spec,
     input: RunInput,
     github: Value,
     vars: Value,
@@ -408,6 +423,8 @@ pub struct RunPlan {
     run_env: Vec<(usize, String, String)>,
     /// The combinations `exclude` and `where:` removed, by job, with why: for the preview.
     removed: BTreeMap<String, Vec<(serde_json::Value, String)>>,
+    /// The commit's package graph ([`PlanSource::graph`]), for `affected()`.
+    graph: Option<Arc<Graph>>,
 }
 
 /// One job, as the run page and persistence see it.
@@ -432,6 +449,8 @@ struct Cx {
     values: Vec<(&'static str, Value)>,
     status: StatusView,
     changed: Option<Arc<Vec<String>>>,
+    /// The commit's package graph, for `affected()` (W24-R17).
+    graph: Option<Arc<Graph>>,
 }
 
 impl Contexts for Cx {
@@ -450,6 +469,65 @@ impl Contexts for Cx {
         let p = Patterns::new(globs).map_err(|e| ExprError::new("KCI2020", e.to_string(), None))?;
         Ok(p.any(files.iter().map(String::as_str)))
     }
+
+    /// The event's changed files mapped to their packages, and every package that depends on
+    /// them ([`graph::affected`]). A graph with problems in the ecosystem may be short of
+    /// packages, so it isn't used: the problem is the error.
+    fn affected(&self, ecosystem: &str) -> Result<Vec<String>, ExprError> {
+        let eco = Ecosystem::parse(ecosystem).ok_or_else(|| ExprError::new("KCI2020", format!("affected(): `{ecosystem}` is not an ecosystem: cargo, npm (pnpm, yarn), uv or go"), None))?;
+        let Some(files) = &self.changed else {
+            return Err(ExprError::new("KCI2011", "affected() needs the event's changed files, which this event doesn't have", None));
+        };
+        let Some(g) = &self.graph else {
+            return Err(ExprError::new("KCI2013", "affected() needs the repository's package graph, which this run doesn't have", None));
+        };
+        if let Some(p) = g.problems_of(eco).next() {
+            let more = g.problems_of(eco).count().saturating_sub(1);
+            let more = if more == 0 { String::new() } else { format!(" (and {more} more)") };
+            return Err(ExprError::new("KCI2013", format!("affected('{eco}'): the {eco} package graph couldn't be read: {p}{more}"), None));
+        }
+        Ok(graph::affected(g, eco, files).into_iter().collect())
+    }
+}
+
+/// [`Cx`] as if the change had touched everything: `changed()` holds for any pattern, and
+/// `affected()` lists every package of its ecosystem. A condition false with the run's own change
+/// that holds here was false only for what the change didn't touch (W24-R06).
+struct Everything<'a>(&'a Cx);
+
+impl Contexts for Everything<'_> {
+    fn get(&self, name: &str) -> Option<Value> {
+        self.0.get(name)
+    }
+
+    fn status(&self) -> StatusView {
+        self.0.status
+    }
+
+    fn changed(&self, globs: &[String]) -> Result<bool, ExprError> {
+        Patterns::new(globs).map_err(|e| ExprError::new("KCI2020", e.to_string(), None))?;
+        Ok(true)
+    }
+
+    fn affected(&self, ecosystem: &str) -> Result<Vec<String>, ExprError> {
+        let eco = Ecosystem::parse(ecosystem).ok_or_else(|| ExprError::new("KCI2020", format!("affected(): `{ecosystem}` is not an ecosystem"), None))?;
+        let g = self.0.graph.as_ref().ok_or_else(|| ExprError::new("KCI2013", "affected() needs the repository's package graph", None))?;
+        let all: std::collections::BTreeSet<String> = g.of(eco).filter(|p| p.member).map(|p| p.name.clone()).collect();
+        Ok(all.into_iter().collect())
+    }
+}
+
+/// Whether a job opts in to reuse (`reuse:`, or `work: { memo }`, W08-R10, W24-R06).
+fn opts_in(job: &Job) -> bool {
+    job.kiln.reuse.as_ref().is_some_and(|v| reuse::Spec::from_yval(v).ok().flatten().is_some())
+}
+
+/// Whether a condition of a job (`t`: its `if`, or its matrix's `when`), false with the run's
+/// change, would hold had the change touched everything, and the job opts in to reuse: then only
+/// what the change didn't touch kept it from running, so its legs are queued to finish reused,
+/// else skipped (W24-R06). A job that calls a workflow has no legs of its own to reuse.
+fn unaffected_if(job: &Job, t: &Tpl, dialect: Dialect, cx: &Cx) -> bool {
+    job.uses.is_none() && opts_in(job) && condition_in(t, dialect, &Everything(cx), "if").unwrap_or(false)
 }
 
 fn err_at(what: &str, e: &ExprError) -> String {
@@ -467,6 +545,10 @@ fn template_value(t: &Tpl, dialect: Dialect, cx: &Cx, what: &str) -> Result<Valu
 }
 
 fn condition(t: &Tpl, dialect: Dialect, cx: &Cx, what: &str) -> Result<bool, String> {
+    condition_in(t, dialect, cx, what)
+}
+
+fn condition_in(t: &Tpl, dialect: Dialect, cx: &dyn Contexts, what: &str) -> Result<bool, String> {
     let c = Condition::parse(&t.src, &ParseOptions::permissive(dialect)).map_err(|e| err_at(what, &e))?;
     expr::eval_condition(&c, cx, &mut Budget::default()).map_err(|e| err_at(what, &e))
 }
@@ -539,7 +621,7 @@ impl RunPlan {
         let github = Value::from_json(&input.github);
         let vars = Value::from_json(&input.vars);
         let inputs = Value::from_json(&input.inputs);
-        let cx = Cx { values: vec![("github", github.clone()), ("inputs", inputs.clone()), ("vars", vars.clone())], status: StatusView::default(), changed: None };
+        let cx = Cx { values: vec![("github", github.clone()), ("inputs", inputs.clone()), ("vars", vars.clone())], status: StatusView::default(), changed: None, graph: None };
         let name = match &wf.run_name {
             Some(t) => Some(template(t, dialect, &cx, "run-name")?).filter(|n| !n.trim().is_empty()),
             None => None,
@@ -548,9 +630,11 @@ impl RunPlan {
             Some(c) => Some(group(c, dialect, &cx, "concurrency")?),
             None => None,
         };
+        let admission = crate::sched::admit::Spec::parse(wf.coalesce.as_ref(), wf.cadence.as_ref())?;
         let mut plan = RunPlan {
             name,
             concurrency,
+            admission,
             input,
             github,
             vars,
@@ -565,6 +649,7 @@ impl RunPlan {
             output_bytes: 0,
             run_env: Vec::new(),
             removed: BTreeMap::new(),
+            graph: src.graph(),
         };
         plan.add_scope(wf, dialect, inputs, String::new(), String::new(), None, 0, None, None, SecretsSpec::Run);
         let mut out = Vec::new();
@@ -1034,7 +1119,7 @@ impl RunPlan {
         if self.scope_of(n).is_some_and(|s| s.dialect == Dialect::Kiln) {
             values.push(("run", self.run_context(n)));
         }
-        Cx { values, status: self.status(n), changed: self.input.changed.clone() }
+        Cx { values, status: self.status(n), changed: self.input.changed.clone(), graph: self.graph.clone() }
     }
 
     /// kiln's `run` context: `run.env` as written by the job's needs, transitively (W04-R21).
@@ -1057,14 +1142,20 @@ impl RunPlan {
         let Some((job, dialect)) = self.job_def(n).map(|(j, d)| (j.clone(), d)) else { return };
         let id = self.nodes.get(n).map(|x| x.id.clone()).unwrap_or_default();
         let has_leg_needs = self.nodes.get(n).is_some_and(|x| !x.leg_needs.is_empty());
+        // W24-R06: why it would have been skipped, when only what the change didn't touch kept
+        // its `if` from holding: its legs go on to be reused, else skipped for it.
+        let mut unaffected: Option<String> = None;
         if !has_leg_needs {
             let cx = self.base_cx(n, self.needs_context(n, None));
             match self.job_if(&job, dialect, &cx) {
                 Ok(true) => {}
                 Ok(false) => {
                     let reason = skip_reason(&job, cx.status);
-                    self.conclude_job(n, Conclusion::Skipped, reason, out);
-                    return;
+                    if !job.cond.as_ref().is_some_and(|t| unaffected_if(&job, t, dialect, &cx)) {
+                        self.conclude_job(n, Conclusion::Skipped, reason, out);
+                        return;
+                    }
+                    unaffected = Some(reason);
                 }
                 Err(e) => {
                     self.conclude_job(n, Conclusion::Failure, e, out);
@@ -1072,11 +1163,17 @@ impl RunPlan {
                 }
             }
         }
+        // A job that wouldn't have run doesn't fail for what it couldn't expand: it's skipped.
+        let fails = |e: String| match &unaffected {
+            Some(r) => (Conclusion::Skipped, r.clone()),
+            None => (Conclusion::Failure, e),
+        };
         let cx = self.base_cx(n, self.needs_context(n, None));
         let mut legs = match self.legs_of(n, &job, dialect, &cx, src) {
             Ok(l) => l,
             Err(e) => {
-                self.conclude_job(n, Conclusion::Failure, e, out);
+                let (c, why) = fails(e);
+                self.conclude_job(n, c, why, out);
                 return;
             }
         };
@@ -1093,7 +1190,8 @@ impl RunPlan {
         let (ff, max_parallel, per_axis) = match strategy_settings(&job, dialect, &cx) {
             Ok(s) => s,
             Err(e) => {
-                self.conclude_job(n, Conclusion::Failure, e, out);
+                let (c, why) = fails(e);
+                self.conclude_job(n, c, why, out);
                 return;
             }
         };
@@ -1126,7 +1224,7 @@ impl RunPlan {
             let key = self.unique_key(key);
             let spec = self.leg_spec(n, &job, dialect, &lcx, &combo, strategy, key.clone(), base_name, format!("{prefix}{display}"), items, requires, emulated);
             match spec {
-                Ok(spec) => built.push(Leg { spec, combo, state: LegState::Waiting, report: LegReport::default(), finished: 0, called: None, deps: Vec::new(), cancel_sent: false }),
+                Ok(spec) => built.push(Leg { spec: LegSpec { unaffected: unaffected.clone(), ..spec }, combo, state: LegState::Waiting, report: LegReport::default(), finished: 0, called: None, deps: Vec::new(), cancel_sent: false }),
                 Err((spec, e)) => failures.push((*spec, e)),
             }
         }
@@ -1164,12 +1262,13 @@ impl RunPlan {
             }
         }
         for (spec, e) in failures {
+            let (c, why) = fails(e);
             let at = self.nodes.get(n).map_or(0, |x| x.legs.len());
             self.keys.insert(spec.key.clone(), (n, at));
             if let Some(node) = self.nodes.get_mut(n) {
-                node.legs.push(Leg { spec: spec.clone(), combo: Vec::new(), state: LegState::Done(Conclusion::Failure), report: LegReport::default(), finished: 0, called: None, deps: Vec::new(), cancel_sent: false });
+                node.legs.push(Leg { spec: spec.clone(), combo: Vec::new(), state: LegState::Done(c), report: LegReport::default(), finished: 0, called: None, deps: Vec::new(), cancel_sent: false });
             }
-            out.push(PlanAction::Settle { leg: Box::new(spec), conclusion: Conclusion::Failure, reason: e });
+            out.push(PlanAction::Settle { leg: Box::new(spec), conclusion: c, reason: why });
         }
         let _ = id;
     }
@@ -1254,7 +1353,7 @@ impl RunPlan {
         if let Some(f) = &filter {
             let mut kept = Vec::new();
             for c in combos {
-                let mut wcx = Cx { values: cx.values.clone(), status: cx.status, changed: cx.changed.clone() };
+                let mut wcx = Cx { values: cx.values.clone(), status: cx.status, changed: cx.changed.clone(), graph: cx.graph.clone() };
                 wcx.values.push(("matrix", combo_value(&c)));
                 if condition(f, dialect, &wcx, "strategy.matrix.where")? {
                     kept.push(c);
@@ -1351,6 +1450,7 @@ impl RunPlan {
             emulated,
             reads: reads(job),
             cache_cap: None,
+            unaffected: None,
             defined_in: scope.map(|s| s.defined.clone()).unwrap_or_default(),
             workflow: wf.clone(),
             job_index,
@@ -1489,6 +1589,8 @@ impl RunPlan {
                 cx.status = self.leg_status(n, &deps);
                 match self.job_if(&job, dialect, &cx) {
                     Ok(true) => {}
+                    // W24-R06: false only for what the change didn't touch: reused, else skipped.
+                    Ok(false) if job.cond.as_ref().is_some_and(|t| unaffected_if(&job, t, dialect, &cx)) => spec.unaffected = Some(skip_reason(&job, cx.status)),
                     Ok(false) => {
                         let reason = skip_reason(&job, cx.status);
                         self.settle(n, l, spec, Conclusion::Skipped, reason, out);
@@ -1509,6 +1611,9 @@ impl RunPlan {
                 cx.values.push(("matrix", combo_value(&combo)));
                 match condition(w, dialect, &cx, "strategy.when") {
                     Ok(true) => {}
+                    Ok(false) if unaffected_if(&job, w, dialect, &cx) => {
+                        spec.unaffected.get_or_insert_with(|| "skipped by when".into());
+                    }
                     Ok(false) => {
                         self.settle(n, l, spec, Conclusion::Skipped, "skipped by when".into(), out);
                         changed = true;
@@ -1616,7 +1721,7 @@ impl RunPlan {
             }
         }
         let called_dialect = wf.dialect.unwrap_or(Dialect::Gha);
-        let dcx = Cx { values: vec![("github", self.github.clone()), ("inputs", Value::Null), ("vars", self.vars.clone())], status: StatusView::default(), changed: None };
+        let dcx = Cx { values: vec![("github", self.github.clone()), ("inputs", Value::Null), ("vars", self.vars.clone())], status: StatusView::default(), changed: None, graph: None };
         let mut inputs: Vec<(String, Value)> = Vec::new();
         for i in &call.inputs {
             let given = with.iter().find(|(k, _)| k.eq_ignore_ascii_case(&i.name)).map(|(_, v)| v.clone());
@@ -1734,7 +1839,7 @@ impl RunPlan {
             let all: Vec<usize> = (0..x.legs.len()).collect();
             Some((x.local.clone(), self.need_value(*m, &all, scope.dialect)))
         }));
-        let cx = Cx { values: vec![("github", self.github.clone()), ("jobs", jobs), ("vars", self.vars.clone()), ("inputs", scope.inputs.clone())], status: StatusView::default(), changed: None };
+        let cx = Cx { values: vec![("github", self.github.clone()), ("jobs", jobs), ("vars", self.vars.clone()), ("inputs", scope.inputs.clone())], status: StatusView::default(), changed: None, graph: None };
         let mut outputs = Vec::new();
         if let Some(call) = scope.wf.trigger("workflow_call") {
             for o in &call.outputs {
