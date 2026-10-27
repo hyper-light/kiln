@@ -6,6 +6,7 @@
  */
 import { apiPath } from "@/lib/peer-base";
 import { request } from "./client";
+import type { ReviewMark } from "./review";
 
 export type ShipStand = "needs_you" | "failing" | "landing" | "checking" | "building" | "in_staging" | "waiting" | "shipping" | "replanting" | "shipped" | "fixed" | "rolled_back" | "superseded";
 
@@ -59,6 +60,8 @@ export interface ShipCommit {
   /** The change's tip this commit folds under. */
   fold_under?: string | null;
   actions?: ShipAction[];
+  /** A hash of what the row shows (W26-R06): the same row, the same `v`. */
+  v?: string;
 }
 
 export interface ShipPage {
@@ -71,11 +74,13 @@ export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded"
 
 /** A commit with every record its stand came from: `GET /api/ship/commits/{repo}/{sha}`. */
 export interface ShipDetail extends ShipCommit {
-  checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string; job?: string; run?: string }[] }[];
+  checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string; job?: string; run?: string; start?: number; end?: number }[] }[];
   build?: { platforms: { name: string; state: ShipPart }[]; image: { state: ShipPart; digest: string | null } };
   deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
   releases?: { state: string; message: string | null; rolled_back: boolean }[];
   replant?: { name: string; state: string; why: string }[];
+  /** Review's marks, oldest first (W26-R14), for the Review lane group. */
+  review?: ReviewMark[];
 }
 
 /** What a list asks for: a repository, the facets (W26-R02), a page. */

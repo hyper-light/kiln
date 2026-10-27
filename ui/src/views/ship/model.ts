@@ -2,8 +2,9 @@
  * Ship's list, the pure part (docs/ci.md W26-R01, R02): a change's folded commits under its tip,
  * the needs-you-first order by stand, the words of each stand and action, and the facets.
  */
-import type { ShipCommit, ShipPip } from "@/api/ship";
-import { GLYPHS, type GlyphState, type Pip } from "@/components/ui/status-glyph-spec";
+import type { ShipCommit, ShipDetail, ShipPip } from "@/api/ship";
+import { GLYPHS, STAGE_WORD, type GlyphState, type Pip, type Stage } from "@/components/ui/status-glyph-spec";
+import type { ShipLane, ShipLaneGroup } from "./review/lanes";
 
 /** Each stand's place in the needs-you-first order, and its word. */
 export const STANDS: { id: string; word: string }[] = [
@@ -205,4 +206,26 @@ export function pickCard(cards: readonly { state: string }[]): number {
     if (st && st !== "none" && st !== "queued") return i;
   }
   return 0;
+}
+
+/** A deployment's state as a glyph's (W26-R14's lanes). */
+const DEPLOY_GLYPH: Record<string, string> = { success: "passed", failure: "failed", error: "failed", inactive: "superseded", in_progress: "running", pending: "queued", queued: "queued" };
+
+/**
+ * Ship's stages as the Lanes' groups (W26-R14), in the journey's order after Review: each its pip's
+ * state, and a lane for what the detail times (each Checks leg that ran, each deploy).
+ */
+export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
+  const pip = (stage: Stage) => detail.pips.find((p) => p.stage === stage)?.state ?? "none";
+  const legs: ShipLane[] = (detail.checks ?? []).flatMap((c) =>
+    c.legs.flatMap((l) =>
+      l.start === undefined ? [] : [{ id: l.job ?? `${c.pipeline}/${l.name}`, name: l.name, state: l.state, start: l.start, end: l.end ?? null, ...(l.note ? { note: l.note } : {}) }],
+    ),
+  );
+  const deploys = (production: boolean): ShipLane[] =>
+    (detail.deployments ?? [])
+      .filter((d) => d.production === production)
+      .map((d) => ({ id: `${d.environment}@${d.at}`, name: d.environment, state: DEPLOY_GLYPH[d.state ?? ""] ?? "none", start: d.at, end: d.at, ...(d.description ? { note: d.description } : {}) }));
+  const group = (stage: Stage, lanes: ShipLane[]): ShipLaneGroup => ({ group: stage, label: STAGE_WORD[stage], state: pip(stage), note: "", lanes });
+  return [group("land", []), group("checks", legs), group("build", []), group("staging", deploys(false)), group("production", deploys(true)), group("replant", [])];
 }

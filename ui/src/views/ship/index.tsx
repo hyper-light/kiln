@@ -208,7 +208,10 @@ function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; o
         </span>
         <span className="ship-metas">
           <span>
-            {c.author} · <RelTime ts={c.at} />
+            {c.author} ·{" "}
+            <span className="ship-ago">
+              <RelTime ts={c.at} />
+            </span>
           </span>
           <span className="ship-m2">
             {c.change && <span className="ship-change">{c.change.name}</span>}

@@ -892,7 +892,9 @@ export class Trunk {
           attempts: j.retried ? 2 : 1,
           note: j.note,
           // Once it has run, the job it ran as and that job's run (Output streams its log).
-          ...(j.state === "none" || j.state === "queued" ? {} : { job: `ship-job-${c.id}-${p.name}-${i}`, run: `ship-run-${c.id}` }),
+          ...(j.state === "none" || j.state === "queued"
+            ? {}
+            : { job: `ship-job-${c.id}-${p.name}-${i}`, run: `ship-run-${c.id}`, start: wall(j.start), ...(j.state === "running" ? {} : { end: wall(j.end) }) }),
         })),
       })),
       build: {

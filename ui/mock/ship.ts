@@ -8,6 +8,7 @@
 import type http from "node:http";
 import type { ShipChange, ShipCommit, ShipDetail, ShipPage, ShipPip } from "../src/api/ship.ts";
 import { Trunk } from "./ship-sim.ts";
+import type { ReviewMark } from "../src/api/review.ts";
 
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
@@ -71,13 +72,14 @@ function commits(): ShipCommit[] {
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
       ],
     }),
-    // A landed change: its tip commit carries its review, approved and landed (W26-R14's e2e).
+    // A landed change: its tip commit carries its review, approved and landed (W26-R14's e2e), older
+    // than D41 so the newest is still D41, on a sha of its own.
     row({
-      sha: sha("5"),
-      short: "5555555",
+      sha: sha("6"),
+      short: "6666666",
       message: "ci: a landed change",
       author: "user:ada",
-      at: t - 300,
+      at: t - 5400,
       stand: "shipped",
       line: "Landed · In production",
       cursor: 12,
@@ -230,6 +232,45 @@ const arrival = (n: number): ShipCommit => ({
   actions: [],
 });
 
+/**
+ * A fixed row's review marks, oldest first (W26-R14): a commit with no change has one, its push; a
+ * change has a push per revision, a comment per open thread, and its approval, asked or given.
+ */
+function marksOf(c: ShipCommit): ReviewMark[] {
+  const base = c.at - 3600;
+  const push = (n: number | null, at: number): ReviewMark => ({ id: `${c.short}-push-${n ?? 0}`, kind: "push", at, end: at, by: c.author, signer: null, revision: n, state: "passed" });
+  const ch = c.change;
+  if (!ch) return [push(null, c.at)];
+  const marks: ReviewMark[] = [];
+  for (let n = 1; n <= ch.revision; n++) marks.push(push(n, base + n * 600));
+  const after = base + ch.revision * 600;
+  const open = ch.open ? ch.open.question + ch.open.nit + ch.open.issue + ch.open.blocking : 0;
+  for (let i = 0; i < open; i++)
+    marks.push({
+      id: `${ch.name}-comment-${i}`,
+      kind: "comment",
+      at: after + 60 * (i + 1),
+      end: null,
+      by: ch.turn[0] ?? "user:kim",
+      signer: null,
+      revision: ch.revision,
+      state: "requested",
+      thread: `${ch.name}-t${i}`,
+    });
+  const approved = ch.state === "approved" || ch.state === "landed";
+  marks.push({
+    id: `${ch.name}-approval`,
+    kind: "approval",
+    at: after + 300,
+    end: approved ? after + 900 : null,
+    by: ch.turn[0] ?? "user:lee",
+    signer: null,
+    revision: ch.revision,
+    state: approved ? "approved" : "requested",
+  });
+  return marks;
+}
+
 /** Every row: those a test added, the trunk's commits (newest first), then the fixed ones. */
 const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...commits()];
 
@@ -255,7 +296,13 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const row = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
     const live = ctx.liveJob?.();
     const fixed: ShipDetail | null = row
-      ? { ...row, checks: live ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run }] }] : [] }
+      ? {
+          ...row,
+          review: marksOf(row),
+          checks: live
+            ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run, start: now() - 120 }] }]
+            : [],
+        }
       : null;
     const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
     if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });
