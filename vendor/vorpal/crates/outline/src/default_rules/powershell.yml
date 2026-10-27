@@ -1,0 +1,81 @@
+id: ps-function
+language: PowerShell
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_statement
+    - has:
+        kind: function_name
+        pattern:
+          context: function $NAME {}
+          selector: function_name
+name: '$NAME'
+---
+id: ps-class
+language: PowerShell
+role: item
+symbolType: class
+# Kind-based: the class name is the class_statement's direct simple_name child
+# (snippet context-patterns do not parse in this grammar).
+rule:
+  all:
+    - kind: class_statement
+    - has:
+        kind: simple_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: ps-method
+language: PowerShell
+role: member
+parentRuleIds: [ps-class]
+symbolType: method
+rule:
+  all:
+    - kind: class_method_definition
+    - has:
+        kind: simple_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: ps-property
+language: PowerShell
+role: member
+parentRuleIds: [ps-class]
+symbolType: field
+rule:
+  all:
+    - kind: class_property_definition
+    - has:
+        stopBy: end
+        kind: variable
+        pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: ps-enum
+language: PowerShell
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: enum_statement
+    - has:
+        kind: simple_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: ps-enum-member
+language: PowerShell
+role: member
+parentRuleIds: [ps-enum]
+symbolType: enumMember
+rule:
+  all:
+    - kind: enum_member
+    - has:
+        kind: simple_name
+        pattern: $NAME
+name: '$NAME'
+isPublic: true

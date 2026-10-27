@@ -57,6 +57,7 @@ pub mod routing;
 pub mod runs;
 pub mod runs_api;
 pub mod sbom;
+pub mod search;
 pub mod schedule;
 pub mod secrets;
 pub mod services;

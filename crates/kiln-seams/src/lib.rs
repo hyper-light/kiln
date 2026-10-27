@@ -13,6 +13,7 @@
 //! | [`Sandbox`](sandbox::Sandbox) | a harness launched in a boundary | `host`, then Shards (CP-T4.1), then Hex |
 //! | [`Placement`](placement::Placement) | where work runs, by resources | Hex (CP-T7.1) |
 //! | [`HarnessPort`](harness::HarnessPort) | kiln's agents: who they are, and commands to them | kiln's harness registry |
+//! | [`Search`](search::Search) | a tree's files, searched by text or by code's shape | vorpal (`kiln-search`, W26-R07) |
 //!
 //! Each module holds the trait, its simulator (`Sim*`: deterministic, in memory, bounded) and its
 //! conformance suite (`conformance::cases`, run with [`conformance::run`] against a fixture that
@@ -34,6 +35,7 @@ pub mod harness;
 pub mod placement;
 pub mod records;
 pub mod sandbox;
+pub mod search;
 pub mod secrets;
 pub mod spawn;
 
@@ -45,6 +47,7 @@ pub use harness::HarnessPort;
 pub use placement::Placement;
 pub use records::Records;
 pub use sandbox::Sandbox;
+pub use search::Search;
 pub use secrets::Secrets;
 pub use spawn::Spawn;
 

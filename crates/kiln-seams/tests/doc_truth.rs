@@ -204,6 +204,22 @@ fn seams() -> Vec<Seam> {
                 count(harness::SIM_INBOX as u64)
             )],
         },
+        Seam {
+            title: "Search",
+            file: "search.rs",
+            tr: "Search",
+            more: &[],
+            cases: said(&search::cases::<search::SimSearchFixture>()),
+            bounds: vec![
+                format!("holding {} trees", count(search::SIM_TREES as u64)),
+                format!("tree ids 1 to {} bytes", search::TREE_ID_MAX),
+                format!("files to {}", size(search::FILE_MAX as u64)),
+                format!("{} files and {} a tree", count(search::TREE_FILES_MAX as u64), size(search::TREE_BYTES_MAX)),
+                format!("queries to {} bytes", count(search::QUERY_MAX as u64)),
+                format!("{} hits a search", count(search::HITS_MAX as u64)),
+                format!("{} characters of a hit's line", count(search::LINE_MAX as u64)),
+            ],
+        },
     ]
 }
 

@@ -1,0 +1,240 @@
+//! L1→L3 assembly: outline extraction → interned nodes + containment graph, then queries.
+
+use std::borrow::Cow;
+
+use vorpal_kg::{EdgeType, Kg, KgWriter, NodeId, SymbolKind};
+use vorpal_outline::model::{
+  EntryRole, OutlineEntry, OutlineItem, OutlineMember, SourcePosition, SourceRange, SymbolType,
+};
+
+fn range() -> SourceRange {
+  SourceRange {
+    byte_offset: 0..1,
+    start: SourcePosition { line: 0, column: 0 },
+    end: SourcePosition { line: 0, column: 1 },
+  }
+}
+
+fn entry(
+  role: EntryRole,
+  sym: SymbolType,
+  name: &'static str,
+  sig: &'static str,
+) -> OutlineEntry<'static> {
+  OutlineEntry {
+    role,
+    symbol_type: sym,
+    name: Cow::Borrowed(name),
+    range: range(),
+    signature: Cow::Borrowed(sig),
+    ast_kind: Cow::Borrowed(""),
+  }
+}
+
+fn item(
+  sym: SymbolType,
+  name: &'static str,
+  sig: &'static str,
+  exported: bool,
+  members: Vec<OutlineMember<'static>>,
+) -> OutlineItem<'static> {
+  OutlineItem {
+    entry: entry(EntryRole::Item, sym, name, sig),
+    is_import: false,
+    is_exported: exported,
+    members,
+  }
+}
+
+fn member(sym: SymbolType, name: &'static str, sig: &'static str) -> OutlineMember<'static> {
+  OutlineMember {
+    entry: entry(EntryRole::Member, sym, name, sig),
+    is_public: true,
+  }
+}
+
+/// A class `Parser` with a method and a field, plus a free function.
+fn parser_file() -> Vec<OutlineItem<'static>> {
+  vec![
+    item(
+      SymbolType::Class,
+      "Parser",
+      "class Parser",
+      true,
+      vec![
+        member(SymbolType::Method, "parse", "parse(input)"),
+        member(SymbolType::Field, "pos", "pos: usize"),
+      ],
+    ),
+    item(SymbolType::Function, "helper", "fn helper()", false, vec![]),
+  ]
+}
+
+fn find(kg: &Kg, name: &str) -> NodeId {
+  (0..kg.node_count() as u64)
+    .map(NodeId::new)
+    .find(|&id| kg.node(id).is_some_and(|v| v.name == name))
+    .unwrap_or_else(|| panic!("node {name} not found"))
+}
+
+fn defines_names(kg: &Kg, id: NodeId) -> Vec<String> {
+  let mut names: Vec<String> = kg
+    .defines(id)
+    .into_iter()
+    .map(|n| kg.node(n).unwrap().name.to_string())
+    .collect();
+  names.sort();
+  names
+}
+
+#[test]
+fn assembles_nodes_and_containment_edges() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("src/parser.rs", &parser_file());
+  let kg = writer.seal();
+
+  // File + Parser + parse + pos + helper.
+  assert_eq!(kg.node_count(), 5);
+
+  let file = find(&kg, "src/parser.rs");
+  let parser = find(&kg, "Parser");
+  let parse = find(&kg, "parse");
+  let pos = find(&kg, "pos");
+  let helper = find(&kg, "helper");
+
+  // Node attributes come back from the sealed columns + heap.
+  let pv = kg.node(parser).unwrap();
+  assert_eq!(pv.kind, SymbolKind::Class);
+  assert_eq!(pv.signature, "class Parser");
+  assert_eq!(pv.path, "src/parser.rs");
+  assert!(pv.exported);
+  assert_eq!(kg.node(file).unwrap().kind, SymbolKind::File);
+  assert_eq!(kg.node(parse).unwrap().kind, SymbolKind::Method);
+  assert_eq!(kg.node(pos).unwrap().kind, SymbolKind::Field);
+  assert!(!kg.node(helper).unwrap().exported);
+
+  // Containment forest: file defines the two top-level items.
+  assert_eq!(defines_names(&kg, file), vec!["Parser", "helper"]);
+  // Parser has a method and a field.
+  assert_eq!(defines_names(&kg, parser), vec!["parse", "pos"]);
+
+  // Edge kinds distinguish method vs field.
+  let out: Vec<(NodeId, EdgeType)> = kg.out_neighbors(parser);
+  assert!(out.contains(&(parse, EdgeType::HAS_METHOD)));
+  assert!(out.contains(&(pos, EdgeType::HAS_FIELD)));
+
+  // Reverse containment (`callersOf`-style CSC read).
+  assert_eq!(kg.container_of(parse), Some(parser));
+  assert_eq!(kg.container_of(parser), Some(file));
+  assert_eq!(kg.container_of(file), None);
+}
+
+#[test]
+fn dedups_repeated_ingest_of_the_same_file() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("a.rs", &parser_file());
+  let first = writer.node_count();
+  // Re-ingesting the identical file assigns no new ids (canonical dedup).
+  writer.ingest_file("a.rs", &parser_file());
+  assert_eq!(writer.node_count(), first);
+}
+
+#[test]
+fn keeps_files_independent() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file(
+    "a.rs",
+    &[item(SymbolType::Function, "f", "fn f()", true, vec![])],
+  );
+  writer.ingest_file(
+    "b.rs",
+    &[item(SymbolType::Function, "f", "fn f()", true, vec![])],
+  );
+  let kg = writer.seal();
+
+  // Same symbol name in two files → two distinct nodes (path-qualified identity).
+  assert_eq!(kg.node_count(), 4); // 2 files + 2 functions
+  let a = find(&kg, "a.rs");
+  let b = find(&kg, "b.rs");
+  assert_eq!(defines_names(&kg, a), vec!["f"]);
+  assert_eq!(defines_names(&kg, b), vec!["f"]);
+  // The two `f` nodes have different containers.
+  assert_ne!(kg.defines(a)[0], kg.defines(b)[0]);
+}
+
+#[test]
+fn transitive_containment_closure() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("src/parser.rs", &parser_file());
+  let kg = writer.seal();
+
+  let file = find(&kg, "src/parser.rs");
+  let parse = find(&kg, "parse");
+
+  let names = |ids: Vec<NodeId>| {
+    let mut v: Vec<String> = ids
+      .into_iter()
+      .map(|n| kg.node(n).unwrap().name.to_string())
+      .collect();
+    v.sort();
+    v
+  };
+
+  // The file transitively contains every node beneath it (§11.5 closure over out-edges).
+  assert_eq!(
+    names(kg.reachable_out(file)),
+    vec!["Parser", "helper", "parse", "pos"]
+  );
+  // A method's container chain up to the file (transitive in-edges).
+  assert_eq!(
+    names(kg.reachable_in(parse)),
+    vec!["Parser", "src/parser.rs"]
+  );
+  // A leaf method reaches nothing downward.
+  assert!(kg.reachable_out(parse).is_empty());
+}
+
+#[test]
+fn name_queries_over_the_kg() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("src/parser.rs", &parser_file());
+  let kg = writer.seal();
+
+  assert_eq!(kg.nodes_named("parse").len(), 1);
+  assert_eq!(kg.nodes_named("Parser").len(), 1);
+  assert!(kg.nodes_named("missing").is_empty());
+  // A containment-only graph has no `calls` edges.
+  assert!(kg.callers_of("parse").is_empty());
+}
+
+#[test]
+fn persists_and_cold_opens_the_kg() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("src/parser.rs", &parser_file());
+  let kg = writer.seal();
+  let file = find(&kg, "src/parser.rs");
+  let before = defines_names(&kg, file);
+
+  let dir = std::env::temp_dir().join(format!("vorpal-kg-persist-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  kg.save(&dir).unwrap();
+
+  // Cold open (the node segment is mmapped, not heap-loaded).
+  let loaded = vorpal_kg::Kg::load(&dir).unwrap();
+  assert_eq!(loaded.node_count(), kg.node_count());
+  let file2 = find(&loaded, "src/parser.rs");
+  assert_eq!(loaded.node(file2).unwrap().name, "src/parser.rs");
+  assert_eq!(
+    defines_names(&loaded, file2),
+    before,
+    "containment survives the round-trip"
+  );
+  let parser = find(&loaded, "Parser");
+  assert_eq!(
+    defines_names(&loaded, parser),
+    vec!["parse", "pos"],
+    "members survive too"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}
