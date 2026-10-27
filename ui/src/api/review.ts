@@ -46,6 +46,10 @@ export interface DiffVersion {
   note: string | null;
   created_at: number;
   ref: string;
+  /** Why it exists (W26-R04) when it isn't a push: `suggestion applied`, `conflict resolved`. */
+  why?: string | null;
+  /** The thread it answers (a suggestion's). */
+  thread?: string | null;
 }
 
 export interface DiffRun {
@@ -124,7 +128,26 @@ export interface ThreadComment {
   created_at: number;
   /** Yours, not published yet: it goes out with your review. */
   draft: boolean;
+  /** Its author deleted it: a thread's first comment stays, saying `deleted`, while replies remain (W26-R08). */
+  deleted?: boolean;
+  /** Its suggestions (W26-R10): its body's ```suggestion blocks, then its old `suggestion` field as one more. */
+  suggestions?: Suggestion[];
 }
+
+/** A comment's suggestion (W26-R10): the lines it puts where its thread's lines are (none: they go), and which revision applied it. */
+export interface Suggestion {
+  /** Which of the comment's suggestions it is, from 0: what Apply's `suggestion` names. */
+  index: number;
+  lines: string[];
+  /** The comment's old `suggestion` field, not a block of its body. */
+  field: boolean;
+  applied: { version: number; by: string; at: number } | null;
+  /** Its lines changed since it was written: it doesn't apply. */
+  outdated: boolean;
+}
+
+/** A thread's kind (W26-R11); threads from before kinds are questions. */
+export type ThreadKind = "question" | "nit" | "issue" | "blocking";
 
 export interface Thread {
   id: string;
@@ -142,6 +165,24 @@ export interface Thread {
   /** Where it sits in the latest version. */
   now: { version: number; start_line: number; end_line: number } | null;
   comments: ThreadComment[];
+  kind?: ThreadKind;
+  /** Who resolved it, when, and why (an owner resolving someone else's blocking thread says why). */
+  resolved_by?: string | null;
+  resolved_at?: number | null;
+  resolution?: string | null;
+}
+
+/** The gate (W26-R11) as it stands for you approving: a blocking thread or a conflict holds it, open issues warn, open nits inform. */
+export interface ReviewGate {
+  verdict: "hold" | "warn" | "inform" | "clear";
+  /** What holds it, each naming where it is, whose it is to resolve (a conflict: no one's), and why. */
+  holds: { at: string; by: string | null; reason: string }[];
+  open: { question: number; nit: number; issue: number; blocking: number };
+  conflicts: number;
+  /** `2 issues open`: approving asks to go ahead anyway. */
+  warning: string | null;
+  /** `1 nit open`: approving says so. */
+  note: string | null;
 }
 
 export interface Readiness {
@@ -233,16 +274,26 @@ export const reviewApi = {
   interdiff: (key: string, from: number, to: number, signal?: AbortSignal) => request<Interdiff>("GET", `/api/diffs/${enc(key)}/interdiff?from=${from}&to=${to}`, undefined, { signal }),
   dependencies: (key: string, to: number, from: number | null, signal?: AbortSignal) =>
     request<Dependencies>("GET", `/api/diffs/${enc(key)}/dependencies?to=${to}${from != null ? `&from=${from}` : ""}`, undefined, { signal }),
-  threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[] }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
+  threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[]; gate?: ReviewGate }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
   comment: (
     key: string,
-    body: { body: string; suggestion?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number },
+    body: { body: string; suggestion?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number; kind?: ThreadKind },
   ) => request<{ id: string; thread: string; draft: boolean }>("POST", `/api/diffs/${enc(key)}/comments`, body),
-  editComment: (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open" }) =>
-    request<{ id: string; thread: string; state: string }>("PATCH", `/api/comments/${enc(id)}`, body),
-  applySuggestion: (id: string) => request<unknown>("POST", `/api/comments/${enc(id)}/apply`, {}),
-  review: (key: string, action: ReviewAction, body: string) =>
-    request<{ diff: string; action: string; version: number; published: number; state: string }>("POST", `/api/diffs/${enc(key)}/review`, { action, body }),
+  editComment: (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open"; kind?: ThreadKind; reason?: string }) =>
+    request<{ id: string; thread: string; state: string; kind?: ThreadKind }>("PATCH", `/api/comments/${enc(id)}`, body),
+  deleteComment: (id: string) => request<{ id: string; thread: string; deleted: boolean; thread_deleted: boolean }>("DELETE", `/api/comments/${enc(id)}`),
+  applySuggestion: (id: string, suggestion?: number) =>
+    request<{ diff: string; version: number; thread: string; state: string; commit?: string; suggestion?: number; signer?: string | null }>(
+      "POST",
+      `/api/comments/${enc(id)}/apply`,
+      suggestion == null ? {} : { suggestion },
+    ),
+  review: (key: string, action: ReviewAction, body: string, force?: boolean) =>
+    request<{ diff: string; action: string; version: number; published: number; state: string; note?: string | null }>(
+      "POST",
+      `/api/diffs/${enc(key)}/review`,
+      force ? { action, body, force } : { action, body },
+    ),
   viewed: (key: string, file: string, viewed: boolean) => request<{ file: string; viewed: boolean; version: number }>("POST", `/api/diffs/${enc(key)}/viewed`, { file, viewed }),
   readiness: (key: string, signal?: AbortSignal) => request<Readiness>("GET", `/api/diffs/${enc(key)}/land`, undefined, { signal }),
   land: (key: string, strategy?: string) => request<unknown>("POST", `/api/diffs/${enc(key)}/land`, strategy ? { strategy } : {}),
@@ -370,3 +421,83 @@ export const STATE_WORD: Record<string, string> = {
   landed: "Landed",
   abandoned: "Abandoned",
 };
+
+/** A conflict's kind (W26-R12): a text file's conflicts sit where they fall and resolve line by line; the others take a side. */
+export type ConflictKind = "text" | "binary" | "modify_delete" | "delete_modify" | "other";
+
+/** How a conflict is resolved (W26-R12): main's side, this change's, both (main's then this change's), an agent's resolution, or an edit. */
+export type ConflictTake = "main" | "this" | "both" | "agent" | "edit";
+
+/** A text conflict's side (its lines, and where they start in that side's own file); a path taken whole: what that side has there, or null where it deleted it. */
+export type ConflictSide = { start?: number | null; lines: string[] } | { mode: string; blob: string } | null;
+
+/** A conflict of a change's replay onto where it lands, where it falls (W26-R12). */
+export interface Conflict {
+  id: string;
+  file: string;
+  kind: ConflictKind;
+  /** A text conflict's place among its file's, from 0. */
+  hunk: number | null;
+  /** How many conflicts its file has. */
+  of: number;
+  /** Where it falls in this change's own file (a text conflict). */
+  line: number | null;
+  end_line: number | null;
+  main: ConflictSide;
+  this: ConflictSide;
+  base: ConflictSide;
+  /** What it is, in words, for a conflict resolved by taking a side. */
+  says: string | null;
+  /** git's own words on it. */
+  git: string | null;
+  /** What resolves it. */
+  takes: ConflictTake[];
+  /** An agent's resolution, for a person to take. */
+  agent: { by: string; take: ConflictTake | null; lines: string[] | null; at: number | null } | null;
+  /** The resolution taken: what it took, the lines a text conflict resolves to, by whom and when. */
+  resolution: { take: ConflictTake; lines: string[] | null; by: string | null; at: number | null } | null;
+}
+
+/** A change's latest revision replayed onto where it lands, and its conflicts (W26-R12). */
+export interface Conflicts {
+  diff: string;
+  version: number | null;
+  /** None when there's nothing to replay; once Commit resolution made the latest revision, the replay it resolved. */
+  replay: {
+    id: string;
+    version: number;
+    commit: string;
+    onto: { name: string; commit: string };
+    state: "clean" | "conflicted" | "resolved";
+    by: string;
+    at: number;
+    resolved_in: number | null;
+    resolved_by: string | null;
+    resolved_at: number | null;
+  } | null;
+  conflicts: Conflict[];
+  unresolved: number;
+  /** Each conflict resolved: Commit resolution may go. */
+  ready: boolean;
+}
+
+/** What Commit resolution made: one revision of whoever committed it, its why `conflict resolved` (`signer` null: unsigned until W27-R03). */
+export interface ConflictsCommitted {
+  diff: string;
+  version: number;
+  why: string;
+  commit: string;
+  by: string;
+  signer: string | null;
+  replay: string;
+  conflicts: number;
+}
+
+export const conflictsApi = {
+  list: (key: string, signal?: AbortSignal) => request<Conflicts>("GET", `/api/diffs/${enc(key)}/conflicts`, undefined, { signal }),
+  resolve: (key: string, id: string, body: { take: ConflictTake; lines?: string[]; text?: string }) => request<Conflicts>("POST", `/api/diffs/${enc(key)}/conflicts/${enc(id)}/resolution`, body),
+  undo: (key: string, id: string) => request<Conflicts>("DELETE", `/api/diffs/${enc(key)}/conflicts/${enc(id)}/resolution`),
+  commit: (key: string) => request<ConflictsCommitted>("POST", `/api/diffs/${enc(key)}/conflicts/commit`, {}),
+};
+
+export const conflictsRes = (key: string): Res<Conflicts> => ({ key: `review/conflicts/${key}`, fetch: (s) => conflictsApi.list(key, s), opts: { on: ["conflict", "diff_version", "diff"] } });

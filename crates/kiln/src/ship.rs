@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use http::StatusCode;
 use kiln_cd::journey::{self, Attempt, Author, Build, Check, Journey, Kinds, Land, Leg, Part, Platform, Production, Replant, Review, ReviewState, Runner, RunnerReplant, Staging};
-use kiln_ci::review::{Facts, Open, Standing};
+use kiln_ci::review::{Facts, Kind, Standing};
 use kiln_ci::turn;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -160,6 +160,9 @@ struct ChangeRec {
     replies: Vec<(String, i64)>,
     /// The land queue's latest entry landing this change: its state and why.
     queue: Option<(String, Option<String>)>,
+    /// The conflicts its latest revision's replay onto where it lands left, each holding its gate
+    /// until Commit resolution makes a revision of them (W26-R12).
+    conflicts: Vec<kiln_ci::review::Conflict>,
 }
 
 impl ChangeRec {
@@ -240,6 +243,13 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
     ch.threads = st.query_map([&id], |r| Ok(ThreadRec { kind: r.get(0)?, file: r.get(1)?, line: r.get(2)?, by: r.get(3)?, said: r.get::<_, Option<String>>(4)?.unwrap_or_default() }))?.collect::<Result<_, _>>()?;
     let mut st = c.prepare("SELECT c.author, c.created_at FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 ORDER BY c.created_at, c.rowid")?;
     ch.replies = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut st = c.prepare(
+        "SELECT k.file, k.line, k.take IS NOT NULL FROM review_conflicts k JOIN review_replays r ON r.id = k.replay_id
+         WHERE r.id = (SELECT p.id FROM review_replays p WHERE p.diff_id = ?1 ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+           AND r.state = 'conflicted' AND r.version = (SELECT MAX(v.n) FROM diff_versions v WHERE v.diff_id = ?1)
+         ORDER BY k.position",
+    )?;
+    ch.conflicts = st.query_map([&id], |r| Ok(kiln_ci::review::Conflict { file: r.get(0)?, line: r.get(1)?, taken: r.get(2)? }))?.collect::<Result<_, _>>()?;
     ch.queue = c
         .query_row(
             "SELECT l.state, l.reason FROM land_queue l WHERE l.repo_id = ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.diffs) THEN l.diffs ELSE '[]' END) j WHERE j.value = ?2) ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
@@ -313,6 +323,8 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         threads,
         replies: Vec::new(),
         queue: None,
+        // A host's pull request is replayed on its host, not here.
+        conflicts: Vec::new(),
     })
 }
 
@@ -348,20 +360,20 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
     let mut whose: Vec<String> = turn::fold(&ch.author, &events).turn.into_iter().map(|p| if p == ch.author { author.clone() } else { p }).collect();
     whose.sort();
     whose.dedup();
-    let mut open = Kinds::default();
-    for t in &ch.threads {
-        match t.kind.as_str() {
-            "nit" => open.nit += 1,
-            "issue" => open.issue += 1,
-            "blocking" => open.blocking += 1,
-            _ => open.question += 1,
-        }
-    }
+    // The gate (W26-R11), as merging asks it: what's open by kind, and what holds the change, read
+    // as accepting and the land queue read them.
+    let threads: Vec<kiln_ci::review::Thread> = ch
+        .threads
+        .iter()
+        .map(|t| kiln_ci::review::Thread { kind: Kind::read(&t.kind), by: t.by.clone(), file: t.file.clone(), line: t.line.and_then(|l| u32::try_from(l).ok()), ..kiln_ci::review::Thread::default() })
+        .collect();
+    let gate = kiln_ci::review::gate(&threads, &ch.conflicts, None);
+    let open = Kinds { question: gate.open.question, nit: gate.open.nit, issue: gate.open.issue, blocking: gate.open.blocking };
     let facts = Facts {
         draft: ch.state == "draft",
         changes_asked: ch.state == "changes-requested",
-        open: Open { question: open.question, nit: open.nit, issue: open.issue, blocking: open.blocking },
-        conflicts: 0,
+        open: gate.open,
+        conflicts: gate.conflicts,
         fixing: false,
         policy_met: matches!(ch.state.as_str(), "accepted" | "landing" | "landed"),
     };
@@ -376,19 +388,20 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
     };
     let said = |t: &ThreadRec| format!("{}: {}", shown(&t.by), first_words(&t.said));
     let about = match state {
-        ReviewState::Blocked => ch.threads.iter().rev().find(|t| t.kind == "blocking").map(|t| match (&t.file, t.line) {
+        ReviewState::Blocked => ch.threads.iter().rev().find(|t| Kind::read(&t.kind) == Kind::Blocking).map(|t| match (&t.file, t.line) {
             (Some(f), Some(l)) => format!("{}:{l}", f.rsplit('/').next().unwrap_or(f)),
             (Some(f), None) => f.rsplit('/').next().unwrap_or(f).to_string(),
             _ => said(t),
         }),
         ReviewState::Changes => ch.reviews.iter().rev().find(|r| r.1 == "request_changes").map(|r| first_words(&r.3)),
+        ReviewState::Conflict => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)),
         ReviewState::Requested => ch.threads.last().map(said),
         _ => None,
     }
     .unwrap_or_default();
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
-    Some(Review { state, turn: whose, author, open, conflicts: 0, fixing: None, about, superseded_by })
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: None, about, superseded_by })
 }
 
 fn short(sha: &str) -> String {
@@ -1616,6 +1629,22 @@ mod tests {
                 pick(&["open", "open", "draft", "merged"]),
                 if n % 4 == 3 { sha } else { "" }
             ),
+            // A change's latest revision replayed onto main (W26-R12): conflicted (a text conflict and
+            // a binary file, one of them resolved), or clean.
+            30 => format!(
+                "INSERT INTO review_replays (id, diff_id, version, commit_sha, onto, onto_name, tree, state, created_by, created_at)
+                 SELECT 'rp{n}', d.id, (SELECT MAX(v.n) FROM diff_versions v WHERE v.diff_id = d.id), '{sha}', 'onto{n}', 'main', 'tree{n}', '{}', 'kiln', {t} FROM diffs d WHERE d.id = {d} AND EXISTS (SELECT 1 FROM diff_versions v WHERE v.diff_id = d.id);
+                 INSERT INTO review_conflicts (id, replay_id, diff_id, position, file, kind, hunk, line, end_line, fingerprint) SELECT 'ka{n}', id, diff_id, 0, 'src/expand.rs', 'text', 0, 18, 24, 'fa{n}' FROM review_replays WHERE id = 'rp{n}' AND state = 'conflicted';
+                 INSERT INTO review_conflicts (id, replay_id, diff_id, position, file, kind, fingerprint, take) SELECT 'kb{n}', id, diff_id, 1, 'assets/logo.png', 'binary', 'fb{n}', '{}' FROM review_replays WHERE id = 'rp{n}' AND state = 'conflicted';",
+                pick(&["conflicted", "conflicted", "clean"]),
+                pick(&["main", "this"])
+            ),
+            // A conflict resolved or taken back, and a replay's resolution committed.
+            31 => format!(
+                "UPDATE review_conflicts SET take = CASE WHEN take IS NULL THEN 'both' ELSE NULL END WHERE id = (SELECT id FROM review_conflicts ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM review_conflicts))));
+                 UPDATE review_replays SET state = 'resolved', resolved_version = version + 1 WHERE {} AND id = (SELECT id FROM review_replays WHERE state = 'conflicted' ORDER BY rowid LIMIT 1);",
+                u8::from(n.is_multiple_of(3))
+            ),
             _ => "DELETE FROM host_pulls WHERE rowid = (SELECT MIN(rowid) FROM host_pulls);".to_string(),
         }
     }
@@ -1656,8 +1685,8 @@ mod tests {
     /// What memory serves is what the store says: random inserts, updates and deletes across every
     /// table the model reads (runs, legs, attempts, images, deployments and their statuses, Deploy
     /// API releases, tags; and review's: diffs, versions, a change request's commits, reviewers,
-    /// reviews, threads, comments, the land queue, the hosts' mirrored pull requests), the list (as
-    /// three viewers, through each facet)
+    /// reviews, threads, comments, the land queue, the hosts' mirrored pull requests, replays and
+    /// their conflicts), the list (as three viewers, through each facet)
     /// and every commit's detail compared after each refresh; a cap of 3 so pages past memory come
     /// from the store.
     #[test]
@@ -1684,7 +1713,7 @@ mod tests {
                 for _ in 0..4 {
                     n += 1;
                     let sha = shas.get(usize::try_from(next(7)).unwrap_or(0)).copied().unwrap_or(C1);
-                    let sql = ops(n, next(31), sha);
+                    let sql = ops(n, next(33), sha);
                     store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
                 }
                 now += FRESH_MS;

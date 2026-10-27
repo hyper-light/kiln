@@ -17,7 +17,9 @@
 //! - [`attest`]: provenance statements, DSSE envelopes and Sigstore bundles (W18).
 //! - [`trust`]: which untrusted runs wait for approval, and where legs may connect (W18).
 //! - [`turn`]: whose turn it is on a change under review (W26).
+//! - [`suggest`]: a comment's suggestion blocks, and what applying one does to a file (W26).
 //! - [`mirror`]: when to read the hosts' pull requests, within their rate limits (W26).
+//! - [`conflicts`]: a replay's conflicts where they fall, and the files their resolutions make (W26).
 //! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
 //! - [`store`]: chunking and GitHub's cache rules for the runtime store (W08).
 //! - [`secrets`]: secret scopes, and which secrets a leg reads (W09).
@@ -28,6 +30,7 @@
 
 pub mod attest;
 pub mod compare;
+pub mod conflicts;
 pub mod dockerfile;
 pub mod env;
 pub mod experiments;
@@ -48,6 +51,7 @@ pub mod sched;
 pub mod secrets;
 pub mod stats;
 pub mod store;
+pub mod suggest;
 pub mod trigger;
 pub mod trust;
 pub mod turn;
