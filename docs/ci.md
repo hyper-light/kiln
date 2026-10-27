@@ -1663,7 +1663,13 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
   by its room alone, as before samples. The engine and the v1 dispatcher place through one function
   shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
-  over (docs/runners.md §5).
+  over (docs/runners.md §5). **None starves**: smaller legs would otherwise take every gap before a
+  bigger one, so the first legs in a queue that no runner has had room for since a minute hold a
+  runner each (EASY backfilling's reservation, one a leg as conservative backfilling has it, up to
+  a runner each): the one whose running legs' expected ends leave it room within the target
+  soonest (its shadow). There, another leg starts only if it's expected to end by the shadow, or
+  fits in what the held leg will leave; the hold ends when its leg starts or leaves the queue, or
+  its runner goes or drains.
 - **W05-R04 Data structures.** Requirements are interned into **signatures**; each signature keeps
   its eligible runner set (recomputed when a runner or a rule changes) and a priority queue of its
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
@@ -1704,9 +1710,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R10 Fair share.** Within a priority, start-time fair queuing across repositories (or
   organizations, `[ci.scheduler] fair_by`), weighted by `[ci.fairness] weights`: each leg's virtual
   start is `max(V, finish[repo])`, and `finish[repo] += expected_cost / weight`, with
-  `expected_cost` the leg's median runner-seconds from history (W19) or a default. Under
-  saturation, two equally weighted repositories each get within 10 % of half the capacity
-  (W05-AC04).
+  `expected_cost` the leg's median runner-seconds from history (W19) or a default, times the CPUs
+  it asks (one at the least: a leg asking none costs its runner-seconds). Under saturation, two
+  equally weighted repositories each get within 10 % of half the capacity (W05-AC04), and of the
+  fleet's CPU-time whether their legs ask 8 CPUs or 1.
 - **W05-R11 Quotas** (opt-in): per repository or organization, maximum legs in progress and
   runner-minutes per day, per pool.
 - **W05-R12 Reservations** (opt-in): a pool or runner reserved for matching legs during windows
@@ -1716,7 +1723,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `capacity` (with counts: eligible runners, busy, draining), `oversized` (in resource mode, it
   asks for more than any eligible runner has even idle: what it asks, and what each of them has of
   it), `headroom` (every runner with room for it would pass `[ci.scheduler] target_use` with it,
-  by its live samples: the target and those runners), `no-runner` (none eligible is
+  by its live samples: what it asks and where, "waiting for 14 CPUs and 1 GiB of memory free on a
+  linux/x86_64 runner", the target and those runners, and the runner held for it with when it's to
+  have room there), `no-runner` (none eligible is
   connected; lists the ones offline), `unroutable` (no runner known to kiln could ever run it; lists
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),

@@ -119,7 +119,12 @@ can't go anywhere yet waits saying why: `oversized` when it asks for more than a
 has, naming what each has ("Too big for any runner"), `headroom` while every runner with room
 would pass the target with it ("Runners at their target use"), `capacity` while none has room,
 `unroutable` when none could ever take it. A leg asking for more than any runner has left under
-the target waits while smaller legs fill what comes free: nothing holds room for it yet.
+the target doesn't wait for ever while smaller legs fill what comes free: once it's waited a minute
+first in line, it holds the runner whose running legs are expected to leave it room soonest, and
+there only legs expected to end by then, or that fit beside it, start; its wait says what it waits
+for ("waiting for 14 CPUs and 1 GiB of memory free on a linux/x86_64 runner: a is held for it, with
+room about 09:42"). Fair share between repositories counts the CPUs legs ask, so a repository of
+big legs gets no more of the fleet than one of small legs at the same weight.
 
 **One rule, in the shape Hex's placement takes.** The engine and the v1 dispatcher place through
 one function, `kiln_ci::sched::place` (reach ranks a command by the same measure): what's needed and
