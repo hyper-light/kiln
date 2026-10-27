@@ -5,6 +5,9 @@
 //! working folder, a variable by its name. Each record is one `write` of at most 4,096 bytes, whole
 //! on a pipe. A program that doesn't go through the C library (Go's, or one making system calls
 //! itself) escapes it, and its unit is partial.
+// It interposes on Linux's C library (glibc's `__errno_location`, `fopen64`): elsewhere the
+// library is empty, as the tracer is Linux's.
+#![cfg(target_os = "linux")]
 #![allow(unsafe_code)]
 // `open`'s and `openat`'s C definitions are variadic, which stable Rust can't write: defined with
 // the mode as a third (or fourth) argument they receive it where the x86_64 and aarch64 Linux ABIs
