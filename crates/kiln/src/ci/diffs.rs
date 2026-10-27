@@ -1436,6 +1436,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         }
         (&Method::POST, ["review", "inbox", "read"]) => ok(super::inbox::read(hub, caller, body).await?),
         (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
+        (&Method::DELETE, ["comments", id]) => ok(super::review::delete(hub, id, caller).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
         (_, ["diffs" | "change-requests", key, rest @ ..]) => {
             let d = find(hub, key).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, format!("no diff {key}")))?;
@@ -1476,7 +1477,11 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     };
                     ok(dependencies(hub, &d, &from, &to.commit, &from_label, &format!("v{}", to.n)).await?)
                 }
-                (&Method::GET, ["comments"]) => ok(json!({ "threads": super::review::threads(hub, &d, &super::review::who(caller).0).await? })),
+                // The threads, and the gate as it stands for the caller approving (W26-R11).
+                (&Method::GET, ["comments"]) => {
+                    let me = super::review::who(caller).0;
+                    ok(json!({ "threads": super::review::threads(hub, &d, &me).await?, "gate": super::review::gate_of(hub, &d, Some(&me)).await? }))
+                }
                 (&Method::POST, ["comments"]) => ok(super::review::comment(hub, &d, caller, body).await?),
                 (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),
                 (&Method::POST, ["viewed"]) => ok(super::review::viewed(hub, &d, caller, body).await?),

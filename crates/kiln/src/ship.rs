@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use http::StatusCode;
 use kiln_cd::journey::{self, Attempt, Author, Build, Check, Journey, Kinds, Land, Leg, Part, Platform, Production, Replant, Review, ReviewState, Runner, RunnerReplant, Staging};
-use kiln_ci::review::{Facts, Open, Standing};
+use kiln_ci::review::{Facts, Kind, Standing};
 use kiln_ci::turn;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -346,20 +346,20 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
     let mut whose: Vec<String> = turn::fold(&ch.author, &events).turn.into_iter().map(|p| if p == ch.author { author.clone() } else { p }).collect();
     whose.sort();
     whose.dedup();
-    let mut open = Kinds::default();
-    for t in &ch.threads {
-        match t.kind.as_str() {
-            "nit" => open.nit += 1,
-            "issue" => open.issue += 1,
-            "blocking" => open.blocking += 1,
-            _ => open.question += 1,
-        }
-    }
+    // The gate (W26-R11), as merging asks it: what's open by kind, and what holds the change, read
+    // as accepting and the land queue read them.
+    let threads: Vec<kiln_ci::review::Thread> = ch
+        .threads
+        .iter()
+        .map(|t| kiln_ci::review::Thread { kind: Kind::read(&t.kind), by: t.by.clone(), file: t.file.clone(), line: t.line.and_then(|l| u32::try_from(l).ok()), ..kiln_ci::review::Thread::default() })
+        .collect();
+    let gate = kiln_ci::review::gate(&threads, &[], None);
+    let open = Kinds { question: gate.open.question, nit: gate.open.nit, issue: gate.open.issue, blocking: gate.open.blocking };
     let facts = Facts {
         draft: ch.state == "draft",
         changes_asked: ch.state == "changes-requested",
-        open: Open { question: open.question, nit: open.nit, issue: open.issue, blocking: open.blocking },
-        conflicts: 0,
+        open: gate.open,
+        conflicts: gate.conflicts,
         fixing: false,
         policy_met: matches!(ch.state.as_str(), "accepted" | "landing" | "landed"),
     };
@@ -374,7 +374,7 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
     };
     let said = |t: &ThreadRec| format!("{}: {}", shown(&t.by), first_words(&t.said));
     let about = match state {
-        ReviewState::Blocked => ch.threads.iter().rev().find(|t| t.kind == "blocking").map(|t| match (&t.file, t.line) {
+        ReviewState::Blocked => ch.threads.iter().rev().find(|t| Kind::read(&t.kind) == Kind::Blocking).map(|t| match (&t.file, t.line) {
             (Some(f), Some(l)) => format!("{}:{l}", f.rsplit('/').next().unwrap_or(f)),
             (Some(f), None) => f.rsplit('/').next().unwrap_or(f).to_string(),
             _ => said(t),
@@ -386,7 +386,7 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
     .unwrap_or_default();
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
-    Some(Review { state, turn: whose, author, open, conflicts: 0, fixing: None, about, superseded_by })
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: None, about, superseded_by })
 }
 
 fn short(sha: &str) -> String {

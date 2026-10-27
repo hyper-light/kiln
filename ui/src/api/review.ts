@@ -124,7 +124,12 @@ export interface ThreadComment {
   created_at: number;
   /** Yours, not published yet: it goes out with your review. */
   draft: boolean;
+  /** Its author deleted it: a thread's first comment stays, saying `deleted`, while replies remain (W26-R08). */
+  deleted?: boolean;
 }
+
+/** A thread's kind (W26-R11); threads from before kinds are questions. */
+export type ThreadKind = "question" | "nit" | "issue" | "blocking";
 
 export interface Thread {
   id: string;
@@ -142,6 +147,24 @@ export interface Thread {
   /** Where it sits in the latest version. */
   now: { version: number; start_line: number; end_line: number } | null;
   comments: ThreadComment[];
+  kind?: ThreadKind;
+  /** Who resolved it, when, and why (an owner resolving someone else's blocking thread says why). */
+  resolved_by?: string | null;
+  resolved_at?: number | null;
+  resolution?: string | null;
+}
+
+/** The gate (W26-R11) as it stands for you approving: a blocking thread or a conflict holds it, open issues warn, open nits inform. */
+export interface ReviewGate {
+  verdict: "hold" | "warn" | "inform" | "clear";
+  /** What holds it, each naming where it is, whose it is to resolve (a conflict: no one's), and why. */
+  holds: { at: string; by: string | null; reason: string }[];
+  open: { question: number; nit: number; issue: number; blocking: number };
+  conflicts: number;
+  /** `2 issues open`: approving asks to go ahead anyway. */
+  warning: string | null;
+  /** `1 nit open`: approving says so. */
+  note: string | null;
 }
 
 export interface Readiness {
@@ -233,16 +256,21 @@ export const reviewApi = {
   interdiff: (key: string, from: number, to: number, signal?: AbortSignal) => request<Interdiff>("GET", `/api/diffs/${enc(key)}/interdiff?from=${from}&to=${to}`, undefined, { signal }),
   dependencies: (key: string, to: number, from: number | null, signal?: AbortSignal) =>
     request<Dependencies>("GET", `/api/diffs/${enc(key)}/dependencies?to=${to}${from != null ? `&from=${from}` : ""}`, undefined, { signal }),
-  threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[] }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
+  threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[]; gate?: ReviewGate }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
   comment: (
     key: string,
-    body: { body: string; suggestion?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number },
+    body: { body: string; suggestion?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number; kind?: ThreadKind },
   ) => request<{ id: string; thread: string; draft: boolean }>("POST", `/api/diffs/${enc(key)}/comments`, body),
-  editComment: (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open" }) =>
-    request<{ id: string; thread: string; state: string }>("PATCH", `/api/comments/${enc(id)}`, body),
+  editComment: (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open"; kind?: ThreadKind; reason?: string }) =>
+    request<{ id: string; thread: string; state: string; kind?: ThreadKind }>("PATCH", `/api/comments/${enc(id)}`, body),
+  deleteComment: (id: string) => request<{ id: string; thread: string; deleted: boolean; thread_deleted: boolean }>("DELETE", `/api/comments/${enc(id)}`),
   applySuggestion: (id: string) => request<unknown>("POST", `/api/comments/${enc(id)}/apply`, {}),
-  review: (key: string, action: ReviewAction, body: string) =>
-    request<{ diff: string; action: string; version: number; published: number; state: string }>("POST", `/api/diffs/${enc(key)}/review`, { action, body }),
+  review: (key: string, action: ReviewAction, body: string, force?: boolean) =>
+    request<{ diff: string; action: string; version: number; published: number; state: string; note?: string | null }>(
+      "POST",
+      `/api/diffs/${enc(key)}/review`,
+      force ? { action, body, force } : { action, body },
+    ),
   viewed: (key: string, file: string, viewed: boolean) => request<{ file: string; viewed: boolean; version: number }>("POST", `/api/diffs/${enc(key)}/viewed`, { file, viewed }),
   readiness: (key: string, signal?: AbortSignal) => request<Readiness>("GET", `/api/diffs/${enc(key)}/land`, undefined, { signal }),
   land: (key: string, strategy?: string) => request<unknown>("POST", `/api/diffs/${enc(key)}/land`, strategy ? { strategy } : {}),
