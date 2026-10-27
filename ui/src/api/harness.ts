@@ -1078,11 +1078,26 @@ export class SessionStore {
       // The server restarted, or the network came back: this socket may be gone too without having said so.
       events.onReopen(() => this.kick(true)),
       // The session is on the server again (its machine came back): no need to wait for the next try.
+      // And what of its messages couldn't be read, which only the server says, as it changes.
       events.on((ev) => {
-        if (ev.type === "harness" && ev.info.id === this.id) this.kick(false);
+        if (ev.type !== "harness" || ev.info.id !== this.id) return;
+        this.refused(ev.info.refused);
+        this.kick(false);
       }),
     ];
     this.connect();
+  }
+
+  /**
+   * What of its messages couldn't be read (`crate::wire::unread`), as an event about it says: the
+   * server keeps it, and the socket's open said it only as it was then. Shown at once.
+   */
+  private refused(refused: AgentInfo["refused"]) {
+    const info = this.snap.info;
+    if (!info || share(info.refused, refused) === info.refused) return;
+    const next = { ...info, refused };
+    if (!refused) delete next.refused;
+    this.patch({ info: next });
   }
 
   /** Nothing shows it any more: it stays live a while, then closes. */

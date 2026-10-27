@@ -840,8 +840,12 @@ impl Hub {
         }
     }
 
+    /// A runner's record to the pages, with what's kept of its refusals as `GET /api/agents` has
+    /// it: told for anything else, it doesn't say it has none (`crate::wire::unread`).
     pub(crate) fn emit_agent(&self, a: &AgentLive) {
-        self.emit(&ServerEvent::Agent { agent: Box::new(a.clone()) });
+        let mut a = a.clone();
+        a.refused = self.refusals.lock().kept(&crate::wire::unread::Page::Runner(a.name.clone())).cloned();
+        self.emit(&ServerEvent::Agent { agent: Box::new(a) });
     }
 
     /// A message a wire couldn't read (`crate::wire::unread`): counted, kept for its sender's page
@@ -939,16 +943,17 @@ impl Hub {
     /// `page`'s refusals changed: its viewers are told, a runner's in its record, an agent
     /// session's in its info.
     fn emit_refused(&self, page: &crate::wire::unread::Page) {
-        let kept = self.refusals.lock().kept(page).cloned();
         match page {
             crate::wire::unread::Page::Runner(name) => {
                 let a = self.agents.lock().get(name).cloned();
-                if let Some(mut a) = a {
-                    a.refused = kept;
+                if let Some(a) = a {
                     self.emit_agent(&a);
                 }
             }
-            crate::wire::unread::Page::Session(id) => self.harness.set_refused(self, id, kept),
+            crate::wire::unread::Page::Session(id) => {
+                let kept = self.refusals.lock().kept(page).cloned();
+                self.harness.set_refused(self, id, kept);
+            }
         }
     }
 
@@ -3414,6 +3419,10 @@ pub(crate) mod tests {
             anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "GET /api/agents carries it: {kept:?}");
             let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
             anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("agent")) && told.pointer("/agent/refused/counts/0/n") == Some(&serde_json::json!(1)), "{told}");
+            // Its record told for anything else carries them too: its page doesn't say it has none.
+            anyhow::ensure!(hub.set_draining("fedora", true).await, "fedora drains");
+            let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
+            anyhow::ensure!(told.pointer("/agent/draining") == Some(&serde_json::json!(true)) && told.pointer("/agent/refused/counts/0/n") == Some(&serde_json::json!(1)), "{told}");
             Ok(())
         })
     }

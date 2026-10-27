@@ -4,7 +4,8 @@
  * child first, naming its parent), and ending the parent offers to end them too.
  *
  *   /agents/fam-orch   "Release prep" (Claude Code, the server), working, waiting for its agents
- *   /agents/fam-tests  "Fix the flaky retry test" (Codex, metal-ryzen-01), working
+ *   /agents/fam-tests  "Fix the flaky retry test" (Codex, metal-ryzen-01), working; some of its
+ *                      messages kiln couldn't read, flagged in its head (refused.ts)
  *   /agents/fam-docs   "Update the docs" (Claude Code, metal-ryzen-02), finished
  *   /agents/fam-migr   "Check the migration" (Claude Code, metal-epyc-01), asks to run a command
  *
@@ -22,6 +23,7 @@ import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
 import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
+import { agentRefused, note, unreadUpdate } from "./refused.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -123,6 +125,7 @@ const family = new Map<string, Member>(
         lines_removed: 2,
         cwd: "/home/ada/.local/state/kiln/workspaces/kiln-famtests",
         workspace: { kind: "volume", over: CWD, made: { volume: "c3f2bc748ffa0cb00001000000000012", name: "kiln-famtests", mount: "/home/ada/.local/state/kiln/workspaces/kiln-famtests" } },
+        refused: agentRefused(),
       },
     ),
     member(
@@ -815,6 +818,15 @@ async function handleRun(req: http.IncomingMessage, res: http.ServerResponse, ur
 /** The family, for the agents list. */
 export function familyInfos(): AgentInfo[] {
   return [...family.values()].map((m) => m.info);
+}
+
+/** Agent `id`'s runner sent an update of it kiln couldn't read, `what` it was: its page is told, as kiln's is (`POST /api/mock/refuse`). */
+export function refuseAgent(id: string, what: string): AgentInfo["refused"] | null {
+  const m = family.get(id);
+  if (!m) return null;
+  m.info.refused = note(m.info.refused, unreadUpdate(m.info.target.replace(/^agent:/, ""), what), Date.now());
+  emitEvent({ type: "harness", info: m.info });
+  return m.info.refused;
 }
 
 function stand(i: AgentInfo): string {

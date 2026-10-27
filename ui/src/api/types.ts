@@ -11,6 +11,8 @@ export type {
   LogDown as LogControlFrame,
   NetDrop,
   PlannedJob,
+  RefusedMessage,
+  RefusedMessages,
   Run,
   RunnerFacts,
   InstanceView as RunnerInstance,

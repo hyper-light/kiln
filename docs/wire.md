@@ -253,7 +253,9 @@ Each refusal noted:
 - is kept for its sender's page, and for the agent session it's about when it's about one: how
   many by wire and code, and the newest 16, for at most 4,096 senders (the least recent let go
   first). The runner record (`GET /api/agents`) and an agent session's info carry them as
-  `refused`, and the UI's `agent` and `harness` events say when they change;
+  `refused`, as does each of the UI's `agent` and `harness` events, which say when they change.
+  A runner's page says them in its "Refused messages" row, in the fail tone while any came within
+  a day; an agent's page flags them in its head, and the flag opens their list;
 - is written to the audit log as `security.wire_refused`: its sender as the principal, the wire as
   the target, the code as the result, and what and why as the detail, 512 bytes at most. The
   first for a sender, wire and code in a minute is written at once, and the rest as one row a

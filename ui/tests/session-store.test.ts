@@ -165,6 +165,36 @@ await test("cached resources do not process live events while nothing shows them
   } finally { events.stop(); }
 });
 
+await test("what of its messages was refused comes with its events, on the socket it has: no new snapshot, no reload", async () => {
+  const { events } = await import("../src/api/events.ts");
+  const store = new SessionStore("refused");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  events.start();
+  const feed = Socket.all.at(-1)!;
+  const refused = (n: number) => ({
+    counts: [{ wire: "runner_payload", code: "unknown", n }],
+    newest: [{ at: 1, unread: { wire: "runner_payload", from: { runner: { name: "box", instance: "main" } }, what: "update kind teleport", code: "unknown", why: "no such update" } }],
+  });
+  try {
+    for (const frame of snapshot("refused", [event(1)])) ws.frame(frame);
+    await tick();
+    assert.equal(store.get().info?.refused, undefined);
+    feed.frame({ type: "harness", info: { id: "refused", status: "running", refused: refused(1) } });
+    assert.deepEqual(store.get().info?.refused, refused(1));
+    // Another agent's says nothing of this one's.
+    feed.frame({ type: "harness", info: { id: "other", status: "running", refused: refused(5) } });
+    assert.deepEqual(store.get().info?.refused, refused(1));
+    feed.frame({ type: "harness", info: { id: "refused", status: "running", refused: refused(2) } });
+    assert.equal(store.get().info?.refused?.counts[0]?.n, 2);
+    assert.equal(store.get().info?.status, "running", "the rest of what it shows stays");
+    assert.equal(Socket.all.at(-1), feed, "the session's socket stays: nothing is read again");
+  } finally {
+    off();
+    events.stop();
+  }
+});
+
 await test("a message's id is a UUIDv7 made once: 32 hex digits, its time first, and never another's (CP-T3.2)", async () => {
   const { clientId } = await import("../src/api/harness.ts");
   const ids = Array.from({ length: 10_000 }, () => clientId());

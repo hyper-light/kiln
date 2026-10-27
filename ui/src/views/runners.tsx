@@ -3,7 +3,7 @@ import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
 import { Plus, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, Job, RunnerFacts, RunnerInstance, RunnerUpdate } from "@/api/types";
+import type { Agent, Job, RefusedMessages, RunnerFacts, RunnerInstance, RunnerUpdate } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
@@ -15,7 +15,7 @@ import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { agentsRes, historyRes, lastSamples, mergeJobs, updatesRes, useAgentsLive, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
-import { errorMessage } from "@/lib/hooks";
+import { errorMessage, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -28,6 +28,8 @@ import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared"
 import { BatteryLine, LowBattery } from "./battery";
 import { lostLine } from "./runner-lost";
 import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-limit";
+import { refusedLately, refusedLine } from "./refused";
+import { useClock } from "./harness/dom";
 import { ImagesPanel, PoolsPanel } from "./runners-pools";
 import { useAuth } from "@/lib/auth";
 
@@ -462,6 +464,11 @@ function useRunningJobs(ids: string[]): Job[] {
   return useSuspenseResource(`jobs/${key}`, async (s) => (key ? (await Promise.all(ids.map((id) => api.job(id, s).catch(() => null)))).filter((j): j is Job => j !== null) : [])).data;
 }
 
+/** The messages kiln couldn't read of a runner, of the server's to it, and of reach's (`refusedLine`), kept current by the shared clock: only these words render again as it counts. */
+function RefusedWords({ refused }: { refused: RefusedMessages | undefined }) {
+  return <>{refusedLine(refused, useNow())}</>;
+}
+
 /** One runner in depth, open in the page under its row: what it is, what it runs, its last hour. */
 function AgentDetails({
   agent,
@@ -479,6 +486,8 @@ function AgentDetails({
   const [forgetting, setForgetting] = React.useState(false);
   const samples = useAgentHistory(agent.name);
   const jobs = useRunningJobs(agent.running);
+  // A minute is near enough for whether any refusal came within a day.
+  const now = useClock(60_000);
 
   const s = agent.sample;
   return (
@@ -557,6 +566,7 @@ function AgentDetails({
             { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
             { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
             { label: "Lost below the channel", value: lostLine(agent) },
+            { label: "Refused messages", value: <RefusedWords refused={agent.refused} />, tone: refusedLately(agent.refused, now) ? "fail" : undefined },
           ]}
         />
       </div>
