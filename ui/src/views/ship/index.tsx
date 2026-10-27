@@ -29,7 +29,7 @@ import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { firstStage, JobCards } from "./jobs";
 import { ShipOutput } from "./output";
-import { ReviewFiles, ReviewLanes } from "./review";
+import { ReviewFiles, ShipLanes } from "./review";
 
 const LIMIT = 100;
 
@@ -332,7 +332,7 @@ function Dropdown({ commit }: { commit: ShipCommit }) {
       <section aria-label="Lanes" className="ship-sec">
         <h3>Lanes</h3>
         <Loadable label="Loading the lanes" className="ship-lanes-slot">
-          <ReviewLanes commit={commit} />
+          <ShipLanes commit={commit} />
         </Loadable>
         {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}
       </section>

@@ -1,27 +1,29 @@
 /**
- * The Review lane group drawn inside Ship's Lanes (W26-R14), as agreed with the Ship agent
- * (2026-10-26, NOTES.md): the item's marks (`ShipDetail.review`, oldest first) shaped as Ship's
- * generic lanes {group, label, state, note, lanes: [{id, name, state, start, end, note?, seal?}]},
- * `group` the stage key `review` — the first of STAGES — and drawn like Ship's own groups: the
- * group's glyph and name, then a lane per mark with its time, who did it and its seal — "unsigned"
- * while `signer` is null (until W27-R03). Data through Suspense, the same detail read Output makes.
+ * Ship's Lanes (W26-R14, W26-R15), drawn as f-ship's lanes: each group {group, label, state, note,
+ * lanes[]} given to it — Review's marks first (reviewGroup), Ship's stage groups as they land —
+ * every lane a bar on one horizon, at least 30 minutes wide and growing by 10 as marks need, its
+ * label pinned left, the bar wearing its rim, "unsigned" on every seal until W27-R03, its key the
+ * mark's id so a live update moves it, never remounts it. Fit squeezes rows; Detail gives each bar
+ * its room and its who/when/where. Previous/Now/next walk the horizon. No effects: times tick on
+ * the resource's poll; the horizon holds the marks it was given.
  */
 import { shipApi, type ShipCommit, type ShipMark } from "@/api/ship";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import type { GlyphState } from "@/components/ui/status-glyph-spec";
 import { clockTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
+import * as React from "react";
 import "./review.css";
 
-/** One lane of a Ship lane group (Fit/Detail): a span, or a point when end = start. */
+/** One lane of a Ship lane group (f-ship): a span, or a point when end = start. */
 export interface ShipLane {
   id: string;
-  kind: ShipMark["kind"];
+  kind?: string;
   name: string;
   state: string;
   start: number | null;
   end: number | null;
-  by: string;
+  by?: string;
   note?: string;
   /** The mark's signer; null = unsigned until W27-R03, a name once signed. */
   seal?: string | null;
@@ -38,7 +40,7 @@ export interface ShipLaneGroup {
 /** A principal's name as a lane shows it (`user:kim` is kim, `agent:x for user:y` is x). */
 const shown = (p: string) => p.split(" for ")[0]?.split(":").pop() ?? p;
 
-/** A mark's lane name, as the mock's ("v5 · pushed", "kim · comment", "approval · kim"). */
+/** A mark's lane name ("v5 · pushed", "kim · comment", "approval · kim"). */
 function nameOf(m: ShipMark): string {
   const v = m.revision != null ? `v${m.revision} · ` : "";
   switch (m.kind) {
@@ -47,7 +49,6 @@ function nameOf(m: ShipMark): string {
     case "replay":
       return `${v}replayed${m.note ? ` ${m.note}` : ""}`;
     case "comment": {
-      // The server names a thread's marks `{thread}:open`, `{thread}:resolved`, `comment:{id}`.
       const role = m.id.endsWith(":resolved") ? "resolved" : m.note === "answered" ? "reply" : "comment";
       return `${shown(m.by)} · ${role}`;
     }
@@ -62,10 +63,8 @@ function nameOf(m: ShipMark): string {
   }
 }
 
-/**
- * The marks as a group for Ship's Lanes: one lane per mark, the group's state the change's review
- * state (a commit with no change reads passed). The horizon starts at the earliest mark — Ship's.
- */
+/** The marks as the Review group for Lanes: one lane per mark, oldest first; the group's state the
+ * change's review state (a commit with no change reads passed). */
 export function reviewGroup(detail: { change?: { state?: string | null } | null; review?: ShipMark[] }): ShipLaneGroup | null {
   const marks = detail.review ?? [];
   if (marks.length === 0 && !detail.change) return null;
@@ -78,34 +77,124 @@ export function reviewGroup(detail: { change?: { state?: string | null } | null;
   };
 }
 
-/** The Review lane group in the item's Lanes: its marks in order, each with time, who and seal. */
-export function ReviewLanes({ commit }: { commit: ShipCommit }) {
-  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
-  const group = reviewGroup(detail.data);
-  if (!group) return null;
+/* Ship's own groups are the Ship agent's to give (shipGroups on its line); until they land, a
+ * fixture in the same shape proves the drawer draws whatever it's given. */
+function shipGroupsFixture(commit: ShipCommit): ShipLaneGroup[] {
+  const t = Math.floor(Date.now() / 1000);
+  const seen = commit.environments?.map((e) => e.environment) ?? [];
+  if (seen.length === 0) return [];
+  return [
+    {
+      group: "production",
+      label: "Production",
+      state: "healthy",
+      note: "",
+      lanes: seen.map((e) => ({ id: `env:${e}`, name: e, state: "healthy", start: t - 3600, end: null })),
+    },
+  ];
+}
+
+const MIN_HORIZON = 30 * 60;
+const GROW_BY = 10 * 60;
+
+/** The window the lanes draw on: from the earliest start to now, at least 30 minutes, growing by
+ * 10 more whenever a mark passes it. `now` is the caller's — no clock inside. */
+function horizonOf(groups: ShipLaneGroup[], now: number): [number, number] {
+  let lo = now;
+  for (const g of groups) for (const l of g.lanes) if (l.start != null && l.start < lo) lo = l.start;
+  let hi = now;
+  for (const g of groups) for (const l of g.lanes) if (l.end != null && l.end > hi) hi = l.end;
+  if (hi <= lo) hi = lo + MIN_HORIZON;
+  while (hi - lo < MIN_HORIZON) hi += GROW_BY;
+  return [lo, hi];
+}
+
+/** One lane's bar: its span on the horizon, or a tick for a point. `pos` is 0..1. */
+const pos = (t: number, [lo, hi]: [number, number]) => Math.min(1, Math.max(0, (t - lo) / (hi - lo)));
+
+/** A lane's words: name and, in Detail, who did it and when (and its place when it has one). */
+function LaneBar({ lane, window }: { lane: ShipLane; window: [number, number] }) {
+  const [lo, hi] = window;
+  const a = lane.start == null ? null : pos(lane.start, [lo, hi]);
+  const b = lane.end == null ? 1 : pos(lane.end, [lo, hi]);
+  return (
+    <li className="ship-lane" data-kind={lane.kind}>
+      <StatusGlyph state={lane.state as GlyphState} size={12} />
+      <span className="ship-lane__name" title={lane.note}>
+        {lane.name}
+        {lane.note && !lane.name.includes(lane.note) ? <em className="ship-lane__note"> {lane.note}</em> : null}
+      </span>
+      <span className="ship-lane__track">
+        {a == null ? (
+          <i className="ship-lane__now" style={{ left: "100%" }} />
+        ) : b - a < 0.004 ? (
+          <i className="ship-lane__bar ship-lane__bar--point" data-state={lane.state} style={{ left: `${a * 100}%` }} />
+        ) : (
+          <i className="ship-lane__bar" data-state={lane.state} style={{ left: `${a * 100}%`, width: `${(b - a) * 100}%` }} />
+        )}
+      </span>
+      <span className="ship-lane__who">{lane.by ? shown(lane.by) : ""}</span>
+      <span className="ship-lane__when">
+        {lane.start == null ? "—" : clockTime(lane.start * 1000)}
+        {lane.end != null && lane.end !== lane.start ? ` – ${clockTime(lane.end * 1000)}` : ""}
+      </span>
+      <span className="ship-lane__seal">{lane.seal ?? "unsigned"}</span>
+    </li>
+  );
+}
+
+/** One group's lanes on the shared horizon: its head glyph and label pinned, lanes sorted as given. */
+function LaneGroup({ group, window }: { group: ShipLaneGroup; window: [number, number] }) {
   return (
     <div className="ship-lanegroup" data-group={group.group}>
       <p className="ship-lanegroup__head">
         <StatusGlyph state={group.state as GlyphState} size={12} />
         <span>{group.label}</span>
+        {group.note ? <em className="ship-lane__note">{group.note}</em> : null}
       </p>
       <ul className="ship-lanes">
         {group.lanes.map((l) => (
-          <li key={l.id} className="ship-lane" data-kind={l.kind}>
-            <StatusGlyph state={l.state as GlyphState} size={12} />
-            <span className="ship-lane__name" title={l.note}>
-              {l.name}
-              {l.note && !l.name.includes(l.note) ? <em className="ship-lane__note"> {l.note}</em> : null}
-            </span>
-            <span className="ship-lane__by">{shown(l.by)}</span>
-            <span className="ship-lane__when">
-              {l.start == null ? "—" : clockTime(l.start * 1000)}
-              {l.end != null && l.end !== l.start ? ` – ${clockTime(l.end * 1000)}` : ""}
-            </span>
-            <span className="ship-lane__seal">{l.seal ?? "unsigned"}</span>
-          </li>
+          <LaneBar key={l.id} lane={l} window={window} />
         ))}
       </ul>
+    </div>
+  );
+}
+
+/** The dropdown's Lanes: the item's groups on one horizon — Review's marks first, Ship's own as
+ * they arrive — with Previous / Now / next walking it and Fit/Detail picking the room. */
+export function ShipLanes({ commit }: { commit: ShipCommit }) {
+  const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
+  const [walk, setWalk] = React.useState(0);
+  const [fit, setFit] = React.useState(true);
+  const groups = React.useMemo(() => [reviewGroup(detail.data), ...shipGroupsFixture(commit)].filter((g): g is ShipLaneGroup => g != null), [detail.data, commit]);
+  const base = horizonOf(groups, Math.floor(Date.now() / 1000));
+  // A step walks a third of the horizon; Now is always the freshest end.
+  const step = Math.max(1, Math.round((base[1] - base[0]) / 3));
+  const window: [number, number] = walk === 0 ? base : [base[0] + walk * step, base[1] + walk * step];
+  if (groups.length === 0) return null;
+  return (
+    <div className="ship-lanesbox" data-fit={fit || undefined}>
+      <div className="ship-lanesbox__nav">
+        <button type="button" className="rv-ib" aria-label="Earlier" onClick={() => setWalk(walk - 1)}>
+          previous
+        </button>
+        <button type="button" className="rv-ib" aria-label="Now" disabled={walk === 0} onClick={() => setWalk(0)}>
+          Now
+        </button>
+        <button type="button" className="rv-ib" aria-label="Later" onClick={() => setWalk(walk + 1)}>
+          next
+        </button>
+        <span className="ship-lanesbox__span">
+          {clockTime(window[0] * 1000)} – {clockTime(window[1] * 1000)}
+        </span>
+        <button type="button" className="rv-ib" aria-label={fit ? "Detail" : "Fit"} onClick={() => setFit(!fit)}>
+          {fit ? "Detail" : "Fit"}
+        </button>
+      </div>
+      {groups.map((g) => (
+        <LaneGroup key={g.group} group={g} window={window} />
+      ))}
     </div>
   );
 }
