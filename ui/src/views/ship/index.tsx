@@ -21,11 +21,12 @@ import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
-import { ACTION_WORD, FACET_KEYS, fold, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
+import { ACTION_WORD, FACET_KEYS, fold, keyOf, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
 import "./ship.css";
 import { ShipViews } from "./views";
 import { Stands } from "@/views/harness/stands";
 import { SelectField } from "@/components/ui/misc";
+import { useGlide, useListHold } from "@/views/harness/list-tools";
 
 const LIMIT = 100;
 
@@ -69,6 +70,29 @@ function ShipList() {
   };
   const commits = all.filter((c) => Object.entries(chosen).every(([k, vs]) => vs.length === 0 || vs.includes(value[k]?.(c) ?? "")));
   const items = order(fold(commits), sort);
+  // Holding still (step 6): while the list is in use or a row is open, the rows keep their places,
+  // each with its latest data, and what arrives waits for the release; then the rows glide.
+  const [opened, setOpened] = React.useState<ReadonlySet<string>>(() => new Set());
+  const toggle = (k: string, o: boolean) =>
+    setOpened((was) => {
+      const next = new Set(was);
+      if (o) next.add(k);
+      else next.delete(k);
+      return next;
+    });
+  const hold = useListHold(opened.size > 0);
+  const { ref: holdRef, ...holdProps } = hold.bind;
+  // Your own change of view (lens, sort, filter) applies at once; only what arrives waits.
+  const view = `${lens}|${sort}|${JSON.stringify(chosen)}`;
+  const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, Item>(), view }));
+  for (const it of items) kept.last.set(keyOf(it), it);
+  if (!hold.held || kept.order.length === 0 || kept.view !== view) {
+    kept.order = items.map(keyOf);
+    kept.view = view;
+  }
+  const shown = hold.held ? kept.order.flatMap((k) => kept.last.get(k) ?? []) : items;
+  if (!hold.held) kept.last = new Map(items.map((it) => [keyOf(it), it]));
+  const glide = useGlide(shown.map(keyOf).join("\n"));
 
   const set = (k: string, v: string | null) =>
     setParams(
@@ -134,9 +158,17 @@ function ShipList() {
       {items.length === 0 ? (
         <EmptyState title={lens === "review" ? "No changes under review" : "No commits yet"}>Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
       ) : (
-        <ul className="ship-list" aria-label="Commits">
-          {items.map((it) => (
-            <Row key={`${it.head.repo}/${it.head.sha}`} item={it} reload={page.reload} />
+        <ul
+          className="ship-list"
+          aria-label="Commits"
+          {...holdProps}
+          ref={(el) => {
+            glide(el);
+            holdRef(el);
+          }}
+        >
+          {shown.map((it) => (
+            <Row key={keyOf(it)} item={it} reload={page.reload} open={opened.has(keyOf(it))} onOpen={(o) => toggle(keyOf(it), o)} />
           ))}
         </ul>
       )}
@@ -144,9 +176,8 @@ function ShipList() {
   );
 }
 
-function Row({ item, reload }: { item: Item; reload: () => void }) {
+function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
   const c = item.head;
-  const [open, setOpen] = React.useState(false);
   const [riders, setRiders] = React.useState(false);
   // One environment flag: production when it runs there, else the first it runs in.
   const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
@@ -158,9 +189,9 @@ function Row({ item, reload }: { item: Item; reload: () => void }) {
         ? `${n} more shipped`
         : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
   return (
-    <li className="ship-row" data-stand={c.stand}>
+    <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)}>
       <div className="ship-r">
-        <button type="button" className="ship-main" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
           <span className="ship-name">{c.message || c.change?.title || c.short}</span>
           <span className="ship-line">
             <span className="ship-stand" data-stand={c.stand}>
@@ -191,8 +222,8 @@ function Row({ item, reload }: { item: Item; reload: () => void }) {
             <span className="ship-sha">{c.short}</span>
           </span>
         </span>
-        <Actions commit={c} reload={reload} onReview={() => setOpen(true)} />
-        <button type="button" className="ship-go" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${c.short}`} onClick={() => setOpen(!open)}>
+        <Actions commit={c} reload={reload} onReview={() => onOpen(true)} />
+        <button type="button" className="ship-go" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${c.short}`} onClick={() => onOpen(!open)}>
           <ChevronDown size={16} />
         </button>
       </div>

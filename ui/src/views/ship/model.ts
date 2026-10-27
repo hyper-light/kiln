@@ -93,6 +93,9 @@ export function fold(commits: readonly ShipCommit[]): Item[] {
   return out;
 }
 
+/** A row's key, stable as it changes: a change by its name (a new revision patches it in place), a commit by its sha. */
+export const keyOf = (it: Item) => (it.head.change ? `${it.head.repo}/${it.head.change.name}` : `${it.head.repo}/${it.head.sha}`);
+
 export type Sort = "needs" | "newest" | "trunk" | "stage" | "author" | "oldest";
 
 /** Ship's sorts, offered as Mission control's list bar offers its own (plan 01a175b7f20b7277b15bddd2ad001bcc, step 4). */

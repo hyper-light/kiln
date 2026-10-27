@@ -187,8 +187,32 @@ function commits(): ShipCommit[] {
   ];
 }
 
-/** Every row: the trunk's commits (newest first), then the fixed ones. */
-const all = (): ShipCommit[] => [...(trunk?.commits() ?? []), ...commits()];
+/** Commits a test adds on top (`POST /api/mock/ship/arrive`, `?clear=1` to take them away), newest first. */
+const arrived: ShipCommit[] = [];
+const arrival = (n: number): ShipCommit => ({
+  repo: REPO,
+  sha: sha(`e${n % 10}`),
+  short: sha(`e${n % 10}`).slice(0, 7),
+  message: `arrived ${n}`,
+  author: "agent:burst",
+  branch: "main",
+  at: now(),
+  stand: "needs_you",
+  line: `arrived ${n} · waits on you`,
+  pips: pips("none", "passed", "failed"),
+  environments: [],
+  tags: [],
+  runs: [],
+  cursor: 100 + n,
+  kind: "commit",
+  host: null,
+  change: null,
+  fold_under: null,
+  actions: [],
+});
+
+/** Every row: those a test added, the trunk's commits (newest first), then the fixed ones. */
+const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...commits()];
 
 /** Ship's routes, and the actions its rows name for the trunk's own ids (`ship-run-…`,
  * `ship-rel-…`, a trunk runner whose upgrade failed), so they answer before the routes the rest of
@@ -212,6 +236,12 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? "")) ?? null;
     if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });
     else ctx.json(res, 200, detail);
+    return true;
+  }
+  if (p === "/api/mock/ship/arrive" && m === "POST") {
+    if (q.get("clear")) arrived.length = 0;
+    else arrived.unshift(arrival(arrived.length + 1));
+    ctx.json(res, 200, { ok: true });
     return true;
   }
   if (!trunk || m !== "POST") return false;
