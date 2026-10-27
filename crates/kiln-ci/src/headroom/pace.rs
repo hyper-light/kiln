@@ -24,6 +24,10 @@ pub struct Running {
     pub protected: bool,
 }
 
+/// How finely a share is applied: the runner's pacer runs a group a whole number of percent of
+/// each period.
+pub const SHARE_STEPS: f64 = 100.0;
+
 /// A group's share of time from now (1: full speed), and why.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Pace {

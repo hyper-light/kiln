@@ -391,7 +391,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
         } else {
             HashMap::new()
         };
-        pacer.set(shares.iter().map(|(d, s)| (d.clone(), (s * 100.0).floor().clamp(0.0, 99.0) as u8)).collect(), Duration::from_micros(probes.fastest_us()));
+        pacer.set(shares.iter().map(|(d, s)| (d.clone(), (s * kiln_ci::headroom::pace::SHARE_STEPS).floor().clamp(0.0, 99.0) as u8)).collect(), Duration::from_micros(probes.fastest_us()));
         // Admission: who the engine let start.
         let started: Vec<(String, u64)> = plan
             .decisions
@@ -450,7 +450,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
                     cpu_pct: l.cpu_pct.round() as u32,
                     write_mb_s: (l.write_rate / 1e6).round() as u32,
                     mem_mb: (l.mem_bytes / 1e6).round() as u64,
-                    share: shares.get(&g.dir).map_or(100, |s| (s * 100.0).floor() as u8),
+                    share: shares.get(&g.dir).map_or(100, |s| (s * kiln_ci::headroom::pace::SHARE_STEPS).floor() as u8),
                     why: plan.shares.iter().find(|p| p.id == g.dir.display().to_string()).map(|p| p.why.clone()).unwrap_or_default(),
                 })
                 .collect(),

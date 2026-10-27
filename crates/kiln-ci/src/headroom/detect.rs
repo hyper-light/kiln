@@ -168,6 +168,15 @@ impl Detector {
     }
 
     /// The threshold for alarming, calibrated on this regime's calm record.
+    /// Whether a sample of `us` pushes the CUSUM up: past calm by more than the reference (with
+    /// nothing learned yet, only the tolerance does).
+    pub fn rising(&self, us: f64) -> bool {
+        match (self.mean(), self.reference()) {
+            (Some(mean), Some(k)) => us.max(f64::MIN_POSITIVE).ln() - mean > k,
+            _ => us >= self.tolerance_us,
+        }
+    }
+
     pub fn threshold(&self, budget_per_day: f64) -> f64 {
         self.up.peaks.threshold(self.allowed(budget_per_day), budget_per_day, self.days())
     }

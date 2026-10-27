@@ -16,6 +16,8 @@ pub mod admit;
 pub mod detect;
 pub mod knee;
 pub mod pace;
+#[cfg(test)]
+mod sim;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -51,6 +53,11 @@ pub struct Learned {
     #[serde(default)]
     pub cpu_knee: knee::Knee,
     pub demand: admit::Learned,
+    /// What the machine delivered (bytes written a second) the last time trouble showed: with a
+    /// queue built up, that is all its disks take, so kiln's budget is never raised past it less
+    /// what others write. Unknown where the system doesn't say what it writes.
+    #[serde(default)]
+    pub capacity_bps: Option<f64>,
 }
 
 /// A running group of work, as measured.
@@ -161,6 +168,11 @@ pub struct Engine {
     /// Shares in force, and what they were decided from (they change only when that does).
     shares: Vec<Pace>,
     decided_from: Option<(Option<u64>, Option<u64>, Vec<String>)>,
+    /// The most delivered during the trouble under way.
+    trouble_bps: Option<f64>,
+    /// The last cut: when, and the first answer to a probe sent after it (its target, when it
+    /// came, how long it took), which later probes of that target are measured against.
+    cut: Option<(u64, Option<(String, u64, f64)>)>,
 }
 
 impl Engine {
@@ -173,7 +185,7 @@ impl Engine {
             detectors.insert(t.name.clone(), d);
         }
         learned.detectors = detectors;
-        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None }
+        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, cut: None }
     }
 
     fn alarmed(&self) -> bool {
@@ -202,8 +214,13 @@ impl Engine {
 
         // Unslowed demand of what runs: measured at full speed, or scaled up from its share.
         for g in &o.running {
-            let r = self.runs.entry(g.id.clone()).or_insert_with(|| Run { key: g.key.clone(), since_us: now, peak_write: 0.0, peak_cpu: 0.0, peak_mem: 0.0, demand: 0.0, demand_cpu: 0.0 });
-            if g.share >= 1.0 {
+            // Until it's measured, what its kind was learned to want.
+            let prior = self.learned.demand.demand(&g.key).unwrap_or_default();
+            let r = self.runs.entry(g.id.clone()).or_insert_with(|| Run { key: g.key.clone(), since_us: now, peak_write: 0.0, peak_cpu: 0.0, peak_mem: 0.0, demand: prior.write_bps, demand_cpu: prior.cpu_cores });
+            let measured = g.write_bps > 0.0 || g.cpu_cores > 0.0;
+            if !measured {
+                // Not yet running anything measurable: the prior stands.
+            } else if g.share >= 1.0 {
                 r.demand = g.write_bps;
                 r.demand_cpu = g.cpu_cores;
             } else if g.share > 0.0 {
@@ -277,22 +294,78 @@ impl Engine {
         // its own as it holds calm where it limits.
         let hold = self.hold_us();
         let now_alarmed = self.alarmed();
+        // Whether trouble is draining since the last cut. Probes of a target go one after another:
+        // the first answer to one sent after the cut is the mark, and a later probe of it (sent
+        // after that answer came) no faster says it isn't draining. Only what is itself trouble
+        // (a sample the CUSUM counts as rising) says so.
+        let rising = |n: &str, us: f64| self.learned.detectors.get(n).is_some_and(|d| d.rising(us));
+        let mut worse = false;
+        let mut shown = false;
+        if let Some((at, first)) = &mut self.cut {
+            for (n, a) in &o.answers {
+                let Answer::Took(us) = a else { continue };
+                let sent = now.saturating_sub(*us as u64);
+                if sent < *at {
+                    continue;
+                }
+                if !rising(n, *us) {
+                    // Calm again: it drained.
+                    shown |= first.as_ref().is_some_and(|(n0, came, _)| n0 == n && sent >= *came);
+                    continue;
+                }
+                match first {
+                    None => *first = Some((n.clone(), now, *us)),
+                    Some((n0, came, took)) if n == n0 && sent >= *came => {
+                        worse |= us >= took;
+                        shown |= us < took;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if let Some((n0, came, took)) = first {
+                worse |= o.inflight.iter().any(|(n, age)| n == n0 && now.saturating_sub(*age as u64) >= *came && age >= took && rising(n, *age));
+            }
+        }
+        // While trouble shows, a queue is built up and what's delivered is all the disks take.
+        if now_alarmed && let Some(d) = o.delivered_bps {
+            self.trouble_bps = Some(self.trouble_bps.map_or(d, |t| t.max(d)));
+        } else if !now_alarmed && let Some(t) = self.trouble_bps.take() {
+            self.learned.capacity_bps = Some(t);
+        }
+        let cap_w = self.learned.capacity_bps.map(|c| c - o.delivered_bps.map_or(0.0, |d| (d - ours_w).max(0.0)));
+        if shown {
+            self.learned.knee.shown(now);
+            self.learned.cpu_knee.shown(now);
+        }
+        // The disks delivering all they were measured to take: they are the cause, not the CPU.
+        let disks_full = matches!((o.delivered_bps, self.learned.capacity_bps), (Some(d), Some(c)) if d + wanted / pace::SHARE_STEPS >= c);
         use knee::Unit;
         if now_alarmed && !was {
             events.push(self.learned.knee.alarm(now, ours_w, Unit::Writes));
-            events.push(self.learned.cpu_knee.alarm(now, ours_c, Unit::Cpu));
+            if !disks_full {
+                events.push(self.learned.cpu_knee.alarm(now, ours_c, Unit::Cpu));
+            }
+            self.cut = Some((now, None));
         } else if now_alarmed {
-            events.extend(self.learned.knee.persisting(now, ours_w, hold, Unit::Writes));
-            events.extend(self.learned.cpu_knee.persisting(now, ours_c, hold, Unit::Cpu));
+            let cut_w = self.learned.knee.persisting(now, ours_w, worse, Unit::Writes);
+            let cut_c = if disks_full { None } else { self.learned.cpu_knee.persisting(now, ours_c, worse, Unit::Cpu) };
+            if cut_w.is_some() || cut_c.is_some() {
+                self.cut = Some((now, None));
+            }
+            events.extend(cut_w);
+            events.extend(cut_c);
         } else {
+            self.cut = None;
             if was {
                 self.learned.knee.clear(now);
                 self.learned.cpu_knee.clear(now);
             }
-            let limited = self.learned.knee.budget.is_some_and(|b| wanted > b);
-            events.extend(self.learned.knee.calm(now, ours_w, limited, hold, Unit::Writes));
-            let limited_cpu = self.learned.cpu_knee.budget.is_some_and(|b| wanted_cpu > b);
-            events.extend(self.learned.cpu_knee.calm(now, ours_c, limited_cpu, hold, Unit::Cpu));
+            // A budget limits when what runs wants more, or when work waiting would take it past.
+            let next: Vec<Demand> = o.waiting.iter().filter_map(|w| self.learned.demand.demand(&w.key)).collect();
+            let limited = self.learned.knee.budget.is_some_and(|b| wanted > b || next.iter().any(|d| wanted + d.write_bps > b));
+            events.extend(self.learned.knee.calm(now, knee::Calm { delivered: ours_w, limited, hold_us: hold, resolution: wanted / pace::SHARE_STEPS, cap: cap_w }, Unit::Writes));
+            let limited_cpu = self.learned.cpu_knee.budget.is_some_and(|b| wanted_cpu > b || next.iter().any(|d| wanted_cpu + d.cpu_cores > b));
+            events.extend(self.learned.cpu_knee.calm(now, knee::Calm { delivered: ours_c, limited: limited_cpu, hold_us: hold, resolution: wanted_cpu / pace::SHARE_STEPS, cap: None }, Unit::Cpu));
         }
         let budget = self.learned.knee.budget;
         let cpu_budget = self.learned.cpu_knee.budget;

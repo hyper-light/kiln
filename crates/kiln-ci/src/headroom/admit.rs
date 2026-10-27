@@ -1,8 +1,9 @@
 //! Who starts next (docs/headroom.md, "Admission"): work waiting to start (a session's next turn,
 //! a heavy command) has a class, how long it has waited, and a demand learned from its own past
 //! (writes a second, CPU cores, peak memory, how long it runs) with the mean over everything as the
-//! prior. It starts when that demand fits what's left: the write and CPU budgets less what runs and
-//! what is promised, and the memory free less what is promised. Order: class, then highest response
+//! prior. It starts while some of the write and CPU budgets is left after what runs and what is
+//! promised (past that the pacer slows it, so the budgets are used whole and never overrun), and
+//! when its peak memory fits the memory free less what is promised (memory can't be slowed). Order: class, then highest response
 //! ratio ((wait + run time) / run time), so short work goes first and long work never starves.
 //! Work behind one that doesn't fit starts only if it delays no waiting work (conservative
 //! backfilling). With nothing learned at all, one unknown at a time starts, until its demand shows.
@@ -171,7 +172,7 @@ impl Profile {
             let end = run.map(|r| start.saturating_add(r));
             // The step in force at `start`, and every one that begins before `end`.
             let at = self.steps.iter().rposition(|s| s.0 <= start).unwrap_or_default();
-            self.steps.iter().skip(at).take_while(|s| s.0 == start || s.0 > start && end.is_none_or(|e| s.0 < e)).all(|s| d.write_bps <= s.1 + 1e-9 && d.mem_bytes <= s.2 + 1e-9 && d.cpu_cores <= s.3 + 1e-9)
+            self.steps.iter().skip(at).take_while(|s| s.0 == start || s.0 > start && end.is_none_or(|e| s.0 < e)).all(|s| (d.write_bps <= 0.0 || s.1 > 0.0) && d.mem_bytes <= s.2 + 1e-9 && (d.cpu_cores <= 0.0 || s.3 > 0.0))
         })
     }
 
@@ -229,6 +230,9 @@ pub fn decide(now_us: u64, room: &Room, promised: &[Promise], waiting: &[Waiting
             out.push(Decision { id: w.id.clone(), start: true, at_us: Some(now_us), why: "nothing learned yet: starts alone, to learn what it needs".into() });
             continue;
         };
+        // What it needs of what can be paced is at most the budget: past that it is slowed, so it
+        // starts once kiln's other work leaves it the whole budget, and never starves.
+        let d = Demand { write_bps: room.write_budget.map_or(d.write_bps, |b| d.write_bps.min(b)), cpu_cores: room.cpu_budget.map_or(d.cpu_cores, |b| d.cpu_cores.min(b)), ..d };
         // Its run, as learned (none known: it holds its room for good, which delays no one).
         let run = (d.duration_us > 0.0).then_some(d.duration_us as u64);
         match profile.earliest(d, run) {
@@ -325,7 +329,9 @@ mod tests {
             let d = decide(2_000_000, &room, &[], &q, &l);
             let demand = |id: &str| q.iter().find(|x| x.id == id).and_then(|x| l.demand(&x.key)).unwrap_or_default();
             let started: Vec<Demand> = d.iter().filter(|d| d.start).map(|d| demand(&d.id)).collect();
-            prop_assert!(started.iter().map(|d| d.write_bps).sum::<f64>() <= (budget - used).max(0.0) + 1e-6);
+            // Writes are paced to the budget: each starts while some is left, so all but one fit.
+            let largest = started.iter().map(|d| d.write_bps).fold(0.0, f64::max);
+            prop_assert!(started.iter().map(|d| d.write_bps).sum::<f64>() - largest <= (budget - used).max(0.0) + 1e-6);
             prop_assert!(started.iter().map(|d| d.mem_bytes).sum::<f64>() <= mem + 1e-6);
             // Each one's reservation is the one it gets with only the work ahead of it waiting.
             for (i, x) in d.iter().enumerate() {
