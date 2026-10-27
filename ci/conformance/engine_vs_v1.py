@@ -10,7 +10,9 @@ both at once don't fit one machine beside its other work, and a side waiting on 
 would spend its jobs' timeouts waiting). Then it records every job's conclusion on each side and,
 for the `rust` job, each test that failed (from its `test` step's cargo output). The next commit
 waits for that, since ci.yaml and release.yaml cancel a run in progress when main moves. With one
-`--repo` for both, both sides get each commit at once.
+`--repo` for both, both sides get each commit at once. Only push runs count: a `schedule:` fires on
+each server's own clock at whatever commit its main is at then, so its runs don't line up with the
+replay's commits (W28 step 3).
 
     python3 -I ci/conformance/engine_vs_v1.py --v1-repo <bare repository> --engine-repo <another> \\
         --v1 http://127.0.0.1:17101 --v1-token-file <a>/data/admin.token \\
@@ -115,7 +117,7 @@ class V1:
 
     def runs(self, sha):
         page = self.s.get(f"/api/runs?repo={self.repo}&limit=200") or []
-        return [r for r in page if r.get("sha") == sha and not r.get("workflow_id")]
+        return [r for r in page if r.get("sha") == sha and not r.get("workflow_id") and r.get("event", "push") == "push"]
 
     def done(self, run):
         return run.get("status") in FINISHED_V1
@@ -147,7 +149,7 @@ class Engine:
     def runs(self, sha):
         q = urllib.parse.quote(self.name, safe="")
         page = (self.s.get(f"/api/ci/runs?repo={q}&limit=100") or {}).get("runs", [])
-        return [r for r in page if r.get("sha") == sha or r.get("head_sha") == sha]
+        return [r for r in page if (r.get("sha") == sha or r.get("head_sha") == sha) and r.get("event", "push") == "push"]
 
     def done(self, run):
         # The engine's runs share v1's table and statuses (`failed`, …), with a conclusion besides.
