@@ -55,8 +55,15 @@ only for the resource that's short. Groups are each agent session's cgroup and, 
 on, the user's transient units (`systemd-run --user`: agents' builds). Units the desktop starts
 for a person (`app-…`, `dbus-…`, `xdg-…`) are never paced.
 
-**Failing safe.** What's paced is noted in `<state>/headroom/paced.json` and started again on the
-next start; what was learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own
+On macOS and Windows a group is each agent session's processes as kiln holds them (followed fork
+by fork on macOS, its job object on Windows), metered process by process (CPU time, bytes
+written, resident memory: `sysinfo`) and stopped process by process: SIGSTOP and SIGCONT on
+macOS, every thread suspended and resumed on Windows. A process an agent starts while its group
+is stopped runs until the next stop. Neither system says what its disks write in all, so
+`delivered_bps` is unknown there: budgets are measured on kiln's own work either way.
+
+**Failing safe.** What's stopped is noted in `<state>/headroom/paced.json` (a cgroup's folder; a
+process id on macOS and Windows) and started again on the next start; what was learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own
 threads, from settings it kept, with the server away. `max_sessions` never turns away sessions a
 restart continues.
 
@@ -124,8 +131,8 @@ backtraces still give file and line, and each gate writes several times less.
 
 ## Next
 
-- Pausing containers, microVMs, VMs and Kubernetes pods through their own controls, and Windows
-  and macOS pacing (job objects; SIGSTOP of a tracked tree), with OS limits where available.
+- Pausing containers, microVMs, VMs and Kubernetes pods through their own controls, with OS
+  limits where available.
 - Targets from KilnCD's records of what it deployed on each machine.
 - Learned costs per command and leases on the window; merging identical gates; moving work to
   calmer machines; the server pacing what it sends a busy runner, and itself.

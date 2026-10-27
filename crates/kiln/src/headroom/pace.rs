@@ -4,8 +4,9 @@
 //!
 //! Linux: each agent session's cgroup (`crate::os::contain`), and, unless the settings say not to,
 //! every transient unit the user's service manager runs (`systemd-run --user`: a build an agent
-//! started to outlive its command), stopped and started with `cgroup.freeze`. Elsewhere there is
-//! nothing to pace yet (work past the window still waits to start).
+//! started to outlive its command), stopped and started with `cgroup.freeze`. macOS and Windows:
+//! each agent session's processes as `crate::os::contain` holds them, metered process by process
+//! and stopped process by process (SIGSTOP and SIGCONT; every thread suspended and resumed).
 //!
 //! Every group paced is noted in a file, so a runner that dies with work stopped starts it again
 //! when it starts (and so does the next one, should this one never come back).
@@ -29,9 +30,15 @@ pub struct Group {
     pub session: Option<String>,
 }
 
-/// How the machine paces work: `"cgroup"`, or `"none"`.
+/// How the machine paces work: `"cgroup"` (Linux), `"signals"` (macOS), `"threads"` (Windows), or
+/// `"none"`.
 pub fn how() -> &'static str {
-    if cfg!(target_os = "linux") && imp::available() { "cgroup" } else { "none" }
+    match imp::available() {
+        false => "none",
+        true if cfg!(target_os = "linux") => "cgroup",
+        true if cfg!(windows) => "threads",
+        true => "signals",
+    }
 }
 
 /// The groups there are now.
@@ -83,6 +90,8 @@ impl Meter {
 pub struct Pacer {
     shares: Arc<Mutex<HashMap<PathBuf, u8>>>,
     period: Arc<Mutex<Duration>>,
+    /// The groups stopped now, each with what starts it again (`imp::release`).
+    held: Arc<Mutex<HashMap<PathBuf, Vec<String>>>>,
     stop: Arc<AtomicBool>,
     record: PathBuf,
 }
@@ -93,81 +102,88 @@ impl Pacer {
         let record = dir.join("paced.json");
         release_recorded(&record);
         let shares: Arc<Mutex<HashMap<PathBuf, u8>>> = Arc::default();
+        let held: Arc<Mutex<HashMap<PathBuf, Vec<String>>>> = Arc::default();
         let period = Arc::new(Mutex::new(Duration::from_millis(1000)));
         let stop = Arc::new(AtomicBool::new(false));
-        let (sh, pe, st) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stop));
+        let (sh, pe, he, st, rec) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&held), Arc::clone(&stop), record.clone());
         let spawned = std::thread::Builder::new().name("kiln-pacer".into()).spawn(move || {
             let base = Instant::now();
-            let mut stopped: HashMap<PathBuf, bool> = HashMap::new();
             while !st.load(Ordering::Relaxed) {
                 let p = pe.lock().as_millis().max(1) as u64;
                 let now = base.elapsed().as_millis() as u64;
                 let want: Vec<(PathBuf, u8)> = sh.lock().iter().map(|(d, s)| (d.clone(), *s)).collect();
+                let mut held = he.lock();
+                let mut changed = false;
                 for (dir, share) in &want {
                     // Each group's period starts at its own offset, so they don't all start at once.
                     let offset = dir.to_string_lossy().bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))) % p;
                     let run = (now + offset) % p < p * u64::from(*share) / 100;
-                    if stopped.get(dir).copied() != Some(!run) && imp::freeze(dir, !run).is_ok() {
-                        stopped.insert(dir.clone(), !run);
+                    if run {
+                        if let Some(keys) = held.remove(dir) {
+                            keys.iter().for_each(|k| imp::release(k));
+                            changed = true;
+                        }
+                    } else if !held.contains_key(dir)
+                        && let Ok(keys) = imp::stop(dir)
+                    {
+                        held.insert(dir.clone(), keys);
+                        changed = true;
                     }
                 }
                 // Groups no longer paced run again.
-                stopped.retain(|dir, was| {
-                    if want.iter().any(|(d, _)| d == dir) {
-                        return true;
+                held.retain(|dir, keys| {
+                    let keep = want.iter().any(|(d, _)| d == dir);
+                    if !keep {
+                        keys.iter().for_each(|k| imp::release(k));
+                        changed = true;
                     }
-                    if *was {
-                        let _ = imp::freeze(dir, false);
-                    }
-                    false
+                    keep
                 });
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            for (dir, was) in stopped {
-                if was {
-                    let _ = imp::freeze(&dir, false);
+                if changed {
+                    note(&rec, &held);
                 }
+                drop(held);
+                std::thread::sleep(Duration::from_millis(50));
             }
         });
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "headroom: the pacer couldn't start; work past the window still waits to start");
         }
-        Self { shares, period, stop, record }
+        Self { shares, period, held, stop, record }
     }
 
     /// Each paced group's share from now (percent; groups at 100 aren't listed).
     pub fn set(&self, paced: HashMap<PathBuf, u8>, period: Duration) {
         *self.period.lock() = period;
-        let changed = *self.shares.lock() != paced;
-        if changed {
-            let dirs: Vec<String> = paced.keys().map(|d| d.display().to_string()).collect();
-            if let Err(e) = crate::util::write_secret_unsynced(&self.record, &serde_json::to_vec(&dirs).unwrap_or_default(), 0o644) {
-                tracing::warn!(error = %e, "headroom: couldn't note what is paced");
-            }
-            *self.shares.lock() = paced;
-        }
+        *self.shares.lock() = paced;
+    }
+}
+
+/// Notes what starts every group stopped now, for a runner that starts after this one dies.
+fn note(record: &Path, held: &HashMap<PathBuf, Vec<String>>) {
+    let keys: Vec<&String> = held.values().flatten().collect();
+    if let Err(e) = crate::util::write_secret_unsynced(record, &serde_json::to_vec(&keys).unwrap_or_default(), 0o644) {
+        tracing::warn!(error = %e, "headroom: couldn't note what is paced");
     }
 }
 
 impl Drop for Pacer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for dir in self.shares.lock().keys() {
-            let _ = imp::freeze(dir, false);
+        for keys in std::mem::take(&mut *self.held.lock()).into_values() {
+            keys.iter().for_each(|k| imp::release(k));
         }
         let _ = std::fs::remove_file(&self.record);
     }
 }
 
-/// Starts every group a record says was paced.
+/// Starts everything a record says was stopped.
 fn release_recorded(record: &Path) {
     let Ok(raw) = std::fs::read(record) else { return };
-    let dirs: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
-    for d in &dirs {
-        let _ = imp::freeze(Path::new(d), false);
-    }
-    if !dirs.is_empty() {
-        tracing::info!(groups = dirs.len(), "headroom: work a previous runner left paced runs again");
+    let keys: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
+    keys.iter().for_each(|k| imp::release(k));
+    if !keys.is_empty() {
+        tracing::info!(stopped = keys.len(), "headroom: work a previous runner left paced runs again");
     }
     let _ = std::fs::remove_file(record);
 }
@@ -286,31 +302,199 @@ mod imp {
         }
     }
 
-    pub fn freeze(dir: &Path, stop: bool) -> std::io::Result<()> {
+    fn freeze(dir: &Path, stop: bool) -> std::io::Result<()> {
         fs::write(dir.join("cgroup.freeze"), if stop { "1" } else { "0" })
     }
+
+    /// Stops the whole cgroup at once; it starts again by its folder.
+    pub fn stop(dir: &Path) -> std::io::Result<Vec<String>> {
+        freeze(dir, true).map(|()| vec![dir.display().to_string()])
+    }
+
+    pub fn release(key: &str) {
+        let _ = freeze(Path::new(key), false);
+    }
+}
+
+/// What processes `pids` have done between them, as a cgroup's counters say it: CPU time (µs),
+/// bytes written, memory held now. A process that ends takes its counts with it, so a group's next
+/// rate starts from what's left (the meter never goes below zero): it reads low for that one look.
+#[cfg(any(not(target_os = "linux"), test))]
+fn processes(pids: &[u32]) -> (u64, u64, u64) {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    static SYSTEM: std::sync::OnceLock<Mutex<System>> = std::sync::OnceLock::new();
+    if pids.is_empty() {
+        return (0, 0, 0);
+    }
+    let pids: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
+    let mut sys = SYSTEM.get_or_init(|| Mutex::new(System::new())).lock();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::nothing().with_cpu().with_disk_usage().with_memory().without_tasks());
+    pids.iter().filter_map(|p| sys.process(*p)).fold((0, 0, 0), |(c, w, m), p| {
+        (c + p.accumulated_cpu_time().saturating_mul(1000), w + p.disk_usage().total_written_bytes, m + p.memory())
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::Group;
 
+    /// A session's group's `dir`: no folder here, the session it is.
+    const SESSION: &str = "session:";
+
+    /// Pacing by stopping processes: macOS by signal, Windows thread by thread.
     pub fn available() -> bool {
-        false
+        cfg!(any(target_os = "macos", windows))
     }
 
+    /// A group for each agent session with processes held (`crate::os::contain`): a job object's
+    /// on Windows, those followed fork by fork on macOS. A unit outside them (a build an agent
+    /// started to outlive its command) isn't one: nothing here holds it.
     pub fn groups(_escapes: bool) -> Vec<Group> {
-        Vec::new()
+        crate::os::contain::sessions().into_iter().map(|s| Group { dir: PathBuf::from(format!("{SESSION}{s}")), label: s.clone(), session: Some(s) }).collect()
     }
 
-    pub fn counters(_dir: &Path) -> (u64, u64, u64) {
-        (0, 0, 0)
+    /// The session's processes' counters, summed.
+    pub fn counters(dir: &Path) -> (u64, u64, u64) {
+        super::processes(&pids(dir))
     }
 
-    pub fn freeze(_dir: &Path, _stop: bool) -> std::io::Result<()> {
-        Err(std::io::Error::other("no pacing on this system yet"))
+    fn pids(dir: &Path) -> Vec<u32> {
+        let Some(session) = dir.to_str().and_then(|d| d.strip_prefix(SESSION)) else { return Vec::new() };
+        crate::os::contain::Group::existing(session).map(|g| g.pids()).unwrap_or_default()
+    }
+
+    /// Stops each of the session's processes, each starting again by its id: one started
+    /// meanwhile runs until the next stop.
+    pub fn stop(dir: &Path) -> std::io::Result<Vec<String>> {
+        stop_pids(&pids(dir))
+    }
+
+    /// Stops processes `pids`: SIGSTOP on macOS, every thread suspended on Windows.
+    #[cfg(target_os = "macos")]
+    pub fn stop_pids(pids: &[u32]) -> std::io::Result<Vec<String>> {
+        use nix::sys::signal::{Signal, kill};
+        Ok(pids
+            .iter()
+            .copied()
+            .filter(|p| i32::try_from(*p).is_ok_and(|p| kill(nix::unistd::Pid::from_raw(p), Signal::SIGSTOP).is_ok()))
+            .map(|p| format!("pid:{p}"))
+            .collect())
+    }
+
+    #[cfg(windows)]
+    pub fn stop_pids(pids: &[u32]) -> std::io::Result<Vec<String>> {
+        Ok(crate::os::contain::suspend_all(pids).into_iter().map(|p| format!("pid:{p}")).collect())
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    pub fn stop_pids(_pids: &[u32]) -> std::io::Result<Vec<String>> {
+        Err(std::io::Error::other("no pacing on this system"))
+    }
+
+    pub fn release(key: &str) {
+        let Some(pid) = key.strip_prefix("pid:").and_then(|p| p.parse::<u32>().ok()) else { return };
+        #[cfg(target_os = "macos")]
+        if let Ok(pid) = i32::try_from(pid) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGCONT);
+        }
+        #[cfg(windows)]
+        crate::os::contain::resume_all(&[pid]);
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = pid;
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use std::io::Write as _;
+
+    /// Set in a child this test starts: the child writes there until it's ended.
+    const WRITER: &str = "KILN_HEADROOM_TEST_WRITER";
+
+    use std::time::Duration;
+
+    /// A child process writing (and syncing) a file until it's ended: this test binary again, run
+    /// as the test named `test`, which writes when it finds [`WRITER`] set.
+    struct Writer {
+        child: std::process::Child,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Writer {
+        fn start(test: &str) -> anyhow::Result<Self> {
+            // On a real disk next to the test binary (a tmpfs would never count a write).
+            let exe = std::env::current_exe()?;
+            let dir = tempfile::tempdir_in(exe.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?)?;
+            let me = format!("{}::{test}", module_path!().split_once("::").map_or("", |(_, m)| m));
+            let child = std::process::Command::new(&exe)
+                .args([me.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+                .env(WRITER, dir.path().join("w"))
+                .stdout(std::process::Stdio::null())
+                .spawn()?;
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(Self { child, _dir: dir })
+        }
+
+        fn pid(&self) -> [u32; 1] {
+            [self.child.id()]
+        }
+
+        /// What it did over `d`: CPU µs and bytes written.
+        fn over(&self, d: Duration) -> (u64, u64) {
+            let (c0, w0, _) = super::processes(&self.pid());
+            std::thread::sleep(d);
+            let (c1, w1, _) = super::processes(&self.pid());
+            (c1.saturating_sub(c0), w1.saturating_sub(w0))
+        }
+    }
+
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// In the child [`Writer`] starts: write until ended.
+    fn write_if_asked() -> anyhow::Result<()> {
+        let Some(path) = std::env::var_os(WRITER) else { return Ok(()) };
+        let mut f = std::fs::File::create(path)?;
+        let block = vec![7u8; 1 << 20];
+        loop {
+            f.write_all(&block)?;
+            f.sync_data()?;
+        }
+    }
+
+    #[test]
+    fn a_processs_cpu_and_writes_rise_as_it_works() -> anyhow::Result<()> {
+        write_if_asked()?;
+        let w = Writer::start("a_processs_cpu_and_writes_rise_as_it_works")?;
+        let (_, _, mem) = super::processes(&w.pid());
+        let (cpu, written) = w.over(Duration::from_millis(700));
+        anyhow::ensure!(cpu > 0, "no CPU time");
+        anyhow::ensure!(written > 0, "nothing written");
+        anyhow::ensure!(mem > 0, "no memory");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_stopped_process_does_nothing_and_works_again_once_released() -> anyhow::Result<()> {
+        write_if_asked()?;
+        let w = Writer::start("a_stopped_process_does_nothing_and_works_again_once_released")?;
+        let keys = super::imp::stop_pids(&w.pid())?;
+        anyhow::ensure!(keys.len() == 1, "{keys:?}");
+        // What was under way when it stopped lands first.
+        std::thread::sleep(Duration::from_millis(200));
+        let (cpu, written) = w.over(Duration::from_millis(700));
+        anyhow::ensure!(cpu == 0 && written == 0, "stopped, yet {cpu} µs of CPU and {written} bytes written");
+        keys.iter().for_each(|k| super::imp::release(k));
+        let (cpu, written) = w.over(Duration::from_millis(700));
+        anyhow::ensure!(cpu > 0 && written > 0, "released, yet {cpu} µs of CPU and {written} bytes written");
+        Ok(())
     }
 }
 

@@ -287,12 +287,20 @@ impl Disks {
     }
 }
 
-/// Memory the machine has free for new work (MemAvailable), in bytes.
+/// Memory the machine has free for new work, in bytes: MemAvailable on Linux, what the system says
+/// is available elsewhere.
 fn mem_free() -> f64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|t| t.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()))
-        .map_or(0.0, |kib| kib * 1024.0)
+        .map_or_else(
+            || {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+                sys.available_memory() as f64
+            },
+            |kib| kib * 1024.0,
+        )
 }
 
 fn run(ctx: Ctx, mut settings: Settings) {
