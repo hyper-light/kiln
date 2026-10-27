@@ -1,6 +1,6 @@
 /**
  * A commit's states as glyphs (status-glyph-spec.ts): one shape and one word each, every one with a
- * motion of its own (status-glyph.css), and the journey strip of six of them, land to replant.
+ * motion of its own (status-glyph.css), and the journey strip of seven of them, review to replant.
  */
 import * as React from "react";
 import { cn } from "@/lib/utils";
@@ -86,7 +86,7 @@ export function StatusGlyph({ state, size = 14, p = 0, label, className }: { sta
   );
 }
 
-/** A commit's journey as six pips joined by a line: lit where the stage before is done, light flowing where work is under way. */
+/** A commit's journey as seven pips joined by a line: lit where the stage before is done, light flowing where work is under way. */
 export function JourneyStrip({ pips, labels = true, className }: { pips: readonly Pip[]; labels?: boolean; className?: string }) {
   return (
     <span ref={phaseLock} className={cn("js", className)} role="img" aria-label={journeyLabel(pips)}>

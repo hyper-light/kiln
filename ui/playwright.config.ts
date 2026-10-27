@@ -12,6 +12,8 @@ import { defineConfig, devices } from "@playwright/test";
 const PORT = Number(process.env.E2E_PORT ?? 17073);
 /** A real kiln server to run against, instead of the mock. */
 const REAL = process.env.E2E_BASE_URL;
+/** Chromium's channel: the machine's own Chrome unless `E2E_CHANNEL` names another (WebKit has none). */
+const CHANNEL = process.env.E2E_CHANNEL ?? "chrome";
 
 export default defineConfig({
   testDir: "e2e",
@@ -20,7 +22,7 @@ export default defineConfig({
   workers: 1,
   reporter: [["list"]],
   timeout: 120_000,
-  use: { baseURL: REAL ?? `http://127.0.0.1:${PORT}`, channel: process.env.E2E_CHANNEL ?? "chrome", trace: "off" },
+  use: { baseURL: REAL ?? `http://127.0.0.1:${PORT}`, trace: "off" },
   webServer: REAL
     ? undefined
     : {
@@ -31,13 +33,13 @@ export default defineConfig({
         timeout: 60_000,
       },
   projects: [
-    { name: "desktop", use: { browserName: "chromium", viewport: { width: 1440, height: 900 } } },
-    { name: "phone", use: { ...devices["Pixel 7"], browserName: "chromium" } },
+    { name: "desktop", use: { browserName: "chromium", channel: CHANNEL, viewport: { width: 1440, height: 900 } } },
+    { name: "phone", use: { ...devices["Pixel 7"], browserName: "chromium", channel: CHANNEL } },
     // WebKit too (E2E_WEBKIT=1, with Playwright's WebKit installed: `npx playwright install webkit`).
     ...(process.env.E2E_WEBKIT
       ? [
-          { name: "desktop-webkit", use: { browserName: "webkit" as const, channel: undefined, viewport: { width: 1440, height: 900 } } },
-          { name: "phone-webkit", use: { ...devices["iPhone 15"], browserName: "webkit" as const, channel: undefined } },
+          { name: "desktop-webkit", use: { browserName: "webkit" as const, viewport: { width: 1440, height: 900 } } },
+          { name: "phone-webkit", use: { ...devices["iPhone 15"], browserName: "webkit" as const } },
         ]
       : []),
   ],

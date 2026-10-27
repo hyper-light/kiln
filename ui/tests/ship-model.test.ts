@@ -3,7 +3,20 @@ import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
 import { fold, order, reviewWord, standWord, strip } from "../src/views/ship/model.ts";
 
-const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({ repo: "r", sha, short: sha.slice(0, 7), message: sha, author: "ada", branch: "main", at: 0, stand, line: "", pips: [], cursor: 0, ...extra });
+const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
+  repo: "r",
+  sha,
+  short: sha.slice(0, 7),
+  message: sha,
+  author: "ada",
+  branch: "main",
+  at: 0,
+  stand,
+  line: "",
+  pips: [],
+  cursor: 0,
+  ...extra,
+});
 
 test("w26_r01: a change's other commits fold under its tip, and stand alone when the tip isn't on the page", () => {
   const items = fold([c("tip", "waiting"), c("a", "waiting", { fold_under: "tip" }), c("b", "waiting", { fold_under: "gone" })]);
@@ -30,15 +43,21 @@ test("w26_r02: needs you first, then failing, by stand; newest keeps Ship's orde
   assert.equal(standWord("superseded"), "Superseded");
 });
 
-test("w26_r02: the strip draws what it knows; the review shows in words until its glyph comes", () => {
+test("w26_r02: the strip draws Review first, then the stages after it; what it doesn't know waits for its glyph", () => {
   const pips = [
     { stage: "review", state: "requested" },
     { stage: "land", state: "none" },
     { stage: "checks", state: "passed" },
+    { stage: "orbit", state: "passed" },
+    { stage: "build", state: "levitating" },
   ];
   assert.deepEqual(
-    strip(pips).map((p) => p.stage),
-    ["land", "checks"],
+    strip(pips).map((p) => [p.stage, p.state]),
+    [
+      ["review", "requested"],
+      ["land", "none"],
+      ["checks", "passed"],
+    ],
   );
   const d41 = c("d", "needs_you", { pips, change: { name: "D41", kind: "diff", host: "kiln", title: "t", revision: 1, latest: 1, state: "requested", turn: [], open: null, superseded_by: null } });
   assert.equal(reviewWord(d41), "D41 · requested");

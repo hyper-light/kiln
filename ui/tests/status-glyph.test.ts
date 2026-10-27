@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { arcPath, GLYPHS, journeyLabel, moves, pipDone, pipFlows, signature, STATES, type Pip } from "../src/components/ui/status-glyph-spec.ts";
+import { arcPath, GLYPHS, journeyLabel, moves, pipDone, pipFlows, signature, STAGES, STATES, type Pip } from "../src/components/ui/status-glyph-spec.ts";
 
 test("every state has a word and a shape no other state has, so none needs its colour to be told apart", () => {
   const seen = new Map<string, string>();
@@ -47,4 +47,18 @@ test("the line into a stage lights once the stage before is done, and light flow
   assert.equal(pipFlows("running"), true);
   assert.equal(pipFlows("needs"), true);
   assert.equal(pipFlows("passed"), false);
+});
+
+test("w26_r02: Review is the journey's first stage, with a glyph for each of a review's seven states", () => {
+  assert.deepEqual(STAGES, ["review", "land", "checks", "build", "staging", "production", "replant"]);
+  for (const state of ["draft", "requested", "changes", "blocked", "fixing", "conflict", "approved"] as const) assert.ok(moves(state), state);
+  assert.equal(pipDone("approved"), true, "an approved review lights the line to Land");
+  assert.equal(pipDone("requested"), false);
+  assert.equal(pipFlows("fixing"), true, "an agent fixing is work under way");
+  const pips: Pip[] = [
+    { stage: "review", state: "requested" },
+    { stage: "land", state: "none" },
+    { stage: "checks", state: "passed" },
+  ];
+  assert.equal(journeyLabel(pips), "Review: requested, Land: not yet, Checks: passed");
 });

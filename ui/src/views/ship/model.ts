@@ -74,13 +74,13 @@ export function order(items: readonly Item[], sort: Sort): Item[] {
     .map((x) => x.it);
 }
 
-/** The pips the journey strip draws: the stages and states it knows (others wait for their glyphs). */
+/** The pips the journey strip draws, Review first: the stages and states it knows (others wait for their glyphs). */
 export function strip(pips: readonly ShipPip[]): Pip[] {
   const stages = STAGES as readonly string[];
   return pips.filter((p) => stages.includes(p.stage) && p.state in GLYPHS).map((p) => ({ stage: p.stage as Pip["stage"], state: p.state as GlyphState, p: p.p }));
 }
 
-/** The review's word on the row, while its glyph is to come: `D41 · requested`. */
+/** The change and its review's state on the row, beside its Review pip: `D41 · requested`. */
 export function reviewWord(c: ShipCommit): string | null {
   const ch = c.change;
   if (!ch) return null;
