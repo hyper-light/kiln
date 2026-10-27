@@ -157,6 +157,16 @@ counted.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
   it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
   many, with Select all and Done. With a mouse, rows keep their checkboxes.
+- **What to do with those selected.** The list's head offers each of one agent's own actions that
+  some of the selected take, saying how many: **Resume** (those paused at a usage limit, and those
+  whose goals are paused part-way), **Pause** (their goals running), **Stop** (their turns under
+  way), **Restart** and **Remove** (those stopped or ended), **Move to…** and **End…**. Moving
+  and ending are asked in a line under the buttons: Move offers each machine that takes some of
+  them (how many, when not all, and why the rest stay), once their turns are over or now; End
+  says what goes with them and ends the agents they started that still run too, unless unticked.
+  **More** holds where their commands run, keeping them going, and muting their notifications.
+  Each goes to every agent it's for at once; a line says how it went (done, skipped, failed) and
+  opens to each agent's outcome and why. Those all ended leave the selection.
 - **The message box.** It writes to the agents selected (each named in its To line, put back with
   its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
   harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say

@@ -26,6 +26,7 @@ import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
+import { BulkBar } from "./bulk";
 import { DEFAULT_VIEW, isFiltered, ListBar, sortOf, useGlide, useListHold, useShownList, type ListView } from "./list-tools";
 import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
@@ -598,6 +599,8 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                 Message agents
               </button>
             )}
+            {/* What to do with those selected, in the head (held in view by touch while selecting). */}
+            <BulkBar agents={checked.map((r) => r.a)} all={findable} onGone={clear} />
           </div>
           {phone && (!folds || messaging) && message}
           {live.length > 0 ? (
