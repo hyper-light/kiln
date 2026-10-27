@@ -72,22 +72,22 @@ function commits(): ShipCommit[] {
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
       ],
     }),
-    // A landed change: its tip commit carries its review, approved and landed (W26-R14's e2e), older
-    // than D41 so the newest is still D41, on a sha of its own.
+    // A landed change, GitLab's !6: its tip commit carries its review, approved and landed (W26-R14's
+    // e2e); older than D41 so the newest is still D41, on a sha of its own.
     row({
       sha: sha("6"),
       short: "6666666",
       message: "ci: a landed change",
       author: "user:ada",
-      at: t - 5400,
+      at: t - 3600,
       stand: "shipped",
       line: "Landed · In production",
       cursor: 12,
       pips: pips("approved", "passed", "passed", "passed", "passed", "healthy"),
-      kind: "diff",
-      host: "kiln",
+      kind: "request",
+      host: "gitlab",
       environments: [{ environment: "production", production: true }],
-      change: { ...change("D44", "diff", "kiln", "ci: a landed change", "landed", [], { question: 0, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
+      change: { ...change("!6", "request", "gitlab", "ci: a landed change", "landed", [], { question: 0, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
       runs: [{ id: "run-44", pipeline: "ci" }],
     }),
     // D41's first revision, which its second replaced: quiet, folded under it.
@@ -236,7 +236,31 @@ const arrival = (n: number): ShipCommit => ({
  * A fixed row's review marks, oldest first (W26-R14): a commit with no change has one, its push; a
  * change has a push per revision, a comment per open thread, and its approval, asked or given.
  */
+/** The marks Review's step 8 tells its story with (W26-R14): D41 pushed, a blocking thread
+ * resolved, fixed by Apply, its conflict resolved, approved; the landed !6; CR12 asked of kim. */
+const MARKS: Record<string, (at: number) => ReviewMark[]> = {
+  D41: (at) => [
+    { id: "D41-push-5", kind: "push", at: at - 3000, end: at - 3000, by: "agent:matrix", signer: null, revision: 5, state: "passed" },
+    { id: "D41-comment-1", kind: "comment", at: at - 2700, end: at - 2100, by: "user:kim", signer: null, revision: 5, state: "blocked", thread: "D41-t1", note: "blocking" },
+    { id: "D41-resolved-1", kind: "comment", at: at - 2100, end: at - 2100, by: "user:kim", signer: null, revision: 5, state: "passed", thread: "D41-t1", note: "resolved" },
+    { id: "D41-fix-6", kind: "fix", at: at - 1800, end: at - 1800, by: "agent:matrix for user:ada", signer: null, revision: 6, state: "passed", thread: "D41-t1", note: "suggestion applied" },
+    { id: "D41-resolution-7", kind: "resolution", at: at - 900, end: at - 900, by: "agent:matrix", signer: null, revision: 7, state: "passed" },
+    { id: "D41-approval", kind: "approval", at: at - 600, end: at - 300, by: "user:kim", signer: null, revision: 7, state: "approved" },
+  ],
+  "!6": (at) => [
+    { id: "!6-push-1", kind: "push", at: at - 2400, end: at - 2400, by: "gitlab:mei", signer: null, revision: 1, state: "passed" },
+    { id: "!6-push-2", kind: "push", at: at - 1200, end: at - 1200, by: "gitlab:mei", signer: null, revision: 2, state: "passed" },
+    { id: "!6-approval", kind: "approval", at: at - 900, end: at - 600, by: "gitlab:mei", signer: null, revision: 2, state: "approved" },
+  ],
+  CR12: (at) => [
+    { id: "CR12-push-1", kind: "push", at: at - 1200, end: at - 1200, by: "user:lee", signer: null, revision: 1, state: "passed" },
+    { id: "CR12-approval", kind: "approval", at: at - 600, end: null, by: "user:kim", signer: null, revision: 1, state: "requested" },
+  ],
+};
+
 function marksOf(c: ShipCommit): ReviewMark[] {
+  const told = MARKS[c.change?.name ?? ""];
+  if (told) return told(c.at);
   const base = c.at - 3600;
   const push = (n: number | null, at: number): ReviewMark => ({ id: `${c.short}-push-${n ?? 0}`, kind: "push", at, end: at, by: c.author, signer: null, revision: n, state: "passed" });
   const ch = c.change;
