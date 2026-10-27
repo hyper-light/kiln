@@ -985,16 +985,20 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { ok: true }), true);
   }
   if (a === "mock" && b === "review" && m === "POST") {
-    const body = await ctx.body<{ conflicts?: boolean }>(req);
+    const body = await ctx.body<{ conflicts?: boolean; emit?: { type: string; diff?: string } }>(req);
     if (body.conflicts !== undefined) conflictState.on = body.conflicts;
+    if (body.emit) ctx.emit(body.emit);
     return (ctx.json(res, 200, { ok: true }), true);
   }
+  // A commit's own diff (no change): "sync: a move carries its homes" carries the 10,000-line
+  // fixture one Ship item's dropdown scrolls (W26-AC06); the rest show D41's patch.
+  const commitPatch = (sha7: string) => (sha7.startsWith("3333") ? bigPatch() : d41Patch(2));
   if (a === "ship" && b === "commits" && segs.at(-1) === "diff" && m === "GET") {
-    const patch = d41Patch(2);
+    const patch = commitPatch(segs.at(-2) ?? "");
     return (ctx.json(res, 200, { repo: REPO, commit: segs.at(-2) ?? "", parent: sha("p"), files: filesOf(patch), patch, truncated: false }), true);
   }
   if (a === "ship" && b === "commits" && segs.at(-1) === "blob" && m === "GET") {
-    const t = textOf(d41Patch(2), url.searchParams.get("path") ?? "");
+    const t = textOf(commitPatch(segs.at(-2) ?? ""), url.searchParams.get("path") ?? "");
     if (t == null) {
       res.writeHead(200, { "content-type": "image/png", "content-length": PNG.length });
       res.end(PNG);

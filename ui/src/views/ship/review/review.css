@@ -614,6 +614,11 @@
   font-size: 12.5px;
   line-height: 1.65;
 }
+/* Laid out only as it nears the screen, so a file of thousands scrolls as a short one (W26-R15, AC06): the whole-file view's rows. */
+.rv-fullb .rv-l {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 21px;
+}
 .rv-l .rv-ln {
   border: 0;
   background: none;

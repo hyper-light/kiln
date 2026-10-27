@@ -74,8 +74,11 @@ const marksOf = (row: ShipCommit): ShipMark[] => {
   return marks ?? [unsigned(`push:${row.sha}`, "push", row.at, row.at, row.author, null, "passed")];
 };
 
+/** The fixed rows' times: the mock's start, so every read of the page sends the same rows (W26-R15's memo reads "the same" by them). */
+const T0 = now();
+
 function commits(): ShipCommit[] {
-  const t = now();
+  const t = T0;
   const change = (name: string, kind: ShipChange["kind"], host: string, title: string, state: string, turn: string[], open = { question: 0, nit: 0, issue: 0, blocking: 0 }): ShipChange => ({
     name,
     kind,

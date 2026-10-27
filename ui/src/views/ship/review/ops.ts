@@ -4,7 +4,7 @@
  * (the forge seam's) and a commit with no change (reads only). The item and the viewer come from
  * the row; `kiln` says which actions a host can't answer stay out rather than fail.
  */
-import type { Thread, ThreadKind } from "@/api/review";
+import type { Thread, ThreadComment, ThreadKind } from "@/api/review";
 import type { Side } from "./fold";
 import type { Lines } from "./suggestion";
 
@@ -44,3 +44,74 @@ export interface Ops {
 
 /** The lines a thread's suggestions and new-thread suggestions go against. */
 export type LinesOf = (file: string, side: Side, start: number, end: number) => Lines | null;
+
+/* ------------------------------------------------------------- optimistic (W26-R15, AC06) */
+
+/** A change to the threads shown, applied while its mutation runs (useOptimistic's reducer's input). */
+export type ThreadPatch =
+  | { type: "reply"; thread: string; c: ThreadComment }
+  | { type: "thread"; t: Thread }
+  | { type: "resolve"; thread: string; on: boolean; me: string }
+  | { type: "edit"; id: string; body: string }
+  | { type: "remove"; id: string }
+  | { type: "kind"; thread: string; kind: ThreadKind }
+  | { type: "retagThread"; id: string; t: Thread }
+  | { type: "retag"; thread: string; id: string; c: ThreadComment }
+  | { type: "unthread"; id: string }
+  | { type: "unreply"; thread: string; id: string };
+
+/** `threads` with `p` applied: the optimistic state a mutation shows until the server answers. */
+export function applyThreadPatch(threads: Thread[], p: ThreadPatch): Thread[] {
+  switch (p.type) {
+    case "reply":
+      return threads.map((t) => (t.id === p.thread ? { ...t, comments: [...t.comments, p.c] } : t));
+    case "thread":
+      return [...threads, p.t];
+    case "resolve":
+      return threads.map((t) => (t.id === p.thread ? { ...t, state: p.on ? "resolved" : "open", resolved_by: p.on ? p.me : null, resolved_at: p.on ? now() : null } : t));
+    case "edit":
+      return threads.map((t) => ({ ...t, comments: t.comments.map((c) => (c.id === p.id ? { ...c, body: p.body } : c)) }));
+    case "remove":
+      return threads.map((t) =>
+        t.comments.some((c) => c.id === p.id) ? (t.comments.length === 1 ? { ...t, comments: [] } : { ...t, comments: t.comments.map((c) => (c.id === p.id ? { ...c, deleted: true } : c)) }) : t,
+      );
+    case "kind":
+      return threads.map((t) => (t.id === p.thread ? { ...t, kind: p.kind } : t));
+    case "retagThread":
+      return threads.map((t) => (t.id === p.id ? p.t : t));
+    case "retag":
+      return threads.map((t) => (t.id === p.thread ? { ...t, comments: t.comments.map((c) => (c.id === p.id ? p.c : c)) } : t));
+    case "unthread":
+      return threads.filter((t) => t.id !== p.id);
+    case "unreply":
+      return threads.map((t) => (t.id === p.thread ? { ...t, comments: t.comments.filter((c) => c.id !== p.id) } : t));
+  }
+}
+
+const now = () => Math.floor(Date.now() / 1000);
+let optSeq = 0;
+const optId = (p: string) => `local:${p}${++optSeq}`;
+
+/** A comment that's still going out, shown at once (its id says so). */
+export function pendingComment(me: string, body: string): ThreadComment {
+  return { id: optId("c"), author: me, body, suggestion: null, created_at: now(), draft: false };
+}
+
+/** A thread that's still going out: `at` names its file and line, or the diff as a whole. */
+export function pendingThread(me: string, version: number, at: { file: string | null; side: "old" | "new"; line: number | null }, kind: ThreadKind, c: ThreadComment): Thread {
+  return {
+    id: optId("t"),
+    version,
+    file: at.file,
+    side: at.side,
+    start_line: at.line,
+    end_line: at.line,
+    state: "open",
+    created_by: me,
+    created_at: c.created_at,
+    outdated: false,
+    now: null,
+    comments: [c],
+    kind,
+  };
+}

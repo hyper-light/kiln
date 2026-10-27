@@ -14,6 +14,7 @@ import { useDraft } from "@/views/harness/state";
 import { CommentText } from "./comment";
 import { draftKey, insertSuggestion, useDraftKind, type DraftAt } from "./draft";
 import { KindPicker } from "./kinds";
+import { counted } from "./perf";
 import type { Lines } from "./suggestion";
 import "./review.css";
 
@@ -40,6 +41,7 @@ export function ReviewComposer({
   onCancel?: () => void;
   autoFocus?: boolean;
 }) {
+  counted("ship/composer");
   const key = draftKey(at);
   const [text, setText] = useDraft(key);
   const [kind, setKind] = useDraftKind(key);

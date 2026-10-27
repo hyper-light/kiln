@@ -15,6 +15,7 @@ import { ReviewComposer } from "./composer";
 import { ConflictBlock } from "./conflicts";
 import { anchorOf, fold, linesAt, type Anchor, type Row, type Side } from "./fold";
 import type { DraftPlace, LinesOf, Ops } from "./ops";
+import { counted } from "./perf";
 import { ThreadView } from "./threads";
 import "./review.css";
 
@@ -30,6 +31,8 @@ export interface FilesCtx {
   open: (file: string) => void;
   /** The search's letters: matching lines marked, the rest dimmed. */
   q: string;
+  /** The lines a span holds, as a file's rows have them (stable, for the memoized threads). */
+  linesOf: LinesOf;
 }
 
 /** Threads by the line they end on, in the version shown. */
@@ -61,8 +64,9 @@ export function makeLinesOf(rowsByFile: Map<string, Row[]>): LinesOf {
   };
 }
 
-/** One file: its header (path, the change's size, the whole-file icon) folds its diff. */
-export function FileDiff({
+/** One file: its header (path, the change's size, the whole-file icon) folds its diff. Renders only
+ * when what it draws changes — its file, its threads' places, or its ctx (W26-R15, AC06). */
+export const FileDiff = React.memo(function FileDiff({
   file,
   ctx,
   map,
@@ -73,6 +77,7 @@ export function FileDiff({
   map: Map<string, { t: Thread; a: Anchor }[]>;
   meta?: { binary?: boolean; generated?: boolean; status?: string };
 }) {
+  counted("ship/filediff");
   const [open, setOpen] = React.useState(!(meta?.generated ?? false));
   const rows = ctx.rowsByFile.get(file.path) ?? [];
   const add = rows.filter((r) => r.kind === "add").length;
@@ -130,7 +135,7 @@ export function FileDiff({
       </div>
     </details>
   );
-}
+});
 
 function lineOf(r: Row, side: Side): number | null {
   return side === "old" ? r.o : r.n;
@@ -163,7 +168,7 @@ function Line({ file, row, ctx, map, q }: { file: PatchFile; row: Row; ctx: File
         </code>
       </div>
       {here.map(({ t }) => (
-        <ThreadView key={t.id} t={t} ops={ctx.ops} linesOf={makeLinesOf(ctx.rowsByFile)} draft={ctx.draft?.kind === "reply" && ctx.draft.thread === t.id} setDraft={(d) => ctx.setDraft(d)} />
+        <ThreadView key={t.id} t={t} ops={ctx.ops} linesOf={ctx.linesOf} draft={ctx.draft?.kind === "reply" && ctx.draft.thread === t.id} setDraft={ctx.setDraft} />
       ))}
       {cfs.map((cf) => (
         <ConflictBlock key={cf.id} cf={cf} n={cf.of} diffKey={ctx.ops.key ?? ""} />
@@ -201,6 +206,8 @@ function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; m
     return body.split("\n").map((t, i) => ({ o: null, n: i + 1, kind: added.has(i + 1) ? "add" : "ctx", text: t }));
   }, [body, ctx.rowsByFile, file.path]);
   const all = React.useMemo(() => new Map(ctx.rowsByFile).set(file.path, rows), [ctx.rowsByFile, file.path, rows]);
+  const linesOf = React.useMemo(() => makeLinesOf(all), [all]);
+  const whole = React.useMemo(() => ({ ...ctx, rowsByFile: all, linesOf }), [ctx, all, linesOf]);
   const q = ctx.q.trim().toLowerCase();
   return (
     <div className="rv-full" role="region" aria-label={file.path} tabIndex={-1} ref={(el) => el?.focus({ preventScroll: true })} onKeyDown={(e) => e.key === "Escape" && ctx.open("")}>
@@ -212,7 +219,7 @@ function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; m
       </div>
       <div className="rv-fullb rv-code">
         {rows.map((r, i) => (
-          <Line key={i} file={file} row={r} ctx={{ ...ctx, rowsByFile: all }} map={map} q={q} />
+          <Line key={i} file={file} row={r} ctx={whole} map={map} q={q} />
         ))}
       </div>
     </div>

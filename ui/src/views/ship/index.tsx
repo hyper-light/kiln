@@ -30,6 +30,7 @@ import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { firstStage, JobCards } from "./jobs";
 import { ShipOutput } from "./output";
 import { ReviewFiles, ReviewLanes } from "./review";
+import { counted } from "./review/perf";
 
 const LIMIT = 100;
 
@@ -87,14 +88,24 @@ function ShipList() {
   const { ref: holdRef, ...holdProps } = hold.bind;
   // Your own change of view (lens, sort, filter) applies at once; only what arrives waits.
   const view = `${lens}|${sort}|${JSON.stringify(chosen)}`;
-  const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, Item>(), view }));
-  for (const it of items) kept.last.set(keyOf(it), it);
+  const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, { it: Item; sig: string }>(), view }));
+  // What a refetch brings that reads the same isn't a change (W26-R15): the item keeps its last
+  // reference, so its memoized row doesn't render again; a changed item keeps its key and is
+  // patched in place, never remounted.
+  const stable = items.map((it) => {
+    const k = keyOf(it);
+    const sig = JSON.stringify(it);
+    const was = kept.last.get(k);
+    const same = was && was.sig === sig ? was.it : it;
+    kept.last.set(k, { it: same, sig });
+    return same;
+  });
   if (!hold.held || kept.order.length === 0 || kept.view !== view) {
     kept.order = items.map(keyOf);
     kept.view = view;
   }
-  const shown = hold.held ? kept.order.flatMap((k) => kept.last.get(k) ?? []) : items;
-  if (!hold.held) kept.last = new Map(items.map((it) => [keyOf(it), it]));
+  const shown = hold.held ? kept.order.flatMap((k) => kept.last.get(k)?.it ?? []) : stable;
+  if (!hold.held) kept.last = new Map(stable.map((it) => [keyOf(it), { it, sig: JSON.stringify(it) }]));
   const glide = useGlide(shown.map(keyOf).join("\n"));
 
   const set = (k: string, v: string | null) =>
@@ -110,7 +121,7 @@ function ShipList() {
 
   return (
     <>
-      <Stands counts={standCounts(commits)} every={SHIP_STANDS} />
+      <Stands counts={standCounts(shown.map((it) => it.head))} every={SHIP_STANDS} />
       <div className="ship-tools">
         <FacetBox
           className="ship-facet"
@@ -179,79 +190,85 @@ function ShipList() {
   );
 }
 
-function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
-  const c = item.head;
-  const [riders, setRiders] = React.useState(false);
-  // One environment flag: production when it runs there, else the first it runs in.
-  const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
-  const n = item.riders.length;
-  const what =
-    item.folds === "rides"
-      ? `${n} commit${n === 1 ? "" : "s"} riding with it`
-      : item.folds === "shipped"
-        ? `${n} more shipped`
-        : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
-  return (
-    <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)}>
-      <div className="ship-r">
-        <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
-          <span className="ship-name">{c.message || c.change?.title || c.short}</span>
-          <span className="ship-line">
-            <span className="ship-stand" data-stand={c.stand}>
-              {standWord(c.stand)}
+const Row = React.memo(
+  function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
+    counted("ship/row");
+    const c = item.head;
+    const [riders, setRiders] = React.useState(false);
+    // One environment flag: production when it runs there, else the first it runs in.
+    const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
+    const n = item.riders.length;
+    const what =
+      item.folds === "rides"
+        ? `${n} commit${n === 1 ? "" : "s"} riding with it`
+        : item.folds === "shipped"
+          ? `${n} more shipped`
+          : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
+    return (
+      <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)}>
+        <div className="ship-r">
+          <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
+            <span className="ship-name">{c.message || c.change?.title || c.short}</span>
+            <span className="ship-line">
+              <span className="ship-stand" data-stand={c.stand}>
+                {standWord(c.stand)}
+              </span>
+              <span className="ship-text">{c.line}</span>
             </span>
-            <span className="ship-text">{c.line}</span>
+          </button>
+          <span className="ship-pips">
+            <JourneyStrip pips={strip(c.pips)} labels={false} />
           </span>
-        </button>
-        <span className="ship-pips">
-          <JourneyStrip pips={strip(c.pips)} labels={false} />
-        </span>
-        <span className="ship-metas">
-          <span>
-            {c.author} · <RelTime ts={c.at} />
+          <span className="ship-metas">
+            <span>
+              {c.author} · <RelTime ts={c.at} />
+            </span>
+            <span className="ship-m2">
+              {c.change && <span className="ship-change">{c.change.name}</span>}
+              {c.tags?.map((t) => (
+                <span key={t} className="ship-tag">
+                  {t}
+                </span>
+              ))}
+              {env && (
+                <span className="ship-env" data-prod={env.production || undefined}>
+                  {env.environment}
+                </span>
+              )}
+              <span className="ship-sha">{c.short}</span>
+            </span>
           </span>
-          <span className="ship-m2">
-            {c.change && <span className="ship-change">{c.change.name}</span>}
-            {c.tags?.map((t) => (
-              <span key={t} className="ship-tag">
-                {t}
-              </span>
+          <Actions commit={c} reload={reload} onReview={() => onOpen(true)} />
+          <button type="button" className="ship-go" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${c.short}`} onClick={() => onOpen(!open)}>
+            <ChevronDown size={16} />
+          </button>
+        </div>
+        {item.riders.length > 0 && (
+          <button type="button" className="ship-fold" aria-expanded={riders} onClick={() => setRiders(!riders)}>
+            {riders ? "Hide" : "Show"} {what}
+          </button>
+        )}
+        {riders && (
+          <ul className="ship-riders" aria-label={`The other commits of ${c.change?.name ?? c.short}`}>
+            {item.riders.map((r) => (
+              <li key={r.sha} className="ship-rider" data-stand={r.stand}>
+                <span className="ship-name">{r.message || r.short}</span>
+                <span className="ship-text">
+                  {standWord(r.stand)} · {r.line}
+                </span>
+                <span className="ship-sha">{r.short}</span>
+              </li>
             ))}
-            {env && (
-              <span className="ship-env" data-prod={env.production || undefined}>
-                {env.environment}
-              </span>
-            )}
-            <span className="ship-sha">{c.short}</span>
-          </span>
-        </span>
-        <Actions commit={c} reload={reload} onReview={() => onOpen(true)} />
-        <button type="button" className="ship-go" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${c.short}`} onClick={() => onOpen(!open)}>
-          <ChevronDown size={16} />
-        </button>
-      </div>
-      {item.riders.length > 0 && (
-        <button type="button" className="ship-fold" aria-expanded={riders} onClick={() => setRiders(!riders)}>
-          {riders ? "Hide" : "Show"} {what}
-        </button>
-      )}
-      {riders && (
-        <ul className="ship-riders" aria-label={`The other commits of ${c.change?.name ?? c.short}`}>
-          {item.riders.map((r) => (
-            <li key={r.sha} className="ship-rider" data-stand={r.stand}>
-              <span className="ship-name">{r.message || r.short}</span>
-              <span className="ship-text">
-                {standWord(r.stand)} · {r.line}
-              </span>
-              <span className="ship-sha">{r.short}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-      {open && <Dropdown commit={c} />}
-    </li>
-  );
-}
+          </ul>
+        )}
+        {open && <Dropdown commit={c} />}
+      </li>
+    );
+  },
+  // A row renders only when its item does (a stable reference while it reads the same) or its open
+  // state flips; reload and onOpen are made each render but always do the same thing (W26-R15, AC06).
+  (a, b) => a.item === b.item && a.open === b.open,
+);
 
 /** The row's paired actions, each through the endpoint it names; Review opens the item at its files. */
 function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () => void; onReview: () => void }) {
