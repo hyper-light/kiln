@@ -405,16 +405,11 @@ async fn drive(hub: Arc<Hub>, mut b: Bisect, trusted: bool, marked: bool) {
                 return;
             }
         };
-        // W24's ledger, once it is on main, answers a try whose inputs already ran (W28-R57).
+        // Result reuse (W28-R57): what the ledger knows of the check at this commit is the try's
+        // outcome, and nothing runs.
         let check = kiln_ci::verdict::Check { workflow: b.workflow.clone(), unit: b.unit.clone().unwrap_or_else(|| b.job.clone()), test: b.test.clone().unwrap_or_default() };
-        let ledger: &dyn kiln_ci::verdict::Ledger = &kiln_ci::verdict::NoLedger;
-        let t = match ledger.outcome(&check, &sha) {
-            Some(o) => Tried {
-                sha: sha.clone(),
-                run: None,
-                conclusion: if matches!(o, kiln_ci::verdict::Outcome::Failed { .. }) { "failure" } else { "success" }.into(),
-                why: Some("its result with these inputs, from the ledger".into()),
-            },
+        let t = match LEDGER.outcome(&check, &sha) {
+            Some(k) => known(&sha, &k),
             None => try_commit(&hub, &repo, &b, &sha, trusted).await,
         };
         let failed = match t.conclusion.as_str() {
@@ -439,12 +434,25 @@ async fn drive(hub: Arc<Hub>, mut b: Bisect, trusted: bool, marked: bool) {
     }
 }
 
+/// The results culprit finding reuses (W28-R57, `kiln_ci::verdict::Ledger`): none until a try's
+/// inputs can be keyed as W24-R06's ledger keys a leg's, so every try runs (its legs reusing what
+/// W24-R06 finds as dispatch queues them).
+const LEDGER: &dyn kiln_ci::verdict::Ledger = &kiln_ci::verdict::NoLedger;
+
+/// A try the ledger answered: its outcome, and the run it came from.
+fn known(sha: &str, k: &kiln_ci::verdict::Known) -> Tried {
+    let conclusion = if k.failed() { "failure" } else { "success" };
+    Tried { sha: sha.to_owned(), run: None, conclusion: conclusion.into(), why: Some(format!("its result with the same inputs, from the ledger ({})", k.from)) }
+}
+
+/// What a try on `branch` is (W28-R57): a gate's when `[ci] culprit_gates` names the branch.
+pub(crate) fn try_of(cfg: &crate::config::ci::Ci, branch: &str) -> super::dispatch::Try {
+    super::dispatch::Try { gate: cfg.culprit_gates.iter().any(|g| g == branch) }
+}
+
 /// The job run at `sha`, to its end: its conclusion, or given a test, the test's own result in it.
 async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: &str, trusted: bool) -> Tried {
     let mut vars = BTreeMap::new();
-    // W28-R57: a gate's tries go at once, at gate priority; the rest at low priority.
-    let gate = hub.cfg.ci.culprit_gates.contains(&b.branch);
-    vars.insert("KILN_TRY_PRIORITY".to_owned(), if gate { "90" } else { "20" }.to_owned());
     if let (Some(test), Some(unit)) = (&b.test, &b.unit) {
         vars.insert("KILN_VERDICT_UNITS".to_owned(), unit.clone());
         vars.insert("KILN_VERDICT_TESTS".to_owned(), test.clone());
@@ -456,6 +464,8 @@ async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: 
         workflows: vec![b.workflow.clone()],
         job: Some(b.job.clone()),
         vars,
+        // W28-R57: a try, a gate's at once at gate priority, the rest at low priority.
+        culprit: Some(try_of(&hub.cfg.ci, &b.branch)),
         ..super::uploads::Ask::default()
     };
     let untestable = |why: String| Tried { sha: sha.to_owned(), run: None, conclusion: "untestable".into(), why: Some(why) };

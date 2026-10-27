@@ -435,10 +435,11 @@ pub async fn refresh(hub: &Arc<Hub>, repo_key: &str, workflow: &str, branch: &st
             Some(_) => true,
             None => (after..=at).contains(&c),
         };
-        // The push that brought it: the lane's first run at or after it.
-        let pushed = l.runs.range(c..).next().and_then(|p| l.shas.get(*p)).map_or(commit.as_str(), String::as_str);
+        // The push that brought it: the lane's first run at or after it (a culprit-finding try's
+        // passed over).
+        let pushed: Vec<&str> = l.runs.range(c..).take(8).filter_map(|p| l.shas.get(*p)).map(String::as_str).collect();
         if news && v.kind != Kind::Pending
-            && let Some(agent) = pusher(hub, &repo.id, &mirror, commit, pushed).await
+            && let Some(agent) = pusher(hub, &repo, &mirror, (workflow, branch), commit, &pushed).await
         {
             crate::workspace::follow::deliver(hub, &agent, message(&repo.name, workflow, branch, commit, &v, &l.shas)).await;
         }
@@ -446,26 +447,59 @@ pub async fn refresh(hub: &Arc<Hub>, repo_key: &str, workflow: &str, branch: &st
 }
 
 /// The agent that pushed a commit, as step 6 attributes it (W28-R67, `kiln_ci::sched::actor`):
-/// the agent token its push came with (the actor of the run of `pushed`, the push that brought
-/// it), the agent change request whose last pushed commit it is, or its `Kiln-Agent` line.
-async fn pusher(hub: &Hub, repo_id: &str, mirror: &str, sha: &str, pushed: &str) -> Option<String> {
+/// the agent token its push came with, the agent change request whose last pushed commit it is,
+/// or its `Kiln-Agent` line. Its push is the one that made the lane's first run at or after it
+/// (of `pushed`, the commits with runs from it on, the first whose run isn't a culprit-finding
+/// try): what kiln kept of that push names the token (its event's `started_by`), which is the
+/// agent's only for the commits that push brought, not those its branch already held.
+async fn pusher(hub: &Hub, repo: &crate::store::Repo, mirror: &str, (workflow, branch): (&str, &str), sha: &str, pushed: &[&str]) -> Option<String> {
     use kiln_ci::sched::actor;
     let message = git(hub, &["-C", mirror, "log", "-1", "--format=%B", sha]).await.unwrap_or_default();
-    let (rid, at) = (repo_id.to_owned(), pushed.to_owned());
-    let by: String = hub
+    let (rid, w, b, at) = (repo.id.clone(), workflow.to_owned(), branch.to_owned(), pushed.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>());
+    let rows: Vec<(String, String)> = hub
         .store
         .call(move |c| {
             use rusqlite::OptionalExtension as _;
-            Ok(c.query_row("SELECT actor FROM runs WHERE repo_id = ?1 AND sha = ?2 ORDER BY created_at LIMIT 1", rusqlite::params![rid, at], |r| r.get::<_, String>(0)).optional()?)
+            let mut out = Vec::new();
+            for s in &at {
+                let row = c
+                    .query_row(
+                        "SELECT r.actor, COALESCE(p.input, '') FROM runs r LEFT JOIN ci_plans p ON p.run_id = r.id WHERE r.repo_id = ?1 AND r.workflow_id = ?2 AND r.branch = ?3 AND r.sha = ?4 ORDER BY r.created_at LIMIT 1",
+                        rusqlite::params![rid, w, b, s],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                out.extend(row);
+            }
+            Ok(out)
         })
         .await
-        .ok()
-        .flatten()
         .unwrap_or_default();
+    let input = |text: &str| serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+    let (actor_of_run, saved) = rows.into_iter().map(|(a, i)| (a, input(&i))).find(|(_, v)| v.get("culprit").is_none_or(Value::is_null)).unwrap_or_default();
+    let event = saved.get("event").cloned().unwrap_or(Value::Null);
+    let text = |p: &str| event.pointer(p).and_then(Value::as_str);
+    let mut by = actor::pusher(text("/started_by/name"), text("/actor").unwrap_or(actor_of_run.as_str()));
+    if by.starts_with("agent:") && !brought(hub, mirror, repo, branch, text("/before"), sha).await {
+        by.clear();
+    }
     let changes: Vec<crate::workspace::change::Record> = hub.store.kv_prefix("agents/change/".into()).await.unwrap_or_default().iter().filter_map(|(_, v)| serde_json::from_str(v).ok()).collect();
     let refs: Vec<actor::Change> = changes.iter().map(|c| actor::Change { agent: &c.agent, sha: &c.sha, change: c.change.as_deref() }).collect();
     let who = actor::attribute(&actor::Push { sha, pusher: &by, message: &message }, &refs);
     who.id.strip_prefix("agent:").filter(|id| !id.is_empty()).map(str::to_owned)
+}
+
+/// Whether a push to `branch` from `before` brought commit `sha`: it isn't one `before` held, or
+/// for a push that made the branch, one the default branch held (W28-R67's token counts for those).
+async fn brought(hub: &Hub, mirror: &str, repo: &crate::store::Repo, branch: &str, before: Option<&str>, sha: &str) -> bool {
+    let base = match before.filter(|b| b.bytes().any(|c| c != b'0')) {
+        Some(b) => Some(b.to_owned()),
+        None => Some(repo.default_branch.clone().unwrap_or_else(|| "main".into())).filter(|d| d != branch).map(|d| format!("refs/heads/{d}")),
+    };
+    match base {
+        Some(base) => crate::gitops::run_git(hub, &["-C", mirror, "merge-base", "--is-ancestor", sha, &base], crate::gitops::LS_REMOTE_TIMEOUT).await.is_err(),
+        None => true,
+    }
 }
 
 /// A `verdict.changed` message (W28-R59): direct and covered in a line; suspect and culprit with

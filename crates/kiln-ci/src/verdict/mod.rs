@@ -271,19 +271,36 @@ pub struct Failure {
     pub suspects: Vec<usize>,
 }
 
-/// What a ledger of results by input key knows (W24-R06's, once it is on main): a check's outcome
-/// for a unit's key. Culprit finding asks it before each try, so a try whose inputs already ran
-/// takes that result instead of running again (W28-R57).
-pub trait Ledger {
-    fn outcome(&self, check: &Check, key: &str) -> Option<Outcome>;
+/// What a ledger knows of a check at a commit: its outcome there, and where that came from (the
+/// run of the same inputs that produced it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Known {
+    pub outcome: Outcome,
+    pub from: String,
 }
 
-/// No ledger yet: every try runs.
+impl Known {
+    /// Whether the check failed there.
+    pub fn failed(&self) -> bool {
+        matches!(self.outcome, Outcome::Failed { .. })
+    }
+}
+
+/// Result reuse for culprit finding (W28-R57), behind a trait: what a run of the same inputs as a
+/// check's try at `commit` already concluded. Culprit finding asks before each try; what the
+/// ledger knows is that try's outcome, and nothing runs. W24-R06's ledger keys a leg by its inputs
+/// as dispatch plans it; until a bisection can key a try's inputs so, kiln asks [`NoLedger`] and
+/// every try runs (a try's legs still reuse what W24-R06 finds as dispatch queues them).
+pub trait Ledger: Send + Sync {
+    fn outcome(&self, check: &Check, commit: &str) -> Option<Known>;
+}
+
+/// No ledger: every try runs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoLedger;
 
 impl Ledger for NoLedger {
-    fn outcome(&self, _check: &Check, _key: &str) -> Option<Outcome> {
+    fn outcome(&self, _check: &Check, _commit: &str) -> Option<Known> {
         None
     }
 }

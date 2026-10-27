@@ -222,6 +222,72 @@ mod tests {
         assert!(matches!(never.next(), Next::Inconclusive { .. }), "{:?}", never.next());
     }
 
+    /// W28-R57: result reuse behind `Ledger`. A search that asks a ledger before each try, and
+    /// runs only what it doesn't know, names the culprit the search that runs every try names,
+    /// with the same tries, running fewer; `NoLedger` knows nothing, so every try runs.
+    #[test]
+    fn w28_r57_a_ledger_answers_tries_and_the_rest_run() {
+        use std::collections::BTreeMap;
+
+        use crate::verdict::{Check, Known, Ledger, NoLedger, Outcome};
+
+        /// What runs of the same inputs concluded, by commit: whether the check failed.
+        struct Kept(BTreeMap<String, bool>);
+        impl Ledger for Kept {
+            fn outcome(&self, _check: &Check, commit: &str) -> Option<Known> {
+                let outcome = |failed: bool| if failed { Outcome::Failed { signature: "t".into() } } else { Outcome::Passed };
+                self.0.get(commit).map(|failed| Known { outcome: outcome(*failed), from: format!("the run at {commit}") })
+            }
+        }
+        let check = Check::unit("ci.yml", "test");
+        let commit = |at: At| match at {
+            At::Suspect(j) => format!("c{j}"),
+            At::Failing => "bad".to_owned(),
+        };
+        // A search over `n` suspects, `c` the culprit, asking `ledger` first: how it ends, its
+        // tries, and how many of them ran.
+        let search = |n: usize, c: usize, ledger: &dyn Ledger| -> (Next, Vec<At>, usize) {
+            let mut s = Search::new(n, 0.0, false);
+            let (mut tries, mut ran) = (Vec::new(), 0);
+            loop {
+                match s.next() {
+                    Next::Try { at } => {
+                        let failed = match ledger.outcome(&check, &commit(at)) {
+                            Some(k) => k.failed(),
+                            None => {
+                                ran += 1;
+                                match at {
+                                    At::Suspect(j) => j >= c,
+                                    At::Failing => true,
+                                }
+                            }
+                        };
+                        tries.push(at);
+                        s.observe(at, failed);
+                    }
+                    done => return (done, tries, ran),
+                }
+            }
+        };
+        let (mut runs_alone, mut runs_with) = (0, 0);
+        for n in 2..=16usize {
+            for c in 0..n {
+                let (alone, tries, every) = search(n, c, &NoLedger);
+                assert_eq!(alone, Next::Culprit { suspect: c, confidence: 1.0 }, "{n} suspects, culprit {c}");
+                assert_eq!(every, tries.len(), "with no ledger every try runs");
+                // A ledger that knows every other suspect's outcome.
+                let kept = Kept((0..n).filter(|j| j % 2 == 0).map(|j| (format!("c{j}"), j >= c)).collect());
+                let (with, same, ran) = search(n, c, &kept);
+                assert_eq!((&with, &same), (&alone, &tries), "{n} suspects, culprit {c}: the ledger's outcomes are the runs'");
+                let known = tries.iter().filter(|at| matches!(at, At::Suspect(j) if j % 2 == 0)).count();
+                assert_eq!(ran, every - known, "{n} suspects, culprit {c}: only what the ledger doesn't know runs");
+                runs_alone += every;
+                runs_with += ran;
+            }
+        }
+        assert!(runs_with < runs_alone, "{runs_with} runs with the ledger, {runs_alone} without");
+    }
+
     /// W28-R56, property test: over 10,000 random searches (up to 40 suspects, a culprit or none,
     /// flake rates up to 0.3, flaky outcomes drawn from the case): every search ends within its cap
     /// (ceil(log2 n) + 1 + RETRIES tries), and the same outcomes give the same tries; without

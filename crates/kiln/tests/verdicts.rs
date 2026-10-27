@@ -362,5 +362,98 @@ fn w28_r59_the_pushing_agent_hears_its_commits_verdict() -> anyhow::Result<()> {
     assert_eq!(w.pointer("/verdict/lanes/0/verdict/kind"), Some(&json!("covered")), "{w}");
     let (st, w) = op(&s, "ci.verdict.wait", json!({ "repo": "acme/app", "sha": next, "until": "any", "timeout_s": 1 }))?;
     assert!(st == 200 && w.get("timed_out") == Some(&json!(true)), "{st} {w}");
+
+    // W28-R67: a commit with no `Kiln-Agent` line, pushed with the agent's own token to a branch
+    // of its own, is the agent's as step 6 attributes it; what that branch already held from main
+    // isn't the token's, so `next` is still no news to it.
+    let (st, out) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&json!({ "kind": "agent", "agent": agent, "grants": ["developer@repo:acme/app"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "token: {st} {out}");
+    let token = serde_json::from_str::<Value>(&out)?.get("token").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token in {out}"))?;
+    git(&home, &work, &["checkout", "-q", "-b", "fix-q"])?;
+    let tok = commit(&[("crates/q/src/t.rs", "tok\n")], "q: t")?;
+    git(&home, &work, &["push", "-q", &format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port), "HEAD:fix-q"])?;
+    ended(&s, 3)?;
+    let short = tok.get(..12).unwrap_or_default().to_owned();
+    until(&s, 120, "the token's commit's verdict.changed", || {
+        let got = std::fs::read_to_string(&heard).unwrap_or_default();
+        Ok((!(got.contains(&format!("your commit {short} on fix-q")) && got.contains("is direct"))).then_some(got))
+    })?;
+    let got = std::fs::read_to_string(&heard).unwrap_or_default();
+    assert!(!got.contains(next.get(..12).unwrap_or_default()), "{got}");
+    Ok(())
+}
+
+/// W28-R57: once declared (`[ci] culprits = true`), a new failure with two or more suspects is
+/// bisected without anyone asking. f2 breaks p and f4 changes p too (f1 and f3 only q): the run at
+/// f4 fails `p_works`, and kiln bisects the test over f2 and f4 on its own, tries f2 and names it;
+/// f2's verdict is culprit. The tries' ends work the lane out again, and start nothing more.
+#[test]
+fn w28_r57_culprit_finding_starts_on_its_own() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\nculprits = true", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    for d in [".kiln", "crates/p/src", "crates/q/src"] {
+        std::fs::create_dir_all(work.join(d))?;
+    }
+    let commit = |files: &[(&str, &str)], message: &str| -> anyhow::Result<String> {
+        for (f, t) in files {
+            std::fs::write(work.join(f), t)?;
+        }
+        git(&home, &work, &["add", "."])?;
+        git(&home, &work, &["commit", "-qm", message])?;
+        Ok(git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned())
+    };
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    commit(&[("README.md", "app\n")], "first")?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    commit(
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("crates/p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\n"),
+            ("crates/p/src/lib.rs", "pub fn p() {}\n"),
+            ("crates/q/Cargo.toml", "[package]\nname = \"q\"\nversion = \"0.1.0\"\n[dependencies]\np = { path = \"../p\" }\n"),
+            ("crates/q/src/lib.rs", "pub fn q() {}\n"),
+            (".kiln/ci.yaml", CI),
+        ],
+        "the workspace",
+    )?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    ended(&s, 1)?;
+    let f: Vec<String> = [("crates/q/src/f1.rs", "f1"), ("crates/p/bug", "f2"), ("crates/q/src/f3.rs", "f3"), ("crates/p/src/f4.rs", "f4")]
+        .iter()
+        .map(|(file, m)| commit(&[(file, &format!("{m}\n"))], m))
+        .collect::<anyhow::Result<_>>()?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    ended(&s, 2)?;
+    let (_, runs) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
+    let runs: Value = serde_json::from_str(&runs)?;
+    let red = runs.get("runs").and_then(Value::as_array).and_then(|r| r.iter().find(|r| r.get("number") == Some(&json!(2)))).and_then(|r| r.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (f2, f4) = (f.get(1).cloned().unwrap_or_default(), f.get(3).cloned().unwrap_or_default());
+
+    // Nobody calls ci.runs.bisect: kiln starts it, and it ends naming f2.
+    let mut done = Value::Null;
+    until(&s, 300, "culprit finding on its own", || {
+        let (_, v) = op(&s, "ci.runs.bisects", json!({ "run": red }))?;
+        done = v.pointer("/bisects/0").cloned().unwrap_or_default();
+        Ok((done.get("state").and_then(Value::as_str) != Some("found")).then(|| v.to_string()))
+    })?;
+    assert_eq!(done.get("by"), Some(&json!("kiln (W28-R57)")), "{done}");
+    assert_eq!(done.get("test"), Some(&json!("p_works")), "{done}");
+    assert_eq!(done.get("suspects"), Some(&json!([f2, f4])), "only the commits that change p: {done}");
+    assert_eq!(done.pointer("/culprit/sha"), Some(&json!(f2)), "{done}");
+    let v2 = verdict(&s, &f2)?;
+    assert_eq!(kind(&v2), "culprit", "{v2}");
+    // The try's end worked the lane out again: still the one bisection.
+    std::thread::sleep(Duration::from_secs(2));
+    let (_, v) = op(&s, "ci.runs.bisects", json!({ "run": red }))?;
+    assert_eq!(v.get("bisects").and_then(Value::as_array).map(Vec::len), Some(1), "{v}");
     Ok(())
 }

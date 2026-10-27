@@ -8626,10 +8626,17 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
   testable neighbour. A bisection's end is a culprit finding (R52) for its lane's verdicts: found
   (`culprit`), `no-culprit` (a flake) or `inconclusive`. Once declared (`[ci] culprits = true`),
   culprit finding starts on its own for each new failure with two or more suspects, a test's over
-  its unit's commits; its tries run at low priority (20, below W28-R64's work in progress), or at
-  once at gate priority (90) on a branch in `[ci] culprit_gates`. A ledger of results by input key
-  (`kiln_ci::verdict::Ledger`; none until W24-R06's is on main) answers a try whose inputs already
-  ran, so reuse slots in when it lands.
+  its unit's commits, as the run that opened the suspect ends. Its tries run at low priority (20,
+  below W28-R64's work in progress), each a speculative demand of its lane under the lane's window
+  (W28-R68) where the workflow declares admission; on a branch in `[ci] culprit_gates` they go at
+  once, at gate priority (90), nothing holding them. A try is no newer push of its branch: it joins
+  no run-level concurrency group, coalesces with no push and supersedes nothing (W05-R08,
+  W28-R46), so nothing on the branch waits for it, cancels it or is withdrawn by it. Only kiln's
+  bisection marks a run a try (kept with its input, so a restart keeps it); no request can. Result
+  reuse sits behind a trait (`kiln_ci::verdict::Ledger`): before each try the bisection asks what a
+  run of the same inputs concluded, takes it as the try's outcome, and runs nothing. kiln has no
+  ledger for it yet (`NoLedger`: W24-R06's keys a leg's inputs as dispatch plans it, which a
+  bisection can't yet), so every try runs, its legs reusing what W24-R06 finds as they are queued.
 - **W28-R58 Waiting for a verdict.** `ci.verdict.wait` (`GET
   /api/ci/repos/:repo/commits/:sha/verdict/wait`) answers once the commit's verdict is final (every
   lane's direct, covered or culprit; `until: final`, the default) or once it changes at all
@@ -8639,8 +8646,10 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
 - **W28-R59 The pushing agent hears.** When a run of a workflow ends, or a bisection, the lane's
   verdicts around it are worked out again. Each commit whose verdict changed since it was last kept
   gets a `ci_verdict` event (§4.2), and the agent that pushed it, as step 6 attributes it
-  (W28-R67: its push's agent token, the agent change request whose last pushed commit it is, or
-  its `Kiln-Agent` line), a `verdict.changed` message, queued after its turn as `fix_checks`' messages are:
+  (`kiln_ci::sched::actor`, W28-R67: the agent token its push came with, as kiln kept the push for
+  the lane's first run at or after the commit, and only for the commits that push brought; else
+  the agent change request whose last pushed commit it is; else its `Kiln-Agent` line), a
+  `verdict.changed` message, queued after its turn as `fix_checks`' messages are:
   a change of a verdict kept before, or the first answer of a commit the run newly answers.
   Direct and covered say so in a line, covered as optimistic, not passed; suspect says the failing
   check, the commit it failed at, its base and how to find the culprit (`ci.runs.bisect` with the
@@ -8668,10 +8677,18 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
   test -p kiln-ci culprit`, `cargo test -p kiln --test verdicts`).
 - **W28-AC54 Agents hear and wait.** End to end, an agent's commit (its `Kiln-Agent` trailer)
   covered by a later run's pass gets the agent a `verdict.changed` message saying it is covered,
-  and no other commit's; `ci.verdict.wait` answers at once for a final verdict and says the time
-  ran out when nothing changes. `ci.verdict` and `ci.verdict.wait` are §4.1 routes and operations on
-  every surface (`w20_r01_each_operation_is_a_route`). *Integration and unit tests* (`cargo test -p
-  kiln --test verdicts`, `cargo test -p kiln w28_r58`).
+  and no other commit's; so does a commit without the trailer that the agent pushed with its own
+  token, and not what its branch already held; `ci.verdict.wait` answers at once for a final
+  verdict and says the time ran out when nothing changes. `ci.verdict` and `ci.verdict.wait` are
+  §4.1 routes and operations on every surface (`w20_r01_each_operation_is_a_route`). *Integration
+  and unit tests* (`cargo test -p kiln --test verdicts`, `cargo test -p kiln w28_r58`,
+  `cargo test -p kiln-ci w28_r67`).
+- **W28-AC55 Culprit finding on its own.** End to end, with `[ci] culprits = true`, a new failure
+  of a test with two suspects is bisected without anyone asking, over only its unit's commits,
+  naming the culprit, and the tries' ends start no other bisection. A try's priority is 20 (gate:
+  90), its admission speculative (gate: never held), and no request can make a run a try; a
+  ledger's answers replace tries without changing the search. *Integration and unit tests* (`cargo
+  test -p kiln --test verdicts`, `cargo test -p kiln w28_r57`, `cargo test -p kiln-ci w28_r57`).
 
 **Progress.** R50–R59, AC50 and AC52–AC54 built (2026-10-25) in `kiln_ci::verdict` (its `cargo`
 reader and `culprit` planner), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`,
