@@ -732,7 +732,8 @@ mod tests {
             "hyper-light",
             Actor::Leg { enrolled_by: "ada".into(), machine: "fedora-2".into(), instance: "01a174ed".into(), run: 812, attempt: 1, leg: "e2e".into() },
         );
-        let pem = pki.issue_identity(&csr, &leg, &[(fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90")], Duration::hours(6))?;
+        let facts = [(fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90"), (fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main")];
+        let pem = pki.issue_identity(&csr, &leg, &facts, Duration::hours(6))?;
         let v = chain::verify(&[&pem_to_der(&pem)?], &pki.ca_der, &[], now).map_err(|e| anyhow::anyhow!("{e}"))?;
         assert_eq!(v.facts.commit.as_deref(), Some("4c1e2a90"));
         // A tampered CSR (another key's signature) is refused.

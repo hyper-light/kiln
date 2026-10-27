@@ -347,11 +347,57 @@ pub fn private_memory(on: bool) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut Luid) -> i32;
+        fn AdjustTokenPrivileges(token: *mut c_void, disable_all: i32, new: *const OnePrivilege, len: u32, previous: *mut c_void, returned: *mut u32) -> i32;
+    }
+
+    /// `LUID`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Luid {
+        low: u32,
+        high: i32,
+    }
+
+    /// `TOKEN_PRIVILEGES` with one `LUID_AND_ATTRIBUTES`.
+    #[repr(C)]
+    struct OnePrivilege {
+        count: u32,
+        luid: Luid,
+        attributes: u32,
+    }
+
+    /// This process's token without Debug programs enabled: an elevated administrator's opens any
+    /// process whatever its DACL (as root reaches any process on Linux), so this checks what a
+    /// step of an unprivileged runner (kiln installs runners never elevated) meets.
+    fn without_debug_privilege() {
+        const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+        let mut token = std::ptr::null_mut();
+        // SAFETY: this process's pseudo-handle and a place for the token handle.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) } == 0 {
+            return;
+        }
+        let name = wide("SeDebugPrivilege");
+        let mut luid = Luid { low: 0, high: 0 };
+        // SAFETY: the local system, a NUL-terminated name and a place for its LUID.
+        if unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) } != 0 {
+            let disabled = OnePrivilege { count: 1, luid, attributes: 0 };
+            let len = u32::try_from(std::mem::size_of::<OnePrivilege>()).unwrap_or(16);
+            // SAFETY: an open token and one privilege to disable; the previous state isn't asked.
+            unsafe { AdjustTokenPrivileges(token, 0, &disabled, len, std::ptr::null_mut(), std::ptr::null_mut()) };
+        }
+        // SAFETY: the token is ours to close.
+        unsafe { CloseHandle(token) };
+    }
+
     /// W27-R02: while its memory is kept private, no process of this user opens this one to read
     /// it (`OpenProcess` checks the DACL for this process's own id too); afterwards it can again.
     #[test]
     fn w27_r02_private_memory_refuses_reading_it() -> io::Result<()> {
         const PROCESS_VM_READ: u32 = 0x0010;
+        without_debug_privilege();
         // SAFETY: no arguments.
         let pid = unsafe { GetCurrentProcessId() };
         let opens = || {

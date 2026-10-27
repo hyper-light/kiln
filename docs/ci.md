@@ -8533,7 +8533,9 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   processes, the steps among them (`os::private_memory`: on Linux the runner isn't dumpable then,
   so neither ptrace nor `/proc/<pid>/mem` reaches it whatever Yama's ptrace scope; on Windows its
   DACL lets them only wait on it, ask after it and end it; macOS refuses them `task_for_pid`
-  already). Tests: `w27_r01_leg_certificate` (a leg on a test runner: its certificate verifies to
+  already). A step running as root, or as an elevated administrator with Debug programs enabled,
+  reaches any process's memory: kiln installs runners as their user, and on Windows never
+  elevated. Tests: `w27_r01_leg_certificate` (a leg on a test runner: its certificate verifies to
   kiln's root with its run, workflow, commit and runner instance) and
   `w27_r02_no_step_reads_the_legs_key` (its step lists its environment, the files it can read and
   its runner's memory: of the private keys it finds, its runner's machine key among them, none is
