@@ -53,12 +53,27 @@ function commits() {
       pips: pips("requested", "none", "passed"),
       kind: "diff",
       host: "kiln",
-      change: change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }),
+      change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
       runs: [{ id: "run-41", pipeline: "ci" }],
       actions: [
         { name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, diff: "D41" } },
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
       ],
+    }),
+    // D41's first revision, which its second replaced: quiet, folded under it.
+    row({
+      sha: sha("2"),
+      short: "2222222",
+      message: "pipeline: dynamic matrices",
+      author: "agent:matrix",
+      at: t - 3600,
+      stand: "superseded",
+      line: "Superseded by revision 2",
+      cursor: 3,
+      pips: pips("none", "none", "superseded"),
+      kind: "diff",
+      host: "kiln",
+      fold_under: sha("4"),
     }),
     row({
       sha: sha("c"),

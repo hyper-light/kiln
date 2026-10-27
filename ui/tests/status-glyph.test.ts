@@ -22,8 +22,8 @@ test("a code failure, CI's own error and a flake are three different glyphs and 
   assert.notEqual(signature("failed"), signature("flaky"));
 });
 
-test("every state but 'not yet' and a person has a motion of its own", () => {
-  for (const state of STATES) assert.equal(moves(state), state !== "none" && state !== "person", state);
+test("every state but 'not yet', a person and a superseded one (quiet, folded away) has a motion of its own", () => {
+  for (const state of STATES) assert.equal(moves(state), state !== "none" && state !== "person" && state !== "superseded", state);
 });
 
 test("a wait's arc grows clockwise from the top as it nears its end", () => {

@@ -108,7 +108,7 @@ export const GLYPHS: Record<GlyphState, Glyph> = {
       },
     ],
   },
-  superseded: { word: "superseded", parts: [ring("off", 1.2), { k: "path", d: "M3.9 10.1 L10.1 3.9", stroke: "off", w: 1.2, m: "fade" }] },
+  superseded: { word: "superseded", parts: [ring("off", 1.2), { k: "path", d: "M3.9 10.1 L10.1 3.9", stroke: "off", w: 1.2 }] },
   needs: {
     word: "needs you",
     parts: [

@@ -21,6 +21,13 @@ test("changes are Ship items, drawn by Ship's own row, needs you first", async (
   await expect(rows.first().getByRole("button", { name: "Hand off" })).toBeVisible();
   await expect(rows.first().getByRole("button", { name: "Review" })).toBeVisible();
 
+  // D41's first revision, superseded by its second: quiet, folded under it.
+  await rows
+    .first()
+    .getByRole("button", { name: /Show 1 more commit of D41/ })
+    .click();
+  await expect(rows.first().getByRole("list", { name: "The other commits of D41" })).toContainText("Superseded");
+
   // The change request's other commit, folded under its head.
   const cr = rows.filter({ hasText: "sched: fair shares" });
   await cr.getByRole("button", { name: /Show 1 more commit of CR12/ }).click();
