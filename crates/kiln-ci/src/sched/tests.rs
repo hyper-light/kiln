@@ -1939,3 +1939,90 @@ fn a_declared_preference_comes_before_headroom_within_the_target() {
     let c = s.handle(Input::LegQueued(Box::new(fast("second"))), 4_000);
     assert_eq!(to(&c, "second").as_deref(), Some("b"), "{c:?}");
 }
+
+/// W05's admission, step 1: a leg first in line that no runner has room for, a minute on, holds the
+/// runner its running legs' expected ends leave room soonest. There a leg expected to end by then
+/// still starts, while one expected to run past it doesn't, though it fits; once the room shows,
+/// the held leg starts there and its hold is done.
+#[test]
+fn a_leg_that_cant_fit_holds_a_runner_for_itself() {
+    use super::state::Sample;
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+    };
+    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu, mem: GIB, ..Resources::default() }, cost: Some(cost_s), ..leg(id, "acme/x", 50) };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    say(&mut s, "a", 0.0, 0);
+    say(&mut s, "b", 0.0, 0);
+    // a runs 12 CPUs for 10 minutes and 12 for 2; b, 27 for 20.
+    for (id, cpu, cost, on) in [("a1", 12.0, 600.0, "a"), ("b1", 27.0, 1200.0, "b"), ("a2", 12.0, 120.0, "a")] {
+        let c = s.handle(Input::LegQueued(Box::new(asking(id, cpu, cost))), 1_000);
+        assert_eq!(to(&c, id).as_deref(), Some(on), "{c:?}");
+    }
+    // 14 CPUs pass 85% on either.
+    let c = s.handle(Input::LegQueued(Box::new(asking("big", 14.0, 600.0))), 2_000);
+    assert_eq!(to(&c, "big"), None, "{c:?}");
+    // A minute on, fresh samples: big holds a, where a2's end leaves it room, with 1.2 CPUs beside.
+    say(&mut s, "a", 24.0, 61_000);
+    say(&mut s, "b", 27.0, 61_000);
+    s.handle(Input::Tick, 62_000);
+    let h = s.held("a").cloned();
+    assert!(h.as_ref().is_some_and(|h| h.leg == "big" && h.shadow == 121_000 && (h.extra.cpu - 1.2).abs() < 1e-9), "{h:?}");
+    assert!(s.held("b").is_none());
+    // On a, a leg expected to run past then doesn't start, though it fits; one that ends by then does.
+    let c = s.handle(Input::LegQueued(Box::new(asking("long", 2.0, 600.0))), 63_000);
+    assert_eq!(to(&c, "long"), None, "{c:?}");
+    let c = s.handle(Input::LegQueued(Box::new(asking("short", 2.0, 30.0))), 63_000);
+    assert_eq!(to(&c, "short").as_deref(), Some("a"), "{c:?}");
+    s.handle(Input::AttemptFinished { leg: "short".into(), attempt: 1, outcome: Outcome::Success }, 90_000);
+    let c = say(&mut s, "a", 24.0, 100_000);
+    assert_eq!(to(&c, "long"), None, "{c:?}");
+    say(&mut s, "b", 27.0, 100_000);
+    // a2 ends; a's next sample shows the room: big starts there, and its hold is done.
+    s.handle(Input::AttemptFinished { leg: "a2".into(), attempt: 1, outcome: Outcome::Success }, 121_000);
+    let c = say(&mut s, "a", 12.0, 122_000);
+    assert_eq!(to(&c, "big").as_deref(), Some("a"), "{c:?}");
+    assert!(s.held("a").is_none());
+}
+
+/// W05's admission: a hold ends when its runner goes, the leg then holding another that can take
+/// it, and when its leg leaves the queue.
+#[test]
+fn a_hold_ends_with_its_runner_or_its_leg() {
+    use super::state::Sample;
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+    };
+    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu, mem: GIB, ..Resources::default() }, cost: Some(cost_s), ..leg(id, "acme/x", 50) };
+    say(&mut s, "a", 0.0, 0);
+    say(&mut s, "b", 0.0, 0);
+    s.handle(Input::LegQueued(Box::new(asking("a1", 24.0, 120.0))), 1_000);
+    s.handle(Input::LegQueued(Box::new(asking("b1", 24.0, 600.0))), 1_000);
+    s.handle(Input::LegQueued(Box::new(asking("big", 14.0, 600.0))), 2_000);
+    say(&mut s, "a", 24.0, 61_000);
+    say(&mut s, "b", 24.0, 61_000);
+    s.handle(Input::Tick, 62_000);
+    assert_eq!(s.held("a").map(|h| h.leg.as_str()), Some("big"));
+    // a goes: big holds b, the one left that can take it.
+    s.handle(Input::RunnerLost { runner: "a".into() }, 63_000);
+    assert!(s.held("a").is_none());
+    assert_eq!(s.held("b").map(|h| (h.leg.as_str(), h.shadow)), Some(("big", 601_000)));
+    // big is cancelled: nothing is held.
+    s.handle(Input::LegCancelled { leg: "big".into(), reason: "the run was cancelled".into() }, 64_000);
+    assert!(s.held("b").is_none());
+}

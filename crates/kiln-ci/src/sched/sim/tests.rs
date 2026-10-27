@@ -41,6 +41,8 @@ fn runner(name: &str, cpus: u32, gib: u64) -> RunnerIn {
 /// then a link step's 12 GiB on one CPU, and takes 1 to 20 minutes: (queued at, leg, duration).
 fn legs(seed: u64, from: i64, until: i64) -> Vec<(i64, LegIn, i64)> {
     let mut rng = Rng::stream(seed, "fleet");
+    // What history expects each to take: within 30% of what it does.
+    let mut guess = Rng::stream(seed, "estimates");
     let pick = |rng: &mut Rng, of: &[u64]| of.get(rng.below(of.len())).copied().unwrap_or(1);
     let mut out = Vec::new();
     let mut t = from;
@@ -52,7 +54,8 @@ fn legs(seed: u64, from: i64, until: i64) -> Vec<(i64, LegIn, i64)> {
         let duration = pick(&mut rng, &[1, 2, 3, 5, 8, 13, 20]) as i64 * MIN + rng.below(60_000) as i64;
         let repo = ["acme/web", "acme/api", "acme/infra"].get(n % 3).copied().unwrap_or_default();
         let request = Resources { cpu: cpus as f64, mem, ..Resources::default() };
-        let leg = LegIn { id: format!("leg-{n}"), run: format!("run-{n}"), repo: repo.into(), route: LegRoute { labels: vec!["fleet".into()], ..LegRoute::default() }, priority: 50, request, ..LegIn::default() };
+        let cost = duration as f64 / 1000.0 * (0.7 + guess.below(61) as f64 / 100.0);
+        let leg = LegIn { id: format!("leg-{n}"), run: format!("run-{n}"), repo: repo.into(), route: LegRoute { labels: vec!["fleet".into()], ..LegRoute::default() }, priority: 50, request, cost: Some(cost), ..LegIn::default() };
         out.push((t, leg, duration));
         if out.len() >= BURST {
             t += 2_000 + rng.below(12_000) as i64;
@@ -135,9 +138,10 @@ fn measure(sim: &Sim, legs: &[(i64, LegIn, i64)]) -> Measured {
 /// W05 step 4: a mixed fleet, each runner sampling itself every 5 s, packs to the target use by
 /// those samples without ever placing memory past a runner's capacity. On three seeds' streams of
 /// legs, more than the fleet runs, the fleet's CPUs are at least 80% in use while the stream keeps
-/// work queued (time-weighted; whole CPUs within 85% are 82.8% of this fleet's). Once it ends the
-/// rest run, none left behind, the last few only big legs that no packing fills the gaps with; and
-/// at no moment of it all is a runner's CPUs or memory in use past the target.
+/// work queued (time-weighted; whole CPUs within 85% are 82.8% of this fleet's), and none starves:
+/// legs that can't fit hold runners (W05's admission), so 8-CPU legs wait at most half as long
+/// again as all legs do, on average. Once the stream ends the rest run, none left behind; and at
+/// no moment of it all is a runner's CPUs or memory in use past the target.
 #[test]
 fn a_fleet_packs_to_the_target_by_headroom_without_overcommitting_memory() {
     for seed in [1, 2, 3] {
@@ -155,6 +159,14 @@ fn a_fleet_packs_to_the_target_by_headroom_without_overcommitting_memory() {
         }
         sim.run(STREAM_MS);
         let stream = measure(&sim, &legs);
+        // None starves: big legs, holding runners once they can't fit (W05's admission), wait not
+        // much longer than the rest.
+        let mean_wait = |cpus: Option<f64>| {
+            let w: Vec<i64> = legs.iter().filter(|(_, l, _)| cpus.is_none_or(|c| l.request.cpu == c)).filter_map(|(q, l, _)| sim.started(&l.id).map(|s| s - q)).collect();
+            w.iter().sum::<i64>() as f64 / w.len().max(1) as f64
+        };
+        let (all, big) = (mean_wait(None), mean_wait(Some(8.0)));
+        assert!(big <= 1.5 * all, "seed {seed}: 8-CPU legs waited {:.0} s on average, all legs {:.0} s", big / 1000.0, all / 1000.0);
         assert!(stream.queued_ms >= STREAM_MS - SAMPLE_MS, "seed {seed}: work stayed queued while the stream lasted: {stream:?}");
         assert!(stream.cpu_use >= 0.80, "seed {seed}: the fleet's CPUs were {:.1}% in use while work was queued: {stream:?}", stream.cpu_use * 100.0);
         sim.run(STREAM_MS + 6 * 60 * MIN);
