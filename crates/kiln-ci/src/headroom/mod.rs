@@ -4,3 +4,4 @@
 pub mod admit;
 pub mod detect;
 pub mod knee;
+pub mod pace;
