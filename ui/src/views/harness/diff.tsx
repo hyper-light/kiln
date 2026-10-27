@@ -11,7 +11,7 @@ import * as React from "react";
 import { flushSync } from "react-dom";
 import { ChevronRight, ChevronsUpDown, FileDiff as FileDiffIcon, FilePlus2 } from "lucide-react";
 import type { FileDiff, Hunk } from "@/api/harness";
-import { AboutCard, AboutContext, offsetAt, selecting, wordAt, type Asked } from "@/components/code/about";
+import { AboutCard, AboutContext, linesLabel, offsetAt, selecting, wordAt, type Asked } from "@/components/code/about";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { cn } from "@/lib/utils";
 import { diffStats } from "./derive";
@@ -493,6 +493,7 @@ function HunkRows({
   onUnfold,
   onAsk,
   asking,
+  cardAfter,
   card,
 }: {
   h: HunkModel;
@@ -503,7 +504,8 @@ function HunkRows({
   onUnfold: (id: string) => void;
   onAsk?: OnAsk;
   /** The line a card is open under, and the card. */
-  asking: Line | null;
+  asking: ReadonlySet<Line>;
+  cardAfter: Line | null;
   card: React.ReactNode;
 }) {
   const out: React.ReactNode[] = [];
@@ -530,9 +532,9 @@ function HunkRows({
           return;
         }
         out.push(
-          <Row key={`${si}.${k}`} line={l} toks={toks?.get(l)} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} onAsk={onAsk} asked={l === asking} />,
+          <Row key={`${si}.${k}`} line={l} toks={toks?.get(l)} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} onAsk={onAsk} asked={asking.has(l)} />,
         );
-        if (l === asking && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
+        if (l === cardAfter && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
       });
       return;
     }
@@ -552,14 +554,14 @@ function HunkRows({
       [seg.adds, rowA, "a"],
     ] as const)
       list.forEach((l, k) => {
-        out.push(<Row key={`${si}${tag}${k}`} line={l} toks={toks?.get(l)} sr={rows[k] ?? top} split={split} onAsk={onAsk} asked={l === asking} />);
-        if (l === asking && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
+        out.push(<Row key={`${si}${tag}${k}`} line={l} toks={toks?.get(l)} sr={rows[k] ?? top} split={split} onAsk={onAsk} asked={asking.has(l)} />);
+        if (l === cardAfter && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
       });
     out.push(...fills);
     sr += seg.pairs.length;
   });
   // Side by side, rows hold their places in the grid: the card goes under the hunk's last row.
-  if (split && asking && card)
+  if (split && cardAfter && h.segs.some((sg) => (sg.t === "ctx" ? sg.lines.includes(cardAfter) : sg.dels.includes(cardAfter) || sg.adds.includes(cardAfter))) && card)
     out.push(
       <div key="about" style={{ gridRow: sr, gridColumn: "1 / -1" }}>
         {card}
@@ -622,34 +624,40 @@ export function FileDiffView({
   const toks = React.useMemo(() => (hl && model.hunks.length ? tokensOf(model.hunks, hl) : null), [hl, model.hunks]);
   // In an agent's conversation, a tapped line opens a card under it (components/code/about.tsx).
   const about = React.useContext(AboutContext);
-  const [asked, setAsked] = React.useState<{ line: Line; ask: Asked } | null>(null);
+  const [asked, setAsked] = React.useState<{ lines: Line[]; ask: Asked } | null>(null);
   const onAsk = React.useCallback<OnAsk>(
-    (line, word, change) => {
-      const hunk = model.hunks.find((x) => x.segs.some((sg) => (sg.t === "ctx" ? sg.lines.includes(line) : sg.dels.includes(line) || sg.adds.includes(line))));
-      const flat = (hunk?.segs ?? []).flatMap((sg) => (sg.t === "ctx" ? sg.lines : [...sg.dels, ...sg.adds]));
-      const i = flat.indexOf(line);
-      // The code around it as a diff's lines, so a change reads as one.
-      const code = flat
-        .slice(Math.max(0, i - 10), i + 11)
-        .map((l) => `${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}${l.text}`)
-        .join("\n");
-      const no = line.n ?? line.o ?? undefined;
-      const selection = word ? line.text.slice(word.start, word.end) : undefined;
-      const file = diff.path.split("/").pop() ?? diff.path;
-      const ask: Asked = {
-        path: diff.path,
-        line: no,
-        selection,
-        change: change || undefined,
-        code,
-        label: change ? "this change" : (selection ?? `line ${no ?? ""}`),
-        where: no ? `${file} · line ${no}` : file,
-      };
-      setAsked((prev) => (prev && prev.line === line && prev.ask.label === ask.label ? null : { line, ask }));
-    },
+    (line, word, change) =>
+      setAsked((prev) => {
+        const hunk = model.hunks.find((x) => x.segs.some((sg) => (sg.t === "ctx" ? sg.lines.includes(line) : sg.dels.includes(line) || sg.adds.includes(line))));
+        const flat = (hunk?.segs ?? []).flatMap((sg) => (sg.t === "ctx" ? sg.lines : [...sg.dels, ...sg.adds]));
+        const selection = word ? line.text.slice(word.start, word.end) : undefined;
+        let lines = [line];
+        if (!selection && prev && !prev.ask.selection && !prev.lines.includes(line) && prev.lines.every((l) => flat.includes(l))) {
+          // Another line's number, in the same hunk: the lines between are taken in.
+          const at = [...prev.lines, line].map((l) => flat.indexOf(l));
+          lines = flat.slice(Math.min(...at), Math.max(...at) + 1);
+        } else if (prev?.lines.length === 1 && prev.lines[0] === line && prev.ask.selection === selection) return null;
+        const first = lines[0] ?? line;
+        const last = lines[lines.length - 1] ?? line;
+        const [lo, hi] = [flat.indexOf(first), flat.indexOf(last)];
+        // The code around it as a diff's lines, so a change reads as one.
+        const code = flat
+          .slice(Math.max(0, lo - 10), hi + 11)
+          .map((l) => `${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}${l.text}`)
+          .join("\n");
+        const many = lines.length > 1;
+        const [a, b] = [first.n ?? first.o ?? undefined, last.n ?? last.o ?? undefined];
+        const changed = many ? lines.some((l) => l.kind !== "ctx") : change;
+        const file = diff.path.split("/").pop() ?? diff.path;
+        const label = selection ?? (changed && !many ? "this change" : linesLabel(a, b));
+        const ask: Asked = { path: diff.path, line: a, end: many ? b : undefined, selection, change: changed || undefined, code, label, where: a ? `${file} · ${linesLabel(a, many ? b : a)}` : file };
+        return { lines, ask };
+      }),
     [model.hunks, diff.path],
   );
   const card = asked ? <AboutCard key={`${asked.ask.label}@${asked.ask.line ?? ""}`} ask={asked.ask} onClose={() => setAsked(null)} /> : null;
+  const asking = React.useMemo(() => new Set(asked?.lines ?? []), [asked]);
+  const cardAfter = asked?.lines[asked.lines.length - 1] ?? null;
   // Side by side only helps when lines changed on both sides (not in a new file or a pure deletion,
   // whose other column of numbers goes, too).
   const split = layout !== "unified" && !model.only ? (layout === "split" ? "on" : "auto") : undefined;
@@ -690,7 +698,18 @@ export function FileDiffView({
                     <span className="hx-sep-label">{h.where}</span>
                   </div>
                 )}
-                <HunkRows h={h} hi={hi} toks={toks} split={split !== undefined} unfolded={unfolded} onUnfold={unfold} onAsk={about ? onAsk : undefined} asking={asked?.line ?? null} card={card} />
+                <HunkRows
+                  h={h}
+                  hi={hi}
+                  toks={toks}
+                  split={split !== undefined}
+                  unfolded={unfolded}
+                  onUnfold={unfold}
+                  onAsk={about ? onAsk : undefined}
+                  asking={asking}
+                  cardAfter={cardAfter}
+                  card={card}
+                />
               </React.Fragment>
             ))
           )}

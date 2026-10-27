@@ -411,7 +411,9 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
-Mission Control lists every agent kiln runs, in one flat list. An agent started through kiln's API
+Mission Control lists every agent kiln runs, in one flat list. The one exception is a card's helper
+(`agents.about`, below): it answers what a person tapped in a conversation, so it's no row, its
+parent isn't told of it, and kiln ends it once no card has read its answer for 90 seconds. An agent started through kiln's API
 is a top-level agent, whoever started it: a row of its own, in the counts, filters, conversation
 search and bulk actions, with no nesting under the agent that started it. A harness's own
 subagents stay subagents: they aren't rows, and their status and output stay inside their agent's
@@ -465,7 +467,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.list` | `GET /api/harness/agents` | `machine?` (a runner's name, `local` for the server), `harness?`, `state?` (a stand or a status), `parent?`, `plan_run?` → `{agents: [Agent]}` |
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
-| `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps |
+| `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
 | `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |

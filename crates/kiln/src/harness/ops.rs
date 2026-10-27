@@ -72,6 +72,8 @@ async fn list(cx: Cx, v: Value) -> Out {
     let agents: Vec<Value> = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list())
         .await
         .iter()
+        // A card's helper (`super::about`) is the card's: no agent of these.
+        .filter(|i| i.helper.is_none())
         .filter(|i| machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local")))
         .filter(|i| harness.as_deref().is_none_or(|h| i.kind == h))
         .filter(|i| parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p)))
@@ -111,15 +113,33 @@ async fn start(cx: Cx, v: Value) -> Out {
 /// The four parts an answer about a piece of code comes in (the UI reads them by these headings).
 pub const ABOUT_PARTS: [&str; 4] = ["What it is", "What it does here", "Used elsewhere", "Worth knowing"];
 
-/// What a child is asked about a piece of code a person tapped in a conversation.
-pub fn about_prompt(path: &str, line: Option<u64>, selection: Option<&str>, code: &str, change: bool, question: Option<&str>) -> String {
-    let at = line.map_or_else(|| path.to_owned(), |l| format!("{path}:{l}"));
-    let subject = match (change, selection) {
+/// What a person tapped in a conversation: a name on a line, a line or lines, or the change on one.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Tapped<'a> {
+    pub path: &'a str,
+    pub line: Option<u64>,
+    /// The last of the lines, when they're several.
+    pub end: Option<u64>,
+    pub selection: Option<&'a str>,
+    pub change: bool,
+    pub question: Option<&'a str>,
+}
+
+/// What a child is asked about a piece of code a person tapped, with `code`, the code around it.
+pub fn about_prompt(t: &Tapped, code: &str) -> String {
+    let path = t.path;
+    let at = match (t.line, t.end.filter(|e| t.line.is_some_and(|l| l != *e))) {
+        (Some(l), Some(e)) => format!("{path}:{}-{}", l.min(e), l.max(e)),
+        (Some(l), None) => format!("{path}:{l}"),
+        (None, _) => path.to_owned(),
+    };
+    let lines = if t.end.is_some_and(|e| t.line.is_some_and(|l| l != e)) { "lines" } else { "line" };
+    let subject = match (t.change, t.selection) {
         (true, _) => format!("the change at {at}"),
         (false, Some(s)) => format!("`{s}` at {at}"),
-        (false, None) => format!("line {at}"),
+        (false, None) => format!("{lines} {at}"),
     };
-    let asked = question.map_or_else(|| "what is this?".to_owned(), |q| format!("{q:?}"));
+    let asked = t.question.map_or_else(|| "what is this?".to_owned(), |q| format!("{q:?}"));
     let parts = ABOUT_PARTS.iter().map(|p| format!("## {p}")).collect::<Vec<_>>().join("\n");
     format!(
         "A person reading a conversation about this repository tapped {subject} and asked: {asked}\n\nThe code there:\n```\n{code}\n```\n\nAnswer them in these four parts, each under its heading, briefly:\n{parts}\n\nUnder \"Used elsewhere\", each other place it's used, found by searching the repository, as `path:line` and that line. Read and search only: change nothing, and don't ask anything back."
@@ -137,7 +157,15 @@ async fn about(cx: Cx, v: Value) -> Out {
     let code = text(&v, "code")?;
     let opt = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     let selection = opt("selection");
-    let prompt = about_prompt(&path, v.get("line").and_then(Value::as_u64), selection, &code, v.get("change").and_then(Value::as_bool).unwrap_or(false), opt("question"));
+    let tapped = Tapped {
+        path: &path,
+        line: v.get("line").and_then(Value::as_u64),
+        end: v.get("end_line").and_then(Value::as_u64),
+        selection,
+        change: v.get("change").and_then(Value::as_bool).unwrap_or(false),
+        question: opt("question"),
+    };
+    let prompt = about_prompt(&tapped, &code);
     if info.max_subagents == Some(0) {
         let mode = if v.get("now").and_then(Value::as_bool).unwrap_or(false) { "steer" } else { "queue" };
         let sent = send(cx.clone(), json!({"agent": info.id, "text": prompt, "mode": mode})).await?;
@@ -151,8 +179,12 @@ async fn about(cx: Cx, v: Value) -> Out {
         _ => None,
     };
     let name = format!("About {}", selection.unwrap_or(&path).chars().take(48).collect::<String>());
-    let ask = Ask { kind: info.kind.clone(), prompt: Some(prompt), mode, name: Some(name), ..Ask::default() };
+    let ask = Ask { kind: info.kind.clone(), prompt: Some(prompt), mode, name: Some(name), helper: Some(super::about::ABOUT.to_owned()), ..Ask::default() };
     let infos = lineage::start(&cx.hub, &by, ask).await?;
+    // It's the card's: ended once no card reads it (`super::about`).
+    for i in &infos {
+        super::about::started(cx.hub.clone(), i.id.clone(), cx.caller.name.clone());
+    }
     Ok(json!({"agents": infos.iter().map(wait::brief).collect::<Vec<_>>(), "itself": false}))
 }
 
@@ -373,6 +405,8 @@ fn reply_of(e: &Value) -> Option<Value> {
 async fn result(cx: Cx, v: Value) -> Out {
     let info = seen(&cx, &agent_of(&v)?).await?;
     let id = info.id.clone();
+    // A card reading its helper keeps it (`super::about`).
+    super::about::seen(&id);
     // Its parent reading it now isn't told of it again (`told`).
     if info.parent.is_some() && info.parent == cx.caller.agent {
         super::told::saw(&cx.hub, &info).await;
@@ -505,6 +539,7 @@ async fn stop(cx: Cx, v: Value) -> Out {
             }
         }
     }
+    super::about::ended(&id);
     if end(&cx.hub, &id, &cx.caller.name).await {
         ended.push(id);
     }
@@ -594,6 +629,7 @@ pub fn list_ops() -> Vec<Op> {
                         "agent": {"type": "string", "description": AGENT},
                         "path": {"type": "string", "description": "The file the code is in."},
                         "line": {"type": "integer", "description": "Its line there."},
+                        "end_line": {"type": "integer", "description": "The last of the lines, when they're several."},
                         "selection": {"type": "string", "description": "The name tapped; none: the whole line."},
                         "code": {"type": "string", "description": "The code around it."},
                         "change": {"type": "boolean", "description": "It's about the change on that line."},
@@ -747,15 +783,20 @@ mod tests {
 
     #[test]
     fn about_asks_what_was_tapped_in_the_four_parts_the_card_reads() {
-        let name = about_prompt("crates/kiln/src/http/client.rs", Some(48), Some("next"), "let wait = backoff.next(now);", false, None);
+        let path = "crates/kiln/src/http/client.rs";
+        let name = about_prompt(&Tapped { path, line: Some(48), selection: Some("next"), ..Tapped::default() }, "let wait = backoff.next(now);");
         assert!(name.contains("`next` at crates/kiln/src/http/client.rs:48") && name.contains("what is this?") && name.contains("backoff.next(now)"), "{name}");
         for part in ABOUT_PARTS {
             assert!(name.contains(&format!("## {part}")), "{part}: {name}");
         }
         assert!(name.contains("change nothing"), "{name}");
-        let change = about_prompt("a.rs", Some(3), Some("x"), "-a\n+b", true, Some("why this?"));
+        let change = about_prompt(&Tapped { path: "a.rs", line: Some(3), selection: Some("x"), change: true, question: Some("why this?"), ..Tapped::default() }, "-a\n+b");
         assert!(change.contains("the change at a.rs:3") && change.contains("\"why this?\""), "{change}");
-        assert!(about_prompt("a.rs", None, None, "x", false, None).contains("line a.rs"));
+        assert!(about_prompt(&Tapped { path: "a.rs", ..Tapped::default() }, "x").contains("line a.rs"));
+        // Several lines, either way round, read as one stretch.
+        let lines = about_prompt(&Tapped { path: "a.rs", line: Some(48), end: Some(44), ..Tapped::default() }, "x");
+        assert!(lines.contains("lines a.rs:44-48"), "{lines}");
+        assert!(about_prompt(&Tapped { path: "a.rs", line: Some(4), end: Some(4), ..Tapped::default() }, "x").contains("line a.rs:4 "));
     }
 
     #[test]

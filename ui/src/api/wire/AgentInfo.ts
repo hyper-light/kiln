@@ -121,6 +121,10 @@ parent?: string,
  */
 plan_run?: string, 
 /**
+ * What it helps with when it's a card's helper (as `Spec::helper`).
+ */
+helper?: string, 
+/**
  * It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
  * an agent it starts can't have it either.
  */

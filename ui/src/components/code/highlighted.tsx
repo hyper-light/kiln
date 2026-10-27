@@ -6,7 +6,7 @@
  */
 import * as React from "react";
 import { resolveLanguage, useHighlighter, type Tok } from "@/lib/syntax/browser";
-import { AboutCard, AboutContext, offsetAt, selecting, wordAt, type Asked } from "./about";
+import { AboutCard, AboutContext, linesLabel, offsetAt, selecting, wordAt, type Asked } from "./about";
 import "./syntax.css";
 
 /** One line in its tokens' colours. */
@@ -49,7 +49,7 @@ export function Highlighted({ text, lang, path }: { text: string; lang?: string 
  */
 export function CodeBlock({ text, lang, className }: { text: string; lang?: string | null; className?: string }) {
   const about = React.useContext(AboutContext);
-  const [asked, setAsked] = React.useState<{ line: number; ask: Asked } | null>(null);
+  const [asked, setAsked] = React.useState<{ from: number; to: number; ask: Asked } | null>(null);
   const hl = useHighlighter(resolveLanguage(lang, null, text));
   const toks = React.useMemo(() => hl?.(text) ?? null, [hl, text]);
   const lines = text.split("\n");
@@ -70,16 +70,24 @@ export function CodeBlock({ text, lang, className }: { text: string; lang?: stri
           const n = from + before.split("\n").length - 1;
           const word = wordAt(lines[n] ?? "", off - (before.lastIndexOf("\n") + 1));
           const selection = word ? (lines[n] ?? "").slice(word.start, word.end) : undefined;
-          const label = selection ?? `line ${n + 1}`;
-          const ask: Asked = {
-            path: lang ? `a ${lang} block in the conversation` : "a code block in the conversation",
-            line: n + 1,
-            selection,
-            code: lines.slice(Math.max(0, n - 20), n + 21).join("\n"),
-            label,
-            where: `the code block · line ${n + 1}`,
-          };
-          setAsked((prev) => (prev && prev.line === n && prev.ask.label === label ? null : { line: n, ask }));
+          setAsked((prev) => {
+            let [lo, hi] = [n, n];
+            // Another line, while lines are asked about: the lines between are taken in.
+            if (!selection && prev && !prev.ask.selection && (n < prev.from || n > prev.to)) [lo, hi] = [Math.min(prev.from, n), Math.max(prev.to, n)];
+            else if (prev && prev.from === n && prev.to === n && prev.ask.selection === selection) return null;
+            const label = selection ?? linesLabel(lo + 1, hi + 1);
+            const code = lines.slice(Math.max(0, lo - 20), hi + 21).join("\n");
+            const ask: Asked = {
+              path: lang ? `a ${lang} block in the conversation` : "a code block in the conversation",
+              line: lo + 1,
+              end: hi > lo ? hi + 1 : undefined,
+              selection,
+              code,
+              label,
+              where: `the code block · ${linesLabel(lo + 1, hi + 1)}`,
+            };
+            return { from: lo, to: hi, ask };
+          });
         }
       : undefined;
   const pre = (from: number, to: number, key: string) => (
@@ -90,9 +98,9 @@ export function CodeBlock({ text, lang, className }: { text: string; lang?: stri
   if (!asked) return pre(0, lines.length, "all");
   return (
     <>
-      {pre(0, asked.line + 1, "top")}
-      <AboutCard key={`${asked.ask.label}@${asked.line}`} ask={asked.ask} onClose={() => setAsked(null)} />
-      {asked.line + 1 < lines.length && pre(asked.line + 1, lines.length, "rest")}
+      {pre(0, asked.to + 1, "top")}
+      <AboutCard key={`${asked.ask.label}@${asked.from}`} ask={asked.ask} onClose={() => setAsked(null)} />
+      {asked.to + 1 < lines.length && pre(asked.to + 1, lines.length, "rest")}
     </>
   );
 }

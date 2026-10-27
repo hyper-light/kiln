@@ -4413,6 +4413,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     // `plans.run`), never what's asked.
     body.spec.parent = None;
     body.spec.plan_run = None;
+    body.spec.helper = None;
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {

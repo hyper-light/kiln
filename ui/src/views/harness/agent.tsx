@@ -75,7 +75,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const info = useSession(store, (s) => s.info);
   // Code in its conversation can be asked about (components/code/about.tsx): by a helper of its, or, with subagents off, it.
   const busy = useSession(store, (s) => s.state?.turn_started != null);
-  const about = React.useMemo(() => ({ id, name: info?.name, subagents: info?.max_subagents !== 0, busy }), [id, info?.name, info?.max_subagents, busy]);
+  const about = React.useMemo(() => ({ id, name: info?.name, subagents: info?.max_subagents !== 0, busy, store }), [id, info?.name, info?.max_subagents, busy, store]);
   const gone = useSession(store, (s) => s.conn === "gone");
   const cwd = useSession(store, (s) => s.state?.cwd || s.info?.cwd || "");
   const accepts = useSession(store, (s) => acceptsOf(s.meta));

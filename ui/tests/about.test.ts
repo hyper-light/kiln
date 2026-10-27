@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { test } from "node:test";
+import type { HEvent } from "../src/api/harness.ts";
 
 // The card's own logic, without its CSS (Node has none to load).
 const loader = registerHooks({
@@ -8,7 +9,7 @@ const loader = registerHooks({
     return url.endsWith(".css") ? { format: "module", source: "export {};", shortCircuit: true } : nextLoad(url, context);
   },
 });
-const { PARTS, partsOf, wordAt } = await import("../src/components/code/about.tsx");
+const { PARTS, linesLabel, partsOf, replyTo, wordAt } = await import("../src/components/code/about.tsx");
 loader.deregister();
 
 test("a tap picks the name under it, or nothing on space and punctuation", () => {
@@ -33,4 +34,29 @@ test("an answer's parts come by their headings, as they stream", () => {
   // An answer that ignored the headings is all its first part.
   assert.deepEqual(partsOf("It's a retry loop."), ["It's a retry loop.", null, null, null]);
   assert.deepEqual(partsOf(""), [null, null, null, null]);
+});
+
+test("lines asked about are named as one stretch, whichever was tapped first", () => {
+  assert.equal(linesLabel(44, 44), "line 44");
+  assert.equal(linesLabel(48, 44), "lines 44–48");
+  assert.equal(linesLabel(44, undefined), "line 44");
+});
+
+test("an agent answering itself: its words after the question, not its subagents', until the next message", () => {
+  const ev = (e: Record<string, unknown>, i: number) => ({ seq: i, at: i, ...e }) as unknown as HEvent;
+  const events = [
+    { id: "u0", kind: "user", text: "earlier" },
+    { id: "a0", kind: "assistant", text: "earlier answer" },
+    { id: "u1", kind: "user", text: "what is next?", client_id: "msg-1" },
+    { id: "a1", kind: "assistant", text: "## What it is\nA backoff." },
+    { id: "s1", kind: "assistant", text: "a subagent's words", parent: "task-1" },
+    { id: "a2", kind: "assistant", text: "## Worth knowing\nIt counts." },
+    { id: "u2", kind: "user", text: "next question" },
+    { id: "a3", kind: "assistant", text: "not this" },
+  ].map(ev);
+  assert.equal(replyTo(events, "msg-1"), "## What it is\nA backoff.\n\n## Worth knowing\nIt counts.");
+  // Its own id finds it too; before it shows, there's nothing yet; asked but not answered, nothing said.
+  assert.equal(replyTo(events, "u2"), "not this");
+  assert.equal(replyTo(events, "msg-9"), null);
+  assert.equal(replyTo(events.slice(0, 3), "msg-1"), "");
 });

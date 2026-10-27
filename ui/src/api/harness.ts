@@ -245,12 +245,17 @@ export interface LandingPlan {
   why_not?: string;
 }
 
+/** Whether an agent is one of the agents kiln lists: a card's helper (`helper`, `agents.about`) is the card's, no row of them. */
+export const listed = (a: AgentInfo) => !a.helper;
+
 /** What a person asks about a piece of code in an agent's conversation (`agents.about`). */
 export interface AboutAsk {
   path: string;
   /** The code around it. */
   code: string;
   line?: number;
+  /** The last of the lines, when they're several. */
+  end_line?: number;
   /** The name tapped; none: the whole line. */
   selection?: string;
   /** It's about the change on that line. */
@@ -471,7 +476,7 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => all.filter(listed)),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
@@ -512,7 +517,7 @@ export const harnessApi = {
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
   end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
   /** Ask about a piece of code in its conversation: a child of it answers, reading only; with no subagents, it does, in its conversation (`itself`). */
-  about: (id: string, ask: AboutAsk) => call<{ agents: AgentBrief[]; itself: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/about`, ask),
+  about: (id: string, ask: AboutAsk) => call<{ agents: AgentBrief[]; itself: boolean; sent?: { sent: boolean; message?: string } }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/about`, ask),
   /** What an agent last said, and how it stands. */
   result: (id: string, signal?: AbortSignal) => call<AgentResult>("GET", `/api/harness/agents/${encodeURIComponent(id)}/result`, undefined, signal),
   /** The agents an agent started that still run (and theirs). */

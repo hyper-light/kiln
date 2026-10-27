@@ -1951,6 +1951,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         max_subagents: None,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        helper: spec.helper.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
