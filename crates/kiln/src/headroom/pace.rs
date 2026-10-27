@@ -201,6 +201,25 @@ mod imp {
         Path::new(ROOT).join("cgroup.controllers").is_file()
     }
 
+    /// Whether this process paces the user's own units: one process a machine does, the one that
+    /// holds `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock` (taken once, held until it exits), so two
+    /// runners on a machine (or a test's runner beside the machine's) never pace the same units.
+    fn escapes_ours() -> bool {
+        static HELD: std::sync::OnceLock<Option<fs::File>> = std::sync::OnceLock::new();
+        HELD.get_or_init(|| {
+            let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::getuid())), PathBuf::from);
+            let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("kiln-headroom-escapes.lock")).ok()?;
+            match f.try_lock() {
+                Ok(()) => Some(f),
+                Err(_) => {
+                    tracing::info!("headroom: another kiln on this machine paces the user's units; this one paces its own sessions");
+                    None
+                }
+            }
+        })
+        .is_some()
+    }
+
     fn own() -> Option<String> {
         fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_owned())
     }
@@ -217,7 +236,7 @@ mod imp {
                 }
             }
         }
-        if escapes && let Some(own) = own() {
+        if escapes && escapes_ours() && let Some(own) = own() {
             // The user's service manager (`.../user@<uid>.service`), when the runner runs under one.
             if let Some(at) = own.find(".service/").filter(|_| own.contains("/user@")) {
                 let manager = Path::new(ROOT).join(own[..at + ".service".len()].trim_start_matches('/'));

@@ -56,7 +56,9 @@ person sends "now" never waits.
 **Pacing.** When running work wants more than a budget, the budget is water-filled class by class,
 max-min fair within a class, and each group runs that share of every period (`cgroup.freeze`):
 only for the resource that's short. Groups are each agent session's cgroup and, with `escapes`
-on, the user's transient units (`systemd-run --user`: agents' builds). Units the desktop starts
+on, the user's transient units (`systemd-run --user`: agents' builds), paced by one kiln a
+machine (the one holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`) and never one that kiln
+itself runs in. Units the desktop starts
 for a person (`app-…`, `dbus-…`, `xdg-…`) are never paced.
 
 On macOS and Windows a group is each agent session's processes as kiln holds them (followed fork
