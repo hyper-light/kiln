@@ -1903,3 +1903,39 @@ fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
     assert!(to(&c, "fourth").is_some(), "{c:?}");
 }
 
+
+/// The scheduler's headroom on three runners (W05, step 2): a declared preference (W05-R23) still
+/// comes first, while the runner it prefers stays within the target with the leg; past it, the leg
+/// goes where the most headroom is left.
+#[test]
+fn a_declared_preference_comes_before_headroom_within_the_target() {
+    use super::state::Sample;
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for (name, labels) in [("a", &["k8s", "fast"][..]), ("b", &["k8s"][..]), ("c", &["k8s"][..])] {
+        let mut r = linux(name, 8);
+        r.view.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+        s.handle(Input::RunnerUp(Box::new(r)), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(0.0) } }, at)
+    };
+    let fast = |id: &str| LegIn { prefer: vec![Preference { label: Some("fast".into()), ..Preference::default() }], request: Resources { cpu: 4.0, mem: 2 * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    say(&mut s, "a", 0.6, 1_000);
+    say(&mut s, "b", 0.2, 1_000);
+    say(&mut s, "c", 0.4, 1_000);
+    // a, which it prefers, stays within 85% with it (60%, and 4 CPUs of 32): there, though b has
+    // the most headroom.
+    let c = s.handle(Input::LegQueued(Box::new(fast("first"))), 2_000);
+    assert_eq!(to(&c, "first").as_deref(), Some("a"), "{c:?}");
+    // a at 80% would pass it (92.5%): of the rest, b, the most headroom left.
+    say(&mut s, "a", 0.8, 3_000);
+    let c = s.handle(Input::LegQueued(Box::new(fast("second"))), 4_000);
+    assert_eq!(to(&c, "second").as_deref(), Some("b"), "{c:?}");
+}
