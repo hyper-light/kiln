@@ -91,3 +91,35 @@ export const KINDS = [
   { id: "request", label: "Pull or change request" },
   { id: "commit", label: "Commit" },
 ];
+
+/** The stands Ship counts, in Mission control's words and order (plan 01a175b7f20b7277b15bddd2ad001bcc, step 3). */
+export const SHIP_STANDS = ["needs", "crashed", "paused", "working", "finished"] as const;
+type ShipShown = (typeof SHIP_STANDS)[number];
+
+/** Ship's stands on Mission control's: needs you; failing and rolled back as stopped; in staging and
+ * waiting as paused; in flight and shipping as working; shipped, fixed and superseded as finished. */
+const STAND_OF: Record<string, ShipShown> = {
+  needs_you: "needs",
+  failing: "crashed",
+  rolled_back: "crashed",
+  in_staging: "paused",
+  waiting: "paused",
+  landing: "working",
+  checking: "working",
+  building: "working",
+  shipping: "working",
+  replanting: "working",
+  shipped: "finished",
+  fixed: "finished",
+  superseded: "finished",
+};
+
+/** How many of the list's items stand each way (a commit folded under its change's tip isn't one). */
+export function standCounts(commits: readonly ShipCommit[]): Record<ShipShown, number> {
+  const out: Record<ShipShown, number> = { needs: 0, crashed: 0, paused: 0, working: 0, finished: 0 };
+  for (const c of commits) {
+    const s = c.fold_under ? undefined : STAND_OF[c.stand];
+    if (s) out[s] += 1;
+  }
+  return out;
+}

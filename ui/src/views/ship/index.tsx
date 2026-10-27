@@ -21,9 +21,10 @@ import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
-import { ACTION_WORD, fold, HOSTS, KINDS, order, standWord, strip, type Item, type Sort } from "./model";
+import { ACTION_WORD, fold, HOSTS, KINDS, order, SHIP_STANDS, standCounts, standWord, strip, type Item, type Sort } from "./model";
 import "./ship.css";
 import { ShipViews } from "./views";
+import { Stands } from "@/views/harness/stands";
 
 const LIMIT = 100;
 
@@ -71,6 +72,7 @@ function ShipList() {
 
   return (
     <>
+      <Stands counts={standCounts(commits)} every={SHIP_STANDS} />
       <div className="ship-tools">
         <FacetBox
           className="ship-facet"
