@@ -346,7 +346,7 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true }));
+    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true, asked: false }));
 }
 
 /// W05-R16: the default retry after `runner-lost` goes to another runner when one could take it,
@@ -401,9 +401,86 @@ fn w05_r16_a_lost_runners_retry() {
     s.handle(Input::RunnerLost { runner: "a".into() }, 1);
     let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 2);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("z"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false }));
+    assert_eq!(s.reason("z"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false, asked: false }));
     let c = s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 3);
     assert!(assigned(&c, "z", "b", 2), "{c:?}");
+}
+
+/// W05-R28: a retry a person placed. `runner` runs it only there, waiting for it busy, draining,
+/// offline or unable, and saying which; `avoid` runs it anywhere else, waiting for another when
+/// only that one could. Either holds through the attempt's own retries, and a refusal by the
+/// runner asked for doesn't send it away for good.
+#[test]
+fn w05_r28_a_placed_retry() {
+    use super::state::{PinnedState, Placement};
+    let assigned = |c: &[Command], l: &str, r: &str| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == l && runner == r));
+    let on = |r: &str| Placement { runner: Some(r.into()), avoid: None };
+    let off = |r: &str| Placement { runner: None, avoid: Some(r.into()) };
+    let pinned = |r: &str, state: PinnedState| Some(WaitReason::Pinned { runner: r.into(), state });
+
+    // Pinned to b while a is free: it waits for b, busy, and runs there once b has room.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("busy", "acme/x", 60))), 0);
+    let first = if assigned(&c, "busy", "a") { "a" } else { "b" };
+    let other = if first == "a" { "b" } else { "a" };
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on(first), ..leg("x", "acme/x", 60) })), 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{other} is free, and not the one asked for: {c:?}");
+    assert_eq!(s.reason("x"), pinned(first, PinnedState::Busy).as_ref());
+    // The explanation says why the free one can't take it.
+    let free = s.explain("x").into_iter().find(|e| e.runner == other);
+    assert!(free.as_ref().is_some_and(|e| !e.eligible && e.checks.iter().any(|c| !c.pass && c.requirement == format!("runner == {first} (asked by its retry)"))), "{free:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "busy".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    assert!(assigned(&c, "x", first), "{c:?}");
+    // Lost with its runner, its retry waits for that runner, offline, and goes back to it.
+    let c = s.handle(Input::RunnerLost { runner: first.into() }, 3);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "x")), "{c:?}");
+    assert_eq!(s.reason("x"), pinned(first, PinnedState::Offline).as_ref());
+    let c = s.handle(Input::RunnerUp(Box::new(linux(first, 1))), 4);
+    assert!(assigned(&c, "x", first), "{c:?}");
+
+    // Draining, or no longer able to run it (its labels changed): said so.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerDraining { runner: "a".into() }, 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("d", "acme/x", 60) })), 1);
+    assert_eq!(s.reason("d"), pinned("a", PinnedState::Draining).as_ref());
+    let mut gpu = linux("a", 1);
+    gpu.view.labels = vec!["gpu".into()];
+    s.handle(Input::RunnerChanged(Box::new(gpu)), 2);
+    assert_eq!(s.reason("d"), pinned("a", PinnedState::Unable).as_ref());
+
+    // Refused by the runner asked for: it stays that runner's, asked again a while later, on the
+    // same attempt.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("r", "acme/x", 60) })), 0);
+    assert!(assigned(&c, "r", "a"), "{c:?}");
+    let c = s.handle(Input::Rejected { leg: "r".into() }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "neither the other nor at once: {c:?}");
+    assert!(c.contains(&Command::Timer { at: 1 + super::state::REFUSED_AGAIN_MS }), "{c:?}");
+    assert_eq!(s.reason("r"), pinned("a", PinnedState::Busy).as_ref());
+    let c = s.handle(Input::Tick, 1 + super::state::REFUSED_AGAIN_MS);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "r" && runner == "a")), "{c:?}");
+
+    // Anywhere but a: b takes it though a is free; with b busy it waits for room, and with only a
+    // left, for another runner, as its retry asked.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: off("a"), ..leg("e1", "acme/x", 60) })), 1);
+    assert!(assigned(&c, "e1", "b"), "{c:?}");
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: off("a"), ..leg("e2", "acme/x", 60) })), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "e2")), "{c:?}");
+    assert_eq!(s.reason("e2"), Some(&WaitReason::Capacity { eligible: 1, busy: 1, draining: 0 }));
+    s.handle(Input::RunnerLost { runner: "b".into() }, 3);
+    assert_eq!(s.reason("e2"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false, asked: true }));
+    // e1's retry after b was lost doesn't go to a either, though nothing else can take it.
+    assert!(matches!(s.reason("e1"), Some(WaitReason::OtherRunner { asked: true, .. })), "{:?}", s.reason("e1"));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("c", 2))), 4);
+    assert!(assigned(&c, "e1", "c") && assigned(&c, "e2", "c"), "{c:?}");
 }
 
 // ------------------------------------------------------------------ pools (W13-R09, W05-R27)

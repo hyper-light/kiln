@@ -85,7 +85,7 @@ impl OutpostInvites {
 /// Whether a runner carries a label a job asks for (`runs-on`), in any case: one of its own, its
 /// name, or what its platform says (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
 /// `aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled so.
-fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
+pub(crate) fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
     want == name || labels.iter().any(|l| l.eq_ignore_ascii_case(want)) || platform_labels(os, arch).iter().any(|l| l.eq_ignore_ascii_case(want))
 }
 
@@ -2675,6 +2675,10 @@ impl Hub {
                     if !job.labels.iter().any(|l| l == "k8s") {
                         continue;
                     }
+                    // A retry asked for a runner by name (W05-R28): a pod made for it isn't that one.
+                    if job.placement.as_ref().is_some_and(|p| p.runner.is_some()) {
+                        continue;
+                    }
                     let timeout = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
                     let launch = self.launching.lock().get(&job.id).copied();
                     match launch {
@@ -2784,6 +2788,8 @@ impl Hub {
             })
             .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
             .filter(|a| meets(job, a))
+            // Where a person's retry asked it to run (docs/ci.md W05-R28).
+            .filter(|a| job.placement.as_ref().is_none_or(|p| p.allows(&a.name)))
             .filter(|a| if exclusive { a.running.is_empty() } else { a.busy < a.slots })
             // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
             // job goes to another, or waits for one (a pod made for it is its own).
