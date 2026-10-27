@@ -177,28 +177,6 @@ const diffs: MockDiff[] = [
     branch: "fair",
     versions: 1,
   },
-  {
-    id: "d44",
-    name: "D44",
-    number: 44,
-    kind: "diff",
-    repo: REPO,
-    change_id: "I44",
-    title: "ci: a landed change",
-    summary: "The review it landed by: two versions, a question, an approval.",
-    author: "user:ada",
-    author_kind: "user",
-    author_for: null,
-    state: "landed",
-    trunk: "main",
-    stack: null,
-    parent: null,
-    topic: null,
-    created_at: now() - 86400,
-    updated_at: now() - 3600,
-    branch: null,
-    versions: 2,
-  },
 ];
 
 const sha = (s: string) => {
@@ -815,7 +793,19 @@ const hostPullOf = (number: number) => ({
     ],
   },
 });
-const hostPulls = [hostPullOf(3), hostPullOf(4)];
+const hostPulls = [
+  hostPullOf(3),
+  hostPullOf(4),
+  {
+    ...hostPullOf(6),
+    title: "ci: a landed change",
+    author: "lee",
+    state: "merged",
+    head: "w26-landed",
+    url: "https://gitlab.com/lundhe/w23/-/merge_requests/6",
+    reviews: [{ author: "mei", state: "approved", body: "The queue is right now.", at: T0 + 7000 }],
+  },
+];
 
 async function handleHostPulls(req: http.IncomingMessage, res: http.ServerResponse, rest: string[], ctx: Ctx): Promise<boolean> {
   const m = req.method ?? "GET";
@@ -977,7 +967,7 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
   const m = req.method ?? "GET";
   const segs = p.split("/").filter(Boolean).slice(1);
   const [a, b, c, d2, e] = segs;
-  if (a === "ci" && b === "repos" && segs[3] === "pulls" && decodeURIComponent(c ?? "") === HOST_REPO) return handleHostPulls(req, res, segs.slice(4), ctx);
+  if (a === "ci" && b === "repos" && segs[3] === "pulls" && [HOST_REPO, "hyper-light/kiln"].includes(decodeURIComponent(c ?? ""))) return handleHostPulls(req, res, segs.slice(4), ctx);
   if (a === "review" && b === "inbox" && m === "GET") return (ctx.json(res, 200, inbox()), true);
   if (a === "stacks" && b && m === "GET") {
     const list = diffs.filter((d) => d.stack === b).map((d) => Object.fromEntries(Object.entries(d).filter(([k]) => k !== "versions")));

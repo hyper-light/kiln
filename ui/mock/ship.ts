@@ -6,7 +6,7 @@
  * does.
  */
 import type http from "node:http";
-import type { ShipChange, ShipCommit, ShipDetail, ShipPage, ShipPip } from "../src/api/ship.ts";
+import type { ShipChange, ShipCommit, ShipDetail, ShipMark, ShipPage, ShipPip } from "../src/api/ship.ts";
 import { Trunk } from "./ship-sim.ts";
 
 interface Ctx {
@@ -36,6 +36,44 @@ const pips = (review: string, land: string, checks: string, build = "none", stag
 /** The fields every row gives; the rest default as a plain commit's. */
 type Row = Pick<ShipCommit, "sha" | "short" | "message" | "author" | "at" | "stand" | "line" | "pips" | "cursor"> & Partial<ShipCommit>;
 
+const unsigned = (id: string, kind: ShipMark["kind"], at: number, end: number | null, by: string, revision: number | null, state: string, extra?: Partial<ShipMark>): ShipMark => ({
+  id,
+  kind,
+  at,
+  end,
+  by,
+  signer: null,
+  revision,
+  state,
+  ...extra,
+});
+
+/** The Review lane group's marks as the server reads them (W26-R14), oldest first, every seal
+ * unsigned until W27-R03: D41 as the step's example — v5 pushed, kim's blocking comment, v6 by
+ * Apply, v7 the conflict's resolution, kim's approval. */
+const MARKS: Record<string, (t: number) => ShipMark[]> = {
+  D41: (t) => [
+    unsigned("d41:v5", "push", t - 3600, t - 3600, "user:ada", 5, "passed"),
+    unsigned("d41:th9:open", "comment", t - 3000, t - 1900, "user:kim", null, "passed", { thread: "th9", note: "blocking · matrix.rs:42" }),
+    unsigned("d41:th9:resolved", "comment", t - 1900, t - 1900, "user:kim", null, "passed", { thread: "th9", note: "resolved" }),
+    unsigned("d41:v6", "fix", t - 1740, t - 1740, "user:ada", 6, "passed", { thread: "th9", note: "suggestion applied" }),
+    unsigned("d41:v7", "resolution", t - 950, t - 950, "user:ada", 7, "passed", { note: "conflict resolved" }),
+    unsigned("d41:review:0", "approval", t - 600, t - 600, "user:kim", 7, "approved"),
+  ],
+  "!6": (t) => [
+    unsigned("pull:gitlab:6:v1", "push", t - 9000, t - 9000, "gitlab:lee", 1, "passed"),
+    unsigned("pull:gitlab:6:v2", "push", t - 8200, t - 8200, "gitlab:lee", 2, "passed"),
+    unsigned("pull:gitlab:6:review:0", "approval", t - 7900, t - 7900, "gitlab:mei", 2, "approved"),
+  ],
+  CR12: (t) => [unsigned("cr12:v1", "push", t - 1200, t - 1200, "user:lee", 1, "passed"), unsigned("ask:cr12:user:kim", "approval", t - 1100, null, "user:kim", null, "requested", { note: "asked" })],
+};
+
+/** A row's Review lane marks: its change's, or a commit with no change's one — its push. */
+const marksOf = (row: ShipCommit): ShipMark[] => {
+  const marks = row.change?.name ? MARKS[row.change.name]?.(row.at) : null;
+  return marks ?? [unsigned(`push:${row.sha}`, "push", row.at, row.at, row.author, null, "passed")];
+};
+
 function commits(): ShipCommit[] {
   const t = now();
   const change = (name: string, kind: ShipChange["kind"], host: string, title: string, state: string, turn: string[], open = { question: 0, nit: 0, issue: 0, blocking: 0 }): ShipChange => ({
@@ -64,28 +102,29 @@ function commits(): ShipCommit[] {
       pips: pips("requested", "none", "passed"),
       kind: "diff",
       host: "kiln",
-      change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
+      change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 7, latest: 7 },
       runs: [{ id: "run-41", pipeline: "ci" }],
       actions: [
         { name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, diff: "D41" } },
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
       ],
     }),
-    // A landed change: its tip commit carries its review, approved and landed (W26-R14's e2e).
+    // A landed change: a host's pull request merged, its review carried on the merge commit's tip
+    // (W26-R14's e2e). A host keeps its review on its host — land passed, the review approved.
     row({
       sha: sha("5"),
       short: "5555555",
       message: "ci: a landed change",
-      author: "user:ada",
-      at: t - 300,
+      author: "gitlab:lee",
+      at: t - 3600,
       stand: "shipped",
       line: "Landed · In production",
       cursor: 12,
       pips: pips("approved", "passed", "passed", "passed", "passed", "healthy"),
-      kind: "diff",
-      host: "kiln",
+      kind: "request",
+      host: "gitlab",
       environments: [{ environment: "production", production: true }],
-      change: { ...change("D44", "diff", "kiln", "ci: a landed change", "landed", [], { question: 0, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
+      change: { ...change("!6", "request", "gitlab", "ci: a landed change", "landed", [], { question: 0, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
       runs: [{ id: "run-44", pipeline: "ci" }],
     }),
     // D41's first revision, which its second replaced: quiet, folded under it.
@@ -255,7 +294,11 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const row = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
     const live = ctx.liveJob?.();
     const fixed: ShipDetail | null = row
-      ? { ...row, checks: live ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run }] }] : [] }
+      ? {
+          ...row,
+          review: marksOf(row),
+          checks: live ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run }] }] : [],
+        }
       : null;
     const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
     if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });

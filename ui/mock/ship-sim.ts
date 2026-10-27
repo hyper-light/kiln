@@ -902,6 +902,8 @@ export class Trunk {
       deployments,
       releases,
       replant: sim.runners.filter((r) => r.target === c.id).map((r) => ({ name: r.name, state: r.state, why: r.why })),
+      // A trunk commit's Review lane has the one mark, its push — unsigned until W27-R03.
+      review: [{ id: `push:${c.sha}`, kind: "push", at: wall(c.at), end: wall(c.at), by: c.author.name, signer: null, revision: null, state: "passed" }],
     };
   }
 

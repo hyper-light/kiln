@@ -69,8 +69,29 @@ export interface ShipPage {
 /** A build part's state (`Part` in kiln_cd::journey). */
 export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded";
 
+/**
+ * A mark of a lane group (W26-R14): a push, replay, comment, fix, resolution or approval with its
+ * time (`end` null while under way, = `at` for a point, unix seconds), who did it, its revision and
+ * its signer — null until W27-R03 signs kiln's records, so the seal says unsigned, never a false
+ * one. `state` is a GlyphState name.
+ */
+export interface ShipMark {
+  id: string;
+  kind: "push" | "replay" | "comment" | "fix" | "resolution" | "approval";
+  at: number;
+  end: number | null;
+  by: string;
+  signer: string | null;
+  revision: number | null;
+  state: string;
+  thread?: string;
+  note?: string;
+}
+
 /** A commit with every record its stand came from: `GET /api/ship/commits/{repo}/{sha}`. */
 export interface ShipDetail extends ShipCommit {
+  /** The Review lane group's marks, oldest first; a commit with no change has the one, its push. */
+  review?: ShipMark[];
   checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string; job?: string; run?: string }[] }[];
   build?: { platforms: { name: string; state: ShipPart }[]; image: { state: ShipPart; digest: string | null } };
   deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
