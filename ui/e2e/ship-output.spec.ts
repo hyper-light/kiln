@@ -33,19 +33,36 @@ for (const width of [1280, 1000, 800, 600, 390]) {
     expect(first).not.toBeNull();
     expect(Math.abs((first?.width ?? 0) - (first?.lanes ?? 0))).toBeLessThanOrEqual(1);
 
+    // What's measured is lines arriving, so the fonts are in first (a late swap isn't a line).
+    await page.evaluate(() => document.fonts.ready.then(() => undefined));
     if (browserName === "chromium")
       await page.evaluate(() => {
-        const w = window as unknown as { __shift: number };
+        const w = window as unknown as { __shift: number; __moved: string[] };
         w.__shift = 0;
+        w.__moved = [];
         new PerformanceObserver((l) => {
-          for (const e of l.getEntries() as unknown as { value: number; hadRecentInput: boolean }[]) if (!e.hadRecentInput) w.__shift += e.value;
+          for (const e of l.getEntries() as unknown as { value: number; hadRecentInput: boolean; sources?: { node?: Node; previousRect: DOMRectReadOnly; currentRect: DOMRectReadOnly }[] }[]) {
+            if (e.hadRecentInput) continue;
+            w.__shift += e.value;
+            for (const s of e.sources ?? []) {
+              const n = s.node as HTMLElement | undefined;
+              w.__moved.push(
+                `${n?.nodeName ?? "?"}.${typeof n?.className === "string" ? n.className.slice(0, 50) : ""} "${(n?.textContent ?? "").slice(0, 30)}" x${Math.round(s.previousRect.x)}->${Math.round(s.currentRect.x)} y${Math.round(s.previousRect.y)}->${Math.round(s.currentRect.y)}`,
+              );
+            }
+          }
         }).observe({ type: "layout-shift" });
       });
     await page.waitForTimeout(3000);
     const after = await measure(row);
     expect(after?.top).toBe(first?.top);
     expect(after?.height).toBe(first?.height);
-    if (browserName === "chromium") expect(await page.evaluate(() => (window as unknown as { __shift: number }).__shift)).toBe(0);
+    if (browserName === "chromium") {
+      const seen = await page
+        .evaluate(() => window as unknown as { __shift: number; __moved: string[] })
+        .then(() => page.evaluate(() => ({ shift: (window as unknown as { __shift: number }).__shift, moved: (window as unknown as { __moved: string[] }).__moved })));
+      expect(seen.shift, `what moved: ${seen.moved.join(" | ")}`).toBe(0);
+    }
   });
 }
 

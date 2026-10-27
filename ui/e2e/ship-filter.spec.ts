@@ -11,7 +11,8 @@ test.skip(REAL, "drives the mock's commits");
 test("choose a repository, change the sort: the list follows", async ({ page }) => {
   await page.goto("/ship");
   const rows = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li");
-  await expect(rows.first()).toBeVisible();
+  // A first load on a busy machine can take a while (as the other Ship specs allow).
+  await expect(rows.first()).toBeVisible({ timeout: 15_000 });
 
   const box = page.getByRole("combobox", { name: "Filter commits" });
   await box.click();
