@@ -29,14 +29,141 @@ use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, Runne
 use super::warm::{self, Held as WarmHeld, Wants};
 
 /// What a leg asks for and a runner offers, in resource mode (W05-R03); and what an exclusive leg
-/// holds of its runner.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
+/// holds of its runner. Every amount is an integer, so they add, subtract and compare exactly, the
+/// same on every machine (docs/needs.md, E1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Resources {
-    pub cpu: f64,
+    pub cpu: Cpus,
     pub mem: u64,
     pub disk: u64,
     pub gpu: u32,
+}
+
+/// CPUs in thousandths, as Kubernetes counts them (`500m`), nothing finer asked for or offered.
+/// It travels as a number of CPUs (`16.0`, `0.5`), as the float it replaces did, so a runner or a
+/// server a version apart reads and writes the same JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Cpus(u64);
+
+impl Cpus {
+    pub const ZERO: Cpus = Cpus(0);
+
+    /// `n` thousandths of a CPU.
+    pub const fn milli(n: u64) -> Cpus {
+        Cpus(n)
+    }
+
+    /// `n` whole CPUs.
+    pub const fn whole(n: u64) -> Cpus {
+        Cpus(n.saturating_mul(1000))
+    }
+
+    /// Its thousandths of a CPU.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn saturating_add(self, b: Cpus) -> Cpus {
+        Cpus(self.0.saturating_add(b.0))
+    }
+
+    pub const fn saturating_sub(self, b: Cpus) -> Cpus {
+        Cpus(self.0.saturating_sub(b.0))
+    }
+
+    /// The whole CPUs it takes, a part counting as one (`0.5` takes 1, `2.25` takes 3).
+    pub const fn ceil(self) -> u64 {
+        self.0.div_ceil(1000)
+    }
+
+    /// A number of CPUs as it comes from outside (JSON, a measurement), to the nearest
+    /// thousandth: none for one that isn't a finite number, nothing below zero, the most there is
+    /// above it. A boundary: what the engine decides with is the integer it gives.
+    #[allow(clippy::float_arithmetic, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn of_f64(cpus: f64) -> Option<Cpus> {
+        cpus.is_finite().then(|| Cpus((cpus * 1000.0).round().clamp(0.0, u64::MAX as f64) as u64))
+    }
+
+    /// As a number of CPUs, for JSON and people. A boundary: nothing decides with it.
+    #[allow(clippy::float_arithmetic, clippy::cast_precision_loss)]
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64 / 1000.0
+    }
+}
+
+/// `8`, `0.5`, `1.25`, `0.001`: as JavaScript writes the number, from the integer.
+impl std::fmt::Display for Cpus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (whole, part) = (self.0 / 1000, self.0 % 1000);
+        if part == 0 {
+            return write!(f, "{whole}");
+        }
+        let part = format!("{part:03}");
+        write!(f, "{whole}.{}", part.trim_end_matches('0'))
+    }
+}
+
+impl Serialize for Cpus {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_f64(self.as_f64())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Cpus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Number;
+        impl serde::de::Visitor<'_> for Number {
+            type Value = Cpus;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a number of CPUs")
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Cpus, E> {
+                Cpus::of_f64(v).ok_or_else(|| E::custom("not a number of CPUs"))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Cpus, E> {
+                Ok(Cpus::whole(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Cpus, E> {
+                Ok(Cpus::whole(u64::try_from(v).unwrap_or(0)))
+            }
+        }
+        // As the f64 it was: JSON gives whole numbers to `visit_u64`, and a binary format reads
+        // the eight bytes it wrote.
+        d.deserialize_f64(Number)
+    }
+}
+
+/// A factor in thousandths (`1.5` is `1500`): what overcommit multiplies capacity by, exactly.
+pub type PerMille = u32;
+
+/// A factor as config gives it (`1.5`), in thousandths, at least 1. A boundary: the engine
+/// multiplies by the integer.
+#[allow(clippy::float_arithmetic, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn per_mille(factor: f64) -> PerMille {
+    if !factor.is_finite() {
+        return 1000;
+    }
+    (factor * 1000.0).round().clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
+/// Whether `used` fits within `cap` multiplied by `factor` (thousandths), exactly.
+fn within(used: u64, cap: u64, factor: PerMille) -> bool {
+    u128::from(used).saturating_mul(1000) <= u128::from(cap).saturating_mul(u128::from(factor))
+}
+
+/// Whether an ordinary leg (or a pool's executor) asking `q` fits a runner of capacity `cap` in
+/// resource mode (W05-R03): beside what its exclusive legs hold (`held`), with what its other work
+/// uses (`used`, `held` among it), overcommitted as `c` says, GPUs never.
+fn fits_beside(used: &Resources, held: &Resources, cap: &Resources, q: &Resources, c: &Config) -> bool {
+    within(used.cpu.saturating_sub(held.cpu).saturating_add(q.cpu).get(), cap.cpu.saturating_sub(held.cpu).get(), c.overcommit_cpu)
+        && within(used.mem.saturating_sub(held.mem).saturating_add(q.mem), cap.mem.saturating_sub(held.mem), c.overcommit_mem)
+        && within(used.disk.saturating_add(q.disk), cap.disk, c.overcommit_disk)
+        && used.gpu.saturating_add(q.gpu) <= cap.gpu
 }
 
 /// The scheduler's settings (`[ci.scheduler]`, `[ci.fairness]`, routing rules).
@@ -50,9 +177,10 @@ pub struct Config {
     pub default_cost: f64,
     /// Resource mode instead of slots (W05-R03).
     pub resources: bool,
-    pub overcommit_cpu: f64,
-    pub overcommit_mem: f64,
-    pub overcommit_disk: f64,
+    /// What a runner's capacity is multiplied by for ordinary legs, in thousandths ([`per_mille`]).
+    pub overcommit_cpu: PerMille,
+    pub overcommit_mem: PerMille,
+    pub overcommit_disk: PerMille,
     /// Routing rules, in order (W05-R21).
     pub rules: Vec<Rule>,
     /// Legs in progress at most, per repository (W05-R11).
@@ -92,9 +220,9 @@ impl Default for Config {
             weights: HashMap::new(),
             default_cost: 60.0,
             resources: false,
-            overcommit_cpu: 1.5,
-            overcommit_mem: 1.0,
-            overcommit_disk: 1.0,
+            overcommit_cpu: 1500,
+            overcommit_mem: 1000,
+            overcommit_disk: 1000,
             rules: vec![routing::native_rule()],
             quotas: HashMap::new(),
             pools: Vec::new(),
@@ -496,18 +624,18 @@ fn claim(l: &LegIn, size: Option<Resources>) -> Option<Claim> {
     if !l.exclusive {
         return None;
     }
-    Some(if l.request.cpu > 0.0 && size.is_some() { Claim::Share(l.request) } else { Claim::Whole })
+    Some(if !l.request.cpu.is_zero() && size.is_some() { Claim::Share(l.request) } else { Claim::Whole })
 }
 
 /// A runner's own size: its CPUs (threads) and memory, as it offers them in resource mode or else
 /// as its facts say; `None` when they don't.
 fn size(r: &Runner) -> Option<Resources> {
     if let Some(c) = r.input.capacity {
-        return (c.cpu > 0.0).then_some(c);
+        return (!c.cpu.is_zero()).then_some(c);
     }
     let f = &r.input.view.facts;
     let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
-    (cpus > 0 && f.mem.total > 0).then(|| Resources { cpu: f64::from(cpus), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
+    (cpus > 0 && f.mem.total > 0).then(|| Resources { cpu: Cpus::whole(u64::from(cpus)), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
 }
 
 /// What a leg coming to a runner holds of it (W05-R03): nothing of its own, the whole runner, or
@@ -523,7 +651,7 @@ impl Incoming {
     /// An exclusive leg asking for CPUs holds them and the memory it asks; asking for none, the
     /// whole runner; any other leg, nothing.
     pub fn of(exclusive: bool, request: &Resources) -> Self {
-        match (exclusive, request.cpu > 0.0) {
+        match (exclusive, !request.cpu.is_zero()) {
             (false, _) => Incoming::Ordinary,
             (true, true) => Incoming::Share(*request),
             (true, false) => Incoming::Whole,
@@ -547,24 +675,32 @@ pub fn room(slots: u32, size: Option<Resources>, held: &Resources, whole: bool, 
         Incoming::Whole => running == 0,
         Incoming::Share(q) => {
             let Some(s) = size else { return running == 0 };
-            let each = 1.0 / f64::from(slots.max(1));
-            let (cpu, mem) = (ordinary as f64 * s.cpu * each, (ordinary as f64 * s.mem as f64 * each) as u64);
-            held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
+            // The ordinary legs there take a slot's share each, `ordinary / slots` of the runner:
+            // compared without dividing, so exactly.
+            let (n, ordinary) = (u128::from(slots.max(1)), u128::try_from(ordinary).unwrap_or(u128::MAX));
+            let cpu = u128::from(held.cpu.saturating_add(q.cpu).get()).saturating_mul(n).saturating_add(ordinary.saturating_mul(u128::from(s.cpu.get())));
+            // Their memory rounds down, as it always has.
+            let mem = ordinary.saturating_mul(u128::from(s.mem)) / n;
+            cpu <= u128::from(s.cpu.get()).saturating_mul(n) && u128::from(held.mem).saturating_add(mem).saturating_add(u128::from(q.mem)) <= u128::from(s.mem)
         }
     }
 }
 
 /// The slots a runner keeps for ordinary legs beside what's held of it: its slots in the share of
-/// its CPUs and memory no exclusive leg holds.
+/// its CPUs and memory no exclusive leg holds, rounded down.
 pub fn slots_left(slots: u32, size: Option<Resources>, held: &Resources) -> usize {
-    let slots = slots.max(1) as usize;
-    let Some(s) = size else { return slots };
-    if held.cpu <= 0.0 && held.mem == 0 {
-        return slots;
+    let n = slots.max(1);
+    let Some(s) = size else { return n as usize };
+    if held.cpu.is_zero() && held.mem == 0 {
+        return n as usize;
     }
-    let cpu = ((s.cpu - held.cpu) / s.cpu).clamp(0.0, 1.0);
-    let mem = if s.mem == 0 { 1.0 } else { (s.mem.saturating_sub(held.mem) as f64 / s.mem as f64).clamp(0.0, 1.0) };
-    (slots as f64 * cpu.min(mem) + 1e-9).floor() as usize
+    let share = |total: u64, held: u64| -> u128 {
+        if total == 0 {
+            return u128::from(n);
+        }
+        u128::from(n) * u128::from(total.saturating_sub(held)) / u128::from(total)
+    };
+    usize::try_from(share(s.cpu.get(), held.cpu.get()).min(share(s.mem, held.mem))).unwrap_or(usize::MAX)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1352,8 +1488,8 @@ impl Scheduler {
                 let Some(s) = size else { return false };
                 return match (c.resources, r.input.capacity) {
                     (true, Some(_)) => {
-                        let (cpu, mem) = ((r.used.cpu - held.cpu).max(0.0), r.used.mem.saturating_sub(held.mem));
-                        held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
+                        let (cpu, mem) = (r.used.cpu.saturating_sub(held.cpu), r.used.mem.saturating_sub(held.mem));
+                        held.cpu.saturating_add(cpu).saturating_add(q.cpu) <= s.cpu && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
                     }
                     _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Share(q)),
                 };
@@ -1362,13 +1498,7 @@ impl Scheduler {
         }
         // An ordinary leg: in what no exclusive leg holds.
         match (c.resources, r.input.capacity) {
-            (true, Some(cap)) => {
-                let q = &l.input.request;
-                (r.used.cpu - held.cpu).max(0.0) + q.cpu <= (cap.cpu - held.cpu).max(0.0) * c.overcommit_cpu
-                    && (r.used.mem.saturating_sub(held.mem) + q.mem) as f64 <= cap.mem.saturating_sub(held.mem) as f64 * c.overcommit_mem
-                    && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
-                    && r.used.gpu + q.gpu <= cap.gpu
-            }
+            (true, Some(cap)) => fits_beside(&r.used, &held, &cap, &l.input.request, c),
             _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Ordinary),
         }
     }
@@ -1391,13 +1521,13 @@ impl Scheduler {
         for r in eligible {
             let cap = r.input.capacity?;
             let mut has = Vec::new();
-            if q.cpu > cap.cpu * c.overcommit_cpu {
+            if !within(q.cpu.get(), cap.cpu.get(), c.overcommit_cpu) {
                 has.push(needs::cpus(cap.cpu));
             }
-            if q.mem as f64 > cap.mem as f64 * c.overcommit_mem {
+            if !within(q.mem, cap.mem, c.overcommit_mem) {
                 has.push(format!("{} of memory", needs::show_size(cap.mem)));
             }
-            if q.disk as f64 > cap.disk as f64 * c.overcommit_disk {
+            if !within(q.disk, cap.disk, c.overcommit_disk) {
                 has.push(format!("{} of disk", needs::show_size(cap.disk)));
             }
             if q.gpu > cap.gpu {
@@ -2285,12 +2415,7 @@ impl Scheduler {
                     // Beside what exclusive legs hold there, never in it.
                     let q = &p.request;
                     let (held, whole, _) = self.holding(r);
-                    let fits = !whole
-                        && (r.used.cpu - held.cpu).max(0.0) + q.cpu <= (cap.cpu - held.cpu).max(0.0) * c.overcommit_cpu
-                        && (r.used.mem.saturating_sub(held.mem) + q.mem) as f64 <= cap.mem.saturating_sub(held.mem) as f64 * c.overcommit_mem
-                        && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
-                        && r.used.gpu + q.gpu <= cap.gpu;
-                    if !fits {
+                    if whole || !fits_beside(&r.used, &held, &cap, q, c) {
                         return None;
                     }
                 }
@@ -2555,7 +2680,7 @@ impl Scheduler {
         if !eligible.is_empty() {
             // A share no runner it could run on is big enough to hold.
             let q = &l.input.request;
-            if l.input.exclusive && q.cpu > 0.0 && eligible.iter().all(|r| size(r).is_some_and(|s| q.cpu > s.cpu + 1e-9 || q.mem > s.mem)) {
+            if l.input.exclusive && !q.cpu.is_zero() && eligible.iter().all(|r| size(r).is_some_and(|s| q.cpu > s.cpu || q.mem > s.mem)) {
                 return WaitReason::Unroutable { failing: vec![format!("{} CPUs and {} MiB held for it alone: no runner it could run on is that big", q.cpu, q.mem >> 20)] };
             }
             if let Some(short) = self.oversized(&eligible, l) {
@@ -2718,14 +2843,14 @@ fn placement_check(p: &Placement, r: &Runner) -> Option<Check> {
 }
 
 fn add(a: &mut Resources, b: &Resources) {
-    a.cpu += b.cpu;
+    a.cpu = a.cpu.saturating_add(b.cpu);
     a.mem = a.mem.saturating_add(b.mem);
     a.disk = a.disk.saturating_add(b.disk);
     a.gpu = a.gpu.saturating_add(b.gpu);
 }
 
 fn sub(a: &mut Resources, b: &Resources) {
-    a.cpu = (a.cpu - b.cpu).max(0.0);
+    a.cpu = a.cpu.saturating_sub(b.cpu);
     a.mem = a.mem.saturating_sub(b.mem);
     a.disk = a.disk.saturating_sub(b.disk);
     a.gpu = a.gpu.saturating_sub(b.gpu);

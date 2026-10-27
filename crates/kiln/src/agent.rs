@@ -237,7 +237,7 @@ struct Running {
 /// Linux), it still holds its room in placement, and the log says so.
 fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
     let kiln_ci::sched::state::Incoming::Share(q) = holds else { return };
-    let threads = q.cpu.ceil().max(1.0) as usize;
+    let threads = usize::try_from(q.cpu.ceil().max(1)).unwrap_or(usize::MAX);
     match crate::runner::cpus::pins().hold(job, threads) {
         Some(cpus) => tracing::info!(job, cpus = %crate::runner::cpus::list(&cpus), "it holds these CPUs; the other legs run on the rest"),
         None => tracing::info!(job, threads, "it holds its share in placement; its cores aren't pinned here"),
@@ -254,7 +254,7 @@ fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl
         match h {
             Incoming::Whole => whole = true,
             Incoming::Share(q) => {
-                held.cpu += q.cpu;
+                held.cpu = held.cpu.saturating_add(q.cpu);
                 held.mem = held.mem.saturating_add(q.mem);
             }
             Incoming::Ordinary => {}
@@ -273,7 +273,7 @@ fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl
     Err(match incoming {
         Incoming::Whole => "an exclusive job waits for this runner to be empty",
         Incoming::Share(_) => "no room for the share it holds",
-        Incoming::Ordinary if held.cpu > 0.0 => "no free slot beside what's held",
+        Incoming::Ordinary if !held.cpu.is_zero() => "no free slot beside what's held",
         Incoming::Ordinary => "no free slot",
     })
 }
@@ -3985,8 +3985,8 @@ mod tests {
     #[test]
     fn a_runner_admits_work_beside_what_a_bench_holds() {
         use kiln_ci::sched::state::{Incoming, Resources};
-        let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
-        let bench = Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() });
+        let size = Some(Resources { cpu: kiln_ci::sched::state::Cpus::whole(32), mem: 64 << 30, ..Resources::default() });
+        let bench = Incoming::Share(Resources { cpu: kiln_ci::sched::state::Cpus::whole(16), mem: 16 << 30, ..Resources::default() });
         let o = Incoming::Ordinary;
         assert_eq!(admits(4, size, std::iter::empty(), false, bench), Ok(()));
         assert_eq!(admits(4, size, [(false, bench), (false, o)].into_iter(), false, o), Ok(()));

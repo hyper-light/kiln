@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use super::pools::{self, ResourceSpec};
 use super::routing::{self, Constraint};
-use super::state::Resources;
+use super::state::{Cpus, Resources};
 use crate::expr;
 use crate::wf::ir::{JobKiln, YVal};
 
@@ -130,7 +130,7 @@ impl Needs {
     /// `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`, `label=gpu`.
     fn ask(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key.to_ascii_lowercase().as_str() {
-            "cpus" | "cpu" => self.request.cpu = pools::cpus(value).ok_or("not a number of CPUs (8, 0.5, 500m)")?,
+            "cpus" | "cpu" => self.request.cpu = pools::cpus(value)?,
             "mem" | "memory" => self.request.mem = size(value).ok_or("not a size (32g, 512m)")?,
             "disk" => self.request.disk = size(value).ok_or("not a size (50g, 512m)")?,
             "gpus" | "gpu" => self.request.gpu = value.trim().parse().map_err(|_| "not a number of GPUs")?,
@@ -212,7 +212,7 @@ fn binary(n: u64) -> String {
 /// memory`, `50 GiB of disk`, `1 GPU`.
 pub fn request_words(r: &Resources) -> Vec<String> {
     let mut parts = Vec::new();
-    if r.cpu > 0.0 {
+    if !r.cpu.is_zero() {
         parts.push(cpus(r.cpu));
     }
     if r.mem > 0 {
@@ -228,8 +228,8 @@ pub fn request_words(r: &Resources) -> Vec<String> {
 }
 
 /// `8 CPUs`, `1 CPU`, `0.5 CPUs`.
-pub fn cpus(n: f64) -> String {
-    format!("{} CPU{}", expr::js_number_to_string(n), if (n - 1.0).abs() < f64::EPSILON { "" } else { "s" })
+pub fn cpus(n: Cpus) -> String {
+    format!("{n} CPU{}", if n == Cpus::whole(1) { "" } else { "s" })
 }
 
 /// `1 GPU`, `2 GPUs`, `no GPU`.
@@ -290,9 +290,9 @@ mod tests {
         let cases: &[(&str, Needs)] = &[
             (
                 "cpus=8,mem=32g,linux/amd64,+gpu,tool:cargo,exclusive",
-                needs(Resources { cpu: 8.0, mem: 32 * GIB, ..Resources::default() }, &["os == linux", "arch == x86_64", "label gpu", "tools has cargo"], true),
+                needs(Resources { cpu: Cpus::whole(8), mem: 32 * GIB, ..Resources::default() }, &["os == linux", "arch == x86_64", "label gpu", "tools has cargo"], true),
             ),
-            ("cpu=500m memory=512Mi disk=50GB gpus=2", needs(Resources { cpu: 0.5, mem: 512 << 20, disk: 50 * GIB, gpu: 2 }, &[], false)),
+            ("cpu=500m memory=512Mi disk=50GB gpus=2", needs(Resources { cpu: Cpus::milli(500), mem: 512 << 20, disk: 50 * GIB, gpu: 2 }, &[], false)),
             ("macos, arm64", needs(Resources::default(), &["os == macos", "arch == aarch64"], false)),
             ("darwin/apple-silicon", needs(Resources::default(), &["os == macos", "arch == aarch64"], false)),
             ("cpus>=16,mem>=32g", needs(Resources::default(), &["cpu.threads >= 16", "mem.free >= 32Gi"], false)),
@@ -354,6 +354,30 @@ mod tests {
         assert_eq!(parse("cpus=8,mem=32g,linux/amd64,exclusive")?.describe(), "8 CPUs, 32 GiB of memory, os == linux, arch == x86_64, the runner whole");
         assert_eq!(parse("cpus=1,disk=1536m,gpus=1")?.describe(), "1 CPU, 1.5 GiB of disk, 1 GPU");
         assert_eq!(Needs::default().describe(), "nothing in particular");
+        Ok(())
+    }
+
+    /// E1 (docs/needs.md), W05-R03: CPUs are read exactly, digit by digit, into thousandths, as
+    /// Kubernetes counts them, and a spelling finer than a thousandth is refused, naming its word.
+    #[test]
+    fn e1_1_cpus_read_exactly_in_thousandths() -> Result<(), String> {
+        for (spelling, milli) in [("cpus=8", 8000), ("cpus=0.5", 500), ("cpu=500m", 500), ("cpus=0.25", 250), ("cpus=.5", 500), ("cpus=+2", 2000), ("cpus=2.000", 2000), ("cpus=0.0010", 1), ("cpus=1m", 1), ("cpus=0", 0)] {
+            assert_eq!(parse(spelling)?.request.cpu, Cpus::milli(milli), "{spelling}");
+        }
+        for (spelling, why) in [
+            ("cpus=0.0005", "cpus=0.0005: finer than 1m (0.001 CPU)"),
+            ("cpus=1.5m", "cpus=1.5m: finer than 1m (0.001 CPU)"),
+            ("cpus=-1", "cpus=-1: not a number of CPUs (8, 0.5, 500m)"),
+            ("cpus=1e3", "cpus=1e3: not a number of CPUs (8, 0.5, 500m)"),
+            ("cpus=.", "cpus=.: not a number of CPUs (8, 0.5, 500m)"),
+            ("cpus=99999999999999999999", "cpus=99999999999999999999: not a number of CPUs (8, 0.5, 500m)"),
+        ] {
+            assert_eq!(parse(spelling), Err(why.to_owned()), "{spelling}");
+        }
+        assert_eq!(ResourceSpec { cpu: Some("0.0005".into()), ..ResourceSpec::default() }.resources(), Err("`resources.cpu` is finer than a thousandth of a CPU (`1m`): `0.0005`".to_owned()));
+        for (spelling, words) in [("cpus=0.5", "0.5 CPUs"), ("cpus=1", "1 CPU"), ("cpus=1.25", "1.25 CPUs"), ("cpus=0.001", "0.001 CPUs"), ("cpus=16", "16 CPUs")] {
+            assert_eq!(parse(spelling)?.describe(), words, "{spelling}");
+        }
         Ok(())
     }
 

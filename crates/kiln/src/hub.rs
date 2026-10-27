@@ -2986,11 +2986,11 @@ pub(crate) fn v1_incoming(exclusive: bool, resources: &crate::pipeline::Resource
 pub(crate) fn agent_room(slots: u32, facts: Option<&kiln_ci::facts::RunnerFacts>, held: &[(String, kiln_ci::sched::state::Resources)], whole: bool, running: usize, incoming: kiln_ci::sched::state::Incoming) -> bool {
     let size = facts.and_then(|f| {
         let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
-        (cpus > 0 && f.mem.total > 0).then(|| kiln_ci::sched::state::Resources { cpu: f64::from(cpus), mem: f.mem.total, ..Default::default() })
+        (cpus > 0 && f.mem.total > 0).then(|| kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(u64::from(cpus)), mem: f.mem.total, ..Default::default() })
     });
     let mut shares = kiln_ci::sched::state::Resources::default();
     for (_, q) in held {
-        shares.cpu += q.cpu;
+        shares.cpu = shares.cpu.saturating_add(q.cpu);
         shares.mem = shares.mem.saturating_add(q.mem);
     }
     kiln_ci::sched::state::room(slots, size, &shares, whole, running.saturating_sub(held.len()), running, incoming)
@@ -3118,12 +3118,12 @@ pub(crate) mod tests {
         };
         let of = |s: crate::pipeline::JobSpec| v1_incoming(s.exclusive, &s.resources);
         let bench = of(spec(true, Some("16"), Some("16Gi")));
-        assert_eq!(bench, Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() }));
+        assert_eq!(bench, Incoming::Share(Resources { cpu: kiln_ci::sched::state::Cpus::whole(16), mem: 16 << 30, ..Resources::default() }));
         assert_eq!(of(spec(true, None, None)), Incoming::Whole);
         assert_eq!(of(spec(false, Some("16"), None)), Incoming::Ordinary);
         // Empty: the bench goes in; then two ordinary jobs beside it, not three.
         assert!(agent_room(4, Some(&facts), &[], false, 0, bench));
-        let held = vec![("bench".to_owned(), Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() })];
+        let held = vec![("bench".to_owned(), Resources { cpu: kiln_ci::sched::state::Cpus::whole(16), mem: 16 << 30, ..Resources::default() })];
         assert!(agent_room(4, Some(&facts), &held, false, 1, Incoming::Ordinary));
         assert!(agent_room(4, Some(&facts), &held, false, 2, Incoming::Ordinary));
         assert!(!agent_room(4, Some(&facts), &held, false, 3, Incoming::Ordinary), "two slots beside half the runner held");

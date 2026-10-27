@@ -206,11 +206,12 @@ impl Want {
     /// runner to itself), or None.
     fn short_of(&self, r: &RunnerInfo, f: &RunnerFacts) -> Option<String> {
         let ask = &self.needs.request;
-        if (ask.cpu > 0.0 && r.cpus == 0) || (ask.mem > 0 && r.mem_total == 0) {
+        if (!ask.cpu.is_zero() && r.cpus == 0) || (ask.mem > 0 && r.mem_total == 0) {
             return Some("it hasn't said how busy it is yet".into());
         }
         let idle = r.idle_cpus().floor();
-        if f64::from(idle) < ask.cpu {
+        // Its idle cores, measured, against what's asked, in thousandths.
+        if kiln_ci::sched::state::Cpus::of_f64(f64::from(idle)).unwrap_or_default() < ask.cpu {
             return Some(format!("{idle:.0} of {} cores idle, under {}", r.cpus, needs::cpus(ask.cpu)));
         }
         if r.mem_free() < ask.mem {

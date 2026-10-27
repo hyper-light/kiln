@@ -6,7 +6,7 @@ use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
-use super::state::{Command, Config, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
+use super::state::{Command, Config, Cpus, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
 use crate::facts::{Disk, RunnerFacts};
 
 const MIN: i64 = 60_000;
@@ -307,8 +307,8 @@ fn machine(name: &str, slots: u32, cpus: u32, gib: u64) -> RunnerIn {
 }
 
 /// An exclusive leg asking for `cpus` CPUs and `gib` GiB: a bench.
-fn bench(id: &str, cpus: f64, gib: u64) -> LegIn {
-    LegIn { exclusive: true, request: Resources { cpu: cpus, mem: gib << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) }
+fn bench(id: &str, cpus: u64, gib: u64) -> LegIn {
+    LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(cpus), mem: gib << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) }
 }
 
 fn assigned(c: &[Command]) -> Vec<String> {
@@ -322,7 +322,7 @@ fn assigned(c: &[Command]) -> Vec<String> {
 fn an_exclusive_leg_holds_its_share_and_others_run_beside_it() {
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
-    let c = s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1);
+    let c = s.handle(Input::LegQueued(Box::new(bench("bench", 16, 16))), 1);
     assert_eq!(assigned(&c), vec!["bench"], "it doesn't wait for an empty runner");
     let mut on = Vec::new();
     for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
@@ -331,7 +331,7 @@ fn an_exclusive_leg_holds_its_share_and_others_run_beside_it() {
     assert_eq!(on, vec!["o1", "o2"], "two ordinary legs beside it, in the half it doesn't hold");
     assert!(matches!(s.reason("o3"), Some(WaitReason::Capacity { eligible: 1, busy: 1, draining: 0 })), "{:?}", s.reason("o3"));
     // Another bench waits for its own share: of the 16 CPUs not held, the two legs there take 16.
-    s.handle(Input::LegQueued(Box::new(bench("bench2", 16.0, 16))), 6);
+    s.handle(Input::LegQueued(Box::new(bench("bench2", 16, 16))), 6);
     assert!(matches!(s.reason("bench2"), Some(WaitReason::Capacity { .. })), "{:?}", s.reason("bench2"));
     // The bench ends: all four slots are there again, and the waiting legs take them.
     let c = s.handle(Input::AttemptFinished { leg: "bench".into(), attempt: 1, outcome: Outcome::Success }, 7);
@@ -358,7 +358,7 @@ fn an_exclusive_leg_asking_nothing_still_takes_the_whole_runner() {
 #[test]
 fn a_bench_adopted_after_a_restart_keeps_its_share() {
     let mut s = Scheduler::new(Config::default());
-    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16.0, 16)), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16, 16)), runner: "a".into(), attempt: 1 }, 0);
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
     let mut on = Vec::new();
     for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
@@ -376,9 +376,9 @@ fn a_bench_adopted_after_a_restart_keeps_its_share() {
 /// The rule both dispatchers and the runner use, in numbers: 32 CPUs, 64 GiB, 4 slots.
 #[test]
 fn the_room_rule_both_dispatchers_and_the_runner_use() {
-    let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
+    let size = Some(Resources { cpu: Cpus::whole(32), mem: 64 << 30, ..Resources::default() });
     let none = Resources::default();
-    let half = Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() };
+    let half = Resources { cpu: Cpus::whole(16), mem: 16 << 30, ..Resources::default() };
     // Nothing held: four ordinary legs, and a share of 16 beside at most two of them.
     assert!(room(4, size, &none, false, 3, 3, Incoming::Ordinary));
     assert!(!room(4, size, &none, false, 4, 4, Incoming::Ordinary));
@@ -395,11 +395,37 @@ fn the_room_rule_both_dispatchers_and_the_runner_use() {
     // A runner whose size isn't known: a share waits for it to be empty, as the whole would.
     assert!(room(4, None, &none, false, 0, 0, Incoming::Share(half)) && !room(4, None, &none, false, 1, 1, Incoming::Share(half)));
     // Memory holds as CPUs do: a share asking more memory than is left waits.
-    let big = Resources { cpu: 4.0, mem: 60 << 30, ..Resources::default() };
+    let big = Resources { cpu: Cpus::whole(4), mem: 60 << 30, ..Resources::default() };
     assert!(!room(4, size, &none, false, 1, 1, Incoming::Share(big)));
     assert_eq!(Incoming::of(true, &half), Incoming::Share(half));
     assert_eq!(Incoming::of(true, &none), Incoming::Whole);
     assert_eq!(Incoming::of(false, &half), Incoming::Ordinary);
+}
+
+/// E1 (docs/needs.md), W05-R03: the rule counts in thousandths and compares without dividing, so
+/// a share that fills a runner to the last thousandth fits, and one thousandth more doesn't, where
+/// thirds made the float version lean on an epsilon.
+#[test]
+fn e1_1_the_room_rule_counts_exactly() {
+    use super::state::slots_left;
+    let three = Some(Resources { cpu: Cpus::whole(3), mem: 3 << 30, ..Resources::default() });
+    let none = Resources::default();
+    // One ordinary leg of three slots takes a third: two CPUs are left, exactly.
+    let two = Resources { cpu: Cpus::whole(2), ..Resources::default() };
+    assert!(room(3, three, &none, false, 1, 1, Incoming::Share(two)));
+    let more = Resources { cpu: Cpus::milli(2001), ..Resources::default() };
+    assert!(!room(3, three, &none, false, 1, 1, Incoming::Share(more)));
+    // A third held leaves two of three slots, not 1.9999999999999998 of them.
+    let third = Resources { cpu: Cpus::whole(1), mem: 1 << 30, ..Resources::default() };
+    assert_eq!(slots_left(3, three, &third), 2);
+    assert_eq!(slots_left(3, three, &Resources { cpu: Cpus::milli(1001), ..Resources::default() }), 1);
+    // Fractions add without drift: ten tenths held are one CPU.
+    let mut held = Resources::default();
+    for _ in 0..10 {
+        held.cpu = held.cpu.saturating_add(Cpus::milli(100));
+    }
+    assert_eq!(held.cpu, Cpus::whole(1));
+    assert_eq!(slots_left(4, Some(Resources { cpu: Cpus::whole(4), ..Resources::default() }), &held), 3);
 }
 
 /// A share bigger than any runner it could run on waits, saying so.
@@ -407,7 +433,7 @@ fn the_room_rule_both_dispatchers_and_the_runner_use() {
 fn a_share_no_runner_can_hold_waits_saying_why() {
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
-    s.handle(Input::LegQueued(Box::new(bench("huge", 64.0, 16))), 1);
+    s.handle(Input::LegQueued(Box::new(bench("huge", 64, 16))), 1);
     assert!(matches!(s.reason("huge"), Some(WaitReason::Unroutable { failing }) if failing.iter().any(|f| f.contains("64 CPUs"))), "{:?}", s.reason("huge"));
 }
 
@@ -416,10 +442,10 @@ fn a_share_no_runner_can_hold_waits_saying_why() {
 #[test]
 fn in_resource_mode_ordinary_legs_overcommit_only_what_isnt_held() {
     let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
-    let big = RunnerIn { capacity: Some(Resources { cpu: 32.0, mem: 64 << 30, disk: 500 << 30, gpu: 0 }), ..machine("a", 99, 32, 64) };
+    let big = RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(32), mem: 64 << 30, disk: 500 << 30, gpu: 0 }), ..machine("a", 99, 32, 64) };
     s.handle(Input::RunnerUp(Box::new(big)), 0);
-    assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1)), vec!["bench"]);
-    let cpu = |id: &str| LegIn { request: Resources { cpu: 4.0, mem: 2 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(bench("bench", 16, 16))), 1)), vec!["bench"]);
+    let cpu = |id: &str| LegIn { request: Resources { cpu: Cpus::whole(4), mem: 2 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let mut on = 0;
     for i in 0..8 {
         on += assigned(&s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}")))), 2 + i)).len();
@@ -431,12 +457,12 @@ fn in_resource_mode_ordinary_legs_overcommit_only_what_isnt_held() {
 fn resources_mode_and_cancellation() {
     let cfg = Config { resources: true, ..Config::default() };
     let mut s = Scheduler::new(cfg);
-    let big = RunnerIn { capacity: Some(Resources { cpu: 4.0, mem: 8 << 30, disk: 100 << 30, gpu: 0 }), ..linux("a", 99) };
+    let big = RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(4), mem: 8 << 30, disk: 100 << 30, gpu: 0 }), ..linux("a", 99) };
     s.handle(Input::RunnerUp(Box::new(big)), 0);
-    let cpu = |id: &str, c: f64| LegIn { request: Resources { cpu: c, mem: 1 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let cpu = |id: &str, c: u64| LegIn { request: Resources { cpu: Cpus::whole(c), mem: 1 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let mut assigned = 0;
     for i in 0..4 {
-        assigned += s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}"), 2.0))), i).iter().filter(|c| matches!(c, Command::Assign { .. })).count();
+        assigned += s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}"), 2))), i).iter().filter(|c| matches!(c, Command::Assign { .. })).count();
     }
     assert_eq!(assigned, 3, "6 CPUs fit 4 × 1.5 overcommit; the fourth waits");
     // Cancelling a queued leg settles it; a running one is stopped on its runner.
@@ -453,14 +479,14 @@ fn resources_mode_and_cancellation() {
 fn w05_r03_needs_place_a_leg_and_one_too_big_waits_saying_so() -> Result<(), String> {
     const GIB: u64 = 1 << 30;
     let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
-    let runner = |name: &str, os: &str, arch: &str, cpu: f64, mem: u64| RunnerIn {
+    let runner = |name: &str, os: &str, arch: &str, cpu: u64, mem: u64| RunnerIn {
         view: RunnerView { facts: RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() }, ..linux(name, 99).view },
-        capacity: Some(Resources { cpu, mem: mem * GIB, disk: 500 * GIB, gpu: 0 }),
+        capacity: Some(Resources { cpu: Cpus::whole(cpu), mem: mem * GIB, disk: 500 * GIB, gpu: 0 }),
         ..linux(name, 99)
     };
-    s.handle(Input::RunnerUp(Box::new(runner("small", "linux", "x86_64", 8.0, 16))), 0);
-    s.handle(Input::RunnerUp(Box::new(runner("large", "linux", "x86_64", 16.0, 64))), 0);
-    s.handle(Input::RunnerUp(Box::new(runner("mac", "macos", "aarch64", 24.0, 192))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("small", "linux", "x86_64", 8, 16))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("large", "linux", "x86_64", 16, 64))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("mac", "macos", "aarch64", 24, 192))), 0);
     let asking = |id: &str, spec: &str| -> Result<LegIn, String> {
         let n = super::needs::parse(spec)?;
         Ok(LegIn { request: n.request, exclusive: n.exclusive, route: LegRoute { labels: vec!["k8s".into()], requires: n.requires, ..LegRoute::default() }, ..leg(id, "acme/x", 60) })
@@ -934,13 +960,13 @@ fn w05_r12_reserved_pool() -> Result<(), String> {
 #[test]
 fn w05_r03_requests_as_written() -> Result<(), String> {
     use super::pools::{ResourceSpec, cpus};
-    assert_eq!(cpus("2"), Some(2.0));
-    assert_eq!(cpus("500m"), Some(0.5));
-    assert_eq!(cpus("0.25"), Some(0.25));
-    assert_eq!(cpus("-1"), None);
-    assert_eq!(cpus("lots"), None);
+    assert_eq!(cpus("2"), Ok(Cpus::whole(2)));
+    assert_eq!(cpus("500m"), Ok(Cpus::milli(500)));
+    assert_eq!(cpus("0.25"), Ok(Cpus::milli(250)));
+    assert_eq!(cpus("-1"), Err(super::pools::NOT_CPUS));
+    assert_eq!(cpus("lots"), Err(super::pools::NOT_CPUS));
     let r = ResourceSpec { cpu: Some("1500m".into()), memory: Some("2Gi".into()), disk: Some("10G".into()), gpu: Some(1) }.resources()?;
-    assert_eq!(r, Resources { cpu: 1.5, mem: 2 << 30, disk: 10_000_000_000, gpu: 1 });
+    assert_eq!(r, Resources { cpu: Cpus::milli(1500), mem: 2 << 30, disk: 10_000_000_000, gpu: 1 });
     assert_eq!(ResourceSpec::default().resources()?, Resources::default(), "nothing asked");
     assert!(ResourceSpec { memory: Some("much".into()), ..ResourceSpec::default() }.resources().is_err());
     let pool = PoolSpec {
@@ -952,7 +978,7 @@ fn w05_r03_requests_as_written() -> Result<(), String> {
         ..PoolSpec::default()
     }
     .pool()?;
-    assert_eq!((pool.request.cpu, pool.request.mem), (0.1, 64 << 20), "a pool's executor asks a tenth of a CPU");
+    assert_eq!((pool.request.cpu, pool.request.mem), (Cpus::milli(100), 64 << 20), "a pool's executor asks a tenth of a CPU");
     Ok(())
 }
 

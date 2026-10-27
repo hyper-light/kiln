@@ -444,9 +444,9 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         weights: f.weights.clone(),
         quotas: f.quotas.clone(),
         resources: s.resources(),
-        overcommit_cpu: s.overcommit.cpu,
-        overcommit_mem: s.overcommit.memory,
-        overcommit_disk: s.overcommit.disk,
+        overcommit_cpu: kiln_ci::sched::state::per_mille(s.overcommit.cpu),
+        overcommit_mem: kiln_ci::sched::state::per_mille(s.overcommit.memory),
+        overcommit_disk: kiln_ci::sched::state::per_mille(s.overcommit.disk),
         fair_by: s.fair_levels(),
         // Admission by load (W24-R19): off until set, and while it doesn't read.
         admission: s.admission.as_ref().and_then(|a| a.admission().inspect_err(|e| tracing::warn!(error = %e, "admission by load is off")).ok()),
@@ -484,8 +484,8 @@ fn executor_options(mode: &str, request: &kiln_ci::sched::state::Resources) -> s
             o.insert("memory".into(), serde_json::json!(request.mem));
         }
         // Whole CPUs, as a cpuset gives them: half of one is one.
-        if request.cpu > 0.0 {
-            o.insert("cpus".into(), serde_json::json!(request.cpu.ceil() as u64));
+        if !request.cpu.is_zero() {
+            o.insert("cpus".into(), serde_json::json!(request.cpu.ceil()));
         }
     }
     if o.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(o) }
@@ -1279,7 +1279,7 @@ impl Dispatch {
         }
         let f = a.facts.as_ref()?;
         let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
-        (cpus > 0).then(|| kiln_ci::sched::state::Resources { cpu: f64::from(cpus), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
+        (cpus > 0).then(|| kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(u64::from(cpus)), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
     }
 
     async fn runner_facts(&mut self, agent: &str) {
@@ -2692,7 +2692,7 @@ impl Dispatch {
             cold: r.cold,
             // Exclusive, it has its runner to itself: the share it asked for, or the whole runner.
             exclusive: job.is_some_and(|j| j.kiln.exclusive),
-            holds: job.filter(|j| j.kiln.exclusive).and_then(|j| asked_of(Some(j))).filter(|q| q.cpu > 0.0),
+            holds: job.filter(|j| j.kiln.exclusive).and_then(|j| asked_of(Some(j))).filter(|q| !q.cpu.is_zero()),
         }
     }
 
@@ -3452,12 +3452,12 @@ mod tests {
     /// in slot mode, and without a memory request, nothing.
     #[test]
     fn w05_r03_a_legs_memory_is_its_executors_limit() {
-        let asked = kiln_ci::sched::state::Resources { cpu: 4.0, mem: 16 << 30, disk: 0, gpu: 0 };
+        let asked = kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(4), mem: 16 << 30, disk: 0, gpu: 0 };
         assert_eq!(super::executor_options("resources", &asked), serde_json::json!({ "memory": 17179869184u64, "cpus": 4 }));
         assert_eq!(super::executor_options("slots", &asked), serde_json::Value::Null);
         assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { mem: 0, ..asked }), serde_json::json!({ "cpus": 4 }));
-        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.5, mem: 0, ..asked }), serde_json::json!({ "cpus": 1 }), "whole CPUs");
-        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: 0.0, mem: 0, ..asked }), serde_json::Value::Null);
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::milli(500), mem: 0, ..asked }), serde_json::json!({ "cpus": 1 }), "whole CPUs");
+        assert_eq!(super::executor_options("resources", &kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::ZERO, mem: 0, ..asked }), serde_json::Value::Null);
     }
 
     /// W05-R03, W13-R04: Docker inside a leg's container goes beside the memory and CPUs it was
@@ -3482,8 +3482,8 @@ mod tests {
         let mut cfg = crate::config::ci::Ci::default();
         cfg.scheduler.default_request = kiln_ci::sched::pools::ResourceSpec { cpu: Some("1".into()), memory: Some("2Gi".into()), ..Default::default() };
         let asked = job("    resources:\n      cpu: 8\n      memory: 32Gi\n")?;
-        assert_eq!(super::request_of(Some(&asked), &cfg), Resources { cpu: 8.0, mem: 32 << 30, ..Resources::default() });
-        let fallback = Resources { cpu: 1.0, mem: 2 << 30, ..Resources::default() };
+        assert_eq!(super::request_of(Some(&asked), &cfg), Resources { cpu: kiln_ci::sched::state::Cpus::whole(8), mem: 32 << 30, ..Resources::default() });
+        let fallback = Resources { cpu: kiln_ci::sched::state::Cpus::whole(1), mem: 2 << 30, ..Resources::default() };
         assert_eq!(super::request_of(Some(&job("")?), &cfg), fallback);
         assert_eq!(super::request_of(None, &cfg), fallback);
         Ok(())

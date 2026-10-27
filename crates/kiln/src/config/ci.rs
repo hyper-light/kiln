@@ -499,8 +499,10 @@ pub struct Overcommit {
 
 impl Default for Overcommit {
     fn default() -> Self {
+        // The engine's, in thousandths, as people write them (`1.5`).
         let d = kiln_ci::sched::state::Config::default();
-        Overcommit { cpu: d.overcommit_cpu, memory: d.overcommit_mem, disk: d.overcommit_disk }
+        let factor = |m: u32| f64::from(m) / 1000.0;
+        Overcommit { cpu: factor(d.overcommit_cpu), memory: factor(d.overcommit_mem), disk: factor(d.overcommit_disk) }
     }
 }
 

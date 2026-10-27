@@ -491,7 +491,7 @@ mod tests {
     /// and the leg is like any other; to an older runner, they're keys it doesn't read.
     #[test]
     fn an_assignment_says_what_its_leg_holds_and_reads_without_it() -> Result<(), serde_json::Error> {
-        let share = crate::sched::state::Resources { cpu: 16.0, mem: 16 << 30, ..Default::default() };
+        let share = crate::sched::state::Resources { cpu: crate::sched::state::Cpus::whole(16), mem: 16 << 30, ..Default::default() };
         let a = AssignmentV2 { job_id: "bench".into(), exclusive: true, holds: Some(share), ..AssignmentV2::default() };
         let back: AssignmentV2 = serde_json::from_str(&serde_json::to_string(&a)?)?;
         assert!(back.exclusive);
@@ -500,6 +500,33 @@ mod tests {
         assert!(!old.exclusive && old.holds.is_none(), "from an older server: a leg like any other");
         let v: serde_json::Value = serde_json::to_value(&a)?;
         assert_eq!(v.get("holds").and_then(|h| h.get("cpu")).and_then(serde_json::Value::as_f64), Some(16.0));
+        Ok(())
+    }
+
+    /// E1 (docs/needs.md), W05-R03: CPUs are counted in thousandths now, and travel as the float
+    /// they were. For every amount up to 100 CPUs, a leg's holds is written byte for byte as
+    /// before, and what an older server or runner wrote reads back to the same thousandths.
+    #[test]
+    fn e1_1_holds_travel_as_the_float_they_were() -> Result<(), serde_json::Error> {
+        use crate::sched::state::{Cpus, Resources};
+        #[derive(Serialize)]
+        struct Before {
+            cpu: f64,
+            mem: u64,
+            disk: u64,
+            gpu: u32,
+        }
+        for milli in 0..=100_000u32 {
+            let before = Before { cpu: f64::from(milli) / 1000.0, mem: 16 << 30, disk: 0, gpu: 0 };
+            let now = Resources { cpu: Cpus::milli(u64::from(milli)), mem: 16 << 30, ..Resources::default() };
+            let (old, new) = (serde_json::to_string(&before)?, serde_json::to_string(&now)?);
+            assert_eq!(new, old, "{milli} thousandths");
+            assert_eq!(serde_json::from_str::<Resources>(&old)?, now, "{old}");
+        }
+        // Whole numbers, as other writers may put them, read too.
+        assert_eq!(serde_json::from_str::<Resources>(r#"{"cpu":8}"#)?.cpu, Cpus::whole(8));
+        let a = AssignmentV2 { job_id: "bench".into(), exclusive: true, holds: Some(Resources { cpu: Cpus::milli(500), mem: 8 << 30, ..Resources::default() }), ..AssignmentV2::default() };
+        assert!(serde_json::to_string(&a)?.contains(r#""holds":{"cpu":0.5,"mem":8589934592,"disk":0,"gpu":0}"#));
         Ok(())
     }
 
