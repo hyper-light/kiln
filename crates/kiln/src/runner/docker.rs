@@ -39,12 +39,11 @@ const MUSL_PROBE: &str = "for f in /lib/ld-musl-*; do [ -e \"$f\" ] && echo musl
 /// else `podman`, when its daemon answers. In a `k8s` pool's pod, the one its Docker sidecar's
 /// copied in (W13-R07).
 pub fn find() -> Option<String> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
     let pod = std::env::var_os("KILN_POD").and(std::env::var_os("KILN_POD_DOCKER")).map(PathBuf::from);
     for bin in ["docker", "podman"] {
         let found = match &pod {
             Some(p) => (bin == "docker").then(|| p.clone()),
-            None => std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file()),
+            None => crate::os::which(bin),
         };
         let Some(full) = found else { continue };
         let ok = std::process::Command::new(&full).args(["version", "--format", "{{.Server.Version}}"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
@@ -108,6 +107,11 @@ impl Probe {
     }
 }
 
+/// Whether the container CLI at `bin` is Podman (`/usr/bin/podman`, `podman.exe`).
+pub fn is_podman(bin: &str) -> bool {
+    crate::os::program_stem(bin) == "podman"
+}
+
 /// Whether this machine can run containers (for `CAP_DOCKER`, W13-R01).
 pub fn available() -> bool {
     static PROBED: Probe = Probe::new();
@@ -120,7 +124,7 @@ pub fn rootless_engine() -> bool {
     static PROBED: Probe = Probe::new();
     PROBED.answer(|| {
         find().is_some_and(|bin| {
-            let format = if bin.ends_with("podman") { "{{.Host.Security.Rootless}}" } else { "{{json .SecurityOptions}}" };
+            let format = if is_podman(&bin) { "{{.Host.Security.Rootless}}" } else { "{{json .SecurityOptions}}" };
             std::process::Command::new(&bin).args(["info", "--format", format]).stderr(std::process::Stdio::null()).output().is_ok_and(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
                 o.status.success() && (out.trim() == "true" || out.contains("rootless"))
@@ -878,7 +882,7 @@ impl PathMap {
         for (host, inside) in &self.0 {
             let h = host.to_string_lossy();
             if !h.is_empty() && out.contains(h.as_ref()) {
-                out = out.replace(h.as_ref(), inside);
+                out = if windows_path(&h) { swap_windows_path(&out, &h, inside) } else { out.replace(h.as_ref(), inside) };
             }
         }
         for lo in ["://127.0.0.1", "://localhost", "://[::1]"] {
@@ -922,6 +926,29 @@ impl PathMap {
     pub fn mounts(&self) -> Vec<String> {
         self.0.iter().map(|(h, i)| format!("{}:{i}", h.to_string_lossy())).collect()
     }
+}
+
+/// A Windows host's path (`C:\…`, `\\server\share`).
+fn windows_path(p: &str) -> bool {
+    p.contains('\\') || p.get(1..2) == Some(":")
+}
+
+/// `s` with each `host` (a Windows path) swapped for `inside`, and the rest of the path it starts
+/// written with `/`, as the container's paths are: `C:\w\_temp\x.sh` → `/__w/_temp/x.sh`. That
+/// rest ends where a path would: at a space, a quote, or a list's separator.
+fn swap_windows_path(s: &str, host: &str, inside: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find(host) {
+        out.push_str(rest.get(..at).unwrap_or_default());
+        out.push_str(inside);
+        let after = rest.get(at + host.len()..).unwrap_or_default();
+        let end = after.find(|c: char| c.is_whitespace() || "\"';:,|<>*?".contains(c)).unwrap_or(after.len());
+        out.push_str(&after.get(..end).unwrap_or_default().replace('\\', "/"));
+        rest = after.get(end..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A service, started.
@@ -1228,7 +1255,7 @@ impl Containers {
     /// Whether the engine runs rootless.
     async fn rootless(&self) -> bool {
         let none = BTreeMap::new();
-        if self.cli.bin.ends_with("podman") {
+        if is_podman(&self.cli.bin) {
             return self.cli.run(&[s("info"), s("--format"), s("{{.Host.Security.Rootless}}")], &none, CALL).await.is_ok_and(|o| o == "true");
         }
         self.cli.run(&[s("info"), s("--format"), s("{{json .SecurityOptions}}")], &none, CALL).await.is_ok_and(|o| o.contains("rootless"))
@@ -1829,6 +1856,18 @@ mod tests {
         assert_eq!(get("NO_PROXY"), Some("localhost,127.0.0.1,::1"), "a list of hosts isn't a URL");
         let elsewhere: BTreeMap<String, String> = [("GH_HOST".to_owned(), "kiln.example:8443".to_owned())].into_iter().collect();
         assert_eq!(m.translate_env(&elsewhere).get("GH_HOST").map(String::as_str), Some("kiln.example:8443"));
+    }
+
+    #[test]
+    fn a_windows_hosts_paths_are_the_containers_paths_inside() {
+        let m = PathMap::new(vec![(PathBuf::from(r"C:\w\leg\repo"), "/__w/repo/repo".into()), (PathBuf::from(r"C:\w\leg\_temp"), "/__w/_temp".into())]);
+        assert_eq!(m.translate(r"C:\w\leg\_temp\_runner_file_commands\github_output_1"), "/__w/_temp/_runner_file_commands/github_output_1");
+        assert_eq!(m.translate(r"C:\w\leg\repo"), "/__w/repo/repo");
+        assert_eq!(m.translate(r"cd C:\w\leg\repo\src && cat 'C:\w\leg\_temp\a b.txt'"), "cd /__w/repo/repo/src && cat '/__w/_temp/a b.txt'");
+        assert_eq!(m.translate(r"C:\w\leg\repo\bin;C:\Windows\System32"), r"/__w/repo/repo/bin;C:\Windows\System32", "a list's other entries stay");
+        assert_eq!(m.mounts(), [r"C:\w\leg\_temp:/__w/_temp", r"C:\w\leg\repo:/__w/repo/repo"]);
+        // A Unix host's paths are swapped as they are: a backslash after one is the text's own.
+        assert_eq!(PathMap::new(vec![(PathBuf::from("/w/leg/repo"), "/__w/repo/repo".into())]).translate(r"/w/leg/repo\n"), r"/__w/repo/repo\n");
     }
 
     #[test]

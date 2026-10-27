@@ -147,15 +147,10 @@ fn leg_path(st: &State, path: Option<&str>) -> String {
     path
 }
 
-/// Where `prog` is on `env`'s `PATH`.
+/// Where `prog` is on `env`'s `PATH` (on Windows the `.exe` or `.cmd` there, never npm's or
+/// Maven's shell script of its name beside it).
 fn on_path(env: &BTreeMap<String, String>, prog: &str) -> Option<PathBuf> {
-    let path = env.get("PATH")?;
-    std::env::split_paths(path).flat_map(|d| [d.join(prog), d.join(format!("{prog}.exe"))]).find(|p| p.is_file())
-}
-
-/// Whether a program is on `PATH`.
-fn which(prog: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file() || d.join(format!("{prog}.exe")).is_file()))
+    crate::os::which_in(prog, std::ffi::OsStr::new(env.get("PATH")?))
 }
 
 /// GitHub's view of a typed output (W04-R20): its JSON, but a string as itself.
@@ -1607,7 +1602,7 @@ impl Leg {
         anyhow::ensure!(ws.starts_with(&st.layout.workspace) && !c.path.split(['/', '\\']).any(|p| p == ".."), "`path` must stay inside the workspace");
         let remote = format!("{}/{}", st.server_url.trim_end_matches('/'), a.repo);
         let token = a.runtime.github_token.clone();
-        if crate::rt::blocking(|| which("git")).await.unwrap_or(false) {
+        if crate::rt::blocking(|| crate::os::have("git")).await.unwrap_or(false) {
             // The token rides in git's environment config, never on a command line.
             let header = format!("AUTHORIZATION: basic {}", base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}")));
             let w = ws.to_string_lossy().to_string();
@@ -2610,9 +2605,10 @@ impl Leg {
         let oom_after = super::chaos::for_leg(self.a.attempt).and_then(|c| c.oom_after).filter(|_| on_host);
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
-                // In a job container without bash, the default shell is sh (GitHub-exact).
+                // In a job container the default shell is the container's: bash, else sh
+                // (GitHub-exact), whatever the host's is (PowerShell on Windows).
                 let shell = match shell {
-                    None if in_job && st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some_and(|j| !j.has_bash) => Some("sh"),
+                    None if in_job => Some(if st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some_and(|j| j.has_bash) { "bash -e {0}" } else { "sh" }),
                     other => *other,
                 };
                 let (ext, body) = script_file(shell, script);

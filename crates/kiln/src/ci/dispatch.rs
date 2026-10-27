@@ -1051,7 +1051,8 @@ impl Dispatch {
             Some(f) => (**f).clone(),
             None => {
                 let mut executors = std::collections::BTreeMap::new();
-                if caps & CAP_DOCKER != 0 {
+                // Never on Windows (`crate::runner::probe`'s executors).
+                if caps & CAP_DOCKER != 0 && a.os != "windows" {
                     let rootless = caps & crate::proto::CAP_DOCKER_ROOTLESS != 0;
                     executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
                 }
