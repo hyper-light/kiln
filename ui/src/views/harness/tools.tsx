@@ -4,10 +4,11 @@
  * can use, to read or run.
  */
 import * as React from "react";
-import { ChevronRight, ExternalLink, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ChevronRight, ExternalLink, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { clientId, type McpServer, type SessionStore, type Skill, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { SearchField } from "@/components/ui/misc";
 import { cn } from "@/lib/utils";
 import { Prose } from "./parts";
 
@@ -319,10 +320,7 @@ export function SkillsPanel({ state, store }: { state: State | null; store: Sess
   const plugins = state?.plugins ?? [];
   return (
     <div className="hx-stack">
-      <label className="hx-skill-search">
-        <Search size={13} />
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={`Search ${skills.length} skills`} aria-label="Search skills" />
-      </label>
+      <SearchField label="Search skills" placeholder={`Search ${skills.length} skills`} value={q} onChange={setQ} />
       {shown.length === 0 && <div className="hx-dim text-[12.5px]">{skills.length ? "No skills match." : "No skills yet."}</div>}
       <ul className="hx-skills">
         {shown.map((k) => (

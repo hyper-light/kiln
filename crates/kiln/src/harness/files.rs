@@ -22,6 +22,8 @@ const MOST_MENTIONED: usize = 32;
 
 /// A file as its machine has it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "FileMeta"))]
 pub struct Meta {
     pub size: u64,
     /// Unix ms.
@@ -30,8 +32,10 @@ pub struct Meta {
     /// In pixels as it shows (turned as its own data says), when it's an image or a video and its
     /// start says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub height: Option<u32>,
 }
 

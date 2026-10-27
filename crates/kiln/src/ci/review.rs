@@ -173,10 +173,21 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
     if publish {
         hub.store.audit(caller.name.clone(), "diffs.comment".into(), format!("{} {} thread {tid}", d.repo, d.name)).await;
         // For whoever follows a diff's conversation (an agent's queue, the inbox).
-        hub.emit(&json!({
-            "type": "comment", "repo": d.repo, "diff": d.name, "version": version, "thread": tid, "comment": cid, "author": me, "body": said,
-            "file": file_c, "side": side_c, "start_line": start, "end_line": end.or(start), "diff_author": d.author, "diff_author_for": d.author_for,
-        }));
+        hub.emit(&crate::wire::events::ServerEvent::Comment(Box::new(crate::wire::events::Comment {
+            repo: d.repo.clone(),
+            diff: d.name.clone(),
+            version,
+            thread: tid.clone(),
+            comment: cid.clone(),
+            author: me.clone(),
+            body: said.clone(),
+            file: file_c,
+            side: side_c,
+            start_line: start,
+            end_line: end.or(start),
+            diff_author: d.author.clone(),
+            diff_author_for: d.author_for.clone(),
+        })));
         tell(hub, d, &me, vec![(tid.clone(), said)]);
     }
     Ok(json!({ "id": cid, "thread": tid, "draft": !publish }))
@@ -452,7 +463,18 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     }
     let shown = if matches!(state, State::NeedsReview | State::ChangesRequested | State::Accepted) { now } else { state };
     hub.store.audit(caller.name.clone(), format!("diffs.review.{}", action.as_str()), format!("{} {} v{latest}", d.repo, d.name)).await;
-    hub.emit(&json!({ "type": "review", "repo": d.repo, "diff": d.name, "version": latest, "reviewer": me, "action": action.as_str(), "body": text, "published": published, "state": shown.as_str(), "diff_author": d.author, "diff_author_for": d.author_for }));
+    hub.emit(&crate::wire::events::ServerEvent::Review(Box::new(crate::wire::events::Review {
+        repo: d.repo.clone(),
+        diff: d.name.clone(),
+        version: latest,
+        reviewer: me.clone(),
+        action: action.as_str().to_owned(),
+        body: text.clone(),
+        published,
+        state: shown.as_str().to_owned(),
+        diff_author: d.author.clone(),
+        diff_author_for: d.author_for.clone(),
+    })));
     Ok(json!({ "diff": d.name, "action": action.as_str(), "version": latest, "published": published, "state": shown.as_str() }))
 }
 
@@ -710,17 +732,17 @@ async fn diff_run(hub: &Hub, run: &str) -> anyhow::Result<()> {
         .await?;
     let Some((_, name, version, author, author_for, repo, status, conclusion, workflow)) = found else { return Ok(()) };
     let key = run.to_owned();
-    let failed: Vec<Value> = hub
+    let failed: Vec<crate::wire::events::FailedLeg> = hub
         .store
         .call(move |c| {
             let mut st = c.prepare("SELECT id, COALESCE(job_id, key), status FROM jobs WHERE run_id = ?1 AND status IN ('failed', 'timed_out')")?;
             let rows = st.query_map([&key], |r| {
                 let id: String = r.get(0)?;
-                Ok(json!({ "leg": id, "name": r.get::<_, String>(1)?, "status": r.get::<_, String>(2)?, "failure": format!("/api/ci/legs/{id}/logs/failure") }))
+                Ok(crate::wire::events::FailedLeg { name: r.get::<_, String>(1)?, status: r.get::<_, String>(2)?, failure: format!("/api/ci/legs/{id}/logs/failure"), leg: id })
             })?;
             Ok(rows.filter_map(Result::ok).collect())
         })
         .await?;
-    hub.emit(&json!({ "type": "diff_run", "repo": repo, "diff": name, "version": version, "run": run, "workflow": workflow, "status": status, "conclusion": conclusion, "failed": failed, "diff_author": author, "diff_author_for": author_for }));
+    hub.emit(&crate::wire::events::ServerEvent::DiffRun(Box::new(crate::wire::events::DiffRun { repo, diff: name, version, run: run.to_owned(), workflow, status, conclusion, failed, diff_author: author, diff_author_for: author_for })));
     Ok(())
 }

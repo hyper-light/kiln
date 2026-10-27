@@ -132,7 +132,7 @@ async fn save(hub: &Hub, st: &Stack) {
     if let Ok(text) = serde_json::to_string(st) {
         let _ = hub.store.kv_set(key(&st.run), text).await;
     }
-    hub.emit(&json!({"type": "plan_stack", "run": st.run}));
+    hub.emit(&crate::wire::events::ServerEvent::PlanStack { run: st.run.clone() });
 }
 
 /// A stack as a run's page shows it.
@@ -762,7 +762,7 @@ mod end_to_end {
                 anyhow::ensure!(record.change == e.change && record.stack.as_ref().is_some_and(|s| s.step == i + 1 && s.run == run), "{record:?}");
                 if i == 0 {
                     // While the run goes on, a reviewer's comment on step 1's diff waits for it to end.
-                    hub.emit(&json!({"type": "comment", "diff": "D1", "diff_author": format!("agent:{agent}"), "author": "user:ada", "body": "Call it run_engine", "file": "engine.rs", "start_line": 1}));
+                    hub.emit(&crate::wire::events::ServerEvent::Comment(Box::new(crate::wire::events::Comment { diff: "D1".into(), diff_author: format!("agent:{agent}"), author: "user:ada".into(), body: "Call it run_engine".into(), file: Some("engine.rs".into()), start_line: Some(1), ..Default::default() })));
                     let mut waited = false;
                     for _ in 0..250 {
                         if hub.store.kv_get(format!("plans/stack-held/{run}")).await?.is_some_and(|t| t.contains("Call it run_engine")) {

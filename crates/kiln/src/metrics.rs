@@ -251,6 +251,10 @@ pub struct Metrics {
     pub ci_attempts: CounterVec,
     pub ci_wait_seconds: CounterVec,
     pub ci_rollup_lag: Gauge,
+    /// W24's (docs/ci.md W24-R28): lookups of recorded work by layer (`leg`, …) and outcome
+    /// (`hit`, `miss`, `error`), and the seconds the results taken over had run.
+    pub work_lookups: CounterVec,
+    pub work_saved_seconds: Counter,
 }
 
 pub fn global() -> &'static Metrics {
@@ -285,6 +289,8 @@ pub fn global() -> &'static Metrics {
         ci_attempts: CounterVec::new(&["conclusion", "class"]),
         ci_wait_seconds: CounterVec::new(&["reason"]),
         ci_rollup_lag: Gauge::default(),
+        work_lookups: CounterVec::new(&["layer", "outcome"]),
+        work_saved_seconds: Counter::default(),
     })
 }
 
@@ -590,6 +596,34 @@ impl NetMetrics {
     }
 }
 
+/// What the wires couldn't read (`crate::wire::unread`, docs/wire.md "What can't be read"), by
+/// `wire` and `code`: every series there from the start. No label says who sent it: the audit log
+/// and its runner's or agent's page say that.
+pub struct WireMetrics {
+    pub refused: CounterVec,
+}
+
+pub fn wire() -> &'static WireMetrics {
+    static M: OnceLock<WireMetrics> = OnceLock::new();
+    M.get_or_init(|| {
+        let refused = CounterVec::new(&["wire", "code"]);
+        for w in crate::wire::unread::Wire::ALL {
+            for c in crate::wire::unread::Code::ALL {
+                refused.add(&[w.name(), c.name()], 0);
+            }
+        }
+        WireMetrics { refused }
+    })
+}
+
+fn render_wire(o: &mut String) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_wire_refused_total Messages kiln couldn't read, refused, by wire and code (unknown, malformed).\n# TYPE kiln_wire_refused_total counter"
+    );
+    wire().refused.render(o, "kiln_wire_refused_total");
+}
+
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
     M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: RwLock::new(BTreeMap::new()) })
@@ -804,6 +838,37 @@ mod tests {
         assert!(text.contains("kiln_move_barrier_seconds_bucket{le=\"600\"} "), "an unlabelled histogram's buckets");
     }
 
+    /// W24-R28's metrics: lookups by layer and outcome, and the seconds reuse saved.
+    #[test]
+    fn w24_r28_work_families() {
+        let m = global();
+        m.work_lookups.inc(&["leg", "hit"]);
+        m.work_saved_seconds.add(0);
+        let text = render();
+        for (name, kind) in [("kiln_work_lookups_total", "counter"), ("kiln_work_saved_seconds_total", "counter")] {
+            assert!(text.contains(&format!("# TYPE {name} {kind}\n")), "{name}");
+        }
+        assert!(text.contains("kiln_work_lookups_total{layer=\"leg\",outcome=\"hit\"} "), "{text}");
+        assert!(text.contains("\nkiln_work_saved_seconds_total "), "{text}");
+    }
+
+    /// What the wires couldn't read (`crate::wire::unread`): every wire and code's series there before
+    /// any refusal, far under a family's budget of series.
+    #[test]
+    fn the_refused_counter_renders_every_series_before_any_refusal() {
+        let text = render();
+        assert!(text.contains("# TYPE kiln_wire_refused_total counter\n"), "{text}");
+        let series = text.lines().filter(|l| l.starts_with("kiln_wire_refused_total{")).count();
+        assert_eq!(series, crate::wire::unread::Wire::ALL.len() * crate::wire::unread::Code::ALL.len());
+        assert!(series <= 200, "{series} series: past the budget for one family");
+        for w in crate::wire::unread::Wire::ALL {
+            for c in crate::wire::unread::Code::ALL {
+                let line = format!("kiln_wire_refused_total{{wire=\"{}\",code=\"{}\"}} ", w.name(), c.name());
+                assert!(text.contains(&line), "{line}");
+            }
+        }
+    }
+
     /// CP-M2's counters (docs/agents.md, "Metrics"): every series is there before anything is
     /// counted, at 0, under the help and type the table gives, and in the server's exposition.
     #[test]
@@ -878,6 +943,7 @@ mod tests {
 
 /// Live per-agent host samples, reported by agents and rendered with an `agent` label.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct HostSample {
     pub ts_ms: i64,
     pub cpu_pct: f32,
@@ -1017,6 +1083,9 @@ pub fn render() -> String {
     help(&mut o, "kiln_ci_wait_seconds_total", "counter", "Seconds CI legs waited, by wait reason.");
     m.ci_wait_seconds.render(&mut o, "kiln_ci_wait_seconds_total");
     scalar!("kiln_ci_rollup_lag_seconds", "gauge", "How far behind the CI insights rollups are.", m.ci_rollup_lag.get());
+    help(&mut o, "kiln_work_lookups_total", "counter", "Lookups of recorded work (W24), by layer (leg, ...) and outcome (hit, miss, error).");
+    m.work_lookups.render(&mut o, "kiln_work_lookups_total");
+    scalar!("kiln_work_saved_seconds_total", "counter", "Seconds of work saved: what the results reuse took over had run.", m.work_saved_seconds.get());
     help(&mut o, "kiln_job_duration_seconds", "histogram", "Job wall time.");
     m.job_duration.render(&mut o, "kiln_job_duration_seconds", "");
     help(&mut o, "kiln_queue_wait_seconds", "histogram", "Time from queued to started.");
@@ -1027,6 +1096,7 @@ pub fn render() -> String {
     render_blobs(&mut o);
     render_bus(&mut o);
     render_net(&mut o);
+    render_wire(&mut o);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {

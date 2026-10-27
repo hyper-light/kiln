@@ -295,6 +295,12 @@ be upgraded to exactly what the server runs, so platforms don't drift apart.
   release branch, and every 10 minutes until then. A build that fails is tried again after 30
   minutes, at most 3 times.
 - An uploaded binary isn't built from any commit, so the next build replaces it.
+- A run of the release pipeline at the commit still under way is the build: the server starts no
+  other, and neither does *Build every platform* (System → Builds).
+- With kiln's own workflows on the CI engine (`[ci] kiln_workflows`), the build is the engine's run
+  of release.yaml. Each leg's `artifacts:` are an artifact of that leg (`artifacts-linux`,
+  `artifacts-macos`, docs/ci.md W08-R08). As each leg succeeds, the binaries in its artifact are
+  checked and kept, as a v1 job's are. A machine waiting on the build is told which run and leg.
 - `[updates] in_step = false` turns this off. System → Builds shows the commit, and which
   platforms are behind it.
 

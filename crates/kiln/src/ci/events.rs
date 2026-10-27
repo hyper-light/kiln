@@ -58,6 +58,27 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     Ok(true)
 }
 
+/// [`on_trigger`] for the one workflow `t` names (its path or name), asked for by kiln itself
+/// (`[updates] in_step`'s build of the server's commit): the run's id once it's made. None when
+/// the commit has no such workflow the engine runs, or it doesn't take the event.
+pub async fn start_one(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<Option<String>> {
+    let Some(p) = t.pipeline.as_deref() else { anyhow::bail!("no workflow named") };
+    if !hub.ci.enabled() || !super::providers::kiln_runs(hub, repo).await {
+        return Ok(None);
+    }
+    let commit = load::load(hub, repo, &t.sha).await?;
+    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows;
+    let Some(l) = commit.workflows.iter().find(|l| l.runs && engine_runs(l) && (l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p))) else { return Ok(None) };
+    let event = event(hub, repo, t).await;
+    let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
+    let (tx, rx) = async_channel::bounded(1);
+    let given = super::dispatch::Given { reply: Some(tx), ..super::dispatch::Given::default() };
+    if !start_given(hub, repo, &event, l, (&message, &author), serde_json::Value::Null, given).await? {
+        return Ok(None);
+    }
+    Ok(crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.ok().and_then(Result::ok))
+}
+
 /// Starts workflow `l` for `event` when it matches (W03-R03), with its remote actions pinned
 /// now (W07-R02). A workflow with errors gets a run that fails at once, listing them (W02-AC09).
 /// `inputs` are the run's typed inputs (`workflow_dispatch`), or null. Whether a run began.

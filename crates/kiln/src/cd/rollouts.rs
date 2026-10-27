@@ -502,7 +502,7 @@ impl Cd {
         let (live, rolling) = start(cx, desired, &Start { app: app.clone(), environment, revision, before }).await?;
         if rolling {
             let (target, key) = (cx.conn.target.name(), applied_key(obj::group(desired), obj::kind(desired), obj::namespace(desired), obj::name(desired)));
-            self.hub.emit(&json!({ "type": "cd_rollout", "app": app, "id": rollout_id(&target, &key) }));
+            self.hub.emit(&crate::wire::events::ServerEvent::CdRollout { app: app.clone(), id: rollout_id(&target, &key) });
             drive(self.clone(), &target, &key);
         }
         Ok(live)
@@ -638,7 +638,7 @@ impl Host for Cd {
     }
 
     fn changed(&self, rec: &RolloutRecord, was: &Rollout) {
-        self.hub.emit(&json!({ "type": "cd_rollout", "app": rec.app, "id": rollout_id(&rec.target, &rec.key) }));
+        self.hub.emit(&crate::wire::events::ServerEvent::CdRollout { app: rec.app.clone(), id: rollout_id(&rec.target, &rec.key) });
         let Some(cd) = super::get() else { return };
         if rec.rollout.summary() != was.summary() {
             cd.reread(rec);

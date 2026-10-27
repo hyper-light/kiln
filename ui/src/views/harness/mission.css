@@ -648,23 +648,9 @@ a.ms-why:hover {
 }
 
 /* ---------------------------------------------------------------- how the list is shown, and messaging it */
-/* The filter field and the sort, side by side, on a phone too: there the sort gives way. */
+/* The filter field and the sort, side by side, on a phone too (a FilterBar). */
 .ms-bar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 220px;
-  gap: 10px;
   margin-bottom: 10px;
-}
-@container (max-width: 760px) {
-  .ms-bar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 180px);
-  }
-}
-@container (max-width: 520px) {
-  .ms-bar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 150px);
-    gap: 8px;
-  }
 }
 
 /* Message the agents: an agent's composer, in the page. */

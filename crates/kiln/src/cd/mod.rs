@@ -307,7 +307,7 @@ impl Cd {
         for child in children {
             self.unregister(&child, cascade);
         }
-        self.hub.emit(&json!({"type": "cd_app_deleted", "app": id}));
+        self.hub.emit(&crate::wire::events::ServerEvent::CdAppDeleted { app: id.to_owned() });
     }
 
     // ---------------------------------------------------------------- sources
@@ -391,9 +391,22 @@ impl Cd {
             let ids: BTreeSet<String> = defs.iter().map(AppDef::id).collect();
             for def in defs {
                 let changed = self.apps.read().get(&def.id()).is_none_or(|e| e.def != def);
+                // A copy of the app kept in kiln (`cd.apps.keep`, taken over) loads at each start,
+                // before this file is read, and stays while it doesn't read: kiln-production once
+                // came back so as it was a week before, and a sync deployed that (2026-10-26). The
+                // file's is the app now, so it's the copy kept.
+                let kept = self.store.read(|d| d.apps.get(&def.id()).is_some_and(|k| *k != def));
                 if changed {
                     tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: an app from a deploy file");
-                    self.register(def);
+                    self.register(def.clone());
+                }
+                if kept {
+                    tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: the copy kept in kiln follows the deploy file");
+                    match self.store.submit(Command::PutApp(Box::new(def))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(repo = %repo.name, error = %e, "deployments: can't keep a deploy file's app"),
+                        Err(_) => tracing::warn!(repo = %repo.name, "deployments: the store stopped"),
+                    }
                 }
             }
             let gone: Vec<String> = self
@@ -725,7 +738,7 @@ impl Cd {
                 (Some(_), Some(s)) => s,
                 (Some(p), None) => {
                     let pipeline = given.pipeline.as_deref().unwrap_or("image");
-                    self.published_locally(def, pipeline, revision).await.with_context(|| format!("artifact {name}"))?;
+                    self.published_locally(def, p, pipeline, revision).await.with_context(|| format!("artifact {name}"))?;
                     refs.push(ArtifactRef { name: name.clone(), reference: format!("{p}:{revision}"), repository: p.clone(), tag: Some(revision.to_owned()), digest: String::new() });
                     continue;
                 }
@@ -1421,10 +1434,10 @@ impl Cd {
                 continue;
             }
             let statuses = self.statuses.read();
-            let apps: Vec<Value> = dirty.iter().filter_map(|a| statuses.get(a)).map(summary_json).collect();
+            let apps: Vec<crate::wire::events::CdStatus> = dirty.iter().filter_map(|a| statuses.get(a)).map(crate::wire::events::CdStatus::of).collect();
             drop(statuses);
             for chunk in apps.chunks(500) {
-                self.hub.emit(&json!({"type": "cd_apps", "apps": chunk}));
+                self.hub.emit(&crate::wire::events::ServerEvent::CdApps { apps: chunk.to_vec() });
             }
         }
     }
@@ -1462,6 +1475,12 @@ fn in_place_of_head(mut stack: Vec<String>, runs: &str) -> Vec<String> {
 
 /// An app's status as the API and events show it.
 pub fn summary_json(s: &Summary) -> Value {
+    serde_json::to_value(crate::wire::events::CdStatus::of(s)).unwrap_or(Value::Null)
+}
+
+/// [`summary_json`] as it was built before [`crate::wire::events::CdStatus`], for its test.
+#[cfg(test)]
+fn summary_json_was(s: &Summary) -> Value {
     json!({
         "app": s.app.as_ref(),
         "sync": s.sync.as_str(),
@@ -1664,6 +1683,32 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app's status is the JSON it was before it was a type (`wire::events::CdStatus`).
+    #[test]
+    fn summary_json_is_what_it_was() -> anyhow::Result<()> {
+        use kiln_cd::engine::{OpPhase, OpStatus, Trigger};
+        let mut s = Summary {
+            app: "default/web".into(),
+            sync: kiln_cd::model::Sync::OutOfSync,
+            health: kiln_cd::model::Health::Progressing,
+            revision: None,
+            resources: 4,
+            out_of_sync: 2,
+            shared: 0,
+            missing: 1,
+            prune: 1,
+            unmarked: 0,
+            operation: None,
+            message: None,
+        };
+        anyhow::ensure!(summary_json(&s) == summary_json_was(&s), "{}", summary_json(&s));
+        s.revision = Some("abc".into());
+        s.message = Some("rendering".into());
+        s.operation = Some(OpStatus { id: 3, phase: OpPhase::Running, trigger: Trigger::SelfHeal, attempt: 1, message: "applying".into(), by: Some("user:ada".into()), started_ms: 10, finished_ms: None });
+        anyhow::ensure!(summary_json(&s) == summary_json_was(&s), "{}", summary_json(&s));
+        Ok(())
+    }
 
     /// An Application `kiln-root` renders (app of apps).
     fn child(name: &str) -> Result<AppDef, String> {

@@ -5,7 +5,7 @@ import type { AuditEntry, SystemInfo } from "@/api/types";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { CopyButton, EmptyState, FoldSection, PageIntro, SearchField, openFold } from "@/components/ui/misc";
+import { CopyButton, EmptyState, FilterBar, FoldSection, PageIntro, SearchField, openFold } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -235,21 +235,16 @@ function AuditTable({ win }: { win: AuditWindow }) {
   const shown = rows.filter((a) => auditTakes(a, chosen, q));
   return (
     <>
-      <div className="log-tools">
-        <FacetBox
-          className="min-w-0 flex-1"
-          label="Filter the audit log"
-          placeholder="Filter by who, action, scope, result, address, or words…"
-          query={q}
-          onQuery={setQ}
-          facets={facets}
-          chosen={chosen}
-          onChosen={setChosen}
-        />
-        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the entries shown, as CSV" onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}>
-          <Download /> Download
-        </Button>
-      </div>
+      <FilterBar
+        className="log-tools"
+        aside={
+          <Button variant="ghost" size="bar" disabled={shown.length === 0} title="Download the entries shown, as CSV" onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}>
+            <Download /> Download
+          </Button>
+        }
+      >
+        <FacetBox label="Filter the audit log" placeholder="Filter by who, action, scope, result, address, or words…" query={q} onQuery={setQ} facets={facets} chosen={chosen} onChosen={setChosen} />
+      </FilterBar>
       {shown.length === 0 ? (
         <EmptyState title={rows.length ? "No entries match." : "No audit entries in this window."} />
       ) : (
@@ -313,13 +308,19 @@ function CrashLog({ lines }: { lines: string[] }) {
   const shown = words ? lines.filter((l) => l.toLowerCase().includes(words)) : lines;
   return (
     <>
-      <div className="log-tools">
-        <SearchField className="min-w-0 flex-1" label="Filter the crash log" placeholder="Filter by generation, signal, or words…" value={q} onChange={setQ} />
-        <span className="log-count">{words ? `${shown.length} of ${lines.length}` : lines.length} lines</span>
-        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the lines shown" onClick={() => saveFile(`kiln-crash-log-${fileStamp()}.txt`, shown.join("\n") + "\n")}>
-          <Download /> Download
-        </Button>
-      </div>
+      <FilterBar
+        className="log-tools"
+        aside={
+          <>
+            <span className="log-count">{words ? `${shown.length} of ${lines.length}` : lines.length} lines</span>
+            <Button variant="ghost" size="bar" disabled={shown.length === 0} title="Download the lines shown" onClick={() => saveFile(`kiln-crash-log-${fileStamp()}.txt`, shown.join("\n") + "\n")}>
+              <Download /> Download
+            </Button>
+          </>
+        }
+      >
+        <SearchField label="Filter the crash log" placeholder="Filter by generation, signal, or words…" value={q} onChange={setQ} />
+      </FilterBar>
       {shown.length === 0 ? (
         <EmptyState title="No lines match." />
       ) : (

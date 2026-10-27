@@ -10,7 +10,7 @@ import { Link, useNavigate, useParams } from "@/lib/router";
 import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
 import { api } from "@/api/client";
-import { boardHref, checkName, deployApi, describe, providerName, releaseAppHref, releaseHref, releaseRepoUrl, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
+import { boardHref, checkName, deployApi, describe, diffsOf, providerName, releaseAppHref, releaseHref, releaseRepoUrl, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
@@ -378,7 +378,7 @@ function MoveReport({ m }: { m: Move }) {
               {!!r.differences?.length && (
                 <details className="rel-manifest">
                   <summary>Where it disagrees</summary>
-                  {r.differences.map((d) => (
+                  {diffsOf(r.differences).map((d) => (
                     <pre key={`${d.key.kind}/${d.key.namespace}/${d.key.name}`} className="rel-log">
                       {`${d.key.kind} ${d.key.namespace}/${d.key.name}\n`}
                       {d.hunks.flatMap((h) => h.lines).join("\n")}

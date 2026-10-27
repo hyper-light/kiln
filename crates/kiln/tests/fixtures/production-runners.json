@@ -1,0 +1,854 @@
+[
+ {
+  "name": "adacachy",
+  "labels": [
+   "baremetal",
+   "bench",
+   "local"
+  ],
+  "os": "linux",
+  "arch": "x86_64",
+  "slots": 8,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "linux",
+   "os_version": "rolling",
+   "os_distro": "cachyos",
+   "kernel": "7.2.9-2-cachyos",
+   "arch": "x86_64",
+   "arch_variant": null,
+   "cpu": {
+    "model": "AMD Ryzen 9 9950X3D2 16-Core Processor",
+    "cores": 16,
+    "threads": 32,
+    "flags": [
+     "sse4.2",
+     "popcnt",
+     "aes",
+     "pclmulqdq",
+     "avx",
+     "avx2",
+     "fma",
+     "bmi1",
+     "bmi2",
+     "f16c",
+     "sha",
+     "avx512f",
+     "avx512bw",
+     "avx512vl",
+     "avx512vnni",
+     "vaes",
+     "vpclmulqdq"
+    ]
+   },
+   "mem": {
+    "total": 134000160768,
+    "free": 82693951488
+   },
+   "disk": {
+    "total": 7997298634752,
+    "free": 3945890824192
+   },
+   "gpus": [
+    {
+     "vendor": "nvidia",
+     "model": "NVIDIA GeForce RTX 5060 Ti",
+     "memory": 8546942976,
+     "driver": "615.78.08"
+    }
+   ],
+   "virt": {
+    "kvm": true,
+    "hvf": false,
+    "nested": true
+   },
+   "executors": {
+    "docker": {
+     "version": "29.9.0",
+     "details": {
+      "engine": "docker",
+      "rootless": "false"
+     }
+    },
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [
+    "linux/arm/v7",
+    "linux/arm64",
+    "linux/loong64",
+    "linux/mips64",
+    "linux/mips64le",
+    "linux/ppc64le",
+    "linux/riscv64",
+    "linux/s390x"
+   ],
+   "tools": {
+    "cargo": "1.99.1",
+    "docker": "29.9.0",
+    "docker buildx": "0.38.0",
+    "git": "2.56.0",
+    "go": "1.27.2",
+    "kubectl": "1.37.1",
+    "node": "24.21.0",
+    "python3": "3.14.8"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792967274,
+   "kiln": {
+    "commit": "a084bb77695001cabd8654b368377d4c179dea90",
+    "build": "48374e694aae",
+    "version": "0.2.0",
+    "target": "x86_64-unknown-linux-musl",
+    "checkout": "/home/adalundhe/Projects/kiln"
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ },
+ {
+  "name": "adalundhe-macbook-pro",
+  "labels": [
+   "baremetal",
+   "macos",
+   "aarch64"
+  ],
+  "os": "macos",
+  "arch": "aarch64",
+  "slots": 4,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "macos",
+   "os_version": "26.5.2",
+   "os_distro": null,
+   "kernel": "25.5.0",
+   "arch": "aarch64",
+   "arch_variant": "v8",
+   "cpu": {
+    "model": "Apple M5 Max",
+    "cores": 18,
+    "threads": 18,
+    "flags": [
+     "neon",
+     "aes",
+     "sha2",
+     "sha3",
+     "crc",
+     "lse",
+     "dotprod",
+     "fp16",
+     "bf16",
+     "i8mm"
+    ]
+   },
+   "mem": {
+    "total": 68719476736,
+    "free": 37028757504
+   },
+   "disk": {
+    "total": 1995165736960,
+    "free": 1264632795136
+   },
+   "gpus": [
+    {
+     "vendor": "apple",
+     "model": "Apple M5 Max",
+     "memory": 0,
+     "driver": "metal4"
+    }
+   ],
+   "virt": {
+    "kvm": false,
+    "hvf": true,
+    "nested": false
+   },
+   "executors": {
+    "docker": {
+     "version": "29.6.2",
+     "details": {
+      "engine": "docker",
+      "rootless": "false"
+     }
+    },
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [],
+   "tools": {
+    "docker": "29.6.2",
+    "docker buildx": "0.35.0",
+    "git": "2.50.1",
+    "go": "1.26.5",
+    "kubectl": "1.36.1",
+    "node": "26.5.0",
+    "python3": "3.14.6"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792967261,
+   "kiln": {
+    "commit": "8adeadba572e164d4e2e342ba2a7d518c43d1b10",
+    "build": "4b49ab7e6805",
+    "version": "0.2.0",
+    "target": "aarch64-apple-darwin",
+    "checkout": "/Users/ada.lundhe/Projects/kiln"
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ },
+ {
+  "name": "adas-mac-studio-2.local",
+  "labels": [
+   "baremetal",
+   "macos",
+   "aarch64"
+  ],
+  "os": "macos",
+  "arch": "aarch64",
+  "slots": 3,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "macos",
+   "os_version": "26.2",
+   "os_distro": null,
+   "kernel": "25.2.0",
+   "arch": "aarch64",
+   "arch_variant": "v8",
+   "cpu": {
+    "model": "Apple M4 Max",
+    "cores": 14,
+    "threads": 14,
+    "flags": [
+     "neon",
+     "aes",
+     "sha2",
+     "sha3",
+     "crc",
+     "lse",
+     "dotprod",
+     "fp16",
+     "bf16",
+     "i8mm"
+    ]
+   },
+   "mem": {
+    "total": 38654705664,
+    "free": 30885314560
+   },
+   "disk": {
+    "total": 494384795648,
+    "free": 225496350720
+   },
+   "gpus": [
+    {
+     "vendor": "apple",
+     "model": "Apple M4 Max",
+     "memory": 0,
+     "driver": "metal4"
+    }
+   ],
+   "virt": {
+    "kvm": false,
+    "hvf": true,
+    "nested": false
+   },
+   "executors": {
+    "docker": {
+     "version": "29.1.5",
+     "details": {
+      "engine": "docker",
+      "rootless": "false"
+     }
+    },
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [],
+   "tools": {
+    "docker": "29.1.5",
+    "docker buildx": "0.30.1",
+    "git": "2.50.1",
+    "kubectl": "1.34.1",
+    "python3": "3.14.2"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792966912,
+   "kiln": {
+    "commit": "a084bb77695001cabd8654b368377d4c179dea90",
+    "build": "0bbc712d462f",
+    "version": "0.2.0",
+    "target": "aarch64-apple-darwin",
+    "checkout": null
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ },
+ {
+  "name": "adas-mac-studio-3.local",
+  "labels": [
+   "baremetal",
+   "macos",
+   "aarch64"
+  ],
+  "os": "macos",
+  "arch": "aarch64",
+  "slots": 3,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "macos",
+   "os_version": "26.2",
+   "os_distro": null,
+   "kernel": "25.2.0",
+   "arch": "aarch64",
+   "arch_variant": "v8",
+   "cpu": {
+    "model": "Apple M4 Max",
+    "cores": 14,
+    "threads": 14,
+    "flags": [
+     "neon",
+     "aes",
+     "sha2",
+     "sha3",
+     "crc",
+     "lse",
+     "dotprod",
+     "fp16",
+     "bf16",
+     "i8mm"
+    ]
+   },
+   "mem": {
+    "total": 38654705664,
+    "free": 29118857216
+   },
+   "disk": {
+    "total": 494384795648,
+    "free": 191469932544
+   },
+   "gpus": [
+    {
+     "vendor": "apple",
+     "model": "Apple M4 Max",
+     "memory": 0,
+     "driver": "metal4"
+    }
+   ],
+   "virt": {
+    "kvm": false,
+    "hvf": true,
+    "nested": false
+   },
+   "executors": {
+    "docker": {
+     "version": "29.1.5",
+     "details": {
+      "engine": "docker",
+      "rootless": "false"
+     }
+    },
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [],
+   "tools": {
+    "docker": "29.1.5",
+    "docker buildx": "0.30.1",
+    "git": "2.50.1",
+    "kubectl": "1.34.1",
+    "python3": "3.9.6"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792966849,
+   "kiln": {
+    "commit": "a084bb77695001cabd8654b368377d4c179dea90",
+    "build": "0bbc712d462f",
+    "version": "0.2.0",
+    "target": "aarch64-apple-darwin",
+    "checkout": null
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ },
+ {
+  "name": "adas-mac-studio.local",
+  "labels": [
+   "baremetal",
+   "macos",
+   "aarch64"
+  ],
+  "os": "macos",
+  "arch": "aarch64",
+  "slots": 3,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "macos",
+   "os_version": "26.2",
+   "os_distro": null,
+   "kernel": "25.2.0",
+   "arch": "aarch64",
+   "arch_variant": "v8",
+   "cpu": {
+    "model": "Apple M4 Max",
+    "cores": 14,
+    "threads": 14,
+    "flags": [
+     "neon",
+     "aes",
+     "sha2",
+     "sha3",
+     "crc",
+     "lse",
+     "dotprod",
+     "fp16",
+     "bf16",
+     "i8mm"
+    ]
+   },
+   "mem": {
+    "total": 38654705664,
+    "free": 23663067136
+   },
+   "disk": {
+    "total": 494384795648,
+    "free": 197551575040
+   },
+   "gpus": [
+    {
+     "vendor": "apple",
+     "model": "Apple M4 Max",
+     "memory": 0,
+     "driver": "metal4"
+    }
+   ],
+   "virt": {
+    "kvm": false,
+    "hvf": true,
+    "nested": false
+   },
+   "executors": {
+    "docker": {
+     "version": "29.1.5",
+     "details": {
+      "engine": "docker",
+      "rootless": "false"
+     }
+    },
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [],
+   "tools": {
+    "docker": "29.1.5",
+    "docker buildx": "0.30.1",
+    "git": "2.50.1",
+    "kubectl": "1.34.1",
+    "python3": "3.14.2"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792966896,
+   "kiln": {
+    "commit": "a084bb77695001cabd8654b368377d4c179dea90",
+    "build": "0bbc712d462f",
+    "version": "0.2.0",
+    "target": "aarch64-apple-darwin",
+    "checkout": null
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ },
+ {
+  "name": "adas-macbook-pro-2.local",
+  "labels": [
+   "baremetal",
+   "macos",
+   "aarch64"
+  ],
+  "os": "macos",
+  "arch": "aarch64",
+  "slots": 4,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "macos",
+   "os_version": "26.4.1",
+   "os_distro": null,
+   "kernel": "25.4.0",
+   "arch": "aarch64",
+   "arch_variant": "v8",
+   "cpu": {
+    "model": "Apple M5 Max",
+    "cores": 18,
+    "threads": 18,
+    "flags": [
+     "neon",
+     "aes",
+     "sha2",
+     "sha3",
+     "crc",
+     "lse",
+     "dotprod",
+     "fp16",
+     "bf16",
+     "i8mm"
+    ]
+   },
+   "mem": {
+    "total": 137438953472,
+    "free": 118995288064
+   },
+   "disk": {
+    "total": 7998499225600,
+    "free": 46202650624
+   },
+   "gpus": [
+    {
+     "vendor": "apple",
+     "model": "Apple M5 Max",
+     "memory": 0,
+     "driver": "metal4"
+    }
+   ],
+   "virt": {
+    "kvm": false,
+    "hvf": true,
+    "nested": false
+   },
+   "executors": {
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [],
+   "tools": {
+    "cargo": "1.99.1",
+    "docker": "29.3.1",
+    "git": "2.50.1",
+    "go": "1.26.1",
+    "kubectl": "1.34.1",
+    "node": "24.14.1",
+    "python3": "3.9.6",
+    "shards": "0.1.0"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792967025,
+   "kiln": {
+    "commit": "a084bb77695001cabd8654b368377d4c179dea90",
+    "build": "0bbc712d462f",
+    "version": "0.2.0",
+    "target": "aarch64-apple-darwin",
+    "checkout": "/Users/adalundhe/Projects/kiln"
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ },
+ {
+  "name": "fedora.attlocal.net",
+  "labels": [
+   "baremetal",
+   "linux",
+   "x86_64"
+  ],
+  "os": "linux",
+  "arch": "x86_64",
+  "slots": 8,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "linux",
+   "os_version": "44",
+   "os_distro": "fedora",
+   "kernel": "6.19.10-300.fc44.x86_64",
+   "arch": "x86_64",
+   "arch_variant": null,
+   "cpu": {
+    "model": "Intel(R) Core(TM) i9-14900HX",
+    "cores": 24,
+    "threads": 32,
+    "flags": [
+     "sse4.2",
+     "popcnt",
+     "aes",
+     "pclmulqdq",
+     "avx",
+     "avx2",
+     "fma",
+     "bmi1",
+     "bmi2",
+     "f16c",
+     "sha",
+     "vaes",
+     "vpclmulqdq"
+    ]
+   },
+   "mem": {
+    "total": 67128655872,
+    "free": 45986738176
+   },
+   "disk": {
+    "total": 7998785191936,
+    "free": 4884529582080
+   },
+   "gpus": [],
+   "virt": {
+    "kvm": true,
+    "hvf": false,
+    "nested": true
+   },
+   "executors": {
+    "docker": {
+     "version": "29.8.2",
+     "details": {
+      "engine": "docker",
+      "rootless": "false"
+     }
+    },
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [
+    "linux/aarch64_be",
+    "linux/alpha",
+    "linux/arm/v7",
+    "linux/arm64",
+    "linux/armeb",
+    "linux/hexagon",
+    "linux/hppa",
+    "linux/loong64",
+    "linux/m68k",
+    "linux/microblaze",
+    "linux/microblazeel",
+    "linux/mips",
+    "linux/mips64",
+    "linux/mips64le",
+    "linux/mipsel",
+    "linux/mipsn32",
+    "linux/mipsn32el",
+    "linux/or1k",
+    "linux/ppc",
+    "linux/ppc64",
+    "linux/ppc64le",
+    "linux/riscv32",
+    "linux/riscv64",
+    "linux/s390x",
+    "linux/sh4",
+    "linux/sh4eb",
+    "linux/sparc",
+    "linux/sparc32plus",
+    "linux/sparc64",
+    "linux/xtensa",
+    "linux/xtensaeb"
+   ],
+   "tools": {
+    "cargo": "1.99.0",
+    "docker": "29.8.2",
+    "docker buildx": "0.37.1",
+    "git": "2.55.0",
+    "go": "1.26.8",
+    "java": "25.0.2",
+    "kubectl": "1.37.0",
+    "node": "24.21.0",
+    "podman": "5.8.1",
+    "python3": "3.14.3"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792967282,
+   "kiln": {
+    "commit": "a084bb77695001cabd8654b368377d4c179dea90",
+    "build": "48374e694aae",
+    "version": "0.2.0",
+    "target": "x86_64-unknown-linux-musl",
+    "checkout": "/home/adalundhe/Projects/kiln"
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ },
+ {
+  "name": "jupiter",
+  "labels": [
+   "baremetal",
+   "windows",
+   "x86_64"
+  ],
+  "os": "windows",
+  "arch": "x86_64",
+  "slots": 8,
+  "connected": true,
+  "ephemeral": false,
+  "facts": {
+   "os": "windows",
+   "os_version": "11 (26200)",
+   "os_distro": null,
+   "kernel": "26200",
+   "arch": "x86_64",
+   "arch_variant": null,
+   "cpu": {
+    "model": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "cores": 16,
+    "threads": 32,
+    "flags": [
+     "sse4.2",
+     "popcnt",
+     "aes",
+     "pclmulqdq",
+     "avx",
+     "avx2",
+     "fma",
+     "bmi1",
+     "bmi2",
+     "f16c",
+     "sha",
+     "avx512f",
+     "avx512bw",
+     "avx512vl",
+     "avx512vnni",
+     "vaes",
+     "vpclmulqdq"
+    ]
+   },
+   "mem": {
+    "total": 132766306304,
+    "free": 101273481216
+   },
+   "disk": {
+    "total": 992549867520,
+    "free": 356180955136
+   },
+   "gpus": [],
+   "virt": {
+    "kvm": false,
+    "hvf": false,
+    "nested": false
+   },
+   "executors": {
+    "docker": {
+     "version": "29.9.1",
+     "details": {
+      "engine": "docker",
+      "rootless": "false"
+     }
+    },
+    "host": {
+     "version": null,
+     "details": {}
+    }
+   },
+   "binfmt": [],
+   "tools": {
+    "cargo": "1.99.0",
+    "docker": "29.9.1",
+    "docker buildx": "0.38.0",
+    "git": "2.56.0",
+    "go": "1.27.2",
+    "kubectl": "1.36.1",
+    "node": "24.21.0"
+   },
+   "net": {
+    "egress": true,
+    "proxy": null
+   },
+   "custom": {},
+   "probed_at": 1792967292,
+   "kiln": {
+    "commit": "a084bb77695001cabd8654b368377d4c179dea90",
+    "build": "5c2ee8f84245",
+    "version": "0.2.0",
+    "target": "x86_64-pc-windows-gnu",
+    "checkout": "C:\\Users\\corph\\Projects/kiln"
+   },
+   "workspaces": {
+    "available": false,
+    "slates": null,
+    "mount": null,
+    "running": false,
+    "why_not": "Slates isn't installed on this machine"
+   }
+  }
+ }
+]

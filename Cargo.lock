@@ -2222,6 +2222,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "ts-rs",
  "tungstenite",
  "turso_core",
  "uuid",
@@ -2255,6 +2256,7 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+ "ts-rs",
  "xxhash-rust",
 ]
 
@@ -2263,6 +2265,7 @@ name = "kiln-ci"
 version = "0.2.0"
 dependencies = [
  "aho-corasick",
+ "anyhow",
  "base64 0.23.1",
  "fancy-regex",
  "jiff",
@@ -2274,6 +2277,7 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "toml",
+ "ts-rs",
  "yaml-rust2",
 ]
 
@@ -4018,6 +4022,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "termcolor"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4237,6 +4250,29 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "ts-rs"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "756050066659291d47a554a9f558125db17428b073c5ffce1daf5dcb0f7231d8"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
+ "ts-rs-macros",
+]
+
+[[package]]
+name = "ts-rs-macros"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d90eea51bc7988ef9e674bf80a85ba6804739e535e9cab48e4bb34a8b652aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "termcolor",
 ]
 
 [[package]]

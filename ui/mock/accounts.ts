@@ -17,6 +17,7 @@ import type http from "node:http";
 import { randomBytes } from "node:crypto";
 import type { WebSocket } from "ws";
 import type { Account, AccountFlow, AccountMethod, AgentInfo, HEvent, Meta, SlashCommand, State } from "../src/api/harness.ts";
+import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 import { longInfo } from "./conversation.ts";
 import { fleetCommand, fleetInfos } from "./push.ts";
 import { familyInfos } from "./agents.ts";
@@ -178,10 +179,10 @@ function advance(s: Sim) {
 /* ------------------------------------------------------------------ demo agents */
 
 const COMMANDS: SlashCommand[] = [
-  { name: "login", description: "Sign in, or switch accounts", group: "Session", args: "none", route: { kind: "view", view: "login" } },
-  { name: "logout", description: "Sign out on this machine", group: "Session", args: "none", route: { kind: "view", view: "logout" } },
-  { name: "model", description: "Change the model", group: "Model & mode", args: "optional", route: { kind: "view", view: "model" } },
-  { name: "compact", description: "Summarize the conversation to free context", group: "Context", args: "optional", route: { kind: "prompt" } },
+  { name: "login", description: "Sign in, or switch accounts", hint: "", group: "Session", args: "none", route: { kind: "view", view: "login" } },
+  { name: "logout", description: "Sign out on this machine", hint: "", group: "Session", args: "none", route: { kind: "view", view: "logout" } },
+  { name: "model", description: "Change the model", hint: "", group: "Model & mode", args: "optional", route: { kind: "view", view: "model" } },
+  { name: "compact", description: "Summarize the conversation to free context", hint: "", group: "Context", args: "optional", route: { kind: "prompt" } },
 ];
 
 interface Demo {
@@ -202,6 +203,7 @@ const SPEED_STATE = process.env.MOCK_SPEED;
 function demo(id: string, kind: string, target: string, title: string, model: string, ask: string, refusal: string): Demo {
   const t = Date.now() - 6 * 60_000;
   const info: AgentInfo = {
+    ...defaultInfo(),
     id,
     kind,
     kind_name: NAMES[kind] ?? kind,
@@ -220,6 +222,7 @@ function demo(id: string, kind: string, target: string, title: string, model: st
     last_activity: t + 4000,
   };
   const meta: Meta = {
+    ...defaultMeta(),
     version: kind === "claude" ? "2.3.1" : "0.46.0",
     modes: [
       { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
@@ -236,10 +239,10 @@ function demo(id: string, kind: string, target: string, title: string, model: st
     models:
       kind === "claude"
         ? ["default", "opus", "fable", "sonnet", "haiku", "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"].map(
-            (id) => ({ id, label: id === "default" ? "Default (recommended)" : id, description: id === "default" ? "Opus 5.5" : undefined }),
+            (id) => ({ id, label: id === "default" ? "Default (recommended)" : id, description: id === "default" ? "Opus 5.5" : "" }),
           )
-        : [{ id: model, label: model }],
-    efforts: kind === "claude" ? ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })) : undefined,
+        : [{ id: model, label: model, description: "" }],
+    efforts: kind === "claude" ? ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })) : [],
     // Its speeds past standard: Claude Code's fast mode on Opus, Codex's tiers on its newest models.
     speeds:
       kind === "claude"
@@ -284,6 +287,7 @@ const demos = new Map<string, Demo>(
 
 function stateOf(d: Demo): State {
   return {
+    ...defaultState(),
     status: "idle",
     cwd: d.info.cwd,
     model: d.info.model,

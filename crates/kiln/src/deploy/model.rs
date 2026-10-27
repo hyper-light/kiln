@@ -64,6 +64,7 @@ pub struct Environment {
 
 /// How kiln drives an Argo CD environment's Applications (docs/deploy-api.md §8.3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ArgoSettings {
     /// kiln writes each Application itself, for an Argo CD that doesn't allow ApplicationSets.
@@ -307,16 +308,20 @@ pub struct Provenance {
 
 /// A gate's result on a release, with its evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct GateResult {
     pub gate: String,
     pub passed: bool,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
+    #[cfg_attr(test, ts(type = "Record<string, unknown>"))]
     pub evidence: Value,
 }
 
 /// A person's answer to a release waiting for approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "DeployApproval"))]
 pub struct Approval {
     /// Who, as the audit names them.
     pub by: String,
@@ -324,6 +329,7 @@ pub struct Approval {
     #[serde(default = "yes")]
     pub approved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub note: Option<String>,
 }
 
@@ -681,6 +687,7 @@ impl Package {
 
 /// An app in an environment (docs/deploy-api.md §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Registration {
     pub app: String,
     pub environment: String,
@@ -691,16 +698,20 @@ pub struct Registration {
     pub paused: bool,
     /// The release that runs, once one has landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub running: Option<i64>,
     pub created_at: i64,
     /// Why what runs here needs a person (§8.1): a release failed and kiln didn't put back what ran
     /// before (a rollback, a revert, one asked not to be), or putting it back didn't land. The next
     /// release that lands clears it; until then nothing is promoted here by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub degraded: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "ReleaseKind"))]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// A new version.
@@ -730,6 +741,8 @@ impl Kind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "ReleaseState"))]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     /// Held by a gate, or by the release before it.
@@ -786,6 +799,8 @@ impl State {
 
 /// Where a release came from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "ReleaseOrigin"))]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     /// Asked for through the API (the UI, `kiln`, chat, MCP).
@@ -799,6 +814,7 @@ pub enum Origin {
 
 /// An image or other build output a release deploys, pinned by digest where known.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
     #[serde(default)]
@@ -811,6 +827,7 @@ pub struct Artifact {
 
 /// One numbered change to what an environment runs (docs/deploy-api.md §9).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Release {
     pub id: i64,
     pub app: String,
@@ -820,30 +837,37 @@ pub struct Release {
     #[serde(default)]
     pub origin: Origin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub artifacts: BTreeMap<String, Artifact>,
     /// A config release's new `values.yaml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub values: Option<String>,
     /// The commit that holds it, once committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub commit: Option<String>,
     pub requested_by: String,
     /// What it's waiting for, or why it failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub message: Option<String>,
     /// The release it goes back to (a rollback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub rollback_of: Option<i64>,
     /// The rollback that replaced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub rolled_back_by: Option<i64>,
     /// A disable that keeps what the app runs, rather than remove it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep: bool,
     /// What the provider last said about it.
     #[serde(default, skip_serializing_if = "Value::is_null")]
+    #[cfg_attr(test, ts(type = "Record<string, unknown>"))]
     pub provider: Value,
     /// Each gate's result, with its evidence (§9.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -853,18 +877,23 @@ pub struct Release {
     pub approvals: Vec<Approval>,
     /// The upstream release it promotes (the same version and artifacts, §9.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub promoted_from: Option<i64>,
     /// The key it was asked for with: asked for again with it, it is this release again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub idempotency_key: Option<String>,
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub committed_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub ended_at: Option<i64>,
     /// Secrets changed since what runs, that it delivers (§3.5): a secrets release's reason
     /// (`DB_PASSWORD v4`), or changes a waiting release took on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub secrets: Option<String>,
     /// Failed, it isn't reverted: it is held for a person (asked so, as for a secret rotated after
     /// a leak, which a revert would deliver again).
@@ -872,13 +901,16 @@ pub struct Release {
     pub no_revert: bool,
     /// A revert: the release it puts back what ran before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reverts: Option<i64>,
     /// The revert that puts back what ran before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reverted_by: Option<i64>,
     /// What it runs on its way in that a revert couldn't undo (a migration's hook), as its
     /// preflight found it: failed, it's held rather than reverted (§8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub irreversible: Option<String>,
 }
 

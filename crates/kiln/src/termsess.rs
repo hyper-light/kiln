@@ -45,6 +45,8 @@ pub enum Input {
 
 /// A session as the API lists it.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "TerminalSessionInfo"))]
 pub struct Info {
     pub id: String,
     pub target: String,
@@ -53,6 +55,7 @@ pub struct Info {
     pub title: String,
     /// The name a person gave it, if any (shown over the title).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub name: Option<String>,
     pub created_at: i64,
     pub attached: usize,

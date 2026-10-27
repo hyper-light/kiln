@@ -94,6 +94,7 @@ pub async fn set(hub: &Arc<Hub>, t: Option<Tolerance>) -> anyhow::Result<()> {
 
 /// Where a runner's kiln stands against the server's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "standing", rename_all = "snake_case")]
 pub enum Skew {
     /// Not weighed yet: it hasn't said its commit since it connected (it does at once).
@@ -284,7 +285,7 @@ impl Hub {
         // Its legs: none while it's to be upgraded (CI's dispatch counts no slots for it).
         self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_owned() });
         self.wake.notify();
-        self.emit(&serde_json::json!({ "type": "updates" }));
+        self.emit(&crate::wire::events::ServerEvent::Updates);
     }
 
     /// Every connected runner process weighed again (the tolerances changed).

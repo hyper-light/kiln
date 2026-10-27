@@ -107,7 +107,7 @@ async fn set(cx: Cx, v: Value) -> Out {
     super::save_settings(&cx.hub, &id, &s).await.map_err(failed)?;
     drop(writing);
     cx.hub.store.audit(cx.caller.name.clone(), "programs.set".into(), id.clone()).await;
-    cx.hub.emit(&json!({"type": "program", "program": id}));
+    cx.hub.emit(&crate::wire::events::ServerEvent::Program { program: id.clone() });
     json_of(&program(&cx, &id).await?)
 }
 
@@ -215,7 +215,7 @@ async fn assign(cx: Cx, v: Value) -> Out {
     super::save_assignments(&cx.hub.store, &id, &all).await.map_err(failed)?;
     drop(writing);
     cx.hub.store.audit(cx.caller.name.clone(), "programs.assign".into(), format!("{id} {track}")).await;
-    cx.hub.emit(&json!({"type": "program", "program": id}));
+    cx.hub.emit(&crate::wire::events::ServerEvent::Program { program: id.clone() });
     json_of(&program(&cx, &id).await?)
 }
 

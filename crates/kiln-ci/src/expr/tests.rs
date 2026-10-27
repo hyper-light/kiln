@@ -117,6 +117,35 @@ fn w01_s08_kiln_changed_and_bare_names() -> Result<(), ExprError> {
     Ok(())
 }
 
+/// Contexts whose change affects two crates.
+struct Affects;
+
+impl Contexts for Affects {
+    fn get(&self, _: &str) -> Option<Value> {
+        None
+    }
+    fn status(&self) -> StatusView {
+        StatusView::default()
+    }
+    fn affected(&self, ecosystem: &str) -> Result<Vec<String>, ExprError> {
+        Ok(if ecosystem == "cargo" { vec!["kiln".into(), "kiln-ci".into()] } else { Vec::new() })
+    }
+}
+
+/// W24-R17: `affected(ecosystem)` is the kiln dialect's and takes one argument; it's an array of
+/// names where the contexts know them, and an error that says why where they don't.
+#[test]
+fn w24_r17_affected() -> Result<(), ExprError> {
+    assert_eq!(Expr::parse("affected('cargo')", Dialect::Gha).err().map(|e| e.code), Some("KCI5001"));
+    assert_eq!(Expr::parse("affected()", Dialect::Kiln).err().map(|e| e.code), Some("KCI2007"));
+    assert_eq!(Expr::parse("affected('cargo', 'npm')", Dialect::Kiln).err().map(|e| e.code), Some("KCI2008"));
+    assert_eq!(ev_kiln("join(affected('cargo'), ' ')", &Affects)?, Value::str("kiln kiln-ci"));
+    assert_eq!(ev_kiln("contains(affected('cargo'), 'kiln-ci')", &Affects)?, Value::Bool(true));
+    assert_eq!(ev_kiln("toJSON(affected('npm'))", &Affects)?, Value::str("[]"));
+    assert_eq!(ev_kiln("affected('cargo')", &MapContexts::default()).err().map(|e| e.code), Some("KCI2013"));
+    Ok(())
+}
+
 #[test]
 fn w01_ac02_coercion_table() -> Result<(), ExprError> {
     // Rows and columns: null, true, 1, '1', an array, an object. Each array and object is the

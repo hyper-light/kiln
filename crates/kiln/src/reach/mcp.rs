@@ -135,7 +135,8 @@ fn command_schema(waits: bool) -> Value {
         "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
         "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
         "shell": {"type": "string", "description": "A named shell over there: its folder and exported variables carry over between runs that name it."},
-        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment for the command."}
+        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment for the command."},
+        "reuse": {"type": "boolean", "description": "Give back the result of an identical earlier run instead of running again (the same command, folder, environment and machine, over an identical tree; only successes are kept)."}
     });
     if waits && let Some(p) = props.as_object_mut() {
         p.insert("wait_s".into(), json!({"type": "number", "description": "Return after this many seconds even if it is still running (it keeps running in the background; default 600)."}));
@@ -525,7 +526,8 @@ impl Server {
             detach: false,
         };
         let mut client = Client::connect(&self.sock).map_err(|e| format!("{e:#}"))?;
-        client.send(&Req::Run(Box::new(req))).map_err(|e| format!("{e:#}"))?;
+        let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(false);
+        client.send(&if reuse { Req::RunReuse(Box::new(req)) } else { Req::Run(Box::new(req)) }).map_err(|e| format!("{e:#}"))?;
         let id = {
             let mut n = self.next.lock().map_err(|_| "busy".to_owned())?;
             *n += 1;

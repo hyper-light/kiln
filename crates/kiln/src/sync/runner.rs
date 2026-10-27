@@ -71,6 +71,7 @@ enum Input {
 /// the machine the session goes to takes the log that far before the session goes on there, so
 /// it never starts on files older than the ones it left.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Mark {
     pub repo: String,
     pub index: u64,

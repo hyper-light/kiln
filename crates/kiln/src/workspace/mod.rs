@@ -22,17 +22,20 @@ use serde_json::{Value, json};
 
 /// Where an agent works when not in its folder itself (`Spec::workspace`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Workspace {
     /// `volume`: a Slates volume of its own, laid over its folder.
     pub kind: String,
     /// The folder it's laid over: its repository's top (else the folder itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub over: Option<String>,
     /// Its folder within that, relative to it (`crates/kiln`); empty for the top itself.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sub: String,
     /// The volume, once made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub made: Option<slates::Made>,
 }
 

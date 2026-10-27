@@ -421,8 +421,16 @@ pub async fn refresh(hub: &Arc<Hub>, repo_key: &str, workflow: &str, branch: &st
         if hub.store.kv_set(key, kept).await.is_err() {
             continue;
         }
-        let j = l.named(&v);
-        hub.emit(&json!({ "type": "ci_verdict", "repo": repo.name, "workflow": workflow, "branch": branch, "sha": commit, "kind": v.kind, "why": v.why, "verdict": j }));
+        let verdict = l.named(&v);
+        hub.emit(&crate::wire::events::ServerEvent::CiVerdict(Box::new(crate::wire::events::CiVerdict {
+            repo: repo.name.clone(),
+            workflow: workflow.to_owned(),
+            branch: branch.to_owned(),
+            sha: commit.clone(),
+            kind: v.kind,
+            why: v.why.clone(),
+            verdict,
+        })));
         let news = match &before {
             Some(_) => true,
             None => (after..=at).contains(&c),

@@ -6,7 +6,7 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { ArrowDownToLine, MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
-import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type Meta, type State } from "@/api/harness";
+import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type JsonValue, type Meta, type State } from "@/api/harness";
 import { formatBytes } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
@@ -54,7 +54,7 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
   const v = valueOf(c, state);
   const [text, setText] = React.useState(typeof v === "string" ? v : "");
   const [option, setOption] = React.useState("");
-  const set = (value: unknown, dangerous?: boolean) =>
+  const set = (value: JsonValue, dangerous?: boolean) =>
     confirm(dangerous ?? c.dangerous, `${c.label}?`, c.description ?? "This can't be undone from kiln.", () => send({ type: "control", id: c.id, value }));
   return (
     <div className="hx-ctl">
@@ -105,7 +105,7 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
             onSubmit={(e) => {
               e.preventDefault();
               const chosen = c.options?.find((o) => o.id === option) ?? c.options?.[0];
-              set(c.options?.length ? { option: chosen?.id, text } : text, chosen?.dangerous);
+              set(c.options?.length ? (chosen ? { option: chosen.id, text } : { text }) : text, chosen?.dangerous);
               setText("");
             }}
           >

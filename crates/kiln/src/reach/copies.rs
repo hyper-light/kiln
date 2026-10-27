@@ -185,7 +185,7 @@ impl Copies {
         };
         if changed {
             self.save().await;
-            hub.emit(&json!({ "type": "keep" }));
+            hub.emit(&crate::wire::events::ServerEvent::Keep);
         }
         let asked = self.asked.lock().get(runner).copied().unwrap_or(0);
         serde_json::to_value(Answer { set, asked }).unwrap_or_default()

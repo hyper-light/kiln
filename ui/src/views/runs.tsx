@@ -3,12 +3,12 @@ import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ChartLine, GitBranch, Search, Activity } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Run, Status } from "@/api/types";
+import type { RunRow, Status } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { EmptyState, ErrorState, PageIntro, SelectField } from "@/components/ui/misc";
+import { EmptyState, ErrorState, FilterBar, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { reposRes, useRepos, warm } from "@/lib/data";
@@ -34,7 +34,7 @@ const STATUS_GROUPS: Record<StatusFilter, Status[] | null> = {
 };
 
 /** The facets the list filters by (W21-R03), each a URL parameter of its own, comma-separated. */
-const FACETS: { id: "repo" | "workflow" | "event" | "branch" | "author" | "runner" | "executor"; label: string; of: (r: Run) => string[] }[] = [
+const FACETS: { id: "repo" | "workflow" | "event" | "branch" | "author" | "runner" | "executor"; label: string; of: (r: RunRow) => string[] }[] = [
   { id: "repo", label: "Repository", of: (r) => [r.repo_name] },
   { id: "workflow", label: "Workflow", of: (r) => [r.pipeline] },
   { id: "event", label: "Event", of: (r) => [r.event] },
@@ -87,7 +87,7 @@ export default function Runs() {
 /** Older pages of one list (`key`: the repository filter they belong to). */
 interface Older {
   key: string;
-  runs: Run[];
+  runs: RunRow[];
   hasMore: boolean | null;
   loading: boolean;
   error: string | null;
@@ -182,7 +182,7 @@ function RunsBody() {
   // A repository may be chosen by its id (an older link): its name is what rows carry.
   const named = (f: (typeof FACETS)[number], v: string) => (f.id === "repo" ? (repos.find((r) => r.id === v)?.name ?? v) : v);
   const passes = React.useCallback(
-    (r: Run, except?: string) =>
+    (r: RunRow, except?: string) =>
       FACETS.every((f) => f.id === except || !chosen[f.id]?.length || (chosen[f.id] ?? []).some((v) => f.of(r).includes(named(f, v)))) &&
       (!words || [r.message, r.branch, r.pipeline, r.sha, r.author, r.repo_name].some((x) => x.toLowerCase().includes(words))),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -397,9 +397,11 @@ function RunsToolbar({
   sort: Sort;
   onSort: (v: Sort) => void;
 }) {
+  // The status strip, then the filter and the sort: they share its line while they keep 480 px.
   return (
-    <div className="mb-5 flex flex-wrap items-end gap-3">
+    <div className="mb-5 flex flex-wrap items-center gap-2.5">
       <Segmented
+        size="bar"
         label="Filter by status"
         value={status}
         onChange={onStatus}
@@ -411,19 +413,10 @@ function RunsToolbar({
           { value: "cancelled", label: "Cancelled", count: counts?.cancelled },
         ]}
       />
-      <div className="ml-auto flex w-full flex-wrap gap-3 sm:w-auto">
-        <FacetBox
-          className="min-w-0 flex-1 sm:w-80 sm:flex-none"
-          label="Filter runs"
-          placeholder="Repository, workflow, branch, event, author, or words…"
-          query={query}
-          onQuery={onQuery}
-          facets={facets}
-          chosen={chosen}
-          onChosen={onChosen}
-        />
-        <SelectField label="Sort" hideLabel className="min-w-0 sm:w-40" value={sort} onChange={(v) => onSort(v as Sort)} options={SORTS} />
-      </div>
+      <FilterBar className="min-w-0 flex-[1_1_480px]">
+        <FacetBox label="Filter runs" placeholder="Repository, workflow, branch, event, author, or words…" query={query} onQuery={onQuery} facets={facets} chosen={chosen} onChosen={onChosen} />
+        <SelectField label="Sort" hideLabel value={sort} onChange={(v) => onSort(v as Sort)} options={SORTS} />
+      </FilterBar>
     </div>
   );
 }

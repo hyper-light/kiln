@@ -116,6 +116,7 @@ impl Instance {
 
 /// An instance as the UI shows it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct InstanceView {
     pub id: String,
     pub legacy: bool,

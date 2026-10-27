@@ -11,8 +11,10 @@
 #            the binary by rust-embed), and ui/dist/embed: the UI server (ui/dist/server) and the Bun
 #            that runs it, pinned in vendor/bun, packed for the binary to carry
 #   build  – static musl kiln binary (cargo registry + target dir are BuildKit cache mounts)
-#   final  – alpine with git/bash/ssh (the server shells out to git; the terminal needs a shell),
-#            and helm and kustomize, which render apps for Deployments (docs/cd.md)
+#   runtime  – alpine with git/bash/ssh (the server shells out to git; the terminal needs a shell),
+#              and helm and kustomize, which render apps for Deployments (docs/cd.md)
+#   prebuilt – runtime with a static kiln built outside (`--target prebuilt`, W28-R78)
+#   final    – runtime with the `build` stage's kiln (the default)
 
 ARG NODE_IMAGE=node:24-alpine
 ARG RUST_IMAGE=rust:1-alpine
@@ -75,17 +77,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cp "target/$triple/release/kiln" /out/kiln; \
     if readelf -l /out/kiln | grep -q 'INTERP'; then echo "kiln is not static" >&2; exit 1; fi
 
-# ------------------------------------------------------------------------- final
-FROM ${RUNTIME_IMAGE}
+# ----------------------------------------------------------------------- runtime
+# What both images below share: alpine with git/bash/ssh (the server shells out to git; the terminal
+# needs a shell), helm and kustomize (they render apps for Deployments, docs/cd.md), its user and
+# its configuration; everything but kiln itself.
+FROM ${RUNTIME_IMAGE} AS runtime
 RUN set -eux; \
     apk add --no-cache git bash openssh-client ca-certificates tzdata curl less ncurses-terminfo-base helm kustomize; \
     addgroup -S -g 10001 kiln; \
     adduser -S -D -H -u 10001 -G kiln -h /var/lib/kiln -s /bin/bash kiln; \
     mkdir -p /etc/kiln /var/lib/kiln /cache; \
     chown kiln:kiln /var/lib/kiln /cache
-# Real file at /usr/local/bin/kiln: job pods' initContainer copies it (`cp /usr/local/bin/kiln …`).
-COPY --from=build /out/kiln /usr/local/bin/kiln
-RUN ln -s /usr/local/bin/kiln /kiln
 COPY --chmod=0644 deploy/docker/kiln.toml /etc/kiln/kiln.toml
 # Nothing for the UI server: the binary carries it (Bun with the musl runtime it needs, and its
 # files) and unpacks it into /var/lib/kiln/ui-server/ the first time the server starts.
@@ -93,6 +95,31 @@ COPY --chmod=0644 deploy/docker/kiln.toml /etc/kiln/kiln.toml
 ENV KILN_CONFIG=/etc/kiln/kiln.toml \
     KILN_DATA_DIR=/var/lib/kiln \
     HOME=/var/lib/kiln
+
+# ---------------------------------------------------------------------- prebuilt
+# The image from a static kiln built outside it (docs/ci.md W28-R78): kiln's image job takes
+# release's x86_64-unknown-linux-musl build, `docker build --target prebuilt --build-arg
+# KILN_BINARY=dist/kiln-x86_64-unknown-linux-musl .`, until W24-R29's operations replace BuildKit.
+FROM runtime AS prebuilt
+ARG KILN_BINARY=dist/kiln-x86_64-unknown-linux-musl
+# Real file at /usr/local/bin/kiln: job pods' initContainer copies it (`cp /usr/local/bin/kiln …`).
+COPY --chmod=0755 ${KILN_BINARY} /usr/local/bin/kiln
+# It runs here, on alpine's musl, or the image isn't made.
+RUN ln -s /usr/local/bin/kiln /kiln && /usr/local/bin/kiln --version
+USER 10001:10001
+WORKDIR /var/lib/kiln
+EXPOSE 7070/tcp 7071/udp
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1:7070/healthz || exit 1
+ENTRYPOINT ["/kiln", "supervise", "--"]
+CMD ["server"]
+
+# ------------------------------------------------------------------------- final
+# The image built from source, as `docker build .` makes it (the last stage).
+FROM runtime
+# Real file at /usr/local/bin/kiln: job pods' initContainer copies it (`cp /usr/local/bin/kiln …`).
+COPY --from=build /out/kiln /usr/local/bin/kiln
+RUN ln -s /usr/local/bin/kiln /kiln
 
 USER 10001:10001
 WORKDIR /var/lib/kiln

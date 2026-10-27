@@ -214,6 +214,62 @@ said as `kiln_runner_net_frames_dropped{runner,lane,reason}`. A frame QUIC took 
 connection isn't counted here: the channel resends it after the reconnect, as it does what the
 queue let go.
 
+## What can't be read
+
+A message a wire can't read is refused to its sender, typed, and noted in one place
+(`crate::wire::unread`), as one record, `Unread`. It holds the wire, where the message came from,
+what it was, a code, and why. Where it came from is a runner and its instance (before its Hello:
+its certificate and address), a person, an agent session, or an address. What it was is a
+variant's index, a tag, a method or a tool, never what it said. An unknown field in a known
+message isn't refused: that's how peers of different versions work together.
+
+| Code | When | On the channel and in the UI's nacks |
+|---|---|---|
+| `unknown` | A kind of message this build doesn't know: a newer peer's. | `unsupported` |
+| `malformed` | It couldn't be read: cut short, bytes left over, too large, out of order, or not this sender's link. | `malformed` |
+
+Each refusal noted:
+- is counted in `kiln_wire_refused_total{wire,code}`. Every series is there from the start, and
+  no label names the sender;
+- is kept for its sender's page, and for the agent session it's about when it's about one: how
+  many by wire and code, and the newest 16, for at most 4,096 senders (the least recent let go
+  first). The runner record (`GET /api/agents`) and an agent session's info carry them as
+  `refused`, and the UI's `agent` and `harness` events say when they change;
+- is written to the audit log as `security.wire_refused`: its sender as the principal, the wire as
+  the target, the code as the result, and what and why as the detail, 512 bytes at most. The
+  first for a sender, wire and code in a minute is written at once, and the rest as one row a
+  minute saying how many;
+- is told to its sender, 16 a second each at most: the rest are counted and folded into the next.
+
+What each wire's sender is told today. No wire notes its refusals here yet: the later steps of
+the typed-messages plan move each one onto `Refusals::note` and fill in its row. "Nothing yet":
+what it can't read is let go as before.
+
+| Wire | What it carries | Its sender is told |
+|---|---|---|
+| `runner` | A runner's frames, as the server reads them. | Nothing yet. |
+| `server` | The server's frames, as a runner reads them. | Nothing yet. |
+| `runner_item` | The items of a runner's channel streams, as the server reads them. | A NACK, `malformed`. |
+| `server_item` | The items of the server's channel streams, as a runner reads them. | A NACK, `malformed`. |
+| `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | Nothing yet: its item is answered as taken. |
+| `server_payload` | The JSON the server's frame carries (a session's commands), as a runner reads it. | Nothing yet. |
+| `relay` | What runners send the server's relay for one another. | Nothing yet. |
+| `reach_link` | What a runner reads inside a reach link, from the runner at its other end. | Nothing yet: the link ends. |
+| `session_up` | The session socket: what a page sends up. | A nack, `malformed`. |
+| `session_down` | The session socket: what a page couldn't read of what came down. | Nothing yet. |
+| `terminal_up` | A terminal's socket (a session's, a runner's, a CI leg's): what a page sends up. | Nothing yet. |
+| `terminal_down` | A terminal's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `stream_up` | A stream's socket: what a page sends up. | Nothing yet. |
+| `stream_down` | A stream's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `events_up` | The events socket: what a page sends up. | Nothing yet. |
+| `events_down` | The events socket: what a page couldn't read of what came down. | Nothing yet. |
+| `log_up` | A log's socket: what a page sends up. | Nothing yet. |
+| `log_down` | A log's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `tunnel_up` | A tunnel's socket: what a page sends up. | Nothing yet. |
+| `tunnel_down` | A tunnel's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `mcp_http` | kiln's MCP endpoint, over HTTP. | Nothing yet. |
+| `mcp_reach` | kiln's MCP calls a runner makes through reach. | Nothing yet. |
+
 ## Revisions
 
 Each of the server's copies of a session counts the updates it takes: its revision (`rev`). The
@@ -314,8 +370,9 @@ takes a new bit, never one that means something already, even in the other direc
 | 33 | `CAP_NET_DROPS` | `ServerMsg::Caps` | the server takes what a runner's QUIC layer dropped (`NetDrops`) |
 | 34 | `CAP_INBOX` | `AgentMsg::Caps` | the runner's inbox takes `HarnessSend` (T3, CP-T3.2) |
 | 35 | `CAP_HANDOVER` | `AgentMsg::Caps`, `ServerMsg::Caps` | hand-overs between a machine's runner processes: an older one hands its sessions to the newest (`HarnessHandOver`, `HarnessAdopted`, `HandedOver`; releases.md, "One runner a machine") |
+| 36 | `CAP_WORK` | `AgentMsg::Caps`, `ServerMsg::Caps` | warm workspaces for placement: the runner says what it holds warm, the server takes it (`WorkState`; ci.md W24-R18) |
 
-Bits from 36 are free. Take the next one, and add its row here in the same change.
+Bits from 37 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 
@@ -414,6 +471,7 @@ Four edges are left, and the lab steers clear of each:
 | `NetDrops` | telemetry | What the runner's QUIC layer let go before it reached the wire, by lane and reason, counted from its start: each supersedes the last ("Loss below the channel"). | Sent with its samples once it changed, to a server announcing `CAP_NET_DROPS`. |
 | `HarnessHandOver` | stream | An agent session packed for the machine's newest runner process, in pieces: the server passes it on as `HarnessPackage`. | New: to a server announcing `CAP_HANDOVER`, on the conversation lane. |
 | `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
+| `WorkState` | state | What the runner holds warm: each lane's workspaces and how long its legs took there, for placement (ci.md W24-R18). Each supersedes the last. | New: with its samples once it changed, and every 10 minutes, to a server announcing `CAP_WORK`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -587,6 +645,15 @@ what was refused, and why.
 A command over the API under an `Idempotency-Key` is taken once the same way; the UI makes a key
 for each. A message there is its inbox's to take once (CP-T3.2). A server that restarts lets go of
 its ids, so a command sent again to it goes on again. A message's inbox still takes it once.
+
+Each socket's frames are a Rust type each way, and the server builds what it sends from them:
+`crate::wire::ui` for the session, terminal, stream and log sockets (`SessionDown` and `SessionUp`
+for a session's, its `ack` and `nack` among them), `crate::wire::events::ServerEvent` for
+`/api/events`. The UI reads them, and the `Command`s, `Update`s and runner records they carry, as
+TypeScript made from those types with ts-rs, checked in under `ui/src/api/wire/`; it writes no copy
+of its own. `cargo test -p kiln wire::ts` fails, naming the file and its first difference, when a
+type changes without its file, and `KILN_WRITE_TS=1 cargo test -p kiln wire::ts` writes them. Both
+CIs typecheck the UI against them.
 
 | Socket | Way | Message | Class | Why | Today |
 |---|---|---|---|---|---|

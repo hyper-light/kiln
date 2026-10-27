@@ -76,6 +76,17 @@ impl Kind {
         }
     }
 
+    /// What the events socket calls it ([`Kind::event`]).
+    pub fn notice(self) -> crate::wire::events::AgentNoticeKind {
+        use crate::wire::events::AgentNoticeKind;
+        match self {
+            Kind::NeedsYou => AgentNoticeKind::NeedsYou,
+            Kind::Finished => AgentNoticeKind::Finished,
+            Kind::Stopped => AgentNoticeKind::Stopped,
+            Kind::Paused => AgentNoticeKind::Paused,
+        }
+    }
+
     pub fn of_event(e: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|k| k.event() == e)
     }

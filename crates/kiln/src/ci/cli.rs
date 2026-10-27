@@ -1197,12 +1197,16 @@ pub struct RerunArgs {
     /// (`reuse:`, docs/ci.md W08-R10).
     #[arg(long)]
     no_reuse: bool,
+    /// Run cold (docs/ci.md W24-R23): no leg reuses an earlier result, starts from kept folders or
+    /// restores a cache.
+    #[arg(long)]
+    cold: bool,
 }
 
 pub async fn rerun(args: RerunArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     let mode = if args.failed { "failed" } else if args.job.is_some() { "job" } else { "all" };
-    let body = json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions, "keep_failed": args.keep_failed, "no_reuse": args.no_reuse });
+    let body = json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions, "keep_failed": args.keep_failed, "no_reuse": args.no_reuse, "cold": args.cold });
     let v = api.call(Method::Post, &format!("/runs/{}/rerun", enc(&args.run)), Some(body)).await?;
     match v.get("attempt").and_then(Value::as_i64) {
         Some(a) => println!("attempt {a} of run {} started", args.run),

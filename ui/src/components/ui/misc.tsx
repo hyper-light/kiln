@@ -230,7 +230,7 @@ export const SearchField = React.forwardRef<
   HTMLInputElement,
   { value: string; onChange: (v: string) => void; placeholder?: string; label: string; className?: string }
 >(({ value, onChange, placeholder, label, className }, ref) => (
-  <div className={cn("field", className)}>
+  <div className={cn("field search-field", className)}>
     <Search size={15} aria-hidden="true" />
     <input
       ref={ref}
@@ -241,18 +241,28 @@ export const SearchField = React.forwardRef<
       aria-label={label}
     />
     {value && (
-      <button
-        type="button"
-        onClick={() => onChange("")}
-        aria-label={`Clear ${label.toLowerCase()}`}
-        className="grid size-10 shrink-0 place-items-center text-[#9499a5] hover:text-white"
-      >
+      <button type="button" onClick={() => onChange("")} aria-label={`Clear ${label.toLowerCase()}`} className="field-clear">
         <X size={14} />
       </button>
     )}
   </div>
 ));
 SearchField.displayName = "SearchField";
+
+/**
+ * A filter or search field and what stands beside it, all one height (--field-h): the field takes
+ * the room left, a select beside it --companion-w (200 px; 150 px in a bar under 520 px). `aside` (a
+ * count, a download) ends the bar, or goes under it once the bar is narrow. On a phone an open filter
+ * field spans the bar.
+ */
+export function FilterBar({ children, aside, className }: { children: React.ReactNode; aside?: React.ReactNode; className?: string }) {
+  return (
+    <div className={cn("filter-bar", className)}>
+      <div className="filter-bar-row">{children}</div>
+      {aside && <div className="filter-bar-aside">{aside}</div>}
+    </div>
+  );
+}
 
 export function TextField({
   label,
@@ -292,7 +302,7 @@ export function SelectField({
 }) {
   const id = React.useId();
   return (
-    <div className={className}>
+    <div className={cn("select-field", className)}>
       <label htmlFor={id} className={hideLabel ? "sr-only" : "field-label"}>
         {label}
       </label>

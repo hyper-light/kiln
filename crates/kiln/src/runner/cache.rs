@@ -82,7 +82,7 @@ impl Local {
     }
 
     /// A chunk it holds, touched (it's the newest used now).
-    fn get(&self, digest: &str) -> Option<Vec<u8>> {
+    pub(crate) fn get(&self, digest: &str) -> Option<Vec<u8>> {
         let p = self.path(digest);
         let data = std::fs::read(&p).ok()?;
         (hex::encode(Sha256::digest(&data)) == digest).then(|| {
@@ -93,7 +93,7 @@ impl Local {
         })
     }
 
-    fn put(&self, digest: &str, data: &[u8]) -> std::io::Result<()> {
+    pub(crate) fn put(&self, digest: &str, data: &[u8]) -> std::io::Result<()> {
         let p = self.path(digest);
         if p.is_file() {
             return Ok(());
@@ -386,9 +386,80 @@ pub async fn save(svc: &Service<'_>, key: &str, version: &str, scope: &str, loca
     Ok(Some(Saved { chunks: list.len(), uploaded, size }))
 }
 
+/// Where this runner keeps one of a job's v1 `cache:` folders (docs/ci.md W02-R06, W24-R11):
+/// `<work>/_kept/<repository>/<job>/<folder>`, each name hashed.
+pub fn kept_at(work: &Path, repo: &str, job: &str, dir: &str) -> PathBuf {
+    let h = |s: &str| -> String { crate::util::sha256_hex(s.as_bytes()).chars().take(16).collect() };
+    work.join("_kept").join(h(repo)).join(h(job)).join(h(dir))
+}
+
+/// Puts a kept folder in place for a leg. A trusted leg's is what the job's last leg on this
+/// runner kept, moved rather than copied; an untrusted leg's starts empty. Says which.
+pub fn put_kept(kept: &Path, at: &Path, trusted: bool) -> anyhow::Result<&'static str> {
+    use anyhow::Context as _;
+    if let Some(parent) = at.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    if trusted && kept.is_dir() {
+        if std::fs::symlink_metadata(at).is_ok() {
+            remove_any(at).with_context(|| format!("clear {}", at.display()))?;
+        }
+        std::fs::rename(kept, at).with_context(|| format!("move {} into place", kept.display()))?;
+        return Ok("restored from this runner");
+    }
+    std::fs::create_dir_all(at).with_context(|| format!("create {}", at.display()))?;
+    Ok(if trusted { "empty: nothing kept here yet" } else { "empty: an untrusted leg gets no kept folders" })
+}
+
+/// Keeps a trusted leg's folder for the job's next leg on this runner, in place of what was kept.
+/// `false` when the leg left no folder there.
+pub fn keep(at: &Path, kept: &Path) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    if !std::fs::symlink_metadata(at).is_ok_and(|m| m.is_dir()) {
+        return Ok(false);
+    }
+    if let Some(parent) = kept.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    if std::fs::symlink_metadata(kept).is_ok() {
+        remove_any(kept).with_context(|| format!("clear {}", kept.display()))?;
+    }
+    std::fs::rename(at, kept).with_context(|| format!("keep {}", at.display()))?;
+    Ok(true)
+}
+
+fn remove_any(p: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(p)?.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w24_r11_v1_dirs_are_kept_for_trusted_legs_only() -> anyhow::Result<()> {
+        let d = tempfile::tempdir()?;
+        let kept = kept_at(d.path(), "acme/app", "build", "target");
+        let (one, two, three) = (d.path().join("w/1/target"), d.path().join("w/2/target"), d.path().join("w/3/target"));
+        // The job's first leg starts empty and writes; its folder is kept after its steps.
+        assert_eq!(put_kept(&kept, &one, true)?, "empty: nothing kept here yet");
+        std::fs::write(one.join("f"), "first")?;
+        assert!(keep(&one, &kept)?);
+        // The job's next trusted leg reads what the first wrote, and keeps it again.
+        assert_eq!(put_kept(&kept, &two, true)?, "restored from this runner");
+        assert_eq!(std::fs::read_to_string(two.join("f"))?, "first");
+        assert!(keep(&two, &kept)?);
+        // An untrusted leg sees none of it, and what it writes never reaches the kept folder.
+        assert_eq!(put_kept(&kept, &three, false)?, "empty: an untrusted leg gets no kept folders");
+        assert!(!three.join("f").exists());
+        std::fs::write(three.join("poison"), "x")?;
+        assert!(kept.join("f").exists() && !kept.join("poison").exists());
+        // Each repository, job and folder has its own.
+        assert_ne!(kept, kept_at(d.path(), "acme/other", "build", "target"));
+        assert_ne!(kept, kept_at(d.path(), "acme/app", "test", "target"));
+        assert_ne!(kept, kept_at(d.path(), "acme/app", "build", "node_modules"));
+        Ok(())
+    }
 
     #[test]
     fn w08_r09_archive_round_trip() -> anyhow::Result<()> {

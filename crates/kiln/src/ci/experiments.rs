@@ -96,6 +96,8 @@ pub struct Run {
 
 /// Who chose a variant, and when.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "ExperimentDecision"))]
 #[serde(default)]
 pub struct Decision {
     pub variant: String,
@@ -188,7 +190,7 @@ async fn save(hub: &Hub, e: &mut Experiment) {
     {
         tracing::warn!(experiment = %e.id, error = %format!("{err:#}"), "an experiment couldn't be kept");
     }
-    hub.emit(&json!({ "type": "experiment", "repo": e.repo, "experiment": { "id": e.id, "repo": e.repo, "state": e.state, "measured": e.runs.iter().filter(|r| r.conclusion.is_some()).count(), "runs": planned(e) } }));
+    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: Some(e.runs.iter().filter(|r| r.conclusion.is_some()).count()), runs: Some(planned(e)), decision: None }) });
 }
 
 /// The runs an experiment plans: each buildable variant, each pass/fail criterion, each round.
@@ -233,7 +235,7 @@ async fn record_decision(hub: &Hub, e: &mut Experiment, d: Decision) {
         let _ = hub.store.kv_set(decision_key(&e.id), text).await;
     }
     e.decision = Some(d);
-    hub.emit(&json!({ "type": "experiment", "repo": e.repo, "experiment": { "id": e.id, "repo": e.repo, "state": e.state, "decision": e.decision } }));
+    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: None, runs: None, decision: e.decision.clone() }) });
 }
 
 /// The next experiment's id: `E1`, `E2`, ….
@@ -1075,7 +1077,7 @@ pub async fn cancel(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fa
             let _ = super::runs_api::cancel(hub, run).await;
         }
     }
-    hub.emit(&json!({ "type": "experiment", "repo": e.repo, "experiment": { "id": e.id, "repo": e.repo, "state": e.state } }));
+    hub.emit(&crate::wire::events::ServerEvent::Experiment { repo: e.repo.clone(), experiment: Box::new(crate::wire::events::ExperimentBrief { id: e.id.clone(), repo: e.repo.clone(), state: e.state.clone(), measured: None, runs: None, decision: None }) });
     hub.store.audit(caller.name.clone(), "experiments.cancel".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })))
 }

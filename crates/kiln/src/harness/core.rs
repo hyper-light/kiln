@@ -118,6 +118,7 @@ pub const MAX_EVENTS: usize = 4_000;
 
 /// A change for the UI (and for the server's mirror of a machine's session).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Update {
     /// A session appeared, or is announced again after a reconnect (a snapshot follows). `since`:
@@ -126,6 +127,7 @@ pub enum Update {
     Open {
         info: Box<super::session::Info>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         since: Option<u64>,
     },
     /// The session is gone.
@@ -149,6 +151,7 @@ pub enum Update {
     /// rewind's). None: from the start.
     Reset {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         from: Option<u64>,
     },
 }

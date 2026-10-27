@@ -56,7 +56,8 @@ export const recentRunsRes = (limit: number): Res<Run[]> => ({ key: `runs/recent
 export function useOverview() {
   const ov = useRes(overviewRes);
   useServerEvents((ev) => {
-    if (ev.type === "queue") ov.setData((d) => ({ ...d, queue: { queued: ev.queued, running: ev.running } }));
+    // `queue` also says where a land queue's entry is: the counts are the scheduler's.
+    if (ev.type === "queue" && "queued" in ev) ov.setData((d) => ({ ...d, queue: { queued: ev.queued, running: ev.running } }));
     else if (ev.type === "sample" && ev.agent === "server") ov.setData((d) => ({ ...d, system: { ...d.system, sample: ev.sample } }));
   });
   return ov;

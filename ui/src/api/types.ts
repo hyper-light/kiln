@@ -1,8 +1,34 @@
-import type { AgentInfo } from "./harness";
+import type { CdLogLine, CdStatus, HostSample, Job, Run, InstanceView as RunnerInstance, RunStatus as Status, UpdateJob } from "./wire";
+export type {
+  AgentLive as Agent,
+  Battery,
+  CdLogDown,
+  CdLogLine,
+  CdOperation,
+  CdStatus,
+  HostSample,
+  Job,
+  LogDown as LogControlFrame,
+  NetDrop,
+  PlannedJob,
+  Run,
+  RunnerFacts,
+  InstanceView as RunnerInstance,
+  ServerEvent,
+  RunStatus as Status,
+  JobStep as Step,
+  StepSpec,
+  TerminalDown as TerminalControlFrame,
+  TerminalSessionInfo,
+  TerminalUp,
+  UpdateJob,
+} from "./wire";
 // Types mirror docs/api.md (and crates/kiln/src/store.rs). Timestamps are unix
 // seconds unless the field name ends in `_ms`. Ids are opaque strings.
 
-export type Status = "pending" | "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped" | "timed_out";
+/** A run as `GET /api/runs` lists it: with the runners and executors its legs ran on (W21-R03's
+ *  facets, `Store::run_hosts`). */
+export type RunRow = Run & { runners?: string[]; executors?: string[] };
 
 export const STATUSES: Status[] = ["pending", "queued", "running", "succeeded", "failed", "cancelled", "skipped", "timed_out"];
 
@@ -41,200 +67,7 @@ export interface Repo {
   mode?: string;
 }
 
-export interface Run {
-  id: string;
-  repo_id: string;
-  repo_name: string;
-  number: number;
-  pipeline: string;
-  event: RunEvent | string;
-  branch: string;
-  sha: string;
-  message: string;
-  author: string;
-  status: Status;
-  created_at: number;
-  started_at: number | null;
-  finished_at: number | null;
-  error: string | null;
-  concurrency_group: string | null;
-  /** The runners and executors its legs ran on (the runs list's facets). */
-  runners?: string[];
-  executors?: string[];
-}
-
-export interface Step {
-  idx: number;
-  name: string;
-  status: Status;
-  started_at: number | null;
-  finished_at: number | null;
-  exit_code: number | null;
-  /** The order it started in (CI legs): steps that start in the same second keep it. */
-  seq?: number | null;
-}
-
-export interface StepSpec {
-  name?: string | null;
-  run: string;
-  shell?: string | null;
-  env?: Record<string, string>;
-  "working-directory"?: string | null;
-  "timeout-minutes"?: number | null;
-  "continue-on-error"?: boolean;
-  tty?: boolean;
-}
-
-export interface PlannedJob {
-  key: string;
-  spec_id: string;
-  display: string;
-  needs: string[];
-  labels: string[];
-  image: string | null;
-  toolchain: string | null;
-  env: Record<string, string>;
-  timeout_minutes: number;
-  retries: number;
-  exclusive: boolean;
-  resources: { cpu: string | null; memory: string | null };
-  artifacts: string[];
-  cache: string[];
-  condition: string | null;
-  steps: StepSpec[];
-}
-
 export type Executor = "baremetal" | "k8s";
-
-export interface Job {
-  id: string;
-  run_id: string;
-  key: string;
-  display: string;
-  status: Status;
-  labels: string[];
-  /** job keys */
-  needs: string[];
-  agent: string | null;
-  executor: Executor | null;
-  attempt: number;
-  queued_at: number | null;
-  started_at: number | null;
-  finished_at: number | null;
-  exit_code: number | null;
-  error: string | null;
-  /** bytes */
-  peak_rss: number | null;
-  cpu_seconds: number | null;
-  steps: Step[];
-  spec?: PlannedJob;
-  /** A CI matrix leg's values, by axis. */
-  matrix?: Record<string, unknown>;
-}
-
-export interface HostSample {
-  ts_ms: number;
-  cpu_pct: number;
-  cpus: number;
-  load1: number;
-  mem_total: number;
-  mem_used: number;
-  disk_total: number;
-  disk_used: number;
-  /** cumulative byte counters */
-  net_rx: number;
-  net_tx: number;
-  procs: number;
-}
-
-/** A machine's battery, when it has one (its runner says, about once a minute). */
-export interface Battery {
-  /** How full, 0–100. */
-  percent: number;
-  /** It runs on its charger (false: on battery). */
-  ac: boolean;
-  charging: boolean;
-  /** Minutes left on battery, when the machine says. */
-  minutes?: number | null;
-}
-
-export interface Agent {
-  name: string;
-  labels: string[];
-  slots: number;
-  hostname: string;
-  os: string;
-  arch: string;
-  version: string;
-  ephemeral: boolean;
-  connected: boolean;
-  last_seen: number;
-  enrolled_at: number;
-  /** job ids */
-  running: string[];
-  busy: number;
-  draining: boolean;
-  sample: HostSample | null;
-  /** Its battery, when it has one. */
-  battery?: Battery | null;
-  /** What its QUIC layer let go before the wire, by lane and reason, as it last said; and what the server's let go of what it had for it (docs/wire.md, "Loss below the channel"). */
-  dropped?: NetDrop[];
-  dropped_toward?: NetDrop[];
-  /** While a new runner replaces an old one without a restart: both processes, newest first. */
-  instances?: RunnerInstance[];
-  /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
-  outpost?: boolean;
-  /** What its probes found and its administrator declared (docs/ci.md W13-R01, R02): what routing decides over. */
-  facts?: RunnerFacts;
-}
-
-/** Frames a QUIC layer let go of one lane, for one reason: shed, stuck, refused, closed, ended or chaos. */
-export interface NetDrop {
-  lane: string;
-  reason: string;
-  frames: number;
-}
-
-/** A runner's facts (kiln_ci::facts::RunnerFacts). */
-export interface RunnerFacts {
-  os: string;
-  os_version: string | null;
-  os_distro: string | null;
-  kernel: string | null;
-  arch: string;
-  cpu: { model: string | null; cores: number; threads: number; flags: string[] };
-  mem: { total: number; free: number };
-  disk: { total: number; free: number };
-  gpus: { vendor: string; model: string; memory: number; driver: string | null }[];
-  virt: { kvm: boolean; hvf: boolean; nested: boolean };
-  executors: Record<string, { version: string | null; details: Record<string, string> }>;
-  binfmt: string[];
-  tools: Record<string, string>;
-  net: { egress: boolean; proxy: string | null };
-  custom: Record<string, string>;
-  probed_at: number;
-}
-
-/** One runner process of a machine (see `crates/kiln/src/instances.rs`). */
-export interface RunnerInstance {
-  /** "legacy" for a runner from before instances. */
-  id: string;
-  legacy: boolean;
-  version: string;
-  created_at: number;
-  connected_at: number;
-  pid: number | null;
-  /** New work goes here. */
-  newest: boolean;
-  /** What it still holds (for an older one: what keeps it running). */
-  terminals: number;
-  agents: number;
-  jobs: number;
-  /** The build it runs (start of its binary's SHA-256); null for runners too old to say. */
-  build?: string | null;
-  /** It takes upgrade commands; older runners are upgraded through a terminal instead. */
-  can_upgrade?: boolean;
-}
 
 export type ChildState = "starting" | "running" | "restarting" | "stopped" | "finished";
 
@@ -553,51 +386,6 @@ export interface NewRepo {
   poll_seconds?: number;
 }
 
-/* ---------------------------- WebSocket frames ---------------------------- */
-
-export type ServerEvent =
-  | { type: "resync" }
-  | { type: "run"; run: Run }
-  | { type: "job"; job: Job }
-  | { type: "agent"; agent: Agent }
-  | { type: "sample"; agent: string; sample: HostSample }
-  | { type: "queue"; queued: number; running: number }
-  | { type: "terminals" }
-  /** Join requests changed: refetch GET /api/join-requests. */
-  | { type: "join_requests" }
-  /** The discovery table changed: refetch GET /api/discovery. */
-  | { type: "discovery" }
-  /** A machine's AI sessions changed: refetch GET /api/ai-sessions. */
-  | { type: "ai_sessions"; machine: string }
-  /** An agent session kiln runs appeared or changed. */
-  | { type: "harness"; info: AgentInfo }
-  /** An agent session kiln ran is gone. */
-  | { type: "harness_closed"; id: string }
-  /** System → Updates changed: refetch GET /api/updates. */
-  | { type: "updates" }
-  /** An upgrade moved on (new output, or it finished). */
-  | { type: "update_job"; job: UpdateJob }
-  /** A runner's front door changed (settings, or what the runner reported): refetch it. */
-  | { type: "front_door"; runner: string }
-  /** The tailnet's DNS for the front doors changed (credential, sync): refetch GET /api/tailscale. */
-  | { type: "tailscale" }
-  /** Apps' statuses changed (batched, at most every 300 ms). */
-  | { type: "cd_apps"; apps: CdStatus[] }
-  /** An app was deleted. */
-  | { type: "cd_app_deleted"; app: string }
-  /** A rollout of an app's object on a target moved on: refetch GET /api/cd/apps/:app/rollout. */
-  | { type: "cd_rollout"; app: string; id: string }
-  /** What machines hold, or a task moving a repository between them, changed: refetch GET /api/places. */
-  | { type: "places" }
-  /** Your notifications changed (a device, a mute, a delivery): refetch GET /api/push and its devices. */
-  | { type: "push" }
-  /** Someone marked notices (`principal`: whose; `tags`: agents whose shown notifications go): notices.ts. */
-  | { type: "notices"; principal: string; keys: string[]; how: "away" | "done" | "seen"; at: number; tags?: string[] }
-  /** An agent's change request opened or moved on (`agents.change`, review, CI): refetch GET /api/harness/changes. */
-  | { type: "agent_change"; agent: string }
-  /** The rules for the copies runners keep of other runners' trees, or what a runner holds of them, changed: refetch GET /api/reach/keep. */
-  | { type: "keep" };
-
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
 export type DnsMode = "resolver" | "authoritative";
@@ -736,32 +524,6 @@ export interface FrontDoorView {
 }
 
 /* ---------------------------- updates (System → Updates) ---------------------------- */
-
-export interface UpdateJob {
-  id: string;
-  kind: "runner" | "server";
-  /** The machine, or "server". */
-  target: string;
-  /** native: the runner's own upgrade command · terminal: through a terminal on an older runner ·
-   * build: the newest kiln built from the server's source (on the machine itself, or on `on`) ·
-   * restart: Kubernetes rollout restart · replace: the server's binary replaced. */
-  method: "native" | "terminal" | "build" | "restart" | "replace";
-  state: "running" | "done" | "failed";
-  started_at: number;
-  ended_at: number | null;
-  from_build: string | null;
-  to_build: string | null;
-  /** The commit it brings the machine to, when kiln knows it. */
-  commit?: string;
-  /** A build's: the machine that builds it, when another than the runner's own; the runner downloads that build. */
-  on?: string;
-  /** The machine reported running to_build. */
-  reached: boolean;
-  log: string[];
-  error: string | null;
-  /** kiln stopped waiting for it: which of the upgrade waits ran out. */
-  timed_out?: "upgrade" | "jobs" | "build";
-}
 
 /** A kiln binary the server can hand out. */
 export interface KilnBinary {
@@ -961,8 +723,6 @@ export interface UpdatesOverview {
   waits?: { now: UpgradeWaits; config: UpgradeWaits; changed: boolean };
 }
 
-export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
-
 /** A live AI coding session (Claude Code, Codex, Gemini CLI) on a machine. */
 export interface AiSession {
   /** The runner it was found on. */
@@ -1003,57 +763,10 @@ export interface AiTranscriptEntry {
   at: string;
 }
 
-/** A terminal session kept by the server (any device can attach to it). */
-export interface TerminalSessionInfo {
-  id: string;
-  /** "local" (the server) or "agent:<machine>" */
-  target: string;
-  command: string | null;
-  /** Window title the program set (OSC 0/2). */
-  title: string;
-  /** The name a person gave it (shown over the title). */
-  name?: string | null;
-  created_at: number;
-  attached: number;
-  cols: number;
-  rows: number;
-  idle_seconds: number;
-  exited: boolean;
-  exit_code: number | null;
-  error: string | null;
-}
-
-export type TerminalControlFrame =
-  | { type: "exit"; code: number | null }
-  | { type: "error"; message: string }
-  /** First frame on every attach: which session this socket is on. */
-  | { type: "session"; session: TerminalSessionInfo }
-  /** The session isn't known (yet): e.g. its machine is reconnecting. Retry by id. */
-  | { type: "missing"; session: string }
-  /** The session's machine dropped; it keeps running there. Reattach by id. */
-  | { type: "reconnect" }
-  /** The session's size changed (the device in use set it): draw at exactly this size. */
-  | { type: "size"; cols: number; rows: number };
-
 /* ---------------------------- deployments (docs/cd.md) ---------------------------- */
 
 export type CdSync = "Synced" | "OutOfSync" | "Unknown";
 export type CdHealth = "Healthy" | "Progressing" | "Degraded" | "Suspended" | "Missing" | "Unknown";
-
-/** An app's sync: the one under way, or the last. */
-export interface CdOperation {
-  id: number;
-  phase: "DryRun" | "Running" | "Failing" | "Terminating" | "Succeeded" | "Failed";
-  trigger: "manual" | "rollback" | "promotion" | "auto" | "self-heal";
-  attempt: number;
-  message: string;
-  /** Who started it, when a person or agent did. */
-  by?: string | null;
-  /** ms since the epoch. */
-  started_ms?: number;
-  /** ms since the epoch, once it finished. */
-  finished_ms?: number | null;
-}
 
 /** A commit as people read it. */
 export interface CdCommit {
@@ -1064,31 +777,6 @@ export interface CdCommit {
   at_ms: number;
   subject: string;
   body: string;
-}
-
-/** An app's status, as `cd_apps` events carry it. */
-export interface CdStatus {
-  /** `<project>/<name>`. */
-  app: string;
-  sync: CdSync;
-  health: CdHealth;
-  /** The commit its sources are at. */
-  revision?: string | null;
-  /** Objects in git. */
-  resources?: number;
-  /** Objects that differ, missing and to-prune ones included. */
-  out_of_sync?: number;
-  /** Of those, objects another app's tracking is on: a sync takes them over. */
-  shared?: number;
-  /** Of those, objects in git that the cluster doesn't have. */
-  missing?: number;
-  /** Of those, live objects git no longer has: a sync that prunes deletes them. Not in `resources`. */
-  prune?: number;
-  /** Of those, objects that lack only kiln's tracking marks (no other app's on them): a sync changes nothing else. */
-  unmarked?: number;
-  /** Why the status is what it is, when that isn't obvious. */
-  message?: string | null;
-  operation?: CdOperation | null;
 }
 
 /** An app as lists show it. */
@@ -1291,13 +979,6 @@ export interface CdEvent {
   last: string;
   source: string;
   object: { kind: string | null; name: string | null };
-}
-
-export interface CdLogLine {
-  pod: string;
-  /** RFC 3339, or "" when the line had none. */
-  ts: string;
-  text: string;
 }
 
 export interface CdLogs {

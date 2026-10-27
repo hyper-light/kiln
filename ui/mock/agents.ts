@@ -20,6 +20,7 @@
 import type http from "node:http";
 import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -52,6 +53,7 @@ const CWD = "/home/ada/src/kiln";
 function member(id: string, kind: "claude" | "codex", target: string, name: string, status: AgentInfo["status"], mode: string, prompt: string, reply: string, extra: Partial<AgentInfo> = {}): Member {
   const at = t0 + (id === "fam-orch" ? 0 : 60_000);
   const info: AgentInfo = {
+    ...defaultInfo(),
     id,
     kind,
     kind_name: kind === "claude" ? "Claude Code" : "Codex",
@@ -81,6 +83,7 @@ function member(id: string, kind: "claude" | "codex", target: string, name: stri
 
 const migrApproval: Approval = {
   id: "fam-migr-ap1",
+  tool_id: null,
   tool_name: "Bash",
   tool: "shell",
   title: "cargo run --bin migrate -- --dry-run",
@@ -160,6 +163,7 @@ const family = new Map<string, Member>(
 // subagent too. It coordinates them, at work itself on nothing.
 const fanApproval: Approval = {
   id: "fan-s3-ap1",
+  tool_id: null,
   tool_name: "Bash",
   tool: "shell",
   title: "cargo run --bin chaos -- --partition 2",
@@ -314,6 +318,7 @@ for (const m of [
   if (m) {
     m.tasks = [
       {
+        ...defaultTask(),
         id: "a-planner",
         tool_id: "toolu_planner",
         description: "Plan the planner goal",
@@ -328,6 +333,7 @@ for (const m of [
         stoppable: true,
       },
       {
+        ...defaultTask(),
         id: "a-opt",
         tool_id: "toolu_opt",
         description: "Plan the API optimization goal",
@@ -721,6 +727,7 @@ function descendants(id: string, all: AgentInfo[], live: boolean): AgentInfo[] {
 }
 
 const META: Meta = {
+  ...defaultMeta(),
   version: "2.3.1",
   modes: [
     { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
@@ -776,6 +783,7 @@ function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string
 
 function stateOf(m: Member): State {
   return {
+    ...defaultState(),
     status: m.info.status,
     cwd: m.info.cwd,
     model: m.info.model,
@@ -790,7 +798,7 @@ function stateOf(m: Member): State {
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
-  } as State;
+  };
 }
 
 /** A family member's socket: its snapshot. */

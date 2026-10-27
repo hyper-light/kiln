@@ -144,10 +144,17 @@ async fn tell(hub: &Hub, e: &Entry, state: &str, reason: Option<&str>) {
     let mut list = Vec::new();
     for id in &e.diffs {
         if let Ok(Some(d)) = diffs::find(hub, id).await {
-            list.push(json!({ "diff": d.name, "repo": d.repo, "author": d.author, "author_for": d.author_for }));
+            list.push(crate::wire::events::LandDiff { diff: d.name, repo: d.repo, author: d.author, author_for: d.author_for });
         }
     }
-    hub.emit(&json!({ "type": "queue", "entry": e.id, "state": state, "reason": reason, "strategy": e.strategy.as_str(), "diffs": list, "enqueued_by": e.enqueued_by }));
+    hub.emit(&crate::wire::events::ServerEvent::Queue(crate::wire::events::Queue::Entry(crate::wire::events::LandEntry {
+        entry: e.id.clone(),
+        state: state.to_owned(),
+        reason: reason.map(str::to_owned),
+        strategy: e.strategy.as_str().to_owned(),
+        diffs: list,
+        enqueued_by: e.enqueued_by.clone(),
+    })));
 }
 
 /// GitHub's merge queue events for diffs (W03-R02's native table): `pull_request` `enqueued`, or
@@ -1009,7 +1016,7 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
         }
     }
     let by: Vec<&str> = batch.iter().map(|e| e.enqueued_by.as_str()).collect();
-    hub.emit(&json!({ "type": "landed", "repo": repo.id, "repo_name": repo.name, "trunk": trunk, "tip": tip, "diffs": names, "by": by }));
+    hub.emit(&crate::wire::events::ServerEvent::Landed(Box::new(crate::wire::events::Landed { repo: repo.id.clone(), repo_name: repo.name.clone(), trunk: trunk.to_string(), tip: tip.to_string(), diffs: names, by: by.into_iter().map(str::to_owned).collect() })));
     super::hosting::mirror_trunk(hub, repo, path, trunk);
     // The trunk's push runs (the poller sees it now).
     crate::gitops::want(hub, &repo.id);

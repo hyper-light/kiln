@@ -9,7 +9,7 @@ import { Download } from "lucide-react";
 import { api } from "@/api/client";
 import type { ConvoLogLine, ConvoStatus } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { EmptyState, SearchField, SectionHeading } from "@/components/ui/misc";
+import { EmptyState, FilterBar, SearchField, SectionHeading } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { fileStamp, saveFile } from "@/lib/download";
 import { errorMessage } from "@/lib/hooks";
@@ -311,13 +311,19 @@ export function ReplicationLog() {
   return (
     <section className="rp-log">
       <SectionHeading label="Log" title="Replication log" />
-      <div className="log-tools">
-        <SearchField className="min-w-0 flex-1" label="Search the replication log" placeholder="Search by machine, store, or words…" value={q} onChange={setQ} />
-        <span className="log-count">{count} lines</span>
-        <Button variant="ghost" size="sm" disabled={saving || log.lines.length === 0} title="Download every line that matches" onClick={() => void download()}>
-          <Download /> {saving ? "Downloading…" : "Download"}
-        </Button>
-      </div>
+      <FilterBar
+        className="log-tools"
+        aside={
+          <>
+            <span className="log-count">{count} lines</span>
+            <Button variant="ghost" size="bar" disabled={saving || log.lines.length === 0} title="Download every line that matches" onClick={() => void download()}>
+              <Download /> {saving ? "Downloading…" : "Download"}
+            </Button>
+          </>
+        }
+      >
+        <SearchField label="Search the replication log" placeholder="Search by machine, store, or words…" value={q} onChange={setQ} />
+      </FilterBar>
       {log.lines.length === 0 ? (
         <EmptyState title={words ? "No lines match." : "Nothing has moved yet."}>{!words && <p>Lines come as the stores send batches, sampled every 5 seconds.</p>}</EmptyState>
       ) : (

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { wsUrl } from "@/api/client";
-import type { TerminalControlFrame, TerminalSessionInfo } from "@/api/types";
+import type { TerminalControlFrame, TerminalSessionInfo, TerminalUp } from "@/api/types";
 import { createTerminal, ensureFont, TERM_FONT, type KilnTerminal } from "@/components/terminal/xterm-setup";
 import { copyText, readClipboard } from "./clipboard";
 
@@ -134,7 +134,7 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
     const cur = sessionSize.current;
     if (cur && cur.cols === d.cols && cur.rows === d.rows) return;
     sessionSize.current = d;
-    ws.send(JSON.stringify({ type: "resize", cols: d.cols, rows: d.rows }));
+    ws.send(JSON.stringify({ type: "resize", cols: d.cols, rows: d.rows } satisfies TerminalUp));
   }, []);
 
   /**

@@ -81,23 +81,18 @@ pub(super) fn emit_new_release(d: &Deploy, r: &Release) {
 }
 
 fn tell(d: &Deploy, r: &Release, new: bool) {
-    let mut e = json!({
-        "type": "deploy",
-        "id": r.id,
-        "app": r.app,
-        "environment": r.environment,
-        "kind": r.kind,
-        "state": r.state,
-        "by": r.requested_by,
-        "release": r,
-    });
-    if r.state == State::WaitingApproval
-        && let Some(m) = e.as_object_mut()
-    {
-        m.insert("needs".into(), json!("approval"));
-        m.insert("approvers".into(), approvers(r));
-    }
-    d.hub.emit(&e);
+    let waits = r.state == State::WaitingApproval;
+    d.hub.emit(&crate::wire::events::ServerEvent::Deploy(Box::new(crate::wire::events::DeployRelease {
+        id: r.id,
+        app: r.app.clone(),
+        environment: r.environment.clone(),
+        kind: r.kind,
+        state: r.state,
+        by: r.requested_by.clone(),
+        release: r.clone(),
+        needs: waits.then(|| "approval".to_owned()),
+        approvers: waits.then(|| approvers(r)),
+    })));
     d.changes.send(r.id);
     // The host's deployment of its commit, where the release repository is on another host (§7).
     remote::report(d, r);
@@ -900,7 +895,7 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
         }
     }
     audit(d, actor, "deploy.register", format!("{app_name} in {env_name}")).await;
-    d.hub.emit(&json!({ "type": "deploy_registration", "registration": reg }));
+    d.hub.emit(&crate::wire::events::ServerEvent::DeployRegistration(crate::wire::events::RegistrationChange::Saved { registration: Box::new(reg.clone()) }));
     Ok(reg)
 }
 
@@ -942,7 +937,7 @@ pub async fn deregister(d: &Deploy, who: &Who, app_name: &str, env_name: &str, k
     }
     store::delete_registration(&*d.records, app_name, env_name).await.map_err(internal)?;
     audit(d, actor, "deploy.deregister", format!("{app_name} from {env_name}{}", if keep { " (objects kept)" } else { "" })).await;
-    d.hub.emit(&json!({ "type": "deploy_registration", "removed": { "app": app_name, "environment": env_name } }));
+    d.hub.emit(&crate::wire::events::ServerEvent::DeployRegistration(crate::wire::events::RegistrationChange::Removed { removed: crate::wire::events::RegistrationRemoved { app: app_name.to_owned(), environment: env_name.to_owned() } }));
     Ok(())
 }
 
@@ -972,7 +967,7 @@ pub async fn pause(d: &Deploy, actor: &str, app_name: &str, env_name: &str, paus
     reg.paused = paused;
     store::put_registration(&*d.records, &reg).await.map_err(internal)?;
     audit(d, actor, if paused { "deploy.pause" } else { "deploy.resume" }, format!("{app_name} in {env_name}")).await;
-    d.hub.emit(&json!({ "type": "deploy_registration", "registration": reg }));
+    d.hub.emit(&crate::wire::events::ServerEvent::DeployRegistration(crate::wire::events::RegistrationChange::Saved { registration: Box::new(reg.clone()) }));
     Ok(reg)
 }
 

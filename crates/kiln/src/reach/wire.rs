@@ -36,6 +36,11 @@ pub enum Ask {
     /// there: its record, its timeline). `offset` 0 starts it (again); the other side answers with
     /// [`Say::AdoptGot`] as pieces land and [`Say::Adopted`] once it took it over, or couldn't.
     Adopt { id: u64, offset: u64, data: Vec<u8>, last: bool },
+    /// An object of the other runner's cache, for a peer that lacks it (docs/ci.md W24-R27): from
+    /// `offset`, at most [`WINDOW`] of it, which the other side sends as [`Say::ObjectData`] (or
+    /// [`Say::ObjectMissing`]); the asker asks again from where it got to. Appended last:
+    /// postcard numbers variants by place.
+    Object { id: u64, repo: String, digest: String, offset: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,6 +70,10 @@ pub enum Say {
     AdoptGot { id: u64, bytes: u64 },
     /// The hand-over was taken over (`error` None), or why not.
     Adopted { id: u64, error: Option<String> },
+    /// A piece of an object asked for ([`Ask::Object`]): `last` once its end is in it.
+    ObjectData { id: u64, offset: u64, data: Vec<u8>, last: bool },
+    /// The object asked for isn't here, for that repository.
+    ObjectMissing { id: u64 },
 }
 
 /// The machine a link reached.
@@ -230,6 +239,19 @@ mod tests {
             }
         }
         assert_eq!(got, msgs);
+        Ok(())
+    }
+
+    #[test]
+    fn objects_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let first = |b: Vec<u8>| b.first().copied();
+        let adopt = first(postcard::to_allocvec(&Ask::Adopt { id: 1, offset: 0, data: Vec::new(), last: true })?);
+        let object = first(postcard::to_allocvec(&Ask::Object { id: 1, repo: "acme/app".into(), digest: "d".into(), offset: 0 })?);
+        anyhow::ensure!(object == adopt.map(|i| i + 1), "Ask::Object comes right after Adopt");
+        let adopted = first(postcard::to_allocvec(&Say::Adopted { id: 1, error: None })?);
+        let data = first(postcard::to_allocvec(&Say::ObjectData { id: 1, offset: 0, data: vec![1], last: true })?);
+        let missing = first(postcard::to_allocvec(&Say::ObjectMissing { id: 1 })?);
+        anyhow::ensure!(data == adopted.map(|i| i + 1) && missing == adopted.map(|i| i + 2), "Say's come after Adopted");
         Ok(())
     }
 

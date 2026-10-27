@@ -64,6 +64,11 @@ pub struct RunArgs {
     /// No `[kiln]` lines on stderr (where it ran, what was synced).
     #[arg(long, short = 'q')]
     pub quiet: bool,
+    /// Give back the result of an identical run instead of running again: the same command,
+    /// folder, environment and machine, over an identical tree. Only successes are kept
+    /// (docs/ci.md W24-R24).
+    #[arg(long)]
+    pub reuse: bool,
     /// The command (shell text; several words are joined with spaces).
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -153,7 +158,8 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
     let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach the kiln runner at {}: {e}", path.display()))?;
     stream.set_nonblocking(true)?;
     let fd = std::sync::Arc::new(OwnedFd::from(stream));
-    crate::os::proc::write_all(&fd, &super::wire::frame(&Req::Run(Box::new(req)))?).await?;
+    let req = if a.reuse { Req::RunReuse(Box::new(req)) } else { Req::Run(Box::new(req)) };
+    crate::os::proc::write_all(&fd, &super::wire::frame(&req)?).await?;
     // Stdin, when asked for, goes over as it comes.
     if a.stdin {
         let w = std::sync::Arc::clone(&fd);
@@ -218,6 +224,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
                     };
                 }
                 Ev::Error(e) => anyhow::bail!("{e}"),
+                Ev::Note(line) => say(line),
                 Ev::Status(_) | Ev::Runners(_) | Ev::Forgot(_) | Ev::Answer(_) => {}
             }
         }
@@ -246,6 +253,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         };
         match next {
             Next::Read(Ok(Some(n))) if n > 0 => de.push(buf.get(..n).unwrap_or_default()),
+            Next::Read(_) if a.reuse => anyhow::bail!("the kiln runner closed the connection (one older than `kiln run --reuse` doesn't know it: run without it, or upgrade the runner)"),
             Next::Read(_) => anyhow::bail!("the kiln runner closed the connection"),
             Next::Stop => {
                 // Ctrl-C: the command over there gets it too; its exit comes back as usual.

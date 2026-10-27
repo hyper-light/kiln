@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 
 use futures::channel::oneshot;
 use parking_lot::Mutex;
-use serde_json::json;
-
 use super::registry::Sent;
+use crate::wire::ui::{Outcome, SessionDown, SessionFrame};
 
 /// The answered ids a session keeps, at the most.
 pub const KEEP: usize = 1024;
@@ -204,31 +203,41 @@ impl Asked {
 /// The frame that answers command `id` (of `kind`) on a viewer's socket: `ack`, with what became of
 /// it, or `nack`, with its kind (`code`), why, and whether it may be sent again (`again`).
 pub fn frame(id: &str, sent: &Sent, kind: Kind) -> String {
+    answer(id, sent, kind).text()
+}
+
+/// [`frame`]'s frame, as its type.
+pub fn answer(id: &str, sent: &Sent, kind: Kind) -> SessionDown {
     let again = stand(sent, kind) == Stand::Again;
-    let ack = |outcome: &str| json!({"t": "ack", "id": id, "outcome": outcome});
-    let nack = |code: &str, why: String| json!({"t": "nack", "id": id, "code": code, "why": why, "again": again});
-    let v = match sent {
-        Sent::Taken => ack("taken"),
-        Sent::Parked => ack("parked"),
-        Sent::Ok if kind.deduped => ack("pending"),
-        Sent::Ok => ack("unchecked"),
-        Sent::Accepted(a) => json!({"t": "ack", "id": id, "outcome": "accepted", "accepted": a}),
-        Sent::Refused(r) => {
-            let code = serde_json::to_value(r).ok().and_then(|v| v.get("refused").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_else(|| "refused".to_owned());
-            json!({"t": "nack", "id": id, "code": code, "why": r.to_string(), "again": again, "refused": r})
-        }
-        Sent::Rejected { code, .. } => nack(&serde_json::to_value(code).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "refused".to_owned()), why(sent)),
-        Sent::Unanswered(_) => nack("unanswered", why(sent)),
-        Sent::NoSession => nack("no_session", why(sent)),
-        Sent::Unreachable => nack("unreachable", why(sent)),
+    let id = id.to_owned();
+    let ack = |outcome, accepted| SessionFrame::Ack { id: id.clone(), outcome, accepted };
+    let nack = |code: String, why: String, refused| SessionFrame::Nack { id: Some(id.clone()), code, why, again, refused };
+    let code_of = |v: Option<serde_json::Value>, field: Option<&str>| {
+        v.and_then(|v| match field {
+            Some(f) => v.get(f).and_then(serde_json::Value::as_str).map(str::to_owned),
+            None => v.as_str().map(str::to_owned),
+        })
+        .unwrap_or_else(|| "refused".to_owned())
     };
-    v.to_string()
+    match sent {
+        Sent::Taken => ack(Outcome::Taken, None),
+        Sent::Parked => ack(Outcome::Parked, None),
+        Sent::Ok if kind.deduped => ack(Outcome::Pending, None),
+        Sent::Ok => ack(Outcome::Unchecked, None),
+        Sent::Accepted(a) => ack(Outcome::Accepted, Some(a.clone())),
+        Sent::Refused(r) => nack(code_of(serde_json::to_value(r).ok(), Some("refused")), r.to_string(), Some(r.clone())),
+        Sent::Rejected { code, .. } => nack(code_of(serde_json::to_value(code).ok(), None), why(sent), None),
+        Sent::Unanswered(_) => nack("unanswered".into(), why(sent), None),
+        Sent::NoSession => nack("no_session".into(), why(sent), None),
+        Sent::Unreachable => nack("unreachable".into(), why(sent), None),
+    }
+    .into()
 }
 
 /// The frame that refuses command `id` (none: what couldn't be read far enough to have one) before
 /// it's sent on: `nack`, its kind (`code`) and why. Never to be sent again as it is.
 pub fn nack(id: Option<&str>, code: &str, why: &str) -> String {
-    json!({"t": "nack", "id": id, "code": code, "why": why, "again": false}).to_string()
+    SessionDown::from(SessionFrame::Nack { id: id.map(str::to_owned), code: code.to_owned(), why: why.to_owned(), again: false, refused: None }).text()
 }
 
 /// The frame that answers what a viewer sent that couldn't be read as a command: `nack`,
@@ -244,6 +253,7 @@ fn why(sent: &Sent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const COMMAND: Kind = Kind { message: false, deduped: false };
     const MESSAGE: Kind = Kind { message: true, deduped: true };

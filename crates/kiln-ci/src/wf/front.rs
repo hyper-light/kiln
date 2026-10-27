@@ -738,7 +738,15 @@ impl Fe<'_> {
                 "exclusive" => kiln.exclusive = self.bool(v, &at).unwrap_or(false),
                 "resources" => kiln.resources = Some(self.yval(v)),
                 "requires" => kiln.requires = self.tpl_list(v, &at),
-                "prefer" => kiln.prefer = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default(),
+                // W05-R23, W24-R18: an item routing can't read counts for nothing, and says why.
+                "prefer" => {
+                    kiln.prefer = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default();
+                    for (i, (item, node)) in kiln.prefer.iter().zip(v.as_seq().unwrap_or_default()).enumerate() {
+                        if let Err(why) = crate::sched::routing::preference(item) {
+                            self.diags.push(Diag::warning("KCI1011", format!("`{at}[{i}]` counts for nothing: {why}"), node.range).at(&at));
+                        }
+                    }
+                }
                 "priority" => kiln.priority = Some(self.yval(v)),
                 "retry" => kiln.retry = Some(self.yval(v)),
                 "retries" => {
@@ -749,6 +757,14 @@ impl Fe<'_> {
                     ]));
                 }
                 "reuse" => kiln.reuse = Some(self.yval(v)),
+                // W24: `work:` is kept as written, its `warm` read by `work::slots::warm` (W24-R11);
+                // `work: { memo }` is what `reuse:` is shorthand for (W24-R06).
+                "work" => {
+                    kiln.work = Some(self.yval(v));
+                    if let Some(memo) = v.get("memo") {
+                        kiln.reuse = Some(self.yval(memo));
+                    }
+                }
                 "cache" => kiln.cache = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default(),
                 "exports" => kiln.exports_env = v.get("env").map(|e| self.str_list(e, &format!("{at}.env"))).unwrap_or_default(),
                 "env-from" => kiln.env_from = self.str_list(v, &at),
@@ -1069,14 +1085,35 @@ impl Fe<'_> {
                 "test-results" => kiln.test_results = Some(self.yval(v)),
                 "integrations" => kiln.integrations = self.str_list(v, &at),
                 "tty" => kiln.tty = self.bool(v, &at).unwrap_or(false),
+                // W24-R07: `check`, or a mapping of `memo`'s keys.
+                "memo" => {
+                    if v.as_map().is_some() {
+                        let _ = self.entries(v, keys::MEMO, &at);
+                    }
+                    let memo = self.yval(v);
+                    if let Err(e) = crate::work::memo::Memo::from_yval(&memo) {
+                        self.err("KCI1015", e, v.range, &at);
+                    }
+                    kiln.memo = Some(memo);
+                }
+                // W24-R10: a build's test binaries, run or replayed.
+                "tests" => {
+                    let tests = self.yval(v);
+                    if let Err(e) = crate::work::tests::Spec::from_yval(&tests) {
+                        self.err("KCI1015", e, v.range, &at);
+                    }
+                    kiln.tests = Some(tests);
+                }
                 _ => {}
             }
         }
         s.kiln = kiln;
         if !self.overlay {
+            let tests = s.kiln.tests.is_some();
             match (&s.run, &s.uses, s.is_control()) {
+                (Some(_), _, _) | (_, Some(_), _) if tests => self.err("KCI1012", "a `tests` step runs its test binaries itself: it can't have `run` or `uses`", n.range, path),
                 (Some(_), Some(_), _) => self.err("KCI1012", "a step has `run` or `uses`, not both", n.range, path),
-                (None, None, false) => self.err("KCI1012", "a step needs `run` or `uses` (or `wait`, `wait-all`, `cancel` or `parallel`)", n.range, path),
+                (None, None, false) if !tests => self.err("KCI1012", "a step needs `run` or `uses` (or `wait`, `wait-all`, `cancel` or `parallel`)", n.range, path),
                 (Some(_) | None, Some(_) | None, true) if s.run.is_some() || s.uses.is_some() => {
                     self.err("KCI1012", "a `wait`, `wait-all`, `cancel` or `parallel` step runs nothing itself: it can't have `run` or `uses`", n.range, path)
                 }
