@@ -94,6 +94,40 @@ second.
 }
 ```
 
+## Where every number comes from (v2)
+
+Headroom v2's decisions live in `crates/kiln-ci/src/headroom` as pure code (`docs/ci.md` §0.3):
+the runner passes in what it measured and when, and carries out what comes back. No number in it
+is a tuning choice. Each is a measurement, follows from one, or is one of the two things a person
+decides.
+
+**What a person decides** (settings, with defaults from the platform where it has one):
+- the false-alarm budget: how many times a day headroom may hold or slow work when nothing would
+  have gone wrong;
+- each target's tolerance: how slow it may get before it's harmed. A target that declares one
+  (a Kubernetes probe's timeout, a systemd watchdog) brings its own;
+- the probe-load share: how much of a served target's time its probes may take.
+
+**Everything else:**
+
+| Number | Comes from |
+|---|---|
+| A target's calm latency | the exact mean of its log-latency in the current regime |
+| CUSUM's reference | half the distance from the calm mean to the tolerance (the shift that matters) |
+| The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
+| Harm | a sample, or a probe still out, at the tolerance |
+| A new regime | a fall below the calm the lower CUSUM detects with the same calibration, or an alarm with kiln quiet that outlasts the longest a cut of kiln's ever took to show |
+| The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), never under the probe's own measured cost, and for a served target never under its service time / load share |
+| The write budget | bisection between the highest rate held calm and the lowest rate trouble began at; doubling while there is no unsafe rate; halving the gap is the only step |
+| How long a level must hold | the slowest target's expected detection time plus the longest measured lag |
+| A run's demand | its peak unslowed write rate and memory, and its duration, recorded when it ends; the mean per kind of work, with the mean over everything as the prior |
+| Who starts | class, then response ratio ((wait + run) / run); every waiting item a reservation on the time profile of when running work is expected to free room (conservative backfilling); with nothing learned, one at a time |
+| Each running group's share | the budget water-filled class by class, max-min fair within a class |
+| When shares change | only when the budget or the set of running work does |
+
+Representation limits are not tuning: estimates are exact counts, sums and extremes, so none has a
+resolution or a window.
+
 ## Debug builds
 
 kiln's dev and test builds keep line tables only (`[profile.dev] debug = "line-tables-only"`):
