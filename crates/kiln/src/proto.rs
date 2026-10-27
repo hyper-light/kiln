@@ -778,6 +778,57 @@ mod tests {
         Ok(())
     }
 
+    /// W05-R22, found by W28 step 3's replay: a job pod (`kiln agent --ephemeral`, v1's `[k8s]`
+    /// jobs) never says what it can do, so it was written every job as for a runner from before the
+    /// CI work, without `requires`, and read it as this build does: `rust` refused as malformed
+    /// ("Found an Option discriminant that wasn't 0 or 1"), `ui` read with no steps and passed
+    /// without running one. A pod reads its job whole; a bare-metal runner that hasn't said keeps
+    /// the old layout (W22-AC09).
+    #[test]
+    fn w05_r22_a_job_pod_reads_its_assignment_whole() -> anyhow::Result<()> {
+        let p = crate::pipeline::parse(concat!(
+            "name: ci\njobs:\n",
+            "  rust:\n    runs-on: [k8s]\n    toolchain: rust\n    resources: { cpu: \"2\", memory: 16Gi }\n",
+            "    steps:\n      - { name: clippy, run: cargo clippy }\n      - { name: test, run: cargo test }\n",
+            "  ui:\n    runs-on: [k8s]\n    toolchain: node\n    steps: [{run: npm ci}, {run: npm run lint}]\n",
+            "  linux:\n    runs-on: [k8s]\n    requires: [\"os == linux\"]\n    steps: [{run: uname}]\n",
+        ))?;
+        let jobs = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+        assert_eq!(jobs.len(), 3);
+        let assign = |spec: PlannedJob| {
+            ServerMsg::Assign(Box::new(Assignment {
+                job_id: "j".into(),
+                run_id: "r".into(),
+                repo: "o/r".into(),
+                clone_url: String::new(),
+                sha: "0".repeat(40),
+                branch: "main".into(),
+                event: "push".into(),
+                run_number: 7,
+                attempt: 0,
+                spec,
+                secrets: vec![("K".into(), "v".into())],
+                job_token: "t".into(),
+                server_url: "http://kiln".into(),
+            }))
+        };
+        for spec in &jobs {
+            // What a pod's own decoder (this build's) reads of what the server writes it.
+            let read = decode::<ServerMsg>(&encode(&assign(spec.clone().for_assignee(0, true)))?)?;
+            let ServerMsg::Assign(a) = read else { anyhow::bail!("{} came back as another message", spec.key) };
+            assert_eq!((&a.spec.key, &a.spec.steps, &a.spec.requires), (&spec.key, &spec.steps, &spec.requires), "{} as its pod reads it", spec.key);
+            assert_eq!((a.secrets.len(), a.server_url.as_str()), (1, "http://kiln"), "{}: the fields after the job", spec.key);
+            // What the pod got before: the layout of a runner from before the CI work.
+            let before = decode::<ServerMsg>(&encode(&assign(spec.clone().for_runner(0)))?);
+            assert!(!matches!(&before, Ok(m) if m == &assign(spec.clone())), "{}: read whole without `requires`", spec.key);
+        }
+        // A bare-metal runner that hasn't said what it can do is still written the old layout.
+        let any = jobs.iter().find(|j| j.key == "ui").cloned().ok_or_else(|| anyhow::anyhow!("no ui"))?;
+        assert_eq!(encode(&assign(any.clone().for_assignee(0, false)))?, encode(&assign(any.clone().for_runner(0)))?);
+        assert_eq!(encode(&assign(any.clone().for_assignee(CAP_CI2, false)))?, encode(&assign(any.for_runner(CAP_CI2)))?);
+        Ok(())
+    }
+
     #[test]
     fn appended_variants_keep_their_indexes() -> anyhow::Result<()> {
         // Older peers decode by variant index: the new ones must come after every existing one.

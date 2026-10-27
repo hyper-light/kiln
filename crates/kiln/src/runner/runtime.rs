@@ -1081,6 +1081,15 @@ impl Leg {
         let conf = super::credential::docker_config(&a.integrations, Some(&own), base);
         let wanted = map.is_none() || a.integrations.iter().any(|i| i.kind == "oci");
         if wanted && std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
+            // A leg on the host keeps the runner's builders, contexts and plugins, as a v1 job.
+            if map.is_none()
+                && let Some(from) = super::credential::runner_config_dir()
+            {
+                let to = docker.clone();
+                if let Ok(Err(e)) = crate::rt::blocking(move || super::credential::link_runner_config(&from, &to)).await {
+                    tracing::debug!(error = %e, "the runner's Docker config folder couldn't be linked into the leg's");
+                }
+            }
             st.env.insert("DOCKER_CONFIG".into(), seen(&docker));
             st.env.insert("KILN_REGISTRY_HOST".into(), own);
         }
@@ -1745,6 +1754,10 @@ impl Leg {
                         }
                         anyhow::bail!("git {}: {said}", args.get(2).copied().unwrap_or_default());
                     }
+                }
+                let dir = ws.clone();
+                if !crate::rt::blocking(move || pack_refs(&dir)).await.unwrap_or(false) {
+                    tracing::debug!(workspace = %w, "git pack-refs failed: the checkout keeps no packed-refs");
                 }
                 let Some(x) = warm.filter(|_| in_place) else { return Ok(()) };
                 // In place: only the files that differ are written, the rest keep their mtimes, and
@@ -4803,6 +4816,16 @@ impl Again {
     }
 }
 
+/// A leg's checkout left as a clone leaves a repository: its refs packed, so `.git/packed-refs`
+/// exists, which a fetch into a new repository never writes. A build script that watches it
+/// (`cargo:rerun-if-changed`, as kiln's own build.rs does) runs again on every cargo command
+/// while it's missing, and its crate is built again each time: W28 step 3's replay saw bench's
+/// quic-transport rebuild kiln on each of its five `cargo test` runs and time out, where v1's
+/// clone built it once. Whether it went.
+fn pack_refs(dir: &std::path::Path) -> bool {
+    std::process::Command::new("git").arg("-C").arg(dir).args(["pack-refs", "--all"]).env("GIT_TERMINAL_PROMPT", "0").output().is_ok_and(|o| o.status.success())
+}
+
 /// Whether git's `said` is of a server it couldn't reach, or one that answered it's unavailable.
 fn unreachable(said: &str) -> bool {
     [
@@ -4971,6 +4994,33 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W28 step 3's replay: a leg's checkout (a fetch of its commit into a new repository) leaves
+    /// `.git/packed-refs`, as v1's clone does, so a build script watching it stays fresh.
+    #[test]
+    fn w28_a_legs_checkout_leaves_packed_refs_as_a_clone() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let git = |dir: &std::path::Path, args: &[&str]| -> anyhow::Result<String> {
+            let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).env("GIT_CONFIG_NOSYSTEM", "1").env("HOME", tmp.path()).output()?;
+            anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        let (src, w) = (tmp.path().join("src"), tmp.path().join("w"));
+        std::fs::create_dir_all(&src)?;
+        git(&src, &["init", "-q"])?;
+        git(&src, &["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "one"])?;
+        git(&src, &["config", "uploadpack.allowReachableSHA1InWant", "true"])?;
+        let sha = git(&src, &["rev-parse", "HEAD"])?;
+        git(tmp.path(), &["init", "-q", "w"])?;
+        git(&w, &["remote", "add", "origin", &format!("file://{}", src.display())])?;
+        git(&w, &["fetch", "-q", "--no-tags", "--depth=1", "origin", &sha])?;
+        git(&w, &["checkout", "-q", "--detach", "FETCH_HEAD"])?;
+        assert!(!w.join(".git/packed-refs").exists(), "a fetch into a new repository writes none");
+        assert!(pack_refs(&w));
+        assert!(w.join(".git/packed-refs").is_file());
+        assert_eq!(git(&w, &["rev-parse", "HEAD"])?, sha, "nothing else moved");
+        Ok(())
+    }
 
     /// The server URL actions that refuse GitHub Enterprise Server get keeps the server's port, so
     /// what they fetch from it reaches kiln (docs/ci.md W08-R08).

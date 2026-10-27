@@ -238,8 +238,41 @@ pub fn docker_config(list: &[Integration], own: Option<&str>, base: Option<Value
 
 /// The runner's own Docker config (`$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`).
 pub fn runner_config() -> Option<Value> {
-    let dir = std::env::var_os("DOCKER_CONFIG").map(std::path::PathBuf::from).or_else(|| dirs_home().map(|h| h.join(".docker")))?;
+    let dir = runner_config_dir()?;
     serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()
+}
+
+/// The runner's own Docker config folder (`$DOCKER_CONFIG`, else `~/.docker`).
+pub fn runner_config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("DOCKER_CONFIG").map(std::path::PathBuf::from).or_else(|| dirs_home().map(|h| h.join(".docker")))
+}
+
+/// The rest of the runner's Docker config folder `from` in a host leg's own (`to`, whose
+/// `config.json` is the leg's): each other entry linked, so `docker` in the leg finds the
+/// builders (`buildx/`, `BUILDX_BUILDER`), contexts and CLI plugins the runner was set up with, as
+/// a v1 job on that runner does. Without them W28 step 3's replay saw the engine's image job stop
+/// at once ("no builder found") where v1's built. An entry the leg's folder already has stays;
+/// what isn't there is left out. How many were linked.
+#[cfg(unix)]
+pub fn link_runner_config(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<usize> {
+    let mut linked = 0;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let name = e.file_name();
+        let at = to.join(&name);
+        if name == "config.json" || at.symlink_metadata().is_ok() {
+            continue;
+        }
+        std::os::unix::fs::symlink(e.path(), &at)?;
+        linked += 1;
+    }
+    Ok(linked)
+}
+
+/// [`link_runner_config`] where links need privileges: nothing linked.
+#[cfg(not(unix))]
+pub fn link_runner_config(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<usize> {
+    Ok(0)
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -346,5 +379,31 @@ mod tests {
         assert_eq!(c.pointer("/credHelpers/https:~1~1index.docker.io~1v1~1"), Some(&json!("kiln")));
         assert_eq!(c.pointer("/credHelpers/kiln.example:7070"), Some(&json!("kiln")));
         assert_eq!((c.pointer("/credHelpers/gcr.io"), c.get("credsStore"), c.pointer("/auths/registry.corp/auth")), (Some(&json!("gcloud")), Some(&json!("desktop")), Some(&json!("eA=="))), "the runner's own logins stay");
+    }
+
+    /// W12-R03, found by W28 step 3's replay: a host leg's own Docker config folder keeps the rest
+    /// of the runner's (its builders, contexts, plugins), as a v1 job sees them; its `config.json`
+    /// stays the leg's.
+    #[cfg(unix)]
+    #[test]
+    fn w12_r03_a_host_legs_docker_config_keeps_the_runners_builders() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (runner, leg) = (tmp.path().join("runner"), tmp.path().join("leg"));
+        std::fs::create_dir_all(runner.join("buildx/instances"))?;
+        std::fs::create_dir_all(runner.join("contexts/meta/abc"))?;
+        std::fs::write(runner.join("buildx/instances/w28lab"), "{\"Name\":\"w28lab\"}")?;
+        std::fs::write(runner.join("config.json"), "{\"currentContext\":\"lab\"}")?;
+        std::fs::create_dir_all(&leg)?;
+        std::fs::write(leg.join("config.json"), "{\"credHelpers\":{}}")?;
+        assert_eq!(link_runner_config(&runner, &leg)?, 2, "buildx and contexts");
+        assert_eq!(std::fs::read_to_string(leg.join("buildx/instances/w28lab"))?, "{\"Name\":\"w28lab\"}");
+        assert!(leg.join("contexts/meta/abc").is_dir());
+        assert_eq!(std::fs::read_to_string(leg.join("config.json"))?, "{\"credHelpers\":{}}", "the leg's own");
+        // Again (a retried leg's setup): nothing more, nothing replaced.
+        assert_eq!(link_runner_config(&runner, &leg)?, 0);
+        // The leg's folder going takes the links, not the runner's builders.
+        std::fs::remove_dir_all(&leg)?;
+        assert!(runner.join("buildx/instances/w28lab").is_file());
+        Ok(())
     }
 }

@@ -2624,11 +2624,8 @@ impl Hub {
             let chosen = self.pick_agent(&job);
             match chosen {
                 Some(agent) => {
-                    let executor = if job.labels.iter().any(|l| l == "k8s") && self.agents.lock().get(&agent).is_some_and(|a| a.ephemeral) {
-                        "k8s"
-                    } else {
-                        "baremetal"
-                    };
+                    let ephemeral = self.agents.lock().get(&agent).is_some_and(|a| a.ephemeral);
+                    let executor = if job.labels.iter().any(|l| l == "k8s") && ephemeral { "k8s" } else { "baremetal" };
                     if !self.store.claim_job(job.id.clone(), agent.clone(), executor.into()).await? {
                         continue;
                     }
@@ -2662,7 +2659,7 @@ impl Hub {
                         event: run.event.clone(),
                         run_number: run.number,
                         attempt: job.attempt,
-                        spec: spec.for_runner(self.runner_caps(&agent)),
+                        spec: spec.for_assignee(self.runner_caps(&agent), ephemeral),
                         secrets: self.job_secrets(),
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
