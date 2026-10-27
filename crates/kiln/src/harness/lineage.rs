@@ -445,6 +445,10 @@ pub struct Ask {
     pub count: Option<usize>,
     /// `folder` (the folder itself, the only one there is until workspaces are built).
     pub workspace: Option<String>,
+    /// A card's helper (`super::about`), when kiln starts one for a person (`agents.about`): never
+    /// from what an agent asks (`agents.start` can't hide the agents it starts).
+    #[serde(skip)]
+    pub helper: Option<String>,
 }
 
 /// Who starts agents: the agent that asks (none: a person), whom they act for, how the audit
@@ -827,6 +831,7 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         reach,
         parent: by.parent.as_ref().map(|p| p.id.clone()),
         plan_run: by.plan_run.clone(),
+        helper: ask.helper.clone(),
         workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
         ..Spec::default()
     };
@@ -862,7 +867,7 @@ pub fn short(id: &str) -> &str {
 /// console's End).
 pub fn children_brief(hub: &Hub, id: &str) -> Value {
     let all = hub.harness.list();
-    json!(live_descendants(&all, id).iter().map(|i| json!({"id": i.id, "name": i.name, "kind": i.kind, "status": i.status, "parent": i.parent})).collect::<Vec<_>>())
+    json!(live_descendants(&all, id).iter().filter(|i| i.helper.is_none()).map(|i| json!({"id": i.id, "name": i.name, "kind": i.kind, "status": i.status, "parent": i.parent})).collect::<Vec<_>>())
 }
 
 #[cfg(test)]

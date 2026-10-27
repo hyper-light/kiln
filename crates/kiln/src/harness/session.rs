@@ -87,6 +87,11 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
+    /// What it helps with when it's a card's helper (`harness::about`: `about`, answering what a
+    /// person tapped in its parent's conversation): no row of Mission Control, its parent not told
+    /// of it, ended once no card reads it. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper: Option<String>,
     /// Where it works when not in its folder itself: a Slates volume of its own laid over the
     /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -349,6 +354,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub plan_run: Option<String>,
+    /// What it helps with when it's a card's helper (as `Spec::helper`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub helper: Option<String>,
     /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -996,6 +1005,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        helper: spec.helper.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
@@ -3953,6 +3963,7 @@ mod tests {
             max_subagents: None,
             parent: None,
             plan_run: None,
+            helper: None,
             no_bypass: false,
             workspace: None,
         };

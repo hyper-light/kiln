@@ -40,6 +40,7 @@ import { PlanSourceContext } from "@/views/plans/save";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
 import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
+import { AboutContext } from "@/components/code/about";
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -72,6 +73,9 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   useMarkSeen(id);
   const navigate = useNavigate();
   const info = useSession(store, (s) => s.info);
+  // Code in its conversation can be asked about (components/code/about.tsx): by a helper of its, or, with subagents off, it.
+  const busy = useSession(store, (s) => s.state?.turn_started != null);
+  const about = React.useMemo(() => ({ id, name: info?.name, subagents: info?.max_subagents !== 0, busy, store }), [id, info?.name, info?.max_subagents, busy, store]);
   const gone = useSession(store, (s) => s.conn === "gone");
   const cwd = useSession(store, (s) => s.state?.cwd || s.info?.cwd || "");
   const accepts = useSession(store, (s) => acceptsOf(s.meta));
@@ -276,24 +280,26 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
         </div>
       )}
       <PlanSourceContext.Provider value={planSource}>
-        <Timeline
-          key={task ?? "main"}
-          store={store}
-          agent={id}
-          cwd={cwd}
-          parent={task ?? undefined}
-          onOpenTask={openTask}
-          onCommand={send}
-          onReply={setReply}
-          agentLabel={task ? "Subagent" : info?.kind_name}
-          agentName={info?.name}
-          onDecide={send}
-          target={info?.target}
-          kind={info?.kind}
-          accountOpen={account !== null}
-          find={find}
-          footer={footer}
-        />
+        <AboutContext.Provider value={task ? null : about}>
+          <Timeline
+            key={task ?? "main"}
+            store={store}
+            agent={id}
+            cwd={cwd}
+            parent={task ?? undefined}
+            onOpenTask={openTask}
+            onCommand={send}
+            onReply={setReply}
+            agentLabel={task ? "Subagent" : info?.kind_name}
+            agentName={info?.name}
+            onDecide={send}
+            target={info?.target}
+            kind={info?.kind}
+            accountOpen={account !== null}
+            find={find}
+            footer={footer}
+          />
+        </AboutContext.Provider>
       </PlanSourceContext.Provider>
       <Dock
         store={store}
@@ -354,7 +360,9 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           collapsed={trayCollapsed}
           onCollapsed={setTrayCollapsed}
           side={(actions) => (
-            <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" actions={actions} />
+            <AboutContext.Provider value={about}>
+              <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" actions={actions} />
+            </AboutContext.Provider>
           )}
         >
           {work}
@@ -365,18 +373,20 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           {phoneTab === "work" ? (
             work
           ) : (
-            <Inspector
-              tab={phoneTab}
-              onTab={(t) => setPhoneTab(t)}
-              store={store}
-              cwd={cwd}
-              onOpenTask={openTask}
-              agentId={id}
-              harness={info?.kind_name}
-              send={send}
-              hideTabs
-              className="hx-side hx-side-phone"
-            />
+            <AboutContext.Provider value={about}>
+              <Inspector
+                tab={phoneTab}
+                onTab={(t) => setPhoneTab(t)}
+                store={store}
+                cwd={cwd}
+                onOpenTask={openTask}
+                agentId={id}
+                harness={info?.kind_name}
+                send={send}
+                hideTabs
+                className="hx-side hx-side-phone"
+              />
+            </AboutContext.Provider>
           )}
         </div>
       )}

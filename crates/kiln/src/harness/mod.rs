@@ -20,6 +20,7 @@
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 //! * [`builds`] — agents' builds on the runner's work: the cache variables, warm build folders.
 
+pub mod about;
 pub mod acp;
 pub mod antigravity;
 pub mod archive;

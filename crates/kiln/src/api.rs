@@ -817,7 +817,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
         (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land")]) => {
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             // A send's idempotency key may come as the standard header (CP-T3.2).
             let key = idempotency_key(&req);
@@ -4413,6 +4413,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     // `plans.run`), never what's asked.
     body.spec.parent = None;
     body.spec.plan_run = None;
+    body.spec.helper = None;
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {

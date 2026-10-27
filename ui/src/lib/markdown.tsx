@@ -9,7 +9,7 @@ import type { Element, ElementContent, Root, RootContent } from "hast";
 import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CopyBlock } from "@/components/ui/copy-block";
-import { Highlighted } from "@/components/code/highlighted";
+import { CodeBlock } from "@/components/code/highlighted";
 
 /** A table cell keeps its words whole (harness.css), so a long run in one (a path, a URL, a digest)
  *  gets places to wrap: after its slashes, then (where a piece is still long) its other separators,
@@ -159,11 +159,7 @@ const MARKDOWN: Components = {
           <span className="hx-block-tag">{lang ?? "code"}</span>
           <CopyBlock text={body} />
         </div>
-        <pre className="hx-pre" data-lang={lang}>
-          <code className={code?.props.className}>
-            <Highlighted text={body} lang={lang} />
-          </code>
-        </pre>
+        <CodeBlock text={body} lang={lang} className={code?.props.className} />
       </div>
     );
   },
