@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AgentLimitView, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -252,6 +252,10 @@ export const api = {
   agents: (signal?: AbortSignal) => get<Agent[]>("/api/agents", signal),
   forgetAgent: (name: string) => del<void>(`/api/agents/${enc(name)}`),
   drainAgent: (name: string, draining: boolean) => post<void>(`/api/agents/${enc(name)}/drain`, { draining }),
+  /** How many agent sessions a runner has at work at once: what's set here, what it holds and why, how many are at work now. */
+  agentLimit: (name: string, signal?: AbortSignal) => get<AgentLimitView>(`/api/runners/${enc(name)}/agent-limit`, signal),
+  /** Set it here (wins over the runner's config); `null` takes it away, and its config's (or kiln's default) holds again. */
+  setAgentLimit: (name: string, max_sessions: number | null) => request<AgentLimitView>("PUT", `/api/runners/${enc(name)}/agent-limit`, { max_sessions }),
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),
   joinRequests: (signal?: AbortSignal) => get<JoinRequest[]>("/api/join-requests", signal),
   /** A one-time invite for an outpost: kiln run on a machine without installing it there. */

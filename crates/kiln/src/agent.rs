@@ -1261,12 +1261,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Conversations kept on disk as they happen (docs/conversations.md), and sent to the server's
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
+    // How many agent sessions it has at work at once (docs/agents.md, "How many agents a machine
+    // runs"): what was set for this machine from the server (kept here for its restarts), else its
+    // config's, else kiln's default. What the server sets is taken as it says it, and the config is
+    // read again as it changes.
+    let mut limit_asked = crate::harness::limit::kept(&o.state_dir);
+    let mut limit_config = o.declared.max_agent_sessions;
+    // What the server was told this machine holds, on this connection; and whether it takes that.
+    let mut limit_said: Option<crate::harness::limit::Held> = None;
+    let mut server_limit = false;
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
         convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
-        let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
+        let held = crate::harness::limit::held(limit_asked, limit_config);
+        if held.from != crate::harness::limit::Source::Default {
+            tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
+        }
+        let limits = crate::harness::host::Limits { per_machine: held.max_sessions };
+        let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), limits);
         // A new build taking over takes no messages till it's promoted (`Host::hold`).
         if take_over_pending.is_some() {
             h.hold(true);
@@ -1962,12 +1976,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md), and an
-                // outpost aside, it says what it holds warm (docs/ci.md W24-R18). A test build's
+                // outpost aside, it says what it holds warm (docs/ci.md W24-R18); running agent
+                // sessions, it takes their limit from the server (docs/agents.md). A test build's
                 // `old` says nothing, as a runner from before the channel.
                 if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work }) {
+                    let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2042,6 +2058,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 drops_said = None;
                 server_work = false;
                 work_said = None;
+                server_limit = false;
+                limit_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -2130,6 +2148,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_wire = caps & proto::CAP_WIRE != 0;
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
+                        server_limit = caps & proto::CAP_AGENT_LIMIT != 0;
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
@@ -2201,6 +2220,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // Its battery is said again too (a state: the newest, sent on every connect).
                         power_said = None;
                         power_read_at = None;
+                        // And what its agent sessions are held to, to a server that takes it.
+                        limit_said = None;
+                        if let Some(h) = &harness {
+                            hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit, &uplink).await;
+                        }
                         // The server learns (again) which agent sessions run here, then what it lacks
                         // of each: over the channel only that (a session's stream not started yet
                         // starts with its snapshot), else all of each.
@@ -2912,6 +2936,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             fd.push(json);
                         }
                     }
+                    // What a person set from the server for how many agent sessions this machine
+                    // runs at once (none: its config's holds): kept for its restarts, held from now
+                    // on, and said back (docs/agents.md, "How many agents a machine runs").
+                    ServerMsg::AgentLimit { json } => match serde_json::from_str::<crate::harness::limit::Asked>(&json) {
+                        Ok(asked) => {
+                            let dir = o.state_dir.clone();
+                            if let Err(e) = crate::rt::blocking(move || crate::harness::limit::keep(&dir, asked)).await.and_then(|r| r.map_err(anyhow::Error::from)) {
+                                tracing::warn!(error = %format!("{e:#}"), "what was set for this machine's agent limit couldn't be kept: started again, it holds its config's until the server says it again");
+                            }
+                            limit_asked = asked;
+                            if let Some(h) = &harness {
+                                hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                            }
+                        }
+                        Err(e) => refuse(&mut answer_after, crate::wire::channel::Refusal::Malformed, format!("an agent limit this runner can't read: {e}")),
+                    },
                     // A leg of the CI engine (docs/ci.md W06): this runner announces `CAP_CI2`.
                     ServerMsg::AssignV2 { json } => {
                         let mut a: kiln_ci::wire::AssignmentV2 = match serde_json::from_str(&json) {
@@ -3295,6 +3335,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Heartbeat => {
                 // Counts of jobs long done (a kept leg is let go well within a day).
                 journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
+                // Its config's agent limit, read again: a change holds at once, nothing restarting.
+                // A config that can't be read now (a change half written) keeps the last one read.
+                if let (Some(h), Some(path)) = (&harness, o.config.clone()) {
+                    let read = crate::rt::blocking(move || crate::harness::limit::configured(&path)).await.ok().flatten();
+                    if let Some(config) = read.filter(|c| *c != limit_config) {
+                        if let Some(n) = config.filter(|n| crate::harness::limit::valid(*n).is_err()) {
+                            tracing::warn!(max_agent_sessions = n, "[agent] max_agent_sessions is from 1 to {}: passed over", crate::harness::limit::MAX);
+                        }
+                        limit_config = config;
+                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                    }
+                }
                 if connected {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
@@ -3326,6 +3378,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
                         uplink.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
                         drops_said = Some(dropped);
+                    }
+                    // What its agent sessions are held to, said again if the server lacks it.
+                    if let Some(h) = &harness {
+                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
                     }
                     // What it holds warm, for placement (docs/ci.md W24-R18): once it changed here,
                     // and every 10 minutes for what the machine's other runner processes changed.
@@ -3694,6 +3750,22 @@ struct HandedTerm {
     handover: crate::terminal::Handover,
     /// Bytes that rebuild the session's screen and scrollback in the new image's emulator.
     replay: String,
+}
+
+/// What this machine holds its agent sessions to (`crate::harness::limit`), held by its sessions'
+/// host from now on; and said to the server when `tell` (it takes it, on a connection it welcomed)
+/// and it changed since the server last heard it.
+async fn hold_agent_limit(h: &crate::harness::host::Host, held: crate::harness::limit::Held, said: &mut Option<crate::harness::limit::Held>, tell: bool, uplink: &Uplink) {
+    if h.set_max_sessions(held.max_sessions) {
+        tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
+    }
+    if tell
+        && *said != Some(held)
+        && let Ok(json) = serde_json::to_string(&held)
+    {
+        uplink.msg(AgentMsg::AgentLimit { json }).await;
+        *said = Some(held);
+    }
 }
 
 /// Whether this machine takes upgrades from its server: its config's `[updates] accept`, read

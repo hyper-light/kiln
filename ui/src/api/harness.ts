@@ -701,6 +701,8 @@ export interface AgentInfo {
   reach?: string | null;
   /** It waits for a usage limit to reset (as `State.pause`). */
   pause?: Pause;
+  /** Since when (Unix ms) it waits for room on its machine to go to work: as many of the machine's agents are at work as its limit lets be. What it was sent waits in its queue. */
+  room_wait?: number;
   /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
   keep_off?: boolean;
   /** Its goals wait on you: it paused them for you, until you resume them (set on the server). */
