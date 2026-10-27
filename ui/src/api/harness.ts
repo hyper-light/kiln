@@ -735,6 +735,8 @@ export interface AgentInfo {
   parent?: string;
   /** The plan run it does a step of. */
   plan_run?: string;
+  /** Its parent's subagent: kiln started it for one of its parent's goals or plan steps, on its parent's machine with its parent's settings, and it shows in its parent's chat and on its parent's row, not as an agent of its own. */
+  subagent?: boolean;
   /** Started without its harness's skip-every-check mode (an agent it starts can't have it either). */
   no_bypass?: boolean;
   /** Its workspace of its own: a Slates volume over `over` (its repository's top), once made. */
@@ -1506,10 +1508,13 @@ export class SessionStore {
     this.asked.set(id, { ...a, tries, why });
     this.patch({ asked: [...this.asked.values()] });
     const ws = this.ws;
-    window.setTimeout(() => {
-      const now = this.asked.get(id);
-      if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command }));
-    }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
+    window.setTimeout(
+      () => {
+        const now = this.asked.get(id);
+        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command }));
+      },
+      AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1],
+    );
   }
 
   /** Command `id` was refused: shown so a moment, then let go of. A message refused so says so where it shows in the conversation, until it's sent again or let go of. */

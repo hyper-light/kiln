@@ -1901,6 +1901,8 @@ where
                 crate::harness::told::tick(hub, &all, now, &running, &quiet).await;
                 // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
                 crate::harness::elsewhere::tick(hub, &all, now);
+                // Subagents given the rest of their agent's settings once their harness lists them.
+                crate::harness::lineage::settle_settings(hub).await;
                 // What agents' goals wait on a person for, on their info: Mission Control's Needs
                 // you, and a card wherever you are in kiln.
                 hub.harness.set_held(hub, &held_stacks(self.store).await);

@@ -18,20 +18,21 @@ import { machineName } from "./parts";
 import { RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
-import { subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
+import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
+import { harnessSessionsRes, useRes } from "@/lib/data";
 import "./console.css";
 
 type BorderState = "active" | "stopped" | "finished" | "ready" | "disconnected";
 
-function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null): { tone: BorderState; label: string } {
+function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null, kiln: number): { tone: BorderState; label: string } {
   if (status === "disconnected" || (conn !== "open" && status !== "exited")) return { tone: "disconnected", label: conn === "reconnecting" ? "Reconnecting…" : "Disconnected" };
   if (state?.pause ?? info?.pause) return { tone: "stopped", label: "Paused at a usage limit" };
   if (status === "exited") return { tone: "stopped", label: "Stopped" };
   if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "ready", label: "Waiting for you" };
   if (status === "starting") return { tone: "active", label: state?.harness_session ? "Resuming…" : "Starting…" };
   if (status === "running") return { tone: "active", label: "Working" };
-  // Its turn over, a subagent it sent off still works.
-  const subs = state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info?.subagents).length;
+  // Its turn over, a subagent it sent off still works (its harness's own, or one kiln started for its goals: `kiln`).
+  const subs = (state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info?.subagents).length) + kiln;
   if (workingThrough(status, subs)) return { tone: "active", label: `Working · ${subs} subagent${subs === 1 ? "" : "s"}` };
   if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
   return { tone: "ready", label: "Ready" };
@@ -44,7 +45,9 @@ function TurnControl({ tone, label, action, onClick, restart = false }: { tone: 
       <RoundButton className="ag-turn-control" data-state={tone} label={action ? `${label} · ${action}` : label} disabled={!onClick} onClick={onClick}>
         {restart ? <RotateCcw size={15} aria-hidden="true" /> : <Pause size={15} aria-hidden="true" />}
       </RoundButton>
-      <span className="sr-only" role="status">{label}</span>
+      <span className="sr-only" role="status">
+        {label}
+      </span>
     </>
   );
 }
@@ -59,7 +62,11 @@ function StoppingControl({ stopAt, onForce, unavailable }: { stopAt: number; onF
  *  turn runs, and keeps room for hours. */
 function TurnTime({ started }: { started: number }) {
   const now = useClock(1000);
-  return <span className="ag-turn-time" title="Time in this turn" aria-label={`Time in this turn: ${formatThought((now - started) / 1000)}`}>{formatThought((now - started) / 1000)}</span>;
+  return (
+    <span className="ag-turn-time" title="Time in this turn" aria-label={`Time in this turn: ${formatThought((now - started) / 1000)}`}>
+      {formatThought((now - started) / 1000)}
+    </span>
+  );
 }
 
 /** Between turns the clock stops where the last one ended. */
@@ -115,14 +122,21 @@ export function AgentHeader({
   const running = status === "running" || status === "waiting";
   const plan = state?.plan ?? info?.plan;
   const unavailable = status === "disconnected" || conn !== "open";
-  const signal = turnSignal(status, conn, state, info);
+  // The subagents kiln started for its goals or plan steps at work, beside its harness's own.
+  const everyone = useRes(harnessSessionsRes).data;
+  const kiln = info ? kilnAtWork(kilnSubagentsOf(everyone, info.id)).length : 0;
+  const signal = turnSignal(status, conn, state, info, kiln);
   // Stop can use HTTP while its socket reconnects; keep that escape available.
   const canStop = running && features.includes("interrupt");
   const canRestart = status === "exited" && features.includes("resume");
   const left = state?.left_behind ?? info?.left_behind ?? 0;
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
   // Settings always: kiln's own (usage limits) are there whatever the harness offers.
-  const extra = [...(left > 0 && onBackground ? [{ label: `${left} left running…`, onSelect: onBackground }] : []), ...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), { label: "Settings…", onSelect: onSettings }];
+  const extra = [
+    ...(left > 0 && onBackground ? [{ label: `${left} left running…`, onSelect: onBackground }] : []),
+    ...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []),
+    { label: "Settings…", onSelect: onSettings },
+  ];
   // Newer Codex adapters can interrupt and continue a turn to apply its permissions immediately.
   const permissionsLive = features.includes("permissions_live");
   const nextTurn = info?.kind === "codex" ? { mode: !permissionsLive, model: true, effort: true } : undefined;
@@ -207,8 +221,15 @@ export function AgentHeader({
           )}
         </div>
         <div className="ag-actions">
-          {canStop && stopAt != null ? <StoppingControl stopAt={stopAt} onForce={onForceStop} unavailable={unavailable} /> : (
-            <TurnControl {...signal} action={canStop ? "Stop the current turn" : canRestart ? "Restart" : undefined} onClick={canStop ? onStop : canRestart ? () => send({ type: "restart" }) : undefined} restart={canRestart} />
+          {canStop && stopAt != null ? (
+            <StoppingControl stopAt={stopAt} onForce={onForceStop} unavailable={unavailable} />
+          ) : (
+            <TurnControl
+              {...signal}
+              action={canStop ? "Stop the current turn" : canRestart ? "Restart" : undefined}
+              onClick={canStop ? onStop : canRestart ? () => send({ type: "restart" }) : undefined}
+              restart={canRestart}
+            />
           )}
           {onFind && (
             <RoundButton label="Find in the conversation (Ctrl F)" onClick={onFind}>
@@ -232,11 +253,7 @@ export function AgentHeader({
         </div>
       </div>
       <div className="ag-clock-row">
-        {running && state?.turn_started != null ? (
-          <TurnTime started={state.turn_started} />
-        ) : state?.last_turn && lastTurnFrom != null ? (
-          <TurnTook ms={state.last_turn.at - lastTurnFrom} />
-        ) : null}
+        {running && state?.turn_started != null ? <TurnTime started={state.turn_started} /> : state?.last_turn && lastTurnFrom != null ? <TurnTook ms={state.last_turn.at - lastTurnFrom} /> : null}
       </div>
       {switchTarget ? (
         <React.Suspense fallback={<RunSettings {...line} />}>

@@ -111,7 +111,9 @@ There is no operation for answering another agent's approvals or questions.
 **O2 Parents and children.** An agent started by an agent records its parent (`parent`, set from
 the caller's identity, never from input). It's a top-level agent all the same: Mission Control
 lists it as a row of its own, like an agent a person starts. A harness's own subagents stay in
-their agent's chat.
+their agent's chat, and so do the subagents kiln starts for an agent's goals and plan steps side by
+side, and for the steps of a plan run an agent runs (docs/goals.md, "A plan's steps side by side"):
+those are its subagents (`subagent`), on its machine with its settings, in its chat and on its row.
 Ending a parent lists its live children and offers to end them too.
 
 **O3 No more than its parent.** A child's permission mode is at most its parent's (plan < ask <

@@ -414,7 +414,15 @@ Mission Control lists every agent kiln runs, in one flat list. An agent started 
 is a top-level agent, whoever started it: a row of its own, in the counts, filters, conversation
 search and bulk actions, with no nesting under the agent that started it. A harness's own
 subagents stay subagents: they aren't rows, and their status and output stay inside their agent's
-chat, including after they finish.
+chat, including after they finish. So do the subagents kiln starts for an agent's goals or plan
+steps side by side, and for each step of a plan run the agent runs (`subagent` on the session,
+set by kiln alone: `lineage::start_subagent`; docs/goals.md, "A plan's steps side by side"):
+sessions of their own on the agent's machine, with its harness, folder, model, effort, speed, mode,
+Subagents setting, pause point, environment and program. The agent's row works through them and
+carries what one asks you (answered as that one's); its chat lists them with its harness's own
+(the line by its composer, Tools → Subagents), each opening its thread in place, and a subagent's
+own page opens there too (`?own=1` keeps it a page of its own). One whose agent has gone is a row
+of its own.
 The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
