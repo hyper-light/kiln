@@ -401,8 +401,13 @@ mod tests {
             anyhow::ensure!(get(&ada, "TURBO_API") == Some(url.as_str()) && get(&ada, "TURBO_TOKEN") == Some(token.as_str()) && get(&ada, "TURBO_TEAM").is_some());
             anyhow::ensure!(get(&ada, "GOCACHEPROG") == Some("'/opt/kiln dir/kiln' gocacheprog"), "{ada:?}");
             anyhow::ensure!(get(&ada, "CCACHE_REMOTE_STORAGE") == Some(format!("http://kiln:{token}@{at}/ccache").as_str()));
-            if cfg!(unix) {
+            // sccache's server listens on a socket of the scope's own: its wrapper only where that
+            // socket's path fits (a deep temporary folder may not).
+            let socket_fits = get(&ada, "SCCACHE_DIR").is_some_and(|d| Path::new(d).with_file_name("sccache.sock").as_os_str().len() <= SOCKET_PATH_MAX);
+            if cfg!(unix) && socket_fits {
                 anyhow::ensure!(get(&ada, "RUSTC_WRAPPER") == Some("/usr/bin/sccache") && get(&ada, "SCCACHE_SERVER_UDS").is_some(), "{ada:?}");
+            } else {
+                anyhow::ensure!(get(&ada, "RUSTC_WRAPPER").is_none() && get(&ada, "SCCACHE_SERVER_UDS").is_none(), "{ada:?}");
             }
             // Another person: another token and folders of their own; no sccache, no wrapper.
             let bob = cache_env(&svc, "acme/app", "person:bob", &Tools { sccache: None, kiln: tools.kiln.clone() })?;
