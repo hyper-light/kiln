@@ -1194,7 +1194,9 @@ impl Scheduler {
 
     fn queue(&mut self, id: &str, now: i64, since: i64, out: &mut Vec<Command>) {
         let Some(leg) = self.legs.get(id) else { return };
-        let cost = leg.input.cost.unwrap_or(self.config().default_cost);
+        // What it costs its repository: its expected runner-seconds times the CPUs it asks, one at
+        // the least, so repositories at equal weights get equal CPU-time, big legs or small (W05).
+        let cost = leg.input.cost.unwrap_or(self.config().default_cost) * leg.input.request.cpu.max(1.0);
         let cadenced = leg.input.exclusive && leg.input.admission.as_ref().is_some_and(|a| a.cadence.is_some());
         self.count(id);
         // Start-time fair queuing across repositories (W05-R10), and inside each by actor and lane

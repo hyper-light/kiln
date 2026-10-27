@@ -64,6 +64,18 @@ fn legs(seed: u64, from: i64, until: i64) -> Vec<(i64, LegIn, i64)> {
     out
 }
 
+/// The fleet up, each runner sampling itself once it's up, the fleet's samples spread over the
+/// period: legs may come from [`SAMPLE_MS`] on.
+fn fleet() -> Sim {
+    let mut sim = Sim::new(Config::default());
+    for (i, &(name, cpus, gib, own_cpu, own_gib, io_full)) in FLEET.iter().enumerate() {
+        sim.runner(0, runner(name, cpus, gib));
+        let first = i as i64 * SAMPLE_MS / FLEET.len() as i64;
+        sim.sampled(first, name, Machine { cpus, mem: gib * GIB, own_cpu, own_mem: own_gib * GIB, io_full }, SAMPLE_MS);
+    }
+    sim
+}
+
 /// What a fleet's run measured, to where it is now.
 #[derive(Debug, Default)]
 struct Measured {
@@ -145,13 +157,7 @@ fn measure(sim: &Sim, legs: &[(i64, LegIn, i64)]) -> Measured {
 #[test]
 fn a_fleet_packs_to_the_target_by_headroom_without_overcommitting_memory() {
     for seed in [1, 2, 3] {
-        let mut sim = Sim::new(Config::default());
-        for (i, &(name, cpus, gib, own_cpu, own_gib, io_full)) in FLEET.iter().enumerate() {
-            sim.runner(0, runner(name, cpus, gib));
-            // It samples once it's up, the fleet's samples spread over the period.
-            let first = i as i64 * SAMPLE_MS / FLEET.len() as i64;
-            sim.sampled(first, name, Machine { cpus, mem: gib * GIB, own_cpu, own_mem: own_gib * GIB, io_full }, SAMPLE_MS);
-        }
+        let mut sim = fleet();
         // Legs come once every runner has sent its first sample, for two hours.
         let legs = legs(seed, SAMPLE_MS, STREAM_MS);
         for (at, leg, duration) in &legs {
@@ -174,5 +180,51 @@ fn a_fleet_packs_to_the_target_by_headroom_without_overcommitting_memory() {
         assert_eq!(sim.settled.len(), legs.len(), "seed {seed}: every leg ran: {all:?}");
         assert!(all.worst_mem <= 1.0, "seed {seed}: memory was placed past a runner's capacity: {all:?}");
         assert!(all.worst_use.0 <= TARGET_USE + 1e-9, "seed {seed}: a runner was in use past the target: {all:?}");
+    }
+}
+
+/// W05's admission, step 3: fair share between repositories counts what legs ask. Under a backlog,
+/// two repositories at equal weights, acme/big's legs asking 8 CPUs and acme/small's 1, each a
+/// stream of about the fleet's CPUs, get about half the fleet's CPU-time each (from 10 minutes in,
+/// to an hour and a half), not acme/big eight times acme/small's as when a leg cost its runner-
+/// seconds alone.
+#[test]
+fn repositories_at_equal_weights_get_equal_cpu_time_big_legs_or_small() {
+    let mut sim = fleet();
+    let mut rng = Rng::stream(7, "fair");
+    let mut legs: Vec<(i64, LegIn, i64)> = Vec::new();
+    let (until, from) = (90 * MIN, 10 * MIN);
+    for (repo, cpus, every) in [("acme/big", 8.0, 30_000), ("acme/small", 1.0, 3_750)] {
+        let mut t = SAMPLE_MS;
+        while t <= until {
+            let n = legs.len();
+            let duration = 5 * MIN + rng.below(60_000) as i64;
+            let request = Resources { cpu: cpus, mem: (cpus as u64).max(1) << 30, ..Resources::default() };
+            let leg = LegIn { id: format!("leg-{n}"), run: format!("run-{n}"), repo: repo.into(), route: LegRoute { labels: vec!["fleet".into()], ..LegRoute::default() }, priority: 50, request, cost: Some(duration as f64 / 1000.0), ..LegIn::default() };
+            legs.push((t, leg, duration));
+            t += every;
+        }
+    }
+    for (at, leg, duration) in &legs {
+        sim.leg(*at, leg.clone(), *duration);
+    }
+    sim.run(until);
+    // Each repository's CPU-time in the window: what its legs asked, for as long as they ran in it.
+    let ends: std::collections::HashMap<&str, i64> = sim.busy_legs.iter().map(|(l, _, e)| (l.as_str(), *e)).collect();
+    let mut by: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
+    for (_, leg, _) in &legs {
+        let Some(start) = sim.started(&leg.id) else { continue };
+        let end = ends.get(leg.id.as_str()).copied().unwrap_or(until);
+        let ran = (end.min(until) - start.max(from)).max(0) as f64;
+        *by.entry(leg.repo.as_str()).or_default() += ran * leg.request.cpu;
+    }
+    let all: f64 = by.values().sum();
+    for (repo, t) in &by {
+        let share = t / all;
+        assert!((0.4..=0.6).contains(&share), "{repo} had {:.1}% of the CPU-time: {by:?}", share * 100.0);
+    }
+    // Both kept work queued throughout.
+    for repo in ["acme/big", "acme/small"] {
+        assert!(legs.iter().any(|(_, l, _)| l.repo == repo && sim.started(&l.id).is_none()), "{repo} ran out of work");
     }
 }
