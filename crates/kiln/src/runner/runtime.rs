@@ -147,15 +147,10 @@ fn leg_path(st: &State, path: Option<&str>) -> String {
     path
 }
 
-/// Where `prog` is on `env`'s `PATH`.
+/// Where `prog` is on `env`'s `PATH` (on Windows the `.exe` or `.cmd` there, never npm's or
+/// Maven's shell script of its name beside it).
 fn on_path(env: &BTreeMap<String, String>, prog: &str) -> Option<PathBuf> {
-    let path = env.get("PATH")?;
-    std::env::split_paths(path).flat_map(|d| [d.join(prog), d.join(format!("{prog}.exe"))]).find(|p| p.is_file())
-}
-
-/// Whether a program is on `PATH`.
-fn which(prog: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file() || d.join(format!("{prog}.exe")).is_file()))
+    crate::os::which_in(prog, std::ffi::OsStr::new(env.get("PATH")?))
 }
 
 /// GitHub's view of a typed output (W04-R20): its JSON, but a string as itself.
@@ -1367,7 +1362,7 @@ impl Leg {
                 .get("cpus")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|_| matches!(a.executor.kind.as_str(), "" | "host" | "docker"))
-                .and_then(|n| super::cpus::take(usize::try_from(n).unwrap_or(0)))
+                .and_then(|n| super::cpus::take(&a.job_id, usize::try_from(n).unwrap_or(0)))
                 .map(std::sync::Arc::new),
             matchers: matchers::Job::default(),
             stop: None,
@@ -1607,7 +1602,7 @@ impl Leg {
         anyhow::ensure!(ws.starts_with(&st.layout.workspace) && !c.path.split(['/', '\\']).any(|p| p == ".."), "`path` must stay inside the workspace");
         let remote = format!("{}/{}", st.server_url.trim_end_matches('/'), a.repo);
         let token = a.runtime.github_token.clone();
-        if crate::rt::blocking(|| which("git")).await.unwrap_or(false) {
+        if crate::rt::blocking(|| crate::os::have("git")).await.unwrap_or(false) {
             // The token rides in git's environment config, never on a command line.
             let header = format!("AUTHORIZATION: basic {}", base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}")));
             let w = ws.to_string_lossy().to_string();
@@ -2263,7 +2258,7 @@ impl Leg {
             workspace_size: None,
             memory: None,
             seed_tools: false,
-            cpuset: st.cpus.as_ref().map(|l| l.list()),
+            cpuset: super::cpus::pins().allowed(&self.a.job_id).map(|c| super::cpus::list(&c)),
         })
     }
 
@@ -2460,8 +2455,9 @@ impl Leg {
         let job = job.map(|j| super::docker::Spec { workspace_size: super::chaos::for_leg(a.attempt).and_then(|c| c.disk_mib).map(|mib| u64::from(mib) << 20), ..j });
         // The memory the leg was given in resource mode (W05-R03), its job container's limit.
         let job = job.map(|j| super::docker::Spec { memory: a.executor.options.get("memory").and_then(serde_json::Value::as_u64), ..j });
-        // And the CPUs it was given, its job container's own (`--cpuset-cpus`).
-        let job = job.map(|j| super::docker::Spec { cpuset: st.cpus.as_ref().map(|l| l.list()), ..j });
+        // And the CPUs it may use, its job container's own (`--cpuset-cpus`): those it was lent,
+        // its share, or what no share holds.
+        let job = job.map(|j| super::docker::Spec { cpuset: super::cpus::pins().allowed(&a.job_id).map(|c| super::cpus::list(&c)), ..j });
         // W18-R08: a job in a container is contained, its one way out the relay to the runner's
         // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
         // stops here; a trusted one runs as it would without its policy, and says so.
@@ -2609,9 +2605,10 @@ impl Leg {
         let oom_after = super::chaos::for_leg(self.a.attempt).and_then(|c| c.oom_after).filter(|_| on_host);
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
-                // In a job container without bash, the default shell is sh (GitHub-exact).
+                // In a job container the default shell is the container's: bash, else sh
+                // (GitHub-exact), whatever the host's is (PowerShell on Windows).
                 let shell = match shell {
-                    None if in_job && st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some_and(|j| !j.has_bash) => Some("sh"),
+                    None if in_job => Some(if st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some_and(|j| j.has_bash) { "bash -e {0}" } else { "sh" }),
                     other => *other,
                 };
                 let (ext, body) = script_file(shell, script);
@@ -2716,20 +2713,16 @@ impl Leg {
             }
             cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
         } else {
-            // On the host, within the CPUs the leg was given (W05-R03), as `taskset` starts it.
-            let mut c = match (&st.cpus, super::cpus::taskset()) {
-                (Some(l), Some(t)) => {
-                    let mut c = Command::new(t);
-                    c.arg("-c").arg(l.list()).arg(&prog).args(&args);
-                    c
-                }
-                _ => shell_program(&prog, &args, shell),
-            };
+            let mut c = shell_program(&prog, &args, shell);
             c.current_dir(wd).envs(&env);
             c
         };
-        let mut running = crate::proc::spawn_group(cmd)?;
+        // On the CPUs its leg may use (W05-R03): its share, the CPUs it was lent, or what no share
+        // holds, from its first instruction; and moved as a share is taken or let go.
+        let job = self.a.job_id.clone();
+        let mut running = super::cpus::spawn_on(&job, move || crate::proc::spawn_group(cmd))?;
         st.groups.push(running.pgid);
+        let _pinned = super::cpus::Step::new(&self.a.job_id, running.pgid);
         let mut oom_at = oom_after.map(|d| Instant::now() + d);
         let mut r = Reading { proc: Processor::new(st.allow_unsecure), line: Vec::new(), set_output: BTreeMap::new(), matchers: st.matchers.step(), failed: false, enospc: false };
         let mut flush = Interval::new(Duration::from_millis(100));
@@ -5351,13 +5344,10 @@ runs:
     }
 
     /// W05-R03: a leg in resource mode runs on CPUs of its own, as many as it asked for: on the
-    /// host its steps start within them (`taskset`), so `nproc` says the leg's (Linux).
+    /// host its steps start on them, so `nproc` says the leg's (Linux).
     #[cfg(target_os = "linux")]
     #[test]
     fn w05_r03_a_host_leg_runs_on_its_cpus() -> anyhow::Result<()> {
-        if super::super::cpus::taskset().is_none() {
-            return Ok(());
-        }
         let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: echo \"cpus $(nproc)\"\n";
         let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &|a: &mut AssignmentV2| a.executor.options = serde_json::json!({ "cpus": 1 }))?;
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");

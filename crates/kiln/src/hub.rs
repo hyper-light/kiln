@@ -290,6 +290,10 @@ pub struct AgentLive {
     pub dedicated_job: Option<String>,
     #[serde(skip)]
     pub exclusive: bool,
+    /// The shares of it its exclusive jobs and legs hold, by job (docs/ci.md W05-R03): their CPUs
+    /// and memory are theirs alone, other work runs in the rest.
+    #[serde(skip)]
+    pub held: Vec<(String, kiln_ci::sched::state::Resources)>,
     #[serde(skip)]
     pub lost_at: Option<Instant>,
     /// What the runner's probes found and its administrator declared (docs/ci.md W13-R01, R02).
@@ -785,6 +789,7 @@ impl Hub {
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
+                    held: Vec::new(),
                     lost_at: None,
                     facts: None,
                     instances: vec![],
@@ -1245,7 +1250,8 @@ impl Hub {
     // ------------------------------------------------------------ reach
 
     /// Reach's directory (`crate::reach::directory`): every runner that is not a job pod — what it
-    /// is, how busy it is, its harnesses, its reach identity and whether it takes links.
+    /// is, how busy it is, its harnesses, its reach identity and whether it takes links, and the
+    /// facts it reported (what `kiln run --needs` checks).
     pub fn reach_directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
         let kinds = self.harness.kinds();
         let relay = self.reach.lock();
@@ -1275,6 +1281,7 @@ impl Hub {
                     draining: a.draining,
                     harnesses: kinds.get(&format!("agent:{}", a.name)).map(|ks| ks.iter().filter(|k| k.available).map(|k| k.id.clone()).collect()).unwrap_or_default(),
                     via: a.transport.map(|t| t.to_string()).unwrap_or_default(),
+                    facts: a.facts.clone(),
                 }
             })
             .collect();
@@ -1453,6 +1460,7 @@ impl Hub {
                 Some(a) => {
                     a.busy = 0;
                     a.exclusive = false;
+                    a.held.clear();
                     std::mem::take(&mut a.running)
                 }
                 None => vec![],
@@ -2085,6 +2093,7 @@ impl Hub {
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
+            held: Vec::new(),
             lost_at: None,
             facts: None,
             instances: Vec::new(),
@@ -2111,9 +2120,12 @@ impl Hub {
             }
         }
         let busy = u32::try_from(running.len()).unwrap_or(u32::MAX);
+        // What its jobs still running hold of it, as before (W05-R03).
+        let held: Vec<(String, kiln_ci::sched::state::Resources)> = prev.iter().flat_map(|a| a.held.iter()).filter(|(j, _)| running.contains(j)).cloned().collect();
+        let exclusive = prev.as_ref().is_some_and(|a| a.exclusive) && !running.is_empty();
         let live = match prev {
             Some(prev) if !joined.newest => AgentLive { connected: true, last_seen: now, running, busy, lost_at: None, ..prev },
-            _ => AgentLive { draining, running, busy, facts: prev_facts, battery: prev_battery, ..live },
+            _ => AgentLive { draining, running, busy, facts: prev_facts, battery: prev_battery, held, exclusive, ..live },
         };
         self.store
             .upsert_agent(AgentRow {
@@ -2326,9 +2338,11 @@ impl Hub {
         let mut g = self.agents.lock();
         if let Some(a) = g.get_mut(agent) {
             a.running.retain(|j| j != job);
+            a.held.retain(|(j, _)| j != job);
             a.busy = u32::try_from(a.running.len()).unwrap_or(0);
             if a.running.is_empty() {
                 a.exclusive = false;
+                a.held.clear();
             }
         }
     }
@@ -2504,7 +2518,7 @@ impl Hub {
                         if let Some(a) = g.get_mut(&agent) {
                             a.running.push(job.id.clone());
                             a.busy = u32::try_from(a.running.len()).unwrap_or(u32::MAX);
-                            a.exclusive = spec.exclusive;
+                            hold_on(a, &job.id, v1_incoming(spec.exclusive, &spec.resources));
                         }
                     }
                     if let Some(q) = job.queued_at {
@@ -2529,7 +2543,7 @@ impl Hub {
                         event: run.event.clone(),
                         run_number: run.number,
                         attempt: job.attempt,
-                        spec,
+                        spec: spec.for_runner(self.runner_caps(&agent)),
                         secrets: self.job_secrets(),
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
@@ -2650,7 +2664,7 @@ impl Hub {
     fn pick_agent(&self, job: &Job) -> Option<String> {
         let declined = self.declined.lock().clone();
         let g = self.agents.lock();
-        let exclusive = job.spec.as_ref().is_some_and(|s| s.exclusive);
+        let incoming = job.spec.as_ref().map_or(kiln_ci::sched::state::Incoming::Ordinary, |s| v1_incoming(s.exclusive, &s.resources));
         g.values()
             .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
             .filter(|a| !a.running.contains(&job.id))
@@ -2665,7 +2679,7 @@ impl Hub {
             })
             .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
             .filter(|a| meets(job, a))
-            .filter(|a| if exclusive { a.running.is_empty() } else { a.busy < a.slots })
+            .filter(|a| agent_room(a.slots, a.facts.as_deref(), &a.held, a.exclusive, a.running.len(), incoming))
             // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
             // job goes to another, or waits for one (a pod made for it is its own).
             .filter(|a| a.ephemeral || !strain_of(a).overloaded)
@@ -2825,6 +2839,39 @@ impl Hub {
     }
 }
 
+/// What a v1 job holds of the runner it runs on (docs/ci.md W05-R03): an exclusive one asking for
+/// CPUs (`resources: { cpu, memory }`) holds them and that memory; asking for none, the whole
+/// runner. A `resources:` that isn't a quantity asks for none.
+pub(crate) fn v1_incoming(exclusive: bool, resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Incoming {
+    let asked = kiln_ci::sched::pools::ResourceSpec { cpu: resources.cpu.clone(), memory: resources.memory.clone(), ..Default::default() }.resources().unwrap_or_default();
+    kiln_ci::sched::state::Incoming::of(exclusive, &asked)
+}
+
+/// Whether a runner has room for one more job or leg, by the rule the engine's scheduler and the
+/// runner's own admission use (`kiln_ci::sched::state::room`): its slots, its size as its facts
+/// give it, what's held of it and what runs.
+pub(crate) fn agent_room(slots: u32, facts: Option<&kiln_ci::facts::RunnerFacts>, held: &[(String, kiln_ci::sched::state::Resources)], whole: bool, running: usize, incoming: kiln_ci::sched::state::Incoming) -> bool {
+    let size = facts.and_then(|f| {
+        let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
+        (cpus > 0 && f.mem.total > 0).then(|| kiln_ci::sched::state::Resources { cpu: f64::from(cpus), mem: f.mem.total, ..Default::default() })
+    });
+    let mut shares = kiln_ci::sched::state::Resources::default();
+    for (_, q) in held {
+        shares.cpu += q.cpu;
+        shares.mem = shares.mem.saturating_add(q.mem);
+    }
+    kiln_ci::sched::state::room(slots, size, &shares, whole, running.saturating_sub(held.len()), running, incoming)
+}
+
+/// A job or leg now on a runner holds what it holds of it: its share, or the whole runner.
+pub(crate) fn hold_on(a: &mut AgentLive, job: &str, incoming: kiln_ci::sched::state::Incoming) {
+    match incoming {
+        kiln_ci::sched::state::Incoming::Share(q) => a.held.push((job.to_owned(), q)),
+        kiln_ci::sched::state::Incoming::Whole => a.exclusive = true,
+        kiln_ci::sched::state::Incoming::Ordinary => {}
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2872,6 +2919,38 @@ pub(crate) mod tests {
         assert_eq!(seen, vec![("studio-3", true, 2, tools.clone()), ("studio-2", false, 2, tools.clone()), ("old", false, 4, tools)], "an agent can fix only the one that hosts agents and lacks only tools");
     }
 
+    /// A bench holding 16 of a 32-CPU, 64 GiB runner's CPUs leaves two of its four slots: the v1
+    /// dispatcher packs ordinary jobs beside it, and an exclusive job asking nothing still waits
+    /// for the runner to be empty.
+    #[test]
+    fn a_v1_bench_holds_its_share_and_jobs_run_beside_it() {
+        use kiln_ci::sched::state::{Incoming, Resources};
+        let mut facts = kiln_ci::facts::RunnerFacts::default();
+        facts.cpu.threads = 32;
+        facts.mem.total = 64 << 30;
+        let spec = |exclusive: bool, cpu: Option<&str>, memory: Option<&str>| crate::pipeline::JobSpec {
+            exclusive,
+            resources: crate::pipeline::Resources { cpu: cpu.map(str::to_owned), memory: memory.map(str::to_owned) },
+            ..crate::pipeline::JobSpec::default()
+        };
+        let of = |s: crate::pipeline::JobSpec| v1_incoming(s.exclusive, &s.resources);
+        let bench = of(spec(true, Some("16"), Some("16Gi")));
+        assert_eq!(bench, Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() }));
+        assert_eq!(of(spec(true, None, None)), Incoming::Whole);
+        assert_eq!(of(spec(false, Some("16"), None)), Incoming::Ordinary);
+        // Empty: the bench goes in; then two ordinary jobs beside it, not three.
+        assert!(agent_room(4, Some(&facts), &[], false, 0, bench));
+        let held = vec![("bench".to_owned(), Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() })];
+        assert!(agent_room(4, Some(&facts), &held, false, 1, Incoming::Ordinary));
+        assert!(agent_room(4, Some(&facts), &held, false, 2, Incoming::Ordinary));
+        assert!(!agent_room(4, Some(&facts), &held, false, 3, Incoming::Ordinary), "two slots beside half the runner held");
+        assert!(!agent_room(4, Some(&facts), &held, false, 1, Incoming::Whole), "the whole runner waits for it to be empty");
+        // Before: an exclusive job took the whole runner; asking nothing, it still does.
+        assert!(!agent_room(4, Some(&facts), &[], true, 1, Incoming::Ordinary));
+        // A runner whose facts aren't in yet: the bench waits for it to be empty.
+        assert!(!agent_room(4, None, &[], false, 1, bench) && agent_room(4, None, &[], false, 0, bench));
+    }
+
     /// A job's labels fit a runner by its own labels, its name, or its platform (`linux`, `amd64`,
     /// `arm64`, `self-hosted`), in any case: `[linux]` isn't only for runners labelled so.
     #[test]
@@ -2904,6 +2983,7 @@ pub(crate) mod tests {
             enrolled_at: 0,
             running: vec![],
             busy: 0,
+            held: Vec::new(),
             draining: false,
             sample: None,
             battery: None,

@@ -179,14 +179,22 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
 
 /// A runner process beside the machine's usual one: the machine's key with this instance's own
 /// certificate, fetched (or renewed) from the server with a current certificate as proof — this
-/// instance's own while it is valid, else the machine's.
+/// instance's own while it is valid, else the machine's. Its own goes once it is for another key
+/// (the machine enrolled again since, with a new one): with it, no TLS configuration is made and
+/// the runner never reaches the server, so an upgrade that starts it never completes.
 async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     let dir = crate::upgrade::instance_dir(&o.state_dir, id);
     let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
     let (machine_cert, key) = crate::upgrade::machine_credentials(&o.state_dir)?;
     let quic = std::fs::read_to_string(o.state_dir.join("quic")).ok().map(|s| s.trim().to_owned());
     let cert_p = dir.join("agent.pem");
-    let own = std::fs::read_to_string(&cert_p).ok();
+    let own = std::fs::read_to_string(&cert_p).ok().filter(|c| {
+        let mine = crate::pki::cert_matches_key(c, &key);
+        if !mine {
+            tracing::warn!(instance = %id, "this runner process's certificate is for a key the machine no longer has (it enrolled again): asking for a new one");
+        }
+        mine
+    });
     if let Some(c) = &own
         && !crate::pki::needs_renewal(c)
     {
@@ -219,6 +227,55 @@ struct Running {
     cancel: Shutdown,
     /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
     pooled: bool,
+    /// What it holds of this runner (docs/ci.md W05-R03): a share of its CPUs and memory, the
+    /// whole runner, or nothing of its own.
+    holds: kiln_ci::sched::state::Incoming,
+}
+
+/// A job holding a share of this runner takes its CPUs (docs/ci.md W05-R03): whole cores of its
+/// own, the other legs' steps moving off them. Where they can't be pinned (no topology: not
+/// Linux), it still holds its room in placement, and the log says so.
+fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
+    let kiln_ci::sched::state::Incoming::Share(q) = holds else { return };
+    let threads = q.cpu.ceil().max(1.0) as usize;
+    match crate::runner::cpus::pins().hold(job, threads) {
+        Some(cpus) => tracing::info!(job, cpus = %crate::runner::cpus::list(&cpus), "it holds these CPUs; the other legs run on the rest"),
+        None => tracing::info!(job, threads, "it holds its share in placement; its cores aren't pinned here"),
+    }
+}
+
+/// Whether this runner takes one more job or leg (docs/ci.md W05-R03), by the rule its dispatchers
+/// use, counting what its jobs and legs from either hold (`jobs`: each one's pooled and holds); a
+/// pool's leg runs in its executor, beside the runner's slots. Why not, when it doesn't.
+fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
+    use kiln_ci::sched::state::{Incoming, Resources, room};
+    let (mut held, mut whole, mut ordinary, mut running) = (Resources::default(), false, 0, 0);
+    for (p, h) in jobs {
+        match h {
+            Incoming::Whole => whole = true,
+            Incoming::Share(q) => {
+                held.cpu += q.cpu;
+                held.mem = held.mem.saturating_add(q.mem);
+            }
+            Incoming::Ordinary => {}
+        }
+        if !p {
+            running += 1;
+            ordinary += usize::from(h == Incoming::Ordinary);
+        }
+    }
+    if whole {
+        return Err("an exclusive job has this runner to itself");
+    }
+    if pooled || room(slots, size, &held, false, ordinary, running, incoming) {
+        return Ok(());
+    }
+    Err(match incoming {
+        Incoming::Whole => "an exclusive job waits for this runner to be empty",
+        Incoming::Share(_) => "no room for the share it holds",
+        Incoming::Ordinary if held.cpu > 0.0 => "no free slot beside what's held",
+        Incoming::Ordinary => "no free slot",
+    })
 }
 
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
@@ -1111,7 +1168,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Its microVM deployments (W15-R02), booted again: they end with the runner.
     #[cfg(target_os = "linux")]
     crate::rt::spawn(crate::runner::firecracker::restore(o.work_dir.join("_firecracker")));
-    let mut exclusive = false;
+    // What this machine is, for what exclusive jobs hold of it (W05-R03).
+    let size = crate::runner::probe::size();
     let mut draining = false;
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and
     // announced again on every reconnect.
@@ -2225,18 +2283,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // from here (NAT, NodePorts, cluster DNS all differ).
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.values().filter(|j| !j.pooled).count()).unwrap_or(u32::MAX) >= o.slots.max(1);
-                        if o.outpost || draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
+                        let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
+                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
+                        if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
                             served_dedicated = true;
                         }
-                        exclusive = a.spec.exclusive;
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false });
+                        hold_cpus(&id, holds);
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -2869,10 +2928,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let id = a.job_id.clone();
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
-                        let own = jobs.values().filter(|j| !j.pooled).count();
-                        let full = !pooled && u32::try_from(own).unwrap_or(u32::MAX) >= o.slots.max(1);
-                        if o.outpost || draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
+                        let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
+                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
+                        if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
@@ -2912,7 +2971,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled });
+                        hold_cpus(&id, holds);
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
                         // Its pool's executor, when the leg can run in it as it is; else the leg
                         // runs the usual way and the executor goes all the same.
@@ -3224,10 +3284,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
                 if jobs.remove(&r.job).is_some() {
+                    crate::runner::cpus::pins().release(&r.job);
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
-                    if jobs.is_empty() {
-                        exclusive = false;
-                    }
                     if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
                         unreceived.insert(r.job.clone(), (Instant::now(), b));
                     }
@@ -3841,6 +3899,27 @@ mod tests {
     }
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
+
+    /// The runner admits by the rule its dispatchers use, counting what jobs from either hold: on
+    /// a 32-CPU, 64 GiB runner of 4 slots, a bench holding 16 CPUs leaves two slots, refusals say
+    /// why, and a pool's leg runs in its executor beside them.
+    #[test]
+    fn a_runner_admits_work_beside_what_a_bench_holds() {
+        use kiln_ci::sched::state::{Incoming, Resources};
+        let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
+        let bench = Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() });
+        let o = Incoming::Ordinary;
+        assert_eq!(admits(4, size, std::iter::empty(), false, bench), Ok(()));
+        assert_eq!(admits(4, size, [(false, bench), (false, o)].into_iter(), false, o), Ok(()));
+        assert_eq!(admits(4, size, [(false, bench), (false, o), (false, o)].into_iter(), false, o), Err("no free slot beside what's held"));
+        assert_eq!(admits(4, size, [(false, o), (false, o), (false, o)].into_iter(), false, bench), Err("no room for the share it holds"));
+        assert_eq!(admits(4, size, [(false, bench), (false, o), (false, o)].into_iter(), true, o), Ok(()), "a pool's leg runs beside the slots");
+        // An exclusive job asking nothing has the runner to itself, as before.
+        assert_eq!(admits(4, size, [(false, o)].into_iter(), false, Incoming::Whole), Err("an exclusive job waits for this runner to be empty"));
+        assert_eq!(admits(4, size, [(false, Incoming::Whole)].into_iter(), true, o), Err("an exclusive job has this runner to itself"));
+        // Without exclusive jobs, slots as ever.
+        assert_eq!(admits(2, size, [(false, o), (false, o)].into_iter(), false, o), Err("no free slot"));
+    }
 
     /// A stream that starts again sends a server whose copy has part of a session only what the
     /// copy lacks. The digests it compares are of the copy as the server keeps it: every kind of

@@ -32,7 +32,7 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { missionFoundSessions, standOf, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
+import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
@@ -144,12 +144,29 @@ function HeldDecide({ a }: { a: AgentInfo }) {
 
 /**
  * A row re-renders only when its own agent changes (or is selected); its clock counts by itself.
- * `picking`: agents are being selected by touch (its mark says whether it is).
+ * `picking`: agents are being selected by touch (its mark says whether it is). `asking`: a subagent
+ * kiln started for it that waits on you: what it asks is said, and answered, here.
  */
-const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: { a: AgentInfo; stand: Stand; selected: boolean; picking?: boolean; onSelect: (id: string, on: boolean) => void }) {
+const Row = React.memo(function Row({
+  a,
+  stand,
+  asking,
+  selected,
+  picking,
+  onSelect,
+}: {
+  a: AgentInfo;
+  stand: Stand;
+  asking?: AgentInfo;
+  selected: boolean;
+  picking?: boolean;
+  onSelect: (id: string, on: boolean) => void;
+}) {
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
-  const ap = a.approvals[0];
+  // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
+  const who = asking ?? a;
+  const ap = who.approvals[0];
   const actions = useAgentActions(a);
   const label = agentLabel(a);
   // The harness, said under a label that isn't its own name.
@@ -161,7 +178,7 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
         <i aria-hidden="true" />
         {WORD[stand]}
       </Shimmer>
-      <span className="ms-text">{lineOf(a, stand)}</span>
+      <span className="ms-text">{asking ? `Its subagent \u201c${agentLabel(asking)}\u201d: ${lineOf(asking, "needs")}` : lineOf(a, stand)}</span>
     </span>
   );
   return (
@@ -201,8 +218,8 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
       <span className="ms-actions">
         {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
         <span className="ms-decide">
-          {stand === "needs" && ap && <Decide a={a} ap={ap} />}
-          {stand === "needs" && !ap && a.held && <HeldDecide a={a} />}
+          {stand === "needs" && ap && <Decide a={who} ap={ap} />}
+          {stand === "needs" && !ap && who.held && <HeldDecide a={who} />}
           {stand === "paused" && (
             <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>
               Resume
@@ -227,12 +244,12 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
   );
 });
 
-/** Where each agent stands (what you answered here counted as taken), and how many stand where (the page's lead says so). */
-function standsOf(list: AgentInfo[], seen: Record<string, number>, done: ReadonlyMap<string, number>) {
-  return list.map((agent) => {
-    const a = asAnswered(agent, done);
-    return { a, stand: standOf(a, seen[a.id]) };
-  });
+/** Where each agent stands (what you answered here counted as taken; the subagents kiln started for one on its row), and how many stand where (the page's lead says so). */
+function standsOf(list: AgentInfo[], seen: Record<string, number>, done: ReadonlyMap<string, number>): MissionRow[] {
+  return missionRows(
+    list.map((agent) => asAnswered(agent, done)),
+    seen,
+  );
 }
 
 /** Before the agents are known: the list's shape, so nothing moves when they come. */
@@ -408,7 +425,12 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
       const { moved } = await harnessApi.recover(machine, to || undefined);
       const failed = moved.filter((m) => m.error);
       const n = moved.length - failed.length;
-      if (n > 0) toast({ title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`, description: failed.length > 0 ? `${failed.length} couldn't: ${failed[0]?.error ?? ""}` : undefined, tone: "running" });
+      if (n > 0)
+        toast({
+          title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`,
+          description: failed.length > 0 ? `${failed.length} couldn't: ${failed[0]?.error ?? ""}` : undefined,
+          tone: "running",
+        });
       else toast.error(`${machine}'s agents couldn't go on elsewhere`, failed[0]?.error ?? "");
       invalidate("harness/agents");
     } catch (e) {
@@ -489,7 +511,13 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   // The rows' gestures ask what's selected now; their props are made once, with the list's hold.
   const [touch] = React.useState(() => {
     const now: { s: TouchSelect } = { s: { isSelected: () => false, set: () => undefined, selecting: false } };
-    return { now, props: both(bind, touchSelect(() => now.s)) };
+    return {
+      now,
+      props: both(
+        bind,
+        touchSelect(() => now.s),
+      ),
+    };
   });
   touch.now.s = { isSelected: (id) => selected.has(id), set: setMany, selecting: touchScreen && selecting };
   // Only what the list shows can be checked: a row the filter takes away is unchecked with it.
@@ -514,7 +542,9 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const findable = React.useMemo(() => all.map((r) => r.a), [all]);
   const message = <MessageBar agents={targets} reach={reach} onEnded={clear} all={findable} onPick={setMany} />;
   const folds = phone && checked.length === 0;
-  const renderRow = ({ a, stand }: MissionRow) => <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />;
+  const renderRow = ({ a, stand, asking }: MissionRow) => <Row key={a.id} a={a} stand={stand} asking={asking} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />;
+  // Every agent kiln runs, the subagents on their agents' rows too: none is listed again as found on its machine.
+  const everyone = React.useMemo(() => list.map((a) => ({ a })), [list]);
 
   return (
     <>
@@ -550,7 +580,17 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                 </span>
                 {selecting ? (
                   <span className="ms-picks">
-                    <button type="button" className="ms-link" disabled={live.length === 0 || liveChecked === live.length} onClick={() => setMany(live.map((r) => r.a.id), true)}>
+                    <button
+                      type="button"
+                      className="ms-link"
+                      disabled={live.length === 0 || liveChecked === live.length}
+                      onClick={() =>
+                        setMany(
+                          live.map((r) => r.a.id),
+                          true,
+                        )
+                      }
+                    >
                       Select all
                     </button>
                     <button type="button" className="ms-link ms-done" onClick={clear}>
@@ -631,7 +671,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
       <React.Suspense fallback={null}>
-        <Found all={all} />
+        <Found all={everyone} />
       </React.Suspense>
 
       {ended.length > 0 && (
@@ -641,15 +681,13 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
               <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
               Ended · {ended.length}
             </button>
-            {ended.length > 0 && <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
-              Clear
-            </button>}
+            {ended.length > 0 && (
+              <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
+                Clear
+              </button>
+            )}
           </div>
-          {showEnded && (
-            <ul className="ms-list">
-              {ended.map(renderRow)}
-            </ul>
-          )}
+          {showEnded && <ul className="ms-list">{ended.map(renderRow)}</ul>}
         </section>
       )}
     </>

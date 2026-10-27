@@ -600,8 +600,15 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
         count: Some(1),
         ..Ask::default()
     };
-    let infos = crate::harness::lineage::start(hub, &starter, ask).await.map_err(|(_, m)| Error::Bad(m))?;
-    let agent = infos.first().map(|i| i.id.clone()).ok_or_else(|| Error::Bad("the step's agent didn't start".into()))?;
+    // The run of an agent (it ran the plan, or its goal's plan runs so): each step's agent is its
+    // subagent, in its chat, where and as it runs unless the run says otherwise. A person's run:
+    // agents of their own.
+    let started = if starter.parent.is_some() {
+        crate::harness::lineage::start_subagent(hub, &starter, ask).await.map(|i| Some(i.id))
+    } else {
+        crate::harness::lineage::start(hub, &starter, ask).await.map(|v| v.into_iter().next().map(|i| i.id))
+    };
+    let agent = started.map_err(|(_, m)| Error::Bad(m))?.ok_or_else(|| Error::Bad("the step's agent didn't start".into()))?;
     mark_started(hub, run, row.idx, &agent).await?;
     crate::goals::add_at(hub, &agent, goal, true, &At::End).await.map_err(|e| Error::Bad(format!("its goal: {e}")))?;
     tracing::info!(%run, step = at + 1, %agent, "a plan step's agent started");
@@ -1128,7 +1135,10 @@ mod tests {
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-fan".into()), ..Place::default() };
                 let cfg = Config { place, parallel: true, max_parallel: Some(2), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
                 let run = start(&hub, &p, cfg, None).await?.run;
-                anyhow::ensure!(stands(&view(&hub, &run).await?) == strs(&["working", "working", "waiting"]));
+                let v = view(&hub, &run).await?;
+                anyhow::ensure!(stands(&v) == strs(&["working", "working", "waiting"]));
+                // A person's run: its steps' agents are agents of their own, not anyone's subagents.
+                anyhow::ensure!(v.steps.iter().filter_map(|s| s.agent_id.as_deref()).filter_map(|id| hub.harness.info(id)).all(|i| !i.subagent && i.parent.is_none()));
                 meet(&hub, &run, 2).await?;
                 advance(&hub, &run).await?;
                 anyhow::ensure!(stands(&view(&hub, &run).await?) == strs(&["working", "met", "working"]));
@@ -1156,9 +1166,12 @@ mod tests {
                 let items = ["One", "Two", "Three"].iter().map(|t| Item { title: (*t).to_owned(), ..Item::default() }).collect();
                 let p = super::super::create(&hub, super::super::New { title: "Fan out".into(), items, ..Default::default() }, "admin").await?;
                 let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some(cwd), ..Place::default() };
-                let cfg = Config { place, parallel: true, main: Some(main.clone()), parent: Some(main), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
+                let cfg = Config { place, parallel: true, main: Some(main.clone()), parent: Some(main.clone()), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
                 let v = view(&hub, &start(&hub, &p, cfg, None).await?.run).await?;
                 anyhow::ensure!(stands(&v) == strs(&["working", "waiting", "waiting"]), "{:?} {:?}", stands(&v), v.steps.iter().map(|s| &s.reason).collect::<Vec<_>>());
+                // An agent's run: each step's agent is its subagent, with its Subagents setting.
+                let first = v.steps.first().and_then(|s| s.agent_id.as_deref()).and_then(|id| hub.harness.info(id)).ok_or_else(|| anyhow::anyhow!("step 1 has no agent"))?;
+                anyhow::ensure!(first.subagent && first.parent.as_deref() == Some(main.as_str()) && first.max_subagents == Some(1), "{first:?}");
                 Ok(())
             })
         })

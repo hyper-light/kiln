@@ -17,6 +17,10 @@ pub enum SpecError {
     Cycle(String),
     #[error("job `{0}` has no steps")]
     NoSteps(String),
+    /// An exclusive job's share is what it asks (docs/ci.md W05-R03): one that isn't a quantity
+    /// would take the whole runner unsaid.
+    #[error("job `{job}`: {why}")]
+    BadResources { job: String, why: String },
     #[error("matrix for job `{job}` expands to {count} combinations (limit {limit})")]
     MatrixTooLarge { job: String, count: usize, limit: usize },
     #[error("job `{job}`'s requires `{expr}`: {why}")]
@@ -178,7 +182,7 @@ pub struct StepSpec {
 }
 
 /// A concrete, matrix-expanded unit of work ready to be queued.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PlannedJob {
     /// `test` or `test (profile=release)`.
     pub key: String,
@@ -197,10 +201,57 @@ pub struct PlannedJob {
     pub artifacts: Vec<String>,
     pub cache: Vec<String>,
     pub condition: Option<String>,
-    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// What a runner's facts must meet for the job to go there ([`JobSpec::requires`]). Written even
+    /// when empty: an assignment carries the job in postcard, which reads each field in turn, so one
+    /// left out puts every field after it out of step and the runner refuses the job as malformed.
+    /// Only a runner from before the CI work goes without it ([`PlannedJob::for_runner`]).
+    #[serde(default)]
     pub requires: Vec<String>,
     pub steps: Vec<StepSpec>,
+    /// Written without `requires`, for a runner that reads a job without it; never kept.
+    #[serde(skip)]
+    pub without_requires: bool,
+}
+
+impl PlannedJob {
+    /// The job as a runner with capabilities `caps` reads it. One from before the CI work (no
+    /// [`crate::proto::CAP_CI2`], W22-AC09's mixed fleet) knows no `requires`, and it's sent only
+    /// jobs that require nothing, as it reports no facts to meet a requirement.
+    pub fn for_runner(mut self, caps: u32) -> Self {
+        self.without_requires = caps & crate::proto::CAP_CI2 == 0;
+        self
+    }
+}
+
+// By hand for `requires`, which a runner from before the CI work reads a job without: the fields
+// in their order, as the derived `Deserialize` reads them.
+impl Serialize for PlannedJob {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut j = s.serialize_struct("PlannedJob", 16 + usize::from(!self.without_requires))?;
+        j.serialize_field("key", &self.key)?;
+        j.serialize_field("spec_id", &self.spec_id)?;
+        j.serialize_field("display", &self.display)?;
+        j.serialize_field("needs", &self.needs)?;
+        j.serialize_field("labels", &self.labels)?;
+        j.serialize_field("image", &self.image)?;
+        j.serialize_field("toolchain", &self.toolchain)?;
+        j.serialize_field("env", &self.env)?;
+        j.serialize_field("timeout_minutes", &self.timeout_minutes)?;
+        j.serialize_field("retries", &self.retries)?;
+        j.serialize_field("exclusive", &self.exclusive)?;
+        j.serialize_field("resources", &self.resources)?;
+        j.serialize_field("artifacts", &self.artifacts)?;
+        j.serialize_field("cache", &self.cache)?;
+        j.serialize_field("condition", &self.condition)?;
+        if self.without_requires {
+            j.skip_field("requires")?;
+        } else {
+            j.serialize_field("requires", &self.requires)?;
+        }
+        j.serialize_field("steps", &self.steps)?;
+        j.end()
+    }
 }
 
 pub const MATRIX_LIMIT: usize = 256;
@@ -308,6 +359,10 @@ fn validate(p: &Pipeline) -> Result<(), SpecError> {
         }
         for r in requirements(job.requires.as_ref()).iter().filter(|r| !r.contains("${{")) {
             kiln_ci::sched::routing::Constraint::parse(r).map_err(|why| SpecError::Requires { job: id.clone(), expr: r.clone(), why })?;
+        }
+        let asked = kiln_ci::sched::pools::ResourceSpec { cpu: job.resources.cpu.clone(), memory: job.resources.memory.clone(), ..Default::default() };
+        if let Err(why) = asked.resources() {
+            return Err(SpecError::BadResources { job: id.clone(), why });
         }
         for need in &job.needs {
             if !p.jobs.contains_key(need) {
@@ -519,6 +574,7 @@ pub fn plan(p: &Pipeline, base: &Context) -> Result<Vec<PlannedJob>, SpecError> 
                 condition: job.condition.as_ref().map(|c| ctx.interpolate(c)),
                 requires: requirements(job.requires.as_ref()).iter().map(|r| ctx.interpolate(r)).collect(),
                 steps,
+                without_requires: false,
             });
         }
         legs.insert(id.clone(), keys);
@@ -631,6 +687,29 @@ jobs:
             read += 1;
         }
         anyhow::ensure!(read >= 3, "only {read} of kiln's own workflows read");
+        Ok(())
+    }
+
+    /// kiln's own benches hold a share of their machine (docs/ci.md W05-R03): the QUIC bench one
+    /// L3 domain's CPUs on adacachy, the CI engine's bench 8 so it fits every machine it may run on
+    /// (a Mac Studio has 14), and memory above their peaks, other work running beside them. A share
+    /// that isn't a quantity is refused, naming its job, rather than taking the whole runner unsaid.
+    #[test]
+    fn the_benches_hold_a_share_and_a_share_that_isnt_one_is_refused() -> anyhow::Result<()> {
+        use kiln_ci::sched::state::{Incoming, Resources};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln/bench.yaml");
+        let p = parse(&std::fs::read_to_string(dir)?)?;
+        for (job, cpu, gib) in [("quic-transport", 16.0, 48), ("ci-bench", 8.0, 16)] {
+            let j = p.jobs.get(job).ok_or_else(|| anyhow::anyhow!("no {job}"))?;
+            assert_eq!(crate::hub::v1_incoming(j.exclusive, &j.resources), Incoming::Share(Resources { cpu, mem: gib << 30, ..Resources::default() }), "{job}");
+        }
+        let noise = p.jobs.get("noise").ok_or_else(|| anyhow::anyhow!("no noise"))?;
+        assert_eq!(crate::hub::v1_incoming(noise.exclusive, &noise.resources), Incoming::Ordinary, "noise runs beside them");
+        let bad = "name: b\njobs:\n  bench:\n    exclusive: true\n    resources: { cpu: lots }\n    steps: [{ run: \"true\" }]\n";
+        match parse(bad) {
+            Err(SpecError::BadResources { job, why }) => assert!(job == "bench" && why.contains("isn't a number of CPUs"), "{why}"),
+            other => anyhow::bail!("not refused: {other:?}"),
+        }
         Ok(())
     }
 
