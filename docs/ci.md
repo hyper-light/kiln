@@ -8490,9 +8490,9 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   `/machine/<machine>/instance/<instance>`, the runner process its key is made and held in (where
   the key is, not whom the agent acts for: certificates from before it was named have none);
   `…/person/<enrolled by>/machine/<machine>/instance/<instance>`; a leg, its runner's then
-  `/run/<number>/attempt/<n>/leg/<key>`, its workflow, repository, commit and run in Fulcio's
-  extensions (1.3.6.1.4.1.57264.1.9, .12, .13, .21); `kiln://<org>/server`; `…/server/cd`. The
-  organization is the CA's. kiln adds no OID of its own.
+  `/run/<number>/attempt/<n>/leg/<key>`, W10's claims for it in Fulcio's extensions (*CI legs*,
+  below); `kiln://<org>/server`; `…/server/cd`. The organization is the CA's. kiln adds no OID of
+  its own.
 - *Checking* is `kiln_ci::identity::chain::verify` (and `verify_signed`): RFC 5280 path validation
   at the time the caller gives, against the revocations it gives. An agent verifies as the agent
   for its person, never as the person.
@@ -8517,6 +8517,27 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   it's forgotten and the certificate lapses. Disabling a person revokes their certificates at the
   moment they're disabled, and none is issued after: one is recorded only in the transaction that
   finds them still enabled.
+- *CI legs.* The runner given a leg makes its key as it's given it and asks for its certificate;
+  kiln issues it only to the machine the leg was given to, for as long as the attempt may run (its
+  timeout and an hour more, as the leg's tokens), and doesn't revoke it: when the leg ends the
+  runner drops the key and its certificate's copy. Its facts are W10's claims for the leg, as
+  Fulcio puts a CI job's (its `github-workflow` templates, kiln's address for GitHub's:
+  `kiln_ci::identity::chain::fulcio::from_claims`): Issuer (.8, kiln's OIDC issuer), Build Signer
+  URI and Digest (.9, .10: the job's workflow by ref and commit), Runner Environment (.11), Source
+  Repository URI, Digest, Ref, Identifier and owner (.12 to .17), Build Config URI and Digest
+  (.18, .19), Build Trigger (.20), Run Invocation URI (.21), visibility (.22) and Deployment
+  Environment (.23); `ci::sigstore` reads them as it reads Fulcio's (`certificate_identity`). A
+  leg's certificate naming no commit or no workflow is refused. No step reaches the key: aws-lc
+  holds it and wipes it when it's dropped (it's never serialized, so it's in no environment, file,
+  frame or log), and while the runner holds a leg's key its memory is kept from its user's other
+  processes, the steps among them (`os::private_memory`: on Linux the runner isn't dumpable then,
+  so neither ptrace nor `/proc/<pid>/mem` reaches it whatever Yama's ptrace scope; on Windows its
+  DACL lets them only wait on it, ask after it and end it; macOS refuses them `task_for_pid`
+  already). Tests: `w27_r01_leg_certificate` (a leg on a test runner: its certificate verifies to
+  kiln's root with its run, workflow, commit and runner instance) and
+  `w27_r02_no_step_reads_the_legs_key` (its step lists its environment, the files it can read and
+  its runner's memory: of the private keys it finds, its runner's machine key among them, none is
+  the leg's).
 - *Revocations* are rows with when, why and by whom (migration `w27_identities`):
   forgetting a runner, a runner process retiring, a session moving to a new epoch (the epochs it
   left), a session ending, a person disabled, or `POST /api/identities/revoke` (`kiln identities

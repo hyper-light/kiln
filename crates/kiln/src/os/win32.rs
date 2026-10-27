@@ -3,7 +3,8 @@
 //! broadcast that tells the desktop it changed (`WM_SETTINGCHANGE`), and running a program as an
 //! administrator (`ShellExecuteExW` with the `runas` verb: Windows asks the person at the desktop).
 //! And one every kiln makes: how big a volume is and how much of it this user may still write
-//! (`GetDiskFreeSpaceExW`), what `statvfs` tells elsewhere.
+//! (`GetDiskFreeSpaceExW`), what `statvfs` tells elsewhere. And a runner's: keeping its memory
+//! from its user's other processes (its own DACL, `SetKernelObjectSecurity`).
 //!
 //! user32 and shell32 are looked up at run time (`LoadLibraryExW` + `GetProcAddress`), so a kiln
 //! that never installs anything (an agent, a supervisor) doesn't load them.
@@ -40,6 +41,13 @@ const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
 const SW_HIDE: i32 = 0;
 const WAIT_OBJECT_0: u32 = 0;
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+const SDDL_REVISION_1: u32 = 1;
+/// A process's DACL while [`private_memory`] keeps it: SYSTEM may do anything (`PROCESS_ALL_ACCESS`);
+/// its owner, this user, only wait on it, ask after it and end it (`SYNCHRONIZE`,
+/// `PROCESS_QUERY_LIMITED_INFORMATION`, `PROCESS_TERMINATE`), and the OWNER RIGHTS entry takes
+/// away an owner's implicit right to change that.
+const PRIVATE_DACL: &str = "D:P(A;;0x1fffff;;;SY)(A;;0x101001;;;OW)";
 /// What `ShellExecuteExW` fails with when the person says no to the elevation prompt.
 pub const ERROR_CANCELLED: i32 = 1223;
 
@@ -82,6 +90,11 @@ const _: () = {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
+    #[cfg(test)]
+    fn GetCurrentProcessId() -> u32;
+    #[cfg(test)]
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+    fn LocalFree(mem: *mut c_void) -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
     fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
@@ -99,6 +112,9 @@ unsafe extern "system" {
     fn RegQueryValueExW(key: isize, name: *const u16, reserved: *mut u32, kind: *mut u32, data: *mut u8, len: *mut u32) -> i32;
     fn RegSetValueExW(key: isize, name: *const u16, reserved: u32, kind: u32, data: *const u8, len: u32) -> i32;
     fn RegCloseKey(key: isize) -> i32;
+    fn GetKernelObjectSecurity(handle: *mut c_void, info: u32, sd: *mut c_void, len: u32, needed: *mut u32) -> i32;
+    fn SetKernelObjectSecurity(handle: *mut c_void, info: u32, sd: *const c_void) -> i32;
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl: *const u16, revision: u32, sd: *mut *mut c_void, len: *mut u32) -> i32;
 }
 
 type SendMessageTimeoutFn = unsafe extern "system" fn(isize, u32, usize, isize, u32, u32, *mut usize) -> isize;
@@ -279,4 +295,77 @@ pub fn disk_space(dir: &Path) -> io::Result<(u64, u64)> {
         return Err(io::Error::last_os_error());
     }
     Ok((total, available))
+}
+
+/// This process's DACL from before [`private_memory`] narrowed it (a self-relative security
+/// descriptor), to put back.
+static WIDE_OPEN: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// While `on`, no other process of this user reaches this process's memory (docs/ci.md W27-R02: a
+/// CI leg's key in it, out of its steps' reach): its DACL is [`PRIVATE_DACL`]. Off, the one it had.
+pub fn private_memory(on: bool) -> io::Result<()> {
+    let mut saved = WIDE_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: no arguments; this process's pseudo-handle, valid as long as it runs.
+    let me = unsafe { GetCurrentProcess() };
+    if on {
+        if saved.is_some() {
+            return Ok(());
+        }
+        let mut needed = 0u32;
+        // SAFETY: no buffer: this asks how big the descriptor is.
+        unsafe { GetKernelObjectSecurity(me, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), 0, &mut needed) };
+        let mut before = vec![0u8; usize::try_from(needed).unwrap_or(0)];
+        // SAFETY: a buffer of `needed` bytes for it.
+        if unsafe { GetKernelObjectSecurity(me, DACL_SECURITY_INFORMATION, before.as_mut_ptr().cast(), needed, &mut needed) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sddl = wide(PRIVATE_DACL);
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated SDDL string, and a place for the descriptor it allocates.
+        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: this process and the descriptor just made, freed once after.
+        let set = unsafe { SetKernelObjectSecurity(me, DACL_SECURITY_INFORMATION, sd) };
+        let err = io::Error::last_os_error();
+        // SAFETY: the descriptor ConvertStringSecurityDescriptorToSecurityDescriptorW allocated.
+        unsafe { LocalFree(sd) };
+        if set == 0 {
+            return Err(err);
+        }
+        *saved = Some(before);
+    } else if let Some(before) = saved.take() {
+        // SAFETY: this process and the descriptor GetKernelObjectSecurity gave for it.
+        if unsafe { SetKernelObjectSecurity(me, DACL_SECURITY_INFORMATION, before.as_ptr().cast()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W27-R02: while its memory is kept private, no process of this user opens this one to read
+    /// it (`OpenProcess` checks the DACL for this process's own id too); afterwards it can again.
+    #[test]
+    fn w27_r02_private_memory_refuses_reading_it() -> io::Result<()> {
+        const PROCESS_VM_READ: u32 = 0x0010;
+        // SAFETY: no arguments.
+        let pid = unsafe { GetCurrentProcessId() };
+        let opens = || {
+            // SAFETY: a process id and an access mask; a handle it gives is closed at once.
+            let h = unsafe { OpenProcess(PROCESS_VM_READ, 0, pid) };
+            // SAFETY: the handle just opened, closed once.
+            !h.is_null() && unsafe { CloseHandle(h) } != 0
+        };
+        assert!(opens(), "readable before");
+        private_memory(true)?;
+        let refused = !opens();
+        private_memory(false)?;
+        assert!(refused, "its memory could be read while kept private");
+        assert!(opens(), "readable again after");
+        Ok(())
+    }
 }

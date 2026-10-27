@@ -14,9 +14,11 @@
 //!   | the server | `kiln://<org>/server` |
 //!   | CD | `kiln://<org>/server/cd` |
 //!
-//! - **Facts that aren't names** ride in registered extensions only: a leg's workflow, repository,
-//!   commit and run in Fulcio's (1.3.6.1.4.1.57264.1.*, DER UTF8Strings), so kiln's Sigstore
-//!   verifier reads them too. kiln adds no OID of its own.
+//! - **Facts that aren't names** ride in registered extensions only: a leg's are W10's claims for
+//!   it (its workflow's ref and digest, its repository, commit and ref, its run and attempt, the
+//!   event, the issuer) in Fulcio's (1.3.6.1.4.1.57264.1.*, DER UTF8Strings), as Fulcio puts a CI
+//!   job's claims ([`fulcio::from_claims`]), so kiln's Sigstore verifier reads them too. kiln adds
+//!   no OID of its own.
 //! - **Checking** is RFC 5280's path validation at the time the caller gives (the time a
 //!   signature was made, from the trail): every certificate signed by the next and the last by
 //!   kiln's root, each valid then, the issuers CAs, the leaf not one and for digital signatures.
@@ -37,25 +39,92 @@ use x509_parser::extensions::GeneralName;
 /// The scheme every kiln identity's URI has.
 pub const SCHEME: &str = "kiln://";
 
-/// Fulcio's extensions, under 1.3.6.1.4.1.57264.1: the arc and the members a leg carries
-/// (Sigstore's OID directory, `docs/oid-info.md`).
+/// Fulcio's extensions, under 1.3.6.1.4.1.57264.1 (Sigstore's OID directory, `docs/oid-info.md`),
+/// and how Fulcio fills them from a CI job's OIDC claims (its `github-workflow` templates,
+/// `config/identity/config.yaml`): W10's claims are GitHub's, so a leg's certificate carries them
+/// as Fulcio would.
 pub mod fulcio {
+    use serde_json::{Map, Value};
+
     /// 1.3.6.1.4.1.57264.1
     pub const ARC: [u64; 8] = [1, 3, 6, 1, 4, 1, 57264, 1];
-    /// Build Signer URI: the workflow that signs (its ref).
+    /// Issuer (V2): the OIDC issuer whose claims these are.
+    pub const ISSUER: u64 = 8;
+    /// Build Signer URI: the build instructions that sign (the job's workflow, by ref).
     pub const BUILD_SIGNER_URI: u64 = 9;
+    /// Build Signer Digest: the commit of those instructions.
+    pub const BUILD_SIGNER_DIGEST: u64 = 10;
+    /// Runner Environment: hosted by the platform, or self-hosted.
+    pub const RUNNER_ENVIRONMENT: u64 = 11;
     /// Source Repository URI.
     pub const SOURCE_REPOSITORY_URI: u64 = 12;
     /// Source Repository Digest: the commit.
     pub const SOURCE_REPOSITORY_DIGEST: u64 = 13;
-    /// Run Invocation URI: the run (and attempt).
+    /// Source Repository Ref.
+    pub const SOURCE_REPOSITORY_REF: u64 = 14;
+    /// Source Repository Identifier.
+    pub const SOURCE_REPOSITORY_IDENTIFIER: u64 = 15;
+    /// Source Repository Owner URI.
+    pub const SOURCE_REPOSITORY_OWNER_URI: u64 = 16;
+    /// Source Repository Owner Identifier.
+    pub const SOURCE_REPOSITORY_OWNER_IDENTIFIER: u64 = 17;
+    /// Build Config URI: the top-level workflow, by ref.
+    pub const BUILD_CONFIG_URI: u64 = 18;
+    /// Build Config Digest: its commit.
+    pub const BUILD_CONFIG_DIGEST: u64 = 19;
+    /// Build Trigger: the event.
+    pub const BUILD_TRIGGER: u64 = 20;
+    /// Run Invocation URI: the run and its attempt.
     pub const RUN_INVOCATION_URI: u64 = 21;
+    /// Source Repository Visibility At Signing.
+    pub const SOURCE_REPOSITORY_VISIBILITY: u64 = 22;
+    /// Deployment Environment.
+    pub const DEPLOYMENT_ENVIRONMENT: u64 = 23;
 
     /// The OID of a member, as a dotted string.
     pub fn oid(member: u64) -> String {
         let mut s: Vec<String> = ARC.iter().map(u64::to_string).collect();
         s.push(member.to_string());
         s.join(".")
+    }
+
+    /// A CI job's claims (GitHub's names, which W10's are) as Fulcio puts them in its
+    /// certificate: each member its `github-workflow` template fills, `url` (the host's address)
+    /// where GitHub's is, the claims' `iss` the issuer. A member whose claims are empty is left
+    /// out, as Fulcio leaves it.
+    pub fn from_claims(claims: &Map<String, Value>, url: &str) -> Vec<(u64, String)> {
+        let url = url.trim_end_matches('/');
+        let get = |k: &str| match claims.get(k) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        };
+        let at = |k: &str| Some(get(k)).filter(|v| !v.is_empty()).map(|v| format!("{url}/{v}")).unwrap_or_default();
+        let run = match (get("repository"), get("run_id"), get("run_attempt")) {
+            (repo, id, attempt) if [&repo, &id, &attempt].iter().all(|v| !v.is_empty()) => format!("{url}/{repo}/actions/runs/{id}/attempts/{attempt}"),
+            _ => String::new(),
+        };
+        [
+            (ISSUER, get("iss")),
+            (BUILD_SIGNER_URI, at("job_workflow_ref")),
+            (BUILD_SIGNER_DIGEST, get("job_workflow_sha")),
+            (RUNNER_ENVIRONMENT, get("runner_environment")),
+            (SOURCE_REPOSITORY_URI, at("repository")),
+            (SOURCE_REPOSITORY_DIGEST, get("sha")),
+            (SOURCE_REPOSITORY_REF, get("ref")),
+            (SOURCE_REPOSITORY_IDENTIFIER, get("repository_id")),
+            (SOURCE_REPOSITORY_OWNER_URI, at("repository_owner")),
+            (SOURCE_REPOSITORY_OWNER_IDENTIFIER, get("repository_owner_id")),
+            (BUILD_CONFIG_URI, at("workflow_ref")),
+            (BUILD_CONFIG_DIGEST, get("workflow_sha")),
+            (BUILD_TRIGGER, get("event_name")),
+            (RUN_INVOCATION_URI, run),
+            (SOURCE_REPOSITORY_VISIBILITY, get("repository_visibility")),
+            (DEPLOYMENT_ENVIRONMENT, get("environment")),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
     }
 }
 
@@ -259,13 +328,21 @@ fn segment(s: &str) -> Result<(), String> {
 /// A leg's facts from Fulcio's extensions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Facts {
+    /// Issuer (V2): whose claims they are.
+    pub issuer: Option<String>,
     /// Build Signer URI: the workflow, by ref.
     pub workflow: Option<String>,
+    /// Build Signer Digest: the workflow's commit.
+    pub workflow_digest: Option<String>,
     /// Source Repository URI.
     pub repository: Option<String>,
     /// Source Repository Digest: the commit.
     pub commit: Option<String>,
-    /// Run Invocation URI.
+    /// Source Repository Ref.
+    pub git_ref: Option<String>,
+    /// Build Trigger: the event.
+    pub trigger: Option<String>,
+    /// Run Invocation URI: the run and its attempt.
     pub run: Option<String>,
 }
 
@@ -432,9 +509,13 @@ fn facts(cert: &X509Certificate<'_>) -> Facts {
     for ext in cert.extensions() {
         let oid = ext.oid.to_id_string();
         let slot = match oid {
+            o if o == fulcio::oid(fulcio::ISSUER) => &mut f.issuer,
             o if o == fulcio::oid(fulcio::BUILD_SIGNER_URI) => &mut f.workflow,
+            o if o == fulcio::oid(fulcio::BUILD_SIGNER_DIGEST) => &mut f.workflow_digest,
             o if o == fulcio::oid(fulcio::SOURCE_REPOSITORY_URI) => &mut f.repository,
             o if o == fulcio::oid(fulcio::SOURCE_REPOSITORY_DIGEST) => &mut f.commit,
+            o if o == fulcio::oid(fulcio::SOURCE_REPOSITORY_REF) => &mut f.git_ref,
+            o if o == fulcio::oid(fulcio::BUILD_TRIGGER) => &mut f.trigger,
             o if o == fulcio::oid(fulcio::RUN_INVOCATION_URI) => &mut f.run,
             _ => continue,
         };
@@ -522,8 +603,12 @@ fn verified(chain: &[&[u8]], root: &[u8], revocations: &[Revocation], at: i64) -
         many => return Err(Refusal::ManyIdentities(many.len())),
     };
     let facts = facts(leaf);
-    if identity.kind() == Kind::Leg && facts.commit.is_none() {
-        return Err(Refusal::Incomplete { who: identity.to_string(), why: "a leg's certificate names no commit (Fulcio's Source Repository Digest)".into() });
+    if identity.kind() == Kind::Leg {
+        for (named, what) in [(facts.commit.is_some(), "commit (Fulcio's Source Repository Digest)"), (facts.workflow.is_some(), "workflow (Fulcio's Build Signer URI)")] {
+            if !named {
+                return Err(Refusal::Incomplete { who: identity.to_string(), why: format!("a leg's certificate names no {what}") });
+            }
+        }
     }
     let spki = leaf.public_key();
     let alg = match spki.algorithm.algorithm.to_id_string().as_str() {
@@ -598,15 +683,26 @@ mod tests {
         Ok(CustomExtension::from_oid_content(&oid, der_utf8_string(value).ok_or_else(|| anyhow::anyhow!("too long"))?))
     }
 
-    fn leg(ca: &Ca, commit: Option<&str>) -> anyhow::Result<Leaf> {
-        let mut p = params(&["kiln://hyper-light/person/ada/machine/fedora-2/instance/01a174ed/run/812/attempt/1/leg/e2e"], 7)?;
-        p.custom_extensions.push(fulcio_ext(fulcio::BUILD_SIGNER_URI, "hyper-light/kiln/.kiln/ci.yml@refs/heads/main")?);
-        p.custom_extensions.push(fulcio_ext(fulcio::SOURCE_REPOSITORY_URI, "https://github.com/hyper-light/kiln")?);
-        p.custom_extensions.push(fulcio_ext(fulcio::RUN_INVOCATION_URI, "https://kiln.home/ci/runs/812/attempts/1")?);
-        if let Some(c) = commit {
-            p.custom_extensions.push(fulcio_ext(fulcio::SOURCE_REPOSITORY_DIGEST, c)?);
+    const LEG: &str = "kiln://hyper-light/person/ada/machine/fedora-2/instance/01a174ed/run/812/attempt/1/leg/e2e";
+
+    /// A leg's certificate carrying `facts` in Fulcio's extensions.
+    fn leg_with(ca: &Ca, facts: &[(u64, &str)]) -> anyhow::Result<Leaf> {
+        let mut p = params(&[LEG], 7)?;
+        for (member, value) in facts {
+            p.custom_extensions.push(fulcio_ext(*member, value)?);
         }
         issue(ca, p)
+    }
+
+    fn leg(ca: &Ca, commit: Option<&str>) -> anyhow::Result<Leaf> {
+        let mut facts = vec![
+            (fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main"),
+            (fulcio::BUILD_SIGNER_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"),
+            (fulcio::SOURCE_REPOSITORY_URI, "https://kiln.home/hyper-light/kiln"),
+            (fulcio::RUN_INVOCATION_URI, "https://kiln.home/hyper-light/kiln/actions/runs/812/attempts/1"),
+        ];
+        facts.extend(commit.map(|c| (fulcio::SOURCE_REPOSITORY_DIGEST, c)));
+        leg_with(ca, &facts)
     }
 
     fn check(ca: &Ca, l: &Leaf) -> Result<Verified, Refusal> {
@@ -663,11 +759,80 @@ mod tests {
         let v = check(&ca, &leg(&ca, Some("4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"))?)?;
         assert_eq!(v.to_string(), "leg e2e of run 812 (attempt 1) at 4c1e2a9, on runner fedora-2 (instance 01a174ed), enrolled by ada, of hyper-light");
         assert_eq!(v.facts.commit.as_deref(), Some("4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"));
-        assert_eq!(v.facts.workflow.as_deref(), Some("hyper-light/kiln/.kiln/ci.yml@refs/heads/main"));
-        assert_eq!(v.facts.repository.as_deref(), Some("https://github.com/hyper-light/kiln"));
-        assert_eq!(v.facts.run.as_deref(), Some("https://kiln.home/ci/runs/812/attempts/1"));
+        assert_eq!(v.facts.workflow.as_deref(), Some("https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main"));
+        assert_eq!(v.facts.workflow_digest.as_deref(), Some("4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"));
+        assert_eq!(v.facts.repository.as_deref(), Some("https://kiln.home/hyper-light/kiln"));
+        assert_eq!(v.facts.run.as_deref(), Some("https://kiln.home/hyper-light/kiln/actions/runs/812/attempts/1"));
         let kinds: Vec<Kind> = v.acts_for().iter().map(Identity::kind).collect();
         assert_eq!(kinds, vec![Kind::Runner, Kind::Person]);
+        Ok(())
+    }
+
+    /// W27-R01: a leg's certificate carries W10's claims for it as Fulcio puts a CI job's (its
+    /// `github-workflow` templates, kiln's address where GitHub's is), and its chain reads them
+    /// back: its workflow's ref and digest, its repository, commit and ref, the event, the run and
+    /// its attempt, and whose claims they are.
+    #[test]
+    fn w27_r01_leg_claims_as_fulcio_puts_a_ci_jobs() -> anyhow::Result<()> {
+        let github = serde_json::json!({
+            "repository": "hyper-light/kiln", "repository_id": 7, "repository_owner": "hyper-light", "repository_owner_id": 3,
+            "ref": "refs/heads/main", "ref_type": "branch", "sha": "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1", "actor": "ada",
+            "event_name": "push", "workflow": "ci", "workflow_ref": "hyper-light/kiln/.kiln/ci.yml@refs/heads/main",
+            "workflow_sha": "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1", "run_id": 812, "run_number": 812, "run_attempt": 1,
+        });
+        let f = crate::oidc::Facts {
+            github: &github,
+            job_workflow_ref: Some("hyper-light/kiln/.kiln/e2e.yml@refs/heads/main"),
+            job_workflow_sha: Some("9d1e3f5a7b9c14c1e2a90d1f3b5a7c9e1f3a5b7c"),
+            trusted: true,
+            executor: "host",
+            runner: "fedora-2",
+            job: "01a17a02",
+            ..crate::oidc::Facts::default()
+        };
+        let claims = crate::oidc::claims(&f, "https://kiln.home/oidc", "https://kiln.home/oidc", "j1", AT, 300, None);
+        let facts = fulcio::from_claims(&claims, "https://kiln.home/");
+        let want: Vec<(u64, &str)> = vec![
+            (fulcio::ISSUER, "https://kiln.home/oidc"),
+            (fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/e2e.yml@refs/heads/main"),
+            (fulcio::BUILD_SIGNER_DIGEST, "9d1e3f5a7b9c14c1e2a90d1f3b5a7c9e1f3a5b7c"),
+            (fulcio::RUNNER_ENVIRONMENT, "self-hosted"),
+            (fulcio::SOURCE_REPOSITORY_URI, "https://kiln.home/hyper-light/kiln"),
+            (fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"),
+            (fulcio::SOURCE_REPOSITORY_REF, "refs/heads/main"),
+            (fulcio::SOURCE_REPOSITORY_IDENTIFIER, "7"),
+            (fulcio::SOURCE_REPOSITORY_OWNER_URI, "https://kiln.home/hyper-light"),
+            (fulcio::SOURCE_REPOSITORY_OWNER_IDENTIFIER, "3"),
+            (fulcio::BUILD_CONFIG_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main"),
+            (fulcio::BUILD_CONFIG_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"),
+            (fulcio::BUILD_TRIGGER, "push"),
+            (fulcio::RUN_INVOCATION_URI, "https://kiln.home/hyper-light/kiln/actions/runs/812/attempts/1"),
+            (fulcio::SOURCE_REPOSITORY_VISIBILITY, "private"),
+        ];
+        assert_eq!(facts.iter().map(|(m, v)| (*m, v.as_str())).collect::<Vec<_>>(), want, "no environment: no Deployment Environment");
+        // Every member under Fulcio's registered arc, none of kiln's own.
+        assert!(facts.iter().all(|(m, _)| (8..=23).contains(m)));
+        let ca = ca("kiln CA")?;
+        let v = check(&ca, &leg_with(&ca, &want)?)?;
+        assert_eq!(v.to_string(), "leg e2e of run 812 (attempt 1) at 4c1e2a9, on runner fedora-2 (instance 01a174ed), enrolled by ada, of hyper-light");
+        let read = Facts {
+            issuer: Some("https://kiln.home/oidc".into()),
+            workflow: Some("https://kiln.home/hyper-light/kiln/.kiln/e2e.yml@refs/heads/main".into()),
+            workflow_digest: Some("9d1e3f5a7b9c14c1e2a90d1f3b5a7c9e1f3a5b7c".into()),
+            repository: Some("https://kiln.home/hyper-light/kiln".into()),
+            commit: Some("4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1".into()),
+            git_ref: Some("refs/heads/main".into()),
+            trigger: Some("push".into()),
+            run: Some("https://kiln.home/hyper-light/kiln/actions/runs/812/attempts/1".into()),
+        };
+        assert_eq!(v.facts, read);
+        // An environment's job carries it; claims with no run leave the run out.
+        let mut deploy = claims.clone();
+        deploy.insert("environment".into(), serde_json::json!("production"));
+        deploy.remove("run_id");
+        let facts = fulcio::from_claims(&deploy, "https://kiln.home");
+        assert!(facts.contains(&(fulcio::DEPLOYMENT_ENVIRONMENT, "production".to_owned())));
+        assert!(!facts.iter().any(|(m, _)| *m == fulcio::RUN_INVOCATION_URI));
         Ok(())
     }
 
@@ -784,8 +949,10 @@ mod tests {
         assert!(matches!(check(&kiln, &issue(&kiln, p)?), Err(Refusal::NotALeaf { .. })));
         // An agent's path without its person.
         assert!(matches!(check(&kiln, &leaf(&kiln, "kiln://hyper-light/agent/matrix/epoch/3")?), Err(Refusal::BadIdentity { .. })));
-        // A leg that names no commit.
-        assert!(matches!(check(&kiln, &leg(&kiln, None)?), Err(Refusal::Incomplete { .. })));
+        // A leg that names no commit, or no workflow.
+        assert!(matches!(check(&kiln, &leg(&kiln, None)?), Err(Refusal::Incomplete { why, .. }) if why.contains("no commit")));
+        let no_workflow = leg_with(&kiln, &[(fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1")])?;
+        assert!(matches!(check(&kiln, &no_workflow), Err(Refusal::Incomplete { why, .. }) if why.contains("no workflow")));
         // Not kiln's root: a leaf passed as the root.
         let l = leaf(&kiln, "kiln://hyper-light/person/sam")?;
         assert!(matches!(verify(&[&l.der], &l.der, &[], AT), Err(Refusal::BadRoot(_))));

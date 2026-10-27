@@ -714,6 +714,36 @@ struct LegFacts {
     github: Value,
 }
 
+impl LegFacts {
+    /// What W10's claims for leg `leg` are made of (W10-R08): the run's `github` context, the
+    /// workflow that defines the job (a called one's for its jobs, W06-R03, else the caller's) and
+    /// the leg's own facts.
+    fn rules<'a>(&'a self, leg: &'a str) -> rules::Facts<'a> {
+        let spec: &'a Value = &self.spec;
+        let defined = move |k: &str| spec.pointer(&format!("/defined_in/{k}")).and_then(Value::as_str).filter(|s| !s.is_empty());
+        rules::Facts {
+            github: &self.github,
+            environment: spec.pointer("/environment/name").and_then(Value::as_str),
+            job_workflow_ref: defined("workflow_ref"),
+            job_workflow_sha: defined("workflow_sha"),
+            trusted: self.trusted,
+            executor: spec.pointer("/executor").and_then(Value::as_str).unwrap_or("host"),
+            runner: self.agent.as_deref().unwrap_or_default(),
+            pool: None,
+            job: leg,
+        }
+    }
+}
+
+/// W10's claims for leg `leg`, as its ID token carries them (kiln the issuer): what the leg's
+/// certificate carries in Fulcio's extensions (docs/ci.md W27-R01). `None`: kiln knows no such
+/// leg of a run.
+pub async fn leg_claims(hub: &Hub, leg: &str) -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
+    let Some(f) = leg_facts(hub, leg).await? else { return Ok(None) };
+    let iss = issuer(hub);
+    Ok(Some(rules::claims(&f.rules(leg), &iss, &iss, &crate::util::new_id(), crate::util::now_unix(), rules::DEFAULT_TTL_SECS, None)))
+}
+
 async fn leg_facts(hub: &Hub, leg: &str) -> anyhow::Result<Option<LegFacts>> {
     let leg = leg.to_owned();
     hub.store
@@ -751,24 +781,9 @@ pub async fn token(hub: &Arc<Hub>, req: &Request) -> Result<Response, Fail> {
     let q = srv::query(req);
     let iss = issuer(hub);
     let audience = q.get("audience").filter(|a| !a.is_empty()).cloned().or_else(|| hub.cfg.ci.oidc.default_audience.clone()).unwrap_or_else(|| iss.clone());
-    let environment = f.spec.pointer("/environment/name").and_then(Value::as_str).map(str::to_owned);
-    let executor = f.spec.pointer("/executor").and_then(Value::as_str).unwrap_or("host").to_owned();
     // The repository's subject, as it, its organization or the server customized it (W10-R09).
     let keys = subject_keys(hub, f.github.get("repository").and_then(Value::as_str).unwrap_or_default()).await.unwrap_or_default();
-    // The workflow that defines the job: a called one's for its jobs (W06-R03), else the caller's.
-    let defined = |k: &str| f.spec.pointer(&format!("/defined_in/{k}")).and_then(Value::as_str).filter(|s| !s.is_empty());
-    let facts = rules::Facts {
-        github: &f.github,
-        environment: environment.as_deref(),
-        job_workflow_ref: defined("workflow_ref"),
-        job_workflow_sha: defined("workflow_sha"),
-        trusted: f.trusted,
-        executor: &executor,
-        runner: f.agent.as_deref().unwrap_or_default(),
-        pool: None,
-        job: &claims.sub,
-    };
-    let c = rules::claims(&facts, &iss, &audience, &crate::util::new_id(), crate::util::now_unix(), rules::DEFAULT_TTL_SECS, (!keys.is_empty()).then_some(keys.as_slice()));
+    let c = rules::claims(&f.rules(&claims.sub), &iss, &audience, &crate::util::new_id(), crate::util::now_unix(), rules::DEFAULT_TTL_SECS, (!keys.is_empty()).then_some(keys.as_slice()));
     let jwt = sign(hub, &c).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::OK, &json!({ "count": jwt.len(), "value": jwt })))
 }

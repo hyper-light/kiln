@@ -165,10 +165,15 @@ pub fn get() -> Option<&'static Chaos> {
 }
 
 /// An identity key this process just made, for `slot` (`crate::runner::identity`): copied where
-/// `keys=` says, under what it's for. Nothing without it.
-pub fn made_key(slot: &str, pem: &str) {
+/// `keys=` says, under what it's for. `pem` is asked for only then: nothing serializes a key
+/// without it.
+pub fn made_key(slot: &str, pem: impl FnOnce() -> Option<String>) {
     use std::io::Write as _;
     let Some(path) = get().and_then(|c| c.keys.as_ref()) else { return };
+    let Some(pem) = pem() else {
+        tracing::warn!(slot, "chaos: a key made can't be copied");
+        return;
+    };
     let wrote = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| write!(f, "{slot}\n{pem}\n"));
     if let Err(e) = wrote {
         tracing::warn!(error = %e, path = %path.display(), "chaos: can't copy a key made");

@@ -52,8 +52,14 @@ pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Res
     Ok(())
 }
 
-/// How long a CI leg's certificate lasts: the leg's attempt, with room.
-pub const LEG_HOURS: i64 = 24;
+/// How long a CI leg's certificate lasts: as long as its attempt may run (its timeout), and an
+/// hour more, as the leg's tokens do (W10-R03), never past a week (a runner process's own
+/// certificate's lifetime, whatever timeout a workflow declares). Not revoked when the leg ends:
+/// its key is dropped then.
+pub fn leg_lifetime(timeout_minutes: u32) -> time::Duration {
+    time::Duration::minutes((i64::from(timeout_minutes) + 60).min(RUNNER_HOURS * 60))
+}
+
 /// How long a person's certificate lasts after they sign in: hours, never past a day. Their CLI
 /// asks again once half of it has gone, while they stay signed in ([`renewal_due`]).
 pub const PERSON_HOURS: i64 = 12;
@@ -533,30 +539,30 @@ pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
 
 async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String)> {
     let mut facts: Vec<(u64, String)> = Vec::new();
-    let (identity, hours) = match ask.kind.as_str() {
+    let (identity, lifetime) = match ask.kind.as_str() {
         "runner" => {
             let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-            (runner_identity(hub, machine, &instance).await?, RUNNER_HOURS)
+            (runner_identity(hub, machine, &instance).await?, time::Duration::hours(RUNNER_HOURS))
         }
         "agent" => {
             let session = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("an agent's identity names its session"))?;
             let epoch = ask.epoch.ok_or_else(|| anyhow::anyhow!("an agent's identity names its epoch"))?;
             // The runner process asking holds the session's key at this epoch: named in its certificate.
             let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-            (agent_identity(hub, machine, &instance, session, epoch).await?, AGENT_HOURS)
+            (agent_identity(hub, machine, &instance, session, epoch).await?, time::Duration::hours(AGENT_HOURS))
         }
         "leg" => {
             let leg = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("a leg's identity names its leg"))?;
             let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-            let (identity, f) = leg_identity(hub, machine, &instance, leg).await?;
+            let (identity, f, lifetime) = leg_identity(hub, machine, &instance, leg).await?;
             facts = f;
-            (identity, LEG_HOURS)
+            (identity, lifetime)
         }
         other => anyhow::bail!("kiln doesn't issue {other:?} identities"),
     };
     let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
     let facts: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
-    let pem = hub.pki.issue_identity(&ask.csr, &identity, &facts, time::Duration::hours(hours))?;
+    let pem = hub.pki.issue_identity(&ask.csr, &identity, &facts, lifetime)?;
     let now = crate::util::now_unix();
     revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
     if let Actor::Agent { epoch, held_by, .. } = &identity.actor
@@ -594,25 +600,30 @@ async fn agent_identity(hub: &Hub, machine: &str, instance: &str, session: &str,
 }
 
 /// A CI leg's identity, for the runner process of `machine` it was given to: its run's number,
-/// its attempt and key, on that runner (and through it who enrolled the machine), and as facts in
-/// Fulcio's extensions its workflow, repository, commit and run.
-async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> anyhow::Result<(Identity, Vec<(u64, String)>)> {
+/// its attempt and key, on that runner (and through it who enrolled the machine); as facts, W10's
+/// claims for it in Fulcio's extensions, as Fulcio puts a CI job's (its workflow's ref and digest,
+/// its repository, commit and ref, the event, its run and attempt); and how long it lasts.
+async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> anyhow::Result<(Identity, Vec<(u64, String)>, time::Duration)> {
     use kiln_ci::identity::chain::fulcio;
     let id = leg.to_owned();
-    type Row = (i64, i64, String, Option<String>, String, String, String, String);
+    type Row = (i64, i64, String, Option<String>, Option<String>);
     let row: Option<Row> = hub
         .store
         .call(move |c| {
-            Ok(c.query_row(
-                "SELECT r.number, j.attempt, j.key, j.agent, r.sha, COALESCE(r.workflow_id, ''), p.name, r.id FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1",
-                [&id],
-                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?, x.get(6)?, x.get(7)?)),
-            )
+            Ok(c.query_row("SELECT r.number, j.attempt, j.key, j.agent, j.leg FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1", [&id], |x| {
+                Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))
+            })
             .optional()?)
         })
         .await?;
-    let (number, attempt, key, agent, sha, workflow, repo, run) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
+    let (number, attempt, key, agent, spec) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
     anyhow::ensure!(agent.as_deref() == Some(machine), "leg {leg} was given to {}, not {machine}", agent.unwrap_or_else(|| "no runner".into()));
+    let claims = crate::ci::oidc::leg_claims(hub, leg).await?.ok_or_else(|| anyhow::anyhow!("leg {leg} is of no run kiln planned"))?;
+    // Its spec's timeout, as the scheduler reads it (360 minutes when it has none).
+    let timeout = spec
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("timeout_minutes").and_then(serde_json::Value::as_u64))
+        .map_or(360, |t| u32::try_from(t).unwrap_or(u32::MAX));
     let enrolled_by = enrolled_by(&hub.store, machine).await?;
     let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' }).collect();
     let safe = crate::util::truncate(safe.trim_matches('-'), 128).to_owned();
@@ -627,14 +638,7 @@ async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> an
             leg: if safe.is_empty() { "leg".to_owned() } else { safe },
         },
     );
-    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let facts = vec![
-        (fulcio::BUILD_SIGNER_URI, format!("{base}/{repo}/{workflow}")),
-        (fulcio::SOURCE_REPOSITORY_URI, format!("{base}/{repo}")),
-        (fulcio::SOURCE_REPOSITORY_DIGEST, sha),
-        (fulcio::RUN_INVOCATION_URI, format!("{base}/runs/{run}/attempts/{}", attempt.max(1))),
-    ];
-    Ok((identity, facts))
+    Ok((identity, fulcio::from_claims(&claims, &hub.cfg.server.public_url), leg_lifetime(timeout)))
 }
 
 /// Every subject an agent session's certificates were issued for, with its epoch.
@@ -901,6 +905,15 @@ mod tests {
     fn cert(pki: &crate::pki::Pki, name: &str) -> anyhow::Result<String> {
         let (csr, _key) = crate::pki::make_csr(name)?;
         pki.sign_csr(&csr, name, 30)
+    }
+
+    /// W27-R01: a leg's certificate lasts as long as its attempt may (its timeout) and an hour
+    /// more, and no workflow's timeout makes it last past a week.
+    #[test]
+    fn w27_r01_a_legs_certificate_lasts_its_attempt() {
+        assert_eq!(leg_lifetime(360), time::Duration::hours(7));
+        assert_eq!(leg_lifetime(60), time::Duration::hours(2));
+        assert_eq!(leg_lifetime(u32::MAX), time::Duration::days(7));
     }
 
     #[test]

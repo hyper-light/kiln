@@ -727,16 +727,27 @@ jobs:
           echo "no key here"
 "#;
 
-/// W27-R01, R02: a CI leg has a certificate of its own, for a key its runner made outside the
-/// steps' reach, naming its run, attempt and leg, its runner (and who enrolled it) and, in
-/// Fulcio's extensions, its commit.
-#[test]
-fn w27_r01_a_ci_leg_its_own_certificate() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+/// A leg's workflow for the test runner alone (no other runner is up), its step `run`.
+fn leg_workflow(run: &str) -> String {
+    format!("on: push\njobs:\n  e2e:\n    runs-on: self-hosted\n    steps:\n      - run: {run}\n")
+}
+
+/// A server whose one runner is `fedora-2` (enrolled with the join token, `env` in its
+/// environment), and a repository of its own whose push of `workflow` (`.kiln/e2e.yaml`) runs:
+/// returned once the run has ended, successful, with the commit it ran at.
+struct LegRun {
+    s: Server,
+    runner: agents::Runner,
+    sha: String,
+}
+
+fn leg_on_a_test_runner(dir: &Path, workflow: &str, env: &[(&str, &str)]) -> anyhow::Result<LegRun> {
+    let s = start(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" })?;
+    let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", None, TALK, env)?;
+    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
-    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    let (home, work) = (dir.join("githome"), dir.join("tree"));
     std::fs::create_dir_all(&home)?;
     std::fs::create_dir_all(work.join(".kiln"))?;
     let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
@@ -747,39 +758,244 @@ fn w27_r01_a_ci_leg_its_own_certificate() -> anyhow::Result<()> {
     git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
     // Once the server has polled its trunk, the workflow comes as a push.
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
-        if !body.contains("\"last_polled_at\":null") {
-            break;
-        }
-        anyhow::ensure!(Instant::now() < deadline, "never polled: {body}");
+    while http(s.port, "GET", "/api/repos", &s.admin, None)?.1.contains("\"last_polled_at\":null") {
+        anyhow::ensure!(Instant::now() < deadline, "never polled");
         std::thread::sleep(Duration::from_millis(300));
     }
-    std::fs::write(work.join(".kiln/e2e.yaml"), LEG)?;
+    std::fs::write(work.join(".kiln/e2e.yaml"), workflow)?;
     git(&home, &work, &["add", "."])?;
     git(&home, &work, &["commit", "-qm", "the workflow"])?;
     let sha = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
     git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
-
-    // The run finishes, its leg successful (it found no key).
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
         let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
         if let Some(r) = runs.iter().find(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
-            assert_eq!(r.get("conclusion").and_then(Value::as_str), Some("success"), "{r}\n{}", s.log());
+            let said = || format!("{r}\n{}\n{}", s.log(), std::fs::read_to_string(&log).unwrap_or_default());
+            anyhow::ensure!(r.get("conclusion").and_then(Value::as_str) == Some("success"), "the run failed: {}", said());
             break;
         }
         anyhow::ensure!(Instant::now() < deadline, "no finished run: {body}\n{}", s.log());
         std::thread::sleep(Duration::from_millis(500));
     }
-    let legs = until_identities(&s, "leg", Duration::from_secs(30), |l| l.iter().any(|i| !field(i, "verified").is_empty()))?;
-    let leg = legs.iter().find(|i| !field(i, "verified").is_empty()).cloned().unwrap_or_default();
-    let said = field(&leg, "verified");
-    let short = sha.get(..7).unwrap_or_default();
-    assert!(said.starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner ")), "{said}");
-    assert!(said.ends_with(", enrolled by admin, of hyper-light"), "{said}");
-    assert!(field(&leg, "subject").contains("/run/1/attempt/1/leg/e2e"), "{leg}");
+    Ok(LegRun { s, runner, sha })
+}
+
+/// The leg's certificate as kiln issued it (its store's record of it), and kiln's root: DER.
+fn leg_certificate(dir: &Path) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    let pem: String = db.query_row("SELECT cert_pem FROM identities WHERE kind = 'leg' ORDER BY issued_at DESC LIMIT 1", [], |r| r.get(0))?;
+    let root = std::fs::read_to_string(dir.join("data/pki/ca.pem"))?;
+    Ok((kiln::pki::der_of(&pem)?, kiln::pki::der_of(&root)?))
+}
+
+/// The leg `e2e`'s timeout (minutes), as its spec in the store has it.
+fn leg_timeout(dir: &Path) -> anyhow::Result<i64> {
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    let spec: String = db.query_row("SELECT leg FROM jobs WHERE key = 'e2e'", [], |r| r.get(0))?;
+    serde_json::from_str::<Value>(&spec)?.get("timeout_minutes").and_then(Value::as_i64).ok_or_else(|| anyhow::anyhow!("no timeout in {spec}"))
+}
+
+/// Who owns a process's memory file: its own user while it's dumpable, root while it isn't.
+#[cfg(target_os = "linux")]
+fn memory_owner(pid: u32) -> anyhow::Result<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(std::fs::metadata(format!("/proc/{pid}/mem"))?.uid())
+}
+
+/// W27-R01, R02: a CI leg run on a test runner has a certificate of its own, for a key that runner
+/// made: it verifies to kiln's root as the leg of its run and attempt, at its commit, on its
+/// runner instance, and through that runner who enrolled it and the organization; W10's claims
+/// for it are in Fulcio's extensions (its workflow by ref and digest, its repository, commit and
+/// ref, the event, the run), as kiln's Sigstore verifier reads them too; it lasts as long as the
+/// attempt may, and once the leg is over its key is gone from the runner.
+#[test]
+fn w27_r01_leg_certificate() -> anyhow::Result<()> {
+    use kiln_ci::identity::chain::{Actor, Identity, Kind, verify};
+    let dir = tempfile::tempdir()?;
+    let run = leg_on_a_test_runner(dir.path(), &leg_workflow("echo e2e"), &[])?;
+    let (leaf, root) = leg_certificate(dir.path())?;
+    let base = format!("http://127.0.0.1:{}", run.s.port);
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    let v = verify(&[&leaf], &root, &[], now)?;
+    let short = run.sha.get(..7).unwrap_or_default();
+    assert_eq!(v.to_string(), format!("leg e2e of run 1 (attempt 1) at {short}, on runner fedora-2 (instance main), enrolled by admin, of hyper-light"));
+    assert_eq!(v.identity, Identity::new("hyper-light", Actor::Leg { enrolled_by: "admin".into(), machine: "fedora-2".into(), instance: "main".into(), run: 1, attempt: 1, leg: "e2e".into() }));
+    let acts_for: Vec<String> = v.acts_for().iter().map(ToString::to_string).collect();
+    assert_eq!(acts_for, ["runner fedora-2 (instance main), enrolled by admin, of hyper-light", "admin of hyper-light"]);
+    assert_eq!(v.acts_for().iter().map(Identity::kind).collect::<Vec<_>>(), [Kind::Runner, Kind::Person]);
+    let f = &v.facts;
+    let workflow = format!("{base}/acme/app/.kiln/e2e.yaml@refs/heads/main");
+    assert_eq!(f.workflow.as_deref(), Some(workflow.as_str()), "{f:?}");
+    assert_eq!(f.workflow_digest.as_deref(), Some(run.sha.as_str()));
+    assert_eq!(f.repository.as_deref(), Some(format!("{base}/acme/app").as_str()));
+    assert_eq!(f.commit.as_deref(), Some(run.sha.as_str()));
+    assert_eq!(f.git_ref.as_deref(), Some("refs/heads/main"));
+    assert_eq!(f.trigger.as_deref(), Some("push"));
+    assert_eq!(f.issuer.as_deref(), Some(format!("{base}/oidc").as_str()));
+    let invoked = f.run.clone().unwrap_or_default();
+    assert!(invoked.starts_with(&format!("{base}/acme/app/actions/runs/")) && invoked.ends_with("/attempts/1"), "{invoked}");
+    // kiln's existing Sigstore verifier reads the same facts, by Fulcio's names.
+    let (issuer, subject, claims) = kiln::ci::sigstore::certificate_identity(&leaf)?;
+    assert_eq!((issuer.as_str(), subject.as_str()), (format!("{base}/oidc").as_str(), "kiln://hyper-light/person/admin/machine/fedora-2/instance/main/run/1/attempt/1/leg/e2e"));
+    let claim = |k: &str| claims.get(k).cloned().unwrap_or_default();
+    assert_eq!((claim("build_signer_uri"), claim("build_signer_digest")), (workflow, run.sha.clone()));
+    assert_eq!((claim("source_repository_digest"), claim("run_invocation_uri")), (run.sha.clone(), invoked));
+    // As long as its attempt may run (its timeout) and an hour more, from five minutes before it
+    // was issued.
+    let timeout = leg_timeout(dir.path())?;
+    let (lived, want) = (v.not_after - v.not_before, (timeout + 60) * 60 + 300);
+    assert!((want - 1..=want + 1).contains(&lived), "{lived} s for a timeout of {timeout} min");
+    // The leg over, its runner let go of its key: its certificate's copy is gone, and the runner's
+    // memory, kept from its user's other processes meanwhile, is theirs to read again.
+    let ids = dir.path().join("fedora-2-state/identities");
+    let names: Vec<String> = std::fs::read_dir(&ids)?.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(!names.iter().any(|n| n.starts_with("main-leg")), "{names:?}");
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let pid = run.runner.0.id();
+        assert_eq!(memory_owner(pid)?, std::fs::metadata(dir.path())?.uid(), "the runner is dumpable again");
+        std::fs::read(format!("/proc/{pid}/environ")).map_err(|e| anyhow::anyhow!("the runner's memory is still kept: {e}"))?;
+    }
+    Ok(())
+}
+
+/// What a leg's step lists of what it can reach (W27-R02): its environment, every file it can
+/// read under `$W27_ROOTS` and `/dev/shm`, the environment and command line of every process it
+/// sees, and the memory of the processes it runs under (its shell, its runner and the one above),
+/// where it may read it. Every private key it finds goes to `$W27_FOUND`: PEM blocks, and P-256
+/// keys as DER (PKCS #8, SEC 1) by their scalar. The words are split so its own text holds none.
+const SCAN: &str = r#"
+import json, os, re
+
+found = {"env": 0, "files": 0, "keys": [], "memory": {}, "owners": {}}
+PEM = re.compile(rb"-----BEGIN ((?:EC |RSA )?PRIV" rb"ATE KEY)-----[A-Za-z0-9+/=\r\n]+-----END \1-----")
+DER = [bytes.fromhex("308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420"), bytes.fromhex("30770201010420")]
+
+
+def scan(where, data):
+    for m in PEM.finditer(data):
+        found["keys"].append({"where": where, "pem": m.group(0).decode("ascii", "replace")})
+    for head in DER:
+        at = data.find(head)
+        while at != -1:
+            scalar = data[at + len(head):at + len(head) + 32]
+            if len(scalar) == 32:
+                found["keys"].append({"where": where, "scalar": scalar.hex()})
+            at = data.find(head, at + 1)
+
+
+for k, v in os.environ.items():
+    found["env"] += 1
+    scan("env " + k, (k + "=" + v).encode())
+for root in os.environ["W27_ROOTS"].split(os.pathsep) + ["/dev/shm"]:
+    for d, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(d, name)
+            try:
+                with open(path, "rb") as f:
+                    data = f.read(64 << 20)
+            except OSError:
+                continue
+            found["files"] += 1
+            scan(path, data)
+pids = [p for p in os.listdir("/proc") if p.isdigit()] if os.path.isdir("/proc") else []
+for pid in pids:
+    for part in ("environ", "cmdline"):
+        try:
+            with open(f"/proc/{pid}/{part}", "rb") as f:
+                scan(f"/proc/{pid}/{part}", f.read())
+        except OSError:
+            pass
+pid = os.getppid()
+for _ in range(3):
+    if pid <= 1 or str(pid) not in pids:
+        break
+    try:
+        found["owners"][str(pid)] = os.stat(f"/proc/{pid}/mem").st_uid
+        with open(f"/proc/{pid}/maps") as f:
+            maps = f.read().splitlines()
+        mem = open(f"/proc/{pid}/mem", "rb")
+    except OSError:
+        found["memory"][str(pid)] = "refused"
+    else:
+        read = 0
+        with mem:
+            for line in maps:
+                span, perms = line.split()[:2]
+                lo, hi = (int(x, 16) for x in span.split("-"))
+                if perms[0] != "r" or hi - lo > 1 << 30:
+                    continue
+                try:
+                    mem.seek(lo)
+                    data = mem.read(hi - lo)
+                except (OSError, OverflowError, ValueError):
+                    continue
+                read += len(data)
+                scan(f"/proc/{pid}/mem", data)
+        found["memory"][str(pid)] = read
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            pid = int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        break
+with open(os.environ["W27_FOUND"], "w") as f:
+    json.dump(found, f)
+print(f"{found['env']} variables, {found['files']} files, {len(pids)} processes, the memory of {len(found['memory'])}: {len(found['keys'])} private keys")
+"#;
+
+/// W27-R02: no step of a leg can read the leg's private key. The leg's step lists its environment
+/// and every file it can read (its runner's state, workspace and logs, the server's data, its
+/// home), the environment and command line of every process, and its runner's memory: of the
+/// private keys it finds there (its runner's machine key among them: a step runs as its runner's
+/// user), none is the leg's, which its runner made and holds in memory the step can't read.
+#[test]
+fn w27_r02_no_step_reads_the_legs_key() -> anyhow::Result<()> {
+    use rcgen::PublicKeyData as _;
+    let dir = tempfile::tempdir()?;
+    let (scan, found) = (dir.path().join("scan.py"), dir.path().join("found.json"));
+    std::fs::write(&scan, SCAN)?;
+    let (scan, found_at, roots) = (scan.display().to_string(), found.display().to_string(), dir.path().display().to_string());
+    let run = leg_on_a_test_runner(dir.path(), &leg_workflow("python3 \"$W27_SCAN\""), &[("W27_SCAN", &scan), ("W27_FOUND", &found_at), ("W27_ROOTS", &roots)])?;
+    let seen: Value = serde_json::from_slice(&std::fs::read(&found)?)?;
+    let (leaf, _) = leg_certificate(dir.path())?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&leaf)?;
+    let leg_key = cert.public_key().subject_public_key.data.to_vec();
+    // Each key found, by its public half.
+    let public = |k: &Value| -> Option<Vec<u8>> {
+        if let Some(pem) = k.get("pem").and_then(Value::as_str) {
+            return rcgen::KeyPair::from_pem(pem).ok().map(|kp| kp.der_bytes().to_vec());
+        }
+        let scalar = hex::decode(k.get("scalar").and_then(Value::as_str)?).ok()?;
+        let pkcs8 = [hex::decode("3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420").ok()?, scalar].concat();
+        rcgen::KeyPair::try_from(pkcs8.as_slice()).ok().map(|kp| kp.der_bytes().to_vec())
+    };
+    let keys = seen.get("keys").and_then(Value::as_array).cloned().unwrap_or_default();
+    let occurrences: Vec<&str> = keys.iter().filter(|k| public(k).as_deref() == Some(leg_key.as_slice())).map(|k| field(k, "where")).collect();
+    eprintln!(
+        "the step looked at {} variables and {} files, and the memory of {}: {} private keys, {} of them the leg's",
+        seen.get("env").unwrap_or(&Value::Null),
+        seen.get("files").unwrap_or(&Value::Null),
+        seen.get("memory").unwrap_or(&Value::Null),
+        keys.len(),
+        occurrences.len()
+    );
+    assert_eq!(occurrences.len(), 0, "the leg's private key, where its step could read it: {occurrences:?}");
+    // It looked: at its environment, at files, and it read the runner's own (its machine's key).
+    let count = |k: &str| seen.get(k).and_then(Value::as_u64).unwrap_or_default();
+    assert!(count("env") > 0 && count("files") > 10, "{seen}");
+    assert!(keys.iter().any(|k| field(k, "where").ends_with("fedora-2-state/agent.key") && public(k).is_some()), "the step reads its runner's files: {keys:?}");
+    // And its runner's memory was refused it on Linux, whatever Yama's ptrace scope says: while the
+    // leg ran its runner wasn't dumpable, its memory root's.
+    if cfg!(target_os = "linux") {
+        let runner = run.runner.0.id().to_string();
+        let memory = seen.get("memory").cloned().unwrap_or_default();
+        assert_eq!(memory.get(&runner).and_then(Value::as_str), Some("refused"), "{memory}");
+        let owners = seen.get("owners").cloned().unwrap_or_default();
+        assert_eq!(owners.get(&runner).and_then(Value::as_u64), Some(0), "{owners}");
+    }
     Ok(())
 }
 
