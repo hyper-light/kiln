@@ -428,3 +428,29 @@
 .ship-jobs__page:disabled {
   opacity: 0.35;
 }
+
+/* A card picks its job (opened commit's Output, step 2): the whole card is the button; the picked
+   one is lit. */
+.ship-job__pick {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.ship-job__pick:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 6px;
+  border-radius: 0.5rem;
+}
+.ship-job[data-picked] {
+  border-color: rgb(255 255 255 / 0.42);
+  background: rgb(255 255 255 / 0.06);
+}

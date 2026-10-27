@@ -9,14 +9,21 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import type { ShipCommit } from "@/api/ship";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
-import { strip } from "./model";
+import { pickCard, strip } from "./model";
 
 /** Whether the track is at its start and at its end. */
 const endsOf = (el: HTMLElement) => ({ start: el.scrollLeft <= 1, end: el.scrollLeft + el.clientWidth >= el.scrollWidth - 1 });
 
-export function JobCards({ commit }: { commit: ShipCommit }) {
+export function JobCards({ commit, onPick }: { commit: ShipCommit; onPick?: (stage: string) => void }) {
   // Review is Files' to show; the cards are the journey's six stages after it.
   const stages = strip(commit.pips).filter((p) => p.stage !== "review");
+  // The picked card's job is the one whose output shows: yours once you click one, else the rule's.
+  const [picked, setPicked] = React.useState<string | null>(null);
+  const shown = picked ?? stages[pickCard(stages)]?.stage;
+  const pick = (stage: string) => {
+    setPicked(stage);
+    onPick?.(stage);
+  };
   const [ends, setEnds] = React.useState({ start: true, end: true });
   const track = React.useRef<HTMLOListElement | null>(null);
   const attach = React.useCallback((el: HTMLOListElement | null) => {
@@ -38,12 +45,14 @@ export function JobCards({ commit }: { commit: ShipCommit }) {
     <div className="ship-jobs">
       <ol className="ship-jobs__track" ref={attach} onScroll={(e) => setEnds(endsOf(e.currentTarget))} aria-label="Stages">
         {stages.map((p) => (
-          <li key={p.stage} className="ship-job" data-stage={p.stage} data-state={p.state}>
-            <span className="ship-job__head">
-              <StatusGlyph state={p.state} size={16} p={p.p} />
-              {STAGE_WORD[p.stage]}
-            </span>
-            <span className="ship-job__state">{GLYPHS[p.state].word}</span>
+          <li key={p.stage} className="ship-job" data-stage={p.stage} data-state={p.state} data-picked={p.stage === shown || undefined}>
+            <button type="button" className="ship-job__pick" aria-pressed={p.stage === shown} onClick={() => pick(p.stage)}>
+              <span className="ship-job__head">
+                <StatusGlyph state={p.state} size={16} p={p.p} />
+                {STAGE_WORD[p.stage]}
+              </span>
+              <span className="ship-job__state">{GLYPHS[p.state].word}</span>
+            </button>
           </li>
         ))}
       </ol>

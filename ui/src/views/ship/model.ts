@@ -186,3 +186,23 @@ export function standCounts(commits: readonly ShipCommit[]): Record<ShipShown, n
   }
   return out;
 }
+
+/** States a card's job is under way in, and those it failed in (opened commit's Output, step 2). */
+const UNDER_WAY = new Set(["running", "soaking", "guard", "replanting"]);
+const FELL = new Set(["failed", "error", "rolledback", "partial"]);
+
+/**
+ * The card picked first, as kiln's stepToShow picks a step: the running one, else the one that
+ * failed, else the last that ran (the first when none has).
+ */
+export function pickCard(cards: readonly { state: string }[]): number {
+  const running = cards.findIndex((c) => UNDER_WAY.has(c.state));
+  if (running >= 0) return running;
+  const failed = cards.findIndex((c) => FELL.has(c.state));
+  if (failed >= 0) return failed;
+  for (let i = cards.length - 1; i >= 0; i--) {
+    const st = cards[i]?.state;
+    if (st && st !== "none" && st !== "queued") return i;
+  }
+  return 0;
+}

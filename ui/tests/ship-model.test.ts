@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { fold, order, standWord, strip } from "../src/views/ship/model.ts";
+import { fold, order, pickCard, standWord, strip } from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -59,4 +59,14 @@ test("w26_r02: the strip draws every pip the server sends, Review first; a state
       ["build", "none"],
     ],
   );
+});
+
+test("the job card picked first: the running one, else the one that failed, else the last that ran", () => {
+  const cards = (...states: string[]) => states.map((state) => ({ state }));
+  assert.equal(pickCard(cards("passed", "running", "queued", "none", "none", "none")), 1);
+  assert.equal(pickCard(cards("passed", "passed", "soaking", "none", "none", "none")), 2);
+  assert.equal(pickCard(cards("passed", "failed", "superseded", "none", "none", "none")), 1);
+  assert.equal(pickCard(cards("passed", "passed", "passed", "healthy", "passed", "replanted")), 5);
+  assert.equal(pickCard(cards("passed", "passed", "passed", "passed", "none", "none")), 3);
+  assert.equal(pickCard(cards("queued", "none", "none", "none", "none", "none")), 0);
 });

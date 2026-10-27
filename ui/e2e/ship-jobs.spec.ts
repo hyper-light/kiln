@@ -37,3 +37,18 @@ for (const width of [1280, 1000, 800, 600, 390]) {
     await expect(row.getByRole("button", { name: "Previous stages" })).toBeDisabled();
   });
 }
+
+test("one job card is picked at a time: the rule's first, then the one you click", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the desktop shows every card at once");
+  await page.goto("/ship");
+  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  await row.getByRole("button", { name: /^Open / }).click();
+  const cards = row.getByRole("list", { name: "Stages" }).getByRole("button");
+  await expect(cards).toHaveCount(6);
+  await expect(row.locator('.ship-job__pick[aria-pressed="true"]')).toHaveCount(1);
+  // The first row (D41) has passed its checks and gone no further: the rule picks Checks.
+  await expect(cards.nth(1)).toHaveAttribute("aria-pressed", "true");
+  await cards.nth(0).click();
+  await expect(cards.nth(0)).toHaveAttribute("aria-pressed", "true");
+  await expect(row.locator('.ship-job__pick[aria-pressed="true"]')).toHaveCount(1);
+});
