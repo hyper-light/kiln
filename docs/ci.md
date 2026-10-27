@@ -8346,6 +8346,11 @@ cold 2211 s) for the one-file change. Each run's reports say why each step ran, 
 warm (R28), which tells a miss from a slow hit; the figures go in the baseline's table above, with
 their commits, runner and date.
 
+**M5 (seams), not yet on main.** Warm `k8s` pools, the ledger behind one interface (on `Records`)
+and the Remote Execution API's cache are built on branch `ci-w24-m5-seams` against an older ledger
+and an older pod builder; they need porting onto main's (`k8s::pool_pod`, and the ledger's trust,
+signatures, verification, classes and reaper) before they land.
+
 ### W26 Review in Ship: changes as Ship items, each owning its review
 
 **Scope.** Review lives in Ship (the CI/CD Integration agent's page). Ship's unit stays the commit (or tag): a
