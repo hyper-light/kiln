@@ -1086,6 +1086,15 @@ impl Leg {
         let conf = super::credential::docker_config(&a.integrations, Some(&own), base);
         let wanted = map.is_none() || a.integrations.iter().any(|i| i.kind == "oci");
         if wanted && std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
+            // A leg on the host keeps the runner's builders, contexts and plugins, as a v1 job.
+            if map.is_none()
+                && let Some(from) = super::credential::runner_config_dir()
+            {
+                let to = docker.clone();
+                if let Ok(Err(e)) = crate::rt::blocking(move || super::credential::link_runner_config(&from, &to)).await {
+                    tracing::debug!(error = %e, "the runner's Docker config folder couldn't be linked into the leg's");
+                }
+            }
             st.env.insert("DOCKER_CONFIG".into(), seen(&docker));
             st.env.insert("KILN_REGISTRY_HOST".into(), own);
         }
