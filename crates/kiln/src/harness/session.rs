@@ -1761,6 +1761,13 @@ fn settled_core(core: &Core) -> bool {
     core.state.status == Status::Idle && core.state.approvals.is_empty() && core.state.turn_started.is_none()
 }
 
+/// Nothing under way for a switch to another harness to wait for: settled, or its harness still
+/// starting with no turn begun (one that can't sign in never gets further, and the switch is the
+/// way out of it).
+fn switch_now(core: &Core) -> bool {
+    matches!(core.state.status, Status::Idle | Status::Starting) && core.state.approvals.is_empty() && core.state.turn_started.is_none()
+}
+
 /// A person chose a model of harness `to`: the session goes on in it once nothing is under way
 /// (kiln's queue waits for it meanwhile). None: it can't (said in the timeline).
 fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<Switch> {
@@ -1782,7 +1789,7 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
     let (mode, effort, modes, efforts) = carried_choices(from, target, &core.state.mode, &core.state.effort, allow_bypass, &model);
     core.state.switching = Some(super::model::Switching { kind: target.id.to_owned(), model: model.clone(), mode, effort, modes, efforts });
     core.touch_state();
-    if !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited) {
+    if !switch_now(&core) && !matches!(core.state.status, Status::Exited) {
         let text = format!("Switching to {} when this turn ends — the conversation carries over", in_harness(target, &model));
         core.upsert("switch-pending", None, super::model::Body::Notice { level: Level::Info, text });
     }
@@ -3405,7 +3412,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     // A switch, now that nothing is under way: the harness ends by itself once its
                     // input closes (its record of the conversation complete), else it is stopped.
-                    if (switching.is_some() || moving.is_some() || reloading) && settled(&s) {
+                    let go = {
+                        let core = s.core.lock();
+                        (switching.is_some() && switch_now(&core)) || ((moving.is_some() || reloading) && settled_core(&core))
+                    };
+                    if go {
                         left = s.core.lock().state.tasks.iter().filter(|t| t.left_running()).count();
                         p.stdin.close();
                         if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
@@ -3901,6 +3912,23 @@ mod tests {
         let top = ["max", "xhigh", "high"].into_iter().find(|l| efforts.iter().any(|e| e.id == *l));
         assert_eq!(effort.as_deref(), top, "{efforts:?}");
         Ok(())
+    }
+
+    /// A harness that never gets past starting (Devin that can't sign in) is switched out of at
+    /// once: no turn is under way to wait for. A turn under way, or an approval, still waits.
+    #[test]
+    fn a_switch_out_of_a_harness_stuck_starting_goes_at_once() {
+        use super::{Status, switch_now};
+        let mut core = Core::new();
+        core.state.status = Status::Starting;
+        assert!(switch_now(&core), "stuck starting");
+        core.state.status = Status::Idle;
+        assert!(switch_now(&core), "idle");
+        core.state.turn_started = Some(1);
+        assert!(!switch_now(&core), "a turn under way");
+        core.state.turn_started = None;
+        core.state.status = Status::Running;
+        assert!(!switch_now(&core), "running");
     }
 
     /// Into Devin, Antigravity or another ACP agent too: named by its own modes (kiln's Ask and
