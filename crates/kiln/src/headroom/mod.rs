@@ -300,7 +300,8 @@ fn run(ctx: Ctx, mut settings: Settings) {
         let now = base.elapsed().as_millis() as u64;
         let verdicts = probes.verdicts();
         let healthy = !verdicts.iter().any(|v| matches!(v, probes::Verdict::Missed { .. }));
-        if control.observe(&settings, now, healthy) {
+        let before = control.window();
+        if control.observe(&settings, now, healthy) && control.window() < before {
             tracing::info!(window = control.window(), missed = ?probes.targets.iter().zip(&verdicts).filter(|(_, v)| matches!(v, probes::Verdict::Missed { .. })).map(|(t, _)| t.name.as_str()).collect::<Vec<_>>(), "headroom: a target missed its goal; the window halves");
         }
         if measured.is_none_or(|m| m.elapsed() >= MEASURE) {
