@@ -1067,7 +1067,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Some(c) = crate::runner::chaos::get() {
         net.command(net::Out::Seed(c.seed)).await;
         for rule in c.faults.iter().copied() {
-            net.command(net::Out::Shed(rule)).await;
+            net.command(net::Out::Shed(rule.past(crate::wire::agent_classes().len()))).await;
         }
         // And what it sends, copied for a test to read (W27-R02).
         if let Some(path) = &c.copy {
@@ -1313,6 +1313,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut server_identity = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
     let mut identity_asked: HashMap<String, Instant> = HashMap::new();
+    // The server takes word that a frame of its couldn't be read here (`AgentMsg::Unread`): of each
+    // kind its newer build sends once an hour on a connection, the rest folded into the next word
+    // (`wire::unread::Told`).
+    let mut server_unread = false;
+    let mut told = crate::wire::unread::Told::default();
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
@@ -2123,7 +2128,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_UNREAD }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2206,6 +2211,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 updates.down();
                 server_wire = false;
                 server_drops = false;
+                server_unread = false;
+                told = crate::wire::unread::Told::default();
                 drops_said = None;
                 server_work = false;
                 work_said = None;
@@ -2234,10 +2241,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
-                let msg: ServerMsg = match proto::decode(&data) {
+                let msg: ServerMsg = match proto::read_server(&data) {
                     Ok(m) => m,
+                    // The server hears of it, when it takes word of it (docs/wire.md, "What can't
+                    // be read"), and notes it against this runner.
                     Err(e) => {
-                        tracing::warn!(error = %e, "bad frame from server");
+                        tracing::warn!(what = %e.what(), why = %e.why("ServerMsg"), "a frame from the server couldn't be read");
+                        if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::Server, e.code(), &e.what(), &e.why("ServerMsg")) {
+                            uplink.msg(AgentMsg::Unread { wire: crate::wire::unread::Wire::Server, what: e.what(), code: e.code(), why: e.why("ServerMsg"), folded, session: None }).await;
+                        }
                         continue;
                     }
                 };
@@ -2256,13 +2268,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 crate::wire::commands::Stand::Current => {}
                             }
                             let answer = match wire_in.on_item(&stream, seq, low, body) {
-                                Arrival::Take(body) => match proto::decode::<ServerMsg>(&body) {
-                                    Ok(ServerMsg::Wire(_)) => wire_in.refused(&stream, seq, Refusal::Malformed, "a channel frame inside a command"),
+                                Arrival::Take(body) => match proto::read_server(&body) {
+                                    Ok(ServerMsg::Wire(_)) => {
+                                        let why = "a channel frame inside a command";
+                                        if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::ServerItem, crate::wire::unread::Code::Malformed, "Wire", why) {
+                                            uplink.msg(AgentMsg::Unread { wire: crate::wire::unread::Wire::ServerItem, what: "Wire".to_owned(), code: crate::wire::unread::Code::Malformed, why: why.to_owned(), folded, session: None }).await;
+                                        }
+                                        wire_in.refused(&stream, seq, Refusal::Malformed, why)
+                                    }
                                     Ok(inner) => {
                                         answer_after = Some((stream, seq, None));
                                         break 'item (inner, body);
                                     }
-                                    Err(e) => wire_in.refused(&stream, seq, Refusal::Malformed, e.to_string()),
+                                    // Its NACK says it (unsupported for a variant this build doesn't
+                                    // know), and the server hears of it as of a frame.
+                                    Err(e) => {
+                                        if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::ServerItem, e.code(), &e.what(), &e.why("ServerMsg")) {
+                                            uplink.msg(AgentMsg::Unread { wire: crate::wire::unread::Wire::ServerItem, what: e.what(), code: e.code(), why: e.why("ServerMsg"), folded, session: None }).await;
+                                        }
+                                        wire_in.refused(&stream, seq, e.code().refusal(), e.why("ServerMsg"))
+                                    }
                                 },
                                 Arrival::Answered(Some(a)) | Arrival::Gap(a) => a,
                                 Arrival::Answered(None) => continue 'events,
@@ -2330,9 +2355,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.0.send(Up::Term(AgentMsg::HeadroomStatus { json: json.clone() })).await.ok();
                             headroom_sent = Some(json);
                         }
+                        server_unread = caps & proto::CAP_UNREAD != 0;
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
+                    }
+                    // The server couldn't read a frame of this runner's: it keeps it for this
+                    // runner's page; here it's said in the log.
+                    ServerMsg::Unread { wire, what, code, why, folded } => {
+                        tracing::warn!(wire = wire.name(), %what, code = code.name(), %why, folded, "the server couldn't read a message from this runner");
                     }
                     // Taken above, before this match: what it carries came here instead.
                     ServerMsg::Wire(crate::wire::channel::Frame::Item { .. }) => {}
@@ -3577,6 +3608,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
+                // What it folded of the server's it couldn't read, and no word carried for a
+                // minute: told now (`wire::unread::Told::flush`).
+                if server_unread && let Some((f, folded)) = told.flush(Instant::now()) {
+                    uplink.msg(AgentMsg::Unread { wire: f.wire, what: f.what, code: f.code, why: f.why, folded, session: None }).await;
+                }
                 // Counts of jobs long done (a kept leg is let go well within a day).
                 journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
                 // Its config's agent limit, read again: a change holds at once, nothing restarting.

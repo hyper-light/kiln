@@ -214,6 +214,33 @@ pub struct Shed {
     pub act: Act,
 }
 
+impl Shed {
+    /// This rule as the sender of an enum of `variants` variants does it: an `unknown` fault's index
+    /// one past them (in a byte: a postcard varint below 128).
+    pub fn past(mut self, variants: usize) -> Shed {
+        if let Act::Unknown(_) = self.act {
+            self.act = Act::Unknown(u8::try_from(variants).unwrap_or(u8::MAX).min(127));
+        }
+        self
+    }
+}
+
+/// `data` made unreadable as `draw` picks: cut short, bytes added after it, or a byte past its first
+/// (its variant index) flipped.
+fn garble(data: &mut Vec<u8>, draw: u64) {
+    match draw % 3 {
+        0 => data.truncate(data.len() / 2),
+        1 => data.extend_from_slice(&[0xde, 0xad, 0xbe]),
+        _ => {
+            let past = data.len().saturating_sub(1).max(1);
+            let at = 1 + usize::try_from(draw / 3).unwrap_or(0) % past;
+            if let Some(b) = data.get_mut(at) {
+                *b ^= 0xff;
+            }
+        }
+    }
+}
+
 /// What a test build's fault does to a frame it picks ([`Shed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Act {
@@ -225,6 +252,13 @@ pub enum Act {
     /// Held back and sent after the next frame on its lane, or once [`LATE_FOR`] passes with
     /// none: frames out of order.
     Late,
+    /// Its first byte, its message's variant index, made this one: one past what its sender's enum
+    /// has, a kind its receiver doesn't know (docs/wire.md, "What can't be read"). 0 until
+    /// [`Shed::past`] says whose enum.
+    Unknown(u8),
+    /// Cut short, given bytes after it, or a byte past its variant index flipped, as the same draw
+    /// says: a frame that can't be read (a flip may leave one readable).
+    Garble,
 }
 
 /// How long a frame sent late waits for the next on its lane, at the most.
@@ -535,7 +569,7 @@ enum Push {
 }
 
 impl Outbox {
-    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, mut data: Vec<u8>) -> Push {
         if let Some(f) = &mut self.copy {
             use std::io::Write as _;
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
@@ -562,6 +596,12 @@ impl Outbox {
                 }
                 Act::Twice => twice = true,
                 Act::Late => late = true,
+                Act::Unknown(index) => {
+                    if let Some(first) = data.first_mut() {
+                        *first = index;
+                    }
+                }
+                Act::Garble => garble(&mut data, *draw),
             }
         }
         // One held back goes after this one; this one waits for the next, when it's to be late.
@@ -980,6 +1020,27 @@ fn on_event<B, D>(
 mod tests {
     use super::*;
 
+    /// A frame garbled for a test can't be read: cut short, or given bytes after it; or a byte past
+    /// its variant index flipped (which may leave it readable, and never touches the index).
+    #[test]
+    fn a_garbled_frame_is_cut_short_given_more_or_flipped_past_its_index() -> anyhow::Result<()> {
+        let frame = crate::proto::encode(&crate::proto::AgentMsg::HarnessAdopted { session: "session".into(), error: Some("no room".into()) })?;
+        let mut cut = frame.clone();
+        garble(&mut cut, 3);
+        assert!(cut.len() < frame.len() && crate::proto::read_agent(&cut).is_err());
+        let mut more = frame.clone();
+        garble(&mut more, 4);
+        assert!(more.len() == frame.len() + 3 && crate::proto::read_agent(&more).is_err());
+        for draw in [5, 8, 11, 302] {
+            let mut flipped = frame.clone();
+            garble(&mut flipped, draw);
+            assert_eq!(flipped.len(), frame.len());
+            assert_eq!(flipped.first(), frame.first(), "its index stays");
+            assert_eq!(flipped.iter().zip(&frame).filter(|(a, b)| a != b).count(), 1, "one byte flipped");
+        }
+        Ok(())
+    }
+
     async fn next_event(rx: &async_channel::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
         crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
             .await
@@ -1200,12 +1261,12 @@ mod tests {
                         }
                         (server, NetEvent::Frame { data, .. }) => {
                             let frame = if server {
-                                match crate::proto::decode::<AgentMsg>(&data)? {
+                                match crate::proto::read_agent(&data).map_err(|e| anyhow::anyhow!("the runner's frame: {}: {}", e.what(), e.why("AgentMsg")))? {
                                     AgentMsg::Wire(f) => f,
                                     other => anyhow::bail!("the runner sent {other:?}"),
                                 }
                             } else {
-                                match crate::proto::decode::<ServerMsg>(&data)? {
+                                match crate::proto::read_server(&data).map_err(|e| anyhow::anyhow!("the server's frame: {}: {}", e.what(), e.why("ServerMsg")))? {
                                     ServerMsg::Wire(f) => f,
                                     other => anyhow::bail!("the server sent {other:?}"),
                                 }

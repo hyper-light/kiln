@@ -1,13 +1,19 @@
 //! What can't be read, on any wire (docs/wire.md, "What can't be read"). One record, [`Unread`], for
 //! any message a wire refuses because it can't read it, and one place each is noted,
-//! [`Refusals::note`]. A refusal is:
+//! [`Refusals::note`] ([`Refusals::note_told`] for one its sender is told of). A refusal is:
 //! - counted, in `kiln_wire_refused_total{wire,code}`, with no label for its sender;
 //! - kept for its sender's page: each runner's and agent session's counts by wire and code, and its
 //!   newest few;
 //! - written to the audit log as `security.wire_refused`, coalesced: the first for a sender, wire and
 //!   code in a minute at once, the rest in one row a minute saying how many;
-//! - and said whether its sender may be told of it now: a few a second each, the rest counted and
-//!   folded into the next.
+//! - and, when its sender is told of such refusals, said whether it may be told of this one now: a
+//!   few a second each, the rest counted and folded into the next.
+//!
+//! A kind of message this build doesn't know (`unknown`) is a newer peer's, and a skew between
+//! builds can last days, on frames sent many a second: each kind from a sender on a wire is audited
+//! and told of once an hour ([`SKEW_EVERY`]), the rest counted, kept for its page and folded into
+//! the next its sender is told of. A runner tells the server likewise ([`Told`]), and the server
+//! counts its word as the refusals it folds in.
 //!
 //! The core here opens nothing and reads only the clock it's given. The hub's shell writes the rows
 //! it returns, tells the sender when it says so, and says which pages changed.
@@ -30,6 +36,15 @@ pub const NEWEST: usize = 16;
 pub const AUDIT_EVERY: Duration = Duration::from_secs(60);
 /// How many refusals a second a sender is told of: the rest are counted and folded into the next.
 pub const TELL_PER_SECOND: u32 = 16;
+/// How long a kind of message a sender's newer build sends (`unknown`) is audited and told of once,
+/// for each sender, wire and kind: the rest say nothing new.
+pub const SKEW_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How long a runner holds what it folded before telling the server of it anyway ([`Told::flush`]):
+/// no refusal goes untold for longer, though no other word comes.
+pub const FOLD_FLUSH: Duration = Duration::from_secs(60);
+/// The most kinds of the server's a runner keeps having told it of on one connection ([`Told`]):
+/// past it, a new one is folded into the next word.
+pub const TOLD_KINDS: usize = 1024;
 /// The most of a refusal's `why`, and of its audit row's detail, in bytes.
 pub const WHY_MOST: usize = 512;
 /// The most of a refusal's `what`, in bytes: it names a kind of message, never what one said.
@@ -37,7 +52,9 @@ pub const WHAT_MOST: usize = 128;
 /// The audit log's action for a refusal.
 pub const ACTION: &str = "security.wire_refused";
 
-/// A wire, and which way along it: what reads it and what sent it.
+/// A wire, and which way along it: what reads it and what sent it. It travels in frames
+/// (`AgentMsg::Unread`, `ServerMsg::Unread`): new ones are appended last, as postcard encodes
+/// variants by index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -144,7 +161,8 @@ impl Wire {
     }
 }
 
-/// Why a message couldn't be read.
+/// Why a message couldn't be read. It travels in frames, as [`Wire`] does: appended to, never
+/// reordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "UnreadCode"))]
@@ -298,10 +316,10 @@ pub struct Kept {
 }
 
 impl Kept {
-    fn add(&mut self, at: i64, u: &Unread) {
+    fn add(&mut self, at: i64, u: &Unread, n: u64) {
         match self.counts.iter_mut().find(|c| c.wire == u.wire && c.code == u.code) {
-            Some(c) => c.n = c.n.saturating_add(1),
-            None => self.counts.push(Count { wire: u.wire, code: u.code, n: 1 }),
+            Some(c) => c.n = c.n.saturating_add(n),
+            None => self.counts.push(Count { wire: u.wire, code: u.code, n }),
         }
         if self.newest.len() >= NEWEST {
             self.newest.pop_front();
@@ -330,7 +348,7 @@ pub struct Row {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Noted {
     /// Tell its sender now, and how many before it it wasn't told of; none: not now (it's counted,
-    /// and folded into the next it's told of).
+    /// and folded into the next it's told of). Always none from [`Refusals::note`].
     pub tell: Option<u64>,
     /// Rows for the audit log, now.
     pub rows: Vec<Row>,
@@ -361,30 +379,74 @@ pub struct Refusals {
     kept: Recent<Page, Kept>,
     audits: Recent<(Sender, Wire, Code), Window>,
     tells: Recent<Sender, Tells>,
+    /// When each unknown kind from a sender on a wire was last audited and told of.
+    skews: Recent<(Sender, Wire, String), Option<Instant>>,
 }
 
 impl Refusals {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
-        Refusals { clock, kept: Recent::new(SENDERS), audits: Recent::new(SENDERS), tells: Recent::new(SENDERS) }
+        Refusals { clock, kept: Recent::new(SENDERS), audits: Recent::new(SENDERS), tells: Recent::new(SENDERS), skews: Recent::new(SENDERS) }
     }
 
     /// Note a refusal: counted, kept for its sender's page and the page `on` names (an agent
     /// session's, for a runner's update of it), and audited. What it returns says which rows to
-    /// write, whether to tell its sender, and which pages changed.
+    /// write and which pages changed. Its sender isn't told of it here (a NACK answered it, say, or
+    /// it's a runner's word of a frame of the server's): [`Refusals::note_told`] is for one it is.
     pub fn note(&mut self, u: Unread, on: Option<Page>) -> Noted {
+        self.noted(u, on, false, 1)
+    }
+
+    /// As [`Refusals::note`], for a refusal its sender is told of (`Unread`): it also says whether
+    /// it may be told now, and how many before it weren't. Only these count against a sender's
+    /// [`TELL_PER_SECOND`] and are folded into the next, so what a sender is told counts exactly
+    /// the refusals it's told of.
+    pub fn note_told(&mut self, u: Unread, on: Option<Page>) -> Noted {
+        self.noted(u, on, true, 1)
+    }
+
+    /// A runner's word of a frame of the server's it couldn't read (`AgentMsg::Unread`), with the
+    /// `folded` before it it didn't tell of: noted as that many, audited once.
+    pub fn note_folded(&mut self, u: Unread, on: Option<Page>, folded: u64) -> Noted {
+        self.noted(u, on, false, folded.saturating_add(1))
+    }
+
+    fn noted(&mut self, u: Unread, on: Option<Page>, told: bool, n: u64) -> Noted {
         let u = u.cut();
         let (now, at) = (self.clock.now(), self.clock.unix_ms());
-        crate::metrics::wire().refused.inc(&[u.wire.name(), u.code.name()]);
+        crate::metrics::wire().refused.add(&[u.wire.name(), u.code.name()], n);
         let mut changed: Vec<Page> = Vec::new();
         for page in u.from.page().into_iter().chain(on) {
             if !changed.contains(&page) {
-                self.kept.entry(page.clone(), Kept::default).0.add(at, &u);
+                self.kept.entry(page.clone(), Kept::default).0.add(at, &u, n);
                 changed.push(page);
             }
         }
-        let rows = self.audit(now, &u);
-        let tell = self.tell(now, &u.from);
+        // A kind a newer build sends, said within the hour: counted and kept, and folded into the
+        // next its sender is told of, but no row or word of its own.
+        let again = u.code == Code::Unknown && self.said_within(now, &u);
+        let rows = if again { Vec::new() } else { self.audit(now, &u) };
+        let tell = match (told, again) {
+            (false, _) => None,
+            (true, true) => {
+                self.fold(now, &u.from);
+                None
+            }
+            (true, false) => self.tell(now, &u.from),
+        };
         Noted { tell, rows, changed }
+    }
+
+    /// Whether `u`'s kind, from its sender on its wire, was audited and told of within
+    /// [`SKEW_EVERY`]; if not, it is now.
+    fn said_within(&mut self, now: Instant, u: &Unread) -> bool {
+        let (at, _) = self.skews.entry((u.from.clone(), u.wire, u.what.clone()), || None);
+        match at {
+            Some(t) if now.saturating_duration_since(*t) < SKEW_EVERY => true,
+            _ => {
+                *at = Some(now);
+                false
+            }
+        }
     }
 
     /// The rows a minute that are due: for each sender, wire and code whose minute is over, how
@@ -446,6 +508,12 @@ impl Refusals {
         rows
     }
 
+    /// One its sender isn't told of now, folded into the next it is.
+    fn fold(&mut self, now: Instant, from: &Sender) {
+        let (t, _) = self.tells.entry(from.clone(), || Tells { second: now, told: 0, untold: 0 });
+        t.untold = t.untold.saturating_add(1);
+    }
+
     fn tell(&mut self, now: Instant, from: &Sender) -> Option<u64> {
         let (t, _) = self.tells.entry(from.clone(), || Tells { second: now, told: 0, untold: 0 });
         if now.saturating_duration_since(t.second) >= Duration::from_secs(1) {
@@ -459,6 +527,57 @@ impl Refusals {
             t.untold = t.untold.saturating_add(1);
             None
         }
+    }
+}
+
+/// What a runner told the server of what it couldn't read of the server's, on one connection: a
+/// kind the server's newer build sends (`unknown`) once an hour ([`SKEW_EVERY`]), as it may come on
+/// every frame for days, the rest folded into the next word (and told within [`FOLD_FLUSH`] though
+/// none comes); what it couldn't read for any other reason, each time.
+#[derive(Debug, Default)]
+pub struct Told {
+    kinds: HashMap<(Wire, String), Instant>,
+    untold: u64,
+    /// The newest it folded, while any are untold.
+    last: Option<Folded>,
+}
+
+/// The newest refusal a runner folded, and since when it has held any untold.
+#[derive(Debug, Clone)]
+pub struct Folded {
+    pub wire: Wire,
+    pub what: String,
+    pub code: Code,
+    pub why: String,
+    since: Instant,
+}
+
+impl Told {
+    /// Whether to tell the server of this one now, and how many before it it didn't (`folded`).
+    pub fn tell(&mut self, now: Instant, wire: Wire, code: Code, what: &str, why: &str) -> Option<u64> {
+        if code == Code::Unknown {
+            let key = (wire, what.to_owned());
+            let said = self.kinds.get(&key).is_some_and(|at| now.saturating_duration_since(*at) < SKEW_EVERY);
+            if said || (!self.kinds.contains_key(&key) && self.kinds.len() >= TOLD_KINDS) {
+                self.untold = self.untold.saturating_add(1);
+                let since = self.last.as_ref().map_or(now, |l| l.since);
+                self.last = Some(Folded { wire, what: what.to_owned(), code, why: why.to_owned(), since });
+                return None;
+            }
+            self.kinds.insert(key, now);
+        }
+        self.last = None;
+        Some(std::mem::take(&mut self.untold))
+    }
+
+    /// What it folded that no word has carried for [`FOLD_FLUSH`]: the newest of them, to tell the
+    /// server of now, and how many before it (`folded`).
+    pub fn flush(&mut self, now: Instant) -> Option<(Folded, u64)> {
+        if now.saturating_duration_since(self.last.as_ref()?.since) < FOLD_FLUSH {
+            return None;
+        }
+        let last = self.last.take()?;
+        Some((last, std::mem::take(&mut self.untold).saturating_sub(1)))
     }
 }
 
@@ -552,7 +671,7 @@ mod tests {
     fn a_refusal_is_counted_kept_for_its_page_audited_and_its_sender_told() {
         let (_clock, mut r) = refusals();
         let before = crate::metrics::wire().refused.get(&["runner", "unknown"]);
-        let noted = r.note(unread(runner("fedora"), Wire::Runner, Code::Unknown), None);
+        let noted = r.note_told(unread(runner("fedora"), Wire::Runner, Code::Unknown), None);
         assert!(crate::metrics::wire().refused.get(&["runner", "unknown"]) > before, "counted");
         assert_eq!(noted.tell, Some(0), "told, of none before it");
         assert_eq!(noted.changed, vec![Page::Runner("fedora".into())]);
@@ -580,7 +699,7 @@ mod tests {
         let (clock, mut r) = refusals();
         let mut rows = Vec::new();
         for _ in 0..10_000 {
-            rows.extend(r.note(unread(runner("fedora"), Wire::Runner, Code::Unknown), None).rows);
+            rows.extend(r.note(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).rows);
             clock.advance(Duration::from_millis(5));
             rows.extend(r.tick());
         }
@@ -593,11 +712,11 @@ mod tests {
         // A minute with nothing in it closes the window: the next goes at once.
         clock.advance(AUDIT_EVERY);
         assert!(r.tick().is_empty());
-        assert_eq!(r.note(unread(runner("fedora"), Wire::Runner, Code::Unknown), None).rows.len(), 1);
-        // Another wire, code or sender has its own minute.
         assert_eq!(r.note(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).rows.len(), 1);
-        assert_eq!(r.note(unread(runner("fedora"), Wire::Server, Code::Unknown), None).rows.len(), 1);
-        assert_eq!(r.note(unread(runner("mac"), Wire::Runner, Code::Unknown), None).rows.len(), 1);
+        // Another wire, code or sender has its own minute.
+        assert_eq!(r.note(unread(runner("fedora"), Wire::Runner, Code::Unknown), None).rows.len(), 1);
+        assert_eq!(r.note(unread(runner("fedora"), Wire::Server, Code::Malformed), None).rows.len(), 1);
+        assert_eq!(r.note(unread(runner("mac"), Wire::Runner, Code::Malformed), None).rows.len(), 1);
     }
 
     #[test]
@@ -606,22 +725,113 @@ mod tests {
         let mut rows = Vec::new();
         // One a second for five minutes.
         for _ in 0..300 {
-            rows.extend(r.note(unread(runner("fedora"), Wire::Runner, Code::Unknown), None).rows);
+            rows.extend(r.note(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).rows);
             clock.advance(Duration::from_secs(1));
             rows.extend(r.tick());
         }
         assert_eq!(rows.len(), 6, "the first at once, then one a minute: {rows:?}");
     }
 
+    /// A kind a sender's newer build sends, on every frame for days (a raft's heartbeats to a runner
+    /// not yet upgraded): audited and told of once an hour for each sender, wire and kind, each one
+    /// still counted, kept for its page, and folded into the next its sender is told of.
+    #[test]
+    fn an_unknown_kind_is_audited_and_told_of_once_an_hour_each_one_counted() {
+        let (clock, mut r) = refusals();
+        let observe = || {
+            let mut u = unread(runner("fedora"), Wire::RunnerPayload, Code::Unknown);
+            u.what = "Observe (teleport)".into();
+            u
+        };
+        let before = crate::metrics::wire().refused.get(&["runner_payload", "unknown"]);
+        let first = r.note_told(observe(), None);
+        assert_eq!((first.tell, first.rows.len()), (Some(0), 1), "the first, at once");
+        for _ in 0..1000 {
+            clock.advance(Duration::from_millis(100));
+            let n = r.note_told(observe(), None);
+            assert_eq!((n.tell, n.rows.len()), (None, 0), "the rest say nothing new");
+            assert!(r.tick().is_empty(), "nor in a row a minute");
+        }
+        assert!(crate::metrics::wire().refused.get(&["runner_payload", "unknown"]) >= before + 1001, "each counted");
+        assert_eq!(r.kept(&Page::Runner("fedora".into())).map(Kept::total), Some(1001), "each kept for its page");
+        // Another kind, wire or sender is its own, told at once; a malformed one is said as ever.
+        let mut other = observe();
+        other.what = "Observe (hologram)".into();
+        assert_eq!(r.note_told(other, None).tell, Some(1000), "the thousand folded into the next told of");
+        let mut wire = observe();
+        wire.wire = Wire::Runner;
+        assert_eq!(r.note_told(wire, None).tell, Some(0));
+        assert_eq!(r.note_told(unread(runner("mac"), Wire::RunnerPayload, Code::Unknown), None).tell, Some(0));
+        let mut bad = observe();
+        bad.code = Code::Malformed;
+        assert!(r.note_told(bad.clone(), None).tell.is_some() && r.note_told(bad, None).tell.is_some());
+        // An hour on, it's said again: the skew goes on.
+        clock.advance(SKEW_EVERY);
+        let again = r.note_told(observe(), None);
+        assert_eq!((again.tell, again.rows.len()), (Some(0), 1));
+    }
+
+    /// A runner tells the server of each kind the server's newer build sends once an hour on a
+    /// connection, the rest folded into its next word, or told within a minute though none comes;
+    /// of what it couldn't read for any other reason, each time.
+    #[test]
+    fn a_runner_tells_of_an_unknown_kind_once_an_hour_the_rest_folded() -> anyhow::Result<()> {
+        let t0 = Instant::now();
+        let mut told = Told::default();
+        let observe = |told: &mut Told, at: Instant, what: &str| told.tell(at, Wire::ServerPayload, Code::Unknown, what, "no kind teleport");
+        assert_eq!(observe(&mut told, t0, "Observe (teleport)"), Some(0));
+        assert_eq!((observe(&mut told, t0, "Observe (teleport)"), observe(&mut told, t0, "Observe (teleport)")), (None, None));
+        assert_eq!(observe(&mut told, t0, "Observe (hologram)"), Some(2), "another kind, told with the two folded");
+        assert_eq!(told.tell(t0, Wire::Server, Code::Unknown, "Observe (teleport)", "x"), Some(0), "another wire");
+        assert_eq!((told.tell(t0, Wire::Server, Code::Malformed, "variant 9", "cut short"), told.tell(t0, Wire::Server, Code::Malformed, "variant 9", "cut short")), (Some(0), Some(0)), "malformed, each time");
+        // Folded with no word after: held a minute, then told, the newest with the rest folded in.
+        assert_eq!((observe(&mut told, t0, "Observe (teleport)"), observe(&mut told, t0, "Observe (teleport)")), (None, None));
+        assert!(told.flush(t0 + FOLD_FLUSH / 2).is_none(), "not yet");
+        let (last, folded) = told.flush(t0 + FOLD_FLUSH).ok_or_else(|| anyhow::anyhow!("not flushed"))?;
+        assert_eq!((last.wire, last.what.as_str(), last.code, folded), (Wire::ServerPayload, "Observe (teleport)", Code::Unknown, 1));
+        assert!(told.flush(t0 + FOLD_FLUSH * 2).is_none(), "nothing left untold");
+        let later = t0 + SKEW_EVERY;
+        assert_eq!(observe(&mut told, later, "Observe (teleport)"), Some(0), "an hour on, said again");
+        for n in 0..TOLD_KINDS {
+            let _ = told.tell(later, Wire::Server, Code::Unknown, &format!("variant {n}"), "x");
+        }
+        assert_eq!(told.tell(later, Wire::Server, Code::Unknown, "variant past them all", "x"), None, "at most {TOLD_KINDS} kinds kept: the rest folded");
+        assert_eq!(Told::default().tell(t0, Wire::ServerPayload, Code::Unknown, "Observe (teleport)", "x"), Some(0), "a new connection tells again");
+        Ok(())
+    }
+
     #[test]
     fn a_sender_is_told_of_sixteen_a_second_and_the_rest_are_folded_into_the_next() {
         let (clock, mut r) = refusals();
-        let tells: Vec<Option<u64>> = (0..20).map(|_| r.note(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).tell).collect();
+        let tells: Vec<Option<u64>> = (0..20).map(|_| r.note_told(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).tell).collect();
         assert_eq!(tells.iter().filter(|t| t.is_some()).count(), 16);
         assert!(tells.iter().skip(16).all(Option::is_none), "{tells:?}");
         clock.advance(Duration::from_secs(1));
-        assert_eq!(r.note(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).tell, Some(4), "the four not told of, folded in");
-        assert_eq!(r.note(unread(runner("mac"), Wire::Runner, Code::Malformed), None).tell, Some(0), "each sender its own");
+        assert_eq!(r.note_told(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).tell, Some(4), "the four not told of, folded in");
+        assert_eq!(r.note_told(unread(runner("mac"), Wire::Runner, Code::Malformed), None).tell, Some(0), "each sender its own");
+    }
+
+    /// What a sender is told counts only what it's told of (typed messages, step 3): a refusal
+    /// answered another way (a NACK), or a runner's word of a frame of the server's, takes none of
+    /// its sixteen a second and isn't folded into the next it's told of.
+    #[test]
+    fn what_its_sender_isnt_told_of_is_never_folded_into_what_it_is() {
+        let (clock, mut r) = refusals();
+        let quiet = |r: &mut Refusals| {
+            let item = r.note(unread(runner("fedora"), Wire::RunnerItem, Code::Unknown), None).tell;
+            let word = r.note(unread(runner("fedora"), Wire::Server, Code::Malformed), None).tell;
+            (item, word)
+        };
+        for _ in 0..40 {
+            assert_eq!(quiet(&mut r), (None, None));
+        }
+        let tells: Vec<Option<u64>> = (0..18).map(|_| r.note_told(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).tell).collect();
+        assert_eq!(tells.iter().filter(|t| **t == Some(0)).count(), 16, "sixteen told, none of the eighty quiet ones folded in: {tells:?}");
+        assert_eq!(quiet(&mut r), (None, None));
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(quiet(&mut r), (None, None));
+        assert_eq!(r.note_told(unread(runner("fedora"), Wire::Runner, Code::Malformed), None).tell, Some(2), "the two told-of ones not told, and no quiet one");
+        assert_eq!(r.kept(&Page::Runner("fedora".into())).map(Kept::total), Some(84 + 19), "each still counted for its page");
     }
 
     #[test]
@@ -629,11 +839,11 @@ mod tests {
         let (clock, mut r) = refusals();
         let mut rows = 0;
         for n in 0..5000 {
-            rows += r.note(unread(runner(&format!("r{n}")), Wire::Runner, Code::Unknown), None).rows.len();
+            rows += r.note_told(unread(runner(&format!("r{n}")), Wire::Runner, Code::Unknown), None).rows.len();
             clock.advance(Duration::from_millis(1));
         }
         assert_eq!(rows, 5000, "each one's first goes at once");
-        assert_eq!((r.kept.len(), r.audits.len(), r.tells.len()), (SENDERS, SENDERS, SENDERS));
+        assert_eq!((r.kept.len(), r.audits.len(), r.tells.len(), r.skews.len()), (SENDERS, SENDERS, SENDERS, SENDERS));
         assert!(r.kept(&Page::Runner("r903".into())).is_none(), "the least recent went");
         assert!(r.kept(&Page::Runner("r904".into())).is_some());
         assert!(r.kept(&Page::Runner("r4999".into())).is_some());
@@ -648,7 +858,7 @@ mod tests {
     fn a_sender_let_go_with_refusals_held_says_how_many() {
         let (_clock, mut r) = refusals();
         for _ in 0..3 {
-            let _ = r.note(unread(runner("held"), Wire::Runner, Code::Unknown), None);
+            let _ = r.note(unread(runner("held"), Wire::Runner, Code::Malformed), None);
         }
         let rows: Vec<Row> = (0..SENDERS).flat_map(|n| r.note(unread(runner(&format!("r{n}")), Wire::Runner, Code::Unknown), None).rows).collect();
         assert!(rows.iter().any(|row| row.principal == "runner:held" && row.detail.starts_with("2 more in the minute")), "{:?}", rows.iter().find(|row| row.principal == "runner:held"));

@@ -262,6 +262,13 @@ pub enum AgentMsg {
     /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
     /// encodes variants by index.
     HeadroomStatus { json: String },
+    /// A frame of the server's this runner couldn't read (`crate::wire::unread`): on which wire,
+    /// what it was (never what it said), why, how many more before it went untold (`folded`), and
+    /// the agent session it was about, when that much of it could be read (`session`). The server
+    /// notes it against this runner, and on that session's page too. Only to a server announcing
+    /// [`CAP_UNREAD`]. Appended last, after identities', observe's and headroom's (`Identity`, `Observe`,
+    /// `HeadroomStatus`): postcard encodes variants by index.
+    Unread { wire: crate::wire::unread::Wire, what: String, code: crate::wire::unread::Code, why: String, folded: u64, session: Option<String> },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -448,6 +455,14 @@ pub struct IdentityGiven {
     pub cert_pem: Option<String>,
     pub error: Option<String>,
 }
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: the peer takes word that a frame of its
+/// couldn't be read ([`AgentMsg::Unread`], [`ServerMsg::Unread`]; `crate::wire::unread`, docs/wire.md
+/// "What can't be read"). One without it is told nothing new; what it sends that can't be read is
+/// noted all the same. Bit 37 is the agent limit's [`CAP_AGENT_LIMIT`], 38 identities'
+/// [`CAP_IDENTITY`], 39 headroom's [`CAP_HEADROOM`], 40 changesets' patches'
+/// [`CAP_CHANGES_PATCH`].
+pub const CAP_UNREAD: u64 = 1 << 41;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -710,6 +725,11 @@ pub enum ServerMsg {
     /// for the runner's next start. Only to runners announcing [`CAP_HEADROOM`]. Appended last:
     /// postcard encodes variants by index.
     Headroom { json: String },
+    /// A frame of this runner's the server couldn't read (`crate::wire::unread`): on which wire,
+    /// what it was (never what it said), why, and how many more before it went untold (`folded`).
+    /// Only to runners announcing [`CAP_UNREAD`]. Appended last, after identities', observe's and headroom's
+    /// (`Identity`, `Observe`, `Headroom`): postcard encodes variants by index.
+    Unread { wire: crate::wire::unread::Wire, what: String, code: crate::wire::unread::Code, why: String, folded: u64 },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -766,13 +786,107 @@ pub fn encode<T: Serialize>(v: &T) -> anyhow::Result<Vec<u8>> {
     postcard::to_allocvec(v).map_err(|e| anyhow::anyhow!("encode: {e}"))
 }
 
-pub fn decode<'a, T: Deserialize<'a>>(b: &'a [u8]) -> anyhow::Result<T> {
-    postcard::from_bytes(b).map_err(|e| anyhow::anyhow!("decode: {e}"))
+/// Why a frame couldn't be read ([`read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unreadable {
+    /// Its variant's index is past the `known` variants this build has: a newer peer's.
+    Unknown { index: u64, known: usize },
+    /// It isn't one: cut short, bytes left over, or otherwise unreadable. `variant`: its variant's
+    /// index, when that much could be read.
+    Malformed { variant: Option<u64>, why: String },
+}
+
+impl Unreadable {
+    pub fn code(&self) -> crate::wire::unread::Code {
+        match self {
+            Unreadable::Unknown { .. } => crate::wire::unread::Code::Unknown,
+            Unreadable::Malformed { .. } => crate::wire::unread::Code::Malformed,
+        }
+    }
+
+    /// What it was, as `crate::wire::unread::Unread` says it: its variant, never what it said.
+    pub fn what(&self) -> String {
+        match self {
+            Unreadable::Unknown { index, .. } | Unreadable::Malformed { variant: Some(index), .. } => format!("variant {index}"),
+            Unreadable::Malformed { variant: None, .. } => "a frame".to_owned(),
+        }
+    }
+
+    /// Why, of a frame that was to be an `of`.
+    pub fn why(&self, of: &str) -> String {
+        match self {
+            Unreadable::Unknown { known, .. } => format!("{of} has {known} variants"),
+            Unreadable::Malformed { why, .. } => why.clone(),
+        }
+    }
+}
+
+/// A frame read whole into `T`, an enum of `variants()` variants (postcard), or why it couldn't
+/// be: a variant this build doesn't know (its index past them), or bytes that aren't one, or that
+/// are one with more after it.
+pub fn read<'a, T: Deserialize<'a>>(b: &'a [u8], variants: impl FnOnce() -> usize) -> Result<T, Unreadable> {
+    let variant = varint(b);
+    match postcard::take_from_bytes::<T>(b) {
+        Ok((m, [])) => Ok(m),
+        Ok((_, rest)) => Err(Unreadable::Malformed { variant, why: format!("{} bytes left over", rest.len()) }),
+        Err(e) => {
+            let known = variants();
+            match variant {
+                Some(index) if usize::try_from(index).ok().is_none_or(|i| i >= known) => Err(Unreadable::Unknown { index, known }),
+                _ => Err(Unreadable::Malformed { variant, why: unreadable(&e) }),
+            }
+        }
+    }
+}
+
+/// A frame read whole into `T`, a message that isn't an enum ([`LogChunk`]), or why it couldn't be.
+pub fn read_whole<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T, Unreadable> {
+    match postcard::take_from_bytes::<T>(b) {
+        Ok((m, [])) => Ok(m),
+        Ok((_, rest)) => Err(Unreadable::Malformed { variant: None, why: format!("{} bytes left over", rest.len()) }),
+        Err(e) => Err(Unreadable::Malformed { variant: None, why: unreadable(&e) }),
+    }
+}
+
+/// A runner's frame, read ([`read`]).
+pub fn read_agent(b: &[u8]) -> Result<AgentMsg, Unreadable> {
+    read(b, || crate::wire::agent_classes().len())
+}
+
+/// The server's frame, read ([`read`]).
+pub fn read_server(b: &[u8]) -> Result<ServerMsg, Unreadable> {
+    read(b, || crate::wire::server_classes().len())
+}
+
+/// Why postcard couldn't read a frame, as an `Unread` says it.
+fn unreadable(e: &postcard::Error) -> String {
+    match e {
+        postcard::Error::DeserializeUnexpectedEnd => "cut short".to_owned(),
+        e => e.to_string(),
+    }
+}
+
+/// The varint `b` starts with: a postcard enum's variant index, when it has one.
+fn varint(b: &[u8]) -> Option<u64> {
+    let mut v: u64 = 0;
+    for (i, byte) in b.iter().take(10).enumerate() {
+        v |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame as postcard reads it, bytes left over or not: what these tests compare with what was
+    /// encoded. What the server and a runner read goes through `read` (`read_agent`, `read_server`).
+    fn decode<'a, T: Deserialize<'a>>(b: &'a [u8]) -> anyhow::Result<T> {
+        postcard::from_bytes(b).map_err(|e| anyhow::anyhow!("decode: {e}"))
+    }
 
     #[test]
     fn roundtrip() -> anyhow::Result<()> {
@@ -1062,6 +1176,82 @@ mod tests {
     fn the_changes_patch_bit_is_a_new_one() {
         let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM;
         assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
+    }
+
+    /// Typed messages, step 3: word that a frame couldn't be read is appended last in both, after
+    /// the hand-overs', T3's, W24's, the agent limit's, identities', observe's and headroom's, behind
+    /// a bit of its own.
+    #[test]
+    fn word_of_what_couldnt_be_read_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        use crate::wire::unread::{Code, Wire};
+        let up = AgentMsg::Unread { wire: Wire::Server, what: "variant 60".into(), code: Code::Unknown, why: "ServerMsg has 60 variants".into(), folded: 0, session: None };
+        let down = ServerMsg::Unread { wire: Wire::Runner, what: "variant 54".into(), code: Code::Malformed, why: "cut short".into(), folded: 3 };
+        let headroom = encode(&AgentMsg::HeadroomStatus { json: "{}".into() })?;
+        assert_eq!(encode(&up)?.first().copied(), headroom.first().map(|i| i + 1), "AgentMsg::Unread comes right after HeadroomStatus");
+        assert_eq!(encode(&up)?.first(), Some(&56));
+        let headroom = encode(&ServerMsg::Headroom { json: "{}".into() })?;
+        assert_eq!(encode(&down)?.first().copied(), headroom.first().map(|i| i + 1), "ServerMsg::Unread comes right after Headroom");
+        assert_eq!(encode(&down)?.first(), Some(&62));
+        assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
+        assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (57, 63), "each table has every variant once");
+        assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
+        Ok(())
+    }
+
+    /// A frame is read whole into its message, or said why not: a variant past the enum's is
+    /// unknown (a newer peer's); cut short, or with bytes left over, it's malformed.
+    #[test]
+    fn a_frame_is_read_whole_or_said_why_not() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let hello = encode(&AgentMsg::HarnessAdopted { session: "s".into(), error: None })?;
+        assert!(read_agent(&hello).is_ok());
+        // A newer runner's variant 200 (two bytes of varint), and one just past.
+        let mut newer = vec![0xc8, 0x01];
+        newer.extend_from_slice(&[1, 2, 3]);
+        let (agents, servers) = (crate::wire::agent_classes().len(), crate::wire::server_classes().len());
+        let e = read_agent(&newer).err().ok_or_else(|| anyhow::anyhow!("read"))?;
+        assert_eq!((e.code(), e.what(), e.why("AgentMsg")), (Code::Unknown, "variant 200".to_owned(), format!("AgentMsg has {agents} variants")));
+        assert_eq!(read_agent(&[u8::try_from(agents)?]).err().map(|e| e.code()), Some(Code::Unknown));
+        assert_eq!(read_server(&[u8::try_from(servers)?, 0]).err().map(|e| e.code()), Some(Code::Unknown));
+        // Cut short: a known variant whose fields aren't all there.
+        let cut = hello.get(..hello.len().saturating_sub(1)).unwrap_or_default();
+        let e = read_agent(cut).err().ok_or_else(|| anyhow::anyhow!("read"))?;
+        assert_eq!((e.code(), e.why("AgentMsg")), (Code::Malformed, "cut short".to_owned()));
+        // Bytes left over after a whole message.
+        let mut more = hello.clone();
+        more.extend_from_slice(&[7, 7]);
+        let e = read_agent(&more).err().ok_or_else(|| anyhow::anyhow!("read"))?;
+        assert_eq!((e.code(), e.why("AgentMsg")), (Code::Malformed, "2 bytes left over".to_owned()));
+        // Nothing at all, and a message that isn't an enum.
+        assert_eq!(read_agent(&[]).err().map(|e| (e.code(), e.what())), Some((Code::Malformed, "a frame".to_owned())));
+        let chunk = encode(&LogChunk { job: "j".into(), idx: 1, data: vec![1] })?;
+        assert!(read_whole::<LogChunk>(&chunk).is_ok());
+        let mut over = chunk.clone();
+        over.push(0);
+        assert!(read_whole::<LogChunk>(&over).is_err_and(|e| e.code() == Code::Malformed));
+        Ok(())
+    }
+
+    /// Whatever bytes come, reading them never panics: always a message, or why it isn't one.
+    #[test]
+    fn any_bytes_read_as_a_message_or_say_why_not() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut read, mut refused) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            let len = usize::try_from(next() % 64).unwrap_or(0);
+            let bytes: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            for ok in [read_agent(&bytes).is_ok(), read_server(&bytes).is_ok()] {
+                if ok { read += 1 } else { refused += 1 }
+            }
+        }
+        assert!(refused > 0 && read + refused == 40_000);
     }
 
     #[test]

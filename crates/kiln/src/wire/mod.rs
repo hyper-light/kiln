@@ -201,6 +201,7 @@ classes! {
         AgentMsg::AgentLimit { .. } => Class::State,
         AgentMsg::Identity { .. } => Class::Ask,
         AgentMsg::Observe { .. } => OBSERVE,
+        AgentMsg::Unread { .. } => Class::Ack,
     }
 }
 
@@ -269,6 +270,7 @@ classes! {
         ServerMsg::AgentLimit { .. } => Class::State,
         ServerMsg::Identity { .. } => Class::Answer,
         ServerMsg::Observe { .. } => OBSERVE,
+        ServerMsg::Unread { .. } => Class::Ack,
     }
 }
 

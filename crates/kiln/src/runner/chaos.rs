@@ -25,6 +25,10 @@
 //! - `twice=<lane>[/<variant>]:<every>` and `late=<lane>[/<variant>]:<every>`: as `shed`, the
 //!   frames it picks sent twice, or held back and sent after the next frame on their lane (out of
 //!   order), not dropped. Each may be given beside the others, each drawing on its own.
+//! - `unknown=<lane>[/<variant>]:<every>` and `garble=<lane>[/<variant>]:<every>`: as `shed`, the
+//!   frames it picks made unreadable, not dropped: their variant index made one past what their
+//!   sender's enum has, a kind the receiver doesn't know; or cut short, given bytes after them, or a
+//!   byte past their index flipped (docs/wire.md, "What can't be read").
 //! - `seed=<n>`: the frames those faults pick are another seed's, the same each run (a lab run
 //!   again on a seed goes wrong as it did).
 //! - `fanout=<frames>`: the server's: each session's live feed keeps that many frames for its
@@ -120,11 +124,13 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 c.platform = Some(v.to_owned());
             }
             "rebuild" => c.rebuild_after = Some(d()?),
-            "shed" | "twice" | "late" => {
+            "shed" | "twice" | "late" | "unknown" | "garble" => {
                 let act = match k {
                     "shed" => crate::net::Act::Drop,
                     "twice" => crate::net::Act::Twice,
-                    _ => crate::net::Act::Late,
+                    "late" => crate::net::Act::Late,
+                    "unknown" => crate::net::Act::Unknown(0),
+                    _ => crate::net::Act::Garble,
                 };
                 c.faults.push(shed(v, act).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes <lane>[/<variant>]:<every> (term/46:7), not `{v}`"))?);
             }
@@ -140,7 +146,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, unknown, garble, seed, fanout, old, copy or keys"),
         }
     }
     Ok(c)
@@ -394,6 +400,12 @@ mod tests {
         // Frames sent twice, or late, beside those dropped, each its own.
         let faults = parse("shed=term/46:7,twice=term/46:5,late=control:9")?.faults;
         assert_eq!(faults.iter().map(|f| (f.act, f.every)).collect::<Vec<_>>(), [(Act::Drop, 7), (Act::Twice, 5), (Act::Late, 9)]);
+        // Frames made unreadable (docs/wire.md, "What can't be read"): a kind the receiver doesn't
+        // know, one past what its sender's enum has, or garbled.
+        let faults = parse("unknown=control/10:3,garble=term:4")?.faults;
+        assert_eq!(faults.iter().map(|f| (f.act, f.variant, f.every)).collect::<Vec<_>>(), [(Act::Unknown(0), Some(10), 3), (Act::Garble, None, 4)]);
+        assert_eq!(faults.first().map(|f| f.past(52).act), Some(Act::Unknown(52)));
+        assert_eq!(faults.get(1).map(|f| f.past(52).act), Some(Act::Garble));
         assert!(parse("twice=term:0").is_err() && parse("late=nowhere:2").is_err());
         assert_eq!(parse("shed=term:3,seed=42")?.seed, 42);
         assert!(parse("seed=x").is_err());

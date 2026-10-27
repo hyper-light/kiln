@@ -247,18 +247,27 @@ Each refusal noted:
   the target, the code as the result, and what and why as the detail, 512 bytes at most. The
   first for a sender, wire and code in a minute is written at once, and the rest as one row a
   minute saying how many;
-- is told to its sender, 16 a second each at most: the rest are counted and folded into the next.
+- is told to its sender where its wire tells it (`Unread`, below), 16 a second each at most: the
+  rest are counted and folded into the next. Only those count toward it, so a `folded` is how
+  many went untold: one answered another way (a NACK), or a runner's word of a frame of the
+  server's, is never among them.
 
-What each wire's sender is told today. No wire notes its refusals here yet: the later steps of
-the typed-messages plan move each one onto `Refusals::note` and fill in its row. "Nothing yet":
-what it can't read is let go as before.
+An `unknown` one is a newer build's kind, and a skew between builds can last days on frames sent
+many a second (a raft's heartbeats, say). Each kind (its `what`) from a sender on a wire is audited
+and told of once an hour. The rest are counted and kept for its page, and folded into the next
+`Unread` its sender gets, but write no row of their own. A runner tells the server likewise, and
+tells what it folded within a minute though no other word comes. The server counts a runner's
+word as one refusal and the ones it folds in.
+
+What each wire's sender is told. The later steps of the typed-messages plan move the rest onto
+`Refusals::note` and fill in their rows. "Nothing yet": what it can't read is let go as before.
 
 | Wire | What it carries | Its sender is told |
 |---|---|---|
-| `runner` | A runner's frames, as the server reads them. | Nothing yet. |
-| `server` | The server's frames, as a runner reads them. | Nothing yet. |
-| `runner_item` | The items of a runner's channel streams, as the server reads them. | A NACK, `malformed`. |
-| `server_item` | The items of the server's channel streams, as a runner reads them. | A NACK, `malformed`. |
+| `runner` | A runner's frames, as the server reads them. | `ServerMsg::Unread`, if it says `CAP_UNREAD`. One on its control lane before its Hello is `malformed`: out of order. (One on another lane, which may outrun its Hello, is let go.) |
+| `server` | The server's frames, as a runner reads them. | The runner says so (`AgentMsg::Unread`, to a server that says `CAP_UNREAD`), and the server notes it against the runner. |
+| `runner_item` | The items of a runner's channel streams, as the server reads them. | A NACK: `unsupported` for a variant the server doesn't know, `malformed` for the rest. |
+| `server_item` | The items of the server's channel streams, as a runner reads them. | A NACK, as for `runner_item`, and `AgentMsg::Unread` to a server that says `CAP_UNREAD`. |
 | `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | Nothing yet: its item is answered as taken. |
 | `server_payload` | The JSON the server's frame carries (a session's commands), as a runner reads it. | Nothing yet. |
 | `relay` | What runners send the server's relay for one another. | Nothing yet. |
@@ -277,6 +286,11 @@ what it can't read is let go as before.
 | `tunnel_down` | A tunnel's socket: what a page couldn't read of what came down. | Nothing yet. |
 | `mcp_http` | kiln's MCP endpoint, over HTTP. | Nothing yet. |
 | `mcp_reach` | kiln's MCP calls a runner makes through reach. | Nothing yet. |
+
+A test build makes frames unreadable as it loses them (`crate::runner::chaos`). `unknown=` makes a
+frame's variant one past what its sender's enum has. `garble=` cuts a frame short, adds bytes after
+it, or flips a byte past its variant (which may leave it readable). The channel makes up for a frame
+that couldn't be read as for one lost below it (`tests/unread_frames.rs`).
 
 ## Revisions
 
@@ -381,8 +395,11 @@ takes a new bit, never one that means something already, even in the other direc
 | 36 | `CAP_WORK` | `AgentMsg::Caps`, `ServerMsg::Caps` | warm workspaces for placement: the runner says what it holds warm, the server takes it (`WorkState`; ci.md W24-R18) |
 | 37 | `CAP_AGENT_LIMIT` | `AgentMsg::Caps`, `ServerMsg::Caps` | the most agent sessions a machine has at work at once, set from the server: the runner takes it and says what it holds, the server takes that (`AgentLimit`; agents.md, "How many agents a machine runs") |
 | 38 | `CAP_IDENTITY` | `AgentMsg::Caps`, `ServerMsg::Caps` | identities: the runner asks for certificates for keys it makes and keeps, the server issues them (`Identity`; ci.md W27-R01) |
+| 39 | `CAP_HEADROOM` | `AgentMsg::Caps`, `ServerMsg::Caps` | headroom: the runner keeps its machine's from settings the server sends and says how it does, the server takes that (`Headroom`, `HeadroomStatus`; docs/headroom.md) |
+| 40 | `CAP_CHANGES_PATCH` | `ServerMsg::Caps` | the server takes a session's changeset as what changed in it (`Update::ChangesPatch`), so a runner sends the files an agent touched, not the whole changeset |
+| 41 | `CAP_UNREAD` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side takes word that a frame of its couldn't be read (`Unread`, "What can't be read") |
 
-Bits from 38 are free. Take the next one, and add its row here in the same change.
+Bits from 42 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 
@@ -486,6 +503,7 @@ Four edges are left, and the lab steers clear of each:
 | `AgentLimit` | state | The most agent sessions the machine has at work at once, and where that comes from: set from the server, its config, or kiln's default (agents.md, "How many agents a machine runs"). Each supersedes the last. | New: as it's welcomed and whenever it changes, to a server announcing `CAP_AGENT_LIMIT`. |
 | `Identity` | ask | A CSR for a key the runner process made and keeps: for itself, an agent session it holds at an epoch, or a leg it runs (ci.md W27-R01). The server answers with `Identity`. | New: on each connection for the process's own, to a server announcing `CAP_IDENTITY`. |
 | `Observe` | carried (observe's group) | The runner's replica of observe's group (docs/observe.md §5): hyper-raft's messages, which it acknowledges and resends, and the writes it takes, offered to the leader until they commit. | Only from a runner announcing `CAP_OBSERVE`, on lane 5. |
+| `Unread` | ack | A frame of the server's the runner couldn't read: on which wire, what it was, why, how many more went untold before it, and the agent session it was about, when that much of it could be read ("What can't be read"). The server notes it against the runner, and on that session's page too. | New: to a server announcing `CAP_UNREAD`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -553,6 +571,7 @@ Four edges are left, and the lab steers clear of each:
 | `AgentLimit` | state | What a person set from the server for the most agent sessions the machine has at work at once, over its config's; none set, its config's (or kiln's default) holds (agents.md, "How many agents a machine runs"). | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent as the runner says `CAP_AGENT_LIMIT` and whenever it changes; the runner keeps it for its restarts. |
 | `Identity` | answer | The certificate kiln's CA issued for an `Identity` the runner asked for, or why there's none (ci.md W27-R01). | New: to runners that say `CAP_IDENTITY`. |
 | `Observe` | carried (observe's group) | To the runner's replica: hyper-raft's messages, and the leader's word on the writes it took. | Only to a runner announcing `CAP_OBSERVE`, on lane 5. |
+| `Unread` | ack | A frame of the runner's the server couldn't read: on which wire, what it was, why, and how many more went untold before it ("What can't be read"). | New: to runners announcing `CAP_UNREAD`. |
 
 ## Commands to a session: `Command`
 
