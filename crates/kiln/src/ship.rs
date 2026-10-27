@@ -71,6 +71,9 @@ struct LegRec {
     /// The job's id (`jobs.id`), the one its log streams under.
     job: String,
     run_id: String,
+    /// When its job started and finished (unix seconds), as far as it has.
+    started: Option<i64>,
+    finished: Option<i64>,
     name: String,
     status: String,
     conclusion: Option<String>,
@@ -715,12 +718,12 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
         .collect::<Result<_, _>>()?;
 
     let mut st = c.prepare(
-        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error
+        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at
          FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND j.job_id IS NOT NULL AND j.run_attempt = r.attempt ORDER BY j.rowid",
     )?;
     let legs: Vec<(String, LegRec)> = st
         .query_map(params![repo_id, sha], |r| {
-            Ok((r.get::<_, String>(0)?, LegRec { job: r.get(0)?, run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, attempts: Vec::new() }))
+            Ok((r.get::<_, String>(0)?, LegRec { job: r.get(0)?, run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, started: r.get(7)?, finished: r.get(8)?, attempts: Vec::new() }))
         })?
         .collect::<Result<_, _>>()?;
     let mut at = c.prepare("SELECT status, conclusion, failure_class FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
@@ -795,7 +798,7 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
         };
         // A leg names its job and run once it has run (Output streams that job's log).
         let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked");
-        let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()) };
+        let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()), start: leg.started, end: leg.finished };
         match checks.iter_mut().find(|c| c.pipeline == pipeline) {
             Some(c) => c.legs.push(l),
             None => checks.push(Check { pipeline: pipeline.to_string(), legs: vec![l] }),
@@ -986,7 +989,7 @@ fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
         }),
         (None, _) => Value::Null,
     };
-    json!({
+    let row = json!({
         "repo": rec.repo, "sha": rec.sha, "short": short(&rec.sha),
         "message": message,
         "author": first.map(|r| r.actor.clone()).or_else(|| ch.map(|c| c.author.clone())).unwrap_or_default(),
@@ -999,7 +1002,22 @@ fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
         "kind": kind_of(rec), "host": ch.map(|c| c.host.clone()), "change": change,
         "fold_under": ch.map(ChangeRec::tip).filter(|tip| *tip != rec.sha),
         "actions": actions(rec, j, yours),
-    })
+    });
+    with_version(row)
+}
+
+/// The row with `v`: a hash of the JSON it shows (FNV-1a, 64 bits, in hex), the same from memory
+/// and from the store, so the page can keep a row that hasn't changed as it is (W26-R06).
+fn with_version(mut row: Value) -> Value {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in row.to_string().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    if let Some(o) = row.as_object_mut() {
+        o.insert("v".into(), json!(format!("{h:016x}")));
+    }
+    row
 }
 
 /// A commit rendered once for everyone and once for those whose turn it is (when anyone's).
@@ -1025,6 +1043,12 @@ fn leg_json(l: &journey::Leg) -> Value {
         }
         if let Some(run) = &l.run {
             o.insert("run".into(), json!(run));
+        }
+        if let Some(start) = l.start {
+            o.insert("start".into(), json!(start));
+        }
+        if let Some(end) = l.end {
+            o.insert("end".into(), json!(end));
         }
     }
     v
@@ -1535,7 +1559,10 @@ mod tests {
     /// for it; the newest a person's, failing its checks.
     fn fixture() -> String {
         let leg = |id: &str, run: &str, name: &str, status: &str, conclusion: &str| {
-            format!("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES ('{id}', '{run}', '{name}', '{name}', '{status}', '{conclusion}', '[]', '[]', '{{}}', '{name}', 1);")
+            // A leg that ran has its start, and its finish once completed (W26-R14's lanes).
+            let started = if status == "queued" { "NULL" } else { "1700000000" };
+            let finished = if status == "completed" { "1700000300" } else { "NULL" };
+            format!("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt, started_at, finished_at) VALUES ('{id}', '{run}', '{name}', '{name}', '{status}', '{conclusion}', '[]', '[]', '{{}}', '{name}', 1, {started}, {finished});")
         };
         let run = |id: &str, n: i64, pipeline: &str, sha: &str, author: &str, msg: &str| {
             format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES ('{id}', 'kiln', {n}, '{pipeline}', 'push', 'main', '{sha}', '{msg}', '{author}', 'completed', {NOW_S}, 1);")
@@ -1612,6 +1639,9 @@ mod tests {
             let leg = field(&one, &["checks"]).and_then(Value::as_array).and_then(|c| c.first()).and_then(|c| c.get("legs")).and_then(Value::as_array).and_then(|l| l.first()).cloned().unwrap_or_default();
             assert!(leg.get("job").and_then(Value::as_str).is_some_and(|j| !j.is_empty()), "a leg that ran names its job: {leg}");
             assert!(leg.get("run").and_then(Value::as_str).is_some_and(|r| !r.is_empty()), "a leg that ran names its run: {leg}");
+            // It says when it started (W26-R14), and the row carries its version `v` (W26-R06).
+            assert!(leg.get("start").and_then(Value::as_i64).is_some(), "a leg that ran says when it started: {leg}");
+            assert!(one.get("v").and_then(Value::as_str).is_some_and(|v| v.len() == 16), "a row carries its version: {one}");
 
             let shipped = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(field(&shipped, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));

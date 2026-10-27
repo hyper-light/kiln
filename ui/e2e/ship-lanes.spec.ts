@@ -42,15 +42,14 @@ test("a diff's Review lane group shows each mark in order, its time and unsigned
   const group = row.locator('.ship-lanegroup[data-group="review"]');
   await expect(group.locator(".ship-lanegroup__head")).toContainText("Review");
   const lanes = group.locator(".ship-lane");
-  await expect(lanes).toHaveCount(6);
-  const names = ["v5 · pushed", "kim · comment", "kim · resolved", "v6 · suggestion applied", "v7 · conflict resolved", "approval · kim (v7)"];
+  await expect(lanes).toHaveCount(9);
+  const names = ["v1 · pushed", "v2 · pushed", "v3 · pushed", "v4 · pushed", "v5 · pushed", "v6 · pushed", "v7 · pushed", "ada · comment", "approval · ada (v7)"];
   for (const [i, name] of names.entries()) {
     const lane = lanes.nth(i);
     await expect(lane).toContainText(name);
     await expect(lane).toContainText("unsigned");
     await expect(lane.locator(".ship-lane__when")).toHaveText(/\d{2}:\d{2}/);
   }
-  await expect(lanes.nth(1)).toContainText("blocking · matrix.rs:42");
 });
 
 test("a commit with no change's Review lane group has the one mark, its push", async ({ page }) => {

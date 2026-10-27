@@ -36,44 +36,6 @@ const pips = (review: string, land: string, checks: string, build = "none", stag
 /** The fields every row gives; the rest default as a plain commit's. */
 type Row = Pick<ShipCommit, "sha" | "short" | "message" | "author" | "at" | "stand" | "line" | "pips" | "cursor"> & Partial<ShipCommit>;
 
-const unsigned = (id: string, kind: ShipMark["kind"], at: number, end: number | null, by: string, revision: number | null, state: string, extra?: Partial<ShipMark>): ShipMark => ({
-  id,
-  kind,
-  at,
-  end,
-  by,
-  signer: null,
-  revision,
-  state,
-  ...extra,
-});
-
-/** The Review lane group's marks as the server reads them (W26-R14), oldest first, every seal
- * unsigned until W27-R03: D41 as the step's example — v5 pushed, kim's blocking comment, v6 by
- * Apply, v7 the conflict's resolution, kim's approval. */
-const MARKS: Record<string, (t: number) => ShipMark[]> = {
-  D41: (t) => [
-    unsigned("d41:v5", "push", t - 3600, t - 3600, "user:ada", 5, "passed"),
-    unsigned("d41:th9:open", "comment", t - 3000, t - 1900, "user:kim", null, "passed", { thread: "th9", note: "blocking · matrix.rs:42" }),
-    unsigned("d41:th9:resolved", "comment", t - 1900, t - 1900, "user:kim", null, "passed", { thread: "th9", note: "resolved" }),
-    unsigned("d41:v6", "fix", t - 1740, t - 1740, "user:ada", 6, "passed", { thread: "th9", note: "suggestion applied" }),
-    unsigned("d41:v7", "resolution", t - 950, t - 950, "user:ada", 7, "passed", { note: "conflict resolved" }),
-    unsigned("d41:review:0", "approval", t - 600, t - 600, "user:kim", 7, "approved"),
-  ],
-  "!6": (t) => [
-    unsigned("pull:gitlab:6:v1", "push", t - 9000, t - 9000, "gitlab:lee", 1, "passed"),
-    unsigned("pull:gitlab:6:v2", "push", t - 8200, t - 8200, "gitlab:lee", 2, "passed"),
-    unsigned("pull:gitlab:6:review:0", "approval", t - 7900, t - 7900, "gitlab:mei", 2, "approved"),
-  ],
-  CR12: (t) => [unsigned("cr12:v1", "push", t - 1200, t - 1200, "user:lee", 1, "passed"), unsigned("ask:cr12:user:kim", "approval", t - 1100, null, "user:kim", null, "requested", { note: "asked" })],
-};
-
-/** A row's Review lane marks: its change's, or a commit with no change's one — its push. */
-const marksOf = (row: ShipCommit): ShipMark[] => {
-  const marks = row.change?.name ? MARKS[row.change.name]?.(row.at) : null;
-  return marks ?? [unsigned(`push:${row.sha}`, "push", row.at, row.at, row.author, null, "passed")];
-};
-
 function commits(): ShipCommit[] {
   const t = now();
   const change = (name: string, kind: ShipChange["kind"], host: string, title: string, state: string, turn: string[], open = { question: 0, nit: 0, issue: 0, blocking: 0 }): ShipChange => ({
@@ -109,22 +71,22 @@ function commits(): ShipCommit[] {
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
       ],
     }),
-    // A landed change: a host's pull request merged, its review carried on the merge commit's tip
-    // (W26-R14's e2e). A host keeps its review on its host — land passed, the review approved.
+    // A landed change: its tip commit carries its review, approved and landed (W26-R14's e2e), older
+    // than D41 so the newest is still D41, on a sha of its own.
     row({
-      sha: sha("5"),
-      short: "5555555",
+      sha: sha("6"),
+      short: "6666666",
       message: "ci: a landed change",
-      author: "gitlab:lee",
-      at: t - 3600,
+      author: "user:ada",
+      at: t - 5400,
       stand: "shipped",
       line: "Landed · In production",
       cursor: 12,
       pips: pips("approved", "passed", "passed", "passed", "passed", "healthy"),
-      kind: "request",
-      host: "gitlab",
+      kind: "diff",
+      host: "kiln",
       environments: [{ environment: "production", production: true }],
-      change: { ...change("!6", "request", "gitlab", "ci: a landed change", "landed", [], { question: 0, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
+      change: { ...change("D44", "diff", "kiln", "ci: a landed change", "landed", [], { question: 0, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
       runs: [{ id: "run-44", pipeline: "ci" }],
     }),
     // D41's first revision, which its second replaced: quiet, folded under it.
@@ -269,6 +231,45 @@ const arrival = (n: number): ShipCommit => ({
   actions: [],
 });
 
+/**
+ * A fixed row's review marks, oldest first (W26-R14): a commit with no change has one, its push; a
+ * change has a push per revision, a comment per open thread, and its approval, asked or given.
+ */
+function marksOf(c: ShipCommit): ShipMark[] {
+  const base = c.at - 3600;
+  const push = (n: number | null, at: number): ShipMark => ({ id: `${c.short}-push-${n ?? 0}`, kind: "push", at, end: at, by: c.author, signer: null, revision: n, state: "passed" });
+  const ch = c.change;
+  if (!ch) return [push(null, c.at)];
+  const marks: ShipMark[] = [];
+  for (let n = 1; n <= ch.revision; n++) marks.push(push(n, base + n * 600));
+  const after = base + ch.revision * 600;
+  const open = ch.open ? ch.open.question + ch.open.nit + ch.open.issue + ch.open.blocking : 0;
+  for (let i = 0; i < open; i++)
+    marks.push({
+      id: `${ch.name}-comment-${i}`,
+      kind: "comment",
+      at: after + 60 * (i + 1),
+      end: null,
+      by: ch.turn[0] ?? "user:kim",
+      signer: null,
+      revision: ch.revision,
+      state: "requested",
+      thread: `${ch.name}-t${i}`,
+    });
+  const approved = ch.state === "approved" || ch.state === "landed";
+  marks.push({
+    id: `${ch.name}-approval`,
+    kind: "approval",
+    at: after + 300,
+    end: approved ? after + 900 : null,
+    by: ch.turn[0] ?? "user:lee",
+    signer: null,
+    revision: ch.revision,
+    state: approved ? "approved" : "requested",
+  });
+  return marks;
+}
+
 /** Every row: those a test added, the trunk's commits (newest first), then the fixed ones. */
 const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...commits()];
 
@@ -297,7 +298,9 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       ? {
           ...row,
           review: marksOf(row),
-          checks: live ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run }] }] : [],
+          checks: live
+            ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run, start: now() - 120 }] }]
+            : [],
         }
       : null;
     const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;

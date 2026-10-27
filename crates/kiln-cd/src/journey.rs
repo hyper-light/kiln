@@ -57,6 +57,9 @@ pub struct Leg {
     /// The kiln job that ran it (its latest attempt's) and that job's run, once it has run.
     pub job: Option<String>,
     pub run: Option<String>,
+    /// When it started and finished (unix seconds), as far as it has (the lanes draw them, W26-R14).
+    pub start: Option<i64>,
+    pub end: Option<i64>,
 }
 
 /// One pipeline's run on the commit.
@@ -627,7 +630,7 @@ mod tests {
     const MIN: i64 = 60_000;
 
     fn leg(name: &str, attempts: &[Attempt], note: &str) -> Leg {
-        Leg { name: name.to_string(), attempts: attempts.to_vec(), note: note.to_string(), job: None, run: None }
+        Leg { name: name.to_string(), attempts: attempts.to_vec(), note: note.to_string(), job: None, run: None, start: None, end: None }
     }
 
     fn built() -> Build {

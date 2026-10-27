@@ -177,6 +177,29 @@ const diffs: MockDiff[] = [
     branch: "fair",
     versions: 1,
   },
+  // A landed change for Ship's landed row (W26-R14's e2e): its review ended approved.
+  {
+    id: "d44",
+    name: "D44",
+    number: 44,
+    kind: "diff",
+    repo: REPO,
+    change_id: "I44",
+    title: "ci: a landed change",
+    summary: "The queue's weights, landed: two revisions, kim's approval.",
+    author: "user:ada",
+    author_kind: "user",
+    author_for: null,
+    state: "landed",
+    trunk: "main",
+    stack: null,
+    parent: null,
+    topic: null,
+    created_at: now() - 172800,
+    updated_at: now() - 5400,
+    branch: null,
+    versions: 2,
+  },
 ];
 
 const sha = (s: string) => {

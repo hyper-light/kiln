@@ -487,3 +487,11 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* A row's age, one width as it ticks ("9m ago" to "10m ago"), so the line beside it never moves. */
+.ship-ago {
+  display: inline-block;
+  min-width: 8ch;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}

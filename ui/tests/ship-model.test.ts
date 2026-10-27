@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { fold, order, pickCard, standWord, strip } from "../src/views/ship/model.ts";
+import { fold, order, pickCard, shipGroups, standWord, strip } from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -69,4 +69,34 @@ test("the job card picked first: the running one, else the one that failed, else
   assert.equal(pickCard(cards("passed", "passed", "passed", "healthy", "passed", "replanted")), 5);
   assert.equal(pickCard(cards("passed", "passed", "passed", "passed", "none", "none")), 3);
   assert.equal(pickCard(cards("queued", "none", "none", "none", "none", "none")), 0);
+});
+
+test("w26_r14: Ship's stages as the Lanes' groups, a lane for each Checks leg that ran and each deploy", () => {
+  const detail = {
+    ...c("a1", "in_staging"),
+    pips: [
+      { stage: "checks", state: "passed" },
+      { stage: "staging", state: "soaking" },
+    ],
+    checks: [
+      {
+        pipeline: "ci",
+        legs: [
+          { name: "lint", state: "passed", attempts: 1, note: "", job: "j1", run: "r1", start: 100, end: 160 },
+          { name: "test", state: "queued", attempts: 1, note: "" },
+        ],
+      },
+    ],
+    deployments: [{ environment: "staging", production: false, state: "success", description: "synced", at: 200 }],
+  };
+  const groups = shipGroups(detail);
+  assert.deepEqual(
+    groups.map((g) => g.group),
+    ["land", "checks", "build", "staging", "production", "replant"],
+  );
+  assert.deepEqual(groups[1]?.lanes, [{ id: "j1", name: "lint", state: "passed", start: 100, end: 160 }]);
+  assert.equal(groups[1]?.state, "passed");
+  assert.deepEqual(groups[3]?.lanes, [{ id: "staging@200", name: "staging", state: "passed", start: 200, end: 200, note: "synced" }]);
+  assert.equal(groups[3]?.state, "soaking");
+  assert.deepEqual(groups[4]?.lanes, []);
 });

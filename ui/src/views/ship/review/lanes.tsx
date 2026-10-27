@@ -8,6 +8,7 @@
  * the resource's poll; the horizon holds the marks it was given.
  */
 import { shipApi, type ShipCommit, type ShipMark } from "@/api/ship";
+import { shipGroups } from "../model";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import type { GlyphState } from "@/components/ui/status-glyph-spec";
 import { clockTime } from "@/lib/format";
@@ -75,23 +76,6 @@ export function reviewGroup(detail: { change?: { state?: string | null } | null;
     note: "",
     lanes: marks.map((m) => ({ id: m.id, kind: m.kind, name: nameOf(m), state: m.state, start: m.at, end: m.end, by: m.by, note: m.note, seal: m.signer })),
   };
-}
-
-/* Ship's own groups are the Ship agent's to give (shipGroups on its line); until they land, a
- * fixture in the same shape proves the drawer draws whatever it's given. */
-function shipGroupsFixture(commit: ShipCommit): ShipLaneGroup[] {
-  const t = Math.floor(Date.now() / 1000);
-  const seen = commit.environments?.map((e) => e.environment) ?? [];
-  if (seen.length === 0) return [];
-  return [
-    {
-      group: "production",
-      label: "Production",
-      state: "healthy",
-      note: "",
-      lanes: seen.map((e) => ({ id: `env:${e}`, name: e, state: "healthy", start: t - 3600, end: null })),
-    },
-  ];
 }
 
 const MIN_HORIZON = 30 * 60;
@@ -167,7 +151,7 @@ export function ShipLanes({ commit }: { commit: ShipCommit }) {
   const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
   const [walk, setWalk] = React.useState(0);
   const [fit, setFit] = React.useState(true);
-  const groups = React.useMemo(() => [reviewGroup(detail.data), ...shipGroupsFixture(commit)].filter((g): g is ShipLaneGroup => g != null), [detail.data, commit]);
+  const groups = React.useMemo(() => [reviewGroup(detail.data), ...shipGroups(detail.data)].filter((g): g is ShipLaneGroup => g != null && g.lanes.length > 0), [detail.data]);
   const base = horizonOf(groups, Math.floor(Date.now() / 1000));
   // A step walks a third of the horizon; Now is always the freshest end.
   const step = Math.max(1, Math.round((base[1] - base[0]) / 3));
