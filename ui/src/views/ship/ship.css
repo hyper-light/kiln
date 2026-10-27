@@ -470,3 +470,20 @@
   place-items: center;
   border: 1px dashed rgb(255 255 255 / 0.1);
 }
+
+/* Output's bar: the job's name, and at its right the copy icon (its step 4). */
+.ship-output__bar {
+  display: flex;
+  height: 2rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0 0.25rem 0 0.5rem;
+  color: #a3a5ad;
+  font-size: 0.8125rem;
+}
+.ship-output__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

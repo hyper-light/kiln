@@ -4,9 +4,13 @@
  * colours, streamed live (backlog, then live frames). A fixed height that scrolls inside itself
  * and follows the end unless you've scrolled up, the lanes card's width (ship.css).
  */
+import * as React from "react";
+import { Check, Copy } from "lucide-react";
 import { api } from "@/api/client";
 import { shipApi, type ShipCommit } from "@/api/ship";
 import { STAGE_WORD, type Stage } from "@/components/ui/status-glyph-spec";
+import { toast } from "@/components/ui/toast";
+import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import LogViewer from "@/views/run-detail/log-viewer";
 import { stepToShow } from "@/views/updates/logs";
@@ -32,8 +36,26 @@ export function ShipOutput({ commit, stage }: { commit: ShipCommit; stage: strin
 function JobOutput({ job }: { job: string }) {
   const j = useSuspenseResource(`ship/job/${job}`, (s) => api.job(job, s), { on: ["job"] });
   const step = stepToShow(j.data.steps) ?? 0;
+  const [copied, setCopied] = React.useState(false);
+  // Copy (step 4): the step's whole output as the REST log has it, through the clipboard as
+  // kiln's CopyButton writes it; a refusal says so.
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(await api.jobLogs(job, step));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      toast({ title: "Couldn't copy the output", description: errorMessage(e), tone: "failed" });
+    }
+  };
   return (
-    <div className="ship-output">
+    <div className="ship-output" data-job={job} data-step={step}>
+      <div className="ship-output__bar">
+        <span className="ship-output__name">{j.data.display || j.data.key}</span>
+        <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label={copied ? "Copied the output" : "Copy the output"} onClick={() => void copy()}>
+          {copied ? <Check size={14} /> : <Copy size={14} />}
+        </button>
+      </div>
       <LogViewer key={`${job}/${step}`} jobId={job} step={step} live={j.data.status === "running"} rows={OUTPUT_ROWS} />
     </div>
   );

@@ -61,3 +61,52 @@ test("scrolled up, the output stays where you are", async ({ page, isMobile }) =
   await page.waitForTimeout(2500);
   expect(await viewport.evaluate((v) => v.scrollTop)).toBe(0);
 });
+
+/** Opens the first row at its Checks card and waits for the log; its job and step. */
+async function openOutput(page: import("@playwright/test").Page) {
+  await page.goto("/ship");
+  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  await row.getByRole("button", { name: /^Open / }).click();
+  await row.getByRole("list", { name: "Stages" }).getByRole("button").nth(1).click();
+  const out = row.locator(".ship-output");
+  await expect(out.locator(".xterm")).toBeVisible({ timeout: 15_000 });
+  return { out, url: `/api/jobs/${encodeURIComponent((await out.getAttribute("data-job")) ?? "")}/logs?step=${(await out.getAttribute("data-step")) ?? "0"}` };
+}
+
+test("copy puts the job step's whole output on the clipboard", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the desktop projects run it");
+  await page.addInitScript(() => {
+    const w = window as unknown as { __copied?: string };
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (t: string) => void (w.__copied = t) } });
+  });
+  const { out } = await openOutput(page);
+  // A running job moves from step to step, so each copy is checked against the very log it fetched
+  // (GET /api/jobs/:id/logs?step=N for the job and step the card showed), until one carries text.
+  let copied = "";
+  let url = "";
+  for (let i = 0; i < 15 && !copied; i++) {
+    const got = page.waitForResponse((r) => /\/api\/jobs\/[^/]+\/logs\?step=\d+$/.test(r.url()) && r.request().method() === "GET");
+    await out.getByRole("button", { name: /^Cop(y|ied) the output$/ }).click();
+    const res = await got;
+    const fetched = await res.text();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __copied?: string }).__copied ?? null)).toBe(fetched);
+    copied = fetched;
+    url = new URL(res.url()).pathname + new URL(res.url()).search;
+    if (!copied) await page.waitForTimeout(1000);
+  }
+  expect(copied.length).toBeGreaterThan(0);
+  expect(url).toMatch(new RegExp(`^/api/jobs/${encodeURIComponent((await out.getAttribute("data-job")) ?? "")}/logs\\?step=\\d+$`));
+  // The log only grows: asked again, it starts with what was copied.
+  expect((await (await page.request.get(url)).text()).startsWith(copied)).toBe(true);
+  await expect(out.getByRole("button", { name: "Copied the output" })).toBeVisible();
+});
+
+test("a refused copy says so", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the desktop projects run it");
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => Promise.reject(new DOMException("Write permission denied.", "NotAllowedError")) } });
+  });
+  const { out } = await openOutput(page);
+  await out.getByRole("button", { name: "Copy the output" }).click();
+  await expect(page.getByText("Couldn't copy the output")).toBeVisible();
+});
