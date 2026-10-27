@@ -130,6 +130,24 @@ struct ThreadRec {
     said: String,
 }
 
+/// A mark of the Review lane group (W26-R14), as agreed with the Ship agent (2026-10-26, NOTES.md):
+/// a push, replay, comment, fix, resolution or approval, each with its time (`end` null while under
+/// way, = `at` for a point), who did it (the principal as kiln writes it), its revision and its
+/// signer — null until W27-R03 signs kiln's records, so the seal says unsigned, never a false one.
+/// `state` is a GlyphState name (ui status-glyph-spec.ts).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct MarkRec {
+    id: String,
+    kind: &'static str,
+    at: i64,
+    end: Option<i64>,
+    by: String,
+    revision: Option<u32>,
+    state: &'static str,
+    thread: Option<String>,
+    note: Option<String>,
+}
+
 /// The change a commit is of: a kiln diff or change request (W26-R01), and the records its review
 /// stands on (W26-R02, R05). Times are unix seconds.
 #[derive(Debug, Clone, Default)]
@@ -152,8 +170,8 @@ struct ChangeRec {
     message: String,
     at: i64,
     reviewers: Vec<(String, i64)>,
-    /// (reviewer, action, at, body)
-    reviews: Vec<(String, String, i64, String)>,
+    /// (reviewer, action, at, body, version reviewed)
+    reviews: Vec<(String, String, i64, String, Option<u32>)>,
     /// (version, rebase only, at)
     pushes: Vec<(u32, bool, i64)>,
     threads: Vec<ThreadRec>,
@@ -163,6 +181,8 @@ struct ChangeRec {
     /// The conflicts its latest revision's replay onto where it lands left, each holding its gate
     /// until Commit resolution makes a revision of them (W26-R12).
     conflicts: Vec<kiln_ci::review::Conflict>,
+    /// The Review lane group's marks, oldest first (W26-R14).
+    marks: Vec<MarkRec>,
 }
 
 impl ChangeRec {
@@ -197,6 +217,64 @@ fn shown(p: &str) -> &str {
     p.split(" for ").next().unwrap_or(p).rsplit(':').next().unwrap_or(p)
 }
 
+/// Marks of one second read in the order a revision's story takes (W26-R14): the push, the talk,
+/// the fix, the replay, the resolution, the verdict.
+fn mark_rank(kind: &str) -> u8 {
+    match kind {
+        "push" => 0,
+        "comment" => 1,
+        "fix" => 2,
+        "replay" => 3,
+        "resolution" => 4,
+        _ => 5,
+    }
+}
+
+/// Approval marks (W26-R14): each reviewer asked who has answered nothing yet (state `requested`,
+/// no end), and each verdict given (`accept` approves, `request_changes` asks changes, `resign`
+/// steps back). A review posted as comments alone is no verdict; its comments mark themselves.
+fn approval_marks(marks: &mut Vec<MarkRec>, key: &str, reviewers: &[(String, i64)], reviews: &[(String, String, i64, String, Option<u32>)]) {
+    for (reviewer, at) in reviewers {
+        if !reviews.iter().any(|(w, a, _, _, _)| w == reviewer && a != "comment") {
+            marks.push(MarkRec { id: format!("ask:{key}:{reviewer}"), kind: "approval", at: *at, end: None, by: reviewer.clone(), revision: None, state: "requested", thread: None, note: Some("asked".to_string()) });
+        }
+    }
+    for (i, (by, action, at, body, version)) in reviews.iter().enumerate() {
+        let (state, note) = match action.as_str() {
+            "accept" => ("approved", None),
+            "request_changes" => ("changes", None),
+            "resign" => ("superseded", Some("resigned".to_string())),
+            _ => continue,
+        };
+        let words = first_words(body);
+        marks.push(MarkRec {
+            id: format!("{key}:review:{i}"),
+            kind: "approval",
+            at: *at,
+            end: Some(*at),
+            by: by.clone(),
+            revision: *version,
+            state,
+            thread: None,
+            note: note.or_else(|| (!words.is_empty()).then_some(words)),
+        });
+    }
+}
+
+/// A mark as the detail serves it (W26-R14); `signer` is null until W27-R03 signs kiln's records.
+fn mark_json(m: &MarkRec) -> Value {
+    let mut v = json!({ "id": m.id, "kind": m.kind, "at": m.at, "end": m.end, "by": m.by, "signer": Value::Null, "revision": m.revision, "state": m.state });
+    if let Some(o) = v.as_object_mut() {
+        if let Some(t) = &m.thread {
+            o.insert("thread".into(), json!(t));
+        }
+        if let Some(n) = &m.note {
+            o.insert("note".into(), json!(n));
+        }
+    }
+    v
+}
+
 /// One commit's change, if it is a change's.
 fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Result<Option<ChangeRec>> {
     let found: Option<(String, Option<u32>, bool, String)> = c
@@ -223,26 +301,139 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
             ..ChangeRec::default()
         })
     })?;
-    let mut st = c.prepare("SELECT n, commit_sha, rebase_only, created_at, message FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
-    for row in st.query_map([&id], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)))? {
-        let (v, commit, rebase_only, at, message) = row?;
+    let mut marks: Vec<MarkRec> = Vec::new();
+    let mut st = c.prepare("SELECT n, commit_sha, rebase_only, created_at, message, pushed_by, why, thread FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+    for row in st.query_map([&id], |r| {
+        Ok((
+            r.get::<_, u32>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+        ))
+    })? {
+        let (v, commit, rebase_only, at, message, pushed_by, why, thread) = row?;
         if v == ch.n {
             (ch.message, ch.at) = (message, at);
         }
         ch.pushes.push((v, rebase_only, at));
         (ch.latest, ch.latest_sha) = (v, commit);
+        // A revision is the lane's push, the fix answering a thread (an agent's fix, a suggestion
+        // applied) or the resolution of a replay's conflicts, by which `why` it was made (W26-R14).
+        let kind = match why.as_deref() {
+            Some("conflict resolved") => "resolution",
+            Some(_) => "fix",
+            None if thread.is_some() => "fix",
+            None => "push",
+        };
+        marks.push(MarkRec {
+            id: format!("{id}:v{v}"),
+            kind,
+            at,
+            end: Some(at),
+            by: pushed_by,
+            revision: Some(v),
+            state: "passed",
+            thread,
+            note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
+        });
     }
     let mut st = c.prepare("SELECT reviewer, added_at FROM diff_reviewers WHERE diff_id = ?1 ORDER BY added_at, reviewer")?;
     ch.reviewers = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-    let mut st = c.prepare("SELECT reviewer, action, created_at, body FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
-    ch.reviews = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let mut st = c.prepare("SELECT reviewer, action, created_at, body, version FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
+    ch.reviews = st
+        .query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, Some(r.get::<_, u32>(4)?))))?
+        .collect::<Result<_, _>>()?;
+    approval_marks(&mut marks, &id, &ch.reviewers, &ch.reviews);
     let mut st = c.prepare(
         "SELECT t.kind, t.file, t.start_line, t.created_by, (SELECT c.body FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1 ORDER BY c.created_at, c.rowid LIMIT 1)
          FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1) ORDER BY t.created_at, t.id",
     )?;
     ch.threads = st.query_map([&id], |r| Ok(ThreadRec { kind: r.get(0)?, file: r.get(1)?, line: r.get(2)?, by: r.get(3)?, said: r.get::<_, Option<String>>(4)?.unwrap_or_default() }))?.collect::<Result<_, _>>()?;
-    let mut st = c.prepare("SELECT c.author, c.created_at FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 ORDER BY c.created_at, c.rowid")?;
-    ch.replies = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    // Each thread's published comments, oldest first (the first is its opening one).
+    let mut by_thread: HashMap<String, Vec<(String, String, i64)>> = HashMap::new();
+    let mut st = c.prepare("SELECT c.thread_id, c.id, c.author, c.created_at FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 ORDER BY c.created_at, c.rowid")?;
+    for row in st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))? {
+        let (tid, cid, author, at) = row?;
+        ch.replies.push((author.clone(), at));
+        by_thread.entry(tid).or_default().push((cid, author, at));
+    }
+    // Each published thread is a comment mark as it opens (a blocking one holds, any other waits),
+    // each published comment after its thread's first is its answer, each resolution its point.
+    let mut st = c.prepare(
+        "SELECT t.id, t.kind, t.file, t.start_line, t.state, t.created_by, t.created_at, t.resolved_by, t.resolved_at, t.resolution
+         FROM review_threads t WHERE t.diff_id = ?1 AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1) ORDER BY t.created_at, t.id",
+    )?;
+    for row in st.query_map([&id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+        ))
+    })? {
+        let (tid, kind, file, line, state, by, at, resolved_by, resolved_at, resolution) = row?;
+        let open = state != "resolved";
+        let place = kiln_ci::review::place(file.as_deref(), line.and_then(|l| u32::try_from(l).ok()));
+        marks.push(MarkRec {
+            id: format!("{tid}:open"),
+            kind: "comment",
+            at,
+            end: resolved_at,
+            by,
+            revision: None,
+            state: if !open { "passed" } else if kind == "blocking" { "blocked" } else { "needs" },
+            thread: Some(tid.clone()),
+            note: Some(if kind == "question" { place } else { format!("{kind} · {place}") }),
+        });
+        for (cid, author, at) in by_thread.get(&tid).into_iter().flatten().skip(1) {
+            marks.push(MarkRec { id: format!("comment:{cid}"), kind: "comment", at: *at, end: Some(*at), by: author.clone(), revision: None, state: "passed", thread: Some(tid.clone()), note: Some("answered".to_string()) });
+        }
+        if let (Some(by), Some(at)) = (resolved_by, resolved_at) {
+            marks.push(MarkRec {
+                id: format!("{tid}:resolved"),
+                kind: "comment",
+                at,
+                end: Some(at),
+                by,
+                revision: None,
+                state: "passed",
+                thread: Some(tid),
+                note: resolution.filter(|r| !r.is_empty()).or_else(|| Some("resolved".to_string())),
+            });
+        }
+    }
+    // Each replay of a revision onto where it lands: a conflicted one is under way until resolved.
+    let mut st = c.prepare("SELECT id, version, onto_name, state, created_by, created_at, resolved_at FROM review_replays WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
+    for row in st.query_map([&id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, Option<i64>>(6)?))
+    })? {
+        let (rid, version, onto, state, by, at, resolved_at) = row?;
+        let conflicted = state == "conflicted";
+        marks.push(MarkRec {
+            id: format!("replay:{rid}"),
+            kind: "replay",
+            at,
+            end: if conflicted { resolved_at } else { Some(at) },
+            by,
+            revision: Some(version),
+            state: if conflicted && resolved_at.is_none() { "conflict" } else { "passed" },
+            thread: None,
+            note: Some(format!("onto {onto}")),
+        });
+    }
+    // Stable: marks of one second keep the order they were written here.
+    marks.sort_by_key(|m| (m.at, mark_rank(m.kind)));
+    ch.marks = marks;
     let mut st = c.prepare(
         "SELECT k.file, k.line, k.take IS NOT NULL FROM review_conflicts k JOIN review_replays r ON r.id = k.replay_id
          WHERE r.id = (SELECT p.id FROM review_replays p WHERE p.diff_id = ?1 ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
@@ -269,7 +460,7 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         params![repo_id, host, number],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
     )?;
-    let reviews: Vec<(String, String, i64, String)> = serde_json::from_str::<Vec<Value>>(&reviews)
+    let reviews: Vec<(String, String, i64, String, Option<u32>)> = serde_json::from_str::<Vec<Value>>(&reviews)
         .unwrap_or_default()
         .iter()
         .map(|r| {
@@ -278,12 +469,12 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
                 "approve" => "accept".to_string(),
                 v => v.to_string(),
             };
-            (s("by"), action, r.get("at").and_then(Value::as_i64).unwrap_or(first_seen), String::new())
+            (s("by"), action, r.get("at").and_then(Value::as_i64).unwrap_or(first_seen), String::new(), None)
         })
         .collect();
     // Each reviewer's latest word decides, as hosts read them.
     let mut latest: HashMap<&str, &str> = HashMap::new();
-    for (by, action, _, _) in &reviews {
+    for (by, action, _, _, _) in &reviews {
         if action != "comment" {
             latest.insert(by.as_str(), action.as_str());
         }
@@ -302,6 +493,16 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
     let at = heads.iter().find(|(k, _, _)| *k == n).map_or(first_seen, |(_, _, t)| *t);
     let count = usize::try_from(threads).unwrap_or(0);
     let threads: Vec<ThreadRec> = (0..count).map(|i| ThreadRec { kind: "question".into(), by: if i + 1 == count { said_by.clone() } else { String::new() }, said: if i + 1 == count { said.clone() } else { String::new() }, ..ThreadRec::default() }).collect();
+    // A host's pull request's lane marks: a push per head, the asks and the verdicts (the mirror
+    // keeps no per-comment times, so no comment marks).
+    let mut marks: Vec<MarkRec> = Vec::new();
+    let key = format!("pull:{host}:{number}");
+    for (k, _, t) in &heads {
+        marks.push(MarkRec { id: format!("{key}:v{k}"), kind: "push", at: *t, end: Some(*t), by: author.clone(), revision: Some(*k), state: "passed", thread: None, note: None });
+    }
+    let asked: Vec<(String, i64)> = serde_json::from_str::<Vec<String>>(&requested).unwrap_or_default().into_iter().map(|r| (r, first_seen)).collect();
+    approval_marks(&mut marks, &key, &asked, &reviews);
+    marks.sort_by_key(|m| (m.at, mark_rank(m.kind)));
     Ok(ChangeRec {
         name: format!("{}{number}", if host == "gitlab" { "!" } else { "#" }),
         kind: "request",
@@ -317,7 +518,7 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         latest: latest_n,
         latest_sha,
         at,
-        reviewers: serde_json::from_str::<Vec<String>>(&requested).unwrap_or_default().into_iter().map(|r| (r, first_seen)).collect(),
+        reviewers: asked,
         reviews,
         pushes: heads.iter().map(|(k, _, t)| (*k, false, *t)).collect(),
         threads,
@@ -325,6 +526,7 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         queue: None,
         // A host's pull request is replayed on its host, not here.
         conflicts: Vec::new(),
+        marks,
     })
 }
 
@@ -340,7 +542,7 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
     ev.extend(ch.reviewers.iter().map(|(w, at)| (*at, 0, turn::Event::Asked(w.clone()))));
     ev.extend(ch.pushes.iter().filter(|(v, _, _)| *v > 1).map(|(_, rebase_only, at)| (*at, 1, turn::Event::Pushed { rebase_only: *rebase_only })));
     ev.extend(ch.replies.iter().map(|(w, at)| (*at, 2, turn::Event::Replied(w.clone()))));
-    ev.extend(ch.reviews.iter().map(|(w, action, at, _)| {
+    ev.extend(ch.reviews.iter().map(|(w, action, at, _, _)| {
         let e = match action.as_str() {
             "accept" => turn::Event::Approved(w.clone()),
             "resign" => turn::Event::Removed(w.clone()),
@@ -850,7 +1052,15 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
     });
     let deployments: Vec<Value> = rec.own.iter().map(|d| json!({ "environment": d.environment, "production": d.production, "state": d.state, "description": d.description, "at": d.at })).collect();
     let replant: Vec<Value> = j.replant.as_ref().map(|r| r.runners.iter().map(|x| json!({ "name": x.name, "state": format!("{:?}", x.state).to_lowercase(), "why": x.why })).collect()).unwrap_or_default();
+    // The Review lane group's marks (W26-R14), oldest first; a commit with no change has the one:
+    // its push.
+    let mut marks = rec.change.as_ref().map(|c| c.marks.clone()).unwrap_or_default();
+    if rec.change.is_none() {
+        let at = rec.runs.first().map(|r| r.created_at).unwrap_or_default();
+        marks.push(MarkRec { id: format!("push:{}", rec.sha), kind: "push", at, end: Some(at), by: rec.runs.first().map(|r| r.actor.clone()).unwrap_or_default(), revision: None, state: "passed", thread: None, note: None });
+    }
     if let Some(o) = v.as_object_mut() {
+        o.insert("review".into(), json!(marks.iter().map(mark_json).collect::<Vec<_>>()));
         o.insert("checks".into(), json!(checks));
         o.insert("build".into(), build);
         o.insert("deployments".into(), json!(deployments));
@@ -1917,6 +2127,25 @@ mod tests {
                 assert!(p100.2 < 200.0, "limit=100 p99 {:.1} µs is 0.2 ms or more", p100.2);
                 assert!(one.2 < 200.0, "detail p99 {:.1} µs is 0.2 ms or more", one.2);
             }
+            Ok(())
+        })
+    }
+
+    /// W26-R14: a commit with no change carries the Review lane group's one mark — its push,
+    /// revision null, signer null until W27-R03.
+    #[test]
+    fn w26_r14_a_commit_with_no_change_carries_its_push() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let marks = field(&one, &["review"]).and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(marks.len(), 1, "a commit with no change has the one mark: {marks:?}");
+            let m = marks.first().cloned().unwrap_or_default();
+            assert_eq!((m.get("kind"), m.get("state"), m.get("revision"), m.get("signer")), (Some(&json!("push")), Some(&json!("passed")), Some(&Value::Null), Some(&Value::Null)), "{m}");
+            assert!(m.get("end") == m.get("at"), "its push is a point: {m}");
             Ok(())
         })
     }

@@ -582,3 +582,24 @@ export const commitBlobTextRes = (repo: string, sha: string, path: string): Res<
     return r.text();
   },
 });
+
+/**
+ * A mark of the Review lane group (W26-R14), as `ShipDetail.review` serves it (the boundary agreed
+ * with the Ship agent 01a1748c, 2026-10-26): each push, replay, comment, fix, resolution and
+ * approval with its time (`end` null while under way, = `at` for a point), who did it, its
+ * revision and its signer — null until W27-R03 signs kiln's records: the seal says unsigned.
+ */
+export interface ReviewMark {
+  id: string;
+  kind: "push" | "replay" | "comment" | "fix" | "resolution" | "approval";
+  /** Unix seconds. */
+  at: number;
+  end: number | null;
+  by: string;
+  signer: string | null;
+  revision: number | null;
+  /** A GlyphState name (components/ui/status-glyph-spec). */
+  state: string;
+  thread?: string;
+  note?: string;
+}

@@ -71,6 +71,23 @@ function commits(): ShipCommit[] {
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
       ],
     }),
+    // A landed change: its tip commit carries its review, approved and landed (W26-R14's e2e).
+    row({
+      sha: sha("5"),
+      short: "5555555",
+      message: "ci: a landed change",
+      author: "user:ada",
+      at: t - 300,
+      stand: "shipped",
+      line: "Landed · In production",
+      cursor: 12,
+      pips: pips("approved", "passed", "passed", "passed", "passed", "healthy"),
+      kind: "diff",
+      host: "kiln",
+      environments: [{ environment: "production", production: true }],
+      change: { ...change("D44", "diff", "kiln", "ci: a landed change", "landed", [], { question: 0, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
+      runs: [{ id: "run-44", pipeline: "ci" }],
+    }),
     // D41's first revision, which its second replaced: quiet, folded under it.
     row({
       sha: sha("2"),

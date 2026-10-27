@@ -3760,3 +3760,104 @@ jobs:
     })?;
     Ok(())
 }
+
+/// W26-R14 (each Ship item's dropdown owns its review, step 8): a change's commit's detail carries
+/// the Review lane group's marks — each push, replay, comment, fix, resolution and approval with
+/// its time, its revision, who did it and its signer (unsigned until W27-R03), oldest first; a
+/// commit with no change has the one mark, its push.
+#[test]
+fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let kim = person(&s, "kim", &["developer@repo:acme/app"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  resolve-threads: false\n")?;
+    std::fs::write(work.join("expand.rs"), "fn expand(m: &Matrix) {\n    let first = 1;\n}\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    commit(&home, &work, "expand.rs", "fn expand(m: &Matrix) {\n    let first = 10;\n}\n", "pipeline: dynamic matrices", &format!("I{}", "4".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+
+    // kim's blocking thread with a suggestion; dev replies; dev applies it (v2, a fix).
+    let (st, c) = post(&s, &kim, "/api/diffs/D1/comments", &json!({ "body": "an empty matrix panics", "suggestion": "    let first = 2;", "file": "expand.rs", "start_line": 2, "kind": "blocking", "publish": true }))?;
+    anyhow::ensure!(st == 200, "comment: {c}");
+    let (cid, tid) = (text(&c, "id").to_owned(), text(&c, "thread").to_owned());
+    let (st, r) = post(&s, &dev, "/api/diffs/D1/comments", &json!({ "thread": tid, "body": "applying it", "publish": true }))?;
+    anyhow::ensure!(st == 200, "reply: {r}");
+    let (st, r) = post(&s, &dev, &format!("/api/comments/{cid}/apply"), &json!({}))?;
+    anyhow::ensure!(st == 200, "apply: {r}");
+    let (st, r) = http(s.port, "PATCH", &format!("/api/comments/{cid}"), &kim, Some(&json!({ "state": "resolved" })))?;
+    anyhow::ensure!(st == 200, "kim resolves: {r}");
+
+    // Main moves on the same line: replayed, the replay conflicts; resolved and committed (v3).
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "owner"]), "the owner's clone")?;
+    let owner = dir.path().join("owner");
+    std::fs::write(owner.join("expand.rs"), "fn expand(m: &Matrix) {\n    let first = 100;\n}\n")?;
+    must(git(&home, &owner, &["add", "-A"]), "add")?;
+    must(git(&home, &owner, &["commit", "-qm", "main moves"]), "commit")?;
+    must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
+    let got = api(&s, &kim, "GET", "/api/diffs/D1/conflicts")?;
+    assert_eq!(got.pointer("/replay/state"), Some(&json!("conflicted")), "{got}");
+    let list = got.get("conflicts").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert_eq!(list.len(), 1, "{got}");
+    for cf in &list {
+        let id = text(cf, "id").to_owned();
+        let (st, r) = post(&s, &dev, &format!("/api/diffs/D1/conflicts/{id}/resolution"), &json!({ "take": "this" }))?;
+        anyhow::ensure!(st == 200, "resolve {id}: {r}");
+    }
+    let (st, r) = post(&s, &dev, "/api/diffs/D1/conflicts/commit", &json!({}))?;
+    anyhow::ensure!(st == 200, "commit resolution: {r}");
+    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(3)), "conflict resolved"), "{r}");
+    let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    anyhow::ensure!(st == 200, "accept: {r}");
+
+    // The change's tip carries the Review lane group, oldest first.
+    let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
+    let tip = d.pointer("/versions/2/commit").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert_eq!(d.pointer("/versions/2/n"), Some(&json!(3)), "{d}");
+    let one = api(&s, &dev, "GET", &format!("/api/ship/commits/acme/app/{tip}"))?;
+    let marks = one.get("review").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(marks.len() >= 6, "a mark per event: {marks:?}");
+    let kinds: Vec<&str> = marks.iter().filter_map(|m| m.get("kind").and_then(Value::as_str)).collect();
+    let ats: Vec<i64> = marks.iter().filter_map(|m| m.get("at").and_then(Value::as_i64)).collect();
+    assert!(ats.windows(2).all(|w| w.first() <= w.last()), "oldest first: {ats:?}");
+    for m in &marks {
+        let (id, kind, by, state) = (text(m, "id"), text(m, "kind"), text(m, "by"), text(m, "state"));
+        assert!(!id.is_empty() && !by.is_empty() && !state.is_empty(), "id, by and state: {m}");
+        assert!(["push", "replay", "comment", "fix", "resolution", "approval"].contains(&kind), "{m}");
+        assert_eq!(m.get("signer"), Some(&Value::Null), "unsigned until W27-R03: {m}");
+        assert!(m.get("at").is_some_and(Value::is_i64) && m.get("end").is_some() && m.get("revision").is_some(), "{m}");
+    }
+    // In order: the push, the talk, the Apply, the replay, the resolution, the verdict.
+    let expect = ["push", "comment", "comment", "comment", "comment", "fix", "replay", "resolution", "approval"];
+    assert_eq!(kinds, expect, "{marks:?}");
+    let find = |kind: &str, note: &str| marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some(kind) && m.get("note").and_then(Value::as_str).unwrap_or_default().contains(note)).cloned();
+    let by = |m: &Value| text(m, "by").to_owned();
+    let push = find("push", "").unwrap_or_default();
+    assert!(by(&push).ends_with("user:dev") && push.get("revision") == Some(&json!(1)), "{push}");
+    let blocked = find("comment", "blocking · expand.rs:2").unwrap_or_default();
+    // Resolved now: the mark that held while it was open reads passed, its end the resolution's.
+    assert!(blocked.get("state") == Some(&json!("passed")) && by(&blocked).ends_with("user:kim") && blocked.get("end").is_some_and(Value::is_i64), "{blocked}");
+    let fix = find("fix", "suggestion applied").unwrap_or_default();
+    assert!(by(&fix).ends_with("user:dev") && fix.get("revision") == Some(&json!(2)), "{fix}");
+    let replay = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("replay")).cloned().unwrap_or_default();
+    assert_eq!((replay.get("by"), replay.get("state"), replay.get("note")), (Some(&json!("kiln")), Some(&json!("passed")), Some(&json!("onto main"))), "{replay}");
+    let resolution = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("resolution")).cloned().unwrap_or_default();
+    assert!(by(&resolution).ends_with("user:dev") && resolution.get("revision") == Some(&json!(3)), "{resolution}");
+    let verdict = marks.last().cloned().unwrap_or_default();
+    assert!(verdict.get("kind") == Some(&json!("approval")) && by(&verdict).ends_with("user:rev") && verdict.get("state") == Some(&json!("approved")) && verdict.get("revision") == Some(&json!(3)), "{verdict}");
+
+    // A commit with no change has the one mark, its push — covered in ship.rs's
+    // w26_r14_a_commit_with_no_change_carries_its_push (a bare trunk commit gets no runs here).
+    Ok(())
+}
