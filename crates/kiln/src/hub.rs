@@ -250,6 +250,13 @@ impl Pending {
     }
 }
 
+/// A refusal (`n` of them, for a runner's word with those it folded in), at debug under its own
+/// target: what the count says, in a log that outlives the process (the wire lab counts it across
+/// the server's restarts, `tests/wire_lab.rs`).
+fn said_unread(u: &crate::wire::unread::Unread, n: u64) {
+    tracing::debug!(target: "kiln::refused", wire = u.wire.name(), code = u.code.name(), what = %u.what, n, "refused what it couldn't read");
+}
+
 /// Which of a runner process's command streams `msg` rides (docs/wire.md, "Commands"): live for
 /// a command refused while its runner is away, parked for one that waits for it. A `HarnessCmd`
 /// rides as the command it carries says, but for a message with an id, which rides live (CP-T3.2):
@@ -852,6 +859,7 @@ impl Hub {
     /// and `on`'s, audited, and each page it changed told. Its sender isn't told of it here:
     /// [`Hub::note_unread_told`] is for one it is.
     pub async fn note_unread(&self, u: crate::wire::unread::Unread, on: Option<crate::wire::unread::Page>) {
+        said_unread(&u, 1);
         let noted = self.refusals.lock().note(u, on);
         self.noted_unread(noted).await;
     }
@@ -859,6 +867,7 @@ impl Hub {
     /// As [`Hub::note_unread`], for a refusal its sender is told of (`ServerMsg::Unread`). Some:
     /// tell it now, of how many before it it wasn't told; None: not now.
     pub async fn note_unread_told(&self, u: crate::wire::unread::Unread, on: Option<crate::wire::unread::Page>) -> Option<u64> {
+        said_unread(&u, 1);
         let noted = self.refusals.lock().note_told(u, on);
         let tell = noted.tell;
         self.noted_unread(noted).await;
@@ -868,6 +877,7 @@ impl Hub {
     /// A runner's word of a frame of the server's it couldn't read (`AgentMsg::Unread`), with the
     /// `folded` before it it didn't tell of: noted as that many.
     pub async fn note_unread_folded(&self, u: crate::wire::unread::Unread, on: Option<crate::wire::unread::Page>, folded: u64) {
+        said_unread(&u, folded.saturating_add(1));
         let noted = self.refusals.lock().note_folded(u, on, folded);
         self.noted_unread(noted).await;
     }
@@ -1357,6 +1367,39 @@ impl Hub {
             let sent = self.net.send(peer, LANE_CONTROL, Kind::Control, body).await;
             let _ = answer.send(if sent { Answer::Sent } else { Answer::Unreachable { why: "its runner isn't connected".into() } });
         }
+    }
+
+    /// A test build's (`--features chaos`, `POST /api/chaos/send`): `bytes`, which the server never
+    /// sends, to runner `runner`: a frame on `lane`, or an item of its live command stream (`item`),
+    /// whose answer comes back. tests/hostile.rs holds a runner to what it can't read of the
+    /// server's with it.
+    #[cfg(feature = "chaos")]
+    pub(crate) async fn chaos_send(&self, runner: &str, lane: u32, item: bool, bytes: Vec<u8>) -> Result<serde_json::Value, String> {
+        use crate::wire::commands::{Answer, Kind as Stream};
+        let peer = self.agents.lock().get(runner).filter(|a| a.connected).and_then(|a| a.peer).ok_or_else(|| format!("{runner} is not connected"))?;
+        if !item {
+            let kind = match lane {
+                LANE_TERM => Kind::Term,
+                proto::LANE_CONVO => Kind::Log,
+                _ => Kind::Control,
+            };
+            return Ok(serde_json::json!({ "sent": self.net.send(peer, lane, kind, bytes).await }));
+        }
+        let rx = self.cmds.lock().push(peer, Stream::Live, bytes, Instant::now());
+        self.flush_commands().await;
+        let answer = match crate::rt::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(_)) => return Err("its answer was let go".into()),
+            Err(_) => return Err("no answer in 30 s".into()),
+        };
+        Ok(match answer {
+            Answer::Taken => serde_json::json!({ "answer": "taken" }),
+            Answer::Refused { code, why } => serde_json::json!({ "answer": "refused", "code": code, "why": why }),
+            Answer::Unreachable { why } => serde_json::json!({ "answer": "unreachable", "why": why }),
+            Answer::Unanswered { why } => serde_json::json!({ "answer": "unanswered", "why": why }),
+            Answer::Sent => serde_json::json!({ "answer": "sent" }),
+            Answer::Parked => serde_json::json!({ "answer": "parked" }),
+        })
     }
 
     /// The runners' commands due now: those not sent yet on their link, and those whose answer is

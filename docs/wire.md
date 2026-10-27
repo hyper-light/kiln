@@ -290,8 +290,11 @@ and told of once an hour. The rest are counted and kept for its page, and folded
 tells what it folded within a minute though no other word comes. The server counts a runner's
 word as one refusal and the ones it folds in.
 
-What each wire's sender is told. The later steps of the typed-messages plan move the rest onto
-`Refusals::note` and fill in their rows. "Nothing yet": what it can't read is let go as before.
+What each wire's sender is told. The wires are `crate::wire::WIRES`, their inventory, a row each
+here (held to it by `wire::unread`'s tests). `tests/hostile.rs` sends each of them an unknown
+message, a malformed one, one cut short, one with bytes left over and one too large, and holds each
+to what its sender is told, the count, the audit row naming where it came from, its page, and the
+next valid message on its wire applied.
 
 | Wire | What it carries | Its sender is told |
 |---|---|---|
@@ -318,10 +321,28 @@ What each wire's sender is told. The later steps of the typed-messages plan move
 | `mcp_http` | kiln's MCP endpoint, over HTTP. | The error JSON-RPC 2.0 gives it (`crate::mcp::rpc`): -32700 for what isn't JSON, -32600 for what isn't a request (under a null id when its id can't be read; MCP has no null id), -32601 for a method the server doesn't have, -32602 for params that don't fit it and, as MCP 2025-11-25 has it, for a tool it doesn't have. A body it can't read whole is answered under a null id: -32600 with 413 past 16 MiB, -32700 with 400 cut short. A line of `kiln mcp`'s stdio that isn't UTF-8 is refused -32700 like any that isn't JSON. In a batch each message is answered as its own. No notification is answered, but one no client sends is noted `unknown` (a client's are `notifications/initialized`, `cancelled`, `progress`, `roots/list_changed` and `tasks/status`). An input that doesn't fit an operation's type is a tool error saying where and why (docs/agents.md, "Operations"). Each is noted against the agent session its token names, or the person. |
 | `mcp_reach` | What an agent sends its runner's own MCP server (`kiln reach mcp`), which calls kiln's operations through reach. | The error, as for `mcp_http`, from the runner's MCP server (a line that isn't UTF-8 among them). The server hears of it (`ReachAsk`'s `unread`) and notes it against the session, on the runner's page too; an input that doesn't fit an operation is answered (`ReachAsk`'s `call`) and noted the same way. |
 
+A message too large is refused where its wire bounds it:
+- a frame (and what it carries: an item, its JSON, a relay's frame) past its lane's bound (1 MiB
+  for the control and terminal lanes) never leaves its sender: its transport refuses it, and it's
+  counted `refused` in `kiln_net_frames_dropped_total` (and on its runner's page, as what was let go
+  below the channel). A receiver's transport skips one that comes, so no reader of kiln's has it to
+  note: such a frame from a peer that isn't kiln is let go uncounted;
+- a command too large for the frame its item rides (`wire::commands::ITEM_MOST`) is answered at
+  once (unreachable: too large to send) and counted the same way, so it never holds up the commands
+  after it;
+- a message inside a reach link past 4 MiB is refused by its reader, `malformed`, as above;
+- an MCP message past 16 MiB (`mcp::rpc::BODY_MOST`), over HTTP or a line to `kiln reach mcp`, is
+  refused unread, -32600 under a null id (over HTTP, with a 413), and noted `malformed`.
+
 A test build makes frames unreadable as it loses them (`crate::runner::chaos`). `unknown=` makes a
 frame's variant one past what its sender's enum has. `garble=` cuts a frame short, adds bytes after
-it, or flips a byte past its variant (which may leave it readable). The channel makes up for a frame
-that couldn't be read as for one lost below it (`tests/unread_frames.rs`).
+it, or mangles what follows its variant (`net::MANGLED`, which no message reads as). Either goes
+marked (`net::MARK`), and its reader, a test build too, takes the mark off as it reads it and says
+it came, so a lab counts what came against what was refused. The channel makes up for a frame that
+couldn't be read as for one lost below it (`tests/unread_frames.rs`, `tests/wire_lab.rs`). A test
+build's server also sends a runner what it never would, a frame or a command's item, byte for byte
+(`POST /api/chaos/send`, the owner's alone): `tests/hostile.rs` holds runners to what they can't
+read of the server's with it.
 
 ## Revisions
 
@@ -444,6 +465,13 @@ faults:
 - each runner killed (kill -9) and started again, then the server;
 - viewers' sockets dropped and opened again, as a page reloads.
 
+With `WIRE_LAB_GARBLE`, about one in that many of each side's channel frames is made a kind the
+other doesn't know (`unknown=`), and as many garbled (`garble=`), on top of the rest. The checker
+holds the commands and updates as before, and counts the frames made unreadable from the processes'
+logs, which outlive their kills: those that came (the rest went below the channel with their
+connections) must all have been refused, as the server's `kiln_wire_refused_total` and the runners'
+own words say. kiln's CI runs it nightly on the eight seeds too.
+
 The sessions all open before any streams, then stream a first turn of 2,000 lines each while the
 commands come. A checker then holds every command to one answer and to one application at the
 most: exactly one when it was answered taken, accepted or parked, none when it was refused. It
@@ -456,7 +484,10 @@ and cargo says so rather than running nothing.
 
 At one frame in 11 dropped, the channel's repairs take most of its time. Updates come about three
 times slower, and most commands wait past their 30 s for an answer. An item lost with nothing
-after it waits out its patience (15 s for a runner's updates) before it goes again.
+after it waits out its patience (15 s for a runner's updates) before it goes again. A frame made
+unreadable is made up for as one lost is: at one in 64 of each kind they about double the repairs,
+and updates come about half as fast, so with them a run at full scale needs 50,000 updates, and
+10,000 of those frames to have come.
 
 Four edges are left, and the lab steers clear of each:
 - **A message lost to a runner's crash.** A runner killed within half a second of its inbox
@@ -470,7 +501,9 @@ Four edges are left, and the lab steers clear of each:
 - **A command a runner's crash takes with it.** A runner killed after its session took a command,
   before its harness applied it (a model to change to, written to Claude Code and not yet read),
   loses it, though it was answered taken. A harness applies one within milliseconds, but nothing
-  journals it yet. The lab sends a runner nothing for a moment before its kill.
+  journals it yet. The lab sends a runner nothing for a moment before its kill, and kills it only
+  once every model change it was sent has been answered, a moment before: with frames made
+  unreadable, the channel's repairs can bring one seconds after it was sent.
 - **A command sent again to a restarted server goes on again.** The server's command ids live in
   its memory, so an unanswered command sent to the server that starts again is new to it.
 

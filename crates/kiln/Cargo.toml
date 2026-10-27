@@ -14,6 +14,12 @@ chaos = []
 name = "wire_lab"
 required-features = ["chaos"]
 
+# So does tests/hostile.rs: it has the server send runners what it never would, which only a build
+# with `chaos` can (`POST /api/chaos/send`).
+[[test]]
+name = "hostile"
+required-features = ["chaos"]
+
 [dependencies]
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }

@@ -16,44 +16,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, http};
+use common::{Options, audited, http, kept, record, refused};
 use serde_json::{Value, json};
-
-/// A series' value in the server's metrics (0 when it has none).
-fn metric(port: u16, admin: &str, series: &str) -> u64 {
-    let (_, text) = http(port, "GET", "/metrics", admin, None).unwrap_or_default();
-    text.lines().find_map(|l| l.strip_prefix(series).and_then(|v| v.trim().parse().ok())).unwrap_or(0)
-}
-
-/// `kiln_wire_refused_total` of `wire` and `code`.
-fn refused(port: u16, admin: &str, wire: &str, code: &str) -> u64 {
-    metric(port, admin, &format!("kiln_wire_refused_total{{wire=\"{wire}\",code=\"{code}\"}}"))
-}
-
-/// Runner `name`'s record (`GET /api/agents`).
-fn record(port: u16, admin: &str, name: &str) -> Value {
-    let (_, body) = http(port, "GET", "/api/agents", admin, None).unwrap_or_default();
-    let v: Value = serde_json::from_str(&body).unwrap_or_default();
-    let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-    list.into_iter().find(|a| a.get("name").and_then(Value::as_str) == Some(name)).unwrap_or_default()
-}
-
-/// How many refusals of `wire` and `code` a runner's record keeps.
-fn kept(rec: &Value, wire: &str, code: &str) -> u64 {
-    rec.pointer("/refused/counts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|c| c.get("wire").and_then(Value::as_str) == Some(wire) && c.get("code").and_then(Value::as_str) == Some(code))
-        .filter_map(|c| c.get("n").and_then(Value::as_u64))
-        .sum()
-}
-
-/// The audit log's `security.wire_refused` rows for runner `name`.
-fn audited(port: u16, admin: &str, name: &str) -> Vec<Value> {
-    let (_, body) = http(port, "GET", &format!("/api/audit?action=security.wire_refused&principal=runner:{name}"), admin, None).unwrap_or_default();
-    serde_json::from_str::<Value>(&body).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default()
-}
 
 /// A log without its colors: tracing styles its fields' names (`folded=` among them).
 fn plain(log: &str) -> String {
@@ -157,7 +121,7 @@ fn frames_that_cant_be_read_are_refused_typed_and_noted_and_made_up_for() -> any
         let after = plain(&runner_log());
         let counted = [refused(s.port, &s.admin, "runner", "unknown"), refused(s.port, &s.admin, "runner", "malformed"), refused(s.port, &s.admin, "server", "unknown")];
         let on_page = [kept(&rec, "runner", "unknown"), kept(&rec, "runner", "malformed"), kept(&rec, "server", "unknown")];
-        let rows = audited(s.port, &s.admin, "unread-runner");
+        let rows = audited(s.port, &s.admin, "runner:unread-runner");
         let (runners, answered) = (kept(&rec, "runner", "unknown") + kept(&rec, "runner", "malformed"), told(&before));
         let (heard, servers) = (kept(&rec, "server", "unknown") + kept(&rec, "server", "malformed"), after.matches("a frame from the server couldn't be read").count() as u64);
         assert!(answered <= runners && heard <= servers, "an answer without a refusal: the server told the runner of {answered} of its {runners}, and heard of {heard} of the {servers} of its own the runner couldn't read");
@@ -191,7 +155,7 @@ fn a_runner_from_before_is_told_nothing_new_and_its_unreadable_frames_are_noted(
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let rec = record(s.port, &s.admin, "old-unread");
-        let (counted, on_page, rows) = (refused(s.port, &s.admin, "runner", "unknown"), kept(&rec, "runner", "unknown"), audited(s.port, &s.admin, "old-unread"));
+        let (counted, on_page, rows) = (refused(s.port, &s.admin, "runner", "unknown"), kept(&rec, "runner", "unknown"), audited(s.port, &s.admin, "runner:old-unread"));
         if counted > 1 && on_page > 1 && !rows.is_empty() {
             break;
         }

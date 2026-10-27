@@ -22,6 +22,7 @@ pub mod unread;
 pub mod uplink;
 
 pub use payload::{payload, payload_of};
+pub use unread::WIRES;
 
 use crate::harness::core::Update;
 use crate::harness::model::Command;

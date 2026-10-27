@@ -236,6 +236,23 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
             };
         }
+        // A test build's (`--features chaos`): bytes the server never sends, sent to a runner as a
+        // frame or as an item of its live command stream (`Hub::chaos_send`), for tests/hostile.rs.
+        // The owner's alone. `{"runner", "lane", "item", "bytes": <base64>}`.
+        #[cfg(feature = "chaos")]
+        (&Method::POST, ["api", "chaos", "send"]) => {
+            use base64::Engine as _;
+            if !authed(&hub, req.headers()) {
+                return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
+            }
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            let field = |k: &str| body.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            let lane = crate::proto::lane_named(&field("lane")).unwrap_or(crate::proto::LANE_CONTROL);
+            let item = body.get("item").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let bytes = base64::engine::general_purpose::STANDARD.decode(field("bytes")).map_err(|e| err(StatusCode::BAD_REQUEST, format!("bytes: {e}")))?;
+            let runner = field("runner");
+            return boxed(|| hub.chaos_send(&runner, lane, item, bytes)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|why| err(StatusCode::CONFLICT, why));
+        }
         // Every operation over HTTP (docs/ci.md W20-R01): the list, and one run as its caller.
         // Each is checked as its own route is, and a change audited as that route's would be.
         (&Method::GET, ["api", "ops"]) => {

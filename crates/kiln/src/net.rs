@@ -225,19 +225,42 @@ impl Shed {
     }
 }
 
-/// `data` made unreadable as `draw` picks: cut short, bytes added after it, or a byte past its first
-/// (its variant index) flipped.
+/// What follows a frame's variant index once [`garble`] mangles it: ten bytes of 0xff. No message
+/// of `AgentMsg`'s or `ServerMsg`'s reads as them (no varint ends in them, no bool, option or enum
+/// has one as its tag, and one with no fields has them left over), so a mangled frame is always
+/// malformed, never another message (`net::tests`).
+pub const MANGLED: [u8; 10] = [0xff; 10];
+
+/// `data` made unreadable as `draw` picks: cut short, bytes added after it, or what follows its
+/// first byte (its variant index) mangled ([`MANGLED`]). Each can't be read: none is another
+/// message its receiver would take.
 fn garble(data: &mut Vec<u8>, draw: u64) {
     match draw % 3 {
         0 => data.truncate(data.len() / 2),
         1 => data.extend_from_slice(&[0xde, 0xad, 0xbe]),
         _ => {
-            let past = data.len().saturating_sub(1).max(1);
-            let at = 1 + usize::try_from(draw / 3).unwrap_or(0) % past;
-            if let Some(b) = data.get_mut(at) {
-                *b ^= 0xff;
-            }
+            data.truncate(1);
+            data.extend_from_slice(&MANGLED);
         }
+    }
+}
+
+/// A test build's mark on a frame its faults made unreadable ([`Act::Unknown`], [`Act::Garble`]),
+/// ahead of it on the wire. Its reader (a test build too, `crate::proto::read`) takes it off and
+/// says the frame came, as it reads it, so a lab counts what came against what was refused
+/// (`tests/wire_lab.rs`). No frame kiln sends begins with it: postcard never writes 0xff then 0x00.
+pub const MARK: [u8; 8] = [0xff, 0x00, b'u', b'n', b'r', b'e', b'a', b'd'];
+
+/// `frame` without its [`MARK`] when it came with one, said: a frame made unreadable, which its
+/// reader is about to refuse.
+#[cfg(any(test, feature = "chaos"))]
+pub fn unmarked(frame: &[u8]) -> &[u8] {
+    match frame.strip_prefix(&MARK) {
+        Some(rest) => {
+            tracing::warn!("chaos: an unreadable frame came");
+            rest
+        }
+        None => frame,
     }
 }
 
@@ -256,8 +279,8 @@ pub enum Act {
     /// has, a kind its receiver doesn't know (docs/wire.md, "What can't be read"). 0 until
     /// [`Shed::past`] says whose enum.
     Unknown(u8),
-    /// Cut short, given bytes after it, or a byte past its variant index flipped, as the same draw
-    /// says: a frame that can't be read (a flip may leave one readable).
+    /// Cut short, given bytes after it, or what follows its variant index mangled, as the same draw
+    /// says: a frame that can't be read.
     Garble,
 }
 
@@ -577,7 +600,7 @@ impl Outbox {
                 tracing::warn!(error = %e, "chaos: can't copy a frame");
             }
         }
-        let (mut twice, mut late) = (false, false);
+        let (mut twice, mut late, mut unreadable) = (false, false, false);
         for (rule, draw) in &mut self.faults {
             if rule.lane != lane || !rule.variant.is_none_or(|v| data.first() == Some(&v)) {
                 continue;
@@ -600,9 +623,21 @@ impl Outbox {
                     if let Some(first) = data.first_mut() {
                         *first = index;
                     }
+                    unreadable = true;
                 }
-                Act::Garble => garble(&mut data, *draw),
+                Act::Garble => {
+                    garble(&mut data, *draw);
+                    unreadable = true;
+                }
             }
+        }
+        // Made unreadable: marked for its receiver to say it came, and said here, with how many
+        // copies go.
+        if unreadable {
+            let mut marked = MARK.to_vec();
+            marked.append(&mut data);
+            data = marked;
+            tracing::warn!(lane = crate::proto::lane_name(lane), copies = if twice { 2 } else { 1 }, "chaos: frames made unreadable");
         }
         // One held back goes after this one; this one waits for the next, when it's to be late.
         let held = self.late.remove(&(peer, lane));
@@ -1020,10 +1055,10 @@ fn on_event<B, D>(
 mod tests {
     use super::*;
 
-    /// A frame garbled for a test can't be read: cut short, or given bytes after it; or a byte past
-    /// its variant index flipped (which may leave it readable, and never touches the index).
+    /// A frame garbled for a test can't be read: cut short, given bytes after it, or what follows
+    /// its variant index mangled (its index stays).
     #[test]
-    fn a_garbled_frame_is_cut_short_given_more_or_flipped_past_its_index() -> anyhow::Result<()> {
+    fn a_garbled_frame_is_cut_short_given_more_or_mangled_past_its_index() -> anyhow::Result<()> {
         let frame = crate::proto::encode(&crate::proto::AgentMsg::HarnessAdopted { session: "session".into(), error: Some("no room".into()) })?;
         let mut cut = frame.clone();
         garble(&mut cut, 3);
@@ -1032,13 +1067,52 @@ mod tests {
         garble(&mut more, 4);
         assert!(more.len() == frame.len() + 3 && crate::proto::read_agent(&more).is_err());
         for draw in [5, 8, 11, 302] {
-            let mut flipped = frame.clone();
-            garble(&mut flipped, draw);
-            assert_eq!(flipped.len(), frame.len());
-            assert_eq!(flipped.first(), frame.first(), "its index stays");
-            assert_eq!(flipped.iter().zip(&frame).filter(|(a, b)| a != b).count(), 1, "one byte flipped");
+            let mut mangled = frame.clone();
+            garble(&mut mangled, draw);
+            assert_eq!(mangled.first(), frame.first(), "its index stays");
+            assert_eq!(mangled.get(1..), Some(&MANGLED[..]));
+            assert!(crate::proto::read_agent(&mangled).is_err());
         }
         Ok(())
+    }
+
+    /// No message of either side's reads as a mangled frame of its variant: every one is refused,
+    /// as `malformed`, so a lab's faults are never taken for a message (`tests/wire_lab.rs`).
+    #[test]
+    fn a_mangled_frame_of_any_variant_is_malformed() {
+        use crate::wire::unread::Code;
+        let read = |of: &str, n: usize, read: &dyn Fn(&[u8]) -> Result<(), crate::proto::Unreadable>| -> Vec<String> {
+            (0..n)
+                .filter_map(|index| {
+                    let mut frame = vec![u8::try_from(index).unwrap_or(u8::MAX)];
+                    frame.extend_from_slice(&MANGLED);
+                    match read(&frame) {
+                        Err(e) if e.code() == Code::Malformed => None,
+                        Err(e) => Some(format!("{of} variant {index}: {e:?}")),
+                        Ok(()) => Some(format!("{of} variant {index} read as a message")),
+                    }
+                })
+                .collect()
+        };
+        let mut wrong = read("AgentMsg", crate::wire::agent_classes().len(), &|b| crate::proto::read_agent(b).map(drop));
+        wrong.extend(read("ServerMsg", crate::wire::server_classes().len(), &|b| crate::proto::read_server(b).map(drop)));
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// A frame a fault made unreadable goes marked, and its reader reads it as it was made: the
+    /// mark comes off.
+    #[test]
+    fn a_frame_made_unreadable_goes_marked_and_is_read_unmarked() {
+        let mut o = Outbox::default();
+        let (peer, lane) = (7, crate::proto::LANE_TERM);
+        o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(60) }, 0x9e37_79b9_7f4a_7c15)];
+        let frame = vec![46u8, 1, 2, 3];
+        assert_eq!(o.push(peer, lane, Kind::Term, frame.clone()), Push::Queued);
+        let sent = o.queues.get(&(peer, lane)).and_then(|q| q.front()).map(|(_, d)| d.clone()).unwrap_or_default();
+        assert!(sent.starts_with(&MARK), "{sent:?}");
+        assert_eq!(unmarked(&sent), [60u8, 1, 2, 3], "its index one past, the mark off");
+        assert_eq!(unmarked(&frame), frame, "one not made unreadable is read as it went");
+        assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index: 60, .. })), "read as it was made");
     }
 
     async fn next_event(rx: &async_channel::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {

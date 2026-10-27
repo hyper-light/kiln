@@ -23,7 +23,7 @@
 //! that's who it is.
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{BufRead, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -967,7 +967,18 @@ pub fn serve() -> anyhow::Result<()> {
             }
         });
     }
-    for line in crate::mcp::rpc::lines(std::io::stdin().lock()) {
+    let mut stdin = std::io::stdin().lock();
+    while let Ok(Some(line)) = next_line(&mut stdin) {
+        // A line past what a message may be is refused unread, and noted.
+        let Ok(line) = line else {
+            let r = Box::new(crate::mcp::rpc::too_large());
+            server.note(&r);
+            say(&out, &r.answer());
+            continue;
+        };
+        if line.trim_ascii().is_empty() {
+            continue;
+        }
         // Each message read into a request, or refused as JSON-RPC 2.0 says and noted (`rpc`). A
         // batch (MCP before 2025-06-18) is answered whole, each message in turn; a message alone is
         // answered as it's done, a tool's call on a thread of its own.
@@ -979,6 +990,34 @@ pub fn serve() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The next line of `input`, without its newline: none at its end; `Err` for one past what a message
+/// may be (`rpc::BODY_MOST`), the rest of it read and let go.
+fn next_line(input: &mut impl BufRead) -> std::io::Result<Option<Result<Vec<u8>, ()>>> {
+    let (mut line, mut over, mut any) = (Vec::new(), false, false);
+    loop {
+        let buf = input.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(any.then_some(if over { Err(()) } else { Ok(line) }));
+        }
+        any = true;
+        let (took, ended) = match buf.iter().position(|b| *b == b'\n') {
+            Some(at) => (at + 1, Some(at)),
+            None => (buf.len(), None),
+        };
+        if !over {
+            line.extend_from_slice(buf.get(..ended.unwrap_or(took)).unwrap_or_default());
+            if line.len() > crate::mcp::rpc::BODY_MOST {
+                over = true;
+                line = Vec::new();
+            }
+        }
+        input.consume(took);
+        if ended.is_some() {
+            return Ok(Some(if over { Err(()) } else { Ok(line) }));
+        }
+    }
 }
 
 /// One message's answer: none for a notification, nor for a tool's call when `out` is given (its
@@ -1345,5 +1384,20 @@ mod tests {
         let runs: Vec<Value> = machine_ops().into_iter().filter(|o| o.get("name").and_then(Value::as_str).is_some_and(|n| n == "machines.run" || n == "machines.start")).collect();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|o| o.pointer("/input/properties/needs").is_some()), "{runs:?}");
+    }
+
+    /// A line past what a message may be is refused whole and the rest of it let go; the next is
+    /// read as it came.
+    #[test]
+    fn a_line_past_what_a_message_may_be_is_let_go_and_the_next_read() -> anyhow::Result<()> {
+        let mut input = b"{\"a\":1}\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', crate::mcp::rpc::BODY_MOST + 1));
+        input.extend_from_slice(b"\n{\"b\":2}");
+        let mut r = std::io::BufReader::new(input.as_slice());
+        assert_eq!(next_line(&mut r)?, Some(Ok(b"{\"a\":1}".to_vec())));
+        assert_eq!(next_line(&mut r)?, Some(Err(())));
+        assert_eq!(next_line(&mut r)?, Some(Ok(b"{\"b\":2}".to_vec())));
+        assert_eq!(next_line(&mut r)?, None);
+        Ok(())
     }
 }

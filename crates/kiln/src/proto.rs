@@ -853,6 +853,10 @@ impl Unreadable {
 /// be: a variant this build doesn't know (its index past them), or bytes that aren't one, or that
 /// are one with more after it.
 pub fn read<'a, T: Deserialize<'a>>(b: &'a [u8], variants: impl FnOnce() -> usize) -> Result<T, Unreadable> {
+    // A test build's frame made unreadable comes marked (`crate::net::MARK`): the mark comes off,
+    // and it's said.
+    #[cfg(any(test, feature = "chaos"))]
+    let b = crate::net::unmarked(b);
     let variant = varint(b);
     match postcard::take_from_bytes::<T>(b) {
         Ok((m, [])) => Ok(m),
@@ -869,6 +873,8 @@ pub fn read<'a, T: Deserialize<'a>>(b: &'a [u8], variants: impl FnOnce() -> usiz
 
 /// A frame read whole into `T`, a message that isn't an enum ([`LogChunk`]), or why it couldn't be.
 pub fn read_whole<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T, Unreadable> {
+    #[cfg(any(test, feature = "chaos"))]
+    let b = crate::net::unmarked(b);
     match postcard::take_from_bytes::<T>(b) {
         Ok((m, [])) => Ok(m),
         Ok((_, rest)) => Err(Unreadable::Malformed { variant: None, why: format!("{} bytes left over", rest.len()) }),

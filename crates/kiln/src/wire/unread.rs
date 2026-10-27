@@ -106,33 +106,35 @@ pub enum Wire {
     McpReach,
 }
 
-impl Wire {
-    /// Every wire, matched in [`Wire::name`] without a catch-all arm.
-    pub const ALL: [Wire; 22] = [
-        Wire::Runner,
-        Wire::Server,
-        Wire::RunnerItem,
-        Wire::ServerItem,
-        Wire::RunnerPayload,
-        Wire::ServerPayload,
-        Wire::Relay,
-        Wire::ReachLink,
-        Wire::SessionUp,
-        Wire::SessionDown,
-        Wire::TerminalUp,
-        Wire::TerminalDown,
-        Wire::StreamUp,
-        Wire::StreamDown,
-        Wire::EventsUp,
-        Wire::EventsDown,
-        Wire::LogUp,
-        Wire::LogDown,
-        Wire::TunnelUp,
-        Wire::TunnelDown,
-        Wire::McpHttp,
-        Wire::McpReach,
-    ];
+/// Every wire kiln reads, in the enum's order: the one inventory. Each is named in [`Wire::name`],
+/// matched without a catch-all arm; docs/wire.md's "What can't be read" has a row for each, and
+/// tests/hostile.rs its cases. A test holds it to the enum: every variant, once, in order.
+pub const WIRES: [Wire; 22] = [
+    Wire::Runner,
+    Wire::Server,
+    Wire::RunnerItem,
+    Wire::ServerItem,
+    Wire::RunnerPayload,
+    Wire::ServerPayload,
+    Wire::Relay,
+    Wire::ReachLink,
+    Wire::SessionUp,
+    Wire::SessionDown,
+    Wire::TerminalUp,
+    Wire::TerminalDown,
+    Wire::StreamUp,
+    Wire::StreamDown,
+    Wire::EventsUp,
+    Wire::EventsDown,
+    Wire::LogUp,
+    Wire::LogDown,
+    Wire::TunnelUp,
+    Wire::TunnelDown,
+    Wire::McpHttp,
+    Wire::McpReach,
+];
 
+impl Wire {
     /// Its name: the metric's label, and as it's written in JSON and in docs/wire.md.
     pub fn name(self) -> &'static str {
         match self {
@@ -907,7 +909,7 @@ mod tests {
             serde_json::json!({"wire": "runner", "from": {"peer": {"cert": "ab12", "addr": "192.168.1.9:4433"}}, "what": "variant 51", "code": "malformed", "why": "AgentMsg has 51 variants"})
         );
         assert_eq!(serde_json::from_value::<Unread>(json)?, u);
-        for w in Wire::ALL {
+        for w in WIRES {
             assert_eq!(serde_json::to_value(w)?, serde_json::json!(w.name()), "{w:?}");
         }
         for c in Code::ALL {
@@ -919,8 +921,24 @@ mod tests {
         Ok(())
     }
 
-    /// docs/wire.md's "What can't be read" names every code and wire, in their order, and no other,
-    /// and says what the constants here do.
+    /// The inventory is the enum: every variant there is (postcard reads them by index, so the
+    /// first index it can't read is one past the last), once, in its order.
+    #[test]
+    fn every_wire_is_in_the_inventory_once_in_order() {
+        let mut enumerated = Vec::new();
+        for index in 0..=u8::MAX {
+            match postcard::from_bytes::<Wire>(&[index]) {
+                Ok(w) => enumerated.push(w),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(enumerated, WIRES.to_vec(), "wire::WIRES isn't every wire the enum has, in its order");
+        let named: std::collections::BTreeSet<&str> = WIRES.iter().map(|w| w.name()).collect();
+        assert_eq!(named.len(), WIRES.len(), "two wires share a name");
+    }
+
+    /// docs/wire.md's "What can't be read" names every code and every wire of the inventory, in
+    /// their order, and no other, and says what the constants here do.
     #[test]
     fn the_doc_names_every_code_and_wire_there_is() -> anyhow::Result<()> {
         let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/wire.md"))?;
@@ -937,7 +955,7 @@ mod tests {
             out
         };
         assert_eq!(named("Code"), Code::ALL.map(Code::name).map(str::to_owned).to_vec());
-        assert_eq!(named("Wire"), Wire::ALL.map(Wire::name).map(str::to_owned).to_vec());
+        assert_eq!(named("Wire"), WIRES.map(Wire::name).map(str::to_owned).to_vec());
         let flat = section.split_whitespace().collect::<Vec<_>>().join(" ");
         let senders = format!("{},{:03} senders", SENDERS / 1000, SENDERS % 1000);
         let says = [

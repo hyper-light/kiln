@@ -31,6 +31,10 @@ pub struct Paginated {
     pub cursor: Option<String>,
 }
 
+/// The most a message (an HTTP request's body, a line a runner's server reads) may be: one past it
+/// is refused whole, never read ([`too_large`]).
+pub const BODY_MOST: usize = 16 << 20;
+
 /// `initialize`'s params, as far as kiln reads them (a client says more).
 #[derive(Debug, serde::Deserialize)]
 pub struct Initialize {
@@ -199,6 +203,11 @@ pub fn body(text: &[u8]) -> Body {
 /// Blank lines are let go; it ends with its input, or an error reading it.
 pub fn lines(input: impl std::io::BufRead) -> impl Iterator<Item = Vec<u8>> {
     input.split(b'\n').map_while(Result::ok).filter(|l| !l.trim_ascii().is_empty())
+}
+
+/// A message past [`BODY_MOST`], refused as one that isn't a request (its id unread, so null).
+pub fn too_large() -> Refused {
+    Refused::new(Value::Null, INVALID_REQUEST, format!("Invalid Request: more than {} MiB", BODY_MOST >> 20))
 }
 
 /// What to send back for a body whose messages were answered `answers` (a notification's

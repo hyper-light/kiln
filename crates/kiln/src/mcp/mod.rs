@@ -442,25 +442,22 @@ pub fn caller(hub: &Hub, headers: &HeaderMap, authed: bool) -> Option<String> {
     authed.then(|| "admin".to_owned())
 }
 
-/// The most of a body `/api/mcp` reads.
-const BODY_MOST: usize = 16 << 20;
-
 /// `POST /api/mcp`: one JSON-RPC message or a batch, each operation as `caller` may (W20-R06).
 pub async fn http(hub: &Arc<Hub>, caller: Caller, body: kiln_http::Incoming) -> Result<Response, (StatusCode, String)> {
     use http_body_util::BodyExt as _;
-    let read = http_body_util::Limited::new(body, BODY_MOST).collect().await.map(|b| b.to_bytes());
+    let read = http_body_util::Limited::new(body, rpc::BODY_MOST).collect().await.map(|b| b.to_bytes());
     Ok(respond(hub, caller, read).await)
 }
 
 /// What a body `caller` sent is answered: its messages' answers, or 202 when none has one. A body
 /// it couldn't read whole is refused as JSON-RPC 2.0 has it, under a null id, and noted like any
-/// message it can't read: one past [`BODY_MOST`] (413), or one cut short.
+/// message it can't read: one past [`rpc::BODY_MOST`] (413), or one cut short.
 pub(crate) async fn respond(hub: &Arc<Hub>, caller: Caller, read: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>) -> Response {
     let bytes = match read {
         Ok(b) => b,
         Err(e) => {
             let (status, refused) = if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
-                (StatusCode::PAYLOAD_TOO_LARGE, rpc::Refused::new(Value::Null, rpc::INVALID_REQUEST, format!("Invalid Request: more than {} MiB", BODY_MOST >> 20)))
+                (StatusCode::PAYLOAD_TOO_LARGE, rpc::too_large())
             } else {
                 (StatusCode::BAD_REQUEST, rpc::Refused::new(Value::Null, rpc::PARSE_ERROR, "Parse error: the body was cut short"))
             };
