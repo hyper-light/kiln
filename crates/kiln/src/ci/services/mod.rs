@@ -80,6 +80,41 @@ pub async fn maintain(hub: &Hub) -> anyhow::Result<()> {
             tracing::info!(entries = gone, "work ledger entries evicted under quota, the least time saved per byte first (W24-AC12)");
         }
     }
+    // The reaper (W24-R31): the ledger within the data volume's floor and each scope's temporal
+    // rules, when free space, the ledger's ceiling or the system's schedule calls for it.
+    if let Some((size, free)) = crate::os::disk_space(&hub.cfg.server.data_dir) {
+        static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let now = crate::util::now_unix();
+        let last = Some(LAST.load(std::sync::atomic::Ordering::Relaxed)).filter(|l| *l > 0);
+        let went = hub
+            .store
+            .call(move |c| {
+                use kiln_ci::work::reap::{self as r, Scope, Trigger};
+                let (system, repos) = crate::ci::reap::stored(c)?;
+                let sys = r::resolve(size, &[(Scope::System, &system)]);
+                let held: u64 = c.query_row("SELECT COALESCE(SUM(length(value)), 0) FROM work_records", [], |r| r.get::<_, i64>(0)).map(|n| u64::try_from(n).unwrap_or(0))?;
+                let Some(trigger) = r::due(&sys, free, held, 0, last, now) else { return Ok((None, Vec::new())) };
+                let repos = repos.iter().map(|(name, p)| (name.clone(), r::resolve(size, &[(Scope::System, &system), (Scope::Repo, p)]))).collect();
+                let went = crate::ci::work::reap(c, &sys, &repos, free, now)?;
+                Ok((Some(trigger == Trigger::Schedule), went))
+            })
+            .await?;
+        if went.0 == Some(true) {
+            LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+        for e in &went.1 {
+            let reason = match e.reason {
+                kiln_ci::work::reap::Reason::MaxAge => "max_age",
+                kiln_ci::work::reap::Reason::Target => "target",
+                kiln_ci::work::reap::Reason::Floor => "floor",
+            };
+            crate::metrics::global().work_reaped_bytes.add(&["ledger", reason], e.bytes);
+            tracing::info!(entry = %e.id, bytes = e.bytes, reason, rule = e.rule, scope = ?e.scope, "the reaper evicted a work ledger entry (W24-R31)");
+        }
+        if !went.1.is_empty() {
+            hub.store.audit("kiln".into(), "ci.work.reap".into(), format!("{} ledger entries, {} bytes", went.1.len(), went.1.iter().map(|e| e.bytes).sum::<u64>())).await;
+        }
+    }
     // Steps' kept files no result can reuse any more go first, to be collected too (W24-R07).
     memo::sweep(hub).await?;
     let collected = cas::collect(hub).await?;

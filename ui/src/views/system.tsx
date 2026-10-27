@@ -15,6 +15,7 @@ import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useLocation } from "@/lib/router";
 import { KeepSection } from "./keep/section";
+import { ReapSection } from "./reap";
 import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 import { BuildsSection, UpdatesSection } from "./updates/section";
@@ -238,7 +239,13 @@ function AuditTable({ win }: { win: AuditWindow }) {
       <FilterBar
         className="log-tools"
         aside={
-          <Button variant="ghost" size="bar" disabled={shown.length === 0} title="Download the entries shown, as CSV" onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}>
+          <Button
+            variant="ghost"
+            size="bar"
+            disabled={shown.length === 0}
+            title="Download the entries shown, as CSV"
+            onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}
+          >
             <Download /> Download
           </Button>
         }
@@ -390,6 +397,8 @@ function SystemBody() {
       <KeepSection index="07" />
 
       <AuditSection />
+
+      <ReapSection index="08" />
     </>
   );
 }
@@ -418,6 +427,9 @@ function SystemHold() {
       <KeepSection index="07" hold />
       <FoldSection id="system.audit" index="08" label="Audit" title="Audit log">
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
+      </FoldSection>
+      <FoldSection id="system.reaper" index="08" label="Caches" title="Cache reaper">
+        <Hold height={1700} />
       </FoldSection>
     </>
   );

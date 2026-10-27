@@ -1300,6 +1300,9 @@ impl Registry {
                 info.held = g.get(id).and_then(|m| m.info.held.clone());
                 // So is what of its messages couldn't be read (`crate::wire::unread`).
                 info.refused = g.get(id).and_then(|m| m.info.refused.clone());
+                // So is whether kiln started it as its parent's subagent (`Spec::subagent`): a runner
+                // from before the word doesn't say it, and it stays one.
+                info.subagent |= g.get(id).is_some_and(|m| m.info.subagent);
                 // What kiln's own words were handed is kept too, and what waits in its queue until
                 // the state after this says again (neither goes in an Open): a runner that comes
                 // back doesn't make a word handed look lost (CP-T3.2, the fourteenth adversarial check's).
@@ -1813,6 +1816,7 @@ impl Registry {
                         parent: spec.parent.clone(),
                         plan_run: spec.plan_run.clone(),
                         helper: spec.helper.clone(),
+                        subagent: spec.subagent,
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };
