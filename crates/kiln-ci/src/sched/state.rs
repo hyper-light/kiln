@@ -26,6 +26,7 @@ use super::pools::{self, ExecState, Executor, Pool, PoolView};
 use super::reserve::Reservation;
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
+use super::table::Table;
 use super::units::{self, Ms, Ppm};
 use super::warm::{self, Held as WarmHeld, Wants};
 
@@ -731,29 +732,33 @@ impl Sig {
     }
 }
 
-/// The scheduler.
+/// The scheduler. Whatever it walks while deciding, it walks in one order on every machine and in
+/// every replay (docs/needs.md, E1): what it keeps is ordered (`BTreeMap`, `BTreeSet`), but for
+/// the legs, which it looks up on every input and keeps in a `Table` that walks in key order;
+/// hash maps are left to what it only looks up by key and never walks: its settings, the decision
+/// it last told each leg, and the members it counts in each fair-share level.
 #[derive(Debug, Clone, Default)]
 pub struct Scheduler {
     cfg: Config,
     runners: BTreeMap<String, Runner>,
-    legs: HashMap<String, Leg>,
-    sigs: HashMap<String, Sig>,
+    legs: Table<Leg>,
+    sigs: BTreeMap<String, Sig>,
     groups: Groups,
     /// Runs by supersede key, oldest first.
-    superseding: HashMap<String, Vec<String>>,
-    run_groups: HashMap<String, String>,
+    superseding: BTreeMap<String, Vec<String>>,
+    run_groups: BTreeMap<String, String>,
     /// Fair share's virtual finish by repository, and the virtual time now ([`VIRTUAL`]).
-    finish: HashMap<String, u128>,
+    finish: BTreeMap<String, u128>,
     vtime: u128,
     seq: u64,
     timers: BTreeMap<i64, Vec<String>>,
-    in_progress: HashMap<String, usize>,
+    in_progress: BTreeMap<String, usize>,
     /// Pools' executors, by id.
     executors: BTreeMap<String, Executor>,
     /// (pool, runner) left alone until, and the wait after the next failure.
-    backoff: HashMap<(String, String), (i64, i64)>,
+    backoff: BTreeMap<(String, String), (i64, i64)>,
     /// Each pool's last failure to start an executor: (runner, error).
-    pool_errors: HashMap<String, (String, String)>,
+    pool_errors: BTreeMap<String, (String, String)>,
     /// The reservations' windows open now (index, end), and when they're next looked at (W05-R12).
     windows: Vec<(usize, i64)>,
     windows_at: Option<i64>,
@@ -772,7 +777,7 @@ pub struct Scheduler {
     /// actors, `repo\0actor` → lanes.
     members: HashMap<String, HashMap<String, usize>>,
     /// What each runner holds warm, by runner (W24-R18).
-    warm: HashMap<String, WarmHeld>,
+    warm: BTreeMap<String, WarmHeld>,
     /// The time of the last input: explanations reckon waits from it.
     now: i64,
 }

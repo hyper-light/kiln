@@ -402,6 +402,124 @@ fn the_room_rule_both_dispatchers_and_the_runner_use() {
     assert_eq!(Incoming::of(false, &half), Incoming::Ordinary);
 }
 
+/// SplitMix64, as kiln-sim draws: a seed's numbers, the same on every machine.
+struct Draw(u64);
+
+impl Draw {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+
+    fn pick<'a>(&mut self, of: &'a [String]) -> Option<&'a String> {
+        of.get(usize::try_from(self.below(of.len() as u64)).unwrap_or(0))
+    }
+}
+
+/// One seed's inputs, in order with their times: runners coming, going and back, legs queued at
+/// mixed priorities over runs, repositories, actors and lanes (some exclusive, some with work other
+/// runs adopt, some coalescing in a lane), attempts finishing and failing, legs cancelled, runs
+/// superseded with deprioritize and pushes' demands adopting, routing rules changed, ticks.
+fn inputs(seed: u64) -> Vec<(Input, i64)> {
+    let mut d = Draw(seed);
+    let (mut out, mut now, mut legs) = (Vec::new(), 0i64, Vec::<String>::new());
+    let runners = 1 + d.below(4);
+    let runner = |d: &mut Draw| format!("r{}", d.below(runners));
+    for r in 0..runners {
+        out.push((Input::RunnerUp(Box::new(linux(&format!("r{r}"), 1 + u32::try_from(d.below(3)).unwrap_or(0)))), now));
+    }
+    for _ in 0..60 {
+        now += i64::try_from(d.below(5_000)).unwrap_or(0);
+        let input = match d.below(100) {
+            0..=39 => {
+                let id = format!("l{}", legs.len());
+                legs.push(id.clone());
+                let mut l = leg(&id, &format!("acme/r{}", d.below(3)), u8::try_from(d.below(5) * 20).unwrap_or(60));
+                l.run = format!("run{}", d.below(4));
+                l.exclusive = d.below(10) == 0;
+                // Who pushed it and its lane (fair share's levels, W28-R66); work another run may
+                // adopt (W28-R42); a lane admission coalesces (W28-R61).
+                (l.actor, l.lane) = (format!("a{}", d.below(3)), format!("ln{}", d.below(2)));
+                if d.below(4) == 0 {
+                    l.work = Some(super::demand::Work { key: Some(format!("K{}", d.below(3))), domain: super::demand::Domain::Trusted, lane: "acme/x".into(), observed: false });
+                }
+                if d.below(5) == 0 {
+                    let coalesce = (d.below(2) == 0).then_some(super::admit::Coalesce { quiet: 5_000, max_wait: 60_000, always: d.below(2) == 0 });
+                    l.admission = Some(super::admit::Demand { lane: "acme/x\0ci\0main".into(), unit: "test".into(), order: u64::try_from(legs.len()).unwrap_or(0), coalesce, cadence: None, speculative: false });
+                }
+                Input::LegQueued(Box::new(l))
+            }
+            40..=59 => match d.pick(&legs) {
+                Some(id) => {
+                    let outcome = if d.below(4) == 0 { Outcome::Failed(super::retry::Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }) } else { Outcome::Success };
+                    Input::AttemptFinished { leg: id.clone(), attempt: 1, outcome }
+                }
+                None => Input::Tick,
+            },
+            60..=66 => Input::RunQueued { run: format!("run{}", d.below(4)), group: None, supersede: Some(("acme/r0\0main".into(), Supersede::Deprioritize)) },
+            67..=71 => Input::RulesChanged(vec![super::routing::native_rule()]),
+            72..=77 => Input::RunnerLost { runner: runner(&mut d) },
+            78..=84 => Input::RunnerUp(Box::new(linux(&runner(&mut d), 1 + u32::try_from(d.below(3)).unwrap_or(0)))),
+            85..=89 => match d.pick(&legs) {
+                Some(id) => Input::LegCancelled { leg: id.clone(), reason: "cancelled".into() },
+                None => Input::Tick,
+            },
+            // A push's demand, then its run, which adopts what an older one has in flight (W28-R46).
+            90..=94 => {
+                let run = format!("run{}", d.below(4));
+                let demand = super::demand::Demand { run: run.clone(), lane: "acme/x".into(), commit: format!("c{}", d.below(8)), domain: super::demand::Domain::Trusted, at: now, ..super::demand::Demand::default() };
+                out.push((Input::Demand(Box::new(demand)), now));
+                Input::RunQueued { run, group: None, supersede: Some(("acme/x".into(), Supersede::Adopt)) }
+            }
+            _ => Input::Tick,
+        };
+        out.push((input, now));
+    }
+    out
+}
+
+/// E1 (docs/needs.md), W05: the engine decides in a fixed order. The same inputs given to two
+/// schedulers in one process, whose hash maps hash apart (each map draws its own keys), give the
+/// same commands in the same order: 1,000 seeds of runners coming and going, legs queued, finished
+/// and cancelled, runs deprioritized and routing rules changed.
+#[test]
+fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
+    use super::state::FairBy;
+    let mut seen = [0u64; 3];
+    for seed in 0..1_000u64 {
+        // Fair share across repositories, or within them by actor and lane too (W28-R66).
+        let fair_by = match seed % 3 {
+            0 => vec![FairBy::Repo],
+            1 => vec![FairBy::Repo, FairBy::Actor],
+            _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
+        };
+        let cfg = Config { fair_by, ..Config::default() };
+        let (mut a, mut b) = (Scheduler::new(cfg.clone()), Scheduler::new(cfg));
+        for (step, ((x, now), (y, _))) in inputs(seed).into_iter().zip(inputs(seed)).enumerate() {
+            let (ca, cb) = (a.handle(x, now), b.handle(y, now));
+            for c in &ca {
+                match c {
+                    Command::Adopted { .. } => seen[0] += 1,
+                    Command::Demand { .. } => seen[1] += 1,
+                    Command::Wait { reason: WaitReason::Coalescing { .. }, .. } => seen[2] += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(ca, cb, "seed {seed}, input {step} at {now}");
+        }
+    }
+    // What the seeds cover of the work in flight and admission: adoptions, demands' decisions,
+    // legs coalescing.
+    assert!(seen.iter().all(|n| *n > 0), "adopted, demand decisions, coalescing: {seen:?}");
+}
+
 /// E1 (docs/needs.md), W05-R03: the rule counts in thousandths and compares without dividing, so
 /// a share that fills a runner to the last thousandth fits, and one thousandth more doesn't, where
 /// thirds made the float version lean on an epsilon.

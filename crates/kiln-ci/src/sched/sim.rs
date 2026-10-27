@@ -6,7 +6,7 @@
 pub mod replay;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use super::retry::{Failed, FailureClass};
 use super::state::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler, WaitReason};
@@ -33,14 +33,14 @@ pub struct Sim {
     pub sched: Scheduler,
     pub now: i64,
     queue: BinaryHeap<Reverse<(i64, u64)>>,
-    events: HashMap<u64, Ev>,
+    events: BTreeMap<u64, Ev>,
     seq: u64,
-    durations: HashMap<String, i64>,
+    durations: BTreeMap<String, i64>,
     /// A leg's duration on one runner, where it differs (a warm runner's, W24-R18): (leg, runner).
-    pub durations_on: HashMap<(String, String), i64>,
-    failures: HashMap<String, Vec<FailureClass>>,
-    repos: HashMap<String, String>,
-    running: HashMap<String, (String, i64)>,
+    pub durations_on: BTreeMap<(String, String), i64>,
+    failures: BTreeMap<String, Vec<FailureClass>>,
+    repos: BTreeMap<String, String>,
+    running: BTreeMap<String, (String, i64)>,
     pub assigned: Vec<Assigned>,
     pub settled: Vec<(i64, String, Outcome)>,
     pub waits: Vec<(i64, String, WaitReason)>,
@@ -56,7 +56,7 @@ pub struct Sim {
     /// How long a host takes to start a pool's executor (W13-R09).
     pub executor_start_ms: i64,
     /// Hosts whose executors fail to start.
-    pub failing_hosts: HashSet<String>,
+    pub failing_hosts: BTreeSet<String>,
     /// Executors started: (time, executor, host); and stopped: (time, executor).
     pub executors_started: Vec<(i64, String, String)>,
     pub executors_stopped: Vec<(i64, String)>,
@@ -68,13 +68,13 @@ impl Sim {
             sched: Scheduler::new(cfg),
             now: 0,
             queue: BinaryHeap::new(),
-            events: HashMap::new(),
+            events: BTreeMap::new(),
             seq: 0,
-            durations: HashMap::new(),
-            durations_on: HashMap::new(),
-            failures: HashMap::new(),
-            repos: HashMap::new(),
-            running: HashMap::new(),
+            durations: BTreeMap::new(),
+            durations_on: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            repos: BTreeMap::new(),
+            running: BTreeMap::new(),
             assigned: Vec::new(),
             settled: Vec::new(),
             waits: Vec::new(),
@@ -84,7 +84,7 @@ impl Sim {
             busy: Vec::new(),
             busy_legs: Vec::new(),
             executor_start_ms: 500,
-            failing_hosts: HashSet::new(),
+            failing_hosts: BTreeSet::new(),
             executors_started: Vec::new(),
             executors_stopped: Vec::new(),
         }
@@ -203,8 +203,8 @@ impl Sim {
     /// Each repository's share of the slot-time in `[from, to)`: a measurement of what the engine
     /// did, for tests and the bench, not a decision.
     #[allow(clippy::float_arithmetic)]
-    pub fn shares(&self, from: i64, to: i64) -> HashMap<String, f64> {
-        let mut by: HashMap<String, f64> = HashMap::new();
+    pub fn shares(&self, from: i64, to: i64) -> BTreeMap<String, f64> {
+        let mut by: BTreeMap<String, f64> = BTreeMap::new();
         for (repo, s, e) in &self.busy {
             let overlap = (e.min(&to) - s.max(&from)).max(0);
             *by.entry(repo.clone()).or_default() += overlap as f64;
@@ -221,8 +221,8 @@ impl Sim {
     /// Each group's share of the slot-time in `[from, to)`, legs grouped by `key` (their actor, their
     /// lane): a measurement, as [`Self::shares`] is.
     #[allow(clippy::float_arithmetic)]
-    pub fn shares_by(&self, from: i64, to: i64, key: impl Fn(&str) -> String) -> HashMap<String, f64> {
-        let mut by: HashMap<String, f64> = HashMap::new();
+    pub fn shares_by(&self, from: i64, to: i64, key: impl Fn(&str) -> String) -> BTreeMap<String, f64> {
+        let mut by: BTreeMap<String, f64> = BTreeMap::new();
         for (leg, s, e) in &self.busy_legs {
             let overlap = (e.min(&to) - s.max(&from)).max(0);
             *by.entry(key(leg)).or_default() += overlap as f64;

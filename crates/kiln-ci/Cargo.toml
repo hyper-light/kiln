@@ -35,5 +35,9 @@ proptest = "1"
 name = "expr"
 harness = false
 
+[[bench]]
+name = "sched"
+harness = false
+
 [lints]
 workspace = true
