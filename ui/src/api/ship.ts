@@ -71,7 +71,7 @@ export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded"
 
 /** A commit with every record its stand came from: `GET /api/ship/commits/{repo}/{sha}`. */
 export interface ShipDetail extends ShipCommit {
-  checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string }[] }[];
+  checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string; job?: string; run?: string }[] }[];
   build?: { platforms: { name: string; state: ShipPart }[]; image: { state: ShipPart; digest: string | null } };
   deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
   releases?: { state: string; message: string | null; rolled_back: boolean }[];

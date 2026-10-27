@@ -68,6 +68,8 @@ struct AttemptRec {
 
 #[derive(Debug, Clone, Default)]
 struct LegRec {
+    /// The job's id (`jobs.id`), the one its log streams under.
+    job: String,
     run_id: String,
     name: String,
     status: String,
@@ -503,7 +505,7 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     )?;
     let legs: Vec<(String, LegRec)> = st
         .query_map(params![repo_id, sha], |r| {
-            Ok((r.get::<_, String>(0)?, LegRec { run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, attempts: Vec::new() }))
+            Ok((r.get::<_, String>(0)?, LegRec { job: r.get(0)?, run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, attempts: Vec::new() }))
         })?
         .collect::<Result<_, _>>()?;
     let mut at = c.prepare("SELECT status, conclusion, failure_class FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
@@ -576,7 +578,9 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
         } else {
             leg.attempts.iter().map(|a| attempt_of(&a.status, a.conclusion.as_deref(), a.class.as_deref())).collect()
         };
-        let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default() };
+        // A leg names its job and run once it has run (Output streams that job's log).
+        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked");
+        let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()) };
         match checks.iter_mut().find(|c| c.pipeline == pipeline) {
             Some(c) => c.legs.push(l),
             None => checks.push(Check { pipeline: pipeline.to_string(), legs: vec![l] }),
@@ -797,6 +801,20 @@ fn render(rec: &Records, runners: &[RunnerSeen], now: i64) -> Rendered {
     Rendered { others: summary_of(rec, &j, now, false), yours, whose }
 }
 
+/// A leg as the detail shows it; `job` and `run` only once it has run (optional new fields).
+fn leg_json(l: &journey::Leg) -> Value {
+    let mut v = json!({ "name": l.name, "state": journey::leg_glyph(l), "attempts": l.attempts.len(), "note": l.note });
+    if let Some(o) = v.as_object_mut() {
+        if let Some(job) = &l.job {
+            o.insert("job".into(), json!(job));
+        }
+        if let Some(run) = &l.run {
+            o.insert("run".into(), json!(run));
+        }
+    }
+    v
+}
+
 /// A commit with every record its stand came from, as `viewer` sees it.
 fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Value {
     let j = journey_of(rec, runners, now);
@@ -804,7 +822,7 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
     let checks: Vec<Value> = j
         .checks
         .iter()
-        .map(|c| json!({ "pipeline": c.pipeline, "legs": c.legs.iter().map(|l| json!({ "name": l.name, "state": journey::leg_glyph(l), "attempts": l.attempts.len(), "note": l.note })).collect::<Vec<_>>() }))
+        .map(|c| json!({ "pipeline": c.pipeline, "legs": c.legs.iter().map(leg_json).collect::<Vec<_>>() }))
         .collect();
     let part = |p: Part| match p {
         Part::Queued => "queued",
@@ -1367,6 +1385,10 @@ mod tests {
             assert_eq!(pip("production").as_deref(), Some("needs"));
             assert_eq!(field(&one, &["build", "image", "digest"]).and_then(Value::as_str), Some("sha256:abc"));
             assert_eq!(field(&one, &["checks"]).and_then(Value::as_array).map(Vec::len), Some(1));
+            // A leg that ran names its job and its run, for Output to stream.
+            let leg = field(&one, &["checks"]).and_then(Value::as_array).and_then(|c| c.first()).and_then(|c| c.get("legs")).and_then(Value::as_array).and_then(|l| l.first()).cloned().unwrap_or_default();
+            assert!(leg.get("job").and_then(Value::as_str).is_some_and(|j| !j.is_empty()), "a leg that ran names its job: {leg}");
+            assert!(leg.get("run").and_then(Value::as_str).is_some_and(|r| !r.is_empty()), "a leg that ran names its run: {leg}");
 
             let shipped = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(field(&shipped, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));

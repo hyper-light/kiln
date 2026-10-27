@@ -884,7 +884,17 @@ export class Trunk {
     ];
     return {
       ...this.row(c),
-      checks: c.checks.pipes.map((p) => ({ pipeline: p.name, legs: p.jobs.map((j) => ({ name: j.name, state: leg(j), attempts: j.retried ? 2 : 1, note: j.note })) })),
+      checks: c.checks.pipes.map((p) => ({
+        pipeline: p.name,
+        legs: p.jobs.map((j, i) => ({
+          name: j.name,
+          state: leg(j),
+          attempts: j.retried ? 2 : 1,
+          note: j.note,
+          // Once it has run, the job it ran as and that job's run (Output streams its log).
+          ...(j.state === "none" || j.state === "queued" ? {} : { job: `ship-job-${c.id}-${p.name}-${i}`, run: `ship-run-${c.id}` }),
+        })),
+      })),
       build: {
         platforms: c.build.plats.map((p) => ({ name: PLATS.find((x) => x.id === p.id)?.name ?? p.id, state: part(p.state) })),
         image: { state: part(c.build.image.state), digest: c.build.image.state === "passed" ? `sha256:${c.sha.slice(0, 12)}` : null },
