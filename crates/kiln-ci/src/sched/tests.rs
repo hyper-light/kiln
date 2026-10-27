@@ -1851,3 +1851,55 @@ fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_
     assert_eq!(s.headroom("nowhere"), None);
 }
 
+/// The scheduler's headroom, placement (W05): a leg goes to the runner its live sample leaves the
+/// most headroom after it, within the target use (85%); I/O pressure counts against a runner; a
+/// leg every runner with room would pass the target with waits, saying so, and goes once a sample
+/// shows room; once samples go stale, runners are placed as before them.
+#[test]
+fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
+    use super::state::{SAMPLE_FRESH_MS, Sample};
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 8))), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy: f64, io: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) } }, at)
+    };
+    let asking = |id: &str, cpu: f64, mem_gib: u64| LegIn { request: Resources { cpu, mem: mem_gib * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    // a at 80% of its CPUs, b at 30%: 4 CPUs go to b.
+    say(&mut s, "a", 0.8, 0.0, 1_000);
+    say(&mut s, "b", 0.3, 0.0, 1_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("first", 4.0, 2))), 2_000);
+    assert_eq!(to(&c, "first").as_deref(), Some("b"), "{c:?}");
+    // Even, but a's disk under pressure: b.
+    say(&mut s, "a", 0.5, 20.0, 3_000);
+    say(&mut s, "b", 0.5, 0.0, 3_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("second", 1.0, 2))), 4_000);
+    assert_eq!(to(&c, "second").as_deref(), Some("b"), "{c:?}");
+    // Both at 84%: one more CPU of 32 passes 85% on either. It waits, saying so.
+    say(&mut s, "a", 0.84, 0.0, 5_000);
+    say(&mut s, "b", 0.84, 0.0, 5_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("third", 1.0, 2))), 6_000);
+    assert_eq!(to(&c, "third"), None, "{c:?}");
+    assert_eq!(s.reason("third"), Some(&WaitReason::Headroom { target: 85, runners: vec!["a".into(), "b".into()] }));
+    // b's next sample shows room: it goes there.
+    let c = say(&mut s, "b", 0.5, 0.0, 7_000);
+    assert_eq!(to(&c, "third").as_deref(), Some("b"), "{c:?}");
+    // Memory the same: 40 GiB more on 16 of 64 in use passes the target, wherever CPUs are free.
+    say(&mut s, "a", 0.1, 0.0, 8_000);
+    say(&mut s, "b", 0.1, 0.0, 8_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("big", 1.0, 40))), 9_000);
+    assert_eq!(to(&c, "big"), None, "{c:?}");
+    assert!(matches!(s.reason("big"), Some(WaitReason::Headroom { target: 85, .. })), "{:?}", s.reason("big"));
+    // A minute on with no samples: placed as before them, by slots.
+    let c = s.handle(Input::LegQueued(Box::new(asking("fourth", 30.0, 2))), 8_000 + SAMPLE_FRESH_MS + 1);
+    assert!(to(&c, "fourth").is_some(), "{c:?}");
+}
+

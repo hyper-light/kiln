@@ -932,6 +932,7 @@ export function waitSentence(w: unknown): string | null {
     offline?: string[];
     failing?: string[];
     runners?: string[];
+    target?: number;
     group?: string;
     holders?: string[];
     limit?: number;
@@ -971,6 +972,8 @@ export function waitSentence(w: unknown): string | null {
       return `Waiting for a free runner: ${o.eligible ?? 0} can take it, ${o.busy ?? 0} busy${o.draining ? `, ${o.draining} draining` : ""}.`;
     case "oversized":
       return `It asks for more than any runner that can take it has (${o.asked ?? "its request"})${list(o.short)}.`;
+    case "headroom":
+      return `Every runner with room for it would pass ${o.target ?? 85}% use with it${list(o.runners)}.`;
     case "no-runner":
       return `No runner that can take it is connected${list(o.offline)}.`;
     case "unroutable":

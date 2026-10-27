@@ -451,6 +451,8 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         overcommit_mem: s.overcommit.memory,
         overcommit_disk: s.overcommit.disk,
         fair_by: s.fair_levels(),
+        // Within (0, 1]: past it a runner would be filled past all it has.
+        target_use: if s.target_use > 0.0 && s.target_use <= 1.0 { s.target_use } else { kiln_ci::sched::state::TARGET_USE },
         // Admission by load (W24-R19): off until set, and while it doesn't read.
         admission: s.admission.as_ref().and_then(|a| a.admission().inspect_err(|e| tracing::warn!(error = %e, "admission by load is off")).ok()),
         ..Config::default()
