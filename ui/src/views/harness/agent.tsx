@@ -36,6 +36,7 @@ import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { AccountDialog } from "./account-card";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
+import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
 import { useListener } from "./dom";
@@ -55,6 +56,7 @@ import { PlanSourceContext } from "@/views/plans/save";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
 import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
+import { AboutContext } from "@/components/code/about";
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -102,6 +104,9 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   useMarkSeen(id);
   const navigate = useNavigate();
   const info = useSession(store, (s) => s.info);
+  // Code in its conversation can be asked about (components/code/about.tsx): by a helper of its, or, with subagents off, it.
+  const busy = useSession(store, (s) => s.state?.turn_started != null);
+  const about = React.useMemo(() => ({ id, name: info?.name, subagents: info?.max_subagents !== 0, busy, store }), [id, info?.name, info?.max_subagents, busy, store]);
   const gone = useSession(store, (s) => s.conn === "gone");
   const cwd = useSession(store, (s) => s.state?.cwd || s.info?.cwd || "");
   const accepts = useSession(store, (s) => acceptsOf(s.meta));
@@ -326,24 +331,26 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       ) : (
         <>
           <PlanSourceContext.Provider value={planSource}>
-            <Timeline
-              key={task ?? "main"}
-              store={store}
-              agent={id}
-              cwd={cwd}
-              parent={task ?? undefined}
-              onOpenTask={openTask}
-              onCommand={send}
-              onReply={setReply}
-              agentLabel={task ? "Subagent" : info?.kind_name}
-              agentName={info?.name}
-              onDecide={send}
-              target={info?.target}
-              kind={info?.kind}
-              accountOpen={account !== null}
-              find={find}
-              footer={footer}
-            />
+            <AboutContext.Provider value={task ? null : about}>
+              <Timeline
+                key={task ?? "main"}
+                store={store}
+                agent={id}
+                cwd={cwd}
+                parent={task ?? undefined}
+                onOpenTask={openTask}
+                onCommand={send}
+                onReply={setReply}
+                agentLabel={task ? "Subagent" : info?.kind_name}
+                agentName={info?.name}
+                onDecide={send}
+                target={info?.target}
+                kind={info?.kind}
+                accountOpen={account !== null}
+                find={find}
+                footer={footer}
+              />
+            </AboutContext.Provider>
           </PlanSourceContext.Provider>
           <Dock
             store={store}
@@ -407,7 +414,9 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           collapsed={trayCollapsed}
           onCollapsed={setTrayCollapsed}
           side={(actions) => (
-            <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} kiln={kiln} className="hx-side" actions={actions} />
+            <AboutContext.Provider value={about}>
+              <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} kiln={kiln} className="hx-side" actions={actions} />
+            </AboutContext.Provider>
           )}
         >
           {work}
@@ -418,19 +427,21 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           {phoneTab === "work" ? (
             work
           ) : (
-            <Inspector
-              tab={phoneTab}
-              onTab={(t) => setPhoneTab(t)}
-              store={store}
-              cwd={cwd}
-              onOpenTask={openTask}
-              agentId={id}
-              harness={info?.kind_name}
-              send={send}
-              kiln={kiln}
-              hideTabs
-              className="hx-side hx-side-phone"
-            />
+            <AboutContext.Provider value={about}>
+              <Inspector
+                tab={phoneTab}
+                onTab={(t) => setPhoneTab(t)}
+                store={store}
+                cwd={cwd}
+                onOpenTask={openTask}
+                agentId={id}
+                harness={info?.kind_name}
+                send={send}
+                kiln={kiln}
+                hideTabs
+                className="hx-side hx-side-phone"
+              />
+            </AboutContext.Provider>
           )}
         </div>
       )}
@@ -603,6 +614,9 @@ function Dock({
   const exit = useSession(store, (s) => s.state?.exit);
   const empty = useSession(store, (s) => s.events.length === 0);
   const resume = useSession(store, (s) => (s.meta?.features ?? []).includes("resume"));
+  const info = useSession(store, (s) => s.info);
+  const harnessSession = useSession(store, (s) => s.state?.harness_session ?? s.info?.harness_session);
+  const [moving, setMoving] = React.useState(false);
   return (
     <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
       <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} />
@@ -610,6 +624,11 @@ function Dock({
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}
           <div className="mt-2 flex flex-wrap gap-2">
+            {info && movable({ target: info.target, status, harness_session: harnessSession }) && (
+              <Button size="sm" variant="secondary" onClick={() => setMoving(true)}>
+                Move to…
+              </Button>
+            )}
             <Button size="sm" variant="secondary" onClick={() => navigate("/agents?new=1")}>
               Start a new one
             </Button>
@@ -617,6 +636,7 @@ function Dock({
               Remove this one
             </Button>
           </div>
+          {moving && info && <MoveDialog agent={{ ...info, status }} onClose={() => setMoving(false)} />}
         </div>
       ) : status === "exited" ? (
         <div className="hx-exited">

@@ -319,6 +319,9 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .pt {
   display: flex;
   align-items: stretch;
+  min-width: 0;
+  /* More tabs than the window is wide: the rail scrolls them itself, the page never does. */
+  overflow-x: auto;
   border-top: 1px solid #222a33;
   border-bottom: 1px solid #222a33;
 }
@@ -721,6 +724,9 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   display: flex;
   flex-direction: column;
   gap: 30px;
+}
+.in-secs > * {
+  min-width: 0;
 }
 .in-sec-head {
   display: flex;

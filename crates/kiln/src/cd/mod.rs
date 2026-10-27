@@ -322,7 +322,7 @@ impl Cd {
         for child in children {
             self.unregister(&child, cascade);
         }
-        self.hub.emit(&json!({"type": "cd_app_deleted", "app": id}));
+        self.hub.emit(&crate::wire::events::ServerEvent::CdAppDeleted { app: id.to_owned() });
     }
 
     // ---------------------------------------------------------------- sources
@@ -1456,10 +1456,10 @@ impl Cd {
                 continue;
             }
             let statuses = self.statuses.read();
-            let apps: Vec<Value> = dirty.iter().filter_map(|a| statuses.get(a)).map(summary_json).collect();
+            let apps: Vec<crate::wire::events::CdStatus> = dirty.iter().filter_map(|a| statuses.get(a)).map(crate::wire::events::CdStatus::of).collect();
             drop(statuses);
             for chunk in apps.chunks(500) {
-                self.hub.emit(&json!({"type": "cd_apps", "apps": chunk}));
+                self.hub.emit(&crate::wire::events::ServerEvent::CdApps { apps: chunk.to_vec() });
             }
         }
     }
@@ -1497,6 +1497,12 @@ fn in_place_of_head(mut stack: Vec<String>, runs: &str) -> Vec<String> {
 
 /// An app's status as the API and events show it.
 pub fn summary_json(s: &Summary) -> Value {
+    serde_json::to_value(crate::wire::events::CdStatus::of(s)).unwrap_or(Value::Null)
+}
+
+/// [`summary_json`] as it was built before [`crate::wire::events::CdStatus`], for its test.
+#[cfg(test)]
+fn summary_json_was(s: &Summary) -> Value {
     json!({
         "app": s.app.as_ref(),
         "sync": s.sync.as_str(),
@@ -1703,6 +1709,32 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app's status is the JSON it was before it was a type (`wire::events::CdStatus`).
+    #[test]
+    fn summary_json_is_what_it_was() -> anyhow::Result<()> {
+        use kiln_cd::engine::{OpPhase, OpStatus, Trigger};
+        let mut s = Summary {
+            app: "default/web".into(),
+            sync: kiln_cd::model::Sync::OutOfSync,
+            health: kiln_cd::model::Health::Progressing,
+            revision: None,
+            resources: 4,
+            out_of_sync: 2,
+            shared: 0,
+            missing: 1,
+            prune: 1,
+            unmarked: 0,
+            operation: None,
+            message: None,
+        };
+        anyhow::ensure!(summary_json(&s) == summary_json_was(&s), "{}", summary_json(&s));
+        s.revision = Some("abc".into());
+        s.message = Some("rendering".into());
+        s.operation = Some(OpStatus { id: 3, phase: OpPhase::Running, trigger: Trigger::SelfHeal, attempt: 1, message: "applying".into(), by: Some("user:ada".into()), started_ms: 10, finished_ms: None });
+        anyhow::ensure!(summary_json(&s) == summary_json_was(&s), "{}", summary_json(&s));
+        Ok(())
+    }
 
     /// An Application `kiln-root` renders (app of apps).
     fn child(name: &str) -> Result<AppDef, String> {

@@ -513,6 +513,7 @@ mod tests {
             spec: None,
             steps,
             matrix: None,
+            placement: None,
         }
     }
 

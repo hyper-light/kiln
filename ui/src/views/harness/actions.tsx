@@ -1,7 +1,5 @@
 /** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove, mute its notifications. */
 import * as React from "react";
-import { useNavigate } from "@/lib/router";
-import { startFrom } from "./new-agent-draft";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command } from "@/api/harness";
@@ -12,7 +10,7 @@ import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
-import { MoveDialog } from "./move";
+import { MoveDialog, movable } from "./move";
 import { useEndWithChildren } from "./family";
 
 const ReachDialog = React.lazy(() => import("./reach").then((m) => ({ default: m.ReachDialog })));
@@ -23,7 +21,6 @@ export function useAgentActions(
   a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off">,
   after?: { onGone?: () => void },
 ) {
-  const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
   // Kiln keeps it going when it stops part-way unless switched off here (shown at once, kept on the server).
   const [keepSet, setKeepSet] = React.useState<boolean | null>(null);
@@ -58,9 +55,9 @@ export function useAgentActions(
     },
     { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
     { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
-    { label: "Duplicate", onSelect: () => startFrom(navigate, { from: `Like ${a.name}`, kind: a.kind, target: a.target, cwd: a.cwd }) },
-    // Agents the kiln server itself runs stay there.
-    { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !a.target.startsWith("agent:") },
+    { label: "Duplicate…", onSelect: () => setAct("duplicate") },
+    // Agents the kiln server itself runs stay there once they've started; an ended one goes nowhere.
+    { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !movable(a) },
     { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },

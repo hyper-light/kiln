@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AgentKeep, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KeepRules, KeepView, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunRow, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -238,7 +238,7 @@ export const api = {
 
   /** Newest first, older pages `before` a time; or by `sort` (`oldest`, `longest`, `shortest`), later pages from `offset`. */
   runs: (params: { repo?: string; limit?: number; before?: string | number; sort?: string; offset?: number }, signal?: AbortSignal) =>
-    get<Run[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before, sort: params.sort, offset: params.offset })}`, signal),
+    get<RunRow[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before, sort: params.sort, offset: params.offset })}`, signal),
   run: (id: string, signal?: AbortSignal, attempt?: number) => get<RunDetail>(`/api/runs/${enc(id)}${attempt ? `?attempt=${attempt}` : ""}`, signal),
   cancelRun: (id: string) => post<void>(`/api/runs/${enc(id)}/cancel`),
   retryRun: (id: string, onlyFailed: boolean) => post<void>(`/api/runs/${enc(id)}/retry`, { only_failed: onlyFailed }),
@@ -310,6 +310,23 @@ export const api = {
   upgradeServer: (action: "restart" | "replace") => post<UpdateJob>("/api/updates/server", { action }),
   uploadBinary: (target: string, file: Blob) => request<KilnBinary>("POST", `/api/updates/binaries${qs({ target })}`, undefined, { file }),
   deleteBinary: (target: string) => del<void>(`/api/updates/binaries/${enc(target)}`),
+
+  /** The copies runners keep of other runners' trees (docs/reach.md §5.1): every scope's rules, and what each runner holds and let go. */
+  keep: (signal?: AbortSignal) => get<KeepView>("/api/reach/keep", signal),
+  /** Every runner's rules (null: none). */
+  setKeepRules: (rules: KeepRules | null) => (rules ? request<void>("PUT", "/api/reach/keep/rules", rules) : del<void>("/api/reach/keep/rules")),
+  /** A runner's own rules (null: every runner's apply). */
+  setRunnerKeep: (name: string, rules: KeepRules | null) => (rules ? request<void>("PUT", `/api/reach/keep/runners/${enc(name)}`, rules) : del<void>(`/api/reach/keep/runners/${enc(name)}`)),
+  /** A repository's copies' rules, by its key (null: each runner's apply). */
+  setRepoKeep: (key: string, rules: KeepRules | null) => {
+    const path = `/api/reach/keep/repos/${key.split("/").map(enc).join("/")}`;
+    return rules ? request<void>("PUT", path, rules) : del<void>(path);
+  },
+  /** That runner (or every one) lets go now of what its rules don't keep. */
+  keepNow: (runner?: string) => post<{ asked: string[] }>(runner ? `/api/reach/keep/runners/${enc(runner)}/now` : "/api/reach/keep/now"),
+  /** An agent's own rules for its copies, and its copies on every runner. */
+  agentKeep: (id: string, signal?: AbortSignal) => get<AgentKeep>(`/api/harness/sessions/${enc(id)}/keep`, signal),
+  setAgentKeep: (id: string, rules: KeepRules | null) => (rules ? request<void>("PUT", `/api/harness/sessions/${enc(id)}/keep`, rules) : del<void>(`/api/harness/sessions/${enc(id)}/keep`)),
 
   /** Whether kiln turns recordings into text (for browsers without speech recognition of their own). */
   voice: (signal?: AbortSignal) => get<{ transcribe: boolean; language: string }>("/api/voice", signal),

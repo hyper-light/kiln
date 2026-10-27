@@ -8,71 +8,88 @@ import { wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import type { TerminalSessionInfo } from "./types";
+import type {
+  Account,
+  AccountFlow,
+  AgentInfo,
+  Attachment,
+  Command,
+  ControlOption,
+  FileChange,
+  Event as HEvent,
+  KeptFile,
+  Meta,
+  ModelOption,
+  ModeOption,
+  SendMode,
+  SessionDown,
+  SessionUp,
+  SlashCommand,
+  AgentState as State,
+  SessionStatus as Status,
+} from "./wire";
+export type {
+  Account,
+  AccountFlow,
+  AccountMethod,
+  AgentInfo,
+  AlwaysOption,
+  Approval,
+  ApprovalBrief,
+  Attachment,
+  ChoiceAnswer,
+  Command,
+  Compacting,
+  Control,
+  ControlOption,
+  Decision,
+  Delivery,
+  ExitInfo,
+  FileChange,
+  FileDiff,
+  FileMeta,
+  HeldGoals as Held,
+  Event as HEvent,
+  HookInfo,
+  Hunk,
+  JsonValue,
+  KeptFile,
+  Known,
+  Level,
+  Limit,
+  McpServer,
+  Meta,
+  ModelOption,
+  ModeOption,
+  MovePlan,
+  Pause,
+  Plugin,
+  Question,
+  QuestionOption,
+  QueueItem,
+  SendMode,
+  SessionDown,
+  SessionUp,
+  Skill,
+  SlashCommand,
+  AgentState as State,
+  SessionStatus as Status,
+  StatusItem,
+  StreamDown,
+  StreamUp,
+  SubagentBrief,
+  Task,
+  Todo,
+  ToolCall,
+  ToolKind,
+  ToolStatus,
+  TurnEnd,
+  Usage,
+  WebrtcDown,
+  WebrtcUp,
+} from "./wire";
 
 /* ------------------------------------------------------------------ model */
-
-export type Level = "info" | "warn" | "error";
-export type ToolKind = "shell" | "edit" | "read" | "search" | "web" | "agent" | "skill" | "todo" | "question" | "plan" | "mcp" | "other";
-export type ToolStatus = "pending" | "running" | "done" | "error" | "denied" | "cancelled";
-export type Status = "starting" | "idle" | "running" | "waiting" | "exited" | "disconnected";
-export type SendMode = "queue" | "steer" | "now";
-export type Delivery = "sent" | "queued" | "started" | "completed" | "cancelled";
-export type Decision = "allow" | "always" | "deny";
-
-export interface Hunk {
-  old_start: number;
-  old_lines: number;
-  new_start: number;
-  new_lines: number;
-  /** Each line keeps its ' ', '-' or '+' prefix. */
-  lines: string[];
-}
-
-export interface FileDiff {
-  path: string;
-  created?: boolean;
-  hunks: Hunk[];
-}
-
-export interface Todo {
-  text: string;
-  status: "pending" | "in_progress" | "completed" | string;
-}
-
-export interface ToolCall {
-  tool_id: string;
-  name: string;
-  tool: ToolKind;
-  title: string;
-  detail?: string;
-  input: unknown;
-  status: ToolStatus;
-  output?: string;
-  truncated?: boolean;
-  diffs?: FileDiff[];
-  todos?: Todo[];
-  task?: string;
-  exit_code?: number;
-  started: number;
-  ended?: number;
-  /** MCP calls: the server and the tool's own name. */
-  server?: string;
-  tool_short?: string;
-  /** Skill calls: which skill. */
-  skill?: string;
-  /** A command run on another machine (kiln reach): the runner once picked, what it must be (`linux/amd64`) until then, "" while kiln picks the best. */
-  runner?: string;
-}
-
-export type Body =
-  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string; reply_to?: string }
-  | { kind: "assistant"; text: string; streaming?: boolean; reply_to?: string }
-  | { kind: "thinking"; text: string; streaming?: boolean; redacted?: boolean }
-  | ({ kind: "tool" } & ToolCall)
-  | { kind: "notice"; level: Level; text: string };
-
-/** `by`: the harness that was running when it appeared (a conversation switched between harnesses keeps who said what). */
-export type HEvent = { id: string; seq: number; at: number; parent?: string; by?: string } & Body;
 
 /** An event found in a conversation: its agent, the name and machine the server knows it by (none: it ended and is forgotten), the event. */
 export interface SaidHit {
@@ -81,105 +98,6 @@ export interface SaidHit {
   machine: string | null;
   event: HEvent;
 }
-
-export interface AlwaysOption {
-  label: string;
-  scope: string;
-  value: unknown;
-}
-
-export interface QuestionOption {
-  label: string;
-  description?: string;
-  /** Shown while the option is focused or picked (a mockup, a snippet). */
-  preview?: string;
-}
-
-export interface Question {
-  /** The harness's own id for it (Codex). */
-  id?: string;
-  question: string;
-  header?: string;
-  multi?: boolean;
-  options: QuestionOption[];
-  /** An answer in your own words is allowed (Claude always; Codex says). */
-  other?: boolean;
-  /** Mask what's typed. */
-  secret?: boolean;
-}
-
-export interface Approval {
-  id: string;
-  tool_id?: string | null;
-  tool_name: string;
-  tool: ToolKind;
-  title: string;
-  detail?: string;
-  input: unknown;
-  command?: string;
-  cwd: string;
-  diffs?: FileDiff[];
-  reason?: string;
-  always?: AlwaysOption[];
-  default_to_no?: boolean;
-  questions?: Question[];
-  plan?: string;
-  agent?: string;
-  at: number;
-}
-
-export interface QueueItem {
-  id: string;
-  text: string;
-  at: number;
-  attachments?: Attachment[];
-  overrides?: { model?: string; effort?: string };
-  reply_to?: string;
-}
-
-export interface Task {
-  id: string;
-  tool_id?: string;
-  description: string;
-  kind?: string;
-  status: string;
-  background?: boolean;
-  depth?: number;
-  parent_task?: string;
-  prompt?: string;
-  summary?: string;
-  last_tool?: string;
-  tokens?: number;
-  tool_uses?: number;
-  duration_ms?: number;
-  started: number;
-  ended?: number;
-  /** What it is: a shell or monitor the agent left running, a subagent, a workflow, a backgrounded MCP call. */
-  class?: "shell" | "monitor" | "agent" | "workflow" | "mcp";
-  /** What a shell or monitor runs, and where. */
-  command?: string;
-  cwd?: string;
-  /** Where its output is written on the agent's machine (display only; read it with taskOutput). */
-  output?: string;
-  process?: string;
-  exit_code?: number;
-  /** Monitors: how many events it has seen, and the latest. */
-  events?: number;
-  last_event?: string;
-  /** Monitors: whom an event wakes ("agent", or a subagent task's id). */
-  wakes?: string;
-  /** Whether a stop can work. */
-  stoppable?: boolean;
-  /** Subagents: how a person's message reaches it now (a `send` with its `task`); none: it takes none, and the composer writes to the agent. */
-  takes?: SendMode[];
-  /** "parent": a message to it goes by way of the agent that started it (its harness takes none from kiln itself). */
-  via?: string;
-  /** Messages waiting for it to finish what it's doing. */
-  queue?: QueueItem[];
-}
-
-/** A harness's own subagent, tracked within its parent's session without another executor. */
-export type SubagentBrief = Pick<Task, "id" | "tool_id" | "description" | "status" | "parent_task" | "started" | "ended">;
 
 /** A slice of a task's output (`since` → `offset`); `gone` once the harness deleted it. */
 export interface TaskOutput {
@@ -195,284 +113,12 @@ export interface TaskOutput {
   error?: string;
 }
 
-export interface Usage {
-  cost_usd: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  turns: number;
-  context_tokens?: number;
-  context_window?: number;
-}
-
-/** An MCP server the agent can use. `target` is the command line or URL, never with secrets. */
-export interface McpServer {
-  name: string;
-  scope: string;
-  transport: string;
-  status: "connected" | "pending" | "failed" | "needs_auth" | "disabled" | string;
-  error?: string;
-  enabled: boolean;
-  tools: { name: string; description?: string }[];
-  resources?: number;
-  prompts?: number;
-  target?: string;
-}
-
-export interface Skill {
-  name: string;
-  description: string;
-  source: string;
-  path?: string;
-  args_hint?: string;
-  user_invocable: boolean;
-}
-
-export interface Plugin {
-  name: string;
-  source?: string;
-  enabled: boolean;
-  skills?: string[];
-  commands?: string[];
-}
-
-/** A plan limit of the account the agent runs as (5-hour window, weekly …). */
-export interface Limit {
-  id: string;
-  label: string;
-  used_percent: number | null;
-  used?: number;
-  limit?: number;
-  unit?: string;
-  /** Unix ms. */
-  resets_at?: number;
-  window?: string;
-  /** A stable, non-secret id of the account ("claude:max:3f2a…"), the same across its agents. */
-  account?: string;
-  /** "allowed", "warning" (close to the limit) or "rejected" (reached), when the harness says. */
-  status?: string;
-}
-
-/** One line of the harness's status: version, account, model, sandbox, MCP servers … */
-export interface StatusItem {
-  group: string;
-  label: string;
-  value: string;
-  tone?: "ok" | "warn" | "error";
-}
-
-export interface ExitInfo {
-  code: number | null;
-  error?: string;
-  /** Unix ms it ended: what a stop is known by (its card's key). */
-  at?: number;
-}
-
 /** One file's change since the agent first touched it (the server keeps it cumulative). */
-/** A file as its machine had it (`crate::harness::files::Meta`). */
-export interface FileMeta {
-  size: number;
-  /** Unix ms. */
-  mtime: number;
-  mime: string;
-  /** In pixels as it shows, for a picture or a recording whose start says. */
-  width?: number;
-  height?: number;
-}
-
-/**
- * A file a finished message mentioned, as the server kept it (`crate::harness::kept::Kept`): the
- * file as it was when the message (`seq`) was done. `sha`: a copy is kept (served for good);
- * without one it's read from its machine when someone looks. `error`: why it couldn't be read.
- */
-export interface KeptFile {
-  path: string;
-  seq: number;
-  meta?: FileMeta;
-  sha?: string;
-  error?: string;
-}
 
 /** A conversation's kept files with these added (each path and message once). */
 function withFiles(was: KeptFile[], added: KeptFile[]): KeptFile[] {
   const fresh = added.filter((a) => !was.some((w) => w.path === a.path && w.seq === a.seq));
   return fresh.length ? [...was, ...fresh] : was;
-}
-
-export interface FileChange {
-  /** Relative to its working tree's top (`tree`) when it's in one, else to the agent's folder. */
-  path: string;
-  /** The top of the git working tree it's in: its folder's repository's own, or a worktree of it. */
-  tree?: string;
-  created?: boolean;
-  deleted?: boolean;
-  added: number;
-  removed: number;
-  hunks: Hunk[];
-  truncated?: boolean;
-  at: number;
-}
-
-/** A compaction under way (`State.compacting`): the main thread's, or a subagent's (`parent`, its spawning call). */
-export interface Compacting {
-  /** Unix ms it began. */
-  since: number;
-  /** The context it compacts, in tokens, as its harness last said (the main thread's). */
-  tokens?: number;
-  parent?: string;
-}
-
-export interface State {
-  status: Status;
-  goal?: string;
-  turn_started?: number;
-  summary?: string;
-  /** What it is doing right now, in plain words. */
-  doing?: string;
-  files_changed?: number;
-  lines_added?: number;
-  lines_removed?: number;
-  harness_session?: string;
-  cwd: string;
-  model: string;
-  mode: string;
-  title: string;
-  /** Its name as a person last gave it (absent: the one it started with). */
-  name?: string;
-  approvals: Approval[];
-  queue: QueueItem[];
-  delivery: Record<string, Delivery>;
-  tasks: Task[];
-  todos: Todo[];
-  usage: Usage;
-  activity?: string;
-  /** Its harness is compacting a conversation now; its marker (a `compaction:` notice) says how it went. */
-  compacting?: Compacting;
-  exit?: ExitInfo;
-  dropped: number;
-  effort?: string;
-  /** The speed it runs at: absent or "" standard, else one of `Meta.speeds`. */
-  speed?: string;
-  /** Why its faster speeds can't serve it now (its account doesn't allow them), as its harness said. */
-  speed_blocked?: string;
-  /** Fast, but at standard speed for now: fast mode's own rate limit is cooling down (Claude Code). */
-  speed_cooldown?: boolean;
-  /** Live values of Meta.controls, by id. */
-  control_values?: Record<string, unknown>;
-  limits?: Limit[];
-  /** The harness's own status lines (`status` is the session's lifecycle). */
-  harness_status?: StatusItem[];
-  mcp?: McpServer[];
-  skills?: Skill[];
-  plugins?: Plugin[];
-  /** The account's plan as the harness reports it ("Max", "Pro", "API key", …) and a stable account id. */
-  plan?: string;
-  account?: string;
-  /** Shells, monitors and other tasks still running while the agent is idle or ended. */
-  left_behind?: number;
-  /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
-  reach?: string | null;
-  /** Which of those lists the harness has reported yet (servers that predate it omit this). */
-  inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
-  /** A switch to another harness's model, waiting for the turn under way to end: with the permission
-   * mode and effort it carries over and that harness's choices of each, how it will run there. */
-  switching?: { kind: string; model: string; mode?: string; effort?: string; modes?: ModeOption[]; efforts?: ControlOption[] };
-  /** Nothing more goes to the harness until this ends: its account reached a usage limit. Queued messages, goals and plan steps wait. */
-  pause?: Pause;
-  /** It pauses once a limit is this full (percent): between turns, or at the next step of one under way; absent: only when one is reached. */
-  pause_at?: number;
-  /** The most subagents it runs at once: its harness's own, and the agents it starts through kiln (absent: no limit of its own). */
-  max_subagents?: number;
-  /** How its last turn ended (what kiln's keep-going reads). */
-  last_turn?: TurnEnd;
-  /** Turns in a row kiln started to keep it going, since a person last said something. */
-  kept?: number;
-  /** A pause ends only when a person resumes it. */
-  manual_resume?: boolean;
-  /** At a limit it goes on on another machine whose harness is signed in to an account with room. */
-  move_on_limit?: boolean;
-  /** Where it goes on then, as a person chose (sent by runners that take one, empty or not). */
-  move_plan?: MovePlan;
-}
-
-/**
- * Where an agent goes on at a usage limit (`State.move_plan`): a machine (`agent:<name>`), and a
- * harness and model there. What isn't said kiln picks: whichever has room, its own harness or one
- * its conversation can be carried into.
- */
-export interface MovePlan {
-  to?: string;
-  kind?: string;
-  model?: string;
-}
-
-/** Why a session waits for a usage limit, and until when (`State.pause`). */
-export interface Pause {
-  /** "limit" (a limit was reached) or "threshold" (a limit got as full as `pause_at`). */
-  reason: string;
-  /** The window, as a `Limit.id`, when known. */
-  window?: string;
-  label?: string;
-  /** What the harness said, as it said it. */
-  said?: string;
-  /** Unix ms the window starts over, when known. */
-  until?: number;
-  /** Unix ms it paused. */
-  since: number;
-  /** It goes on by itself once the limit resets. */
-  auto: boolean;
-  /** "harness" (it reached the limit), "account" (another agent on its account did) or "threshold". */
-  by: string;
-  /** The turn the limit cut off: it goes on first. */
-  cut?: { message?: string; text?: string; at: number };
-  /** Its folder as it was when it paused, kept in a hidden git ref. */
-  checkpoint?: { git_ref: string; commit: string; at: number };
-  /** Checks at the reset that found the limit still reached. */
-  tries?: number;
-  /** Unix ms a check started (waiting for the harness's answer). */
-  checking?: number;
-  /** Unix ms of the next check, when the reset time isn't known. */
-  next_check?: number;
-}
-
-/** loading: not reported yet; ready: reported (an empty list means none); unsupported: the harness can't say. */
-export type Known = "loading" | "ready" | "unsupported";
-
-export interface ModeOption {
-  id: string;
-  label: string;
-  description: string;
-  dangerous?: boolean;
-}
-
-export interface ModelOption {
-  id: string;
-  label: string;
-  description?: string;
-  default?: boolean;
-  /** The effort levels it takes, lowest first (when the harness says). */
-  efforts?: string[];
-  /** The speeds faster than standard it runs at, slowest first (when the harness says): a new agent can start at one (`Spec.speed`). */
-  speeds?: ControlOption[];
-}
-
-export interface SlashCommand {
-  name: string;
-  description?: string;
-  hint?: string;
-  /** "Session", "Model & mode", "Context", "Tools & MCP", "Skills", "Plugins", "Kiln". */
-  group?: string;
-  /** Whether it takes words after its name. */
-  args?: "none" | "optional" | "required";
-  aliases?: string[];
-  /** What running it does (servers that predate the catalog send none: a prompt). */
-  route?:
-    | { kind: "prompt"; text?: string; skill?: boolean }
-    | { kind: "control"; command: Record<string, unknown> }
-    | { kind: "view"; view: string }
-    | { kind: "unsupported"; reason: string }
-    /** Done in the harness's own screen, opened beside the agent on `command`. */
-    | { kind: "terminal"; command: string };
 }
 
 /** One goal of an agent's goal stack. */
@@ -582,170 +228,7 @@ export interface BroadcastPreview {
   speeds?: Counted<ControlOption>[];
 }
 
-export interface ControlOption {
-  id: string;
-  label: string;
-  description?: string;
-  dangerous?: boolean;
-}
-
-/**
- * Anything a harness lets you set or do, described generically so the console can offer it without
- * knowing the harness: effort, sandboxes, MCP servers, compaction, rewinds, output styles ...
- */
-export interface Control {
-  id: string;
-  group: string;
-  label: string;
-  description?: string;
-  kind: "select" | "toggle" | "action" | "text";
-  options?: ControlOption[];
-  value?: unknown;
-  dangerous?: boolean;
-  /** Can be set for one message only. */
-  per_turn?: boolean;
-  /** "turn": an action on one turn (rewind to it, branch from it). */
-  scope?: "session" | "turn";
-  requires?: string;
-  /** For an action that takes free text (compaction instructions …): the field's placeholder. */
-  input?: string;
-}
-
-/** A file sent with a message: inline, or uploaded first (`harnessApi.upload`) and referenced by id. */
-export interface Attachment {
-  name: string;
-  mime: string;
-  data_base64?: string;
-  file_id?: string;
-}
-
-/** A hook the harness runs on an event (read-only). */
-export interface HookInfo {
-  event: string;
-  matcher?: string;
-  command: string;
-  source?: string;
-}
-
-export interface Meta {
-  version: string;
-  controls?: Control[];
-  hooks?: HookInfo[];
-  /** Reasoning effort levels, when the harness has them. */
-  efforts?: ControlOption[];
-  /** The speeds faster than standard the model in use runs at, slowest first (absent: none). */
-  speeds?: ControlOption[];
-  modes: ModeOption[];
-  models: ModelOption[];
-  commands: SlashCommand[];
-  agents: string[];
-  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "set_speed", "stop_task", "file_suggestions", "resume", "switch_harness" */
-  features: string[];
-}
-
-export interface ApprovalBrief {
-  id: string;
-  tool: ToolKind;
-  tool_name: string;
-  title: string;
-  at: number;
-}
-
 /** An agent session as lists show it. */
-/** How a turn ended (`State.last_turn`). */
-export interface TurnEnd {
-  at: number;
-  /** "done", "cut" (stopped part-way), "stopped" (by you), "limit", "refused". */
-  how: string;
-  /** The harness's own word for it ("end_turn", "stop_sequence", "max_tokens" …). */
-  why?: string;
-  tools?: number;
-  /** Its last step was a tool that failed, with nothing said after it. */
-  after_error?: boolean;
-  /** Its last words ask you something. */
-  asks?: boolean;
-  kept?: number;
-}
-
-/** Goals an agent paused for you, until you resume them (`AgentInfo.held`). */
-export interface Held {
-  /** Why, as its goal stack says it ("Paused by the agent: …"). */
-  why: string;
-  /** The plan it waits for you to look at first, when that's why. */
-  plan?: string;
-  /** Unix ms it paused. */
-  since: number;
-}
-
-export interface AgentInfo {
-  id: string;
-  kind: string;
-  kind_name: string;
-  /** "local" or "agent:<machine>". */
-  target: string;
-  name: string;
-  shell?: string;
-  cwd: string;
-  /** The working tree its work is in (its latest change's): git's questions about its work go there. */
-  tree?: string;
-  created_at: number;
-  status: Status;
-  title: string;
-  model: string;
-  mode: string;
-  harness_session?: string;
-  approvals: ApprovalBrief[];
-  queued: number;
-  tasks_running: number;
-  /** Native Claude/Codex subagents, including their completed work (older servers omit these). */
-  subagents?: SubagentBrief[];
-  /** Shells, monitors and other tasks still running while the agent is idle or ended. */
-  left_behind?: number;
-  /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
-  reach?: string | null;
-  /** It waits for a usage limit to reset (as `State.pause`). */
-  pause?: Pause;
-  /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
-  keep_off?: boolean;
-  /** Its goals wait on you: it paused them for you, until you resume them (set on the server). */
-  held?: Held;
-  /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
-  move_on_limit?: boolean;
-  /** Where it goes on then (as `State.move_plan`). */
-  move_plan?: MovePlan;
-  /** Where it pauses as its limits fill (as `State.pause_at`). */
-  pause_at?: number;
-  /** The most subagents it runs at once (as `State.max_subagents`). */
-  max_subagents?: number;
-  cost_usd: number;
-  activity?: string;
-  last_activity: number;
-  exit?: ExitInfo;
-  /** Board summary (optional: older servers don't send them). */
-  goal?: string;
-  summary?: string;
-  todos_done?: number;
-  todos_total?: number;
-  files_changed?: number;
-  lines_added?: number;
-  lines_removed?: number;
-  context_pct?: number;
-  doing?: string;
-  turn_started?: number;
-  limits?: Limit[];
-  account?: string;
-  plan?: string;
-  /** The agent that started it (docs/agents.md, "Agents that run agents"). */
-  parent?: string;
-  /** The plan run it does a step of. */
-  plan_run?: string;
-  /** Its parent's subagent: kiln started it for one of its parent's goals or plan steps, on its parent's machine with its parent's settings, and it shows in its parent's chat and on its parent's row, not as an agent of its own. */
-  subagent?: boolean;
-  /** Started without its harness's skip-every-check mode (an agent it starts can't have it either). */
-  no_bypass?: boolean;
-  /** Its workspace of its own: a Slates volume over `over` (its repository's top), once made. */
-  workspace?: { kind: string; over?: string; sub?: string; made?: { volume: string; name: string; mount: string } };
-}
 
 /** What writing an agent's workspace back to its folder would do (`agents.land` without a landing). */
 export interface LandingPlan {
@@ -762,6 +245,47 @@ export interface LandingPlan {
   /** Whether this machine's Slates can take a person's go-ahead from kiln (not on Linux yet), and why not. */
   can_write: boolean;
   why_not?: string;
+}
+
+/** Whether an agent is one of the agents kiln lists: a card's helper (`helper`, `agents.about`) is the card's, no row of them. */
+export const listed = (a: AgentInfo) => !a.helper;
+
+/** What a person asks about a piece of code in an agent's conversation (`agents.about`). */
+export interface AboutAsk {
+  path: string;
+  /** The code around it. */
+  code: string;
+  line?: number;
+  /** The last of the lines, when they're several. */
+  end_line?: number;
+  /** The name tapped; none: the whole line. */
+  selection?: string;
+  /** It's about the change on that line. */
+  change?: boolean;
+  question?: string;
+  /** An agent answering itself does between its steps. */
+  now?: boolean;
+}
+
+/** An agent as kiln's operations brief it. */
+export interface AgentBrief {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  /** How it stands: working, needs, ready, finished, stopped, paused, offline, ended. */
+  stand?: string;
+  /** What it's doing now. */
+  doing?: string;
+  model?: string;
+}
+
+/** What an agent concluded (`agents.result`). */
+export interface AgentResult {
+  agent: AgentBrief;
+  reply?: { text: string; at: number } | null;
+  last_turn?: unknown;
+  cost_usd?: number;
 }
 
 /** An agent's children that still run (and theirs), as `agents.children` gives them. */
@@ -825,83 +349,6 @@ export interface Spec {
 
 /** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */
 export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
-
-export type Command =
-  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string }; reply_to?: string; task?: string }
-  | { type: "control"; id: string; value?: unknown }
-  | { type: "mcp_enable"; name: string; enabled: boolean }
-  | { type: "mcp_reconnect"; name: string }
-  | { type: "mcp_auth"; name: string; client: string }
-  | { type: "mcp_add"; scope: string; name: string; transport: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }
-  | { type: "mcp_remove"; scope: string; name: string }
-  | { type: "skill_view"; name: string; client: string }
-  /** `id`: the message's id, made once (a skill run is delivered like a message: once). */
-  | { type: "skill_run"; name: string; args?: string; id?: string }
-  | { type: "set_effort"; effort: string }
-  | { type: "set_speed"; speed: string }
-  | { type: "queue_edit"; id: string; text: string; attachments?: Attachment[] }
-  | { type: "queue_remove"; id: string }
-  | { type: "queue_move"; id: string; index: number }
-  | { type: "queue_send_now"; id: string }
-  | {
-      type: "approve";
-      id: string;
-      decision: Decision;
-      message?: string;
-      always?: number;
-      /** The older form: one string per question (runners from before `choices`). */
-      answers?: Record<string, string>;
-      /** Each question's answer as picked: labels, your own words, a note. Wins over `answers`. */
-      choices?: { question: string; id?: string; selected: string[]; other?: string; note?: string }[];
-    }
-  | { type: "interrupt" }
-  /** The turn didn't stop when asked: the harness starts again at once, the conversation going on. */
-  | { type: "force_stop" }
-  | { type: "set_mode"; mode: string }
-  /** `kind`: the model is another harness's; the agent goes on in it (feature "switch_harness"). */
-  | { type: "set_model"; model: string; kind?: string }
-  | { type: "stop_task"; task: string }
-  | { type: "stop_tasks" }
-  /** Take a queued message out of the queue and steer it into the running turn (no interrupt). */
-  | { type: "queue_steer"; id: string }
-  | { type: "restart" }
-  | { type: "suggest"; client: string; query: string }
-  | { type: "snapshot" }
-  /** End a pause now: the turn it cut off goes on, then the queue. */
-  | { type: "resume" }
-  /** Whether a pause ends by itself once its limit resets. */
-  | { type: "auto_resume"; on: boolean }
-  /** Pause once a limit is this full (null: only when one is reached). */
-  | { type: "pause_at"; percent: number | null }
-  /** The most subagents it runs at once (null: no limit of its own). */
-  | { type: "max_subagents"; count: number | null }
-  /** Whether at a limit it goes on on another machine with room, and where (`MovePlan`). */
-  | ({ type: "move_on_limit"; on: boolean } & MovePlan);
-
-export type Update =
-  /** The session whole follows; `rev` is the server's copy's revision, `born` its process's incarnation (docs/wire.md, "Revisions"). */
-  | { t: "open"; info: AgentInfo; rev?: number; born?: number }
-  /** Only what changed since the revision asked for follows (`?after=`), then "synced". */
-  | { t: "resumed"; info: AgentInfo; rev?: number; born?: number }
-  | { t: "changes"; files: FileChange[] }
-  /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
-  | { t: "files"; files: KeptFile[] }
-  | { t: "error"; error: string }
-  /** A command sent under `id` was taken: applied, parked for its runner, accepted by its inbox (`accepted`), or sent to a runner that can't say more (docs/wire.md, "The UI's sockets"). */
-  | { t: "ack"; id: string; outcome: "taken" | "parked" | "accepted" | "unchecked" | "pending"; accepted?: unknown }
-  /** A command sent under `id` wasn't: its kind (`code`) and why; `again` when it may go again under its id (it didn't get through this time); `id` null for what couldn't be read. */
-  | { t: "nack"; id: string | null; code: string; why: string; again?: boolean; refused?: unknown }
-  | { t: "closed" }
-  | { t: "state"; state: State }
-  /** What changed in the state since the last one (asked for with `?patch=state`): the fields set, and those gone. */
-  | { t: "state_patch"; set: Partial<State>; gone?: string[] }
-  | { t: "meta"; meta: Meta }
-  | { t: "events"; events: HEvent[] }
-  | { t: "stream"; id: string; text: string }
-  | { t: "reply"; client: string; value: unknown }
-  | { t: "reset" }
-  /** The snapshot sent since "open" is complete (the server's socket says so; a machine resending its sessions doesn't). */
-  | { t: "synced" };
 
 /* ------------------------------------------------------------------ REST */
 
@@ -1033,7 +480,7 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => all.filter(listed)),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
@@ -1073,6 +520,10 @@ export const harnessApi = {
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
   end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
+  /** Ask about a piece of code in its conversation: a child of it answers, reading only; with no subagents, it does, in its conversation (`itself`). */
+  about: (id: string, ask: AboutAsk) => call<{ agents: AgentBrief[]; itself: boolean; sent?: { sent: boolean; message?: string } }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/about`, ask),
+  /** What an agent last said, and how it stands. */
+  result: (id: string, signal?: AbortSignal) => call<AgentResult>("GET", `/api/harness/agents/${encodeURIComponent(id)}/result`, undefined, signal),
   /** The agents an agent started that still run (and theirs). */
   children: (id: string) => call<{ children: AgentChild[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/children`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
@@ -1467,7 +918,7 @@ export class SessionStore {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
     const id = commandId(c);
     this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
-    this.ws.send(JSON.stringify({ t: "cmd", id, c }));
+    this.ws.send(JSON.stringify({ t: "cmd", id, c } satisfies SessionUp));
     this.patch({ asked: [...this.asked.values()] });
     if (c.type === "send") this.track(c);
     return true;
@@ -1501,7 +952,7 @@ export class SessionStore {
         changed = true;
         continue;
       }
-      ws.send(JSON.stringify({ t: "cmd", id: a.id, c: a.command }));
+      ws.send(JSON.stringify({ t: "cmd", id: a.id, c: a.command } satisfies SessionUp));
     }
     if (changed) this.patch({ asked: [...this.asked.values()] });
   }
@@ -1514,13 +965,10 @@ export class SessionStore {
     this.asked.set(id, { ...a, tries, why });
     this.patch({ asked: [...this.asked.values()] });
     const ws = this.ws;
-    window.setTimeout(
-      () => {
-        const now = this.asked.get(id);
-        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command }));
-      },
-      AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1],
-    );
+    window.setTimeout(() => {
+      const now = this.asked.get(id);
+      if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
+    }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
   }
 
   /** Command `id` was refused: shown so a moment, then let go of. A message refused so says so where it shows in the conversation, until it's sent again or let go of. */
@@ -1675,9 +1123,9 @@ export class SessionStore {
 
   /** One update, as JSON. */
   private take1(data: string) {
-    let u: Update;
+    let u: SessionDown;
     try {
-      u = JSON.parse(data) as Update;
+      u = JSON.parse(data) as SessionDown;
     } catch {
       return;
     }
@@ -1688,7 +1136,7 @@ export class SessionStore {
 
   /** Where a frame says the server's copy is: an "open" or "resumed" once what follows it is in, a
    * live frame at once. */
-  private mark(u: Update) {
+  private mark(u: SessionDown) {
     const rev = (u as { rev?: unknown }).rev;
     if (u.t === "open" || u.t === "resumed") {
       const born = (u as { born?: unknown }).born;
@@ -1731,7 +1179,7 @@ export class SessionStore {
     this.connect();
   }
 
-  private apply(u: Update) {
+  private apply(u: SessionDown) {
     switch (u.t) {
       case "reply": {
         const r = this.replies.get(u.client);
@@ -1807,7 +1255,7 @@ export class SessionStore {
     this.wait();
   }
 
-  private gather(inc: Incoming, u: Update) {
+  private gather(inc: Incoming, u: SessionDown) {
     switch (u.t) {
       case "reset":
         inc.byId.clear();
@@ -1902,7 +1350,7 @@ export class SessionStore {
     this.settle();
   }
 
-  private take(u: Update) {
+  private take(u: SessionDown) {
     switch (u.t) {
       case "changes":
         this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
@@ -2157,56 +1605,6 @@ export function useSessionReady(store: SessionStore) {
 }
 
 /* ------------------------------------------------------------------ accounts */
-
-/** A way to sign a harness in. `asks`: what it will want given back (the code the page shows, or an API key). */
-export interface AccountMethod {
-  id: string;
-  label: string;
-  asks?: "code" | "api_key";
-}
-
-/** Which account a harness runs as on one machine, as its own CLI reports it. */
-export interface Account {
-  /** "claude", "codex" … */
-  kind: string;
-  /** "Claude Code", "Codex" … */
-  name: string;
-  /** null: kiln couldn't tell (`error` says why). */
-  signed_in: boolean | null;
-  /** How it is signed in: "Claude subscription", "ChatGPT", "API key" … */
-  method?: string;
-  email?: string;
-  org?: string;
-  /** "max", "pro", "plus" … */
-  plan?: string;
-  /** The ways it can be signed in. */
-  methods: AccountMethod[];
-  error?: string;
-}
-
-/** A sign-in or sign-out, run by the harness's own CLI in a hidden terminal on its machine. */
-export interface AccountFlow {
-  id: string;
-  target: string;
-  kind: string;
-  action: "login" | "logout";
-  method?: string;
-  state: "running" | "done" | "failed" | "cancelled";
-  /** The sign-in page to open (on any device). */
-  url?: string;
-  /** A one-time code to enter on that page (device sign-in). */
-  code?: string;
-  /** Waiting to be given something: the code the page shows after signing in, or an API key. */
-  asks?: "code" | "api_key";
-  /** The CLI's own output, as plain text. */
-  lines: string[];
-  /** Once it ended: the account as it is now. */
-  account?: Account;
-  error?: string;
-  /** Unix seconds. */
-  started_at: number;
-  ended_at?: number;
-}
 
 export const accountsApi = {
   /** Every harness's account on a machine ("local" or "agent:<machine>"). */

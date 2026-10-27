@@ -5,7 +5,7 @@ import type { AuditEntry, SystemInfo } from "@/api/types";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { CopyButton, EmptyState, FoldSection, PageIntro, SearchField, openFold } from "@/components/ui/misc";
+import { CopyButton, EmptyState, FilterBar, FoldSection, PageIntro, SearchField, openFold } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ import { fileStamp, saveFile, toCsv } from "@/lib/download";
 import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useLocation } from "@/lib/router";
+import { KeepSection } from "./keep/section";
 import { ReapSection } from "./reap";
 import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
@@ -97,6 +98,7 @@ export default function System() {
               invalidate("system");
               invalidate("updates");
               invalidate("conversations");
+              invalidate("reach/keep");
               invalidate("audit");
             }}
           >
@@ -209,7 +211,7 @@ function auditTakes(a: AuditEntry, chosen: Chosen, q: string, skip?: string) {
 function AuditSection() {
   const [win, setWin] = React.useState<AuditWindow>("7");
   return (
-    <FoldSection id="system.audit" index="07" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
+    <FoldSection id="system.audit" index="08" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
       <Loadable label="the audit log" fallback={<TableHold head={<AuditHead />} rows={8} rowHeight={39} />}>
         <AuditTable win={win} />
       </Loadable>
@@ -234,21 +236,22 @@ function AuditTable({ win }: { win: AuditWindow }) {
   const shown = rows.filter((a) => auditTakes(a, chosen, q));
   return (
     <>
-      <div className="log-tools">
-        <FacetBox
-          className="min-w-0 flex-1"
-          label="Filter the audit log"
-          placeholder="Filter by who, action, scope, result, address, or words…"
-          query={q}
-          onQuery={setQ}
-          facets={facets}
-          chosen={chosen}
-          onChosen={setChosen}
-        />
-        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the entries shown, as CSV" onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}>
-          <Download /> Download
-        </Button>
-      </div>
+      <FilterBar
+        className="log-tools"
+        aside={
+          <Button
+            variant="ghost"
+            size="bar"
+            disabled={shown.length === 0}
+            title="Download the entries shown, as CSV"
+            onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}
+          >
+            <Download /> Download
+          </Button>
+        }
+      >
+        <FacetBox label="Filter the audit log" placeholder="Filter by who, action, scope, result, address, or words…" query={q} onQuery={setQ} facets={facets} chosen={chosen} onChosen={setChosen} />
+      </FilterBar>
       {shown.length === 0 ? (
         <EmptyState title={rows.length ? "No entries match." : "No audit entries in this window."} />
       ) : (
@@ -312,13 +315,19 @@ function CrashLog({ lines }: { lines: string[] }) {
   const shown = words ? lines.filter((l) => l.toLowerCase().includes(words)) : lines;
   return (
     <>
-      <div className="log-tools">
-        <SearchField className="min-w-0 flex-1" label="Filter the crash log" placeholder="Filter by generation, signal, or words…" value={q} onChange={setQ} />
-        <span className="log-count">{words ? `${shown.length} of ${lines.length}` : lines.length} lines</span>
-        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the lines shown" onClick={() => saveFile(`kiln-crash-log-${fileStamp()}.txt`, shown.join("\n") + "\n")}>
-          <Download /> Download
-        </Button>
-      </div>
+      <FilterBar
+        className="log-tools"
+        aside={
+          <>
+            <span className="log-count">{words ? `${shown.length} of ${lines.length}` : lines.length} lines</span>
+            <Button variant="ghost" size="bar" disabled={shown.length === 0} title="Download the lines shown" onClick={() => saveFile(`kiln-crash-log-${fileStamp()}.txt`, shown.join("\n") + "\n")}>
+              <Download /> Download
+            </Button>
+          </>
+        }
+      >
+        <SearchField label="Filter the crash log" placeholder="Filter by generation, signal, or words…" value={q} onChange={setQ} />
+      </FilterBar>
       {shown.length === 0 ? (
         <EmptyState title="No lines match." />
       ) : (
@@ -385,6 +394,8 @@ function SystemBody() {
 
       <StoresSection index="06" />
 
+      <KeepSection index="07" />
+
       <AuditSection />
 
       <ReapSection index="08" />
@@ -413,7 +424,8 @@ function SystemHold() {
       <FoldSection id="system.stores" index="06" label="Conversations" title="Conversation stores">
         <StoresHold />
       </FoldSection>
-      <FoldSection id="system.audit" index="07" label="Audit" title="Audit log">
+      <KeepSection index="07" hold />
+      <FoldSection id="system.audit" index="08" label="Audit" title="Audit log">
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
       </FoldSection>
       <FoldSection id="system.reaper" index="08" label="Caches" title="Cache reaper">

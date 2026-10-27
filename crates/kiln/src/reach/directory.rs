@@ -388,9 +388,47 @@ pub fn pick(runners: &[RunnerInfo], want: &Want, me: &str) -> anyhow::Result<Cho
     anyhow::bail!("no runner suits {}: {}", want.describe(), detail.join("; "))
 }
 
+/// Which runners said they hold which objects of their caches, by repository (docs/ci.md
+/// W24-R27): what a runner asks for an object it lacks. A runner's word only: what a peer sends is
+/// checked by its digest.
+static HOLDERS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>>> = std::sync::LazyLock::new(Default::default);
+
+/// The most objects the directory keeps holders for: past it, it starts over.
+const HOLDERS_MAX: usize = 1 << 20;
+
+/// `runner` holds `digest` for `repo`.
+pub fn holds(runner: &str, repo: &str, digest: &str) {
+    if runner.is_empty() || repo.is_empty() || digest.is_empty() {
+        return;
+    }
+    let mut h = HOLDERS.lock();
+    if h.len() >= HOLDERS_MAX {
+        h.clear();
+    }
+    h.entry((repo.to_owned(), digest.to_owned())).or_default().insert(runner.to_owned());
+}
+
+/// The runners besides `asker` that said they hold `digest` for `repo`.
+pub fn holders(repo: &str, digest: &str, asker: &str) -> Vec<String> {
+    HOLDERS.lock().get(&(repo.to_owned(), digest.to_owned())).map(|s| s.iter().filter(|r| *r != asker).cloned().collect()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W24-R27: the directory says which runners hold an object for a repository, never the
+    /// one asking, and nothing for a runner, repository or object not named.
+    #[test]
+    fn w24_r27_the_directory_of_holders() {
+        holds("linux", "acme/app", "sha256:d1");
+        holds("mac", "acme/app", "sha256:d1");
+        holds("win", "acme/else", "sha256:d1");
+        holds("", "acme/app", "sha256:d2");
+        assert_eq!(holders("acme/app", "sha256:d1", "mac"), vec!["linux".to_owned()]);
+        assert_eq!(holders("acme/else", "sha256:d1", "mac"), vec!["win".to_owned()]);
+        assert!(holders("acme/app", "sha256:d2", "mac").is_empty() && holders("acme/app", "sha256:d3", "mac").is_empty());
+    }
 
     fn runner(name: &str, os: &str, arch: &str, cpus: u32, cpu_pct: f32, mem_free_gb: u64) -> RunnerInfo {
         RunnerInfo {

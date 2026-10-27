@@ -87,6 +87,10 @@ pub enum Family {
     /// quarantine, under `<scope><strong>|<kind>…`; and a unit's nondeterministic mark, under
     /// `<scope><weak>|nondeterministic`.
     Verify,
+    /// A tool's name for an object in a runner's cache (W24-R08: sccache's key, Bazel's action
+    /// digest), keyed `<scope><weak>`: a name, so a newer value or a removal replaces it, where a
+    /// result is never overwritten (W24-R22).
+    Entry,
 }
 
 impl Family {
@@ -101,6 +105,7 @@ impl Family {
             Family::EClass => "work.eclass",
             Family::Object => "work.object",
             Family::Verify => "work.verify",
+            Family::Entry => "work.entry",
         }
     }
 }

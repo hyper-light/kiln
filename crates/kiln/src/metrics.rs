@@ -354,6 +354,13 @@ pub struct SyncMetrics {
     pub move_barrier: Histogram,
     pub move_files_wait: Histogram,
     pub move_carried_bytes: CounterVec,
+    /// A runner's copies of other runners' trees (docs/reach.md §5.1): how many of each runner's
+    /// it holds (`from`) and their bytes; those it let go, by `trigger` (`schedule`, `room`,
+    /// `asked`), and their bytes.
+    pub reach_copies: GaugeVec,
+    pub reach_copies_bytes: GaugeVec,
+    pub reach_let_go: CounterVec,
+    pub reach_let_go_bytes: CounterVec,
 }
 
 pub fn sync() -> &'static SyncMetrics {
@@ -387,6 +394,10 @@ pub fn sync() -> &'static SyncMetrics {
         move_barrier: Histogram::new(LATENCY_BUCKETS),
         move_files_wait: Histogram::new(LATENCY_BUCKETS),
         move_carried_bytes: CounterVec::new(&["what"]),
+        reach_copies: GaugeVec::new(&["from"]),
+        reach_copies_bytes: GaugeVec::new(&["from"]),
+        reach_let_go: CounterVec::new(&["trigger"]),
+        reach_let_go_bytes: CounterVec::new(&["trigger"]),
     })
 }
 
@@ -588,6 +599,34 @@ impl NetMetrics {
     }
 }
 
+/// What the wires couldn't read (`crate::wire::unread`, docs/wire.md "What can't be read"), by
+/// `wire` and `code`: every series there from the start. No label says who sent it: the audit log
+/// and its runner's or agent's page say that.
+pub struct WireMetrics {
+    pub refused: CounterVec,
+}
+
+pub fn wire() -> &'static WireMetrics {
+    static M: OnceLock<WireMetrics> = OnceLock::new();
+    M.get_or_init(|| {
+        let refused = CounterVec::new(&["wire", "code"]);
+        for w in crate::wire::unread::Wire::ALL {
+            for c in crate::wire::unread::Code::ALL {
+                refused.add(&[w.name(), c.name()], 0);
+            }
+        }
+        WireMetrics { refused }
+    })
+}
+
+fn render_wire(o: &mut String) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_wire_refused_total Messages kiln couldn't read, refused, by wire and code (unknown, malformed).\n# TYPE kiln_wire_refused_total counter"
+    );
+    wire().refused.render(o, "kiln_wire_refused_total");
+}
+
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
     M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: RwLock::new(BTreeMap::new()) })
@@ -725,6 +764,8 @@ fn render_sync(o: &mut String) {
         ("kiln_sync_transfer_bytes_total", "Bytes of contents moved with the server, by direction.", &m.transfer_bytes),
         ("kiln_moves_total", "Agent sessions moving off this machine, by result.", &m.moves),
         ("kiln_move_carried_bytes_total", "What moving sessions carried besides synced files (git, ignored, worktree; home: what their harness keeps for them).", &m.move_carried_bytes),
+        ("kiln_reach_copies_let_go_total", "Copies of other runners' trees this machine let go, by trigger (schedule, room, asked).", &m.reach_let_go),
+        ("kiln_reach_copies_let_go_bytes_total", "Bytes of the copies of other runners' trees this machine let go, by trigger.", &m.reach_let_go_bytes),
     ] {
         help(o, name, "counter", h);
         v.render(o, name);
@@ -737,6 +778,8 @@ fn render_sync(o: &mut String) {
         ("kiln_sync_copy_heard_age_seconds", "Seconds since a copy last said how it is.", &m.copy_heard_age),
         ("kiln_sync_conflict_files", "Conflict copies a synced repo holds, not resolved yet.", &m.conflict_files),
         ("kiln_sync_skipped_files", "Files a copy's last look left out.", &m.skipped_files),
+        ("kiln_reach_copies", "Copies of other runners' trees this machine holds, by the runner whose tree it is.", &m.reach_copies),
+        ("kiln_reach_copies_bytes", "What the copies of other runners' trees take on this machine's disk, as last measured.", &m.reach_copies_bytes),
     ] {
         help(o, name, "gauge", h);
         v.render(o, name);
@@ -810,6 +853,23 @@ mod tests {
         }
         assert!(text.contains("kiln_work_lookups_total{layer=\"leg\",outcome=\"hit\"} "), "{text}");
         assert!(text.contains("\nkiln_work_saved_seconds_total "), "{text}");
+    }
+
+    /// What the wires couldn't read (`crate::wire::unread`): every wire and code's series there before
+    /// any refusal, far under a family's budget of series.
+    #[test]
+    fn the_refused_counter_renders_every_series_before_any_refusal() {
+        let text = render();
+        assert!(text.contains("# TYPE kiln_wire_refused_total counter\n"), "{text}");
+        let series = text.lines().filter(|l| l.starts_with("kiln_wire_refused_total{")).count();
+        assert_eq!(series, crate::wire::unread::Wire::ALL.len() * crate::wire::unread::Code::ALL.len());
+        assert!(series <= 200, "{series} series: past the budget for one family");
+        for w in crate::wire::unread::Wire::ALL {
+            for c in crate::wire::unread::Code::ALL {
+                let line = format!("kiln_wire_refused_total{{wire=\"{}\",code=\"{}\"}} ", w.name(), c.name());
+                assert!(text.contains(&line), "{line}");
+            }
+        }
     }
 
     /// CP-M2's counters (docs/agents.md, "Metrics"): every series is there before anything is
@@ -886,6 +946,7 @@ mod tests {
 
 /// Live per-agent host samples, reported by agents and rendered with an `agent` label.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct HostSample {
     pub ts_ms: i64,
     pub cpu_pct: f32,
@@ -1040,6 +1101,7 @@ pub fn render() -> String {
     render_blobs(&mut o);
     render_bus(&mut o);
     render_net(&mut o);
+    render_wire(&mut o);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {

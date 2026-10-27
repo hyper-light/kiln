@@ -263,6 +263,12 @@ pub async fn kept(hub: &Hub, leg: &str, until: Option<i64>) -> anyhow::Result<()
     hub.store.call(move |c| Ok(c.execute("UPDATE jobs SET kept_until = ?2 WHERE id = ?1", params![leg, until]).map(|_| ())?)).await
 }
 
+/// Where a person's retry asked a leg to run (W05-R28), on its row for the API and the UI.
+pub async fn set_placement(hub: &Hub, leg: &str, p: &kiln_ci::sched::Placement) -> anyhow::Result<()> {
+    let (leg, json) = (leg.to_owned(), serde_json::to_string(p)?);
+    hub.store.call(move |c| Ok(c.execute("UPDATE jobs SET placement = ?2 WHERE id = ?1", params![leg, json]).map(|_| ())?)).await
+}
+
 /// When a leg was queued (Unix seconds).
 pub async fn queued_at(hub: &Hub, leg: &str) -> anyhow::Result<i64> {
     let leg = leg.to_owned();

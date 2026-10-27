@@ -90,6 +90,9 @@
   flex-direction: column;
   gap: 10px;
 }
+.hx-stack > * {
+  min-width: 0;
+}
 .hx-empty {
   padding: 28px 8px;
   text-align: center;
@@ -449,6 +452,7 @@ textarea.hx-input {
   flex-direction: column;
   /* The window's visible part (a phone's keyboard takes the rest: app-shell's fitTheWindow). */
   height: calc(var(--window-h, 100dvh) - var(--header-h) - 1px);
+  min-width: 0;
   min-height: 0;
   background: var(--color-background);
 }
@@ -582,6 +586,7 @@ textarea.hx-input {
   display: flex;
   flex: 1;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
 }
 .hx-main {
@@ -594,6 +599,7 @@ textarea.hx-input {
 .hx-side {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
   border-left: 1px solid #1d1f23;
   background: #0a0b0d;
@@ -607,7 +613,9 @@ textarea.hx-input {
   align-items: center;
   gap: 8px;
   /* One line, the same height whatever the subagent's description: it alone gives way. */
+  min-width: 0;
   min-height: 44px;
+  overflow: hidden;
   padding: 6px 16px;
   border-bottom: 1px solid #1d1f23;
   background: #0d0c12;
@@ -628,6 +636,7 @@ textarea.hx-input {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
   min-height: 46px;
   padding: 0 8px 0 14px;
   border-bottom: 1px solid #1d1f23;
@@ -703,6 +712,7 @@ textarea.hx-input {
 }
 .hx-earlier-hit {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 3px;
   width: 100%;
   padding: 8px 14px;
@@ -747,6 +757,7 @@ textarea.hx-input {
 
 .hx-timeline {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -1488,6 +1499,7 @@ textarea.hx-input {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
   padding: 10px max(12px, calc((100% - 884px) / 2)) calc(12px + env(safe-area-inset-bottom));
   border-top: 1px solid #1a1c20;
   background: linear-gradient(180deg, rgb(8 9 10 / 0%), #08090a 24px);
@@ -1677,6 +1689,7 @@ textarea.hx-input {
 /* ------------------------------------------------------------ inspector */
 
 .hx-inspector {
+  min-width: 0;
   min-height: 0;
 }
 .hx-inspector-head {
@@ -2584,25 +2597,6 @@ textarea.hx-input {
   color: var(--color-secondary);
   /* A path or an address in it breaks rather than widening the tab. */
   overflow-wrap: anywhere;
-}
-.hx-skill-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 10px;
-  border: 1px solid #262930;
-  border-radius: 10px;
-  color: var(--color-subtle);
-}
-.hx-skill-search input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  background: transparent;
-  color: var(--color-foreground);
-  font-size: 13px;
-  outline: none;
 }
 .hx-skill-view {
   max-height: 60dvh;

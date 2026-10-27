@@ -19,7 +19,7 @@ import { FacetBox } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { ReapPolicy } from "../reap";
-import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
+import { EmptyState, FilterBar, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
@@ -34,6 +34,7 @@ import { PlaceList, TaskList, taskLine } from "./places";
 import { PutForm, type PutMode } from "./put";
 import { SyncActivity } from "./sync-activity";
 import { ScopeSecrets } from "../settings-ci";
+import { RepoKeep } from "../keep/repo";
 import { Providers } from "./providers";
 import "./repos.css";
 
@@ -191,13 +192,24 @@ function ReposBody() {
 
   return (
     <>
-      <ReposToolbar q={q} onQ={setQ} view={view} onView={setView} facets={facets} count={filtered ? `${list.length} of ${entries.length}` : `${entries.length} ${entries.length === 1 ? "repository" : "repositories"}`} />
+      <ReposToolbar
+        q={q}
+        onQ={setQ}
+        view={view}
+        onView={setView}
+        facets={facets}
+        count={filtered ? `${list.length} of ${entries.length}` : `${entries.length} ${entries.length === 1 ? "repository" : "repositories"}`}
+      />
       {notice && (
         <p role="status" className="notice" data-tone={notice.tone}>
           {notice.text}
         </p>
       )}
-      {sync.data.error && <p className="notice" data-tone="fail">{sync.data.error}</p>}
+      {sync.data.error && (
+        <p className="notice" data-tone="fail">
+          {sync.data.error}
+        </p>
+      )}
       {adding && (
         <AddRepoForm
           onAdded={(r) => {
@@ -284,7 +296,15 @@ function ReposBody() {
             <ReposHead />
             <tbody>
               {list.map((e) => (
-                <Row key={e.key} entry={e} machines={machines} open={open?.key === e.key ? open.what : null} polling={e.built ? polling.has(e.built.id) : false} onToggle={(what) => toggle(e.key, what)} onPoll={() => void poll(e)}>
+                <Row
+                  key={e.key}
+                  entry={e}
+                  machines={machines}
+                  open={open?.key === e.key ? open.what : null}
+                  polling={e.built ? polling.has(e.built.id) : false}
+                  onToggle={(what) => toggle(e.key, what)}
+                  onPoll={() => void poll(e)}
+                >
                   {open?.key === e.key && (
                     <Details
                       entry={e}
@@ -315,11 +335,24 @@ function ReposBody() {
   );
 }
 
-function ReposToolbar({ q, onQ, view, onView, facets, count }: { q: string; onQ: (v: string) => void; view: ListView; onView: (v: ListView) => void; facets: React.ComponentProps<typeof FacetBox>["facets"]; count: string }) {
+function ReposToolbar({
+  q,
+  onQ,
+  view,
+  onView,
+  facets,
+  count,
+}: {
+  q: string;
+  onQ: (v: string) => void;
+  view: ListView;
+  onView: (v: ListView) => void;
+  facets: React.ComponentProps<typeof FacetBox>["facets"];
+  count: string;
+}) {
   return (
-    <div className="repos-tools">
+    <FilterBar className="repos-tools" aside={<span className="label tabular-nums">{count}</span>}>
       <FacetBox
-        className="repos-filter"
         label="Filter repositories"
         placeholder="Filter by name, machine, OS, architecture, kind, state…"
         query={q}
@@ -328,9 +361,8 @@ function ReposToolbar({ q, onQ, view, onView, facets, count }: { q: string; onQ:
         chosen={view.facets}
         onChosen={(f) => onView({ ...view, facets: f })}
       />
-      <SelectField className="repos-sort" label="Sort repositories" hideLabel value={view.sort} onChange={(v) => onView({ ...view, sort: v as SortId })} options={SORTS} />
-      <span className="label repos-count tabular-nums">{count}</span>
-    </div>
+      <SelectField label="Sort repositories" hideLabel value={view.sort} onChange={(v) => onView({ ...view, sort: v as SortId })} options={SORTS} />
+    </FilterBar>
   );
 }
 
@@ -483,7 +515,14 @@ function Row({
               </Tip>
             )}
             <Tip content="Put it on machines: clone or sync">
-              <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Put ${e.name} on machines`} aria-expanded={open === "clone" || open === "sync"} onClick={() => onToggle(e.synced ? "sync" : "clone")}>
+              <button
+                className="icon-btn"
+                data-variant="bare"
+                data-size="sm"
+                aria-label={`Put ${e.name} on machines`}
+                aria-expanded={open === "clone" || open === "sync"}
+                onClick={() => onToggle(e.synced ? "sync" : "clone")}
+              >
                 <HardDriveDownload size={14} />
               </button>
             </Tip>
@@ -580,6 +619,12 @@ function Details({
         // What runs its CI (W23-R07), when its host makes a choice possible.
         <Loadable label="what runs its CI" fallback={<></>}>
           <Providers repo={r.name} />
+        </Loadable>
+      )}
+      {!e.key.startsWith("here:") && (
+        // The copies of its trees runners keep for others, and its rules for them (docs/reach.md §5.1).
+        <Loadable label="its copies on runners" fallback={<Hold height={160} />}>
+          <RepoKeep repoKey={e.key} />
         </Loadable>
       )}
       {r && (

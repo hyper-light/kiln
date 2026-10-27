@@ -66,6 +66,7 @@ const MINUTE: Duration = Duration::from_secs(60);
 
 /// How a runner's QUIC connection reaches the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     /// UDP straight to the QUIC listener.

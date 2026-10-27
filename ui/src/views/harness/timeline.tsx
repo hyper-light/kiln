@@ -73,6 +73,7 @@ import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
 import { unsending } from "./unsend";
+import { Highlighted } from "@/components/code/highlighted";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -232,7 +233,9 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
         <i className="dot" data-status={dotFor(failed ? "error" : c.status)} aria-hidden="true" />
         {typeof c.runner === "string" && <Where runner={c.runner} />}
-        <code className="hx-cmd-line">{c.title}</code>
+        <code className="hx-cmd-line">
+          <Highlighted text={c.title} lang="bash" />
+        </code>
         <span className="hx-cmd-meta">
           {c.exit_code !== undefined && <span className={failed ? "hx-bad" : "hx-good"}>exit {c.exit_code}</span>}
           {c.status === "running" ? <Elapsed from={c.started} /> : c.ended ? <span className="hx-meta-num">{duration(c.ended - c.started)}</span> : null}
@@ -342,7 +345,11 @@ function ToolBody({ calls }: { calls: ToolEvent[] }) {
               lastOf.get(r.id) === i && <ResearchCard id={r.id} />
             ) : (
               <>
-                {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
+                {input && (c.server || c.tool === "other" || c.tool === "mcp") && (
+                  <pre className="hx-pre hx-tool-input">
+                    <Highlighted text={input} lang="json" />
+                  </pre>
+                )}
                 {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
               </>
             )}

@@ -48,11 +48,15 @@ jobs:
     toolchain: node
     resources: { cpu: "2", memory: 4Gi }
     steps:
-      - run: npm ci --prefix ui --no-audit --no-fund
-      - run: npm run --prefix ui typecheck
-      - run: npm run --prefix ui lint
-      # The UI only: packing Bun for the binary (vendor/bun) is the release builds' part.
-      - run: KILN_UI_SERVER=off npm run --prefix ui build
+      # One UI build per ui/ tree for ci, release and image (docs/ci.md W28-R77): this step's text,
+      # memo and place among memo steps are the same in every job that builds the UI, so is its key
+      # (W28-R70), and the first job to reach it builds it while the others wait and take it
+      # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
+      - name: ui
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
+      # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`).
+      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui typecheck && npm run --prefix ui lint && npm --prefix ui test
 
   ui-checks:
     name: ui checks (Chromium and WebKit, desktop and phone)
@@ -72,7 +76,15 @@ jobs:
     steps:
       - name: what it needs
         run: for t in docker python3 git node npm cargo; do command -v "$t" > /dev/null || { echo "this machine has no $t"; exit 1; }; done && docker info --format '{{.ServerVersion}}'
-      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+      # One UI build per ui/ tree for ci, release and image (docs/ci.md W28-R77): this step's text,
+      # memo and place among memo steps are the same in every job that builds the UI, so is its key
+      # (W28-R70), and the first job to reach it builds it while the others wait and take it
+      # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
+      - name: ui
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
+      # The UI server this build carries, for this machine (vendor/bun/README.md).
+      - run: node ui/scripts/pack-ui-server.mjs --require
       - run: cargo build --locked -p kiln --bin kiln
       - run: ci/ui/run-all.sh target/debug/kiln
     artifacts: [ci/ui/shots/*/*]
@@ -97,12 +109,19 @@ jobs:
   release-binary:
     name: release build (bare metal)
     needs: [rust, ui]
-    # The server's own Linux machine (as release.yaml): other runners, a Mac among them, are bare
-    # metal too.
-    runs-on: [baremetal, local]
+    # Any open Linux machine that builds kiln and its UI (W25), placed by `requires`.
+    runs-on: [baremetal]
+    requires: ["os == linux", "tools has cargo", "tools has node"]
     if: "branch == 'main'"
     steps:
-      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+      # One UI build per ui/ tree for ci, release and image (docs/ci.md W28-R77): this step's text,
+      # memo and place among memo steps are the same in every job that builds the UI, so is its key
+      # (W28-R70), and the first job to reach it builds it while the others wait and take it
+      # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
+      - name: ui
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
+      - run: node ui/scripts/pack-ui-server.mjs --require
       - run: cargo build --release --locked -p kiln
       - run: mkdir -p dist && cp target/release/kiln dist/kiln-$(uname -m)
     artifacts: [dist/*]

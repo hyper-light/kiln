@@ -250,6 +250,7 @@ pub enum AgentMsg {
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct NetDrop {
     pub lane: String,
     pub reason: String,

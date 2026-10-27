@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::git::{Facts, Ident, Remote};
 use crate::harness::session::Info;
@@ -34,16 +34,20 @@ pub fn key(agent: &str) -> String {
 
 /// An agent's change request, as kiln keeps it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentChange"))]
 pub struct Record {
     pub agent: String,
     /// The repository as kiln knows it (`owner/name`), when it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub repo: Option<String>,
     /// `kiln`, `github`, `gitlab`, `bitbucket`, or `git` (a remote kiln has no integration with).
     pub provider: String,
     /// `CR12` (kiln), `#34` (a pull or merge request), or none: the branch is pushed, the change
     /// not opened yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub change: Option<String>,
     /// Its page, or where to open it.
     pub url: String,
@@ -59,9 +63,11 @@ pub struct Record {
     pub state: String,
     /// The review state of a change kiln hosts (`needs-review`, `approved`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub review: Option<String>,
     /// How its newest version's checks went (`passed`, `failed`, …), once kiln knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub checks: Option<String>,
     /// Whether failing checks go to the agent to fix (C2).
     pub fix_checks: bool,
@@ -69,11 +75,13 @@ pub struct Record {
     pub updated_at: i64,
     /// The plan run whose stack it is a step of (docs/agentic.md P4), when it is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub stack: Option<InStack>,
 }
 
 /// A change that is one step of a plan run's stack.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct InStack {
     pub run: String,
     /// Its step, from 1.
@@ -109,7 +117,7 @@ pub async fn save(hub: &Hub, r: &Record) {
     if let Ok(text) = serde_json::to_string(r) {
         let _ = hub.store.kv_set(key(&r.agent), text).await;
     }
-    hub.emit(&json!({"type": "agent_change", "agent": r.agent, "change": r}));
+    hub.emit(&crate::wire::events::ServerEvent::AgentChange { agent: r.agent.clone(), change: Box::new(r.clone()) });
 }
 
 fn fail(code: StatusCode, msg: impl Into<String>) -> Fail {

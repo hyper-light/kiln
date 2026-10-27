@@ -20,23 +20,42 @@ concurrency: { group: "release-${{ event }}-${{ branch }}", cancel-in-progress: 
 jobs:
   linux:
     name: Linux (x86-64, ARM64)
-    # A Linux machine with rustup, python3 and node: the server's own runner.
-    runs-on: [baremetal, local]
+    # Any open Linux machine with rustup, python3 and node (W25): v1 places it on the runner
+    # meeting `requires` with the most room; build.sh adds its own rust targets and pinned zig.
+    runs-on: [baremetal]
+    requires: ["os == linux", "tools has cargo", "tools has python3", "tools has node"]
     timeout-minutes: 90
     steps:
+      # One UI build per ui/ tree for ci, release and image (docs/ci.md W28-R77): this step's text,
+      # memo and place among memo steps are the same in every job that builds the UI, so is its key
+      # (W28-R70), and the first job to reach it builds it while the others wait and take it
+      # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
-        run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
-      - name: build
-        run: nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
+      # One x86_64-unknown-linux-musl build per commit for release and the image (W28-R78): the
+      # same text and memo in both, after the shared UI step; its commit named, as the binary
+      # embeds it (KILN_COMMIT).
+      - name: x86_64 musl
+        run: KILN_COMMIT=$KILN_SHA nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
+        memo: { inputs: [Cargo.toml, Cargo.lock, .cargo, crates, vendor, ci/release/build.sh, ui/scripts, ui/dist], outputs: [dist/kiln-x86_64-unknown-linux-musl], platform: [os, arch], tools: { rustc: full } }
+      - name: aarch64 musl
+        run: nice -n 10 ci/release/build.sh aarch64-unknown-linux-musl
     artifacts: ["dist/*"]
 
   windows:
     name: Windows (x86-64, cross-built)
-    runs-on: [baremetal, local]
+    runs-on: [baremetal]
+    requires: ["os == linux", "tools has cargo", "tools has python3", "tools has node"]
     timeout-minutes: 90
     steps:
+      # One UI build per ui/ tree for ci, release and image (docs/ci.md W28-R77): this step's text,
+      # memo and place among memo steps are the same in every job that builds the UI, so is its key
+      # (W28-R70), and the first job to reach it builds it while the others wait and take it
+      # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
-        run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
       - name: build
         run: nice -n 10 ci/release/build.sh x86_64-pc-windows-msvc
     artifacts: ["dist/*"]
@@ -52,9 +71,13 @@ jobs:
     requires: ["os == macos", "arch == aarch64", "tools has cargo", "tools has node"]
     timeout-minutes: 90
     steps:
-      # A launchd service's PATH has none of the usual tools in it.
+      # One UI build per ui/ tree for ci, release and image (docs/ci.md W28-R77): this step's text,
+      # memo and place among memo steps are the same in every job that builds the UI, so is its key
+      # (W28-R70), and the first job to reach it builds it while the others wait and take it
+      # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
-        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
       - name: build
         run: nice -n 10 ci/release/build.sh aarch64-apple-darwin
     artifacts: ["dist/*"]

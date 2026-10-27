@@ -152,6 +152,8 @@ fn default_timeout() -> u32 {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "JobResources"))]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
     #[serde(default)]
@@ -161,6 +163,7 @@ pub struct Resources {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct StepSpec {
     #[serde(default)]
@@ -183,6 +186,7 @@ pub struct StepSpec {
 
 /// A concrete, matrix-expanded unit of work ready to be queued.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct PlannedJob {
     /// `test` or `test (profile=release)`.
     pub key: String,
@@ -331,7 +335,19 @@ impl Context {
 }
 
 pub fn parse(src: &str) -> Result<Pipeline, SpecError> {
-    let p: Pipeline = serde_yaml::from_str(src)?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(src)?;
+    // The CI engine's `memo:` on a step (docs/ci.md W24-R07, W28-R76) is read and left out here, so
+    // `.kiln/` workflows that share steps on the engine still run on v1 until it takes them over.
+    if let Some(jobs) = doc.get_mut("jobs").and_then(serde_yaml::Value::as_mapping_mut) {
+        for job in jobs.values_mut() {
+            for step in job.get_mut("steps").and_then(serde_yaml::Value::as_sequence_mut).into_iter().flatten() {
+                if let Some(m) = step.as_mapping_mut() {
+                    m.remove("memo");
+                }
+            }
+        }
+    }
+    let p: Pipeline = serde_yaml::from_value(doc)?;
     validate(&p)?;
     Ok(p)
 }
@@ -447,11 +463,7 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             None => {}
         }
         let resources = match &j.kiln.resources {
-            Some(YVal::Map(m)) => {
-                let get = |k: &str| m.iter().find(|(x, _)| x == k).map(|(_, v)| yaml_scalar(&yaml_value(v)));
-                Resources { cpu: get("cpu"), memory: get("memory") }
-            }
-            Some(_) => return Err(format!("{} is not a mapping", at("resources"))),
+            Some(r) => resources_of(r).ok_or_else(|| format!("{} is not a mapping", at("resources")))?,
             None => Resources::default(),
         };
         let retries = match j.kiln.retry.as_ref().and_then(|r| r.get("max")) {
@@ -499,6 +511,15 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
     let p = Pipeline { name: wf.name.clone().unwrap_or_default(), on, env: map(&wf.env), concurrency, jobs };
     validate(&p).map_err(|e| e.to_string())?;
     Ok(p)
+}
+
+/// A kiln-dialect job's `resources:` as v1 reads them: its `cpu` and `memory`, as YAML wrote them
+/// (`2`, `"500m"`, `16Gi`). `None` when it isn't a mapping. A `k8s` pool's pod for the job reads
+/// them so too (docs/ci.md W02-R06, W13-R07).
+pub fn resources_of(r: &kiln_ci::wf::ir::YVal) -> Option<Resources> {
+    let kiln_ci::wf::ir::YVal::Map(m) = r else { return None };
+    let get = |k: &str| m.iter().find(|(x, _)| x == k).map(|(_, v)| yaml_scalar(&yaml_value(v)));
+    Some(Resources { cpu: get("cpu"), memory: get("memory") })
 }
 
 /// A value of the new model as v1 read it: whole numbers are integers, as YAML wrote them.

@@ -1,13 +1,15 @@
 /**
  * kiln's markdown: GitHub-flavored (tables, lists, task lists, quotes, code), drawn the console's
- * way. Text only: HTML in it is never injected. No hooks, so it renders in the browser (the agent's
- * live conversation) and in server components (pages that send no markdown code at all).
+ * way, a fenced block's code in its language's colours (components/code/highlighted.tsx). Text
+ * only: HTML in it is never injected. No hooks, so it renders in the browser (the agent's live
+ * conversation) and in server components (pages that send no markdown code at all).
  */
 import * as React from "react";
 import type { Element, ElementContent, Root, RootContent } from "hast";
 import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CopyBlock } from "@/components/ui/copy-block";
+import { CodeBlock } from "@/components/code/highlighted";
 
 /** A table cell keeps its words whole (harness.css), so a long run in one (a path, a URL, a digest)
  *  gets places to wrap: after its slashes, then (where a piece is still long) its other separators,
@@ -157,9 +159,7 @@ const MARKDOWN: Components = {
           <span className="hx-block-tag">{lang ?? "code"}</span>
           <CopyBlock text={body} />
         </div>
-        <pre className="hx-pre" data-lang={lang}>
-          {children}
-        </pre>
+        <CodeBlock text={body} lang={lang} className={code?.props.className} />
       </div>
     );
   },

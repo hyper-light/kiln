@@ -1,7 +1,7 @@
 /** Every agent kiln runs, kept live from the server's events. */
 import * as React from "react";
 import { useServerEvents } from "@/api/events";
-import { harnessApi, type AgentInfo } from "@/api/harness";
+import { harnessApi, listed, type AgentInfo } from "@/api/harness";
 import { useSuspenseResource } from "@/lib/resource";
 
 /**
@@ -28,7 +28,7 @@ export function useAgents() {
   // The latest word from each agent since the last batch (null: it closed).
   const [batch] = React.useState(() => ({ pending: new Map<string, AgentInfo | null>(), timer: 0 }));
   useServerEvents((ev) => {
-    if (ev.type === "harness") batch.pending.set(ev.info.id, ev.info);
+    if (ev.type === "harness") batch.pending.set(ev.info.id, listed(ev.info) ? ev.info : null);
     else if (ev.type === "harness_closed") batch.pending.set(ev.id, null);
     else return;
     if (batch.timer) return;

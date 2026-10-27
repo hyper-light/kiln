@@ -45,8 +45,8 @@ const claude: KindInfo = {
   available: true,
   switch: true,
   models: [
-    { id: "claude-opus-5-5", label: "Opus 5.5" },
-    { id: "claude-sonnet-5-5", label: "Sonnet 5.5" },
+    { id: "claude-opus-5-5", label: "Opus 5.5", description: "" },
+    { id: "claude-sonnet-5-5", label: "Sonnet 5.5", description: "" },
   ],
 };
 const codex: KindInfo = {
@@ -56,8 +56,8 @@ const codex: KindInfo = {
   available: true,
   switch: true,
   models: [
-    { id: "gpt-6.1-sol", label: "GPT-6.1 Sol" },
-    { id: "gpt-6.1-sol-mini", label: "GPT-6.1 Sol mini" },
+    { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", description: "" },
+    { id: "gpt-6.1-sol-mini", label: "GPT-6.1 Sol mini", description: "" },
   ],
 };
 const kindsOf = (hs: string[]) => [claude, codex].filter((k) => hs.includes(k.id));

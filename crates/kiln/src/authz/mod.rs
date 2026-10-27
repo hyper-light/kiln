@@ -451,6 +451,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/legs/*/logs", "logs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs/*", "logs.read", At::Job(3)),
     r("GET", "/api/ci/logs/search", "logs.read", At::RepoQuery),
+    // A finished job (a leg, a pipeline's job) again, here or elsewhere (W05-R28).
+    r("POST", "/api/ci/legs/*/retry", "runs.rerun", At::Job(3)),
     // A terminal into a leg, and keeping or releasing a failed one (W17); on the `host` executor
     // the terminal also needs `runners.terminal` on its runner, which the handler checks.
     r("GET", "/api/ci/legs/*/terminal", "runs.debug", At::Job(3)),
@@ -585,6 +587,14 @@ pub static ROUTES: &[Rule] = &[
     // Runners and machines. The list is of the runners the caller may read (`crate::doctor::readable`).
     r("GET", "/api/agents", "runners.read", At::Anywhere),
     r("GET", "/api/reach/runners", "runners.read", At::Server),
+    // The copies of runners' trees other runners keep (docs/reach.md §5.1): read with the runners,
+    // a runner's rules and asking it to let go now its managers'; every runner's rules and a
+    // repository's are the server's settings (unnamed).
+    r("GET", "/api/reach/keep", "runners.read", At::Server),
+    r("PUT", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
+    r("DELETE", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
+    r("POST", "/api/reach/keep/runners/*/now", "runners.manage", At::Runner(4)),
+    r("POST", "/api/reach/keep/now", "runners.manage", At::Server),
     r("GET", "/api/front-doors", "runners.read", At::Server),
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),

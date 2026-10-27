@@ -765,7 +765,7 @@ async fn published(hub: &Hub, who: &Who, name: &str, tag: &str, digest: &str, ac
         "name": name, "package_type": "CONTAINER", "ecosystem": "CONTAINER", "registry": { "url": hub.cfg.server.public_url, "type": "kiln" },
         "package_version": { "version": digest, "container_metadata": { "tag": { "name": tag, "digest": digest } } },
     });
-    hub.emit(&json!({ "type": "registry_package", "action": action, "name": name, "tag": tag, "digest": digest, "by": who.name() }));
+    hub.emit(&crate::wire::events::ServerEvent::RegistryPackage { action: action.to_owned(), name: name.to_owned(), tag: tag.to_owned(), digest: digest.to_owned(), by: who.name() });
     let scope = auth::scope_of(name);
     let crate::authz::Scope::Repo { repo } = scope else { return };
     let Ok(repos) = hub.store.repos().await else { return };

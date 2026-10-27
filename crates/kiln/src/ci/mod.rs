@@ -39,6 +39,8 @@ pub mod notify;
 pub mod oidc;
 pub mod ops;
 pub mod otel;
+#[cfg(test)]
+mod own_workflows;
 pub mod preview;
 pub mod previews;
 pub mod providers;
@@ -50,6 +52,7 @@ pub mod smtp;
 pub mod repo_config;
 pub mod results;
 pub mod rest;
+pub mod retry;
 pub mod reusable;
 pub mod review;
 pub mod review_cli;
