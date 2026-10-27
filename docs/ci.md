@@ -8506,10 +8506,15 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   refuses revoked keys from the first handshake after a restart, and re-enrolling a name brings a
   new key the revocation doesn't touch. `GET /api/identities` lists what kiln issued, each checked
   now; enrollment records who enrolled each machine.
-- *Seams.* An outside Fulcio and Rekor is reached through `kiln_seams::Sigstore` (docs/seams.md),
-  its simulator passing the suite; `ci/signing.rs`'s client is the real one.
+- *Seams.* An outside Fulcio and Rekor is reached through `kiln_seams::Sigstore` (docs/seams.md);
+  `ci/signing.rs`'s client is the real one. The simulator certifies and logs with keys of its own,
+  so a bundle keyless signing makes through it verifies with kiln's Sigstore verifier against its
+  trusted root; it and kiln's client (over Fulcio's and Rekor's HTTP APIs, in front of it) pass the
+  same suite.
 - *Tests.* `kiln-ci` `w27_r01_*` (each kind; expired, revoked, wrongly issued);
-  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys` and one per kind.
+  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys` and one per kind;
+  `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's client passes
+  the Sigstore suite).
 - *Not yet.* An agent's certificate doesn't name the runner instance holding it; kiln's Sigstore
   client hasn't run the suite against a real Fulcio and Rekor; nothing signs with these identities
   yet (commits, reviews, CI output, lands and deploys: R03 to R11).
