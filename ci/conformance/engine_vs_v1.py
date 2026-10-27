@@ -238,22 +238,27 @@ def compare(rec, prod=None):
 
 
 def retry_timeouts(sides, sha, rec, prod, timeout):
-    """`--retry-timeouts`: a job that timed out on one side only (on a machine shared with other
-    work, its timeout says as much about the load as the job) runs once more there: the jobs of
+    """`--retry-timeouts`: a job whose conclusions differ runs once more on the side where it didn't
+    succeed (on a machine shared with other work a timeout, a missed bench target or a runner
+    frozen past its grace says as much about the load as the job; a real difference comes back):
+    the jobs of
     that side's run of its workflow that didn't succeed (others keep their results: ci-bench's
     bench-gate would compare a second measure with the first), then the commit recorded anew, the
     first record kept in it."""
     again = []
     for d in compare(rec, prod)["diffs"]:
+        ok = {s.side: (d[s.side] or []) == ["success"] for s in sides}
         for s in sides:
-            if "timed_out" in (d[s.side] or []):
+            # The side that didn't succeed where the other did; else the one that timed out or was
+            # cancelled (a runner away past its grace, a lab freeze).
+            if not ok[s.side] and (any(ok.values()) or {"timed_out", "cancelled"} & set(d[s.side] or [])):
                 run = next((r for r in s.runs(sha) if (r.get("pipeline") or r.get("name")) == d["workflow"]), None)
                 if run and all(run is not r for _, r, _ in again):
                     again.append((s, run, d))
     if not again:
         return rec
     for s, run, d in again:
-        print(f"  {s.side} {d['workflow']}/{d['job']} timed out there only: its run's unfinished jobs again ({s.rerun(run, failed_only=True)})", flush=True)
+        print(f"  {s.side} {d['workflow']}/{d['job']} {d[s.side]} there: its run's unfinished jobs again ({s.rerun(run, failed_only=True)})", flush=True)
     time.sleep(60)
     runs, late = {}, rec.get("timed_out", False)
     for s in sides:
@@ -320,7 +325,7 @@ def main():
     ap.add_argument("--prod", help="production's failing tests by commit: {sha: {failed: [...]}}")
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--rerun", help="run a recorded commit's runs again on both sides (a commit the lab disturbed) and record it anew")
-    ap.add_argument("--retry-timeouts", action="store_true", help="a job that timed out on one side only runs once more there before the commit is recorded")
+    ap.add_argument("--retry-timeouts", action="store_true", help="a job whose conclusions differ runs once more where it didn't succeed before the commit is recorded")
     a = ap.parse_args()
     with open(a.commits) as f:
         order = [l.split()[0] for l in f if l.strip() and not l.startswith("#")]
