@@ -2279,9 +2279,10 @@ fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
     });
     let warm = warm.map_err(|e| anyhow::anyhow!("{e}: {last}\n{}", said().unwrap_or_default()))?;
     let num = |k: &str| warm.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
-    // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101).
+    // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101), in the
+    // millionths the engine keeps warmth in, rounded down (docs/ci.md W05-R28).
     assert!(warm.get("files").and_then(Value::as_u64) == Some(1), "{warm}\n{}", said()?);
-    assert!((num("warmth") - 0.5 * 100.0 / 101.0).abs() < 1e-9 && num("run_s") > 0.0 && num("fetch_s") == 0.0 && num("finish_s") >= num("run_s"), "{warm}");
+    assert!((num("warmth") * 1e6).round() == f64::from(500_000 * 100 / 101) && num("run_s") > 0.0 && num("fetch_s") == 0.0 && num("finish_s") >= num("run_s"), "{warm}");
     wait_for(120, "the second run", || Ok((runs()?.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).count() >= 2).then_some(())))?;
     let list = runs()?;
     assert!(list.iter().all(|r| text(r, "conclusion") == "success"), "{list:?}\n{}", s.log());
