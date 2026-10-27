@@ -2490,7 +2490,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let sim = seam::SimForge::github();
-            let (name, r) = ("acme/app", repo("r-host", "acme/app"));
+            let (name, r) = ("acme/app", hub.store.upsert_repo(repo("r-host", "acme/app")).await?);
             sim.add_repo(name);
             sim.push(name, "one", seam::TRUNK, "one")?;
             sim.push(name, "two", seam::TRUNK, "two")?;
