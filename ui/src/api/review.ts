@@ -46,6 +46,10 @@ export interface DiffVersion {
   note: string | null;
   created_at: number;
   ref: string;
+  /** Why it exists (W26-R04) when it isn't a push: `suggestion applied`, `conflict resolved`. */
+  why?: string | null;
+  /** The thread it answers (a suggestion's). */
+  thread?: string | null;
 }
 
 export interface DiffRun {
@@ -126,6 +130,20 @@ export interface ThreadComment {
   draft: boolean;
   /** Its author deleted it: a thread's first comment stays, saying `deleted`, while replies remain (W26-R08). */
   deleted?: boolean;
+  /** Its suggestions (W26-R10): its body's ```suggestion blocks, then its old `suggestion` field as one more. */
+  suggestions?: Suggestion[];
+}
+
+/** A comment's suggestion (W26-R10): the lines it puts where its thread's lines are (none: they go), and which revision applied it. */
+export interface Suggestion {
+  /** Which of the comment's suggestions it is, from 0: what Apply's `suggestion` names. */
+  index: number;
+  lines: string[];
+  /** The comment's old `suggestion` field, not a block of its body. */
+  field: boolean;
+  applied: { version: number; by: string; at: number } | null;
+  /** Its lines changed since it was written: it doesn't apply. */
+  outdated: boolean;
 }
 
 /** A thread's kind (W26-R11); threads from before kinds are questions. */
@@ -264,7 +282,12 @@ export const reviewApi = {
   editComment: (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open"; kind?: ThreadKind; reason?: string }) =>
     request<{ id: string; thread: string; state: string; kind?: ThreadKind }>("PATCH", `/api/comments/${enc(id)}`, body),
   deleteComment: (id: string) => request<{ id: string; thread: string; deleted: boolean; thread_deleted: boolean }>("DELETE", `/api/comments/${enc(id)}`),
-  applySuggestion: (id: string) => request<unknown>("POST", `/api/comments/${enc(id)}/apply`, {}),
+  applySuggestion: (id: string, suggestion?: number) =>
+    request<{ diff: string; version: number; thread: string; state: string; commit?: string; suggestion?: number; signer?: string | null }>(
+      "POST",
+      `/api/comments/${enc(id)}/apply`,
+      suggestion == null ? {} : { suggestion },
+    ),
   review: (key: string, action: ReviewAction, body: string, force?: boolean) =>
     request<{ diff: string; action: string; version: number; published: number; state: string; note?: string | null }>(
       "POST",

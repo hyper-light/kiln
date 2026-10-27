@@ -96,13 +96,21 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
     let latest = versions.last().cloned();
     let path = super::diffs::home(hub, d).await.ok().map(|(_, p)| p);
+    let applied = applied(hub, d).await?;
     let mut by: HashMap<String, Vec<Value>> = HashMap::new();
     for (cid, tid, author, body, suggestion, at, published, deleted) in comments {
-        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted }));
+        // Its suggestions (W26-R10): its body's blocks, then the old field, each saying which
+        // revision applied it.
+        let made = applied.get(&cid);
+        let suggests: Vec<Value> = if deleted { Vec::new() } else { kiln_ci::suggest::suggestions(&body, suggestion.as_deref()) }
+            .into_iter()
+            .map(|s| json!({ "index": s.index, "lines": s.lines, "field": s.field, "applied": made.filter(|a| a.0 == s.index).map(|(_, n, by, at)| json!({ "version": n, "by": by, "at": at })) }))
+            .collect();
+        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
     }
     let mut out = Vec::new();
     for ((tid, version, file, side, start, end, state, created_by, at), (kind, resolved_by, resolved_at, resolution)) in rows {
-        let Some(list) = by.remove(&tid) else { continue };
+        let Some(mut list) = by.remove(&tid) else { continue };
         let side = side.unwrap_or_else(|| "new".into());
         // Where it is now.
         let now = match (&file, start, &latest, &path, versions.iter().find(|v| v.n == version)) {
@@ -110,6 +118,13 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
             (None, ..) => Some(Value::Null),
             _ => None,
         };
+        // A suggestion not applied whose lines changed since is outdated: it says so, and doesn't apply.
+        for s in list.iter_mut().filter_map(|c| c.get_mut("suggestions")).filter_map(Value::as_array_mut).flatten() {
+            let outdated = now.is_none() && s.get("applied").is_none_or(Value::is_null);
+            if let Some(o) = s.as_object_mut() {
+                o.insert("outdated".into(), json!(outdated));
+            }
+        }
         out.push(json!({
             "id": tid, "version": version, "file": file, "side": side, "start_line": start, "end_line": end, "state": state, "created_by": created_by, "created_at": at,
             "outdated": now.is_none(), "now": now.unwrap_or(Value::Null), "comments": list,
@@ -117,6 +132,20 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
         }));
     }
     Ok(out)
+}
+
+/// The suggestions applied on `d` (W26-R10), by comment: which of its suggestions, the revision
+/// that applied it, who applied it and when.
+async fn applied(hub: &Hub, d: &Diff) -> Result<HashMap<String, (u32, u32, String, i64)>, Fail> {
+    let id = d.id.clone();
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT comment, suggestion, n, pushed_by, created_at FROM diff_versions WHERE diff_id = ?1 AND comment IS NOT NULL AND suggestion IS NOT NULL ORDER BY n")?;
+            let rows = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?;
+            Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+        })
+        .await
+        .map_err(fail)
 }
 
 /// A diff's threads as the gate reads them (W26-R11): each one's kind and reviewer, where it
@@ -731,99 +760,170 @@ pub async fn inbox(hub: &Hub, caller: &Caller) -> Result<Value, Fail> {
     Ok(json!({ "you": me, "waiting_for_you": yours, "waiting_for_others": theirs, "review_requested": asked, "your_diffs": mine }))
 }
 
-/// `POST /api/comments/:id/apply` (W14-R05): a comment's suggestion, the lines it replaces taken
-/// to the latest version. A diff gets a new version, its commit amended (same parent, same
-/// message, same author); a change request's branch gets a commit. The thread is resolved, saying
-/// where the suggestion went.
-pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Caller) -> Result<Value, Fail> {
+/// A comment as applying its suggestions reads it (W26-R10): its body and old `suggestion` field,
+/// its author, whether it's published or deleted, and its thread's place.
+struct Suggested {
+    comment: String,
+    field: Option<String>,
+    body: String,
+    by: String,
+    published: bool,
+    deleted: bool,
+    thread: String,
+    diff: String,
+    version: u32,
+    file: Option<String>,
+    side: Option<String>,
+    start: Option<u32>,
+    end: Option<u32>,
+}
+
+/// `POST /api/comments/:id/apply` `{ suggestion? }` (W14-R05, W26-R10): one of a comment's
+/// suggestions (its body's `suggestion` blocks, then its old `suggestion` field as one more;
+/// `suggestion` says which when it has several) taken to the latest revision, where it replaces the
+/// lines its thread is on. It's a revision of whoever applies it, made through the one commit path
+/// W27-R03 signs ([`super::revision::commit`]): a diff's commit amended (its parent, message and
+/// author kept), a change request's branch given a commit of the applier's; the applier its
+/// committer and the suggester a co-author, as GitHub has it. The revision says why it exists
+/// (`suggestion applied`, its thread, the comment and which suggestion), and the thread says which
+/// revision applied it and is resolved, unless it's blocking and someone else's (W26-R11). A
+/// suggestion whose lines changed since says it's outdated and changes nothing, as does a draft's
+/// or one applied already.
+pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let key = id.to_owned();
-    #[allow(clippy::type_complexity)]
-    let found: Option<(Option<String>, String, String, String, u32, Option<String>, Option<String>, Option<u32>, Option<u32>)> = hub
+    let found: Option<Suggested> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT c.suggestion, c.author, c.thread_id, t.diff_id, t.version, t.file, t.side, t.start_line, t.end_line FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE c.id = ?1 OR CAST(c.rowid AS TEXT) = ?1",
+                "SELECT c.id, c.suggestion, c.body, c.author, c.published, c.deleted_at IS NOT NULL, c.thread_id, t.diff_id, t.version, t.file, t.side, t.start_line, t.end_line
+                 FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE c.id = ?1 OR CAST(c.rowid AS TEXT) = ?1",
                 [&key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                |r| {
+                    Ok(Suggested {
+                        comment: r.get(0)?,
+                        field: r.get(1)?,
+                        body: r.get(2)?,
+                        by: r.get(3)?,
+                        published: r.get(4)?,
+                        deleted: r.get(5)?,
+                        thread: r.get(6)?,
+                        diff: r.get(7)?,
+                        version: r.get(8)?,
+                        file: r.get(9)?,
+                        side: r.get(10)?,
+                        start: r.get(11)?,
+                        end: r.get(12)?,
+                    })
+                },
             )
             .optional()?)
         })
         .await
         .map_err(fail)?;
-    let Some((suggestion, suggested_by, thread, diff, version, file, side, start, end)) = found else { return Err((StatusCode::NOT_FOUND, "no such comment".into())) };
-    let Some(suggestion) = suggestion else { return Err(bad("the comment suggests nothing")) };
-    let (Some(file), Some(start)) = (file, start) else { return Err(bad("a suggestion is on a file's lines")) };
-    if side.as_deref() == Some("old") {
+    let c = found.filter(|c| !c.deleted).ok_or((StatusCode::NOT_FOUND, "no such comment".to_owned()))?;
+    let at = kiln_ci::review::place(c.file.as_deref(), c.start);
+    // As on GitHub, a pending review's suggestion waits for the review.
+    if !c.published {
+        return Err((StatusCode::CONFLICT, format!("{at}: a draft's suggestion applies once its review is published")));
+    }
+    let all = kiln_ci::suggest::suggestions(&c.body, c.field.as_deref());
+    let which = match body.get("suggestion") {
+        Some(v) => v.as_u64().and_then(|i| u32::try_from(i).ok()).ok_or_else(|| bad("`suggestion` is which of the comment's suggestions, from 0"))?,
+        None if all.len() > 1 => return Err(bad(format!("the comment suggests {} changes: say which (`suggestion`, 0 to {})", all.len(), all.len() - 1))),
+        None => 0,
+    };
+    let Some(suggestion) = all.into_iter().find(|s| s.index == which) else {
+        return Err(bad(if which == 0 { "the comment suggests nothing".to_owned() } else { format!("the comment has no suggestion {which}") }));
+    };
+    let (Some(file), Some(start)) = (c.file.clone(), c.start) else { return Err(bad("a suggestion is on a file's lines")) };
+    if c.side.as_deref() == Some("old") {
         return Err(bad("a suggestion replaces lines of the new side"));
     }
-    let d = super::diffs::find(hub, &diff).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, "the diff is gone".to_owned()))?;
+    let d = super::diffs::find(hub, &c.diff).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, "the diff is gone".to_owned()))?;
     if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {
         return Err((StatusCode::FORBIDDEN, "applying a suggestion needs `diffs.submit`".into()));
     }
     if !State::parse(&d.state).is_some_and(|s| s.is_open() && s != State::Landing) {
         return Err((StatusCode::CONFLICT, format!("{} is {}", d.name, d.state)));
     }
-    let versions = super::diffs::versions(hub, &d).await.map_err(fail)?;
-    let (Some(from), Some(latest)) = (versions.iter().find(|v| v.n == version).cloned(), versions.last().cloned()) else { return Err(bad("the comment's version is gone")) };
-    let (repo, path) = super::diffs::home(hub, &d).await?;
-    let (s, e) = follow(hub, &path, &file, "new", (&from, &latest), (start, end.unwrap_or(start))).await.ok_or((StatusCode::CONFLICT, "the lines it replaces changed since: it's outdated".to_owned()))?;
-    // The file with the lines replaced.
-    let old = gitops::run_git(hub, &["-C", &path, "show", &format!("{}:{file}", latest.commit)], LS_REMOTE_TIMEOUT).await.map_err(|_| bad(format!("{file} isn't in the latest version")))?;
-    let text = String::from_utf8_lossy(&old).into_owned();
-    let ends_nl = text.ends_with('\n');
-    let mut lines: Vec<&str> = text.lines().collect();
-    let (lo, hi) = (usize::try_from(s).unwrap_or(1).max(1) - 1, usize::try_from(e).unwrap_or(1));
-    if hi > lines.len() || lo >= hi {
-        return Err((StatusCode::CONFLICT, "the lines it replaces aren't there".into()));
+    if let Some((i, n, ..)) = applied(hub, &d).await?.get(&c.comment) {
+        return Err((StatusCode::CONFLICT, format!("{at}: {} applied in v{n}", if *i == which { "this suggestion was" } else { "another of this comment's suggestions was" })));
     }
-    let replacement: Vec<&str> = suggestion.lines().collect();
-    lines.splice(lo..hi, replacement);
-    let mut new_text = lines.join("\n");
-    if ends_nl {
-        new_text.push('\n');
+    let versions = super::diffs::versions(hub, &d).await.map_err(fail)?;
+    let (Some(from), Some(latest)) = (versions.iter().find(|v| v.n == c.version).cloned(), versions.last().cloned()) else { return Err(bad("the comment's version is gone")) };
+    let (repo, path) = super::diffs::home(hub, &d).await?;
+    // The thread's lines where the latest revision has them, or outdated: changed since.
+    let (s, e) = follow(hub, &path, &file, "new", (&from, &latest), (start, c.end.unwrap_or(start))).await.ok_or_else(|| (StatusCode::CONFLICT, format!("{at}: this suggestion is outdated: its lines changed since v{}", c.version)))?;
+    let old = gitops::run_git(hub, &["-C", &path, "show", &format!("{}:{file}", latest.commit)], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{file} isn't in v{}", latest.n)))?;
+    let text = String::from_utf8(old).map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, format!("{file} isn't text: a suggestion changes lines of text")))?;
+    let new_text = kiln_ci::suggest::replace(&text, (s, e), &suggestion.lines).ok_or_else(|| (StatusCode::CONFLICT, format!("{at}: the lines it replaces aren't in v{}", latest.n)))?;
+    if new_text == text {
+        return Err((StatusCode::CONFLICT, format!("{at}: v{} reads as it suggests already", latest.n)));
     }
     let listing = gitops::run_git(hub, &["-C", &path, "ls-tree", &latest.commit, "--", &file], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
     let mode = listing.split_whitespace().next().unwrap_or("100644").to_owned();
     let tree = super::diffs::tree_with(hub, &path, &latest.commit, super::diffs::Edit::Put { file: &file, mode: &mode, content: new_text.into_bytes() }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let (me, _) = who(caller);
-    let applier = me.strip_prefix("user:").unwrap_or(&me).to_owned();
-    let n = match &d.branch {
-        // A change request: a commit on its branch, a version from it.
+    let suggester = c.by.clone();
+    let lines = if s == e { format!("line {s}") } else { format!("lines {s}-{e}") };
+    let note = format!("applied a suggestion from {suggester}");
+    let (made, n) = match &d.branch {
+        // A change request: a commit of the applier's on its branch, a version from it.
         Some(branch) => {
-            let msg = format!("Apply a suggestion from {suggested_by}\n\nOn {file}, lines {s}-{e}.\n");
-            let c = super::diffs::make_commit(hub, &path, &tree, &latest.commit, (&applier, None), &applier, &msg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &c, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{branch} moved: push or pull, then try again")))?;
+            let message = format!("Apply a suggestion from {suggester}\n\nOn {file}, {lines}.\n");
+            let commit = super::revision::Commit { tree: &tree, parents: &[latest.commit.as_str()], author: (&me, None), by: &caller.name, co_authors: &[suggester.as_str()], message: &message };
+            let made = super::revision::commit(hub, &path, &commit).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &made.sha, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{branch} moved: push or pull, then try again")))?;
             let by = super::cr::By { pushed_by: caller.name.clone(), author: super::diffs::author_of(&caller.name, Some(caller.kind)), started_by: caller.started_by() };
-            super::cr::submit(hub, &repo, &path, &d.trunk, branch, &c, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version
+            let n = super::cr::submit(hub, &repo, &path, &d.trunk, branch, &made.sha, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version;
+            (made, n)
         }
-        // A diff: its commit amended.
+        // A diff: its commit amended, still its author's; a suggester who wrote it isn't named again.
         None => {
             let message = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%B", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
             let who_wrote = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%an <%ae>%x00%ad", "--date=raw", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
             let (author, date) = who_wrote.split_once('\0').unwrap_or((&who_wrote, ""));
-            let c = super::diffs::make_commit(hub, &path, &tree, &latest.parent, (author, Some(date).filter(|d| !d.is_empty())), &applier, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            let patch = super::diffs::git_run(hub, &["-C", &path, "show", "--no-color", &c], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
+            let co: Vec<&str> = if suggester.eq_ignore_ascii_case(&d.author) { Vec::new() } else { vec![suggester.as_str()] };
+            let commit = super::revision::Commit { tree: &tree, parents: &[latest.parent.as_str()], author: (author, Some(date)), by: &caller.name, co_authors: &co, message: &message };
+            let made = super::revision::commit(hub, &path, &commit).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let patch = super::diffs::git_run(hub, &["-C", &path, "show", "--no-color", &made.sha], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
             let patch_id = super::diffs::git_with_input(hub, &["-C", &path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
             let id = d.id.clone();
             let below: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT parent_diff FROM diffs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.flatten())).await.map_err(fail)?;
-            let nv = super::diffs::NewVersion { commit: c, parent: latest.parent.clone(), base: latest.base.clone(), patch_id, message, note: Some(format!("applied a suggestion from {suggested_by}")), rebase_only: false, pushed_by: caller.name.clone(), parent_diff: below };
-            super::diffs::add_version(hub, &repo, &path, &d, nv).await.map_err(fail)?
+            let nv = super::diffs::NewVersion {
+                commit: made.sha.clone(),
+                parent: latest.parent.clone(),
+                base: latest.base.clone(),
+                patch_id,
+                message: made.message.clone(),
+                note: Some(note.clone()),
+                rebase_only: false,
+                pushed_by: caller.name.clone(),
+                parent_diff: below,
+            };
+            let n = super::diffs::add_version(hub, &repo, &path, &d, nv).await.map_err(fail)?;
+            (made, n)
         }
     };
-    // The thread says where it went, and is done; a blocking one stays open until its author
-    // resolves it (W26-R11), unless they applied it themselves.
-    let (t, me2, note) = (thread.clone(), me.clone(), format!("Applied in v{n}."));
+    // The revision's why (W26-R04): a suggestion applied, its thread, the comment and which.
+    let why = super::revision::Why { why: "suggestion applied", thread: Some(&c.thread), comment: Some((&c.comment, which)), note: Some(&note) };
+    if !super::revision::record(hub, &d.id, n, &made.sha, &why).await.map_err(fail)? {
+        tracing::warn!(diff = %d.name, version = n, commit = %made.sha, "a suggestion's revision isn't the version's commit: its why isn't recorded");
+    }
+    // The thread says which revision applied it, and is done; a blocking one stays open until its
+    // author resolves it (W26-R11), unless they applied it themselves.
+    let (t, me2, said) = (c.thread.clone(), me.clone(), format!("Applied in v{n}."));
     let resolved = hub
         .store
         .call(move |c| {
             let now = crate::util::now_unix();
-            c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)", params![crate::util::new_id(), t, me2, note, now])?;
+            c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)", params![crate::util::new_id(), t, me2, said, now])?;
             Ok(c.execute("UPDATE review_threads SET state = 'resolved', resolved_by = ?2, resolved_at = ?3 WHERE id = ?1 AND (kind <> 'blocking' OR lower(created_by) = lower(?2))", params![t, me2, now])? > 0)
         })
         .await
         .map_err(fail)?;
-    hub.store.audit(caller.name.clone(), "diffs.suggestion.apply".into(), format!("{} {} v{n}", d.repo, d.name)).await;
-    Ok(json!({ "diff": d.name, "version": n, "thread": thread, "state": if resolved { "resolved" } else { "open" } }))
+    hub.store.audit(caller.name.clone(), "diffs.suggestion.apply".into(), format!("{} {} v{n} ({at}: {suggester}'s suggestion {which}, comment {})", d.repo, d.name, c.comment)).await;
+    Ok(json!({ "diff": d.name, "version": n, "thread": c.thread, "state": if resolved { "resolved" } else { "open" }, "commit": made.sha, "suggestion": which, "signer": made.signer }))
 }
 
 /// Says when a run on a diff's or change request's version finishes (`diff_run`): which version,

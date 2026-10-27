@@ -844,6 +844,10 @@ pub struct Version {
     /// Who submitted it, which its runs are held to (W10-R02's `secrets.use`); kiln's own.
     #[serde(skip)]
     pub started_by: Option<Value>,
+    /// Why it exists (W26-R04), when it isn't a push: `suggestion applied`, `conflict resolved`.
+    pub why: Option<String>,
+    /// The thread it answers (a suggestion's).
+    pub thread: Option<String>,
 }
 
 const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for";
@@ -899,11 +903,24 @@ pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>
     let (id, name) = (d.id.clone(), d.name.clone());
     hub.store
         .call(move |c| {
-            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at, started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at, started_by, why, thread FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
             let rows = st.query_map([&id], |r| {
                 let n: u32 = r.get(0)?;
                 let started_by = r.get::<_, Option<String>>(8)?.and_then(|t| serde_json::from_str(&t).ok());
-                Ok(Version { n, commit: r.get(1)?, parent: r.get(2)?, base: r.get(3)?, rebase_only: r.get(4)?, pushed_by: r.get(5)?, note: r.get(6)?, created_at: r.get(7)?, git_ref: format!("refs/kiln/diffs/{name}/v{n}"), started_by })
+                Ok(Version {
+                    n,
+                    commit: r.get(1)?,
+                    parent: r.get(2)?,
+                    base: r.get(3)?,
+                    rebase_only: r.get(4)?,
+                    pushed_by: r.get(5)?,
+                    note: r.get(6)?,
+                    created_at: r.get(7)?,
+                    git_ref: format!("refs/kiln/diffs/{name}/v{n}"),
+                    started_by,
+                    why: r.get(9)?,
+                    thread: r.get(10)?,
+                })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -1411,7 +1428,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::GET, ["repos", repo, "change-requests"]) => ok(list(hub, repo, q, "change_request").await?),
         (&Method::POST, ["repos", repo, "change-requests"]) => ok(super::cr::create(hub, repo, caller, body).await?),
         (&Method::POST, ["repos", repo, "submit"]) => ok(submit_patches(hub, repo, caller, body).await?),
-        (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller).await?),
+        (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => {

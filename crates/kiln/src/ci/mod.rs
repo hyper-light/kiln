@@ -52,6 +52,7 @@ pub mod rest;
 pub mod reusable;
 pub mod review;
 pub mod review_cli;
+pub mod revision;
 pub mod reuse;
 pub mod routing;
 pub mod runs;
