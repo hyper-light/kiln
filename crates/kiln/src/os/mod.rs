@@ -82,7 +82,6 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
-/// The first executable called `name` on `PATH` (on Windows also `name` + each `PATHEXT`).
 /// Lowers the calling thread's scheduling priority, ten nice levels below its own (19 at the
 /// most): work that may wait (a query's helper threads) yields to what may not (the writes the
 /// server takes). Linux's threads each have their own nice value (`setpriority(PRIO_PROCESS, tid)`);
@@ -97,13 +96,22 @@ pub fn lower_thread_priority() {
     }
 }
 
+/// The first executable called `name` on `PATH`. On Windows a name without a program's extension
+/// is looked for as cmd.exe looks for it, as `name` + each `PATHEXT` extension a process starts
+/// from, never bare: npm puts a shell script `codex`, which Windows can't start, beside `codex.cmd`.
 pub fn which(name: &str) -> Option<PathBuf> {
     which_in(name, &std::env::var_os("PATH")?)
 }
 
 /// [`which`] over `paths`, a `PATH` value.
 pub fn which_in(name: &str, paths: &std::ffi::OsStr) -> Option<PathBuf> {
-    let candidates = exe_names(name);
+    let pathext = cfg!(windows).then(|| std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned()));
+    find_in(name, paths, pathext.as_deref())
+}
+
+/// [`which_in`] with Windows' `PATHEXT` (None: Unix, where a program's name is its file's).
+fn find_in(name: &str, paths: &std::ffi::OsStr, pathext: Option<&str>) -> Option<PathBuf> {
+    let candidates = exe_names(name, pathext);
     std::env::split_paths(paths)
         .filter(|dir| !dir.as_os_str().is_empty())
         .flat_map(|dir| candidates.iter().map(move |n| dir.join(n)).collect::<Vec<_>>())
@@ -297,14 +305,19 @@ pub fn signal_number(kind: hyper_rt::signal::Signal) -> i32 {
     }
 }
 
-/// The names `name` may have on disk: itself, plus the executable extensions on Windows.
-fn exe_names(name: &str) -> Vec<String> {
-    let mut names = vec![name.to_owned()];
-    if cfg!(windows) && Path::new(name).extension().is_none() {
-        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
-        names.extend(exts.split(';').filter(|e| !e.is_empty()).map(|e| format!("{name}{}", e.to_ascii_lowercase())));
+/// The extensions of the files Windows starts as programs: binaries, and batch files (which the
+/// standard library runs through cmd.exe). `PATHEXT`'s others (`.js`, `.vbs`) open in a program.
+const PROGRAM_EXTENSIONS: [&str; 4] = ["exe", "com", "bat", "cmd"];
+
+/// The names `name` may have on disk: itself on Unix; on Windows (`pathext` given) itself when
+/// it has a program's extension, else it with each of `pathext`'s that is one, in that order.
+fn exe_names(name: &str, pathext: Option<&str>) -> Vec<String> {
+    let is_program = |ext: &str| PROGRAM_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str());
+    let Some(pathext) = pathext else { return vec![name.to_owned()] };
+    if Path::new(name).extension().and_then(|e| e.to_str()).is_some_and(is_program) {
+        return vec![name.to_owned()];
     }
-    names
+    pathext.split(';').map(|e| e.trim().trim_start_matches('.')).filter(|e| is_program(e)).map(|e| format!("{name}.{}", e.to_ascii_lowercase())).collect()
 }
 
 /// The file name of a program, without directory or extension, lowercased: what to compare when
@@ -312,7 +325,7 @@ fn exe_names(name: &str) -> Vec<String> {
 pub fn program_stem(program: &str) -> String {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
     let stem = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && ["exe", "com", "bat", "cmd"].contains(&ext.to_ascii_lowercase().as_str()) => stem,
+        Some((stem, ext)) if !stem.is_empty() && PROGRAM_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) => stem,
         _ => name,
     };
     stem.to_ascii_lowercase()
@@ -380,6 +393,33 @@ mod tests {
         println!("{said}");
         assert!(said.contains(&format!("exe={} (deleted)\n", bin.display())), "the replaced binary's own path: {said}");
         assert!(said.contains(&format!("this_kiln={}\n", bin.display())), "{said}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_windows_program_is_one_cmd_would_start() -> anyhow::Result<()> {
+        let pathext = Some(".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC");
+        assert_eq!(exe_names("codex", pathext), ["codex.com", "codex.exe", "codex.bat", "codex.cmd"]);
+        assert_eq!(exe_names("codex.CMD", pathext), ["codex.CMD"]);
+        assert_eq!(exe_names("codex", None), ["codex"]);
+        // What `npm install -g @openai/codex` leaves in Node's folder: a shell script for Git Bash,
+        // a batch file for cmd, a script for PowerShell.
+        let npm = tempfile::tempdir()?;
+        for f in ["codex", "codex.cmd", "codex.ps1"] {
+            std::fs::write(npm.path().join(f), "")?;
+        }
+        let path = std::env::join_paths([npm.path()])?;
+        assert_eq!(find_in("codex", &path, pathext), Some(npm.path().join("codex.cmd")));
+        assert_eq!(find_in("codex.cmd", &path, pathext), Some(npm.path().join("codex.cmd")));
+        assert_eq!(find_in("codex", &path, None), Some(npm.path().join("codex")), "Unix starts the script");
+        // A file Windows opens rather than starts is no program, even first on PATH.
+        let (scripts, node) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        std::fs::write(scripts.path().join("node.js"), "")?;
+        std::fs::write(scripts.path().join("gemini"), "")?;
+        std::fs::write(node.path().join("node.exe"), "")?;
+        let path = std::env::join_paths([scripts.path(), node.path()])?;
+        assert_eq!(find_in("node", &path, pathext), Some(node.path().join("node.exe")));
+        assert_eq!(find_in("gemini", &path, pathext), None, "a shell script alone is not installed");
         Ok(())
     }
 

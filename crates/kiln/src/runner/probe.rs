@@ -85,7 +85,9 @@ async fn tools() -> BTreeMap<String, String> {
 /// The executors this runner can run legs on right now, each probed: the host always; Firecracker
 /// when its microVMs can run here (KVM, Firecracker, its guest kernel and e2fsprogs: W13-R05), with
 /// its version and kernel; Docker (or Podman) when its engine answers, with its version and whether
-/// it runs rootless. shards is reported as a tool until this runner can run legs on it.
+/// it runs rootless. shards is reported as a tool until this runner can run legs on it. Docker
+/// isn't one on Windows: a leg in it keeps the host's paths (`C:\…`), which its Linux container
+/// has no place for (a job's own containers still run there).
 async fn executors() -> BTreeMap<String, Executor> {
     let mut out = BTreeMap::new();
     out.insert("host".to_owned(), Executor::default());
@@ -97,8 +99,11 @@ async fn executors() -> BTreeMap<String, Executor> {
         let version = crate::rt::blocking(move || m.version()).await.ok().flatten();
         out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel), ("jail".to_owned(), jail)].into() });
     }
+    if cfg!(windows) {
+        return out;
+    }
     let Ok(Some(bin)) = crate::rt::blocking(super::docker::find).await else { return out };
-    let engine = if bin.ends_with("podman") { "podman" } else { "docker" };
+    let engine = if super::docker::is_podman(&bin) { "podman" } else { "docker" };
     let mut version = None;
     for format in ["{{.Server.Version}}", "{{.Version}}"] {
         if let Some(v) = output(&bin, &["version", "--format", format]).await.as_deref().and_then(version_in) {
