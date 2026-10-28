@@ -453,6 +453,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| crate::peers::readdress(&hub, &caller.name, &id, req)).await.map_err(|(c, m)| err(c, m))
         }
         (&Method::DELETE, ["api", "peers", id]) => boxed(|| crate::peers::remove(&hub, &caller.name, id)).await.map_err(|(c, m)| err(c, m)),
+        // Ship's read model: a repository's commits and where each stands (plan 01a175b3a21174bc8769f5e784b90ecb).
+        (&Method::GET, ["api", "ship", "commits"]) => boxed(|| crate::ship::list(&hub, &q, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", repo, sha]) => boxed(|| crate::ship::get(&hub, repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", owner, name, sha]) => {
+            let repo = format!("{owner}/{name}");
+            boxed(|| crate::ship::get(&hub, &repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m))
+        }
         (_, ["api", "cd", rest @ ..]) => boxed(|| crate::cd::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => boxed(|| crate::deploy::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ci", "legs", id, "terminal"]) => {
