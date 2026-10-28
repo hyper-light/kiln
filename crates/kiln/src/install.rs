@@ -345,6 +345,17 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     // A server installed where none was: a failure takes back what it made, and nothing else may
     // answer on its port (the check would ask that instead).
     let fresh = !a.agent && !config_path.exists();
+    // A server where none was, on a machine whose runner runs: its local agent would be a second
+    // runner beside that one, under the machine's name (docs/releases.md, "One runner a machine").
+    if fresh && !system {
+        let state_dir = crate::config::default_data_dir().join("agent");
+        if crate::join::enrolled(&state_dir) {
+            let running: Vec<String> = crate::upgrade::services_here(&state_dir, "kiln-agent").into_iter().filter(|h| h.running).map(|h| h.existing.unit).collect();
+            if let Some(why) = server_beside_runner(&running, crate::join::stored(&state_dir, "server").as_deref(), &config_path) {
+                anyhow::bail!(why);
+            }
+        }
+    }
     let (had_bin, data_dir) = (bin.exists(), crate::config::default_data_dir());
     let had_data = data_dir.exists();
     let ours = ["server".to_owned()];
@@ -383,6 +394,26 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
         }
         done => done,
     }
+}
+
+/// Why a server isn't installed on this machine: its runner (`running`, its services) works for
+/// `server`, and the server's local agent would be a second runner beside it, under the machine's
+/// name. Nothing when no runner runs.
+fn server_beside_runner(running: &[String], server: Option<&str>, config: &Path) -> Option<String> {
+    if running.is_empty() {
+        return None;
+    }
+    let units = running.join(", ");
+    let (server, join) = match server {
+        Some(s) => (s, format!("kiln join --server {s}")),
+        None => ("another kiln server", "kiln join".to_owned()),
+    };
+    Some(format!(
+        "this machine's runner ({units}) works for {server}: a kiln server here would run a second runner beside it, its local agent, \
+         under this machine's name. To bring the runner up to this kiln: `{join}`. For a server here as well, without a runner of its \
+         own: put `[local_agent]` with `enabled = false` in {} first. For a server here instead: `kiln uninstall --agent` first",
+        config.display()
+    ))
 }
 
 /// Installs kiln on this machine: its binary at `bin`, its config at `config_path`, started at
@@ -1604,6 +1635,18 @@ mod tests {
         assert_eq!(win_quote(""), "\"\"");
         assert_eq!(win_quote(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(win_quote(r"C:\Program Files\kiln\"), r#""C:\Program Files\kiln\\""#);
+    }
+
+    #[test]
+    fn a_server_isnt_installed_beside_this_machines_runner() {
+        let config = Path::new("/Users/me/.config/kiln/kiln.toml");
+        assert_eq!(server_beside_runner(&[], Some("http://192.168.1.77:7070"), config), None, "no runner here: the server installs");
+        let why = server_beside_runner(&["kiln-agent".to_owned()], Some("http://192.168.1.77:7070"), config).unwrap_or_default();
+        for says in ["(kiln-agent) works for http://192.168.1.77:7070", "a second runner", "`kiln join --server http://192.168.1.77:7070`", "enabled = false", "/Users/me/.config/kiln/kiln.toml", "`kiln uninstall --agent`"] {
+            assert!(why.contains(says), "{says:?} not in {why:?}");
+        }
+        let unknown = server_beside_runner(&["kiln-agent".to_owned()], None, config).unwrap_or_default();
+        assert!(unknown.contains("works for another kiln server") && unknown.contains("`kiln join`"), "{unknown}");
     }
 
     #[test]

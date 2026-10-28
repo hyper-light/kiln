@@ -173,6 +173,12 @@ runner's credentials would change under it):
   stay with that server.
 - **The server can't be asked:** nothing is joined. Try again once it answers.
 
+`kiln install` of a server, where none was, on a machine whose runner is running isn't installed
+either: the server's local agent would be a second runner beside it, under the machine's name. It
+says how to go on instead: `kiln join --server <its server>` to bring the runner up to the new
+kiln, `[local_agent] enabled = false` in the config first for a server beside the runner without
+a runner of its own, or `kiln uninstall --agent` first for a server in its place.
+
 **Handing over.** While a machine has more than one runner process (a take-over, an upgrade beside
 the running runner, or one left over from before), the server has each older process hand its
 agent sessions to the newest. A session waits for its turn to end, and kiln's queue holds what is
