@@ -13,7 +13,6 @@ fn sh(script: &str) -> Option<String> {
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_owned())
 }
 
-#[cfg(target_os = "linux")]
 /// The tightest memory.max on this process's cgroup and its ancestors, when any is set.
 #[cfg(target_os = "linux")]
 fn cgroup_memory_max() -> Option<u64> {
@@ -30,6 +29,7 @@ fn cgroup_memory_max() -> Option<u64> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn close(a: u64, b: u64) -> bool {
     a.abs_diff(b) <= b / 100
 }
