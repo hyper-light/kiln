@@ -22,6 +22,24 @@ test("a change's Review opens its row at its one Files section, in view and focu
   expect(new URL(page.url()).pathname).toBe("/ship");
 });
 
+test("with its review slow to load, Review still ends at its loaded Files, focused", async ({ page }) => {
+  // Review's data held back a moment, so Files comes late (after Review's placeholder, where it draws one).
+  await page.route("**/api/diffs/**", async (route) => {
+    await new Promise((done) => setTimeout(done, 1500));
+    await route.continue();
+  });
+  await page.goto("/ship");
+  const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
+  await expect(row).toBeVisible({ timeout: 15_000 });
+  await row.getByRole("button", { name: "Review", exact: true }).click();
+  const files = row.locator('section[aria-label="Files"]');
+  // Loaded: Review's summary is in its heading.
+  await expect(files.locator(".rv-sum")).toBeVisible({ timeout: 15_000 });
+  await expect(files).toHaveCount(1);
+  await expect(files).toBeFocused();
+  await expect(files).toBeInViewport();
+});
+
 test("opening a row by its chevron leaves the page where it is", async ({ page }) => {
   await page.goto("/ship");
   const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
