@@ -882,6 +882,7 @@ a.ms-why:hover {
 
 /* A machine offline a while, with agents on it: they can go on elsewhere. */
 .ms-recover {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -893,8 +894,11 @@ a.ms-why:hover {
   background: #1b1915;
   color: #c9c3b6;
   font-size: 13px;
+  /* A sideways drag is the card's (to put it away), not the page's. */
+  touch-action: pan-y;
 }
 .ms-recover > span:first-child {
+  padding-right: 28px;
   flex: 1 1 320px;
   min-width: 0;
 }
@@ -906,6 +910,12 @@ a.ms-why:hover {
 }
 .ms-recover-none {
   color: #97999f;
+}
+/* × puts it away (a swipe does too, on a touch screen). */
+.ms-recover-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
 }
 
 /* ---------------------------------------------------------------- notifications, and a phone's page */
