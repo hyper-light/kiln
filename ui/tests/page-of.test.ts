@@ -140,6 +140,21 @@ test("kiln's page answer, however a harness passes it on", () => {
   assert.equal(at(ANSWER.replace(`"id":"${ID}"`, '"id":"../../etc"')), null);
 });
 
+/** A long output as kiln keeps it (`crate::harness::model::clip_middle`, `OUTPUT_MAX`), for ASCII text. */
+const clipMiddle = (s: string, max = 24 * 1024) => (s.length <= max ? s : `${s.slice(0, max / 2)}\n… ${s.length - max} bytes omitted …\n${s.slice(s.length - max / 2)}`);
+
+test("a page that printed a lot is drawn, its answer cut in the middle as kiln keeps a long output", () => {
+  // What it printed comes after the page in kiln's answer: up to 500 lines of its console (`crate::browser::page`).
+  const answer = JSON.parse(ANSWER) as { kiln_page: unknown; seen: Record<string, unknown> };
+  const said = Array.from({ length: 400 }, (_, i) => ({ level: "log", text: `frame ${i}: ${"x".repeat(90)}` }));
+  const kept = clipMiddle(JSON.stringify({ ...answer, seen: { ...answer.seen, said } }));
+  assert.ok(kept.includes("bytes omitted"), "kiln cuts it");
+  assert.equal(pageOf({ output: kept })?.path, PATH);
+  // Whichever harness called it: by its name, its words, or kiln's answer alone (Goose).
+  assert.ok(isShowPage({ ...DEVIN, output: kept }));
+  assert.ok(isShowPage({ name: "tool", tool: "other", title: "showing the review page", output: kept }));
+});
+
 test("a page or live page being shown goes by its own title, not its harness's words for the call", () => {
   assert.equal(shownTitle(KEEPING, "A page"), "Try it: Review, end to end (clickable)");
   assert.equal(shownTitle({ title: "Called show_page from kiln", input: '{"title": "Try it", "path": "/w/a.html"}' }, "A page"), "Try it");

@@ -131,15 +131,17 @@ function objectAt(s: string, from: number): string {
 /**
  * What kiln's tool answered under `key` (`kiln_page`, `kiln_stream`: `crate::reach::mcp`), from a
  * call's output as its harness passed it on: kiln's JSON (one line, `crate::reach::shown`), that
- * JSON quoted as text again (an ACP agent's raw output, as Devin's can be), or among other lines
- * and content (its picture said in words, MCP's whole result). Null when it holds no such answer.
+ * JSON quoted as text again (an ACP agent's raw output, as Devin's can be), among other lines and
+ * content (its picture said in words, MCP's whole result), or cut in its middle, as kiln keeps a
+ * long output (`OUTPUT_MAX`): the answer's own object is read, which comes first, before what a
+ * page printed. Null when it holds no such answer.
  */
 export function answerOf(output: string | undefined, key: string): Record<string, unknown> | null {
   if (!output?.includes(key)) return null;
   const text = /^\s*"/.test(output) ? read(output) : undefined;
   if (typeof text === "string") return answerOf(text, key);
-  for (const m of output.matchAll(new RegExp(`\\{\\s*"${key}"\\s*:`, "g"))) {
-    const answer = (read(objectAt(output, m.index)) as Record<string, unknown> | undefined)?.[key];
+  for (const m of output.matchAll(new RegExp(`"${key}"\\s*:\\s*\\{`, "g"))) {
+    const answer = read(objectAt(output, m.index + m[0].length - 1));
     if (answer && typeof answer === "object" && !Array.isArray(answer)) return answer as Record<string, unknown>;
   }
   return null;
