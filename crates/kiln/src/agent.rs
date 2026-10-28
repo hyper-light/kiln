@@ -92,11 +92,11 @@ pub struct EnrollRequest {
     pub token: String,
     pub name: String,
     pub csr: String,
-    /// The machine's hostname: an outpost enrolling again keeps its name ([`crate::api`]).
+    /// The machine's hostname: a machine enrolling again keeps its name ([`crate::api`]).
     #[serde(default)]
     pub hostname: String,
-    /// The machine's id ([`crate::os::machine_id`]): another machine's outpost with the same host
-    /// name isn't taken for this one. None from a kiln from before.
+    /// The machine's id ([`crate::os::machine_id`]): another machine with the same host name isn't
+    /// taken for this one. None from a kiln from before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 }

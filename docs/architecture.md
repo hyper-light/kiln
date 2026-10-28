@@ -265,7 +265,8 @@ Joining is never automatic: a machine asks, an admin decides.
    another id is another machine whatever its host name (macOS names two Macs "Ada's MacBook Pro"
    alike until one of them notices), and the same machine joining again keeps its name. A runner
    from before that never said its id, or a machine that doesn't send one, is told apart by host
-   name. An outpost enrolling again is named the same way.
+   name. A machine enrolling with the join token (`kiln install --agent --token`), and an outpost,
+   are named the same way.
    The answer carries the certificate, the CA and the QUIC address (the address the machine reached
    the HTTP API at, when that is an IP, else the advertised one).
 6. The machine stores the credentials in the agent state directory like enrollment

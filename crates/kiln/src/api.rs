@@ -3062,9 +3062,10 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         }
         None => crate::pki::sanitize_name(&r.name),
     };
-    // An outpost never takes another machine's name: the same machine enrolling again keeps its
-    // own, another one gets `<name>-2`.
-    let name = if outpost { free_agent_name(hub, &name, &r.hostname, crate::join::clean_machine_id(r.machine_id.as_deref()).as_deref()).await } else { name };
+    // A machine enrolling with the join token, or an outpost, never takes another machine's name,
+    // as a joining one doesn't: the same machine enrolling again keeps its own, another one gets
+    // `<name>-2`. A job's pod has its pod's name.
+    let name = if persistent || outpost { free_agent_name(hub, &name, &r.hostname, crate::join::clean_machine_id(r.machine_id.as_deref()).as_deref()).await } else { name };
     let days = if ephemeral {
         crate::pki::EPHEMERAL_DAYS
     } else if outpost {
