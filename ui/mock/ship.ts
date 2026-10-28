@@ -327,7 +327,23 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
           ...row,
           review: marksOf(row),
           checks: live
-            ? [{ pipeline: "ci", legs: [{ name: live.name, state: live.state === "running" ? "running" : "passed", attempts: 1, note: "", job: live.job, run: live.run, start: now() - 120 }] }]
+            ? [
+                {
+                  pipeline: "ci",
+                  legs: [
+                    {
+                      name: live.name,
+                      state: live.state === "running" ? "running" : "passed",
+                      attempts: 1,
+                      note: "",
+                      job: live.job,
+                      run: live.run,
+                      start: T0 - 120,
+                      ...(live.state === "running" ? {} : { end: T0 - 60 }),
+                    },
+                  ],
+                },
+              ]
             : [],
         }
       : null;

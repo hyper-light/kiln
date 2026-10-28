@@ -56,11 +56,11 @@ function ShipList() {
   const one = (k: string) => (chosen[k]?.length === 1 ? chosen[k][0] : undefined);
   const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), lens: lens === "review" ? "review" : undefined, limit: LIMIT };
   const key = `ship/commits/${JSON.stringify(q)}`;
-  // Every stage it shows moves on its own event: a run or a leg (checks, build), review and comments,
-  // an app's sync and a rollout (staging, production), a runner's update (replant).
+  // Every stage it shows moves on its own event: a run or a leg (checks, build), review, comments and
+  // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant).
   const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), {
     pollMs: 15_000,
-    on: ["run", "job", "review", "comment", "cd_apps", "cd_rollout", "updates", "update_job"],
+    on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"],
   });
   const all = page.data.commits;
   // What each facet reads of a commit; every facet chosen must hold.
