@@ -2,22 +2,7 @@
    opened under its row as a runner is, and every form in the page's flow. */
 
 .repos-tools {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 8px 12px;
   margin-bottom: 20px;
-}
-.repos-filter {
-  min-width: 0;
-  flex: 1 1 320px;
-}
-.repos-sort {
-  flex: 0 0 190px;
-}
-.repos-count {
-  align-self: center;
-  margin-left: auto;
 }
 
 .repos-underway {

@@ -14,6 +14,7 @@ pub const TEXT_MAX: usize = 256 * 1024;
 /// One item of the timeline. Upserted by `id`: a tool call is first sent running, then again
 /// with its result; a streaming reply grows until it is final.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Event {
     pub id: String,
     /// Order of first appearance in the session.
@@ -22,16 +23,19 @@ pub struct Event {
     pub at: i64,
     /// The subagent run (its spawning tool call's id) this event belongs to; None for the main thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub parent: Option<String>,
     /// The harness that was running when it appeared ("Claude Code", "Codex"): a conversation
     /// switched between harnesses keeps who said what.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub by: Option<String>,
     #[serde(flatten)]
     pub body: Body,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Body {
     /// Something the person (or a peer, or the system) said to the agent.
@@ -41,15 +45,18 @@ pub enum Body {
         images: u32,
         /// The id kiln gave the message when it sent it (matches a queue item / delivery state).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         client_id: Option<String>,
         /// "human", "system" (task notifications, reminders) ...
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         origin: Option<String>,
         /// Names of the files attached to it (images are counted in `images` too).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
         /// The event it answers (a messenger-style reply), shown as its quote.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         reply_to: Option<String>,
     },
     Assistant {
@@ -74,6 +81,7 @@ pub enum Body {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Level {
     Info,
@@ -91,6 +99,7 @@ fn is_false(b: &bool) -> bool {
 
 /// What kind of thing a tool does, so the UI can render it properly whatever the harness named it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     /// Runs a shell command.
@@ -114,6 +123,7 @@ pub enum ToolKind {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     /// Proposed, not yet started (or waiting for approval).
@@ -127,6 +137,7 @@ pub enum ToolStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ToolCall {
     pub tool_id: String,
     /// The harness's own name for the tool (Bash, Edit, mcp__github__search ...).
@@ -136,11 +147,13 @@ pub struct ToolCall {
     pub title: String,
     /// A second line: the command's description, a line range, the search root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub detail: Option<String>,
     /// The input as the harness gave it (long strings shortened).
     pub input: serde_json::Value,
     pub status: ToolStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
@@ -151,25 +164,32 @@ pub struct ToolCall {
     pub todos: Vec<Todo>,
     /// The subagent task this call started (for Agent/Task tools).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub task: Option<String>,
     /// Exit code for shell commands, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub exit_code: Option<i32>,
     pub started: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub ended: Option<i64>,
     /// For an MCP tool: its server, and the tool's own name (`mcp__github__search` → "github",
     /// "search").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tool_short: Option<String>,
     /// For a skill run: the skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub skill: Option<String>,
     /// A command run on another machine (kiln reach): the runner it ran on once one is picked, what
     /// it must be (`linux/amd64`) until then, or empty while kiln picks the best.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub runner: Option<String>,
 }
 
@@ -197,6 +217,7 @@ impl ToolCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FileDiff {
     pub path: String,
     /// The file did not exist before.
@@ -207,6 +228,7 @@ pub struct FileDiff {
 
 /// One unified-diff hunk; `lines` carry their ' ', '-' or '+' prefix.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Hunk {
     pub old_start: u32,
     pub old_lines: u32,
@@ -218,6 +240,7 @@ pub struct Hunk {
 /// One file's cumulative change over the whole session: from how it was before the agent first
 /// touched it to how it is now.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FileChange {
     /// Relative to its working tree's top ([`FileChange::tree`]) when it's in one, else to the
     /// session's directory when inside it.
@@ -225,6 +248,7 @@ pub struct FileChange {
     /// The top of the git working tree it's in, when that's one of the session's repository's: its
     /// folder's own, or a worktree of it the agent works in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tree: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub created: bool,
@@ -241,6 +265,7 @@ pub struct FileChange {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Todo {
     pub text: String,
     /// "pending", "in_progress", "completed".
@@ -249,6 +274,8 @@ pub struct Todo {
 
 /// Where a session is in its life.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "SessionStatus"))]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     #[default]
@@ -267,6 +294,7 @@ pub enum Status {
 
 /// A decision the agent is waiting for: a tool call to approve, questions to answer, a plan.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Approval {
     /// The harness's request id (answers go back under it).
     pub id: String,
@@ -275,10 +303,12 @@ pub struct Approval {
     pub tool: ToolKind,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub detail: Option<String>,
     pub input: serde_json::Value,
     /// For shell tools: the exact command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub command: Option<String>,
     pub cwd: String,
     /// For file changes: what would change, computed against the file as it is now.
@@ -286,6 +316,7 @@ pub struct Approval {
     pub diffs: Vec<FileDiff>,
     /// Why the harness is asking (its own words).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reason: Option<String>,
     /// Ways to allow it from now on, as the harness offers them ("always allow npm test in this
     /// project", "accept edits for this session").
@@ -299,14 +330,17 @@ pub struct Approval {
     pub questions: Vec<Question>,
     /// A plan to approve (plan-mode exits).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan: Option<String>,
     /// Which subagent is asking, if not the main thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub agent: Option<String>,
     pub at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AlwaysOption {
     pub label: String,
     /// Where the rule is kept: "session", "project (local)", "project", "user".
@@ -316,6 +350,7 @@ pub struct AlwaysOption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Question {
     /// The harness's own id for it (Codex), when it has one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -337,6 +372,7 @@ pub struct Question {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct QuestionOption {
     #[serde(default)]
     pub label: String,
@@ -355,25 +391,30 @@ pub fn choices_of(answers: Option<std::collections::BTreeMap<String, String>>, c
 
 /// The answer to one question (`Command::Approve::choices`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ChoiceAnswer {
     /// The question's text; `id` its id when it has one.
     #[serde(default)]
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub id: Option<String>,
     /// The labels of the options chosen.
     #[serde(default)]
     pub selected: Vec<String>,
     /// A free-text answer ("Other").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub other: Option<String>,
     /// A note with the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub note: Option<String>,
 }
 
 /// A message kiln holds until the agent's current turn ends.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct QueueItem {
     pub id: String,
     pub text: String,
@@ -381,9 +422,11 @@ pub struct QueueItem {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub overrides: Option<Overrides>,
     /// The event it answers (a messenger-style reply): its quote rides with the message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reply_to: Option<String>,
 }
 
@@ -395,6 +438,7 @@ pub fn attachment_summary(list: &[Attachment]) -> (u32, Vec<String>) {
 
 /// How a message should reach a busy agent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SendMode {
     /// Wait in kiln's queue until the current turn ends.
@@ -409,6 +453,7 @@ pub enum SendMode {
 /// Where a sent message is: written to the agent, accepted into its queue, being worked on,
 /// finished, or dropped.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
     Sent,
@@ -420,10 +465,12 @@ pub enum Delivery {
 
 /// A subagent or background task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Task {
     pub id: String,
     /// The tool call that started it (its events carry this as `parent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tool_id: Option<String>,
     pub description: String,
     /// "general-purpose", "Explore", "shell", ...
@@ -436,12 +483,16 @@ pub struct Task {
     #[serde(default)]
     pub depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub parent_task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub last_tool: Option<String>,
     #[serde(default)]
     pub tokens: u64,
@@ -451,31 +502,40 @@ pub struct Task {
     pub duration_ms: u64,
     pub started: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub ended: Option<i64>,
     /// What it is: "shell" (a command left running), "monitor" (a watch whose events wake the
     /// agent), "agent" (a subagent), "workflow", "mcp" (an MCP call moved to the background).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub class: Option<String>,
     /// The command it runs (shells, monitors) and where.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub cwd: Option<String>,
     /// Where its output is written on its machine (read through the task output endpoint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub output: Option<String>,
     /// The harness's own handle for its process (Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub process: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub exit_code: Option<i32>,
     /// A monitor's events so far, and the latest one (one line).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub events: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub last_event: Option<String>,
     /// Who a monitor's events wake: "agent" (the session), or the subagent task that started it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub wakes: Option<String>,
     /// kiln can stop it (`stop_task`).
     #[serde(default)]
@@ -488,6 +548,7 @@ pub struct Task {
     /// "parent": a message to it goes by way of the agent that started it, which passes it on
     /// with its own tool (its harness takes nothing else from kiln).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub via: Option<String>,
     /// Messages waiting for it to finish what it's doing, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -498,10 +559,15 @@ fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
+/// A task's status, not finished in any way: running, waiting to start, or paused.
+pub fn live_task(status: &str) -> bool {
+    matches!(status, "running" | "pending" | "paused")
+}
+
 impl Task {
     /// Still running (or paused): not finished in any way.
     pub fn live(&self) -> bool {
-        matches!(self.status.as_str(), "running" | "pending" | "paused")
+        live_task(&self.status)
     }
 
     /// One of the agent's own subagents, not something it left running. Older machines only report
@@ -521,6 +587,7 @@ impl Task {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Usage {
     pub cost_usd: f64,
     pub input_tokens: u64,
@@ -529,14 +596,17 @@ pub struct Usage {
     pub turns: u64,
     /// Tokens in the context window right now, and its size, when the harness says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub context_window: Option<u64>,
 }
 
 /// One window of the plan limits of the account a session runs on (what the harness's own
 /// /usage shows): how much of it is used and when it starts over.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Limit {
     /// Stable for the harness: "five_hour", "seven_day", "seven_day_opus", "codex.primary", ...
     pub id: String,
@@ -545,28 +615,36 @@ pub struct Limit {
     /// How much of it is used, 0–100 (None: not a percentage, see `used` and `limit`).
     pub used_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub used: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub limit: Option<f64>,
     /// What `used` and `limit` count ("credits", "USD").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub unit: Option<String>,
     /// Unix ms the window starts over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub resets_at: Option<i64>,
     /// The window's length in short words: "5h", "7d", "month".
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub window: Option<String>,
     /// The account it belongs to (as `State::account`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub account: Option<String>,
     /// "allowed", "warning" (close to the limit) or "rejected" (reached), when the harness says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub status: Option<String>,
 }
 
 /// Whether the harness has said what it has: an empty list reads as "none" only once it did.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Known {
     /// Not reported yet (the harness is starting, or has not answered).
@@ -581,6 +659,7 @@ pub enum Known {
 /// What is known so far of each of the session's inventories (`State::mcp`, `State::skills`,
 /// `State::plugins`, `State::limits`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Inventory {
     #[serde(default)]
     pub mcp: Known,
@@ -594,6 +673,7 @@ pub struct Inventory {
 
 /// One line of the harness's status (its own /status), for the inspector.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct StatusItem {
     pub group: String,
     /// Empty for a line that is a sentence on its own.
@@ -601,10 +681,13 @@ pub struct StatusItem {
     pub label: String,
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tone: Option<Tone>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "StatusTone"))]
 #[serde(rename_all = "snake_case")]
 pub enum Tone {
     Ok,
@@ -614,6 +697,7 @@ pub enum Tone {
 
 /// An MCP server the session can use, as the harness reports it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct McpServer {
     pub name: String,
     /// Where it is configured: "user", "project", "local", "config", "plugin", "dynamic", ...
@@ -622,27 +706,34 @@ pub struct McpServer {
     pub transport: String,
     pub status: McpStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub error: Option<String>,
     pub enabled: bool,
     #[serde(default)]
     pub tools: Vec<McpTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub resources: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub prompts: Option<u32>,
     /// Its command line (never its environment) or its URL (never credentials or the query).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub target: Option<String>,
     /// What the server calls itself, with its version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub server: Option<String>,
     /// How kiln's harness is signed in to it, where the harness says: "oauth", "bearer",
     /// "signed out".
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub auth: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum McpStatus {
     Connected,
@@ -653,14 +744,17 @@ pub enum McpStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct McpTool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub description: Option<String>,
 }
 
 /// A skill the harness can use.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Skill {
     pub name: String,
     #[serde(default)]
@@ -669,8 +763,10 @@ pub struct Skill {
     pub source: String,
     /// Its SKILL.md on the machine, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub args_hint: Option<String>,
     /// A person can run it (`skill_run`); otherwise only the model uses it.
     pub user_invocable: bool,
@@ -685,6 +781,7 @@ fn yes() -> bool {
 
 /// A plugin the harness has installed (read-only).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Plugin {
     pub name: String,
     #[serde(default)]
@@ -695,11 +792,13 @@ pub struct Plugin {
     #[serde(default)]
     pub commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub version: Option<String>,
 }
 
 /// A permission mode the harness offers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ModeOption {
     pub id: String,
     pub label: String,
@@ -710,6 +809,7 @@ pub struct ModeOption {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ModelOption {
     pub id: String,
     pub label: String,
@@ -721,6 +821,11 @@ pub struct ModelOption {
     /// The harness's default model: what a session started without one runs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
+    /// The speeds faster than standard it runs at, slowest first, when the harness says (as
+    /// `Meta::speeds` says them for the model in use): kept with the machine's models, so a new
+    /// agent can start at one (`Spec::speed`) before any session of it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speeds: Vec<ControlOption>,
 }
 
 /// An effort level as people read it: "xhigh" is "Extra high", the rest as they are, capitalized.
@@ -737,6 +842,7 @@ pub fn effort_label(id: &str) -> String {
 /// One entry of a harness's command catalog (`Meta::commands`): every slash command it has, and
 /// what running it from kiln does (`route`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SlashCommand {
     pub name: String,
     #[serde(default)]
@@ -759,12 +865,14 @@ pub struct SlashCommand {
 
 /// What running a catalog command does.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Route {
     /// Sent as a message: `text` when given (with "{args}" replaced by the words typed after the
     /// name), else "/name words". A skill (`skill`) runs with `skill_run`.
     Prompt {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         text: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skill: bool,
@@ -853,6 +961,7 @@ pub fn sort_catalog(mut c: Vec<SlashCommand>) -> Vec<SlashCommand> {
 /// without knowing the harness. Live values are in [`State::control_values`]; changes and
 /// actions come back as [`Command::Control`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Control {
     pub id: String,
     /// Where it belongs: "Model", "Permissions", "Thinking", "Subagents", "Context", "MCP",
@@ -866,6 +975,7 @@ pub struct Control {
     pub options: Vec<ControlOption>,
     /// The initial value (the live one is in `State::control_values`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub value: Option<serde_json::Value>,
     /// Ask before doing it.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -875,6 +985,7 @@ pub struct Control {
     pub per_turn: bool,
     /// Only while the session has this feature (see `Meta::features`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub requires: Option<String>,
     /// "session": a session setting or action. "turn": an action on one prompt (rewind to it,
     /// branch from it): sent with `value: {"event": <the prompt's event id>}`.
@@ -882,10 +993,12 @@ pub struct Control {
     pub scope: ControlScope,
     /// An action that takes text (compact instructions, ...): its placeholder. Absent: no text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub input: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ControlKind {
     Select,
@@ -895,6 +1008,7 @@ pub enum ControlKind {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ControlScope {
     #[default]
@@ -903,6 +1017,7 @@ pub enum ControlScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ControlOption {
     pub id: String,
     pub label: String,
@@ -915,15 +1030,18 @@ pub struct ControlOption {
 /// A file sent with a message: inline (`data_base64`), or uploaded first
 /// (`POST /api/harness/files`, then `file_id`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Attachment {
     pub name: String,
     pub mime: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub data_base64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub file_id: Option<String>,
     /// Where it was written on the agent's machine (set there; never taken from a client).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub path: Option<String>,
 }
 
@@ -935,21 +1053,26 @@ impl Attachment {
 
 /// Settings for one message only, where the harness can.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Overrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub effort: Option<String>,
 }
 
 /// A goal the harness itself pursues across turns (Claude Code's /goal, Codex's thread goal).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Objective {
     /// The condition or objective, as given.
     pub text: String,
     /// "active", "met", "unmet" (it gave up, or it can't be met: `reason`), "paused", "cleared".
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reason: Option<String>,
     /// Unix ms it last changed.
     #[serde(default)]
@@ -964,14 +1087,18 @@ impl Objective {
 
 /// Everything about a session that is not the timeline. Small; sent whole on change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentState"))]
 pub struct State {
     /// Moved here: where its folder stood in its repo's sync log on the machine it left. It goes
     /// on once the folder here has taken the log that far, after a restart too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub arriving: Option<crate::sync::runner::Mark>,
     pub status: Status,
     /// The harness's own session id (what `--resume` takes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub harness_session: Option<String>,
     /// How many times the session went on on another machine (a move, a resume elsewhere): its
     /// conversation's writer. A store takes a session's rows from its latest writer alone
@@ -981,6 +1108,7 @@ pub struct State {
     /// Where its commands may run besides its machine (`Spec::reach`): None anywhere it needs,
     /// `"off"` only its own machine, else a runner or platform it prefers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub reach: Option<String>,
     #[serde(default)]
     pub cwd: String,
@@ -988,6 +1116,7 @@ pub struct State {
     /// or a worktree of its repository), once it has changed a file in one. What's asked of git
     /// about its work is asked there (`Info::work_dir`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub tree: Option<String>,
     #[serde(default)]
     pub model: String,
@@ -1004,15 +1133,18 @@ pub struct State {
     /// The goal the harness itself pursues across turns (Claude Code's /goal, Codex's thread
     /// goal), and how it stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub objective: Option<Objective>,
     /// Unix ms the current turn started (None when idle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub turn_started: Option<i64>,
     /// The agent's latest words (main thread), shortened: what it last said it did or found.
     #[serde(default)]
     pub summary: String,
     /// What it is doing right now, in plain words ("Running cargo test", "Editing src/main.rs").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub doing: Option<String>,
     /// The changeset so far, in numbers (the files themselves come as a `changes` update).
     #[serde(default)]
@@ -1036,8 +1168,15 @@ pub struct State {
     pub usage: Usage,
     /// What the harness is doing right now, in a few words ("requesting", "compacting").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub activity: Option<String>,
+    /// Its harness is compacting a conversation now (summarizing it to free context): what its
+    /// marker, a `compaction:` notice, says once that's over. None: it isn't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub compacting: Option<Compacting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub exit: Option<ExitInfo>,
     /// Events dropped from the front of the timeline to bound memory.
     #[serde(default)]
@@ -1046,6 +1185,7 @@ pub struct State {
     /// The events before it stay history (the store keeps them and search finds them), and a
     /// timeline taken up again (a restart, a move) leaves them out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub cleared: Option<u64>,
     /// The effort / reasoning level in use, where the harness has one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1057,6 +1197,7 @@ pub struct State {
     /// Why its faster speeds can't serve it now, in words, as its harness said (its account
     /// doesn't allow them). None: nothing it said stands in the way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub speed_blocked: Option<String>,
     /// Fast, but at standard speed for now: fast mode's own rate limit was reached, and it goes
     /// back to fast by itself once that cools down (Claude Code).
@@ -1068,9 +1209,11 @@ pub struct State {
     /// The account it runs on, as "<harness>:<plan>[:<short hash of the account>]" (never the
     /// address itself), so one account's limits show once across sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub account: Option<String>,
     /// The plan, in words ("Max", "Pro", "API key").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan: Option<String>,
     /// The account's plan limits, window by window, when the harness reports them.
     #[serde(default)]
@@ -1096,20 +1239,29 @@ pub struct State {
     pub left_behind: u32,
     /// A switch to another harness's model, waiting for the turn under way to end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub switching: Option<Switching>,
     /// Nothing more goes to the harness until this ends: its account reached a usage limit
     /// (`harness::pause`). The queue, goals and plan steps wait; a message sent meanwhile joins
     /// the queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub pause: Option<Pause>,
+    /// Since when (Unix ms) it waits for room on its machine to go to work: as many of its agents
+    /// are at work as its limit lets be (`harness::limit`). What it was sent waits in its queue
+    /// meanwhile, and goes once there's room, the longest waiting first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_wait: Option<i64>,
     /// Stop between turns once any of the account's limits is this full (percent), before the
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub pause_at: Option<u8>,
     /// The most subagents it has at work at once (Agent settings): its harness's own and the agents
     /// it starts through kiln, one pool (`lineage::room`). None: no limit of its own (kiln's `[agents]
     /// max_children`, only when its config sets one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub max_subagents: Option<u32>,
     /// A pause ends only when a person resumes it, not by itself at the reset.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1129,6 +1281,7 @@ pub struct State {
     pub stop_waived: Vec<(String, i64)>,
     /// How its last turn ended (`Core::end_turn`): what kiln's keep-going reads (`goals::keep`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub last_turn: Option<TurnEnd>,
     /// Turns in a row kiln started to keep it going (`Core::note_sent`), since a person last said
     /// something.
@@ -1143,6 +1296,7 @@ pub struct State {
 
 /// One of kiln's own messages its harness was handed (`State::given`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Given {
     pub id: String,
     /// `queued::stable` of the words it had then.
@@ -1154,15 +1308,19 @@ pub struct Given {
 /// machine has room, in its own harness or one its conversation can be carried into
 /// (`harness::elsewhere`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct MovePlan {
     /// The machine, `agent:<name>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub to: Option<String>,
     /// The harness it goes on in there (none: its own, or one it can be carried into).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub kind: Option<String>,
     /// The model, in that harness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub model: Option<String>,
 }
 
@@ -1180,6 +1338,7 @@ impl MovePlan {
 /// How a turn ended (`Core::end_turn`): enough for kiln to tell a turn that's done from one that
 /// stopped part-way through the work (`goals::keep`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct TurnEnd {
     /// Unix ms.
     pub at: i64,
@@ -1190,6 +1349,7 @@ pub struct TurnEnd {
     pub how: String,
     /// The harness's own word for it ("end_turn", "stop_sequence", "max_tokens", "failed" …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub why: Option<String>,
     /// The tools it called in the turn.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -1207,20 +1367,24 @@ pub struct TurnEnd {
 
 /// Why a session waits, and until when (`State::pause`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Pause {
     /// "limit" (a usage limit was reached) or "threshold" (a limit got as full as `pause_at`).
     pub reason: String,
     /// The window, as `Limit::id` ("five_hour", "seven_day", "codex.primary", ...), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub window: Option<String>,
     /// That window's label ("Session", "Weekly").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub label: Option<String>,
     /// What the harness said, as it said it ("You've hit your session limit · resets 10:30pm").
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub said: String,
     /// Unix ms the window starts over, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub until: Option<i64>,
     /// Unix ms it paused.
     pub since: i64,
@@ -1231,27 +1395,33 @@ pub struct Pause {
     pub by: String,
     /// The turn the limit cut off: it goes on first when the pause ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub cut: Option<Cut>,
     /// Its folder as it was when it paused, kept in a hidden git ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub checkpoint: Option<Checkpoint>,
     /// Checks at the reset that found the limit still reached.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub tries: u32,
     /// Unix ms a check started, while it waits for the harness's answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub checking: Option<i64>,
     /// Unix ms of the next check, when the reset time isn't known (or a check found the limit
     /// still reached).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub next_check: Option<i64>,
 }
 
 /// A turn a limit cut off (`Pause::cut`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Cut {
     /// The client id of the message that started it, when kiln sent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub message: Option<String>,
     /// What that message said, shortened.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1261,6 +1431,7 @@ pub struct Cut {
 
 /// A folder kept as it was (`Pause::checkpoint`): a commit outside every branch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Checkpoint {
     /// "refs/kiln/checkpoints/<session>/<unix ms>".
     pub git_ref: String,
@@ -1268,8 +1439,26 @@ pub struct Checkpoint {
     pub at: i64,
 }
 
+/// A compaction under way (`State::compacting`): one at a time, the main thread's over a
+/// subagent's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct Compacting {
+    /// Unix ms it began, as kiln heard.
+    pub since: i64,
+    /// The context it compacts, in tokens, as its harness last said (the main thread's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub tokens: Option<u64>,
+    /// The subagent run whose conversation it is (its spawning call's id); None: the main thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub parent: Option<String>,
+}
+
 /// A switch the session will make (`State::switching`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Switching {
     /// The harness ("codex").
     pub kind: String,
@@ -1278,8 +1467,10 @@ pub struct Switching {
     /// latitude, never more) and the nearest effort; with that harness's own choices of each, so
     /// its page shows the session as it will run while the switch waits, not as the old harness ran it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modes: Vec<ModeOption>,
@@ -1298,9 +1489,11 @@ impl State {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ExitInfo {
     pub code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub error: Option<String>,
     /// Unix ms it ended: what a stop is known by (its card, a person's mark of it), so a refresh
     /// or a restart is never another stop.
@@ -1321,6 +1514,7 @@ fn is_zero_i64(n: &i64) -> bool {
 
 /// What rarely changes: what the harness supports and offers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Meta {
     pub version: String,
     #[serde(default)]
@@ -1355,6 +1549,7 @@ pub struct Meta {
 
 /// A hook the harness runs on an event (read-only).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct HookInfo {
     pub event: String,
     #[serde(default)]
@@ -1366,6 +1561,7 @@ pub struct HookInfo {
 
 /// A command from a person (any device) to a session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Send {
@@ -1373,16 +1569,20 @@ pub enum Command {
         id: String,
         text: String,
         #[serde(default)]
+        #[cfg_attr(test, ts(as = "Option<SendMode>", optional))]
         mode: SendMode,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         overrides: Option<Overrides>,
         /// The event it answers (a messenger-style reply): its quote rides with the prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         reply_to: Option<String>,
         /// To one of its subagents (its task's id, as `Task::takes` allows), not to the agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         task: Option<String>,
     },
     QueueEdit {
@@ -1391,6 +1591,7 @@ pub enum Command {
         /// Its new attachment set, when the edit changed it (a queued message gains or drops
         /// files until it is sent).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         attachments: Option<Vec<Attachment>>,
     },
     QueueRemove {
@@ -1415,16 +1616,20 @@ pub enum Command {
         decision: Decision,
         /// Feedback for a denial, or a note with an approval.
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         message: Option<String>,
         /// For "always": which of the approval's `always` options.
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         always: Option<usize>,
         /// Answers to questions: question text → chosen label(s) (multi-select comma-separated).
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         answers: Option<std::collections::BTreeMap<String, String>>,
         /// Answers to questions, one per question (over `answers`): labels with commas, free
         /// text and notes come through as they are.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         choices: Option<Vec<ChoiceAnswer>>,
     },
     Interrupt,
@@ -1440,6 +1645,7 @@ pub enum Command {
         /// "switch_harness"): the session goes on in that one once the turn under way ends, with
         /// the conversation so far.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         kind: Option<String>,
     },
     SetEffort {
@@ -1448,6 +1654,7 @@ pub enum Command {
     /// The speed it runs at: "" standard, else one of `Meta::speeds` (feature "set_speed").
     SetSpeed {
         #[serde(default)]
+        #[cfg_attr(test, ts(as = "Option<String>", optional))]
         speed: String,
     },
     /// Go on on runner `to`, in its folder `cwd` (a path there, or `~/…`), once the turn under way
@@ -1457,6 +1664,7 @@ pub enum Command {
         cwd: String,
         /// What came along of the folder, said in the timeline ("its repository, kept in step").
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         note: Option<String>,
         /// Not waiting for the turn under way: it is interrupted, and picked up over there.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1464,8 +1672,10 @@ pub enum Command {
         /// It goes on there in another harness (`Kind::id`), its conversation carried over, with
         /// this model (None: that harness's default).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         model: Option<String>,
         /// `to` is this machine itself: the session goes to its newer runner process, which takes
         /// this one's place (a take-over, `harness::handover`). Same disk, same home: nothing of
@@ -1485,6 +1695,7 @@ pub enum Command {
     /// went to it): it waits, and is asked again (CP-T3.2: `super::handing`).
     HandedOver {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         error: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         unsure: bool,
@@ -1499,6 +1710,7 @@ pub enum Command {
     Control {
         id: String,
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         value: Option<serde_json::Value>,
     },
     StopTask {
@@ -1529,36 +1741,45 @@ pub enum Command {
     McpAuth {
         name: String,
         #[serde(default)]
+        #[cfg_attr(test, ts(as = "Option<String>", optional))]
         client: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         redirect: Option<String>,
     },
     /// Add an MCP server with the harness's own CLI (answered to `client`, when given, with
     /// `{"ok": bool, "message": ...}`).
     McpAdd {
         #[serde(default)]
+        #[cfg_attr(test, ts(as = "Option<String>", optional))]
         scope: String,
         name: String,
         #[serde(default)]
+        #[cfg_attr(test, ts(as = "Option<String>", optional))]
         transport: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         command: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         env: std::collections::BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         url: Option<String>,
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         headers: std::collections::BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         client: Option<String>,
     },
     McpRemove {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         scope: Option<String>,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         client: Option<String>,
     },
     /// A skill's SKILL.md, answered to `client` as `{"content": ..., "path": ...}`.
@@ -1570,10 +1791,13 @@ pub enum Command {
     SkillRun {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         args: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         id: Option<String>,
         #[serde(default)]
+        #[cfg_attr(test, ts(as = "Option<SendMode>", optional))]
         mode: SendMode,
     },
     /// Read the skills from disk again.
@@ -1590,11 +1814,13 @@ pub enum Command {
     /// one under way. None: only when one is reached.
     PauseAt {
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         percent: Option<u8>,
     },
     /// The most subagents it runs at once (`State::max_subagents`). None: no limit of its own.
     MaxSubagents {
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         count: Option<u32>,
     },
     /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`),
@@ -1602,31 +1828,39 @@ pub enum Command {
     MoveOnLimit {
         on: bool,
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         to: Option<String>,
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         kind: Option<String>,
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         model: Option<String>,
     },
     /// Another session on the same account reached a usage limit: wait for its reset too, if its
     /// own usage says the limit is its own as well (the server sends it; `pause::account_hold`).
     LimitHold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         window: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         until: Option<i64>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         said: String,
         /// The account that reached it (`account_id`): a session signed in as another by now, as
         /// it knows itself, takes no hold for it. None from a server that didn't say.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         account: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     Allow,

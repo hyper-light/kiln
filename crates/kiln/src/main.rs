@@ -47,6 +47,11 @@ enum Cmd {
     },
     /// Shorthand for `supervise -- server`.
     Up,
+    /// Set kiln up here, with a guide: where it runs (this machine, unless you choose Docker,
+    /// Kubernetes or a kiln server to join), kiln's own code signature on a Mac (its upgrades need
+    /// it), HTTPS under a name of your own (the front door, for phones and your tailnet) and a
+    /// sign-in password. It says each step first; `--unattended` asks nothing.
+    Setup(kiln::setup::SetupArgs),
     /// Install (binary, config, start on boot) — server by default, `--agent` for an agent.
     Install(install::InstallArgs),
     /// Ask a kiln server on this network to take this machine as an agent (an admin approves it
@@ -109,8 +114,9 @@ enum Cmd {
     Spawn(kiln::harness::cli::SpawnArgs),
     /// List, stop, interrupt or message this kiln shell's agents.
     Agents(kiln::harness::cli::AgentsArgs),
-    /// Run a command on another runner (`--on linux/amd64`, `--on <name>`): this repo is synced over
-    /// first, output streams back, and the exit code is the command's.
+    /// Run a command on a runner that has what it needs (`--needs cpus=8,mem=32g,linux/amd64`), or
+    /// on one by name (`--on <name>`): this repo is synced over first, output streams back, and the
+    /// exit code is the command's.
     Run(kiln::reach::cli::RunArgs),
     /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
     /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).
@@ -163,6 +169,10 @@ enum Cmd {
     /// The egress relay in a leg's container (docs/ci.md W18-R08); the runner starts it.
     #[command(hide = true)]
     EgressRelay,
+    /// Go's cache on this runner's cache service (docs/ci.md W24-R08): the go command's
+    /// `GOCACHEPROG` helper (`GOCACHEPROG="kiln gocacheprog"`, with `KILN_CACHE_URL` and
+    /// `KILN_CACHE_TOKEN`).
+    Gocacheprog(kiln::runner::work::gocacheprog::Args),
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// Any of kiln's operations, as agents have them: `kiln op` lists them, `kiln op <name> …` runs one.
@@ -459,9 +469,21 @@ fn main() -> ExitCode {
         };
     }
     let cli = Cli::parse();
+    // `kiln gocacheprog` answers the go command on stdout (W24-R08): nothing else may write there,
+    // logs included, and it needs no runtime.
+    if let Cmd::Gocacheprog(a) = &cli.cmd {
+        return match kiln::runner::work::gocacheprog::main(a.clone()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("kiln gocacheprog: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
-    // the server says only what goes wrong unless asked for more.
-    let quiet = matches!(cli.cmd, Cmd::Workflow(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
+    // the server says only what goes wrong unless asked for more. `kiln setup` says what it does
+    // itself, the same way.
+    let quiet = matches!(cli.cmd, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
     init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
     install_panic_hook();
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
@@ -681,6 +703,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             }
             boxed(|| supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir, exe: None })).await
         }
+        Cmd::Setup(a) => boxed(|| kiln::setup::cli(a)).await,
         Cmd::Install(a) => boxed(|| install::install(a)).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
         Cmd::Login { print, server } => {
@@ -876,6 +899,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Runner(a) => boxed(|| kiln::runner::setup::cli(a)).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),
+        Cmd::Gocacheprog(a) => kiln::runner::work::gocacheprog::main(a),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();

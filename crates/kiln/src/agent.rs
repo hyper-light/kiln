@@ -179,14 +179,22 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
 
 /// A runner process beside the machine's usual one: the machine's key with this instance's own
 /// certificate, fetched (or renewed) from the server with a current certificate as proof — this
-/// instance's own while it is valid, else the machine's.
+/// instance's own while it is valid, else the machine's. Its own goes once it is for another key
+/// (the machine enrolled again since, with a new one): with it, no TLS configuration is made and
+/// the runner never reaches the server, so an upgrade that starts it never completes.
 async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     let dir = crate::upgrade::instance_dir(&o.state_dir, id);
     let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
     let (machine_cert, key) = crate::upgrade::machine_credentials(&o.state_dir)?;
     let quic = std::fs::read_to_string(o.state_dir.join("quic")).ok().map(|s| s.trim().to_owned());
     let cert_p = dir.join("agent.pem");
-    let own = std::fs::read_to_string(&cert_p).ok();
+    let own = std::fs::read_to_string(&cert_p).ok().filter(|c| {
+        let mine = crate::pki::cert_matches_key(c, &key);
+        if !mine {
+            tracing::warn!(instance = %id, "this runner process's certificate is for a key the machine no longer has (it enrolled again): asking for a new one");
+        }
+        mine
+    });
     if let Some(c) = &own
         && !crate::pki::needs_renewal(c)
     {
@@ -219,6 +227,55 @@ struct Running {
     cancel: Shutdown,
     /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
     pooled: bool,
+    /// What it holds of this runner (docs/ci.md W05-R03): a share of its CPUs and memory, the
+    /// whole runner, or nothing of its own.
+    holds: kiln_ci::sched::state::Incoming,
+}
+
+/// A job holding a share of this runner takes its CPUs (docs/ci.md W05-R03): whole cores of its
+/// own, the other legs' steps moving off them. Where they can't be pinned (no topology: not
+/// Linux), it still holds its room in placement, and the log says so.
+fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
+    let kiln_ci::sched::state::Incoming::Share(q) = holds else { return };
+    let threads = q.cpu.ceil().max(1.0) as usize;
+    match crate::runner::cpus::pins().hold(job, threads) {
+        Some(cpus) => tracing::info!(job, cpus = %crate::runner::cpus::list(&cpus), "it holds these CPUs; the other legs run on the rest"),
+        None => tracing::info!(job, threads, "it holds its share in placement; its cores aren't pinned here"),
+    }
+}
+
+/// Whether this runner takes one more job or leg (docs/ci.md W05-R03), by the rule its dispatchers
+/// use, counting what its jobs and legs from either hold (`jobs`: each one's pooled and holds); a
+/// pool's leg runs in its executor, beside the runner's slots. Why not, when it doesn't.
+fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
+    use kiln_ci::sched::state::{Incoming, Resources, room};
+    let (mut held, mut whole, mut ordinary, mut running) = (Resources::default(), false, 0, 0);
+    for (p, h) in jobs {
+        match h {
+            Incoming::Whole => whole = true,
+            Incoming::Share(q) => {
+                held.cpu += q.cpu;
+                held.mem = held.mem.saturating_add(q.mem);
+            }
+            Incoming::Ordinary => {}
+        }
+        if !p {
+            running += 1;
+            ordinary += usize::from(h == Incoming::Ordinary);
+        }
+    }
+    if whole {
+        return Err("an exclusive job has this runner to itself");
+    }
+    if pooled || room(slots, size, &held, false, ordinary, running, incoming) {
+        return Ok(());
+    }
+    Err(match incoming {
+        Incoming::Whole => "an exclusive job waits for this runner to be empty",
+        Incoming::Share(_) => "no room for the share it holds",
+        Incoming::Ordinary if held.cpu > 0.0 => "no free slot beside what's held",
+        Incoming::Ordinary => "no free slot",
+    })
 }
 
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
@@ -921,6 +978,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         std::thread::spawn(crate::os::macsign::keep_watching);
     }
     std::fs::create_dir_all(&o.work_dir).with_context(|| format!("create {}", o.work_dir.display()))?;
+    // Where the runner's cache service opens once something asks for it (docs/ci.md W24-R08).
+    crate::runner::work::service::set_home(&o.work_dir);
     let orphans = crate::exec::reap_orphans(&o.work_dir);
     if orphans > 0 {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");
@@ -1016,12 +1075,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
-    let reach = o.reach.filter(|_| !o.ephemeral).and_then(|accept| match crate::reach::node::start(crate::reach::node::Config {
-        adopt: Some(adopt_tx.clone()),
-        ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)
-    }) {
+    let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
+    });
+    let reach = reach.and_then(|(using, mirrors, started)| match started {
         Ok((handle, said)) => {
             crate::reach::node::set_global(handle.clone());
+            // What other runners' trees left here, kept as people's rules say (docs/reach.md §5.1).
+            crate::reach::keeper::start(handle.clone(), using, mirrors);
             let up = up_tx.clone();
             crate::rt::spawn(async move {
                 while let Ok(m) = said.recv().await {
@@ -1111,7 +1173,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Its microVM deployments (W15-R02), booted again: they end with the runner.
     #[cfg(target_os = "linux")]
     crate::rt::spawn(crate::runner::firecracker::restore(o.work_dir.join("_firecracker")));
-    let mut exclusive = false;
+    // What this machine is, for what exclusive jobs hold of it (W05-R03).
+    let size = crate::runner::probe::size();
     let mut draining = false;
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and
     // announced again on every reconnect.
@@ -1154,6 +1217,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // was last told of it on this connection.
     let mut server_drops = false;
     let mut drops_said: Option<Vec<proto::NetDrop>> = None;
+    // The server takes what this runner holds warm (`AgentMsg::WorkState`, docs/ci.md W24-R18),
+    // and when it was last told it on this connection, and as of which change.
+    // W24-R31: the reaper of this runner's warm workspaces, on its clock.
+    if !o.outpost && !o.ephemeral {
+        crate::runner::warm::start_reaper(&o.work_dir);
+    }
+    let mut server_work = false;
+    let mut work_said: Option<(u64, Instant)> = None;
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
@@ -1199,12 +1270,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Conversations kept on disk as they happen (docs/conversations.md), and sent to the server's
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
+    // How many agent sessions it has at work at once (docs/agents.md, "How many agents a machine
+    // runs"): what was set for this machine from the server (kept here for its restarts), else its
+    // config's, else kiln's default. What the server sets is taken as it says it, and the config is
+    // read again as it changes.
+    let mut limit_asked = crate::harness::limit::kept(&o.state_dir);
+    let mut limit_config = o.declared.max_agent_sessions;
+    // What the server was told this machine holds, on this connection; and whether it takes that.
+    let mut limit_said: Option<crate::harness::limit::Held> = None;
+    let mut server_limit = false;
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
         convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
-        let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
+        let held = crate::harness::limit::held(limit_asked, limit_config);
+        if held.from != crate::harness::limit::Source::Default {
+            tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
+        }
+        let limits = crate::harness::host::Limits { per_machine: held.max_sessions };
+        let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), limits);
         // A new build taking over takes no messages till it's promoted (`Host::hold`).
         if take_over_pending.is_some() {
             h.hold(true);
@@ -1616,6 +1701,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 retire_span = Some(tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.retire", jobs = left, result = empty, error = empty));
                                 tracing::info!(%job, sessions, terminals, jobs = left, "handed over to the new build; this runner retires once its jobs end");
                                 retiring = true;
+                                // The new build keeps the copies of other runners' trees from now on.
+                                crate::reach::keeper::retire();
                                 // No new jobs here: this runner finishes its own, then retires.
                                 draining = true;
                                 retire_at = Some(Instant::now() + RETIRE_QUIET);
@@ -1899,11 +1986,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md). A test
-                // build's `old` says nothing, as a runner from before the channel.
+                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md), and an
+                // outpost aside, it says what it holds warm (docs/ci.md W24-R18); running agent
+                // sessions, it takes their limit from the server (docs/agents.md). A test build's
+                // `old` says nothing, as a runner from before the channel.
                 if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX }) {
+                    let work = if o.outpost { 0 } else { proto::CAP_WORK };
+                    let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -1976,6 +2067,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_wire = false;
                 server_drops = false;
                 drops_said = None;
+                server_work = false;
+                work_said = None;
+                server_limit = false;
+                limit_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -2063,6 +2158,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Caps { caps } => {
                         server_wire = caps & proto::CAP_WIRE != 0;
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
+                        server_work = caps & proto::CAP_WORK != 0;
+                        server_limit = caps & proto::CAP_AGENT_LIMIT != 0;
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
@@ -2134,6 +2231,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // Its battery is said again too (a state: the newest, sent on every connect).
                         power_said = None;
                         power_read_at = None;
+                        // And what its agent sessions are held to, to a server that takes it.
+                        limit_said = None;
+                        if let Some(h) = &harness {
+                            hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit, &uplink).await;
+                        }
                         // The server learns (again) which agent sessions run here, then what it lacks
                         // of each: over the channel only that (a session's stream not started yet
                         // starts with its snapshot), else all of each.
@@ -2212,18 +2314,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // from here (NAT, NodePorts, cluster DNS all differ).
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.values().filter(|j| !j.pooled).count()).unwrap_or(u32::MAX) >= o.slots.max(1);
-                        if o.outpost || draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
+                        let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
+                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
+                        if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
                             served_dedicated = true;
                         }
-                        exclusive = a.spec.exclusive;
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false });
+                        hold_cpus(&id, holds);
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -2844,6 +2947,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             fd.push(json);
                         }
                     }
+                    // What a person set from the server for how many agent sessions this machine
+                    // runs at once (none: its config's holds): kept for its restarts, held from now
+                    // on, and said back (docs/agents.md, "How many agents a machine runs").
+                    ServerMsg::AgentLimit { json } => match serde_json::from_str::<crate::harness::limit::Asked>(&json) {
+                        Ok(asked) => {
+                            let dir = o.state_dir.clone();
+                            if let Err(e) = crate::rt::blocking(move || crate::harness::limit::keep(&dir, asked)).await.and_then(|r| r.map_err(anyhow::Error::from)) {
+                                tracing::warn!(error = %format!("{e:#}"), "what was set for this machine's agent limit couldn't be kept: started again, it holds its config's until the server says it again");
+                            }
+                            limit_asked = asked;
+                            if let Some(h) = &harness {
+                                hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                            }
+                        }
+                        Err(e) => refuse(&mut answer_after, crate::wire::channel::Refusal::Malformed, format!("an agent limit this runner can't read: {e}")),
+                    },
                     // A leg of the CI engine (docs/ci.md W06): this runner announces `CAP_CI2`.
                     ServerMsg::AssignV2 { json } => {
                         let mut a: kiln_ci::wire::AssignmentV2 = match serde_json::from_str(&json) {
@@ -2856,10 +2975,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let id = a.job_id.clone();
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
-                        let own = jobs.values().filter(|j| !j.pooled).count();
-                        let full = !pooled && u32::try_from(own).unwrap_or(u32::MAX) >= o.slots.max(1);
-                        if o.outpost || draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
+                        let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
+                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
+                        if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
@@ -2899,7 +3018,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled });
+                        hold_cpus(&id, holds);
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
                         // Its pool's executor, when the leg can run in it as it is; else the leg
                         // runs the usual way and the executor goes all the same.
@@ -3211,10 +3331,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
                 if jobs.remove(&r.job).is_some() {
+                    crate::runner::cpus::pins().release(&r.job);
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
-                    if jobs.is_empty() {
-                        exclusive = false;
-                    }
                     if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
                         unreceived.insert(r.job.clone(), (Instant::now(), b));
                     }
@@ -3228,6 +3346,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Heartbeat => {
                 // Counts of jobs long done (a kept leg is let go well within a day).
                 journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
+                // Its config's agent limit, read again: a change holds at once, nothing restarting.
+                // A config that can't be read now (a change half written) keeps the last one read.
+                if let (Some(h), Some(path)) = (&harness, o.config.clone()) {
+                    let read = crate::rt::blocking(move || crate::harness::limit::configured(&path)).await.ok().flatten();
+                    if let Some(config) = read.filter(|c| *c != limit_config) {
+                        if let Some(n) = config.filter(|n| crate::harness::limit::valid(*n).is_err()) {
+                            tracing::warn!(max_agent_sessions = n, "[agent] max_agent_sessions is from 1 to {}: passed over", crate::harness::limit::MAX);
+                        }
+                        limit_config = config;
+                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                    }
+                }
                 if connected {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
@@ -3259,6 +3389,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
                         uplink.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
                         drops_said = Some(dropped);
+                    }
+                    // What its agent sessions are held to, said again if the server lacks it.
+                    if let Some(h) = &harness {
+                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                    }
+                    // What it holds warm, for placement (docs/ci.md W24-R18): once it changed here,
+                    // and every 10 minutes for what the machine's other runner processes changed.
+                    let now_changes = crate::runner::warm::changes();
+                    if server_work && welcomed && !o.ephemeral && !o.outpost && work_said.is_none_or(|(at, when)| at != now_changes || when.elapsed() >= Duration::from_secs(600)) {
+                        let dir = o.work_dir.clone();
+                        if let Ok(state) = crate::rt::blocking(move || crate::runner::warm::state(&dir)).await
+                            && let Ok(json) = serde_json::to_string(&state)
+                        {
+                            uplink.msg(AgentMsg::WorkState { json }).await;
+                        }
+                        work_said = Some((now_changes, Instant::now()));
                     }
                     // What its conversation stores are doing, for the server's board (a server from
                     // before takes it for nothing). Never waits: a full link skips one.
@@ -3617,6 +3763,22 @@ struct HandedTerm {
     replay: String,
 }
 
+/// What this machine holds its agent sessions to (`crate::harness::limit`), held by its sessions'
+/// host from now on; and said to the server when `tell` (it takes it, on a connection it welcomed)
+/// and it changed since the server last heard it.
+async fn hold_agent_limit(h: &crate::harness::host::Host, held: crate::harness::limit::Held, said: &mut Option<crate::harness::limit::Held>, tell: bool, uplink: &Uplink) {
+    if h.set_max_sessions(held.max_sessions) {
+        tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
+    }
+    if tell
+        && *said != Some(held)
+        && let Ok(json) = serde_json::to_string(&held)
+    {
+        uplink.msg(AgentMsg::AgentLimit { json }).await;
+        *said = Some(held);
+    }
+}
+
 /// Whether this machine takes upgrades from its server: its config's `[updates] accept`, read
 /// now (a config that can't be read takes them, as before).
 fn takes_updates(o: &Opts) -> bool {
@@ -3816,6 +3978,27 @@ mod tests {
     }
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
+
+    /// The runner admits by the rule its dispatchers use, counting what jobs from either hold: on
+    /// a 32-CPU, 64 GiB runner of 4 slots, a bench holding 16 CPUs leaves two slots, refusals say
+    /// why, and a pool's leg runs in its executor beside them.
+    #[test]
+    fn a_runner_admits_work_beside_what_a_bench_holds() {
+        use kiln_ci::sched::state::{Incoming, Resources};
+        let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
+        let bench = Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() });
+        let o = Incoming::Ordinary;
+        assert_eq!(admits(4, size, std::iter::empty(), false, bench), Ok(()));
+        assert_eq!(admits(4, size, [(false, bench), (false, o)].into_iter(), false, o), Ok(()));
+        assert_eq!(admits(4, size, [(false, bench), (false, o), (false, o)].into_iter(), false, o), Err("no free slot beside what's held"));
+        assert_eq!(admits(4, size, [(false, o), (false, o), (false, o)].into_iter(), false, bench), Err("no room for the share it holds"));
+        assert_eq!(admits(4, size, [(false, bench), (false, o), (false, o)].into_iter(), true, o), Ok(()), "a pool's leg runs beside the slots");
+        // An exclusive job asking nothing has the runner to itself, as before.
+        assert_eq!(admits(4, size, [(false, o)].into_iter(), false, Incoming::Whole), Err("an exclusive job waits for this runner to be empty"));
+        assert_eq!(admits(4, size, [(false, Incoming::Whole)].into_iter(), true, o), Err("an exclusive job has this runner to itself"));
+        // Without exclusive jobs, slots as ever.
+        assert_eq!(admits(2, size, [(false, o), (false, o)].into_iter(), false, o), Err("no free slot"));
+    }
 
     /// A stream that starts again sends a server whose copy has part of a session only what the
     /// copy lacks. The digests it compares are of the copy as the server keeps it: every kind of

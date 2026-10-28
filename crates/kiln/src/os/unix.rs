@@ -17,6 +17,11 @@ pub fn elevated() -> bool {
     is_root()
 }
 
+/// A terminal here takes escapes as it is (Windows' console needs them turned on).
+pub fn console_takes_escapes() -> bool {
+    true
+}
+
 /// Windows only (its UAC prompt): elsewhere installs ask through `sudo`.
 pub fn run_elevated(_program: &Path, _parameters: &str, _timeout: std::time::Duration) -> io::Result<u32> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "only Windows asks for administrator rights this way"))

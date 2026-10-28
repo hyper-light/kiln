@@ -5,8 +5,26 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUpRight, ChevronRight, CircleAlert, Copy, CornerDownRight, Download, FileDown, GitBranch, GitFork, Info, Pencil, Reply, SquarePlus, TriangleAlert, Undo2, X } from "lucide-react";
-import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type QueueItem, type SessionStore, type Task } from "@/api/harness";
+import {
+  ArrowDown,
+  ArrowUpRight,
+  ChevronRight,
+  CircleAlert,
+  Copy,
+  CornerDownRight,
+  Download,
+  FileDown,
+  GitBranch,
+  GitFork,
+  Info,
+  Pencil,
+  Reply,
+  SquarePlus,
+  TriangleAlert,
+  Undo2,
+  X,
+} from "lucide-react";
+import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type Outgoing, type QueueItem, type SessionStore, type Task } from "@/api/harness";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -23,6 +41,7 @@ import {
   taskDuration,
   taskLive,
   taskOfCall,
+  tokens,
   turnsFrom,
   type Item,
   type Step,
@@ -33,9 +52,10 @@ import {
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { MsgMenu, type MenuGroup, type MenuRow } from "./msgmenu";
-import { SpawnDialog } from "./spawn";
+import { startFrom } from "./new-agent-draft";
 import { fileUrl, keptFor, kindOf, resolvePath } from "./files";
 import { toast } from "@/components/ui/toast";
+import { Button } from "@/components/ui/button";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
 import { FilesContext, type ConversationFiles } from "./files";
@@ -47,12 +67,13 @@ import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { researchCall } from "@/api/research";
 import { ResearchCard } from "@/views/research/research";
 import { copyText } from "@/views/terminal/clipboard";
-import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
+import { Beam, Condense, formatThought, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
 import { unsending } from "./unsend";
+import { Highlighted } from "@/components/code/highlighted";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -212,7 +233,9 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
         <i className="dot" data-status={dotFor(failed ? "error" : c.status)} aria-hidden="true" />
         {typeof c.runner === "string" && <Where runner={c.runner} />}
-        <code className="hx-cmd-line">{c.title}</code>
+        <code className="hx-cmd-line">
+          <Highlighted text={c.title} lang="bash" />
+        </code>
         <span className="hx-cmd-meta">
           {c.exit_code !== undefined && <span className={failed ? "hx-bad" : "hx-good"}>exit {c.exit_code}</span>}
           {c.status === "running" ? <Elapsed from={c.started} /> : c.ended ? <span className="hx-meta-num">{duration(c.ended - c.started)}</span> : null}
@@ -322,7 +345,11 @@ function ToolBody({ calls }: { calls: ToolEvent[] }) {
               lastOf.get(r.id) === i && <ResearchCard id={r.id} />
             ) : (
               <>
-                {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
+                {input && (c.server || c.tool === "other" || c.tool === "mcp") && (
+                  <pre className="hx-pre hx-tool-input">
+                    <Highlighted text={input} lang="json" />
+                  </pre>
+                )}
                 {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
               </>
             )}
@@ -778,7 +805,6 @@ const Prompt = React.memo(function Prompt({
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(e.text);
   const [unsent, setUnsent] = React.useState(false);
-  const [spawning, setSpawning] = React.useState(false);
   const queued = delivery === "queued" && Boolean(queueItem || e.client_id);
   const navigate = useNavigate();
   const why = delivery ? DELIVERY[delivery] : "sent";
@@ -846,7 +872,7 @@ const Prompt = React.memo(function Prompt({
         },
         ...(!onCommand ? [] : [{ label: "Go back", rows: goBackRows(e, meta, onCommand, kindName) }]),
         filesGroup,
-        { rows: [{ icon: <SquarePlus size={13} />, label: "Start new agent on this", onSelect: () => setSpawning(true) }] },
+        { rows: [{ icon: <SquarePlus size={13} />, label: "Start new agent on this", onSelect: () => startFrom(navigate, { ...spawn, prompt: e.text, from: "From your message" }) }] },
       ];
   return (
     // The swipe's pointer capture retargets moves to the wrap: the hold-to-copy shares these
@@ -882,7 +908,10 @@ const Prompt = React.memo(function Prompt({
           <span className="hx-dim">{SAID_AT.format(e.at)}</span>
           {delivery && (
             <span className="hx-dim">
-              · <span className="hx-delivery" data-delivery={delivery}>{DELIVERY[delivery]}</span>
+              ·{" "}
+              <span className="hx-delivery" data-delivery={delivery}>
+                {DELIVERY[delivery]}
+              </span>
             </span>
           )}
           {e.attachments?.length ? (
@@ -918,10 +947,69 @@ const Prompt = React.memo(function Prompt({
           <div className="hx-prompt-text">{e.text}</div>
         )}
       </div>
-      {spawning && (
-        <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: e.text }} onStarted={(started) => navigate(started[0] ? `/agents/${started[0].id}` : "/agents")} />
-      )}
     </div>
+  );
+});
+
+/**
+ * Something you sent that the conversation doesn't show yet, where it will show: at once, as it
+ * goes, and as sent once its machine says it has it, until the agent's session shows it (its own
+ * prompt then takes its place). One refused for good says why, and goes again as a new message
+ * (its id's answer stays the refusal) or is let go.
+ */
+const Sending = React.memo(function Sending({
+  m,
+  live,
+  lookup,
+  onResend,
+  onDiscard,
+}: {
+  m: Outgoing;
+  /** Connected: it can go again now. */
+  live: boolean;
+  lookup?: (id: string) => HEvent | undefined;
+  onResend: (id: string) => void;
+  onDiscard: (id: string) => void;
+}) {
+  const failed = m.state === "failed";
+  const why = m.why ? `${m.why.charAt(0).toUpperCase()}${m.why.slice(1)}.` : "It didn't get there.";
+  return (
+    <section className="hx-turn hx-sending" data-state={m.state}>
+      <div className="hx-prompt-wrap">
+        <div className="hx-prompt" data-origin="human">
+          <div className="hx-prompt-meta">
+            <span className="hx-eyebrow">You</span>
+            <span className="hx-dim">{SAID_AT.format(m.at)}</span>
+            <span className="hx-dim">
+              ·{" "}
+              <span className="hx-delivery" data-delivery={m.state}>
+                {failed ? "failed to send" : m.state === "sent" ? "sent" : "sending…"}
+              </span>
+            </span>
+            {m.attachments.length > 0 && (
+              <span className="hx-dim hx-trunc" title={m.attachments.join(", ")}>
+                · {m.attachments.join(", ")}
+              </span>
+            )}
+          </div>
+          {m.reply_to && lookup && <Quote id={m.reply_to} lookup={lookup} />}
+          <div className="hx-prompt-text">{m.text}</div>
+          {failed && (
+            <div className="hx-send-failed" role="alert">
+              <span>{why}</span>
+              <span className="hx-prompt-acts">
+                <Button size="xs" variant="secondary" disabled={!live} title={live ? undefined : "Not connected: it can go again once the page is"} onClick={() => onResend(m.id)}>
+                  Retry
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => onDiscard(m.id)}>
+                  Remove
+                </Button>
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
   );
 });
 
@@ -983,18 +1071,20 @@ function Said({
   spawn?: { target?: string; cwd?: string; kind?: string };
 }) {
   const navigate = useNavigate();
-  const [spawning, setSpawning] = React.useState(false);
   const hold = useHoldCopy(() => item.event.text);
   const replyTo = (item.event as { reply_to?: string }).reply_to;
   return (
     <div className="hx-said" data-ev={item.event.id} data-held={hold.held || undefined} tabIndex={-1} {...hold.props}>
       {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
       {!item.event.streaming && item.event.text && (
-        <MsgMenu groups={saidGroups(item.event, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on this message" className="hx-said-menu" />
+        <MsgMenu
+          groups={saidGroups(item.event, who ?? "Agent", onReply, () => startFrom(navigate, { ...spawn, prompt: item.event.text, from: `From ${who ?? "the agent"}'s message` }))}
+          label="Actions on this message"
+          className="hx-said-menu"
+        />
       )}
       {replyTo && lookup && <Quote id={replyTo} lookup={lookup} />}
       <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
-      {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: item.event.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
     </div>
   );
 }
@@ -1030,6 +1120,8 @@ const ItemView = React.memo(function ItemView({
       return <Thought item={item} live={active && Boolean(latestThought(item).streaming)} since={since} />;
     case "notice":
       return <Notice e={item.event} repeats={item.repeats} />;
+    case "compaction":
+      return <CompactionMark e={item.event} />;
     case "page":
       // The page, or where it'll be while it's being kept; a call that failed says why, as a step.
       return pageOf(item.event) || item.event.status === "running" || item.event.status === "pending" ? (
@@ -1048,7 +1140,7 @@ const ItemView = React.memo(function ItemView({
 
 /** Whether the end of a live turn shows it at work: a reply or a thought streaming, a call running. */
 function moving(items: Item[], turnStarted?: number): boolean {
-  const last = items.findLast((item) => item.type !== "notice");
+  const last = items.findLast((item) => item.type !== "notice" && item.type !== "compaction");
   if (!last) return false;
   if (last.type === "note") return Boolean(last.event.streaming);
   if (last.type === "thought") return thoughtIsLive(last, true, turnStarted) && thoughtShown(last);
@@ -1074,6 +1166,63 @@ function LiveTail({ doing, since }: { doing?: string; since?: number }) {
   );
 }
 
+/** How long it has gone on, ticking (kept out of what's announced). */
+function Since({ since }: { since: number }) {
+  const now = useNow();
+  return (
+    <span className="sg-num" aria-hidden="true">
+      {formatThought(Math.max(0, (now - since) / 1000))}
+    </span>
+  );
+}
+
+/** A compaction under way, where the turn's live line is: what it does, the context it compacts
+ *  and for how long; the optic draws in, and the conversation's spectrum is condensed into the bar
+ *  its marker keeps, in the same place, once it's done. */
+function CompactingRow({ c }: { c: Compacting }) {
+  return (
+    <div className="hx-compaction" data-state="live" role="status">
+      <span className="sg-thinking-line hx-compaction-line">
+        <span className="sg-think-glyph" aria-hidden="true">
+          <Optic state="compacting" />
+        </span>
+        <PrismLabel live sweep>
+          Compacting the conversation
+        </PrismLabel>
+        <span className="hx-compaction-facts">
+          {c.tokens ? `${tokens(c.tokens)} tokens · ` : ""}
+          <Since since={c.since} />
+        </span>
+      </span>
+      <Condense live />
+    </div>
+  );
+}
+
+/** A compaction's marker: the row the live one settles into, in the words its harness's adapter
+ *  wrote, its bar held still as the boundary it is (above it, the agent works from a summary);
+ *  one that didn't compact in the warning's tone. */
+function CompactionMark({ e }: { e: Extract<HEvent, { kind: "notice" }> }) {
+  const warn = e.level !== "info";
+  return (
+    <div
+      className="hx-compaction"
+      data-state="done"
+      data-tone={warn ? "warn" : undefined}
+      data-ev={e.id}
+      title={warn ? undefined : "The conversation was summarized to free context: from here on the agent works from that summary"}
+    >
+      <span className="sg-thinking-line hx-compaction-line">
+        <span className="sg-think-glyph" aria-hidden="true">
+          <Optic state="done" />
+        </span>
+        <PrismLabel>{e.text}</PrismLabel>
+      </span>
+      <Condense warn={warn} />
+    </div>
+  );
+}
+
 /** The turn's answer: hold it to copy it as Markdown; its ⋯ is always there. */
 function OutcomeBody({
   outcome,
@@ -1089,15 +1238,19 @@ function OutcomeBody({
   spawn?: { target?: string; cwd?: string; kind?: string };
 }) {
   const navigate = useNavigate();
-  const [spawning, setSpawning] = React.useState(false);
   const hold = useHoldCopy(() => outcome.text);
   return (
     <div className="hx-outcome-body" data-ev={outcome.id} data-held={hold.held || undefined} {...hold.props}>
       {/* The menu floats right: it has to come first, the quote's and the text's lines wrap around it. */}
-      {outcome.text && <MsgMenu groups={saidGroups(outcome, who ?? "Agent", onReply, () => setSpawning(true))} label="Actions on the answer" className="hx-outcome-menu" />}
+      {outcome.text && (
+        <MsgMenu
+          groups={saidGroups(outcome, who ?? "Agent", onReply, () => startFrom(navigate, { ...spawn, prompt: outcome.text, from: `From ${who ?? "the agent"}'s answer` }))}
+          label="Actions on the answer"
+          className="hx-outcome-menu"
+        />
+      )}
       {outcome.reply_to && lookup && <Quote id={outcome.reply_to} lookup={lookup} />}
       <Prose text={outcome.text} seq={outcome.seq} />
-      {spawning && <SpawnDialog open={spawning} onOpenChange={setSpawning} defaults={{ ...spawn, prompt: outcome.text }} onStarted={(s) => navigate(s[0] ? `/agents/${s[0].id}` : "/agents")} />}
     </div>
   );
 }
@@ -1108,6 +1261,7 @@ const TurnView = React.memo(function TurnView({
   delivery,
   live,
   doing,
+  compacting,
   turnStarted,
   onOpenTask,
   meta,
@@ -1128,6 +1282,8 @@ const TurnView = React.memo(function TurnView({
   live: boolean;
   /** What the agent says it's doing, while the turn is live. */
   doing?: string;
+  /** A compaction of this thread's conversation under way (the last turn's, at its end). */
+  compacting?: Compacting;
   turnStarted?: number;
   onOpenTask?: (t: string) => void;
   meta?: Meta | null;
@@ -1152,7 +1308,7 @@ const TurnView = React.memo(function TurnView({
   const end = allSteps ? turn.items.length : hidden + STEPS_WINDOW;
   const sought = findNow !== null && turn.items.some((it, i) => (i < hidden || i >= end) && itemHolds(it, findNow.id));
   const items = sought ? turn.items : turn.items.slice(hidden, end);
-  const currentItem = turn.items.findLast((item) => item.type !== "notice");
+  const currentItem = turn.items.findLast((item) => item.type !== "notice" && item.type !== "compaction");
   const since = thinkingStarted(turn, turnStarted);
   // At work with nothing moving at its end: said once the end has held still a moment (from the
   // start, before anything has moved, at once).
@@ -1191,7 +1347,7 @@ const TurnView = React.memo(function TurnView({
             spawn={spawn}
           />
         ))}
-        {live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
+        {compacting ? <CompactingRow c={compacting} /> : live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
@@ -1477,6 +1633,16 @@ export const Timeline = React.memo(function Timeline({
     const call = events.find((e) => e.id === parent);
     return call?.kind === "tool" ? call.task : undefined;
   }, [parent, task, events]);
+  // What you sent to this thread (the main one, or this subagent) that it doesn't show yet: at its end.
+  const outgoing = useSession(store, (s) => s.outgoing);
+  const live = useSession(store, (s) => s.conn === "open");
+  const mine = React.useMemo(() => outgoing.filter((m) => (thread ? m.task === thread : !m.task)), [outgoing, thread]);
+  const resend = React.useCallback(
+    (id: string) => {
+      if (!store.resend(id)) toast.error("Not connected", "The page is reconnecting to the agent; try again in a moment.");
+    },
+    [store],
+  );
   const going = parent ? Boolean(task && taskLive(task)) : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
   // Turns that didn't change stay the same objects, so only what changed renders again; and only
   // the turns from the first change on are worked out again (derive.ts), not the whole history.
@@ -1609,6 +1775,8 @@ export const Timeline = React.memo(function Timeline({
     [findQ, findNow, grows, holds, from, to, read, restore],
   );
   const running = parent ? task?.status === "running" : state?.status === "running";
+  // A compaction of this thread's conversation under way, while its harness can still be heard.
+  const compacting = state?.compacting && (state.compacting.parent ?? undefined) === parent && state.status !== "exited" && state.status !== "disconnected" ? state.compacting : undefined;
   const tasks = state?.tasks ?? NO_TASKS;
   // What you answered here goes from sight at once (answered.ts).
   const approvals = stillAsked(state?.approvals ?? NO_APPROVALS, done);
@@ -1687,7 +1855,7 @@ export const Timeline = React.memo(function Timeline({
                 {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
               </div>
             ) : (
-              <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
+              mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
             ))}
           {turns.slice(from, to).map((t, j) => (
             <TurnView
@@ -1697,6 +1865,7 @@ export const Timeline = React.memo(function Timeline({
               delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
               live={running && from + j === turns.length - 1}
               doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
+              compacting={from + j === turns.length - 1 ? compacting : undefined}
               turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
               onOpenTask={onOpenTask}
               meta={meta}
@@ -1712,6 +1881,7 @@ export const Timeline = React.memo(function Timeline({
           ))}
           {/* A window further back: what came after joins as you scroll down to it. */}
           {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
+          {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}
           {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (

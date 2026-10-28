@@ -60,6 +60,8 @@
   --ease: cubic-bezier(0.16, 1, 0.3, 1);
   --prism: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
   --header-h: 64px;
+  /* Every filter and search field, and what stands beside it in its bar: one height. */
+  --field-h: 40px;
   color-scheme: dark;
 }
 
@@ -998,7 +1000,7 @@ html.fills-window body {
 /* ------------------------------------------------------------------ */
 
 .field {
-  min-height: 40px;
+  min-height: var(--field-h);
   display: flex;
   align-items: center;
   padding-left: 12px;
@@ -1021,7 +1023,7 @@ html.fills-window body {
 .field input,
 .field select,
 .field textarea {
-  min-height: 38px;
+  min-height: calc(var(--field-h) - 2px);
   width: 100%;
   min-width: 0;
   color: #e3e4e9;
@@ -1075,7 +1077,7 @@ html.fills-window body {
 .select select {
   appearance: none;
   width: 100%;
-  min-height: 40px;
+  min-height: var(--field-h);
   padding: 8px 32px 8px 12px;
   border: 1px solid #303239;
   border-radius: 5px;
@@ -1138,28 +1140,80 @@ html.fills-window body {
   opacity: 0.4;
 }
 
-/* A filter field (facet-box.tsx): chosen facets as chips in it, its list of facets under it. */
+/* A filter field (facet-box.tsx): one line at one height (--field-h) whatever is chosen. Chosen facets
+   sit in it as chips, and those that don't fit fold into +N (facet-fold.ts). Open, it lifts over the
+   page with every chip and its list of facets under it; the box it leaves keeps its place. */
 .facet-box {
   position: relative;
   min-width: 0;
+  height: var(--field-h);
 }
-.facet-box > .field {
-  flex-wrap: wrap;
-  row-gap: 4px;
-  column-gap: 6px;
-  padding-block: 3px;
+.facet-layer {
+  position: relative;
+}
+.facet-box[data-open] > .facet-layer {
+  position: absolute;
+  z-index: 40;
+  top: 0;
+  right: 0;
+  left: 0;
+}
+.facet-layer > .field {
+  height: var(--field-h);
+  gap: 8px;
   cursor: text;
 }
-.facet-box > .field > input {
-  flex: 1 1 12ch;
+.facet-box[data-open] .field {
+  height: auto;
+  min-height: var(--field-h);
+  align-items: flex-start;
+  background: var(--background);
+  box-shadow: 0 14px 40px #000b;
+}
+/* Open, the icon and the clear button stay level with the first line of chips. */
+.facet-box[data-open] .field > svg {
+  margin-top: 11.5px;
+}
+.facet-box[data-open] .field-clear {
+  margin-top: 3px;
+}
+.facet-line {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  height: 100%;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+/* Open: every chip, wrapped, four lines of them before they scroll. */
+.facet-box[data-open] .facet-line {
+  height: auto;
+  max-height: 128px;
+  flex-wrap: wrap;
+  row-gap: 4px;
+  padding-block: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.facet-line > input {
+  flex: 1 1 auto;
   width: auto;
-  min-width: 12ch;
-  min-height: 32px;
+  min-width: 0;
+  min-height: 26px;
+  height: 26px;
+  padding-right: 4px;
+}
+.facet-box[data-open] .facet-line > input {
+  flex-basis: 8ch;
+  min-width: 8ch;
 }
 .facet-chip {
   display: inline-flex;
+  flex: none;
   min-width: 0;
-  max-width: 100%;
+  max-width: min(180px, 100%);
   align-items: center;
   gap: 1px;
   height: 26px;
@@ -1171,12 +1225,13 @@ html.fills-window body {
   font-size: 12px;
   white-space: nowrap;
 }
-.facet-chip > span {
+.facet-chip > span:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .facet-chip > button,
-.facet-clear {
+.facet-chip-x,
+.field-clear {
   display: grid;
   flex: none;
   width: 24px;
@@ -1185,26 +1240,53 @@ html.fills-window body {
   border-radius: 3px;
   color: #9499a5;
 }
-.facet-clear {
+/* A field's clear button, inside its line: the field never grows for it. */
+.field-clear {
   width: 34px;
   height: 32px;
-  margin-left: auto;
 }
 .facet-chip > button:hover,
-.facet-clear:hover {
+.field-clear:hover,
+.facet-more:hover {
   background: rgb(255 255 255 / 7%);
   color: #fff;
 }
-/* It opens at once, like a select's list (over the menus' pop-in). */
-.facet-pop.popover {
+/* The chips that don't fit, folded: a button that opens the field with every one of them. */
+.facet-more {
+  flex: none;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid #3a3c44;
+  border-radius: 4px;
+  color: #c9c3d8;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* Every chip at its own width, unseen: what the fold is measured from. */
+.facet-measure {
   position: absolute;
-  z-index: 40;
-  top: calc(100% + 6px);
-  right: 0;
+  top: 0;
   left: 0;
+  display: flex;
+  width: 100%;
+  gap: 6px;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+.facet-typed {
+  flex: none;
+  font-size: 12.5px;
+  white-space: pre;
+}
+/* It opens at once, like a select's list (over the menus' pop-in), under the open field. */
+.facet-pop.popover {
   display: flex;
   max-height: min(62dvh, 440px);
   flex-direction: column;
+  margin-top: 6px;
   padding: 0;
   animation: none;
 }
@@ -1301,6 +1383,56 @@ html.fills-window body {
   }
   .facet-act {
     min-height: 40px;
+  }
+}
+/* A search field (SearchField in misc.tsx): one line, its clear button inside it. */
+.search-field {
+  height: var(--field-h);
+}
+
+/* A filter or search field and what stands beside it (FilterBar in misc.tsx), all one height: the
+   field takes the room left, a select beside it --companion-w. What's aside (a count, a download)
+   ends the bar, or goes under it once the bar is narrow. */
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  container: filter-bar / inline-size;
+}
+.filter-bar-row {
+  --companion-w: 200px;
+  position: relative;
+  display: flex;
+  min-width: 0;
+  flex: 1 1 360px;
+  align-items: center;
+  gap: 10px;
+}
+.filter-bar-row > .facet-box,
+.filter-bar-row > .search-field {
+  min-width: 0;
+  flex: 1 1 0;
+}
+.filter-bar-row > .select-field {
+  min-width: 0;
+  flex: 0 0 var(--companion-w);
+}
+.filter-bar-aside {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+@container filter-bar (max-width: 520px) {
+  .filter-bar-row {
+    --companion-w: min(150px, 40%);
+    gap: 8px;
+  }
+  /* On a phone an open filter field takes the whole bar, over the select beside it. */
+  .filter-bar-row > .facet-box[data-open] {
+    position: static;
   }
 }
 
@@ -2871,18 +3003,7 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 /* ------------------------------------------------------------------ */
 
 .runners-tools {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 8px 12px;
   margin-bottom: 20px;
-}
-.runners-filter {
-  min-width: 0;
-  flex: 1 1 320px;
-}
-.runners-layout {
-  flex: 0 0 140px;
 }
 .runner-detail-row > td {
   padding: 0 !important;
@@ -2922,6 +3043,48 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   font-size: 10.5px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+/* A runner's agent limit (runners.tsx AgentLimit): what holds, a number and its actions in a row,
+   then what became of it, a line that keeps its place whatever it says. */
+.runner-limit-line {
+  margin: 0;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.runner-limit-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.runner-limit-field {
+  width: 7rem;
+  min-height: 32px;
+}
+.runner-limit-field input {
+  min-height: 30px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.runner-limit-field:has([aria-invalid="true"]) {
+  border-color: #9c7178;
+}
+.runner-limit-msg {
+  min-height: 1.6em;
+  margin: 6px 0 0;
+  color: #8f939e;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.runner-limit-msg[data-tone="ok"] {
+  color: #a8c9bc;
+}
+.runner-limit-msg[data-tone="error"] {
+  color: #d1aaad;
 }
 .runner-up {
   display: grid;
@@ -3115,11 +3278,8 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 }
 
 
-/* A log's tools above it: its filter, how many lines, its download. */
+/* A log's tools above it (a FilterBar): its filter, how many lines, its download. */
 .log-tools {
-  display: flex;
-  align-items: center;
-  gap: 8px 12px;
   margin-bottom: 14px;
 }
 .log-count {
@@ -3129,12 +3289,4 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-}
-@media (max-width: 639px) {
-  .log-tools {
-    flex-wrap: wrap;
-  }
-  .log-tools > :first-child {
-    flex-basis: 100%;
-  }
 }

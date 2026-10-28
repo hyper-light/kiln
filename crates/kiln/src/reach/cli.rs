@@ -3,9 +3,10 @@
 //! reach's trust.
 //!
 //! ```text
-//! kiln run --on linux/amd64 -- cargo test      # the idlest Linux x86-64 runner, this repo synced over
-//! kiln run --on adacachy --no-sync -- uptime   # a runner by name, in its home folder
-//! kiln runners linux                           # the Linux runners, best first
+//! kiln run --needs linux/amd64 -- cargo test           # the idlest Linux x86-64 runner, this repo synced over
+//! kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free
+//! kiln run --on adacachy --no-sync -- uptime           # a runner by name, in its home folder
+//! kiln runners linux                                   # the Linux runners, best first
 //! ```
 
 #[cfg(unix)]
@@ -31,9 +32,15 @@ impl std::error::Error for ExitWith {}
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct RunArgs {
-    /// Where: a runner's name, or what it must be — `linux/amd64`, `macos`, `arm64`, `linux,+gpu`,
-    /// `cpus>=16`, `mem>=32g`. The idlest runner that suits is picked. Default: the best of all
-    /// (this machine itself when it is).
+    /// What the work needs: what the runner must be and have (`linux/amd64`, `macos`, `+gpu`,
+    /// `tool:cargo`, `cpus>=16`) and the room it asks for, idle and free there now (`cpus=8`,
+    /// `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it). This machine when it has it
+    /// and room to spare, else the idlest runner that has it. Default: the best of all. The command
+    /// finds them in KILN_NEEDS (`ci/gate.sh` holds itself to them).
+    #[arg(long, default_value = "")]
+    pub needs: String,
+    /// A runner by name, for work that has to happen on that machine (it must still meet
+    /// --needs). What it must be, as --needs says it, works here too.
     #[arg(long, short = 'o', default_value = "")]
     pub on: String,
     /// Copy this folder's tree (its git repository, as git sees it) over first, and run in the
@@ -64,6 +71,11 @@ pub struct RunArgs {
     /// No `[kiln]` lines on stderr (where it ran, what was synced).
     #[arg(long, short = 'q')]
     pub quiet: bool,
+    /// Give back the result of an identical run instead of running again: the same command,
+    /// folder, environment and machine, over an identical tree. Only successes are kept
+    /// (docs/ci.md W24-R24).
+    #[arg(long)]
+    pub reuse: bool,
     /// The command (shell text; several words are joined with spaces).
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -71,7 +83,7 @@ pub struct RunArgs {
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct RunnersArgs {
-    /// Rank them for this (`linux/amd64`, `macos`, a name ...).
+    /// Rank them for this, as `kiln run --needs` takes it (`linux/amd64`, `cpus=8,mem=32g`, a name ...).
     pub want: Option<String>,
     #[arg(long)]
     pub json: bool,
@@ -125,18 +137,26 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
     let path = super::local::find_socket()?;
     let here = std::env::current_dir()?;
     let sync = if a.no_sync { false } else { a.sync || in_git_repo(&here) };
-    let env = a
+    let mut env = a
         .env
         .iter()
         .map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).ok_or_else(|| anyhow::anyhow!("--env takes KEY=VALUE, not {kv:?}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // Run by an agent kiln started (its processes carry `KILN_AGENT`): the copy of the tree over
+    // there is that agent's, for the rules that keep copies (docs/reach.md §5.1).
+    if sync
+        && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV)
+        && let Some(agent) = std::env::var("KILN_AGENT").ok().filter(|a| !a.trim().is_empty())
+    {
+        env.push((super::keeper::AGENT_ENV.to_owned(), agent));
+    }
     let req = RunReq {
-        target: a.on.clone(),
+        target: super::directory::target(&a.on, &a.needs).map_err(|e| anyhow::anyhow!("--needs: {e}"))?,
         command: a.command.join(" "),
         cwd: Some(here.to_string_lossy().into_owned()),
         remote_cwd: a.cwd.clone(),
         sync,
-        env,
+        env: super::directory::with_needs(env, &a.needs),
         stdin: a.stdin,
         timeout_ms: a.timeout.map(|s| s.saturating_mul(1000)),
         shell: a.shell.clone(),
@@ -145,7 +165,8 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
     let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach the kiln runner at {}: {e}", path.display()))?;
     stream.set_nonblocking(true)?;
     let fd = std::sync::Arc::new(OwnedFd::from(stream));
-    crate::os::proc::write_all(&fd, &super::wire::frame(&Req::Run(Box::new(req)))?).await?;
+    let req = if a.reuse { Req::RunReuse(Box::new(req)) } else { Req::Run(Box::new(req)) };
+    crate::os::proc::write_all(&fd, &super::wire::frame(&req)?).await?;
     // Stdin, when asked for, goes over as it comes.
     if a.stdin {
         let w = std::sync::Arc::clone(&fd);
@@ -210,6 +231,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
                     };
                 }
                 Ev::Error(e) => anyhow::bail!("{e}"),
+                Ev::Note(line) => say(line),
                 Ev::Status(_) | Ev::Runners(_) | Ev::Forgot(_) | Ev::Answer(_) => {}
             }
         }
@@ -238,6 +260,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         };
         match next {
             Next::Read(Ok(Some(n))) if n > 0 => de.push(buf.get(..n).unwrap_or_default()),
+            Next::Read(_) if a.reuse => anyhow::bail!("the kiln runner closed the connection (one older than `kiln run --reuse` doesn't know it: run without it, or upgrade the runner)"),
             Next::Read(_) => anyhow::bail!("the kiln runner closed the connection"),
             Next::Stop => {
                 // Ctrl-C: the command over there gets it too; its exit comes back as usual.
@@ -331,5 +354,38 @@ pub fn reach(a: ReachArgs) -> anyhow::Result<()> {
             }
             other => anyhow::bail!("unexpected answer {other:?}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::RunArgs;
+    use crate::reach::directory::target;
+
+    #[derive(clap::Parser)]
+    struct Kiln {
+        #[command(flatten)]
+        run: RunArgs,
+    }
+
+    /// `kiln run` takes what the work needs, and a runner by name for work that has to happen on
+    /// one machine: both go to the runner as one spelling, and a bad need is refused before anything
+    /// is asked of it.
+    #[test]
+    fn kiln_run_takes_needs_and_a_runner_by_name() -> anyhow::Result<()> {
+        let a = Kiln::try_parse_from(["kiln", "--needs", "cpus=8,mem=32g,linux/amd64", "--", "cargo", "test"])?.run;
+        assert_eq!((a.needs.as_str(), a.on.as_str(), a.command.join(" ").as_str()), ("cpus=8,mem=32g,linux/amd64", "", "cargo test"));
+        assert_eq!(target(&a.on, &a.needs).as_deref(), Ok("cpus=8,mem=32g,linux/amd64"));
+        let a = Kiln::try_parse_from(["kiln", "-o", "adacachy", "--needs", "mem=32g", "--no-sync", "--", "uptime"])?.run;
+        assert!(a.no_sync);
+        assert_eq!(target(&a.on, &a.needs).as_deref(), Ok("adacachy,mem=32g"));
+        // As before needs: what it must be, given to --on.
+        let a = Kiln::try_parse_from(["kiln", "--on", "linux/amd64", "--", "make"])?.run;
+        assert_eq!(target(&a.on, &a.needs).as_deref(), Ok("linux/amd64"));
+        let a = Kiln::try_parse_from(["kiln", "--needs", "memm=4g", "--", "true"])?.run;
+        assert_eq!(target(&a.on, &a.needs), Err("memm=4g: no such need".to_owned()));
+        Ok(())
     }
 }

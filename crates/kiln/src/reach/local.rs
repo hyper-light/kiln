@@ -34,11 +34,15 @@ pub enum Req {
     /// `crate::browser::ask`), from an agent's MCP server. Answered with [`Ev::Answer`]. Appended
     /// last: postcard encodes variants by index.
     Browser { json: String },
+    /// A run as [`Req::Run`], unless an identical one succeeded before: then its recorded result
+    /// instead (`kiln run --reuse`, `super::reuse`, docs/ci.md W24-R24). Appended last.
+    RunReuse(Box<RunReq>),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunReq {
-    /// Where: a runner's name, what it must be (`linux/amd64`, `macos,+gpu`), or empty for the best.
+    /// Where: a runner's name and what the work needs, as one spelling (`linux/amd64`,
+    /// `cpus=8,mem=32g`, `adacachy,mem=32g`: [`directory::target`]), or empty for the best.
     pub target: String,
     pub command: String,
     /// This machine's folder the command is about: its tree is copied over when `sync`, and the
@@ -79,6 +83,9 @@ pub enum Ev {
     Forgot(bool),
     /// The server's answer to [`Req::Ask`] (JSON).
     Answer(String),
+    /// A line about how a run went that isn't its output: whether it was reused, or recorded
+    /// (`super::reuse`). Appended last: postcard encodes variants by index.
+    Note(String),
 }
 
 static SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -501,6 +508,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             let _ = ev_tx.send(ev).await;
         }
         Req::Run(r) => run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
+        Req::RunReuse(r) => super::reuse::run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
         Req::Input(_) | Req::InputEnd | Req::Signal(_) => {
             let _ = ev_tx.send(Ev::Error("nothing is running on this connection".into())).await;
         }

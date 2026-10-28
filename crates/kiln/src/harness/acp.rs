@@ -20,6 +20,12 @@ use super::model::{
     Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
 };
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness"];
+/// What it turns on or off once it runs, as the agent says what it takes (steering; its model,
+/// effort and speed options): kept as they were across an in-place upgrade.
+pub(super) const LEARNED: &[&str] = &["steer", "queue_steer", "set_model", "set_effort", "set_speed"];
+
 mod catalog;
 
 #[cfg(not(test))]
@@ -135,7 +141,7 @@ pub struct Acp {
     #[serde(default)]
     mcp: Vec<Value>,
     /// The conversation so far, in words, given with the first message it sends (a session that
-    /// went on here from another machine, `super::moving`).
+    /// went on here from another machine, `super::moving`, or from another harness).
     #[serde(default)]
     context: Option<String>,
     /// Config options replace the older model and mode setters when the agent offers them.
@@ -177,6 +183,12 @@ pub struct Acp {
     /// the model in use has a `speed` option.
     #[serde(default)]
     speed_start: Option<String>,
+    /// A `/compact` it was sent: its turn is a compaction (Devin says nothing else of one).
+    #[serde(default)]
+    compact_prompt: Option<String>,
+    /// The compaction it says is under way (`compaction_update`), by its id.
+    #[serde(default)]
+    compaction: Option<String>,
 }
 
 fn ready() -> bool {
@@ -198,6 +210,12 @@ fn kiln_ask() -> ModeOption {
 
 fn kiln_bypass() -> ModeOption {
     ModeOption { id: KILN_BYPASS.into(), label: "Bypass".into(), description: "kiln approves everything the agent asks to do".into(), dangerous: true }
+}
+
+/// The modes kiln can start an agent in before the agent says its own: kiln's (it asks you, or
+/// approves everything itself), which every ACP agent takes.
+pub(super) fn kiln_modes() -> Vec<ModeOption> {
+    vec![kiln_ask(), kiln_bypass()]
 }
 
 impl Acp {
@@ -239,6 +257,8 @@ impl Acp {
             refresh: false,
             empty,
             speed_start: None,
+            compact_prompt: None,
+            compaction: None,
         }
     }
 
@@ -257,6 +277,11 @@ impl Acp {
     /// The conversation so far, in words, to give with the first message it sends.
     pub fn offer_context(&mut self, text: Option<String>) {
         self.context = text.filter(|t| !t.is_empty());
+    }
+
+    /// The conversation it was offered went with a message (or it was offered none).
+    pub fn seeded(&self) -> bool {
+        self.context.is_none()
     }
 
     /// Its session gets these MCP servers (ACP's `mcpServers`, stdio).
@@ -311,7 +336,7 @@ impl Acp {
 
     pub fn start(&mut self, core: &mut Core) {
         self.replaying = self.resume.is_some() && core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
-        core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments"].iter().map(|s| (*s).to_owned()).collect();
+        core.meta.features = FEATURES.iter().map(|s| (*s).to_owned()).collect();
         core.touch_meta();
         // kiln's commands until the agent lists its own.
         if core.meta.commands.is_empty() {
@@ -330,7 +355,7 @@ impl Acp {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}}},
+                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}, "compaction": {}}},
                 "clientInfo": {"name": "kiln", "version": env!("CARGO_PKG_VERSION")},
             }),
         );
@@ -360,6 +385,8 @@ impl Acp {
         self.prompt_result = None;
         self.pending.clear();
         self.asks.clear();
+        self.compact_prompt = None;
+        self.compaction = None;
         core.state.approvals.clear();
         core.state.exit = Some(ExitInfo::now(code, error));
         core.state.doing = None;
@@ -630,7 +657,7 @@ impl Acp {
             if prominent {
                 match category {
                     "model" => {
-                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), efforts: known.iter().find(|m| m.id == o.id).map(|m| m.efforts.clone()).unwrap_or_default(), default: known.iter().find(|m| m.id == o.id).is_some_and(|m| m.default) }).collect();
+                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), efforts: known.iter().find(|m| m.id == o.id).map(|m| m.efforts.clone()).unwrap_or_default(), default: known.iter().find(|m| m.id == o.id).is_some_and(|m| m.default), speeds: known.iter().find(|m| m.id == o.id).map(|m| m.speeds.clone()).unwrap_or_default() }).collect();
                         core.state.model = current.as_str().unwrap_or_default().to_owned();
                         core.meta.features.push("set_model".into());
                     }
@@ -856,7 +883,8 @@ impl Acp {
         self.empty = false;
         self.close_streams(core);
         // Images inline where the agent takes them; everything else as a link to the file. The
-        // conversation so far comes first, once, when it went on here from another machine.
+        // conversation so far comes first, once, when it went on here from another machine or
+        // another harness.
         let mut blocks = Vec::new();
         if let Some(c) = self.context.take() {
             blocks.push(json!({"type": "text", "text": c}));
@@ -876,6 +904,12 @@ impl Acp {
             self.prompting = Some(m.id.clone());
             core.state.turn_started = Some(Core::now());
             core.state.doing = Some("Thinking".to_owned());
+        }
+        // Its own `/compact`: the prompt's turn is the compaction, which it may say nothing else of.
+        let t = m.text.trim();
+        if (t == "/compact" || t.starts_with("/compact ")) && core.meta.commands.iter().any(|c| c.name == "compact") {
+            self.compact_prompt = Some(m.id.clone());
+            core.compacting(None);
         }
         self.show(core, &m, Delivery::Started);
         self.settle(core);
@@ -913,6 +947,16 @@ impl Acp {
             self.prompt(core, item);
             super::pause::sent_from_queue(core, &id);
         }
+    }
+
+    /// There may be room on its machine for it to go to work: what waits goes, as between turns.
+    pub fn room(&mut self, core: &mut Core) {
+        self.next(core);
+    }
+
+    /// It holds messages till its session can take them.
+    pub fn holds(&self) -> bool {
+        !self.waiting.is_empty()
     }
 
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
@@ -996,6 +1040,13 @@ impl Acp {
             let cancelled = v.get("error").is_some() || v.pointer("/result/stopReason").and_then(Value::as_str) == Some("cancelled");
             core.state.delivery.insert(client.clone(), if cancelled { Delivery::Cancelled } else { Delivery::Completed });
             core.touch_state();
+            // Its `/compact` is over: its words say how it went (one it reports ends as it says).
+            if self.compact_prompt.as_deref() == Some(client.as_str()) {
+                self.compact_prompt = None;
+                if self.compaction.is_none() {
+                    core.compacting_over(None);
+                }
+            }
             if self.prompting.as_deref() == Some(client.as_str()) {
                 self.prompt_result = Some(v.clone());
             } else if let Some(err) = v.get("error") {
@@ -1338,7 +1389,10 @@ impl Acp {
     }
 
     fn update(&mut self, core: &mut Core, u: &Value) {
-        let history = matches!(u.get("sessionUpdate").and_then(Value::as_str), Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update"));
+        let history = matches!(
+            u.get("sessionUpdate").and_then(Value::as_str),
+            Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update" | "compaction_update" | "compaction_summary_chunk")
+        );
         if history {
             self.empty = false;
         }
@@ -1468,6 +1522,40 @@ impl Acp {
                 }
                 core.touch_state();
             }
+            "compaction_update" => self.compaction_update(core, u),
+            // A compaction's summary (`compaction_summary_chunk`) isn't shown.
+            _ => {}
+        }
+    }
+
+    /// A compaction it reports (ACP's `session.compaction`, which kiln offers): one by its id,
+    /// under way until it says how it ended, with what claude-agent-acp adds of it
+    /// (`_meta.contextCompaction`).
+    fn compaction_update(&mut self, core: &mut Core, u: &Value) {
+        let Some(id) = u.get("compactionId").and_then(Value::as_str) else { return };
+        let key = format!("{}-{id}", self.run);
+        let meta = u.pointer("/_meta/contextCompaction");
+        let n = |k: &str| meta.and_then(|m| m.get(k)).and_then(Value::as_u64);
+        match u.get("status").and_then(Value::as_str) {
+            Some("in_progress") => {
+                self.compaction = Some(id.to_owned());
+                core.compacting(None);
+            }
+            Some(status @ ("completed" | "failed" | "cancelled")) => {
+                self.compaction = None;
+                let c = core.compacting_of(None).cloned();
+                let ms = n("durationMs").and_then(|d| i64::try_from(d).ok()).or_else(|| c.as_ref().map(|c| Core::now() - c.since));
+                match status {
+                    "completed" => core.compacted(&key, None, Level::Info, super::core::compacted_words(n("preTokens").or(c.and_then(|c| c.tokens)), n("postTokens"), ms)),
+                    "failed" => {
+                        let why = u.get("error").or_else(|| meta.and_then(|m| m.get("error"))).and_then(Value::as_str);
+                        core.compacted(&key, None, Level::Warn, super::core::compaction_failed_words(why));
+                    }
+                    _ if c.is_some() => core.compaction_stopped(None),
+                    _ => core.compacted(&key, None, Level::Warn, "Compaction stopped".to_owned()),
+                }
+            }
+            // Statuses ACP adds later: nothing is read into them.
             _ => {}
         }
     }
@@ -1645,6 +1733,49 @@ mod tests {
         }
     }
 
+    /// kiln offers ACP's session compaction: a compaction the agent reports is under way until it
+    /// says how it ended (claude-agent-acp's `_meta.contextCompaction` saying more); Devin's own
+    /// `/compact`, which it says nothing else of, for its turn.
+    #[test]
+    fn compactions_it_reports_and_its_own_compact() {
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut a = Acp::new(None);
+        a.start(&mut core);
+        let w = written(&mut core);
+        assert_eq!(w.first().and_then(|v| v.pointer("/params/clientCapabilities/session/compaction")), Some(&json!({})));
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
+        let update = |u: Value| json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": u}});
+        let marker = |core: &Core, id: &str| {
+            core.events().find(|e| e.id.starts_with(super::super::core::COMPACTION) && e.id.ends_with(id)).and_then(|e| match &e.body {
+                Body::Notice { level, text } => Some((*level, text.clone())),
+                _ => None,
+            })
+        };
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "compaction_update", "compactionId": "cmp_1", "status": "in_progress"}))]);
+        assert!(core.state.compacting.is_some());
+        feed(
+            &mut a,
+            &mut core,
+            &[
+                update(json!({"sessionUpdate": "compaction_summary_chunk", "compactionId": "cmp_1", "content": {"type": "text", "text": "## Retained"}})),
+                update(json!({"sessionUpdate": "compaction_update", "compactionId": "cmp_1", "status": "completed", "_meta": {"contextCompaction": {"version": 1, "trigger": "automatic", "preTokens": 180_000, "postTokens": 22_000, "durationMs": 41_000}}})),
+            ],
+        );
+        assert!(core.state.compacting.is_none());
+        assert_eq!(marker(&core, "cmp_1"), Some((Level::Info, "Compacted · 180k → 22k tokens · 41s".to_owned())));
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "compaction_update", "compactionId": "cmp_2", "status": "failed", "error": "No model"}))]);
+        assert_eq!(marker(&core, "cmp_2"), Some((Level::Warn, "Couldn't compact: No model".to_owned())));
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "compact", "description": "Force conversation compaction"}]}))]);
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "/compact".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        assert_eq!(core.state.doing.as_deref(), Some(super::super::core::COMPACTING));
+        let pid = written(&mut core).iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).and_then(|p| p.get("id").cloned()).unwrap_or_default();
+        feed(&mut a, &mut core, &[update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Context compacted"}})), json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "end_turn"}})]);
+        assert!(core.state.compacting.is_none());
+        assert_eq!(core.state.doing, None);
+    }
+
     #[test]
     fn the_agents_commands_and_kilns_in_one_catalog() -> anyhow::Result<()> {
         use super::super::model::Route;
@@ -1732,11 +1863,14 @@ mod tests {
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
         let _ = written(&mut core);
+        // Not given yet: started again now, it would be given it then.
+        assert!(!a.seeded());
         a.command(&mut core, Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
         assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("<kiln_handoff>earlier</kiln_handoff>"));
         assert_eq!(prompt.pointer("/params/prompt/1/text").and_then(Value::as_str), Some("go on"));
+        assert!(a.seeded(), "its own session has it now");
         // The timeline shows what the person said, not the conversation it went with.
         assert!(core.events().any(|e| matches!(&e.body, Body::User { text, .. } if text == "go on")));
         let pid = prompt.get("id").cloned().unwrap_or_default();

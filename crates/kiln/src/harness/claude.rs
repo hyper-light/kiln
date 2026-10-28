@@ -21,6 +21,11 @@ use super::model::{
     ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, same_account, sort_catalog,
 };
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"];
+/// It turns nothing on or off once it runs.
+pub(super) const LEARNED: &[&str] = &[];
+
 /// Environment variables a Claude Code session sets for its children; a harness kiln starts must
 /// not inherit them (it would think it runs inside another session).
 pub const SCRUB_ENV: &[&str] = &[
@@ -146,6 +151,16 @@ pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// setting), on the models initialize says take it.
 const FAST: &str = "fast";
 
+/// Fast mode as a speed (`Meta::speeds`, and each model that takes it in `Meta::models`).
+fn fast_speed() -> super::model::ControlOption {
+    super::model::ControlOption {
+        id: FAST.to_owned(),
+        label: "Fast".to_owned(),
+        description: "Up to 2.5x faster, at a higher price per token. Turned on part-way, the conversation so far is billed once at that price".to_owned(),
+        dangerous: false,
+    }
+}
+
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +283,10 @@ pub struct Claude {
     /// until they've taken that one.
     #[serde(default)]
     waking: BTreeSet<String>,
+    /// The compaction under way or just over (its boundary says more of it after its status said
+    /// it ended): its conversation's parent, and its marker's key, one marker for both.
+    #[serde(default)]
+    compaction: Option<(Option<String>, String)>,
 }
 
 impl Claude {
@@ -316,6 +335,7 @@ impl Claude {
             relays: HashMap::new(),
             relay_calls: HashMap::new(),
             waking: BTreeSet::new(),
+            compaction: None,
         }
     }
 
@@ -423,11 +443,7 @@ impl Claude {
         // else the ones the CLI knows.
         core.meta.efforts = self.effort_levels(&core.state.model).iter().map(|e| opt(e, &capitalize(e), "")).collect();
         // Fast mode, where the model in use takes it.
-        core.meta.speeds = if self.fast_on(&core.state.model) {
-            vec![opt(FAST, "Fast", "Up to 2.5x faster, at a higher price per token. Turned on part-way, the conversation so far is billed once at that price")]
-        } else {
-            Vec::new()
-        };
+        core.meta.speeds = if self.fast_on(&core.state.model) { vec![fast_speed()] } else { Vec::new() };
         core.touch_meta();
     }
 
@@ -643,6 +659,19 @@ impl Claude {
         core.upsert(&format!("notice-{}-{}", self.run, self.notice_seq), parent, Body::Notice { level, text: text.into() });
     }
 
+    /// The key of the marker of `parent`'s compaction under way or just over, else a new one.
+    fn compaction_key(&mut self, parent: Option<&str>) -> String {
+        if let Some((p, key)) = &self.compaction
+            && p.as_deref() == parent
+        {
+            return key.clone();
+        }
+        self.notice_seq += 1;
+        let key = format!("{}-{}", self.run, self.notice_seq);
+        self.compaction = Some((parent.map(str::to_owned), key.clone()));
+        key
+    }
+
     /// Something is being worked on: note when the turn began.
     fn begin(&mut self, core: &mut Core) {
         if !self.turn {
@@ -675,7 +704,7 @@ impl Claude {
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(claude_catalog());
         }
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
+        core.meta.features = FEATURES
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -1566,6 +1595,11 @@ impl Claude {
         super::pause::sent_from_queue(core, &id);
     }
 
+    /// There may be room on its machine for it to go to work: kiln's queue goes, as after a turn.
+    pub fn room(&mut self, core: &mut Core) {
+        self.drain_queue(core);
+    }
+
     // ------------------------------------------------------------------ messages to subagents
 
     /// How a person's message reaches subagent `t` now. Claude Code takes none for a subagent
@@ -1617,10 +1651,12 @@ impl Claude {
     /// What waits for its subagents goes, to each that finished, one message each: it's resumed
     /// with it (and the next waits until it finishes again).
     pub fn drain_subagents(&mut self, core: &mut Core) {
-        if !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+        // Room on its machine is asked for only with something to send.
+        let waiting = super::subagent::waiting(core);
+        if waiting.is_empty() || matches!(core.state.status, Status::Exited | Status::Starting) || !super::pause::open(core) {
             return;
         }
-        for task in super::subagent::waiting(core) {
+        for task in waiting {
             let Some(t) = core.state.tasks.iter().find(|t| t.id == task).cloned() else { continue };
             if t.live() || self.waking.contains(&t.id) || self.takes(core, &t).0.is_empty() {
                 continue;
@@ -1844,6 +1880,8 @@ impl Claude {
                                 description: str_of(m, "description").unwrap_or("").to_owned(),
                                 efforts: m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
                                 default: false,
+                                // Whether it goes faster, kept with the machine's models for a new agent.
+                                speeds: if m.get("supportsFastMode").and_then(Value::as_bool).unwrap_or(false) { vec![fast_speed()] } else { Vec::new() },
                             })
                         })
                         .collect();
@@ -2264,6 +2302,28 @@ impl Claude {
                 if activity.as_deref() == Some("requesting") && parent.is_none() {
                     self.begin(core);
                 }
+                // Compacting is said again every 30 s while it goes on; its end says how it went
+                // (older CLIs say nothing of it: their boundary ends it).
+                if activity.as_deref() == Some("compacting") {
+                    // A new one has a marker of its own.
+                    if core.compacting_of(parent.as_deref()).is_none() {
+                        self.compaction = None;
+                    }
+                    core.compacting(parent.clone());
+                } else if let Some(result) = str_of(v, "compact_result") {
+                    let key = self.compaction_key(parent.as_deref());
+                    let (level, text) = if result == "failed" {
+                        (Level::Warn, super::core::compaction_failed_words(str_of(v, "compact_error")))
+                    } else {
+                        let c = core.compacting_of(parent.as_deref());
+                        (Level::Info, super::core::compacted_words(c.and_then(|c| c.tokens), None, c.map(|c| Core::now() - c.since)))
+                    };
+                    core.compacted(&key, parent.clone(), level, text);
+                    // Its boundary follows one that compacted.
+                    if result == "failed" {
+                        self.compaction = None;
+                    }
+                }
                 core.state.activity = activity;
                 core.touch_state();
                 self.settle(core);
@@ -2291,12 +2351,12 @@ impl Claude {
             }
             "compact_boundary" => {
                 let meta = v.get("compact_metadata").or_else(|| v.get("compactMetadata"));
-                let pre = meta.and_then(|m| m.get("pre_tokens").or_else(|| m.get("preTokens"))).and_then(Value::as_u64);
-                let text = match pre {
-                    Some(p) => format!("Conversation compacted (was {} tokens)", fmt_tokens(p)),
-                    None => "Conversation compacted".to_owned(),
-                };
-                self.notice(core, Level::Info, text, parent);
+                let n = |snake: &str, camel: &str| meta.and_then(|m| m.get(snake).or_else(|| m.get(camel))).and_then(Value::as_u64);
+                let key = self.compaction_key(parent.as_deref());
+                let ms = n("duration_ms", "durationMs").and_then(|d| i64::try_from(d).ok()).or_else(|| core.compacting_of(parent.as_deref()).map(|c| Core::now() - c.since));
+                let text = super::core::compacted_words(n("pre_tokens", "preTokens"), n("post_tokens", "postTokens"), ms);
+                core.compacted(&key, parent, Level::Info, text);
+                self.compaction = None;
             }
             "api_retry" => {
                 let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
@@ -2929,6 +2989,9 @@ impl Claude {
     fn result(&mut self, core: &mut Core, v: &Value) {
         self.turn = false;
         self.agents_allowed.clear();
+        // A compaction its turn ended before (an interrupt): it didn't finish.
+        core.compaction_stopped(None);
+        self.compaction = None;
         let started = core.state.turn_started;
         core.state.turn_started = None;
         core.state.doing = None;
@@ -3750,16 +3813,6 @@ fn fast_blocked(reason: &str) -> Option<String> {
     Some(said.to_owned())
 }
 
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.0}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 /// `path` relative to `cwd` when inside it.
 pub fn rel(path: &str, cwd: &str) -> String {
     if !cwd.is_empty()
@@ -4119,6 +4172,54 @@ mod tests {
         for l in lines {
             c.line(core, l);
         }
+    }
+
+    /// The compactions' markers, newest last: (level, words, thread).
+    fn compactions(core: &Core) -> Vec<(Level, String, Option<String>)> {
+        core.events()
+            .filter(|e| e.id.starts_with(super::super::core::COMPACTION))
+            .filter_map(|e| match &e.body {
+                Body::Notice { level, text } => Some((*level, text.clone(), e.parent.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Claude Code 2.1.296 compacting: `status: "compacting"` (said again every 30 s, with what
+    /// it has written so far), its end (`compact_result`), then its boundary (`compact_metadata`):
+    /// one marker. A subagent's is its own, one that fails says why, and one its turn ended before
+    /// stopped.
+    #[test]
+    fn a_compaction_shows_while_it_goes_on_and_its_boundary_after() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.usage.context_tokens = Some(967_000);
+        feed(&mut c, &mut core, &[
+            r#"{"type":"system","subtype":"status","status":"requesting","session_id":"s","uuid":"u1"}"#,
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s","uuid":"u2"}"#,
+        ]);
+        let since = core.state.compacting.as_ref().map(|c| c.since);
+        assert!(since.is_some());
+        assert_eq!(core.state.doing.as_deref(), Some(super::super::core::COMPACTING));
+        feed(&mut c, &mut core, &[r#"{"type":"system","subtype":"status","status":"compacting","compact_output_chars":5120,"session_id":"s","uuid":"u3"}"#]);
+        assert_eq!(core.state.compacting.as_ref().map(|c| c.since), since);
+        feed(&mut c, &mut core, &[
+            r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s","uuid":"u4"}"#,
+            r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":967000,"post_tokens":48000,"duration_ms":98000},"session_id":"s","uuid":"b1"}"#,
+        ]);
+        assert!(core.state.compacting.is_none());
+        assert_eq!(core.state.doing.as_deref(), Some("Thinking"));
+        assert_eq!(compactions(&core), [(Level::Info, "Compacted · 967k → 48k tokens · 1m 38s".to_owned(), None)]);
+        feed(&mut c, &mut core, &[r#"{"type":"system","subtype":"status","status":"compacting","parent_tool_use_id":"toolu_5"}"#]);
+        assert_eq!(core.state.compacting.as_ref().and_then(|c| c.parent.as_deref()), Some("toolu_5"));
+        feed(&mut c, &mut core, &[r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Conversation too long","parent_tool_use_id":"toolu_5"}"#]);
+        assert_eq!(compactions(&core).last(), Some(&(Level::Warn, "Couldn't compact: Conversation too long".to_owned(), Some("toolu_5".to_owned()))));
+        feed(&mut c, &mut core, &[
+            r#"{"type":"system","subtype":"status","status":"compacting"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"","terminal_reason":"aborted_streaming","session_id":"s"}"#,
+        ]);
+        assert!(core.state.compacting.is_none());
+        assert!(compactions(&core).last().is_some_and(|(level, text, _)| *level == Level::Warn && text.starts_with("Compaction stopped")));
     }
 
     fn tool<'a>(core: &'a Core, id: &str) -> Option<&'a ToolCall> {
@@ -5570,6 +5671,9 @@ mod tests {
         );
         let speeds = |core: &Core| core.meta.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
         let applied = |reqs: &[(String, String, Value)]| reqs.iter().filter(|r| r.1 == "apply_flag_settings").filter_map(|r| r.2.pointer("/settings/fastMode").and_then(Value::as_bool)).collect::<Vec<_>>();
+        // Each listed model says whether it goes faster: the machine keeps that for a new agent.
+        let listed = |core: &Core| core.meta.models.iter().map(|m| (m.id.clone(), m.speeds.iter().map(|s| s.id.clone()).collect::<Vec<_>>())).collect::<Vec<_>>();
+        assert_eq!(listed(&core), [("default".to_owned(), vec!["fast".to_owned()]), ("sonnet".to_owned(), vec![]), ("claude-opus-4-7".to_owned(), vec![])]);
         // No model yet: the default model's. A session not opted in yet has nothing in its way.
         assert_eq!(speeds(&core), ["fast"]);
         assert_eq!((core.state.speed.as_str(), core.state.speed_blocked.as_deref()), ("", None));

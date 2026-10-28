@@ -187,6 +187,10 @@ impl Told {
         let mut by_parent: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for c in all {
             let Some(parent) = c.parent.as_deref() else { continue };
+            // A card's helper (`super::about`) answers a person: its parent isn't told of it.
+            if c.helper.is_some() {
+                continue;
+            }
             let (st, key) = (stand(c), key_of(c));
             let e = self.seen.entry(c.id.clone()).or_insert_with(|| Seen { key: key.clone(), since: now, worked: false, told: key.clone() });
             if e.key != key {

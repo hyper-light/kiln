@@ -17,6 +17,7 @@ import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
+import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
@@ -25,6 +26,8 @@ import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
+import { handleKeep } from "./keep.ts";
+import { handleReap } from "./reap.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
@@ -205,8 +208,8 @@ function pushSample(name: string, s: HostSample) {
 const serverHost = newHost(16, 64, 1800);
 prefillHistory("server", serverHost, 0.25);
 
-function addAgent(a: Omit<Agent, "running" | "busy" | "sample" | "draining"> & { draining?: boolean }, host: HostState, prefill = true) {
-  const agent: Agent = { ...a, draining: a.draining ?? false, running: [], busy: 0, sample: null };
+function addAgent(a: Omit<Agent, keyof ReturnType<typeof defaultRunner>> & Partial<ReturnType<typeof defaultRunner>>, host: HostState, prefill = true) {
+  const agent: Agent = { ...defaultRunner(), ...a };
   agents.set(a.name, agent);
   agentState.set(a.name, host);
   if (prefill) {
@@ -262,7 +265,8 @@ function plannedFor(tpl: JobTpl): PlannedJob {
     artifacts: tpl.key === "bench" ? ["target/criterion/**"] : [],
     cache: tpl.toolchain === "rust" ? ["~/.cargo/registry", "target"] : [],
     condition: null,
-    steps: tpl.steps.map((s) => ({ name: s.name, run: s.run, tty: true })),
+    requires: [],
+    steps: tpl.steps.map((s) => ({ name: s.name, run: s.run, shell: null, env: {}, "working-directory": null, "timeout-minutes": null, "continue-on-error": false, tty: true })),
   };
 }
 
@@ -1326,6 +1330,7 @@ const MIME: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".woff2": "font/woff2",
   ".woff": "font/woff",
+  ".wasm": "application/wasm",
   ".png": "image/png",
   ".json": "application/json",
   ".webmanifest": "application/manifest+json",
@@ -1438,6 +1443,10 @@ const server = http.createServer(async (req, res) => {
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
+    // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
+    if (await handleKeep(req, res, url, { json, body })) return;
+    // ---- the reaper's policies (W24-R31) ----
+    if (await handleReap(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 

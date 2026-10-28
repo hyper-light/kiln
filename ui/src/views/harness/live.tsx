@@ -16,7 +16,7 @@
  */
 import * as React from "react";
 import { ArrowLeft, ArrowRight, Circle, Copy, Keyboard, Plus, RotateCw, Square, Volume2, VolumeX, X } from "lucide-react";
-import { harnessApi, recordingUrl, type Recording, type ToolCall } from "@/api/harness";
+import { harnessApi, recordingUrl, type Recording, type StreamDown, type StreamUp, type ToolCall, type WebrtcDown } from "@/api/harness";
 import { SelectField } from "@/components/ui/misc";
 import { formatBytes } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
@@ -108,7 +108,7 @@ class Viewing {
     };
   }
 
-  send(m: unknown) {
+  send(m: StreamUp) {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m));
   }
 
@@ -142,17 +142,18 @@ class Viewing {
   }
 
   private event(text: string) {
-    let e: Record<string, unknown>;
+    let e: StreamDown;
     try {
-      e = JSON.parse(text) as Record<string, unknown>;
+      e = JSON.parse(text) as StreamDown;
     } catch {
       return; // Not one kiln sends.
     }
-    const w = e.webrtc as { can?: boolean; answer?: string; error?: string; gone?: string } | undefined;
-    if (!w) return this.on.event(e);
-    if (w.can) void this.offer();
-    else if (w.answer && this.pc) this.pc.setRemoteDescription({ type: "answer", sdp: w.answer }).catch(() => this.unpeer(true));
-    else if (w.error !== undefined || w.gone !== undefined) this.unpeer(false);
+    // The server's WebRTC, or what the stream's runner said (one key naming what).
+    const w = (e as { webrtc?: WebrtcDown }).webrtc;
+    if (!w) return this.on.event(e as Record<string, unknown>);
+    if ("can" in w && w.can) void this.offer();
+    else if ("answer" in w && this.pc) this.pc.setRemoteDescription({ type: "answer", sdp: w.answer }).catch(() => this.unpeer(true));
+    else if ("error" in w || "gone" in w) this.unpeer(false);
   }
 
   /** A peer offered to the server: the picture and sound come over it once it plays. */
@@ -573,8 +574,8 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const fixed = React.useRef<{ width: number; height: number; scale: number } | null>(null);
   const fixedName = React.useRef("");
 
-  const send = React.useCallback((m: unknown) => viewing.current?.send(m), []);
-  const input = React.useCallback((events: unknown[]) => send({ input: events }), [send]);
+  const send = React.useCallback((m: StreamUp) => viewing.current?.send(m), []);
+  const input = React.useCallback((events: Record<string, unknown>[]) => send({ input: events }), [send]);
   const resize = React.useCallback(() => {
     const f = fixed.current;
     if (f) return send({ control: { resize: { ...f, mobile: false } } });

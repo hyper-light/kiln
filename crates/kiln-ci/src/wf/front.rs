@@ -159,6 +159,53 @@ impl Fe<'_> {
         }
     }
 
+    /// A job's `resources:` (W05-R03): `cpu`, `memory`, `disk` and `gpu`, each a quantity placement
+    /// can reserve, or a KCI1011 at the one that isn't. A templated one is read once it's known.
+    fn job_resources(&mut self, n: &Node, path: &str) -> YVal {
+        match n.as_map() {
+            Some(map) => {
+                for (k, v) in map {
+                    let Some(name) = k.text() else { continue };
+                    let at = format!("{path}.{name}");
+                    let text = v.text().unwrap_or_default().trim().to_owned();
+                    if text.contains("${{") {
+                        continue;
+                    }
+                    let (ok, form) = match name.as_str() {
+                        "cpu" => (crate::sched::pools::cpus(&text).is_some(), "a number of CPUs (`2`, `0.5`, `500m`)"),
+                        // `number` reads a lowercase `m` as minutes: `512m` of memory is 512 minutes.
+                        "memory" | "disk" => (!text.ends_with(['s', 'm', 'h', 'd']) && crate::sched::routing::number(&text).is_some_and(|b| b >= 0.0), "a size (`512Mi`, `32Gi`, `2G`)"),
+                        "gpu" => (text.parse::<u32>().is_ok(), "a number of GPUs"),
+                        _ => {
+                            self.err("KCI1010", format!("unknown key `{name}` in `resources` (cpu, memory, disk, gpu)"), k.range, &at);
+                            continue;
+                        }
+                    };
+                    if !ok {
+                        self.err("KCI1011", format!("`{at}` isn't {form}: `{text}`"), v.range, &at);
+                    }
+                }
+            }
+            None if n.is_null() => {}
+            None => self.err("KCI1011", format!("`{path}` must be a mapping of `cpu`, `memory`, `disk` and `gpu`"), n.range, path),
+        }
+        self.yval(n)
+    }
+
+    /// A job's `requires:` (W05-R22): each a constraint routing can read, or a KCI1011 at the one it
+    /// can't. A templated one is read once it's known.
+    fn job_requires(&mut self, n: &Node, path: &str) -> Vec<Tpl> {
+        let list = self.tpl_list(n, path);
+        for (i, t) in list.iter().enumerate() {
+            if !t.src.contains("${{")
+                && let Err(why) = crate::sched::routing::Constraint::parse(&t.src)
+            {
+                self.err("KCI1011", why, t.range, &format!("{path}[{i}]"));
+            }
+        }
+        list
+    }
+
     pub fn yval(&mut self, n: &Node) -> YVal {
         match &n.kind {
             Kind::Scalar(Scalar::Null, _) => YVal::Null,
@@ -222,6 +269,18 @@ impl Fe<'_> {
                 }
                 "secrets" => wf.secrets = self.secret_decls(v, "secrets"),
                 "supersede" => wf.supersede = Some(self.yval(v)),
+                "coalesce" | "cadence" => {
+                    let y = self.yval(v);
+                    let (c, d) = if k == "coalesce" { (Some(&y), None) } else { (None, Some(&y)) };
+                    if let Err(e) = crate::sched::admit::Spec::parse(c, d) {
+                        self.err("KCI1015", e, v.range, &k);
+                    }
+                    if k == "coalesce" {
+                        wf.coalesce = Some(y);
+                    } else {
+                        wf.cadence = Some(y);
+                    }
+                }
                 "routing" => wf.routing_infer = v.get("infer").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)),
                 "run-env" => wf.run_env = self.bool(v, "run-env").unwrap_or(false),
                 "kiln" => {
@@ -724,9 +783,17 @@ impl Fe<'_> {
                 "toolchain" => kiln.toolchain = self.str(v, &at),
                 "image" => kiln.image = self.tpl(v, &at),
                 "exclusive" => kiln.exclusive = self.bool(v, &at).unwrap_or(false),
-                "resources" => kiln.resources = Some(self.yval(v)),
-                "requires" => kiln.requires = self.tpl_list(v, &at),
-                "prefer" => kiln.prefer = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default(),
+                "resources" => kiln.resources = Some(self.job_resources(v, &at)),
+                "requires" => kiln.requires = self.job_requires(v, &at),
+                // W05-R23, W24-R18: an item routing can't read counts for nothing, and says why.
+                "prefer" => {
+                    kiln.prefer = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default();
+                    for (i, (item, node)) in kiln.prefer.iter().zip(v.as_seq().unwrap_or_default()).enumerate() {
+                        if let Err(why) = crate::sched::routing::preference(item) {
+                            self.diags.push(Diag::warning("KCI1011", format!("`{at}[{i}]` counts for nothing: {why}"), node.range).at(&at));
+                        }
+                    }
+                }
                 "priority" => kiln.priority = Some(self.yval(v)),
                 "retry" => kiln.retry = Some(self.yval(v)),
                 "retries" => {
@@ -737,6 +804,14 @@ impl Fe<'_> {
                     ]));
                 }
                 "reuse" => kiln.reuse = Some(self.yval(v)),
+                // W24: `work:` is kept as written, its `warm` read by `work::slots::warm` (W24-R11);
+                // `work: { memo }` is what `reuse:` is shorthand for (W24-R06).
+                "work" => {
+                    kiln.work = Some(self.yval(v));
+                    if let Some(memo) = v.get("memo") {
+                        kiln.reuse = Some(self.yval(memo));
+                    }
+                }
                 "cache" => kiln.cache = v.as_seq().map(|s| s.iter().map(|x| self.yval(x)).collect()).unwrap_or_default(),
                 "exports" => kiln.exports_env = v.get("env").map(|e| self.str_list(e, &format!("{at}.env"))).unwrap_or_default(),
                 "env-from" => kiln.env_from = self.str_list(v, &at),
@@ -1057,14 +1132,35 @@ impl Fe<'_> {
                 "test-results" => kiln.test_results = Some(self.yval(v)),
                 "integrations" => kiln.integrations = self.str_list(v, &at),
                 "tty" => kiln.tty = self.bool(v, &at).unwrap_or(false),
+                // W24-R07: `check`, or a mapping of `memo`'s keys.
+                "memo" => {
+                    if v.as_map().is_some() {
+                        let _ = self.entries(v, keys::MEMO, &at);
+                    }
+                    let memo = self.yval(v);
+                    if let Err(e) = crate::work::memo::Memo::from_yval(&memo) {
+                        self.err("KCI1015", e, v.range, &at);
+                    }
+                    kiln.memo = Some(memo);
+                }
+                // W24-R10: a build's test binaries, run or replayed.
+                "tests" => {
+                    let tests = self.yval(v);
+                    if let Err(e) = crate::work::tests::Spec::from_yval(&tests) {
+                        self.err("KCI1015", e, v.range, &at);
+                    }
+                    kiln.tests = Some(tests);
+                }
                 _ => {}
             }
         }
         s.kiln = kiln;
         if !self.overlay {
+            let tests = s.kiln.tests.is_some();
             match (&s.run, &s.uses, s.is_control()) {
+                (Some(_), _, _) | (_, Some(_), _) if tests => self.err("KCI1012", "a `tests` step runs its test binaries itself: it can't have `run` or `uses`", n.range, path),
                 (Some(_), Some(_), _) => self.err("KCI1012", "a step has `run` or `uses`, not both", n.range, path),
-                (None, None, false) => self.err("KCI1012", "a step needs `run` or `uses` (or `wait`, `wait-all`, `cancel` or `parallel`)", n.range, path),
+                (None, None, false) if !tests => self.err("KCI1012", "a step needs `run` or `uses` (or `wait`, `wait-all`, `cancel` or `parallel`)", n.range, path),
                 (Some(_) | None, Some(_) | None, true) if s.run.is_some() || s.uses.is_some() => {
                     self.err("KCI1012", "a `wait`, `wait-all`, `cancel` or `parallel` step runs nothing itself: it can't have `run` or `uses`", n.range, path)
                 }

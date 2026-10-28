@@ -15,6 +15,7 @@ use crate::obj::Str;
 
 /// A resource's or an app's health, from most to least healthy (Argo CD's order).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Health {
     /// Doing what it should.
     #[default]
@@ -67,6 +68,7 @@ impl fmt::Display for Health {
 
 /// An app's or a resource's sync state.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Sync {
     /// Live matches git.
     Synced,

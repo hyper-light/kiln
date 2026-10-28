@@ -16,6 +16,7 @@ import { useRes } from "@/lib/data";
 import { answersToClaude, Choices, type ChoiceAnswer, type ChoiceQuestion, type ChoicesProps, type ExperimentSpec } from "./choices";
 import { Prose, ToolIcon } from "./parts";
 import { SavePlan } from "@/views/plans/save";
+import { Highlighted } from "@/components/code/highlighted";
 
 export type Decide = (c: Extract<Command, { type: "approve" }>) => void;
 
@@ -210,7 +211,9 @@ export function ApprovalCard({
 
       {a.command ? (
         <pre className="hx-approval-cmd">
-          <code>{a.command}</code>
+          <code>
+            <Highlighted text={a.command} lang="bash" />
+          </code>
         </pre>
       ) : !isQuestion && !isPlan && (!a.diffs || a.diffs.length === 0) ? (
         <div className="hx-approval-title">{a.title}</div>
