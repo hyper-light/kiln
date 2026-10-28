@@ -530,6 +530,34 @@ impl Adapter {
             Self::Claude(_) => true,
         }
     }
+
+    /// A session an older image handed over runs on this one: it says what this image's harness
+    /// can do, as a start would (its adapter doesn't start again), keeping what its harness turned
+    /// on or off while it ran.
+    pub fn upgraded(&self, core: &mut Core) {
+        let (features, learned) = match self {
+            Self::Claude(_) => (super::claude::FEATURES, super::claude::LEARNED),
+            Self::Codex(_) => (super::codex::FEATURES, super::codex::LEARNED),
+            Self::Acp(_) => (super::acp::FEATURES, super::acp::LEARNED),
+            Self::Agy(_) => (super::antigravity::FEATURES, super::antigravity::LEARNED),
+        };
+        let now = upgraded_features(features, learned, &core.meta.features);
+        if now != core.meta.features {
+            core.meta.features = now;
+            core.touch_meta();
+        }
+    }
+}
+
+/// This image's `features`, those in `learned` as the session had them.
+fn upgraded_features(features: &[&str], learned: &[&str], had: &[String]) -> Vec<String> {
+    let mut now: Vec<String> = features.iter().filter(|f| !learned.contains(f)).map(|f| (*f).to_owned()).collect();
+    for f in had {
+        if learned.contains(&f.as_str()) && !now.contains(f) {
+            now.push(f.clone());
+        }
+    }
+    now
 }
 
 /// What a machine offers, for the "new agent" dialog.
@@ -739,6 +767,22 @@ fn known_models(kind: &str) -> Vec<super::model::ModelOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Devin session handed over from an image before every harness could switch runs on this
+    /// image's features (switching among them), with the model and steering its agent said it takes
+    /// kept, and one it never said left off; what this image dropped is gone.
+    #[test]
+    fn a_session_handed_over_runs_on_this_images_features() {
+        let had: Vec<String> = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "steer", "queue_steer", "set_model", "gone"].iter().map(|s| (*s).to_owned()).collect();
+        let now = upgraded_features(super::super::acp::FEATURES, super::super::acp::LEARNED, &had);
+        for f in super::super::acp::FEATURES {
+            assert!(now.iter().any(|n| n == f), "{f} missing: {now:?}");
+        }
+        assert!(now.iter().any(|n| n == "switch_harness") && now.iter().any(|n| n == "set_model") && now.iter().any(|n| n == "steer"), "{now:?}");
+        assert!(!now.iter().any(|n| n == "set_effort" || n == "gone"), "{now:?}");
+        // Again: nothing changes.
+        assert_eq!(upgraded_features(super::super::acp::FEATURES, super::super::acp::LEARNED, &now), now);
+    }
 
     #[test]
     fn devin_runs_its_acp_protocol_and_keeps_its_terminal_interface() -> anyhow::Result<()> {

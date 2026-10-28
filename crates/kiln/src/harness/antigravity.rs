@@ -23,6 +23,11 @@ use super::model::{
 };
 use super::session::Spec;
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments", "switch_harness"];
+/// It turns nothing on or off once it runs.
+pub(super) const LEARNED: &[&str] = &[];
+
 /// Its modes. Ask is agy's own default; in this mode nothing can ask you, so whatever needs your
 /// approval is denied.
 pub const ASK: &str = "default";
@@ -157,7 +162,7 @@ impl Agy {
     }
 
     pub fn start(&mut self, core: &mut Core) {
-        core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments", "switch_harness"].iter().map(|s| (*s).to_owned()).collect();
+        core.meta.features = FEATURES.iter().map(|s| (*s).to_owned()).collect();
         core.meta.modes = modes();
         core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
         // Its go-back (rewind, restore files, branch, fork) is kiln's own (`harness::goback`).

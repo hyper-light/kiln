@@ -3003,6 +3003,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     let mut core = s.core.lock();
                     // An older image may have left what the harness before a switch ran looking live.
                     core.settle_foreign();
+                    adapter.upgraded(&mut core);
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
                     }

@@ -20,6 +20,12 @@ use super::model::{
     Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
 };
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness"];
+/// What it turns on or off once it runs, as the agent says what it takes (steering; its model,
+/// effort and speed options): kept as they were across an in-place upgrade.
+pub(super) const LEARNED: &[&str] = &["steer", "queue_steer", "set_model", "set_effort", "set_speed"];
+
 mod catalog;
 
 #[cfg(not(test))]
@@ -330,7 +336,7 @@ impl Acp {
 
     pub fn start(&mut self, core: &mut Core) {
         self.replaying = self.resume.is_some() && core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
-        core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness"].iter().map(|s| (*s).to_owned()).collect();
+        core.meta.features = FEATURES.iter().map(|s| (*s).to_owned()).collect();
         core.touch_meta();
         // kiln's commands until the agent lists its own.
         if core.meta.commands.is_empty() {
