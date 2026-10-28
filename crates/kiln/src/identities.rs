@@ -6,7 +6,7 @@
 //! name gets a new key the revocation doesn't touch), and [`revocations`] feeds the chain checker
 //! (`kiln_ci::identity::chain`).
 
-use kiln_ci::identity::chain::{Actor, Identity, Revocation};
+use kiln_ci::identity::chain::{Actor, Holder, Identity, Revocation};
 use rusqlite::{OptionalExtension as _, params};
 
 use crate::hub::Hub;
@@ -201,7 +201,9 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         "agent" => {
             let session = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("an agent's identity names its session"))?;
             let epoch = ask.epoch.ok_or_else(|| anyhow::anyhow!("an agent's identity names its epoch"))?;
-            (agent_identity(hub, machine, session, epoch).await?, AGENT_HOURS)
+            // The runner process asking holds the session's key at this epoch: named in its certificate.
+            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+            (agent_identity(hub, machine, &instance, session, epoch).await?, AGENT_HOURS)
         }
         "leg" => {
             let leg = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("a leg's identity names its leg"))?;
@@ -217,12 +219,15 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
     let pem = hub.pki.issue_identity(&ask.csr, &identity, &facts, time::Duration::hours(hours))?;
     let now = crate::util::now_unix();
     revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
-    if let Actor::Agent { epoch, .. } = &identity.actor
+    if let Actor::Agent { epoch, held_by, .. } = &identity.actor
         && let Some(session) = ask.of.as_deref()
     {
-        // What the session signed at an epoch it has left is refused from the hand-over on.
-        for old in epochs_of(&hub.store, session).await?.into_iter().filter(|(_, e)| e < epoch) {
-            revoke(&hub.store, Target::Subject(old.0), &format!("moved on to epoch {epoch}"), "kiln", now).await?;
+        // What the session signed at an epoch it has left is refused from the hand-over on, saying
+        // both epochs and where it went: "epoch 2 left: moved on to epoch 3, on runner adacachy
+        // (instance 01a17502)".
+        let to = held_by.as_ref().map(|h| format!(", on runner {} (instance {})", h.machine, h.instance)).unwrap_or_default();
+        for (subject, left) in epochs_of(&hub.store, session).await?.into_iter().filter(|(_, e)| e < epoch) {
+            revoke(&hub.store, Target::Subject(subject), &format!("epoch {left} left: moved on to epoch {epoch}{to}"), "kiln", now).await?;
         }
     }
     record(&hub.store, &ask.kind, &uri, &pem).await?;
@@ -230,10 +235,11 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
     Ok((uri, pem))
 }
 
-/// An agent session's identity at `epoch`, for the runner process of `machine` holding it: the
-/// session must run there, at that epoch or a later one than kiln last heard (a copy left behind
-/// at an older one gets none), and kiln must know whom it acts for.
-async fn agent_identity(hub: &Hub, machine: &str, session: &str, epoch: u64) -> anyhow::Result<Identity> {
+/// An agent session's identity at `epoch`, for the runner process of `machine` holding it
+/// (`instance`, named in the certificate): the session must run there, at that epoch or a later
+/// one than kiln last heard (a copy left behind at an older one gets none), and kiln must know
+/// whom it acts for.
+async fn agent_identity(hub: &Hub, machine: &str, instance: &str, session: &str, epoch: u64) -> anyhow::Result<Identity> {
     let info = hub.harness.info(session).ok_or_else(|| anyhow::anyhow!("kiln knows no agent session {session} yet"))?;
     anyhow::ensure!(info.target == format!("agent:{machine}"), "agent session {session} runs on {}, not {machine}", info.target);
     let known = hub.harness.epoch_of(session);
@@ -243,7 +249,8 @@ async fn agent_identity(hub: &Hub, machine: &str, session: &str, epoch: u64) -> 
         Some(p) => person_of(&p),
         None => anyhow::bail!("kiln can't say whom agent session {session} acts for"),
     };
-    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch }))
+    let held_by = Some(Holder { machine: machine.to_owned(), instance: instance.to_owned() });
+    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch, held_by }))
 }
 
 /// A CI leg's identity, for the runner process of `machine` it was given to: its run's number,

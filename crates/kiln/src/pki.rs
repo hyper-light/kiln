@@ -710,17 +710,18 @@ mod tests {
 
     #[test]
     fn w27_r01_identities_issued_by_csr_verify_to_the_root() -> anyhow::Result<()> {
-        use kiln_ci::identity::chain::{self, Actor, Identity, fulcio};
+        use kiln_ci::identity::chain::{self, Actor, Holder, Identity, fulcio};
         let dir = tempfile::tempdir()?;
         let pki = Pki::open_scratch(dir.path())?;
         // The CSR asks for another name; the certificate names what the server says.
         let (csr, key_pem) = make_csr("someone-else")?;
-        let agent = Identity::new("hyper-light", Actor::Agent { person: "sam".into(), agent: "matrix".into(), epoch: 3 });
+        let held_by = Some(Holder { machine: "fedora-2".into(), instance: "01a174ed".into() });
+        let agent = Identity::new("hyper-light", Actor::Agent { person: "sam".into(), agent: "matrix".into(), epoch: 3, held_by });
         let pem = pki.issue_identity(&csr, &agent, &[], Duration::hours(12))?;
         let der = pem_to_der(&pem)?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let v = chain::verify(&[&der], &pki.ca_der, &[], now).map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(v.to_string(), "agent matrix, epoch 3, for sam, of hyper-light");
+        assert_eq!(v.to_string(), "agent matrix, epoch 3, for sam, on runner fedora-2 (instance 01a174ed), of hyper-light");
         assert!(v.not_after - v.not_before <= 12 * 3600 + 300);
         assert!(cert_matches_key(&pem, &key_pem), "certified for the CSR's key, made by the requester");
         let f = fingerprints(&pem)?;

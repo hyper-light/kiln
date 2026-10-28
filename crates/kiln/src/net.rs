@@ -191,6 +191,9 @@ pub enum Out {
     /// A test build's seed (`crate::runner::chaos`, `seed=`): the faults said after it pick other
     /// frames than they would without it (each seed its own, the same each run).
     Seed(u64),
+    /// A test build's copy (`crate::runner::chaos`, `copy=`): every frame sent from now on is
+    /// appended to this file as it's handed below the channel, before any fault (W27-R02).
+    Copy(std::path::PathBuf),
 }
 
 /// About one frame in `every` of `lane` (of those whose first byte, a message's variant, is
@@ -438,6 +441,8 @@ struct Outbox {
     seed: u64,
     /// A frame each lane holds back to send late (`Act::Late`), and since when.
     late: HashMap<(PeerId, u32), (Kind, Vec<u8>, Instant)>,
+    /// A test build's copy of every frame handed to it (`Out::Copy`).
+    copy: Option<std::fs::File>,
 }
 
 /// What became of a frame handed to the outbox.
@@ -451,6 +456,13 @@ enum Push {
 
 impl Outbox {
     fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+        if let Some(f) = &mut self.copy {
+            use std::io::Write as _;
+            let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if let Err(e) = f.write_all(&lane.to_le_bytes()).and_then(|()| f.write_all(&len.to_le_bytes())).and_then(|()| f.write_all(&data)) {
+                tracing::warn!(error = %e, "chaos: can't copy a frame");
+            }
+        }
         let (mut twice, mut late) = (false, false);
         for (rule, draw) in &mut self.faults {
             if rule.lane != lane || !rule.variant.is_none_or(|v| data.first() == Some(&v)) {
@@ -690,6 +702,15 @@ async fn run_loop(
                             outbox.faults.push((rule, seed));
                         }
                         Out::Seed(seed) => outbox.seed = seed,
+                        Out::Copy(path) => {
+                            tracing::warn!(path = %path.display(), "chaos: every frame sent is copied");
+                            outbox.copy = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&path)
+                                .map_err(|e| tracing::warn!(error = %e, path = %path.display(), "chaos: can't copy frames"))
+                                .ok();
+                        }
                         Out::Disconnect { peer } => {
                             outbox.forget(peer, "closed");
                             with_driver!(&mut driver, d => {

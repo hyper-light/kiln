@@ -122,11 +122,20 @@ fn field<'a>(v: &'a Value, k: &str) -> &'a str {
 /// A second runner process of machine `name`, beside its first (a blue/green upgrade's), on the
 /// same state.
 fn instance(dir: &Path, port: u16, name: &str, id: &str) -> anyhow::Result<(agents::Runner, std::path::PathBuf)> {
+    instance_with(dir, port, name, id, None)
+}
+
+/// [`instance`], with `chaos` its faults (a `kiln agent --chaos` spec; a build with the `chaos` feature).
+fn instance_with(dir: &Path, port: u16, name: &str, id: &str, chaos: Option<&str>) -> anyhow::Result<(agents::Runner, std::path::PathBuf)> {
     let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
     let log_path = dir.join(format!("{name}-{id}.log"));
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
-    let child = common::kiln()
-        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--instance", id])
+    let mut cmd = common::kiln();
+    cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--instance", id]);
+    if let Some(c) = chaos {
+        cmd.args(["--chaos", c]);
+    }
+    let child = cmd
         .arg("--work-dir")
         .arg(dir.join(format!("{name}-{id}-work")))
         .arg("--state-dir")
@@ -205,11 +214,12 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
 }
 
 /// W27-R01, R02: an agent session has a key per epoch, made by the runner process holding it and
-/// kept there; each epoch's certificate names the agent, the person it acts for and the epoch; a
-/// hand-over to a newer process raises the epoch, and what the old epoch signs from then is
-/// refused. No session key is written anywhere, in the runners' state or the server's.
+/// kept there; each epoch's certificate names the agent, the person it acts for, the epoch and the
+/// runner process holding it; a hand-over to a newer process raises the epoch, and what the old
+/// epoch signs from then is refused, naming both epochs. Started, then moved twice: exactly three
+/// epochs certified. No session key is written anywhere, in the runners' state or the server's.
 #[test]
-fn w27_r01_an_agent_session_a_key_per_epoch() -> anyhow::Result<()> {
+fn w27_r01_agent_epochs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options::default())?;
     let (_main, log) = agents::runner(dir.path(), s.port, "box-a", None, TALK)?;
@@ -217,18 +227,16 @@ fn w27_r01_an_agent_session_a_key_per_epoch() -> anyhow::Result<()> {
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(s.port, &s.admin, "box-a", &cwd, Duration::from_secs(60))?;
-    let agent_of = |l: &[Value], epoch: u64| l.iter().find(|i| field(i, "subject").ends_with(&format!("/agent/{id}/epoch/{epoch}"))).cloned();
-    let first = until_identities(&s, "agent", Duration::from_secs(60), |l| l.iter().any(|i| field(i, "subject").contains(&format!("/agent/{id}/epoch/")) && !field(i, "verified").is_empty()))?;
-    let e0 = first
-        .iter()
-        .filter_map(|i| field(i, "subject").rsplit_once("/epoch/").and_then(|(_, e)| e.parse::<u64>().ok()))
-        .min()
-        .ok_or_else(|| anyhow::anyhow!("no epoch: {first:?}"))?;
+    // An epoch's subject: `…/agent/<id>/epoch/<n>`, then the runner process holding it.
+    let epoch_of = |subject: &str| subject.split_once(&format!("/agent/{id}/epoch/")).and_then(|(_, rest)| rest.split('/').next()).and_then(|e| e.parse::<u64>().ok());
+    let agent_of = |l: &[Value], epoch: u64| l.iter().find(|i| epoch_of(field(i, "subject")) == Some(epoch)).cloned();
+    let first = until_identities(&s, "agent", Duration::from_secs(60), |l| l.iter().any(|i| epoch_of(field(i, "subject")).is_some() && !field(i, "verified").is_empty()))?;
+    let e0 = first.iter().filter_map(|i| epoch_of(field(i, "subject"))).min().ok_or_else(|| anyhow::anyhow!("no epoch: {first:?}"))?;
     let v0 = agent_of(&first, e0).unwrap_or_default();
-    assert_eq!(field(&v0, "verified"), format!("agent {id}, epoch {e0}, for admin, of hyper-light"), "{v0}");
+    assert_eq!(field(&v0, "verified"), format!("agent {id}, epoch {e0}, for admin, on runner box-a (instance main), of hyper-light"), "{v0}");
 
     // Two newer processes of the machine, one after the other: the session is handed to each, an
-    // epoch up each time; the epoch it left is refused from the hand-over on.
+    // epoch up each time; the epoch it left is refused from the hand-over on, saying both epochs.
     let mut keep = Vec::new();
     for (n, inst) in ["z1", "z2"].iter().enumerate() {
         keep.push(instance(dir.path(), s.port, "box-a", inst)?);
@@ -237,14 +245,21 @@ fn w27_r01_an_agent_session_a_key_per_epoch() -> anyhow::Result<()> {
             agent_of(l, want).is_some_and(|i| !field(&i, "verified").is_empty()) && agent_of(l, want - 1).is_some_and(|i| field(&i, "refused").contains("revoked"))
         })?;
         let now = agent_of(&list, want).unwrap_or_default();
-        assert_eq!(field(&now, "verified"), format!("agent {id}, epoch {want}, for admin, of hyper-light"));
+        assert_eq!(field(&now, "verified"), format!("agent {id}, epoch {want}, for admin, on runner box-a (instance {inst}), of hyper-light"));
         let left = agent_of(&list, want - 1).unwrap_or_default();
-        assert!(field(&left, "refused").contains(&format!("moved on to epoch {want}")), "{left}");
+        let said = format!("epoch {} left: moved on to epoch {want}, on runner box-a (instance {inst})", want - 1);
+        assert!(field(&left, "refused").contains(&said), "{left}");
         assert_ne!(field(&now, "key"), field(&left, "key"), "a new epoch, a new key");
     }
+    // Started, then moved twice: three epochs certified, no more, each naming the process that held it.
     let all = identities(&s, "agent")?;
-    let epochs: Vec<&Value> = all.iter().filter(|i| field(i, "subject").contains(&format!("/agent/{id}/epoch/"))).collect();
-    assert!(epochs.len() >= 3, "three epochs, each certified: {epochs:?}");
+    let mut held: Vec<(u64, String)> = all
+        .iter()
+        .filter_map(|i| epoch_of(field(i, "subject")).map(|e| (e, field(i, "subject").rsplit('/').next().unwrap_or_default().to_owned())))
+        .collect();
+    held.sort();
+    held.dedup();
+    assert_eq!(held, vec![(e0, "main".to_owned()), (e0 + 1, "z1".to_owned()), (e0 + 2, "z2".to_owned())], "{all:?}");
 
     // No session key on disk: not beside the certificates, not in the server's data or logs.
     for f in walk(dir.path())? {
@@ -255,6 +270,87 @@ fn w27_r01_an_agent_session_a_key_per_epoch() -> anyhow::Result<()> {
             assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE KEY"), "a private key in {name}");
         }
     }
+    Ok(())
+}
+
+/// W27-R02: an agent session's key never leaves the runner process that made it. Every frame each
+/// runner process sends is copied (a test build's `copy=`), and each key it makes (`keys=`); the
+/// session is started, then moved twice. Its three keys, as PEM, as the PEM's body and as DER, are
+/// in no frame, in nothing of the server's (its store, its logs) and nowhere in the runners' state.
+///
+/// `cargo test -p kiln --features chaos --test identities w27_r02_agent_key_stays`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r02_agent_key_stays() -> anyhow::Result<()> {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let spy = dir.path().join("spy");
+    std::fs::create_dir_all(&spy)?;
+    let chaos = |who: &str| format!("copy={},keys={}", spy.join(format!("{who}.frames")).display(), spy.join(format!("{who}.keys")).display());
+    let (_main, log) = agents::runner(dir.path(), s.port, "box-a", Some(&chaos("main")), TALK)?;
+    agents::connected(s.port, &s.admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(s.port, &s.admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let epoch_of = |subject: &str| subject.split_once(&format!("/agent/{id}/epoch/")).and_then(|(_, rest)| rest.split('/').next()).and_then(|e| e.parse::<u64>().ok());
+    let verified_at = |l: &[Value], epoch: u64| l.iter().any(|i| epoch_of(field(i, "subject")) == Some(epoch) && !field(i, "verified").is_empty());
+    let first = until_identities(&s, "agent", Duration::from_secs(60), |l| l.iter().any(|i| epoch_of(field(i, "subject")).is_some() && !field(i, "verified").is_empty()))?;
+    let e0 = first.iter().filter_map(|i| epoch_of(field(i, "subject"))).min().ok_or_else(|| anyhow::anyhow!("no epoch: {first:?}"))?;
+    let mut keep = Vec::new();
+    for (n, inst) in ["z1", "z2"].iter().enumerate() {
+        keep.push(instance_with(dir.path(), s.port, "box-a", inst, Some(&chaos(inst)))?);
+        let want = e0 + 1 + u64::try_from(n)?;
+        until_identities(&s, "agent", Duration::from_secs(120), |l| verified_at(l, want))?;
+    }
+
+    // The session's keys, as each process copied them out: one an epoch, made where it was held.
+    let mut keys = Vec::new();
+    for who in ["main", "z1", "z2"] {
+        let text = std::fs::read_to_string(spy.join(format!("{who}.keys"))).unwrap_or_default();
+        let mut lines = text.lines();
+        while let Some(slot) = lines.next() {
+            if !slot.starts_with(&format!("agent/{id}/")) {
+                continue;
+            }
+            let mut pem = String::new();
+            for l in lines.by_ref() {
+                pem.push_str(l);
+                pem.push('\n');
+                if l.starts_with("-----END") {
+                    break;
+                }
+            }
+            keys.push(pem);
+        }
+    }
+    assert_eq!(keys.len(), 3, "a key an epoch, three epochs: {}", keys.len());
+    // Each as PEM text, as the PEM's body on one line, and as the DER it encodes.
+    let mut needles: Vec<Vec<u8>> = Vec::new();
+    for pem in &keys {
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        needles.push(base64::engine::general_purpose::STANDARD.decode(&body)?);
+        needles.push(body.into_bytes());
+        needles.push(pem.as_bytes().to_vec());
+    }
+
+    // What crossed the network, every frame each process sent; then everything on disk but the copies.
+    let mut frames = Vec::new();
+    for who in ["main", "z1", "z2"] {
+        frames.extend(std::fs::read(spy.join(format!("{who}.frames")))?);
+    }
+    assert!(frames.len() > 1024, "the runners' frames were copied: {} bytes", frames.len());
+    let mut places: Vec<(String, Vec<u8>)> = vec![("the frames the runners sent".to_owned(), frames)];
+    for f in walk(dir.path())? {
+        if f.starts_with(&spy) {
+            continue;
+        }
+        places.push((f.to_string_lossy().into_owned(), std::fs::read(&f).unwrap_or_default()));
+    }
+    let holds = |hay: &[u8], needle: &[u8]| !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle);
+    let found: Vec<&str> = places.iter().filter(|(_, bytes)| needles.iter().any(|n| holds(bytes, n))).map(|(name, _)| name.as_str()).collect();
+    assert!(found.is_empty(), "a session's key outside the runner process that made it: {found:?}");
+    drop(keep);
     Ok(())
 }
 
@@ -501,7 +597,7 @@ fn w27_ac01_chains() -> anyhow::Result<()> {
         ("server", "kiln server of hyper-light"),
         ("cd", "CD, for the kiln server of hyper-light"),
         ("runner", ", enrolled by admin, of hyper-light"),
-        ("agent", ", for admin, of hyper-light"),
+        ("agent", ", for admin, on runner box-a (instance main), of hyper-light"),
         ("person", "admin of hyper-light"),
         ("leg", ", enrolled by admin, of hyper-light"),
     ];

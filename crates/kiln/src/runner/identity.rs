@@ -46,6 +46,8 @@ pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<S
             None => {
                 let k = crate::pki::new_key_pem()?;
                 held.keys.insert(slot.clone(), k.clone());
+                // A test build copies it out, to look for it where it must never be.
+                crate::runner::chaos::made_key(&slot, &k);
                 k
             }
         };

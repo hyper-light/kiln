@@ -8486,7 +8486,9 @@ reference state log, fencing, and kiln's own `pki.rs`, `docs/access.md`, W18, W1
 research `01a17947fdad71e5a4f15866e3541c41`.
 
 - *Identities.* A leaf names its actor in one URI subject alternative name whose path is whom it
-  acts for: `kiln://<org>/person/<name>`; `…/person/<name>/agent/<session>/epoch/<n>`;
+  acts for: `kiln://<org>/person/<name>`; `…/person/<name>/agent/<session>/epoch/<n>`, then
+  `/machine/<machine>/instance/<instance>`, the runner process its key is made and held in (where
+  the key is, not whom the agent acts for: certificates from before it was named have none);
   `…/person/<enrolled by>/machine/<machine>/instance/<instance>`; a leg, its runner's then
   `/run/<number>/attempt/<n>/leg/<key>`, its workflow, repository, commit and run in Fulcio's
   extensions (1.3.6.1.4.1.57264.1.9, .12, .13, .21); `kiln://<org>/server`; `…/server/cd`. The
@@ -8512,12 +8514,15 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   trusted root; it and kiln's client (over Fulcio's and Rekor's HTTP APIs, in front of it) pass the
   same suite.
 - *Tests.* `kiln-ci` `w27_r01_*` (each kind; expired, revoked, wrongly issued);
-  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys` and one per kind;
+  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys` and one per kind, an
+  agent's `w27_r01_agent_epochs` (started, then moved twice: three epochs, each named by the
+  process holding it, the one left refused saying both epochs) and, in a build with `chaos`,
+  `w27_r02_agent_key_stays` (every frame each runner process sent, and everything on disk: none
+  holds the session's keys, as PEM, PEM body or DER);
   `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's client passes
   the Sigstore suite).
-- *Not yet.* An agent's certificate doesn't name the runner instance holding it; kiln's Sigstore
-  client hasn't run the suite against a real Fulcio and Rekor; nothing signs with these identities
-  yet (commits, reviews, CI output, lands and deploys: R03 to R11).
+- *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; nothing
+  signs with these identities yet (commits, reviews, CI output, lands and deploys: R03 to R11).
 
 ## 4. API, events, CLI and MCP reference
 

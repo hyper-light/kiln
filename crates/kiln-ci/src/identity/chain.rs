@@ -74,11 +74,21 @@ pub enum Kind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Actor {
     Person { name: String },
-    Agent { person: String, agent: String, epoch: u64 },
+    /// An agent session at an epoch, acting for its person; `held_by`, the runner process its key
+    /// is made and kept in (W27-R01). Certificates from before it was named have none.
+    Agent { person: String, agent: String, epoch: u64, held_by: Option<Holder> },
     Runner { enrolled_by: String, machine: String, instance: String },
     Leg { enrolled_by: String, machine: String, instance: String, run: u64, attempt: u32, leg: String },
     Server,
     Cd,
+}
+
+/// The runner process an agent session's key is held by at an epoch: its machine and instance.
+/// Where the key is, not whom the agent acts for: it isn't in the chain ([`Identity::acts_for`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Holder {
+    pub machine: String,
+    pub instance: String,
 }
 
 /// Who a certificate says its holder is: an actor of an organization.
@@ -108,7 +118,13 @@ impl Identity {
     pub fn uri(&self) -> Result<String, Refusal> {
         let path = match &self.actor {
             Actor::Person { name } => vec!["person".into(), name.clone()],
-            Actor::Agent { person, agent, epoch } => vec!["person".into(), person.clone(), "agent".into(), agent.clone(), "epoch".into(), epoch.to_string()],
+            Actor::Agent { person, agent, epoch, held_by } => {
+                let mut path = vec!["person".into(), person.clone(), "agent".into(), agent.clone(), "epoch".into(), epoch.to_string()];
+                if let Some(h) = held_by {
+                    path.extend(["machine".into(), h.machine.clone(), "instance".into(), h.instance.clone()]);
+                }
+                path
+            }
             Actor::Runner { enrolled_by, machine, instance } => {
                 vec!["person".into(), enrolled_by.clone(), "machine".into(), machine.clone(), "instance".into(), instance.clone()]
             }
@@ -159,7 +175,13 @@ impl Identity {
         let s = |x: &&str| (*x).to_owned();
         let actor = match path {
             ["person", name] => Actor::Person { name: s(name) },
-            ["person", person, "agent", agent, "epoch", epoch] => Actor::Agent { person: s(person), agent: s(agent), epoch: number(epoch, "epoch")? },
+            ["person", person, "agent", agent, "epoch", epoch] => Actor::Agent { person: s(person), agent: s(agent), epoch: number(epoch, "epoch")?, held_by: None },
+            ["person", person, "agent", agent, "epoch", epoch, "machine", machine, "instance", instance] => Actor::Agent {
+                person: s(person),
+                agent: s(agent),
+                epoch: number(epoch, "epoch")?,
+                held_by: Some(Holder { machine: s(machine), instance: s(instance) }),
+            },
             ["person", by, "machine", machine, "instance", instance] => Actor::Runner { enrolled_by: s(by), machine: s(machine), instance: s(instance) },
             ["person", by, "machine", machine, "instance", instance, "run", run, "attempt", attempt, "leg", leg] => Actor::Leg {
                 enrolled_by: s(by),
@@ -203,7 +225,10 @@ impl fmt::Display for Identity {
         let org = &self.org;
         match &self.actor {
             Actor::Person { name } => write!(f, "{name} of {org}"),
-            Actor::Agent { person, agent, epoch } => write!(f, "agent {agent}, epoch {epoch}, for {person}, of {org}"),
+            Actor::Agent { person, agent, epoch, held_by: None } => write!(f, "agent {agent}, epoch {epoch}, for {person}, of {org}"),
+            Actor::Agent { person, agent, epoch, held_by: Some(h) } => {
+                write!(f, "agent {agent}, epoch {epoch}, for {person}, on runner {} (instance {}), of {org}", h.machine, h.instance)
+            }
             Actor::Runner { enrolled_by, machine, instance } => write!(f, "runner {machine} (instance {instance}), enrolled by {enrolled_by}, of {org}"),
             Actor::Leg { enrolled_by, machine, instance, run, attempt, leg } => {
                 write!(f, "leg {leg} of run {run} (attempt {attempt}), on runner {machine} (instance {instance}), enrolled by {enrolled_by}, of {org}")
@@ -602,12 +627,24 @@ mod tests {
     #[test]
     fn w27_r01_chain_agent_never_its_person() -> anyhow::Result<()> {
         let ca = ca("kiln CA")?;
-        let v = check(&ca, &leaf(&ca, "kiln://hyper-light/person/sam/agent/matrix/epoch/3")?)?;
-        assert_eq!(v.to_string(), "agent matrix, epoch 3, for sam, of hyper-light");
-        assert_eq!(v.identity.actor, Actor::Agent { person: "sam".into(), agent: "matrix".into(), epoch: 3 });
+        // As the runner process holding its key names it now (W27-R01): that process, by machine and
+        // instance, in the certificate; the chain stays the agent's person, then the organization.
+        let uri = "kiln://hyper-light/person/sam/agent/matrix/epoch/3/machine/fedora-2/instance/01a174ed";
+        let v = check(&ca, &leaf(&ca, uri)?)?;
+        assert_eq!(v.to_string(), "agent matrix, epoch 3, for sam, on runner fedora-2 (instance 01a174ed), of hyper-light");
+        let held_by = Some(Holder { machine: "fedora-2".into(), instance: "01a174ed".into() });
+        assert_eq!(v.identity.actor, Actor::Agent { person: "sam".into(), agent: "matrix".into(), epoch: 3, held_by });
+        assert_eq!(v.identity.uri()?, uri, "one spelling each way");
         assert_eq!(v.acts_for(), vec![Identity::new("hyper-light", Actor::Person { name: "sam".into() })]);
         assert!(!v.identity.is_person("sam"), "an agent verifies as the agent, never as its person");
         assert_eq!(v.identity.kind(), Kind::Agent);
+        // A certificate from before the holder was named still verifies, as the agent for its person.
+        let old = check(&ca, &leaf(&ca, "kiln://hyper-light/person/sam/agent/matrix/epoch/3")?)?;
+        assert_eq!(old.to_string(), "agent matrix, epoch 3, for sam, of hyper-light");
+        assert_eq!(old.identity.actor, Actor::Agent { person: "sam".into(), agent: "matrix".into(), epoch: 3, held_by: None });
+        assert!(!old.identity.is_person("sam"));
+        // A holder half named is no identity.
+        assert!(Identity::parse("kiln://hyper-light/person/sam/agent/matrix/epoch/3/machine/fedora-2").is_err());
         Ok(())
     }
 

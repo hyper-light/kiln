@@ -1038,6 +1038,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         for rule in c.faults.iter().copied() {
             net.command(net::Out::Shed(rule)).await;
         }
+        // And what it sends, copied for a test to read (W27-R02).
+        if let Some(path) = &c.copy {
+            net.command(net::Out::Copy(path.clone())).await;
+        }
     }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
     let mut paths = if o.ephemeral {
