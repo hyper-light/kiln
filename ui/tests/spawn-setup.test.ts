@@ -99,3 +99,31 @@ test("where its commands can run: other runners and their platforms", () => {
     ["macos/aarch64", "b"],
   );
 });
+
+test("the machine decides the agents: those it runs, its models else another machine's list of them", async () => {
+  const { machinesWithAny, onMachine } = await import("../src/views/harness/spawn-setup.ts");
+  const sol = { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", default: true };
+  const byTarget = {
+    "agent:a": [claude(), codex({ models: [] })],
+    "agent:b": [codex({ models: [sol] })],
+    "agent:c": [claude({ available: false })],
+  };
+  assert.deepEqual(machinesWithAny(byTarget), ["agent:a", "agent:b"]);
+  // a has Codex but never listed its models: b's list stands in.
+  assert.deepEqual(onMachine(byTarget, "agent:a", "codex")?.models, [sol]);
+  assert.deepEqual(onMachine(byTarget, "agent:b", "codex")?.models, [sol]);
+  assert.equal(onMachine(byTarget, "agent:b", "claude"), undefined);
+});
+
+test("a machine in the slot, short: no domain, its host's name only when that's another", async () => {
+  const { shortMachineLabel } = await import("../src/views/harness/spawn-setup.ts");
+  const machines = [
+    { name: "kiln-a094a12d.attlocal.net", hostname: "fedora-2.attlocal.net" },
+    { name: "adas-mac-studio-3.local", hostname: "Adas-Mac-Studio-3.local" },
+    { name: "adacachy" },
+  ] as Parameters<typeof shortMachineLabel>[1];
+  assert.equal(shortMachineLabel("agent:kiln-a094a12d.attlocal.net", machines), "kiln-a094a12d (fedora-2)");
+  assert.equal(shortMachineLabel("agent:adas-mac-studio-3.local", machines), "adas-mac-studio-3");
+  assert.equal(shortMachineLabel("agent:adacachy", machines), "adacachy");
+  assert.equal(shortMachineLabel("local", machines), "kiln server");
+});

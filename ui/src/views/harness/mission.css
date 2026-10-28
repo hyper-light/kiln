@@ -1163,11 +1163,48 @@ html[data-motion="paused"] .ms-pick {
   background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2) 0 100% / 100% 1px no-repeat;
 }
 .mc-dot {
-  padding: 0 10px;
+  flex: none;
+  /* 10px each side: the part's own 10px gap is the right. */
+  padding-left: 10px;
   color: #5d6068;
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 16px;
+}
+/* The folder's dot, on its line's "In" (the folder line is InlinePath's own). */
+.mc-slot > .mc-where .ip-eyebrow::before {
+  padding: 0 10px;
+  color: #5d6068;
+  font-size: 12px;
+  letter-spacing: 0;
+  content: "·";
+}
+/* A long machine name gives way, whole in its tooltip and the machine panel. */
+.mc-slot .mc-part[data-part="machine"] {
+  min-width: 0;
+  max-width: 100%;
+}
+.mc-slot .mc-part[data-part="machine"] .ip-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mc-break {
+  display: none;
+}
+@container (max-width: 520px) {
+  .mc-break {
+    display: block;
+    flex-basis: 100%;
+    height: 0;
+  }
+  /* The second row starts on its part, not on a dot. */
+  .mc-break + .mc-part .mc-dot {
+    display: none;
+  }
+  .mc-break + .mc-where .ip-eyebrow::before {
+    content: none;
+  }
 }
 .mc-looking {
   color: #6d7078;

@@ -38,6 +38,25 @@ export function kindOf(all: KindInfo[], wanted: string): string {
   return installed.length > 0 && !installed.some((k) => k.id === wanted) ? (installed[0]?.id ?? wanted) : wanted;
 }
 
+/** The machines that run any harness, in the order they're listed. */
+export const machinesWithAny = (byTarget: Record<string, KindInfo[]>): string[] =>
+  Object.entries(byTarget)
+    .filter(([, ks]) => ks.some((x) => x.available))
+    .map(([t]) => t);
+
+/**
+ * The harness on a machine, with its models: the machine's own list, else (no session of it has
+ * listed them there yet) the list another machine has for it, so its models can be chosen before.
+ */
+export function onMachine(byTarget: Record<string, KindInfo[]>, target: string, kind: string): KindInfo | undefined {
+  const k = byTarget[target]?.find((x) => x.id === kind);
+  if (!k || (k.models?.length ?? 0) > 0) return k;
+  const elsewhere = Object.values(byTarget)
+    .map((ks) => ks.find((x) => x.id === kind)?.models ?? [])
+    .find((ms) => ms.length > 0);
+  return elsewhere ? { ...k, models: elsewhere } : k;
+}
+
 /** The machines that have harness `kind`. */
 export const machinesWith = (byTarget: Record<string, KindInfo[]>, kind: string): string[] =>
   Object.entries(byTarget)
@@ -48,6 +67,15 @@ export const machinesWith = (byTarget: Record<string, KindInfo[]>, kind: string)
 export const targetOf = (where: string[], wanted: (string | null | undefined)[]): string => wanted.find((t): t is string => Boolean(t) && where.includes(t ?? "")) ?? where[0] ?? "";
 
 /** A machine as people know it: the kiln server, or its name (with its hostname when that differs). */
+/** A machine as the composer's slot says it, short: its name without its domain, and its host's when that's another ("kiln-a094a12d (fedora-2)"). */
+export function shortMachineLabel(target: string, machines: Agent[]): string {
+  if (target === "local") return "kiln server";
+  const n = target.replace(/^agent:/, "");
+  const first = (s: string) => s.split(".")[0] || s;
+  const host = machines.find((x) => x.name === n)?.hostname;
+  return host && first(host).toLowerCase() !== first(n).toLowerCase() ? `${first(n)} (${first(host)})` : first(n);
+}
+
 export function machineLabel(target: string, machines: Agent[]): string {
   if (target === "local") return "kiln server";
   const n = target.replace(/^agent:/, "");

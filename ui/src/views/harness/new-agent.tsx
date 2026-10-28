@@ -31,9 +31,9 @@ import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
 import { usePrefill, type Prefill } from "./new-agent-draft";
 import { machineName } from "./parts";
-import { RunSettings, Scale, WordRow, type Word } from "./run-settings";
+import { ModelChoice, modelWords, RunSettings, Scale, WordRow, type Word } from "./run-settings";
 import { effortsFor, resumeEffort } from "./spawn-efforts";
-import { harnessesOf, kindOf, machineLabel, machinesWith, modeOf, modelOf, modesFor, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "./spawn-setup";
+import { harnessesOf, kindOf, machineLabel, machinesWithAny, shortMachineLabel, modeOf, modelOf, modesFor, onMachine, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "./spawn-setup";
 import { useHeld } from "./state";
 import { MicButton } from "./voice";
 
@@ -160,13 +160,17 @@ type Choices = ReturnType<typeof useChoices>;
 /** The choices, read against what the machines have: which agent, where, its folder, how it runs. */
 function resolve(c: Choices, m: Machines) {
   const all = harnessesOf(m.byTarget);
-  const kind = kindOf(all, c.seed?.kind ?? c.kind);
-  const where = machinesWith(m.byTarget, kind);
+  // The machine first; then the agents it runs (the others shown, not to be chosen there).
+  const where = machinesWithAny(m.byTarget);
   const target = targetOf(where, [c.picked, c.seed?.target, c.lastTarget]);
+  const here = m.byTarget[target] ?? [];
+  const kind = kindOf(here.length > 0 ? here : all, c.seed?.kind ?? c.kind);
+  // Every harness any machine has, those this machine doesn't run shown off.
+  const kinds = all.map((k) => ({ ...k, here: here.some((x) => x.id === k.id && x.available) }));
   const recent = c.dirs[target] ?? [];
   // The folder: typed or browsed to on this machine, else the one handed over, else the last one used here.
   const cwd = (c.folder?.target === target ? c.folder.cwd : undefined) ?? (c.seed?.target === target ? c.seed.cwd : undefined) ?? recent[0] ?? "~";
-  const info = m.byTarget[target]?.find((x) => x.id === kind) ?? all.find((x) => x.id === kind);
+  const info = onMachine(m.byTarget, target, kind) ?? all.find((x) => x.id === kind);
   const modes = modesFor(info);
   const mode = modeOf(modes, { unchecked: c.unchecked, remembered: c.seed?.mode ?? c.modeByKind[kind], fallback: info?.default_mode });
   const model = modelOf(info, c.seed?.model ?? c.modelByKind[kind] ?? "");
@@ -179,6 +183,7 @@ function resolve(c: Choices, m: Machines) {
   const others = (m.byTarget[target] ?? []).filter((x) => x.available && x.id !== kind && (x.models?.length ?? 0) > 0).map((x) => ({ kind: x.id, name: x.name, models: x.models ?? [] }));
   return {
     all,
+    kinds,
     kind,
     where,
     target,
@@ -197,7 +202,8 @@ function resolve(c: Choices, m: Machines) {
     others,
     shells: m.shells.filter((s) => s.target === target && !s.exited),
     kindName: info?.name ?? kind,
-    machine: target ? machineLabel(target, m.machines) : "",
+    machine: target ? shortMachineLabel(target, m.machines) : "",
+    machineFull: target ? machineLabel(target, m.machines) : "",
     noHarness: !all.some((k) => k.available),
     // Connected machines whose runner never reported its harnesses: too old to run agents.
     stale: m.machines.filter((x) => !(`agent:${x.name}` in m.byTarget)),
@@ -259,18 +265,18 @@ function HowLine({ c }: { c: Choices }) {
   );
 }
 
-const Dot = () => (
-  <span className="mc-dot" aria-hidden="true">
-    ·
-  </span>
-);
-
 /** In the box's top slot: the agent, its machine, its folder (or a shell), how many, each opened in place. */
 function Slot({ c }: { c: Choices }) {
   const s = useSetup(c);
   const toggle = (p: Exclude<Part, null>) => c.setOpen(c.open === p ? null : p);
-  const part = (p: Exclude<Part, null>, text: string, eyebrow?: string) => (
-    <button type="button" className="ip-line mc-part" aria-expanded={c.open === p} onClick={() => toggle(p)}>
+  // Each part after the first carries its dot, so a line never ends on one.
+  const part = (p: Exclude<Part, null>, text: string, eyebrow?: string, title?: string) => (
+    <button type="button" className="ip-line mc-part" data-part={p} aria-expanded={c.open === p} title={title} onClick={() => toggle(p)}>
+      {p !== "kind" && (
+        <span className="mc-dot" aria-hidden="true">
+          ·
+        </span>
+      )}
       {eyebrow && <span className="ip-eyebrow">{eyebrow}</span>}
       <span className="ip-path">
         <span className="ip-seg" data-last="">
@@ -280,15 +286,19 @@ function Slot({ c }: { c: Choices }) {
     </button>
   );
   const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
-  const kinds: Word[] = s.all.map((k) => ({ id: k.id, text: k.name, full: k.name, hint: k.available ? (k.verified ? undefined : "Untested") : "Not installed on any connected machine" }));
+  const models = modelWords(s.info?.models ?? [], s.model.shown, modelLabel);
+  const kinds: Word[] = s.kinds.map((k) => ({ id: k.id, text: k.name, full: k.name, off: !k.here, hint: k.here ? (k.verified ? undefined : "Untested") : `Not on ${s.machine}` }));
   return (
     <div className="mc-slot">
       {part("kind", s.kindName)}
-      <Dot />
-      {part("machine", s.machine || "no machine has it", "On")}
-      <Dot />
+      {part("machine", s.machine || "no machine runs agents", "On", s.machineFull)}
+      {/* On a phone: the agent and its machine, then where and how many. */}
+      <i className="mc-break" aria-hidden="true" />
       {c.shell ? (
         <button type="button" className="ip-line mc-part" title="It starts where the shell is: tap for a folder instead" onClick={() => c.setShell("")}>
+          <span className="mc-dot" aria-hidden="true">
+            ·
+          </span>
           <span className="ip-eyebrow">In shell</span>
           <span className="ip-path">
             <span className="ip-seg" data-last="">
@@ -299,7 +309,6 @@ function Slot({ c }: { c: Choices }) {
       ) : s.target ? (
         <InlinePath target={s.target} value={s.cwd} onChange={(v) => c.setFolder({ target: s.target, cwd: v })} recent={s.recent} label="In" className="mc-where" />
       ) : null}
-      <Dot />
       {part("count", `×${c.count}`)}
       {c.open === "kind" && (
         <div className="rs-panel mc-slot-panel" role="group" aria-label="Agent">
@@ -310,20 +319,35 @@ function Slot({ c }: { c: Choices }) {
             onPick={(w) => {
               c.setKind(w.id);
               c.drop("kind");
-              c.setOpen(null);
             }}
           />
-          <p className="rs-now">
-            <span className="rs-now-name">{s.kindName}</span>
-            <span className="rs-now-hint">{s.where.length > 0 ? `On ${s.where.map((t) => machineLabel(t, s.machines)).join(", ")}` : "Not on any connected machine"}</span>
-          </p>
+          {s.kinds.some((k) => !k.here) && <p className="rs-desc">Greyed out: not on {s.machine}</p>}
+          {/* Its models, as the agent page's model select shows them: choosing one picks it and folds this away. */}
+          {models.length > 0 ? (
+            <div className="rs-elsewhere" role="group" aria-label={`${s.kindName} models`}>
+              <p className="rs-elsewhere-name">{s.kindName}</p>
+              <ModelChoice
+                words={models}
+                value={s.model.shown}
+                onPick={(w) => {
+                  c.setModelByKind({ ...c.modelByKind, [s.kind]: w.id });
+                  c.drop("model");
+                  c.setOpen(null);
+                }}
+              />
+            </div>
+          ) : (
+            <p className="rs-desc">
+              It starts on {s.kindName}'s own default model: its models show here once it has run on {s.machine}.
+            </p>
+          )}
         </div>
       )}
       {c.open === "machine" && (
         <div className="rs-panel mc-slot-panel" role="group" aria-label="Machine">
           <WordRow
             label="Machine"
-            words={s.where.map((t) => ({ id: t, text: machineLabel(t, s.machines), full: machineLabel(t, s.machines) }))}
+            words={s.where.map((t) => ({ id: t, text: shortMachineLabel(t, s.machines), full: machineLabel(t, s.machines) }))}
             value={s.target}
             onPick={(w) => {
               c.setPicked(w.id);
@@ -395,13 +419,7 @@ function Options({ c, s }: { c: Choices; s: Setup }) {
       <div className="mc-opt">
         <span className="mc-opt-key">Name</span>
         <div className="mc-opt-val">
-          <input
-            className="mc-inline-input"
-            value={c.name}
-            onChange={(e) => c.setName(e.target.value)}
-            placeholder={c.count > 1 ? "fix-tests (numbered)" : "It names itself from its work"}
-            aria-label="Name"
-          />
+          <input className="mc-inline-input" value={c.name} onChange={(e) => c.setName(e.target.value)} placeholder={c.count > 1 ? "fix-tests (numbered)" : "Optional"} aria-label="Name" />
         </div>
       </div>
       <div className="mc-opt">

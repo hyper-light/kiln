@@ -40,6 +40,8 @@ export interface Word {
   dangerous?: boolean;
   /** A model of another harness than the agent's (its id): choosing it switches there. */
   kind?: string;
+  /** Shown but not to be chosen here (its `hint` says why). */
+  off?: boolean;
 }
 
 const KEY: Record<Kind, string> = { mode: "Permissions", model: "Model", effort: "Effort" };
@@ -110,7 +112,7 @@ function modelWord(m: { id: string; label?: string; description?: string }, pret
   return { id: m.id, text: p !== m.id ? p : m.label || m.id, full: m.label || p, hint: m.description?.trim() || undefined };
 }
 
-function modelWords(models: ModelOption[], current: string, pretty: (id: string) => string): Word[] {
+export function modelWords(models: ModelOption[], current: string, pretty: (id: string) => string): Word[] {
   const list = models.map((m) => modelWord(m, pretty));
   // The agent's own model, when the harness doesn't list it, goes last: the families keep the harness's order. Another
   // harness's (a switch waiting) reads as its model, or "Default".
@@ -225,7 +227,7 @@ export function WordRow({ label, words, value, onPick }: { label: string; words:
   const stop = [focus, value, words[0]?.id].find((id) => id != null && words.some((w) => w.id === id));
 
   const rove = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const radios = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'));
+    const radios = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]:not(:disabled)'));
     const i = radios.findIndex((r) => r === document.activeElement);
     const n = radios.length;
     if (i < 0 || n === 0) return;
@@ -256,6 +258,7 @@ export function WordRow({ label, words, value, onPick }: { label: string; words:
             title={w.hint ? `${w.full}: ${w.hint}` : w.full}
             tabIndex={w.id === stop ? 0 : -1}
             className="rs-word"
+            disabled={w.off}
             onFocus={() => setFocus(w.id)}
             onClick={() => onPick(w)}
           >
@@ -364,13 +367,23 @@ export function Scale({ label, words, value, armed, onPick }: { label: string; w
 /* ------------------------------------------------------------------ the model */
 
 /** The model as its family, with the family's versions one tap further. */
-function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; onPick: (w: Word) => void }) {
+export function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; onPick: (w: Word) => void }) {
   const [versions, setVersions] = React.useState(false);
   const fams = families(words);
   const chosen = words.find((w) => w.id === value);
-  // Few models, or none sharing a family: just the models.
+  // Few models, or none sharing a family: just the models, the chosen one said under them.
   if (fams.length === words.length || words.length <= 4) {
-    return <WordRow label="Model" words={words} value={value} onPick={onPick} />;
+    return (
+      <div className="rs-model">
+        <WordRow label="Model" words={words} value={value} onPick={onPick} />
+        {chosen && (
+          <p className="rs-now">
+            <span className="rs-now-name">{chosen.text}</span>
+            {chosen.hint && <span className="rs-now-hint">{chosen.hint}</span>}
+          </p>
+        )}
+      </div>
+    );
   }
   const current = fams.find((f) => f.versions.some((v) => v.id === value));
   const famWords: Word[] = fams.map((f) => ({ id: `family:${f.name}`, text: f.name, full: f.name, hint: f.pick.hint }));
@@ -389,15 +402,18 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
           }
         }}
       />
-      <p className="rs-now">
-        <span className="rs-now-name">{chosen?.text ?? value}</span>
-        {chosen?.hint && <span className="rs-now-hint">{chosen.hint}</span>}
-        {own.length > 1 && (
-          <button type="button" className="rs-more" aria-expanded={versions} onClick={() => setVersions((v) => !v)}>
-            {versions ? "fewer" : `${own.length - 1} other version${own.length === 2 ? "" : "s"}`}
-          </button>
-        )}
-      </p>
+      {/* Only where the chosen model is: another harness's models don't name it. */}
+      {chosen && (
+        <p className="rs-now">
+          <span className="rs-now-name">{chosen.text}</span>
+          {chosen.hint && <span className="rs-now-hint">{chosen.hint}</span>}
+          {own.length > 1 && (
+            <button type="button" className="rs-more" aria-expanded={versions} onClick={() => setVersions((v) => !v)}>
+              {versions ? "fewer" : `${own.length - 1} other version${own.length === 2 ? "" : "s"}`}
+            </button>
+          )}
+        </p>
+      )}
       {versions && current && own.length > 1 && <WordRow label={`${current.name} versions`} words={own.map((v) => ({ ...v, text: versionText(v, current.name) }))} value={value} onPick={onPick} />}
     </div>
   );

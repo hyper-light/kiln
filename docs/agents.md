@@ -219,7 +219,10 @@ server says, and counts every session it has, ended ones included, until it's up
   permissions · model · effort, and the bolt where the model goes faster (the speeds each model
   runs at come with the machine's models, `KindInfo.models[].speeds`), each opened in place with
   the same controls; choosing another harness's model starts it in that harness. In the box's top
-  slot: the agent, its machine, its folder and how many, each opened in place. Under the box, More
+  slot: the agent, its machine (short: "kiln-a094a12d (fedora-2)"), its folder and how many, each
+  opened in place, in two rows on a phone. The agent opens to the harnesses that machine runs (the
+  others greyed out, saying so) and, under them, the one picked's models as the agent page shows
+  its own: a machine that hasn't listed a harness's models yet takes another machine's list. Under the box, More
   options (name, workspace, where its commands run, a shell to run in; closed, it says what isn't
   as it starts out) and the machine's past sessions to continue, each a dropdown that opens in
   place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
