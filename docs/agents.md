@@ -201,17 +201,23 @@ server says, and counts every session it has, ended ones included, until it's up
   agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
   it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
-  many, with Select all and Done. With a mouse, rows keep their checkboxes.
-- **What to do with those selected.** The list's head offers each of one agent's own actions that
-  some of the selected take, saying how many: **Resume** (those paused at a usage limit, and those
-  whose goals are paused part-way), **Pause** (their goals running), **Stop** (their turns under
-  way), **Restart** and **Remove** (those stopped or ended), **Move to…** and **End…**. Moving
-  and ending are asked in a line under the buttons: Move offers each machine that takes some of
-  them (how many, when not all, and why the rest stay), once their turns are over or now; End
-  says what goes with them and ends the agents they started that still run too, unless unticked.
-  **More** holds where their commands run, keeping them going, and muting their notifications.
-  Each goes to every agent it's for at once; a line says how it went (done, skipped, failed) and
-  opens to each agent's outcome and why. Those all ended leave the selection.
+  many, with Select all and Done. A ring slides in beside each name as selecting starts, and the
+  row under the finger stays under it, whatever the selection changes above it (the page scrolls
+  by as much). With a mouse, rows keep their checkboxes.
+- **What to do with those selected.** The list's head has the same buttons, in the same places,
+  from the moment selecting starts until it ends (by touch, from Select or a row held, before any is
+  picked): **Resume** (those paused at a usage limit, and those whose goals are paused part-way),
+  **Pause** (their goals running), **Move to…**, **End…** and **More**, which holds **Stop their
+  turns**, **Restart** and **Remove** (those stopped or ended), where their commands run, keeping
+  them going, and muting their notifications. A button none of those selected take is turned off,
+  not taken away, and none counts them (the head says how many are selected, each button's title
+  how many it's for), so picking more moves nothing. Moving and ending are asked in a line under
+  the buttons, which stays as others are picked, said for them: Move offers each machine that takes
+  some of them (how many, when not all, and why the rest stay), once their turns are over or now;
+  End says what goes with them and ends the agents they started that still run too, unless
+  unticked. Each goes to every agent it's for at once; a line says how it went (done, skipped,
+  failed), opens to each agent's outcome and why, and stays until it's put away or the next one
+  goes. Those all ended leave the selection.
 - **The composer.** At the top of the page, on a desktop and a phone alike, whole and the agent
   page's composer's size from the start, Queue · Steer · Now in its bar in both of its turns (when
   starting an agent they're shown but not in play: its first message goes at once). There is no New agents button and no dialog: with nothing selected it starts an
@@ -231,7 +237,9 @@ server says, and counts every session it has, ended ones included, until it's up
   composer in and says where it came from, with Clear for your own defaults.
 - **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
   or harness), the same composer writes to them, each named in the To line where the folder was,
-  put back with its ×, Clear for them all; what's written stays as it turns. A prompt goes with
+  in the order they were picked (each new one at the end), put back with its ×, Clear for them
+  all; what's written stays as it turns, and it keeps the height it had starting an agent, so the
+  list under it doesn't move as the first is picked or the last put back. A prompt goes with
   files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
   now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
   chosen (the speed too), only the agents that have it are sent to, and given it first (Reset

@@ -1,10 +1,13 @@
 /**
  * What can be done to the agents selected in Mission control, all of them at once: one agent's own
- * actions (its row's Resume and Restart, the goals panel's Pause, its menu) that some of them take,
- * each saying how many. Where they move and ending them are asked in a line under the buttons; More
- * holds where their commands run, keeping them going and their notifications. How it went is said
- * there too, and opens to each agent's outcome. It all sits in the list's head, in the page: nothing
- * pops up (and a touch screen keeps the head in view while agents are selected).
+ * actions (its row's Resume and Restart, the goals panel's Pause, its menu). The buttons are the
+ * same ones, in the same places, from the moment selecting starts until it ends: one that none of
+ * those selected take is there, turned off, and no button counts them (the head says how many are
+ * selected, each button's title how many it's for), so picking more moves nothing. Where they move
+ * and ending them are asked in a line under the buttons; More holds stopping their turns, restarting
+ * and removing those ended, where their commands run, keeping them going and their notifications.
+ * How it went is said there too, and opens to each agent's outcome. It all sits in the list's head,
+ * in the page: nothing pops up (and a touch screen keeps the head in view while agents are selected).
  */
 import * as React from "react";
 import { ChevronDown, ChevronRight, X } from "lucide-react";
@@ -28,8 +31,6 @@ interface Result {
   line: string;
   outcomes: Outcome[];
 }
-/** The last action's result, and the agents it was for. */
-type Said = Result & { ids: ReadonlySet<string> };
 /** Does an action, saying what it's at meanwhile (`doing`), then how it went. */
 type Run = (doing: string, go: () => Promise<Result>) => void;
 
@@ -64,39 +65,46 @@ function Stacked({ ids, children }: { ids: string; children: (stacks: Stacks) =>
   return children(useSuspenseResource(`harness/selected-goals/${ids}`, () => readStacks(ids.split(",")), { pollMs: 5000 }).data);
 }
 
-export function BulkBar({ agents, all, onGone }: { agents: AgentInfo[]; all: AgentInfo[]; onGone: () => void }) {
+/**
+ * `open`: agents are being selected (by touch, from Select or a row held, even before the first is
+ * picked): the buttons are there, so the first one picked moves nothing.
+ */
+export function BulkBar({ agents, all, open, onGone }: { agents: AgentInfo[]; all: AgentInfo[]; open: boolean; onGone: () => void }) {
   const [ask, setAsk] = React.useState<"move" | "end" | null>(null);
   const [more, setMore] = React.useState(false);
   const [busy, setBusy] = React.useState<string | null>(null);
-  const [said, setSaid] = React.useState<Said | null>(null);
-  const [open, setOpen] = React.useState(false);
+  const [said, setSaid] = React.useState<Result | null>(null);
+  const [outcomes, setOutcomes] = React.useState(false);
   const [keepSet, setKeepSet] = React.useState<{ key: string; on: boolean } | null>(null);
   // Goals resumed or paused again after a try that didn't come back: under the same keys (CP-T3.2).
   const [tries] = React.useState(() => new Tries(clientId));
-  const key = agents.map((a) => a.id).join(",");
+  // Whatever order they were picked in: the same agents read their goal stacks under the same key.
+  const key = agents
+    .map((a) => a.id)
+    .sort()
+    .join(",");
   // Their goal stacks are read for the agents picked a moment ago, so picking more doesn't blink.
   const stacksOf = React.useDeferredValue(key);
-  // Other agents picked: what was being asked was for the ones before, and how the last action went
-  // stays only while no agent it wasn't for is picked.
-  const [askedOf, setAskedOf] = React.useState(key);
-  if (askedOf !== key) {
-    setAskedOf(key);
-    setAsk(null);
-    if (said && agents.some((a) => !said.ids.has(a.id))) setSaid(null);
-  }
   const n = agents.length;
   const acts = actsOf(agents);
   const disabled = busy !== null;
+  /** Who a button is for, in its title: "it", "all 3", "2 of the 3". */
+  const them = (k: number) => (k === n ? (n === 1 ? "it" : `all ${n}`) : `${k} of the ${n}`);
+  // An ask stays open as others are picked, said for them; once none of them takes it, it's put away
+  // (and doesn't come back by itself). Selecting over, or none picked any more, More goes too. How the
+  // last action went stays, picking others or not, until it's put away or another one goes.
+  const asking = ask === "move" && acts.movable.length > 0 ? "move" : ask === "end" && acts.live.length > 0 ? "end" : null;
+  if (ask !== asking) setAsk(asking);
+  if (more && (!open || n === 0)) setMore(false);
 
   const run: Run = (doing, go) => {
-    const ids = new Set(agents.map((a) => a.id));
     setBusy(doing);
     setAsk(null);
-    setOpen(false);
+    setOutcomes(false);
     void go()
       .then(
-        (r) => setSaid({ ...r, ids }),
-        (e: unknown) => setSaid({ line: errorMessage(e), outcomes: [], ids }),
+        (r) => setSaid(r),
+        (e: unknown) => setSaid({ line: errorMessage(e), outcomes: [] }),
       )
       .finally(() => setBusy(null));
   };
@@ -179,93 +187,128 @@ export function BulkBar({ agents, all, onGone }: { agents: AgentInfo[]; all: Age
     );
   };
 
-  /** Resume and Pause: what they take turns on the goal stacks, read once the agents are picked. */
-  const paused = (stacks?: Stacks) => {
+  /**
+   * Resume and Pause: what they take turns on the goal stacks, read once the agents are picked. Both
+   * are always there, so the stacks coming in only turns one on.
+   */
+  const goalButtons = (stacks?: Stacks) => {
     const of = actsOf(agents, stacks);
     const resumes = resumable(of);
     return (
       <>
-        {resumes.length > 0 && (
-          <Button size="xs" variant="secondary" disabled={disabled} onClick={() => resume(stacks)} title="Resume those paused at a usage limit, and the goals of those whose goals are paused">
-            Resume {resumes.length}
-          </Button>
-        )}
-        {of.goalsRunning.length > 0 && (
-          <Button
-            size="xs"
-            variant="secondary"
-            disabled={disabled}
-            onClick={() => pause(stacks)}
-            title="Pause their goals: they aren't held to the goal under way, and no next one starts, until you resume them"
-          >
-            Pause {of.goalsRunning.length}
-          </Button>
-        )}
+        <Button
+          size="xs"
+          variant="secondary"
+          disabled={disabled || resumes.length === 0}
+          onClick={() => resume(stacks)}
+          title={n === 0 ? undefined : resumes.length > 0 ? `Resume ${them(resumes.length)}: those paused at a usage limit, and the goals of those whose goals are paused` : "None of them is paused"}
+        >
+          Resume
+        </Button>
+        <Button
+          size="xs"
+          variant="secondary"
+          disabled={disabled || of.goalsRunning.length === 0}
+          onClick={() => pause(stacks)}
+          title={
+            n === 0
+              ? undefined
+              : of.goalsRunning.length > 0
+                ? `Pause the goals of ${them(of.goalsRunning.length)}: they aren't held to the goal under way, and no next one starts, until you resume them`
+                : "None of them has goals running"
+          }
+        >
+          Pause
+        </Button>
       </>
     );
   };
 
   return (
     <>
-      {n > 0 && (
-        <div className="ms-bulk" role="group" aria-label={`What to do with the ${count(n, "selected agent")}`}>
+      {open && (
+        <div className="ms-bulk" role="group" aria-label={n > 0 ? `What to do with the ${count(n, "selected agent")}` : "What to do with the agents you select"}>
           {stacksOf ? (
-            <React.Suspense fallback={paused()}>
-              <Stacked ids={stacksOf}>{paused}</Stacked>
+            <React.Suspense fallback={goalButtons()}>
+              <Stacked ids={stacksOf}>{goalButtons}</Stacked>
             </React.Suspense>
           ) : (
-            paused()
+            goalButtons()
           )}
-          {acts.working.length > 0 && (
-            <Button size="xs" variant="secondary" disabled={disabled} onClick={stop} title="Stop the turns under way">
-              Stop {acts.working.length}
-            </Button>
-          )}
-          {acts.exited.length > 0 && (
-            <Button size="xs" variant="secondary" disabled={disabled} onClick={restart} title="Start the stopped and ended ones again">
-              Restart {acts.exited.length}
-            </Button>
-          )}
-          {acts.movable.length > 0 && (
-            <Button size="xs" variant="secondary" disabled={disabled} aria-expanded={ask === "move"} onClick={() => setAsk(ask === "move" ? null : "move")}>
-              Move {acts.movable.length} to…
-            </Button>
-          )}
-          {acts.live.length > 0 && (
-            <Button size="xs" variant="danger" disabled={disabled} aria-expanded={ask === "end"} onClick={() => setAsk(ask === "end" ? null : "end")}>
-              End {acts.live.length}…
-            </Button>
-          )}
-          {acts.exited.length > 0 && (
-            <Button size="xs" variant="ghost-danger" disabled={disabled} onClick={remove} title="Take the stopped and ended ones off the board">
-              Remove {acts.exited.length}
-            </Button>
-          )}
-          <button type="button" className="ms-link ms-bulk-more" aria-expanded={more} onClick={() => setMore(!more)}>
+          <Button
+            size="xs"
+            variant="secondary"
+            disabled={disabled || acts.movable.length === 0}
+            aria-expanded={asking === "move"}
+            onClick={() => setAsk(asking === "move" ? null : "move")}
+            title={
+              n === 0
+                ? undefined
+                : acts.movable.length > 0
+                  ? `Move ${them(acts.movable.length)} to another machine`
+                  : "None of them can move: the kiln server's agents stay there, and ended ones go nowhere"
+            }
+          >
+            Move to…
+          </Button>
+          <Button
+            size="xs"
+            variant="danger"
+            disabled={disabled || acts.live.length === 0}
+            aria-expanded={asking === "end"}
+            onClick={() => setAsk(asking === "end" ? null : "end")}
+            title={n === 0 ? undefined : acts.live.length > 0 ? `End ${them(acts.live.length)}` : "They've all ended"}
+          >
+            End…
+          </Button>
+          <button type="button" className="ms-link ms-bulk-more" aria-expanded={more} disabled={n === 0} onClick={() => setMore(!more)}>
             <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
             More
           </button>
         </div>
       )}
-      {n > 0 && ask === "move" && (
+      {asking === "move" && (
         <div className="ms-bulk-ask" role="group" aria-label="Move the selected agents">
           <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
             <MoveAsk agents={acts.movable} disabled={disabled} onMove={move} onCancel={() => setAsk(null)} />
           </Loadable>
         </div>
       )}
-      {n > 0 && ask === "end" && (
+      {asking === "end" && (
         <div className="ms-bulk-ask" role="group" aria-label="End the selected agents">
           <EndAsk agents={acts.live} all={all} disabled={disabled} onEnd={end} onCancel={() => setAsk(null)} />
         </div>
       )}
-      {n > 0 && more && (
+      {/* Each always there, turned off where none of them takes it, the one that can change last. */}
+      {open && more && n > 0 && (
         <div className="ms-bulk-row" role="group" aria-label="More for the selected agents">
-          {acts.onRunner.length > 0 && (
-            <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
-              <ReachPick agents={acts.onRunner} disabled={disabled} onChange={reach} />
-            </Loadable>
-          )}
+          <Button
+            size="xs"
+            variant="secondary"
+            disabled={disabled || acts.working.length === 0}
+            onClick={stop}
+            title={acts.working.length > 0 ? `Stop the turns of ${them(acts.working.length)}` : "None of them is working"}
+          >
+            Stop their turns
+          </Button>
+          <Button
+            size="xs"
+            variant="secondary"
+            disabled={disabled || acts.exited.length === 0}
+            onClick={restart}
+            title={acts.exited.length > 0 ? `Start ${them(acts.exited.length)} again` : "None of them has stopped or ended"}
+          >
+            Restart
+          </Button>
+          <Button
+            size="xs"
+            variant="ghost-danger"
+            disabled={disabled || acts.exited.length === 0}
+            onClick={remove}
+            title={acts.exited.length > 0 ? `Take ${them(acts.exited.length)} off the board` : "None of them has stopped or ended"}
+          >
+            Remove
+          </Button>
           <label className="ms-bulk-check">
             <input
               type="checkbox"
@@ -277,11 +320,14 @@ export function BulkBar({ agents, all, onGone }: { agents: AgentInfo[]; all: Age
               disabled={disabled}
               onChange={(e) => keep(e.target.checked)}
             />
-            Keep {n === 1 ? "it going when it stops" : "them going when they stop"} part-way
+            Keep each going when it stops part-way
           </label>
           <React.Suspense fallback={null}>
             <Mute agents={agents} disabled={disabled} run={run} />
           </React.Suspense>
+          <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
+            <ReachPick agents={acts.onRunner} disabled={disabled} onChange={reach} />
+          </Loadable>
         </div>
       )}
       {/* One line, at it and then how it went, so what it says is read out as it changes. */}
@@ -293,8 +339,8 @@ export function BulkBar({ agents, all, onGone }: { agents: AgentInfo[]; all: Age
             said && (
               <>
                 {said.outcomes.length > 0 ? (
-                  <button type="button" className="ms-msg-result" aria-expanded={open} onClick={() => setOpen(!open)}>
-                    <ChevronRight size={12} className={cn("ms-chev", open && "rotate-90")} aria-hidden="true" />
+                  <button type="button" className="ms-msg-result" aria-expanded={outcomes} onClick={() => setOutcomes(!outcomes)}>
+                    <ChevronRight size={12} className={cn("ms-chev", outcomes && "rotate-90")} aria-hidden="true" />
                     {said.line}
                   </button>
                 ) : (
@@ -308,7 +354,7 @@ export function BulkBar({ agents, all, onGone }: { agents: AgentInfo[]; all: Age
           )}
         </div>
       )}
-      {!busy && said && open && (
+      {!busy && said && outcomes && (
         <ul className="ms-msg-outcomes ms-bulk-outcomes">
           {said.outcomes.map((o) => (
             <li key={o.id} data-result={o.result}>
@@ -451,27 +497,29 @@ function ReachPick({ agents, disabled, onChange }: { agents: AgentInfo[]; disabl
   // A runner without a reach identity runs a kiln from before commands could run elsewhere.
   const older = agents.filter((a) => runners.some((r) => `agent:${r.name}` === a.target && !r.fingerprint));
   const can = agents.filter((a) => !older.includes(a));
-  if (can.length === 0)
+  if (agents.length > 0 && can.length === 0)
     return <span className="ms-bulk-note">{agents.length === 1 ? "Its runner runs" : "Their runners run"} an older kiln, without commands on other runners: upgrade it in System → Updates.</span>;
-  const one = can.length === 1;
+  // One wording for one of them or many, so the line keeps its width as they're picked.
   const had = [...new Set(can.map((a) => a.reach ?? ""))];
   const now = had.length === 1 ? (had[0] ?? "") : null;
   const choices = [
-    { value: "", label: one ? "Any runner it needs" : "Any runner they need" },
+    { value: "", label: "Any runner they need" },
     ...reachChoices(
       runners.filter((r) => r.connected && r.reach),
       "",
     ),
-    { value: "off", label: one ? "Only its own machine" : "Only their own machines" },
+    { value: "off", label: "Only their own machines" },
   ];
   // The one they have stays a choice, whether or not that runner is around now.
   if (now !== null && !choices.some((c) => c.value === now)) choices.splice(1, 0, { value: now, label: `Prefer ${now}` });
   const value = picked ?? now ?? MIXED;
   const skipped = older.map((a) => outcome(a, "skipped", "its runner runs an older kiln, without commands on other runners"));
+  // None of them on a runner: there, turned off.
+  const off = disabled || can.length === 0;
   return (
-    <span className="ms-bulk-reach">
-      <span className="ms-bulk-q">Where {one ? "its" : "their"} commands run</span>
-      <Pick label="Where their commands run" value={value} onChange={setPicked} disabled={disabled}>
+    <span className="ms-bulk-reach" title={can.length === 0 ? "None of them runs on a runner" : undefined}>
+      <span className="ms-bulk-q">Where their commands run</span>
+      <Pick label="Where their commands run" value={value} onChange={setPicked} disabled={off}>
         {now === null && (
           <option value={MIXED} disabled>
             As each has it now
@@ -483,7 +531,7 @@ function ReachPick({ agents, disabled, onChange }: { agents: AgentInfo[]; disabl
           </option>
         ))}
       </Pick>
-      <Button size="xs" variant="secondary" disabled={disabled || picked === null || picked === now} onClick={() => picked !== null && onChange(picked, can, skipped)}>
+      <Button size="xs" variant="secondary" disabled={off || picked === null || picked === now} onClick={() => picked !== null && onChange(picked, can, skipped)}>
         Change
       </Button>
     </span>
@@ -508,8 +556,8 @@ function Mute({ agents, disabled, run }: { agents: AgentInfo[]; disabled: boolea
     });
   };
   return (
-    <Button size="xs" variant="secondary" disabled={disabled} onClick={go}>
-      {unmute ? "Unmute notifications" : `Mute notifications${targets.length < agents.length ? ` of ${targets.length}` : ""}`}
+    <Button size="xs" variant="secondary" disabled={disabled} onClick={go} title={unmute ? undefined : targets.length < agents.length ? `${targets.length} of them aren't muted yet` : undefined}>
+      {unmute ? "Unmute notifications" : "Mute notifications"}
     </Button>
   );
 }
