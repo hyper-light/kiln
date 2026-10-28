@@ -194,7 +194,7 @@ mod tests {
         let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
         let asked = ask("agent", Some("w27-r02-key"), Some(1))?;
         assert!(!asked.contains("PRIVATE"), "only a CSR leaves: {asked}");
-        let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: "w27-r02-key".into(), epoch: 1 });
+        let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: "w27-r02-key".into(), epoch: 1, held_by: None });
         let given_json = answer(&pki, &asked, &identity)?;
         given(&given_json, dir.path(), "main")?;
         let held = slot("agent", Some("w27-r02-key"), Some(1));
