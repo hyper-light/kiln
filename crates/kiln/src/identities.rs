@@ -18,27 +18,38 @@ use crate::store::Store;
 pub const RUNNER_HOURS: i64 = 7 * 24;
 /// How long an agent session's certificate lasts, for one epoch; asked again on each connection.
 pub const AGENT_HOURS: i64 = 7 * 24;
-/// How long the server's and CD's signing certificates last; renewed at start once less than 30
-/// days are left.
+/// How long the server's and CD's signing certificates last; renewed once less than 30 days are
+/// left ([`own_identities`]).
 pub const SERVER_DAYS: i64 = 90;
 
+/// How often the running server looks at its and CD's identities again ([`own_identities_loop`]):
+/// well inside the 30 days a certificate is renewed before it expires.
+pub const OWN_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 /// The server's and CD's own signing identities (W27-R01): keys made here, in `<data>/pki`
-/// (0600, never sent), apart from the server's TLS leaf; certified by kiln's CA, recorded, and
-/// renewed when missing, expiring or not for their key.
+/// (0600, never sent), apart from the server's TLS leaf; certified by kiln's CA and recorded.
+/// Looked at as the server starts, every [`OWN_EVERY`] while it runs and after any revocation
+/// (`POST /api/identities/revoke`): a certificate missing, expiring or not for its key is issued
+/// anew, as is one revoked; a key revoked (lost) is replaced by a new one, and that certified.
 pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Result<()> {
+    let revoked = revocations(store).await?;
     for (kind, actor) in [("server", Actor::Server), ("cd", Actor::Cd)] {
         let identity = Identity::new(pki.organization(), actor);
         let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
         let (key_path, cert_path) = (pki.dir().join(format!("{kind}-signing.key")), pki.dir().join(format!("{kind}-signing.pem")));
+        let held = std::fs::read_to_string(&cert_path).ok();
+        let marks = held.as_deref().and_then(|c| crate::pki::fingerprints(c).ok());
+        let key_revoked = marks.as_ref().is_some_and(|m| revoked.iter().any(|r| r.key.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(&m.key))));
+        let cert_revoked = marks.as_ref().is_some_and(|m| revoked.iter().any(|r| r.serial.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&m.serial))));
         let key = match std::fs::read_to_string(&key_path) {
-            Ok(k) => k,
-            Err(_) => {
+            Ok(k) if !key_revoked => k,
+            _ => {
                 let k = crate::pki::new_key_pem()?;
                 crate::util::write_secret(&key_path, k.as_bytes(), 0o600)?;
                 k
             }
         };
-        let current = std::fs::read_to_string(&cert_path).ok().filter(|c| !crate::pki::needs_renewal(c) && crate::pki::cert_matches_key(c, &key));
+        let current = held.filter(|c| !cert_revoked && !crate::pki::needs_renewal(c) && crate::pki::cert_matches_key(c, &key));
         if current.is_some() {
             continue;
         }
@@ -48,6 +59,17 @@ pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Res
         revoke(store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", crate::util::now_unix()).await?;
         record(store, kind, &uri, &pem).await?;
         tracing::info!(identity = %identity, "issued an identity");
+    }
+    Ok(())
+}
+
+/// Keeps the server's and CD's identities current while the server runs (W27-R01):
+/// [`own_identities`] every [`OWN_EVERY`], so neither expires between restarts.
+pub async fn own_identities_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
+    while hub.shutdown.sleep(OWN_EVERY).await {
+        if let Err(e) = own_identities(&hub.store, &hub.pki).await {
+            tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't renewed");
+        }
     }
     Ok(())
 }

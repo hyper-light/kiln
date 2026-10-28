@@ -2942,6 +2942,10 @@ async fn identity_revoke(hub: &Hub, req: Request, by: &str) -> R {
         hub.net.command(crate::net::Out::RevokeKeys { keys: keys.clone(), why: crate::identities::refusal(at, r.reason.trim(), by) }).await;
     }
     hub.store.audit(by.to_owned(), "identity.revoke".into(), format!("{target:?}: {}", r.reason.trim())).await;
+    // The server's or CD's own, revoked, is issued anew at once (a revoked key replaced).
+    if let Err(e) = crate::identities::own_identities(&hub.store, &hub.pki).await {
+        tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued anew");
+    }
     Ok(srv::json(StatusCode::OK, &json!({ "at": at, "keys": keys })))
 }
 

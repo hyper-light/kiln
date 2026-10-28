@@ -999,10 +999,13 @@ fn w27_r02_no_step_reads_the_legs_key() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// W27-R01: the server and CD sign as themselves, under certificates of their own whose keys stay
-/// in the server's data (0600), kept across a restart.
+/// W27-R01 (identities plan step 7): the server and CD sign as themselves. Their certificates verify
+/// to kiln's root, as the server and as CD for the server; their keys are made in the server's data,
+/// each in its own 0600 file and nowhere else there, and kept across a restart. One revoked is
+/// issued anew at once: a certificate for the same key, or for a new key when the key was revoked.
 #[test]
-fn w27_r01_the_server_and_cd_their_own_identities() -> anyhow::Result<()> {
+fn w27_r01_server_and_cd() -> anyhow::Result<()> {
+    use kiln_ci::identity::chain::{Actor, Identity, verify};
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir()?;
     let mut s = start(dir.path(), &Options::default())?;
@@ -1010,13 +1013,49 @@ fn w27_r01_the_server_and_cd_their_own_identities() -> anyhow::Result<()> {
     assert_eq!(field(server.first().unwrap_or(&Value::Null), "verified"), "kiln server of hyper-light");
     let cd = until_identities(&s, "cd", Duration::from_secs(10), |l| !l.is_empty())?;
     assert_eq!(field(cd.first().unwrap_or(&Value::Null), "verified"), "CD, for the kiln server of hyper-light");
-    for k in ["server-signing.key", "cd-signing.key"] {
-        assert_eq!(std::fs::metadata(dir.path().join("data/pki").join(k))?.permissions().mode() & 0o777, 0o600, "{k}");
+    let (pki, data) = (dir.path().join("data/pki"), dir.path().join("data"));
+    let read = |f: &str| std::fs::read_to_string(pki.join(f));
+    let server_of = Identity::new("hyper-light", Actor::Server);
+    // Each verifies to kiln's root: the server as itself, CD as acting for it.
+    fn verified(s: &Server, pki: &Path, file: &str) -> anyhow::Result<kiln_ci::identity::chain::Verified> {
+        Ok(verify(&[&kiln::pki::der_of(&std::fs::read_to_string(pki.join(file))?)?], &root(s)?, &revocations_now(s)?, unix_now()?)?)
     }
+    fn revoke(s: &Server, what: &Value) -> anyhow::Result<()> {
+        let (st, body) = http(s.port, "POST", "/api/identities/revoke", &s.admin, Some(what))?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        Ok(())
+    }
+    let v = verified(&s, &pki, "server-signing.pem")?;
+    assert_eq!((v.identity.clone(), v.to_string()), (server_of.clone(), "kiln server of hyper-light".to_owned()));
+    let v = verified(&s, &pki, "cd-signing.pem")?;
+    assert_eq!((v.identity.clone(), v.to_string()), (Identity::new("hyper-light", Actor::Cd), "CD, for the kiln server of hyper-light".to_owned()));
+    assert_eq!(v.acts_for(), vec![server_of.clone()]);
+    // Their keys: each in its own 0600 file, nowhere else in the server's data.
+    let kept = |k: &str| -> anyhow::Result<()> {
+        assert_eq!(std::fs::metadata(pki.join(k))?.permissions().mode() & 0o777, 0o600, "{k}");
+        let others: Vec<_> = walk(&data)?.into_iter().filter(|p| !p.ends_with(k)).collect();
+        nowhere(&others, &read(k)?)
+    };
+    kept("server-signing.key")?;
+    kept("cd-signing.key")?;
     // A restart keeps them: nothing new issued.
     s.restart()?;
     assert_eq!(identities(&s, "server")?.len(), 1);
     assert_eq!(identities(&s, "cd")?.len(), 1);
+    // The server's certificate revoked: another for the same key, at once, verifying as before.
+    let (key, was) = (read("server-signing.key")?, kiln::pki::fingerprints(&read("server-signing.pem")?)?);
+    revoke(&s, &serde_json::json!({ "serial": was.serial, "reason": "w27 step 7: a certificate revoked" }))?;
+    let now = kiln::pki::fingerprints(&read("server-signing.pem")?)?;
+    assert!(now.serial != was.serial && now.key == was.key, "a new certificate for the same key: {was:?} then {now:?}");
+    assert_eq!(read("server-signing.key")?, key);
+    assert_eq!(verified(&s, &pki, "server-signing.pem")?.identity, server_of);
+    // CD's key revoked: a new key, in its own 0600 file, and a certificate for it.
+    let (key, was) = (read("cd-signing.key")?, kiln::pki::fingerprints(&read("cd-signing.pem")?)?);
+    revoke(&s, &serde_json::json!({ "key": was.key, "reason": "w27 step 7: a key lost" }))?;
+    let now = kiln::pki::fingerprints(&read("cd-signing.pem")?)?;
+    assert!(now.key != was.key && read("cd-signing.key")? != key, "a new key: {was:?} then {now:?}");
+    kept("cd-signing.key")?;
+    assert_eq!(verified(&s, &pki, "cd-signing.pem")?.acts_for(), vec![server_of]);
     Ok(())
 }
 
