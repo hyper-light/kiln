@@ -1492,7 +1492,7 @@ impl Store {
         self.call(|c| {
             let mut st = c.prepare(
                 "SELECT name, labels, slots, hostname, os, arch, version, ephemeral, connected,
-                        last_seen, enrolled_at FROM agents ORDER BY connected DESC, name",
+                        last_seen, enrolled_at FROM agents ORDER BY connected DESC, COALESCE(label, name)",
             )?;
             let rows = st.query_map([], |r| {
                 Ok(AgentRow {
