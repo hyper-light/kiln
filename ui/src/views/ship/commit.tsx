@@ -4,18 +4,24 @@
  * read from its detail (GET /api/ship/commits/{owner}/{name}/{sha}, the same resource the opened row
  * reads); a commit kiln doesn't know says so. What failed comes first, then the six stage cards,
  * then one trace of every span on a time axis, failures first (step 2); what ships with it, where
- * each environment stands from it with the one image they run, and links to its runs (step 3).
+ * each environment stands from it with the one image they run, and links to its runs (step 3). Its
+ * Build names each platform its release built, the image, and builds a newer push superseded, and for
+ * kiln's own commits, from System's builds, which platforms' runners get its binary (Build and
+ * replant plan 01a175b7f27570ee9f5b248d7bb40c0f, step 1).
  */
+import * as React from "react";
 import { shipApi } from "@/api/ship";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
 import { clockTime } from "@/lib/format";
+import { updatesRes, useRes } from "@/lib/data";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
 import { cardsOf } from "./jobs";
-import { environmentsOf, failuresOf, ridesOf, shipGroups, standWord, strip, traceOf } from "./model";
+import { platformsOf } from "@/views/updates/words";
+import { buildWord, environmentsOf, failuresOf, keptBuildsOf, ridesOf, shipGroups, standWord, strip, traceOf } from "./model";
 import { horizonOf, LaneBar, reviewGroup, type ShipLaneGroup } from "./review/lanes";
 import "./ship.css";
 
@@ -92,6 +98,39 @@ function Commit({ repo, sha }: { repo: string; sha: string }) {
             </li>
           ))}
         </ol>
+      </section>
+      <section className="ship-sec" aria-label="Build">
+        <h2>Build</h2>
+        {c.build ? (
+          <>
+            <ul className="ship-commit__builds">
+              {c.build.platforms.map((p) => (
+                <li key={p.name} data-state={p.state}>
+                  <StatusGlyph state={p.state} size={14} />
+                  <span className="ship-commit__env">{p.name}</span>
+                  <span>{buildWord(p.state)}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="ship-commit__image">
+              The image
+              {c.build.image.digest ? (
+                <>
+                  {" "}
+                  <code>{c.build.image.digest.slice(0, 19)}</code>
+                </>
+              ) : null}
+              : {buildWord(c.build.image.state)}.
+            </p>
+          </>
+        ) : (
+          <p>No build for it yet.</p>
+        )}
+        <Quiet>
+          <React.Suspense fallback={null}>
+            <KeptBuilds repo={repo} sha={c.sha} />
+          </React.Suspense>
+        </Quiet>
       </section>
       <section className="ship-sec" aria-label="Trace">
         <h2>Trace</h2>
@@ -179,4 +218,33 @@ function Commit({ repo, sha }: { repo: string; sha: string }) {
       </section>
     </section>
   );
+}
+
+/** For a commit of kiln's own, from System's builds: which platforms' runners get its binary, and which a newer build replaced. */
+function KeptBuilds({ repo, sha }: { repo: string; sha: string }) {
+  const data = useRes(updatesRes).data;
+  if (data.build?.repo !== repo) return null;
+  const kept = keptBuildsOf(platformsOf(data, null), sha);
+  return kept.length === 0 ? (
+    <p className="ship-commit__kept">No binary runners get is built from it.</p>
+  ) : (
+    <ul className="ship-commit__kept" aria-label="Runners' binaries">
+      {kept.map((k) => (
+        <li key={k.target}>
+          {k.label}: {k.state === "current" ? "runners get its binary" : "its binary is kept; a newer build serves runners"}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** What a viewer may not read (System's builds) leaves the page as it is, saying nothing. */
+class Quiet extends React.Component<{ children: React.ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    return this.state.failed ? null : this.props.children;
+  }
 }

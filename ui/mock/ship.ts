@@ -369,7 +369,8 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
                 build: {
                   platforms: [
                     { name: "linux/amd64", state: "passed" as const },
-                    { name: "macos/arm64", state: "passed" as const },
+                    // "deploy: a rollback holds" was in staging when a newer push came: its Mac build gave way to the newer one's.
+                    { name: "macos/arm64", state: row.short === "1111111" ? ("superseded" as const) : ("passed" as const) },
                   ],
                   image: { state: "passed" as const, digest: `sha256:${row.sha}${row.sha}`.slice(0, 71) },
                 },

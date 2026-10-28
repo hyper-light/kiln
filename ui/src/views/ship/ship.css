@@ -591,3 +591,23 @@
   margin: 8px 0 0;
   overflow-wrap: anywhere;
 }
+
+/* The commit page's Build (Build and replant plan, step 1): each platform, the image, runners' binaries. */
+.ship-commit__builds,
+.ship-commit__kept {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__builds li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__kept {
+  margin-top: 8px;
+  color: #a1a4ad;
+}

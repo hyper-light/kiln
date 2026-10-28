@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { environmentsOf, failuresOf, fold, keyOf, order, pickCard, ridesOf, shipGroups, standWord, strip, traceOf } from "../src/views/ship/model.ts";
+import { buildWord, environmentsOf, failuresOf, fold, keptBuildsOf, keyOf, order, pickCard, ridesOf, shipGroups, standWord, strip, traceOf } from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -224,4 +224,22 @@ test("where each environment stands from a commit: its latest deploy there, and 
     { environment: "staging", production: false, state: "passed", description: "synced", at: 200, now: false },
     { environment: "production", production: true, state: "passed", description: "promoted", at: 300, now: true },
   ]);
+});
+
+test("a commit's Build: each platform's release build in words, a newer push's superseding said so", () => {
+  assert.deepEqual(["passed", "running", "queued", "failed", "superseded"].map(buildWord), ["built", "building", "queued", "failed", "superseded by a newer push"]);
+});
+
+test("from System's builds: the platforms whose runners get a commit's binary, and those whose binary from it a newer build replaced", () => {
+  const platforms = [
+    { label: "linux · x86_64 · gnu", target: "x86_64-unknown-linux-gnu", binary: { sha: "aaaa1111" }, shadowed: [{ sha: "bbbb2222" }] },
+    { label: "linux · aarch64 · gnu", target: "aarch64-unknown-linux-gnu", binary: { sha: "bbbb2222" }, shadowed: [] },
+    { label: "macos · arm64", target: "aarch64-apple-darwin", binary: null, shadowed: [] },
+  ];
+  assert.deepEqual(keptBuildsOf(platforms, "bbbb2222cccc"), [
+    { label: "linux · x86_64 · gnu", target: "x86_64-unknown-linux-gnu", state: "replaced" },
+    { label: "linux · aarch64 · gnu", target: "aarch64-unknown-linux-gnu", state: "current" },
+  ]);
+  assert.deepEqual(keptBuildsOf(platforms, "aaaa1111"), [{ label: "linux · x86_64 · gnu", target: "x86_64-unknown-linux-gnu", state: "current" }]);
+  assert.deepEqual(keptBuildsOf(platforms, "ffff0000"), []);
 });

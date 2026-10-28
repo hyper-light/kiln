@@ -5,6 +5,8 @@
  * commit shows what failed before anything else, then its six stage cards and its trace, failures
  * first; one nothing failed in starts at its stages (step 2). It says what ships with it, where each
  * environment stands from it with the one image they run, and its runs link to their pages (step 3).
+ * Its Build names which platforms built and shows a build a newer push superseded as superseded
+ * (Build and replant plan 01a175b7f27570ee9f5b248d7bb40c0f, step 1).
  */
 import { expect, test } from "@playwright/test";
 
@@ -59,7 +61,8 @@ test("a failing commit shows what failed before anything else, then its stages a
   await expect(errors.getByRole("link", { name: "Its log" })).toHaveAttribute("href", /\/runs\/[^/]+\/jobs\/[^/]+$/);
   await expect(sections.nth(1)).toHaveAttribute("aria-label", "Stages");
   await expect(commit.getByRole("region", { name: "Stages" }).locator(".ship-job")).toHaveCount(6);
-  await expect(sections.nth(2)).toHaveAttribute("aria-label", "Trace");
+  await expect(sections.nth(2)).toHaveAttribute("aria-label", "Build");
+  await expect(sections.nth(3)).toHaveAttribute("aria-label", "Trace");
   await expect(commit.getByRole("region", { name: "Trace" }).locator(".ship-lane__name").first()).toContainText("rust lint + test");
 });
 
@@ -115,9 +118,23 @@ for (const width of [1280, 390]) {
       const { sections } = await pageOf(page, message);
       await expect(sections.first(), `${message}'s first section`).toHaveAttribute("aria-label", first, { timeout: 15_000 });
       const labels = await sections.evaluateAll((els) => els.map((el) => el.getAttribute("aria-label")));
-      expect(labels.slice(labels.indexOf("Stages"))).toEqual(["Stages", "Trace", "Ships with", "Environments", "Runs"]);
+      expect(labels.slice(labels.indexOf("Stages"))).toEqual(["Stages", "Build", "Trace", "Ships with", "Environments", "Runs"]);
       const w = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
       expect(w.scroll, `${message} at ${width}`).toBe(w.client);
     }
   });
 }
+
+test("its Build names which platforms built, and a build a newer push superseded as superseded", async ({ page }) => {
+  const { commit } = await pageOf(page, "deploy: a rollback holds");
+  const build = commit.getByRole("region", { name: "Build" });
+  await expect(build.locator('li[data-state="passed"]')).toContainText(["linux/amd64"], { timeout: 15_000 });
+  await expect(build.locator('li[data-state="passed"]')).toContainText(["built"]);
+  await expect(build.locator('li[data-state="superseded"]')).toContainText(["macos/arm64"]);
+  await expect(build.locator('li[data-state="superseded"]')).toContainText(["superseded by a newer push"]);
+  await expect(build).toContainText("The image sha256:");
+  const other = await pageOf(page, "ci: a landed change");
+  const built = other.commit.getByRole("region", { name: "Build" });
+  await expect(built.locator('li[data-state="passed"]')).toHaveCount(2, { timeout: 15_000 });
+  await expect(built.locator('li[data-state="superseded"]')).toHaveCount(0);
+});

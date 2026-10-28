@@ -325,3 +325,30 @@ export function environmentsOf(detail: ShipDetail): Standing[] {
   }
   return [...by.values()].sort((a, b) => Number(a.production) - Number(b.production) || a.environment.localeCompare(b.environment));
 }
+
+/** A platform's build of a commit, in words (the commit page's Build; Build and replant plan, step 1). */
+const BUILD_WORD: Record<string, string> = { passed: "built", running: "building", queued: "queued", failed: "failed", superseded: "superseded by a newer push" };
+export const buildWord = (state: string) => BUILD_WORD[state] ?? state;
+
+/** A binary System keeps for a platform, as far as a commit goes: runners get it, or a newer build replaced it. */
+export interface KeptBuild {
+  label: string;
+  target: string;
+  state: "current" | "replaced";
+}
+
+/**
+ * From System's builds (the binaries kiln keeps for its runners, as the Builds section reads them):
+ * for a commit of kiln's own, each platform whose binary runners get is built from it, and each
+ * whose binary from it is kept but replaced by a newer build.
+ */
+export function keptBuildsOf(platforms: readonly { label: string; target: string; binary: { sha?: string } | null; shadowed: readonly { sha?: string }[] }[], sha: string): KeptBuild[] {
+  const of = (b: { sha?: string } | null | undefined) => {
+    const a = b?.sha?.toLowerCase();
+    const c = sha.toLowerCase();
+    return !!a && (c.startsWith(a) || a.startsWith(c));
+  };
+  return platforms.flatMap((p): KeptBuild[] =>
+    of(p.binary) ? [{ label: p.label, target: p.target, state: "current" }] : p.shadowed.some(of) ? [{ label: p.label, target: p.target, state: "replaced" }] : [],
+  );
+}
