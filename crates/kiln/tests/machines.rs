@@ -17,14 +17,16 @@ use common::{Options, http, machine, start};
 use serde_json::{Value, json};
 
 /// `kiln agent` of the server at `port` on the machine whose state is `state`, started as `name`
-/// (its machine id made from it): its log.
-fn agent(dir: &Path, port: u16, state: &Path, name: &str, log: &str) -> anyhow::Result<(Runner, PathBuf)> {
+/// (its machine id made from it), with `more` (`--instance <id>`: a runner process an upgrade
+/// started): its log.
+fn agent(dir: &Path, port: u16, state: &Path, name: &str, log: &str, more: &[&str]) -> anyhow::Result<(Runner, PathBuf)> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(log);
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
     let child = common::kiln()
         .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--name", name, "--no-terminal"])
+        .args(more)
         .env("KILN_MACHINE_ID", name)
         .arg("--work-dir")
         .arg(dir.join(format!("{log}-work")))
@@ -61,6 +63,22 @@ fn until(port: u16, admin: &str, what: &str, log: &Path, holds: impl Fn(&[Value]
     }
 }
 
+/// The machine whose state is `state` enrolls as `name`, sending no machine id, as a kiln from
+/// before did: known by that name.
+fn enrolled_by_name(port: u16, admin: &str, join: &str, state: &Path, name: &str) -> anyhow::Result<()> {
+    let (csr, key) = kiln::pki::make_csr(name)?;
+    let ask = json!({ "token": join, "name": name, "csr": csr, "hostname": name });
+    let (st, body) = http(port, "POST", "/api/agents/enroll", admin, Some(&ask))?;
+    anyhow::ensure!(st == 200, "enrolling: {st} {body}");
+    let enrolled: Value = serde_json::from_str(&body)?;
+    anyhow::ensure!(text(&enrolled, "name") == name && enrolled.get("label").is_none(), "known by its name: {enrolled}");
+    std::fs::create_dir_all(state)?;
+    for (file, content) in [("agent.pem", text(&enrolled, "cert_pem")), ("agent.key", key.as_str()), ("ca.pem", text(&enrolled, "ca_pem")), ("quic", text(&enrolled, "quic"))] {
+        std::fs::write(state.join(file), content)?;
+    }
+    Ok(())
+}
+
 fn text<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(Value::as_str).unwrap_or_default()
 }
@@ -76,22 +94,12 @@ fn a_runner_from_before_moves_to_its_machine_id_with_what_was_kept_under_its_nam
     let s = start(dir, &Options::default())?;
     let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
     let state = dir.join("machine");
-    std::fs::create_dir_all(&state)?;
 
-    // The machine enrolls by its name, sending no machine id, as a kiln from before did.
-    let (csr, key) = kiln::pki::make_csr("old-box")?;
-    let ask = json!({ "token": join, "name": "old-box", "csr": csr, "hostname": "old-box" });
-    let (st, body) = http(s.port, "POST", "/api/agents/enroll", &s.admin, Some(&ask))?;
-    anyhow::ensure!(st == 200, "enrolling: {st} {body}");
-    let enrolled: Value = serde_json::from_str(&body)?;
-    anyhow::ensure!(text(&enrolled, "name") == "old-box" && enrolled.get("label").is_none(), "known by its name: {enrolled}");
-    for (file, content) in [("agent.pem", text(&enrolled, "cert_pem")), ("agent.key", key.as_str()), ("ca.pem", text(&enrolled, "ca_pem")), ("quic", text(&enrolled, "quic"))] {
-        std::fs::write(state.join(file), content)?;
-    }
+    enrolled_by_name(s.port, &s.admin, &join, &state, "old-box")?;
 
     // It has never connected, so kiln has nothing of it to move yet: it's refused, and goes on by
     // its name. Kiln keeps what's set for it under that name: its agent limit, a person's grant.
-    let (first, log) = agent(dir, s.port, &state, "old-box", "first.log")?;
+    let (first, log) = agent(dir, s.port, &state, "old-box", "first.log", &[])?;
     until(s.port, &s.admin, "old-box connected by its name", &log, |l| l.iter().any(|a| text(a, "name") == "old-box" && connected(a)))?;
     assert!(std::fs::read_to_string(&log)?.contains("it goes on by its name"), "it said why it wasn't moved");
     let (st, body) = http(s.port, "PUT", "/api/runners/old-box/agent-limit", &s.admin, Some(&json!({ "max_sessions": 2 })))?;
@@ -103,7 +111,7 @@ fn a_runner_from_before_moves_to_its_machine_id_with_what_was_kept_under_its_nam
 
     // It starts again, and moves to its machine id as it does: known by the id, shown by its name,
     // what was kept under the name with it.
-    let (_runner, log) = agent(dir, s.port, &state, "old-box", "runner.log")?;
+    let (_runner, log) = agent(dir, s.port, &state, "old-box", "runner.log", &[])?;
     let id = machine("old-box");
     let list = until(s.port, &s.admin, "the runner connected by its machine id", &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
     let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
@@ -136,6 +144,32 @@ fn a_runner_from_before_moves_to_its_machine_id_with_what_was_kept_under_its_nam
     anyhow::ensure!((200..300).contains(&st), "granting by its name: {st} {body}");
     let (_, body) = http(s.port, "GET", "/api/users", &s.admin, None)?;
     assert!(body.contains(&format!("runners.read@runner:{id}")) && !body.contains("runners.read@runner:build-box"), "{body}");
+    Ok(())
+}
+
+#[test]
+fn a_runner_an_upgrade_started_moves_its_machine_to_its_machine_id_as_it_starts() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let s = start(dir, &Options::default())?;
+    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
+    let state = dir.join("machine");
+    enrolled_by_name(s.port, &s.admin, &join, &state, "up-box")?;
+    // Its usual runner connects by its name (it had nothing to move), then stops.
+    let (first, log) = agent(dir, s.port, &state, "up-box", "first.log", &[])?;
+    until(s.port, &s.admin, "up-box connected by its name", &log, |l| l.iter().any(|a| text(a, "name") == "up-box" && connected(a)))?;
+    stop(first)?;
+    until(s.port, &s.admin, "up-box gone away", &log, |l| l.iter().any(|a| text(a, "name") == "up-box" && !connected(a)))?;
+    // Its runner now is the runner process an upgrade started (`--instance`): as it starts, the
+    // machine moves to its id, and the process gets its own certificate for it.
+    let (_beside, log) = agent(dir, s.port, &state, "up-box", "beside.log", &["--instance", "u1"])?;
+    let id = machine("up-box");
+    let list = until(s.port, &s.admin, "the runner process connected by the machine's id", &log, |l| l.iter().any(|a| text(a, "name") == id && connected(a)))?;
+    let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
+    assert_eq!(text(&me, "label"), "up-box", "shown by its name: {me}");
+    assert!(!list.iter().any(|a| text(a, "name") == "up-box"), "nothing is known by its name any more: {list:?}");
+    let said = std::fs::read_to_string(&log)?;
+    assert!(said.contains("this runner is known by its machine id now") && said.contains("certificate for this runner process issued"), "{said}");
     Ok(())
 }
 

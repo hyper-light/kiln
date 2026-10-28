@@ -151,7 +151,8 @@ async fn moved_to_its_id(o: &Opts, cert: &str, key: &str, ca: &str, cert_p: &std
     let id = crate::rt::blocking(crate::os::machine_id).await.ok().flatten()?;
     let to = crate::join::machine_key(Some(&id))?;
     let name = crate::pki::leaf_name(&Leaf { cert_pem: cert.to_owned(), key_pem: String::new() })?;
-    if name == to {
+    // Known by a machine id already (its own, or the one of a machine it was copied from): it stays.
+    if name == to || crate::join::is_machine_key(&name) {
         return None;
     }
     let csr = crate::pki::make_csr_with_key(&to, key).ok()?;
@@ -253,6 +254,12 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
     let dir = crate::upgrade::instance_dir(&o.state_dir, id);
     let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
     let (machine_cert, key) = crate::upgrade::machine_credentials(&o.state_dir)?;
+    // Known by its name: the machine moves to its machine id as this process starts too, an
+    // upgrade's runner process being its runner since (docs/machines.md). While another process of
+    // it is connected (the one an upgrade takes over from) the server refuses, and it asks again
+    // as it starts next.
+    let machine_cert = moved_to_its_id(o, &machine_cert, &key, &ca, &o.state_dir.join("agent.pem")).await.unwrap_or(machine_cert);
+    let machine = crate::pki::leaf_name(&Leaf { cert_pem: machine_cert.clone(), key_pem: String::new() });
     let quic = std::fs::read_to_string(o.state_dir.join("quic")).ok().map(|s| s.trim().to_owned());
     let cert_p = dir.join("agent.pem");
     let own = std::fs::read_to_string(&cert_p).ok().filter(|c| {
@@ -260,7 +267,13 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
         if !mine {
             tracing::warn!(instance = %id, "this runner process's certificate is for a key the machine no longer has (it enrolled again): asking for a new one");
         }
-        mine
+        // Its certificate names the machine as it was: one known by its machine id since gets one
+        // for that id.
+        let same = crate::pki::leaf_name(&Leaf { cert_pem: c.clone(), key_pem: String::new() }) == machine;
+        if mine && !same {
+            tracing::info!(instance = %id, "the machine is known by its machine id now: asking for this runner process's certificate for it");
+        }
+        mine && same
     });
     if let Some(c) = &own
         && !crate::pki::needs_renewal(c)

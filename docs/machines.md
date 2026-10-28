@@ -79,7 +79,10 @@ whether a machine joining under its name is the same machine.
 A runner that enrolled before this is known by its name: it sent no id when it joined. As it
 starts, before it connects or holds anything, it asks to be known by its machine id
 (`POST /api/agents/rekey`), proving itself with its certificate and key as a second runner process
-of a machine does (`Pki::sign_moved`). The server moves what it kept under the name to the id
+of a machine does (`Pki::sign_moved`). So does a runner process an upgrade started (`--instance`),
+for its machine, then gets its own certificate for the id. An upgrade in place (one process taking
+over from another) moves nothing, as the process it takes over from is connected: the runner
+moves the next time it starts with none of it connected (a restart, a reboot). The server moves what it kept under the name to the id
 (`Hub::move_runner`), and the name becomes its label:
 
 - its agent row, the jobs it ran and the retries placed on it or away from it, its attempts, its
@@ -91,7 +94,8 @@ of a machine does (`Pki::sign_moved`). The server moves what it kept under the n
 The runner keeps its new certificate in place of the old one. It's refused while a process of it
 is connected, for an id other than the one its facts said, for an id another runner is known by,
 and for a runner the server doesn't know (one that never connected, or one forgotten); it then goes
-on by its name and asks again as it starts next. Its old name isn't revoked, so a machine on an
+on by its name and asks again as it starts next. One known by a machine id already never moves to
+another (a VM copied with its runner's state is caught as a copy instead). Its old name isn't revoked, so a machine on an
 older kiln that shares it keeps working.
 
 The server's own runner (`[local_agent]`) is known by its machine's id too
