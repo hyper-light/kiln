@@ -2,10 +2,11 @@
  * An open Ship item holds still and renders only what changes (docs/ci.md W26-R15, AC06), against
  * the mock's production build: 30 s of live updates (a commit arriving, review and run events
  * through /api/mock/review's emit) while an item is open and in use leaves layout-shift entries at
- * exactly 0, with or without recent input; and typing in a thread's composer renders it alone, every
- * counter outside it (the item's rows, its file diffs, its threads, the other items) at exactly 0 per
- * keystroke, read off window.__rvRenders (review/perf.ts). Live updates between keystrokes render
- * only the Files section that takes their data, nothing under it.
+ * exactly 0, with or without recent input (at least 15 updates, one about every 2 s); and typing in
+ * a thread's composer renders it alone, every counter outside it (the item's rows, its file diffs,
+ * its threads, the other items) at exactly 0 per keystroke, read off window.__rvRenders
+ * (review/perf.ts). Live updates between keystrokes render only the Files section that takes their
+ * data, nothing under it.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -68,14 +69,14 @@ test("an open item in use moves nothing through 30 s of live updates", async ({ 
     // shift it causes can't pass for the typing's; the composer must stay to be typed into.
     const end = Date.now() + 30_000;
     let updates = 0;
-    while (Date.now() < end) {
+    while (updates < 15 || Date.now() < end) {
       await field.pressSequentially("ab", { delay: 60 });
       await page.waitForTimeout(600);
       await live(page);
       updates++;
       await page.waitForTimeout(1300);
     }
-    expect(updates).toBeGreaterThanOrEqual(13);
+    expect(updates).toBeGreaterThanOrEqual(15);
     expect(await page.evaluate(() => (window as unknown as { moved: string[] }).moved), "what moved").toEqual([]);
   } finally {
     await page.request.post("/api/mock/ship/arrive?clear=1");
@@ -85,6 +86,8 @@ test("an open item in use moves nothing through 30 s of live updates", async ({ 
 test("typing renders the composer alone, and live updates between keystrokes render nothing under the Files section", async ({ page }) => {
   test.setTimeout(90_000);
   await page.request.post("/api/mock/ship/arrive?clear=1");
+  // The mock's simulated runs stand still (`/api/mock/quiet`): what arrives is what this test sends.
+  await page.request.post("/api/mock/quiet", { data: { on: true } });
   try {
     const row = await open(page, "pipeline: dynamic matrices");
     await row.locator(".rv-thread").first().locator(".rv-btn", { hasText: "Reply" }).click();
@@ -136,6 +139,7 @@ test("typing renders the composer alone, and live updates between keystrokes ren
     delta = await since(before);
     for (const k of Object.keys(delta)) if (k !== "ship/composer" && k !== "ship/kilnfiles") expect(delta[k], `${k} rendered ${delta[k]}× with live updates arriving`).toBe(0);
   } finally {
+    await page.request.post("/api/mock/quiet", { data: { on: false } });
     await page.request.post("/api/mock/ship/arrive?clear=1");
   }
 });

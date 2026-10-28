@@ -874,15 +874,20 @@ function sampleAll() {
 for (let i = 0; i < 3; i++) startRun(weightedRepo(rnd));
 for (let i = 0; i < 25; i++) tick();
 
-setInterval(tick, 1000);
-setInterval(() => emitQueue(), 1000);
-setInterval(() => emitQueue(true), 5000);
-setInterval(sampleAll, 5000);
+/** A browser check's quiet (`POST /api/mock/quiet`, `{ on }`): the simulated runs, queue and samples
+ * stand still while it's on, so a measurement sees only what it sends itself (ship-perf's keystrokes). */
+let quiet = false;
+setInterval(() => quiet || tick(), 1000);
+setInterval(() => quiet || emitQueue(), 1000);
+setInterval(() => quiet || emitQueue(true), 5000);
+setInterval(() => quiet || sampleAll(), 5000);
 (function scheduleNewRun() {
   setTimeout(() => {
-    const repo = weightedRepo(rnd);
-    startRun(repo);
-    repo.last_polled_at = now();
+    if (!quiet) {
+      const repo = weightedRepo(rnd);
+      startRun(repo);
+      repo.last_polled_at = now();
+    }
     scheduleNewRun();
   }, between(12_000, 35_000));
 })();
@@ -1421,6 +1426,10 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/mock/away" && m === "POST") {
       sendAway(Number(url.searchParams.get("ms") ?? 10_000));
       return json(res, 200, { ok: true });
+    }
+    if (p === "/api/mock/quiet" && m === "POST") {
+      quiet = (await body<{ on?: boolean }>(req)).on ?? true;
+      return json(res, 200, { quiet });
     }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
