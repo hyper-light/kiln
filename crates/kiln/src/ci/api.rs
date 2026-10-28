@@ -44,6 +44,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W24-R07: the work ledger, for steps' reuse.
         ["_kiln", "work", "v1", rest @ ..] => Some(super::services::memo::route(hub, rest, req).await),
         ["twirp", service, method] => Some(super::services::twirp::route(hub, service, method, req).await),
+        // W24-R26: the Remote Execution API's cache (its CAS and action cache), gRPC for a leg's token.
+        [service, method] if super::work::reapi::serves(service) => Some(boxed(|| super::work::reapi::route(hub, service, method, req)).await),
         // W14: GitHub's REST API (as GHES serves it, at /api/v3) and GraphQL, for a leg's token.
         ["api", "v3", rest @ ..] => Some(super::rest::route(hub, rest, req).await),
         ["api", "graphql"] => Some(super::rest::graphql(hub, req).await),
@@ -93,6 +95,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
 pub fn is_open(seg: &[&str]) -> bool {
     git_path(seg)
         || matches!(seg, ["git", rest @ ..] if git_path(rest))
+        || matches!(seg, [service, _] if super::work::reapi::serves(service))
         || super::rest::is_web(seg)
         || super::rest::is_download(seg)
         || matches!(

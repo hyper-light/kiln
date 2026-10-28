@@ -2300,6 +2300,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-preload"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "kiln-seams"
 version = "0.2.0"
 dependencies = [

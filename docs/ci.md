@@ -2098,7 +2098,9 @@ W20.
     is kept with the run's saved input, so legs queued after a restart have it too, and on the
     leg's row (`jobs.placement`) for the API and the run page.
   - A pipeline's job retried in place (`Store::retry_job`, `w05_r28_a_job_retried_in_place`) and
-    placed by v1's `pick_agent`; a job asked onto a runner by name gets no pod made for it.
+    placed by v1's `pick_agent`; a job asked onto a runner by name gets no pod made for it. The
+    runners it may be asked onto are where `pick_agent` places it, by its labels and `requires`
+    (`hub::cannot_take`, `w05_r28_a_retry_s_runners_are_where_v1_places_the_job`).
   - `GET /api/ci/legs/:id/runners` and `POST /api/ci/legs/:id/retry` (`crates/kiln/src/ci/retry.rs`),
     `ci.legs.runners` and `ci.legs.retry` for MCP, and the job panel's Retry with where to run it.
   - End to end (`tests/retry_elsewhere.rs`, AC12).
@@ -3874,7 +3876,7 @@ support (G-11, G-18, G-25, G-27, G-28).
   | `virt.kvm`, `virt.hvf`, `virt.nested` | `/dev/kvm` access, Hypervisor.framework entitlement check |
   | `executors` | which of `host`, `docker`, `firecracker`, `shards`, `k8s` work right now (each probed for real: a no-op run), with versions (`docker.version`, `docker.rootless`, `podman.version`, `firecracker.version`, `shards.version`, `shards.features`) |
   | `binfmt` | platforms registered for QEMU user emulation |
-  | `tools.<name>.version` | `git`, `node`, `python3`, `cargo`, `go`, `java`, `dotnet`, `docker buildx`, `shards`, … found on `PATH` |
+  | `tools.<name>.version` | `git`, `node`, `python3`, `cargo`, `go`, `java`, `dotnet`, `docker buildx`, `shards`, … found on the `PATH` a leg's steps have (W13-R03): the runner's, then the folders only its user's login shell has |
   | `net.egress` | whether the internet is reachable directly or only through a proxy |
 
 - **W13-R02 Declared facts.** Administrators add facts in the runner's configuration
@@ -3886,7 +3888,11 @@ support (G-11, G-18, G-25, G-27, G-28).
 - **W13-R03 `host`**: today's executor (a process tree killed as a group; job objects on Windows),
   now behind W06's `Exec` trait. Runs `container:` jobs and services through the host's Docker or
   Podman when `CAP_DOCKER`, GitHub-exact for self-hosted runners (steps on the host, containers
-  beside them).
+  beside them). Its steps' `PATH` is the runner's, then the folders only its user's login shell
+  has (`$SHELL -l -i`, asked as a leg starts unless it answered in the last ten minutes, as for
+  `kiln run` and harnesses): a runner's service keeps the PATH of the terminal it was installed
+  from, so a toolchain installed since (node from nvm, cargo from rustup) is found without
+  installing the runner again.
 - **W13-R04 `docker`**: the whole leg runs in a fresh container of the leg's image (the routing
   rule's `image`, W05-R21), the way a hosted runner gives each job a fresh machine. When the job
   declares `container:`, that container is the leg's container (GitHub-exact). Docker actions and
@@ -8011,6 +8017,10 @@ and verification (`work::verify`).
     in (`work.memo.observe: true`). The decisions (which call means which `Read`, merging traces,
     partiality) stay pure in `work::pathset`, tested on recorded traces as fixtures, as cargo's
     dependency files are; the supervisor lives in `runner/work/observe.rs`.
+  - **Built** (`runner/observe.rs`, `crates/kiln-preload`): `trace` by seccomp user notification,
+    `trace_preload` by the interposition library; a static Go program's read and rustc's are both
+    recorded under the first, rustc's reads and variables under the second. Left: their overhead on
+    kiln's debug build on fedora (at most 3 % and 15 %), measured in a quiet window, and macOS.
 - **`kiln rustc`** (R09) is a `RUSTC_WRAPPER` (`kiln rustc <rustc> <args>`), sccache-compatible for
   library crates, that also caches proc-macro, bin and test units:
   1. It reads the invocation (crate name and types, `--emit`, `-C` flags, `--extern`, `-L`,
@@ -8035,6 +8045,15 @@ and verification (`work::verify`).
      rustc remaps paths and keys on the linker, and R23's sampling checks bins and tests most: a
      linker that still differs marks its units nondeterministic, their lineage quarantined.
   6. Remote mode (R26) ships the toolchain as a tree in the content store.
+  - **Built** (`kiln_ci::work::rustc`, `runner/rustc.rs`): the kiln binary as cargo's
+    `RUSTC_WRAPPER`, its entries in `$KILN_RUSTC_CACHE` (not yet the runner's cache service, R08,
+    nor signed). A miss runs rustc with `--remap-path-prefix` for the workspace, `$CARGO_HOME` and
+    the target folder, so its outputs are the same from any checkout or target; `env-dep` values
+    are keyed remapped; a build script's probes run rustc directly. On kiln's own lib tests from an
+    empty target folder (`CARGO_INCREMENTAL=0`), the second build hits all 468 units, kiln's lib
+    test binary among them, byte for byte the first's, and a change in `crates/kiln` misses only
+    that binary. turso_core's build script writes its build time (`BUILT_TIME_SQLITE`), which is
+    an input: its units hit only with `SOURCE_DATE_EPOCH` set.
 
 **Interfaces.**
 
@@ -8330,6 +8349,38 @@ scenario's three. It passes under 60 s for the docs-only change and at most 663 
 cold 2211 s) for the one-file change. Each run's reports say why each step ran, was reused or was
 warm (R28), which tells a miss from a slow hit; the figures go in the baseline's table above, with
 their commits, runner and date.
+
+**The seams, warm `k8s` pools and the Remote Execution API's cache (M5, in part).** Built (R02,
+R14, R26, on main's one path, R30):
+
+- *The ledger behind one interface.* The one path (`ci::work`: keying, records, lookups, e-classes,
+  trust, signatures, verification, test results, the reaper) is written once over
+  `ci::work::ledger::Rows`, so it runs on the `work_records` table or on `Records` (kiln's
+  `StoreRecords`, the simulator, Amphora's once CP-T1.5 lands) and decides alike on each: a scenario
+  through the whole path says the same, and audits the same, on all three, and the seam's suite
+  passes on a `Records` holding the ledger's rows. There a row's value is its 8-byte stamp, then the
+  table's value; a transaction's writes are one commit, and an entry's insert-only write is a
+  condition that its key is absent, so two writers racing for an entry leave one (R22). What Records
+  can't hold (a path set past a MiB) it refuses, typed, keeping nothing. The bytes a result names
+  (`cas/<sha256>`) are checked through `Blobs`. Production keeps the ledger in the table. AC10 on
+  `StoreRecords`, on disk (fedora, 2026-10-27, 20,000 results, 5,000 lookups through the one path,
+  each its seam's calls in turn and its hit counted): p50 1.4 ms, p99 4.7 ms, held under 10 ms by a
+  test; on the table in the same run, p50 0.17 ms and p99 1.1 ms, held under AC10's 5 ms.
+- *Warm `k8s` pools.* A pool's `warm = { root, node_label }` keeps each pod's `<work>/warm` in
+  `<root>/<pool>` on its node (`/var/lib/kiln/warm` by default, a `hostPath`), on the pod
+  `k8s::pool_pod` makes, its pods only on nodes carrying the label and drawn to the four nodes its
+  pods ran on last. Not while `ci.untrusted.executors` names `k8s`: its pods start cold, and the
+  pool's change says why. Per-lane volumes cloned through CSI snapshots aren't built yet.
+- *The Remote Execution API's cache.* `ContentAddressableStorage`, `ActionCache`, `Capabilities`
+  and `ByteStream`, as gRPC at kiln's listener (HTTP/2 in the clear or over TLS), for a leg's token,
+  as Bazel takes it: `--remote_cache=grpc://<server>` with
+  `--remote_header=authorization="Bearer $ACTIONS_RUNTIME_TOKEN"`. A leg reads and writes as its
+  cache mode lets it, untrusted legs in their own domain, reading down (R21). Blobs are the content
+  store's, a repository told of only those it put. Action results are the ledger's, on its one path:
+  each the result of a unit of kind `action` whose definition is the action's digest, successes
+  only, never overwritten (the same outputs again reproduce the entry; others are refused and have
+  it judged again, R23), and answered while every blob they name is held. `Execute` answers
+  `UNIMPLEMENTED`; people's and agents' own tokens (person scopes) aren't taken yet.
 
 ### W26 Review in Ship: changes as Ship items, each owning its review
 
