@@ -5131,6 +5131,11 @@ And again at d9480644, after counting was made faster (§12.23): kiln-obs's test
 4), kiln's observe, CD and transport tests (291), and every live file above, the Event Log, kiln
 CD's kind cluster and Docker's among them; in three parts, the machine's own kiln runner having
 restarted twice under the run (its files then run again, what they left removed).
+And on the tree observe lands as, main merged in (2026-10-28, at c7da0e5d9c): kiln-obs's tests
+(358) and kiln's observe tests (270) pass, and so does every live file but kiln CD's (its cluster
+not made there) and the loads: 64 scenarios, the 49 that need no Docker first and Docker's then
+under Docker Desktop (its 19 tests, the archives' S3, Datadog's Agent and tracers, email, Event
+Hubs' Kafka, the profilers, Prometheus's remote write and the containers' among them).
 Not run there: DogStatsD's Unix socket (Windows has no Unix datagram sockets),
 macOS's unified log, and the full disk's (it runs this machine's build in a Linux container).
 
