@@ -87,7 +87,7 @@ function Objects({ list, held }: { list: CdPlanObject[]; held?: CdPlanSync["held
             {verb(o)}
           </p>
           {o.hunks ? (
-            <FileDiffView diff={{ path: objectLabel(o.key), hunks: o.hunks }} label={objectLabel(o.key)} defaultOpen={list.length <= 3} />
+            <FileDiffView diff={{ path: objectLabel(o.key), hunks: o.hunks }} label={objectLabel(o.key)} defaultOpen={list.length <= 3} language="yaml" />
           ) : (
             <p className="cd-plan-line">
               <span>{objectLabel(o.key)}</span>

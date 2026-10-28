@@ -4,22 +4,34 @@
 //! turns hub and store events into inputs and carries out the commands.
 //!
 //! Legs with the same requirement share a **signature**, with its eligible runners and one queue
-//! ordered by effective priority (aged: `priority − aging × minutes queued`, which keeps its order
-//! as time passes), then fair-share virtual start time across repositories, then arrival.
+//! per priority, each ordered by fair-share virtual start time (across repositories, or nested
+//! inside one by actor and lane, W28-R66), then arrival. Between priorities the effective one goes
+//! first: `priority + aging × minutes its next leg has waited` (W05-R09), so classes stay strict
+//! while nothing starves, and fair share holds inside a class however long its legs wait.
 //! Capacity that frees looks only at the signatures that runner can serve.
+//!
+//! A leg whose preferences name `warm` or `affinity` (W24-R18) goes where it's expected to finish
+//! first, from what each runner holds warm ([`Input::Warm`], [`super::warm`]), and may wait a
+//! bounded while for a busy runner that would finish it sooner ([`WaitReason::Warm`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use super::demand::{self, Ask, Demand, Demands, End, Fate, Next, Running, Work};
+use super::admit::{self, Admit, Held, Skipped};
 use super::groups::{GroupAction, GroupConfig, Groups};
+use super::needs;
 use super::pools::{self, ExecState, Executor, Pool, PoolView};
 use super::reserve::Reservation;
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
+use super::warm::{self, Held as WarmHeld, Wants};
 
-/// What a leg asks for and a runner offers, in resource mode (W05-R03).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+/// What a leg asks for and a runner offers, in resource mode (W05-R03); and what an exclusive leg
+/// holds of its runner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Resources {
     pub cpu: f64,
     pub mem: u64,
@@ -49,6 +61,28 @@ pub struct Config {
     pub pools: Vec<Pool>,
     /// Runners and pools kept for matching legs in windows (W05-R12).
     pub reservations: Vec<Reservation>,
+    /// Seconds of work left within which work no live demand wants finishes when live work
+    /// contends for its capacity, if it seeds trusted entries (W28-R43).
+    pub finish_within: i64,
+    /// Each lane's speculation window (W28-R68).
+    pub window: admit::Window,
+    /// What fair share is between (W05-R10, W28-R66): repositories, then inside each its actors,
+    /// then their lanes, as far as this lists; each level splits its parent's share equally.
+    pub fair_by: Vec<FairBy>,
+    /// Admission by load (`[ci.scheduler.admission]`, W24-R19): off when `None`.
+    pub admission: Option<super::load::Admission>,
+    /// Warm-aware placement's settings (W24-R18).
+    pub warm: warm::Model,
+}
+
+/// A level of fair share (W28-R66).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FairBy {
+    Repo,
+    /// An agent or a person (W28-R67).
+    Actor,
+    /// A repository's workflow on a branch.
+    Lane,
 }
 
 impl Default for Config {
@@ -65,6 +99,11 @@ impl Default for Config {
             quotas: HashMap::new(),
             pools: Vec::new(),
             reservations: Vec::new(),
+            finish_within: demand::FINISH_WITHIN,
+            window: admit::Window::default(),
+            fair_by: vec![FairBy::Repo],
+            admission: None,
+            warm: warm::Model::default(),
         }
     }
 }
@@ -86,9 +125,68 @@ pub struct LegIn {
     /// Expected runner-seconds (history, W19).
     pub cost: Option<f64>,
     pub prefer: Vec<Preference>,
-    /// It has a `container:` or `services:`: on a hosted pool (`k8s`), it runs in an executor
-    /// made for it (a pod of that container, those services beside it, W13-R07).
+    /// It has a `container:` or `services:`, or is a kiln-dialect leg that sets `toolchain:`,
+    /// `image:` or `resources:`: on a hosted pool (`k8s`), it runs in an executor made for it (a
+    /// pod of that container, those services beside it, W13-R07; a kiln-dialect leg's, v1's job
+    /// pod, W02-R06).
     pub own_executor: bool,
+    /// Its work (W28-R42): the key it adopts or executes by, its domain and its warm lane. A leg
+    /// without stays out of demands.
+    pub work: Option<Work>,
+    /// After a restart: when the attempt its runner still runs started (unix ms), for how long it
+    /// has left (W28-R43).
+    pub started: Option<i64>,
+    /// Its workflow's `supersede.finish-within` (W28-R43), over the scheduler's.
+    pub finish_within: Option<i64>,
+    /// Its lane, unit and place, and its workflow's `coalesce:` and `cadence:` (W28-R60): legs
+    /// without go straight to their queues.
+    pub admission: Option<admit::Demand>,
+    /// Whose it is: the agent or person its commit is attributed to (W28-R67).
+    pub actor: String,
+    /// Its lane (repository, workflow, branch), for fair share by lane (W28-R66).
+    pub lane: String,
+    /// Its intent class and why (W28-R64), when priority is by intent.
+    pub intent: Option<(super::intent::Intent, String)>,
+    /// What admission by load knows of it (W24-R19): heavy on I/O, and its I/O weight.
+    pub load: super::load::Load,
+    /// Its lane (W24-R11) as placement matches lanes (`work::slots::placement`): the workspaces
+    /// its `warm` term looks for (W24-R18), on each runner those made with the toolchain it would
+    /// run with there.
+    pub warm_lane: Option<String>,
+    /// How long it runs cold, in seconds (runners' history of its lane, W24-R18); its `cost` when
+    /// that's unknown.
+    pub cold: Option<f64>,
+    /// Its job's container image (`container:`): with the executor and image a runner gives it,
+    /// the toolchain its lane's workspaces there must have been made with (W24-R11).
+    pub container: Option<String>,
+    /// Its workflow's file (`.kiln/ci.yaml`), as runners' lanes name its jobs: what `affinity: {
+    /// job }` and a `warm` term without a lane go by (W24-R18).
+    pub workflow_file: String,
+    /// Where a person's retry asked it to run (W05-R28).
+    pub placement: Placement,
+}
+
+/// Where a person's retry asked a leg to run (W05-R28): only on `runner`, or on any runner but
+/// `avoid` (the one it ran on). It narrows what the leg's requirements allow, never widens it, and
+/// holds through the attempt's own retries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Placement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avoid: Option<String>,
+}
+
+impl Placement {
+    pub fn is_empty(&self) -> bool {
+        self.runner.is_none() && self.avoid.is_none()
+    }
+
+    /// Whether it lets the leg run on `runner`.
+    pub fn allows(&self, runner: &str) -> bool {
+        self.runner.as_deref().is_none_or(|r| r == runner) && self.avoid.as_deref() != Some(runner)
+    }
 }
 
 /// A runner that can take legs.
@@ -118,6 +216,8 @@ pub enum Outcome {
 pub enum Supersede {
     Cancel,
     Deprioritize,
+    /// Withdraws their demands instead: their work goes on while a live demand wants it (W28-R40).
+    Adopt,
 }
 
 /// Something that happened.
@@ -127,6 +227,11 @@ pub enum Input {
     /// older runs with the same key (workflow and branch, stack or pull request).
     RunQueued { run: String, group: Option<(String, String, GroupConfig)>, supersede: Option<(String, Supersede)> },
     RunFinished { run: String },
+    /// A run's demand (W28-R40), before its `RunQueued`: that withdraws older demands on its lane
+    /// when its `supersede` adopts. On its own (a rerun's), it is live again and withdraws nothing.
+    Demand(Box<Demand>),
+    /// W24-R04's check of what an ended execution read came back, at an adopter's own commit.
+    Checked { leg: String, matched: bool },
     LegQueued(Box<LegIn>),
     /// After a restart: a leg the runner still runs (W05-R25).
     LegRunning { leg: Box<LegIn>, runner: String, attempt: u32 },
@@ -158,6 +263,10 @@ pub enum Input {
     PoolsChanged { pools: Vec<Pool>, reservations: Vec<Reservation> },
     /// The time a [`Command::Timer`] asked for.
     Tick,
+    /// What a runner holds warm (W24-R18), in place of what it held before: its workspaces, how
+    /// far each is behind and what warm runs took there, and its bandwidth. From the runners'
+    /// reports of their workspaces and the ledger's history.
+    Warm { runner: String, held: WarmHeld },
 }
 
 /// Why a leg waits (W05-R13): exactly one, the current one.
@@ -177,8 +286,81 @@ pub enum WaitReason {
     /// The runners or pool that could take it are kept for other legs until `until` (W05-R12).
     Reservation { reservation: String, until: i64 },
     /// Only `avoided` could take it, and it waits for another: as its retry policy asks
-    /// (`runner: different`), or as that one refused it (W05-R16).
-    OtherRunner { avoided: String, refused: bool },
+    /// (`runner: different`), as that one refused it (W05-R16), or as a person's retry asked
+    /// (`asked`, W05-R28).
+    OtherRunner {
+        avoided: String,
+        refused: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        asked: bool,
+    },
+    /// Only `runner` may run it, as a person's retry asked (W05-R28), and that runner can't take
+    /// it now.
+    Pinned { runner: String, state: PinnedState },
+    /// It adopted `leg` of `run`, the same work in flight, and waits for it to end (W28-R42).
+    Adopted { leg: String, run: String },
+    /// Held to coalesce a burst of its lane while the runners it needs are busy (W28-R61): until
+    /// its quiet period ends, never past `deadline` (unix ms).
+    Coalescing { lane: String, until: i64, deadline: i64 },
+    /// On its workflow's cadence (`every`, W28-R62): not before `next` (unix ms).
+    Cadence { lane: String, next: i64 },
+    /// Its lane's speculation window is full (W28-R68).
+    Speculation { lane: String, size: u32, in_flight: u32 },
+    /// It's heavy on I/O, and the runners that could take it are past admission's limits
+    /// (W24-R19): each, with its I/O pressure, the leg's limit there, its free disk and the floor.
+    Load { held: Vec<super::load::Held> },
+    /// It waits for `runner`, busy, where it's expected to finish `saves_s` seconds sooner than
+    /// where it could start now, until `until` (unix ms) at most: its `warm` or `affinity` term's
+    /// patience (W24-R18).
+    Warm { runner: String, saves_s: u64, until: i64 },
+    /// It asks for more than any runner that could take it has, even idle (resource mode,
+    /// W05-R03): what it asks, and what each of those runners has of what it's short of.
+    Oversized { asked: String, short: Vec<String> },
+}
+
+/// Why the runner a retry asked for can't take its leg now (W05-R28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PinnedState {
+    /// Every slot taken (or its room held by a reservation or another's exclusive leg).
+    Busy,
+    Draining,
+    Offline,
+    /// It no longer meets the leg's requirements.
+    Unable,
+}
+
+impl From<Held> for WaitReason {
+    fn from(h: Held) -> Self {
+        match h {
+            Held::Coalescing { lane, until, deadline } => WaitReason::Coalescing { lane, until, deadline },
+            Held::Cadence { lane, next } => WaitReason::Cadence { lane, next },
+            Held::Speculation { lane, size, in_flight } => WaitReason::Speculation { lane, size, in_flight },
+        }
+    }
+}
+
+/// A decision about a leg's work in demands (W28-R45), for its routing and its run's page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Decision {
+    /// What its ask got: it executes, adopts, or (its run withdrawn) is dropped (W28-R42).
+    Asked(Ask),
+    /// What becomes of its execution: kept, dropped, run on, finished or cancelled (W28-R43).
+    Fate(Fate),
+    /// What it does once the execution it adopted ended, or its check came back (W28-R44).
+    Next(Next),
+}
+
+impl Decision {
+    /// Why, in words.
+    pub fn why(&self) -> String {
+        match self {
+            Decision::Asked(a) => a.why(),
+            Decision::Fate(f) => f.why(),
+            Decision::Next(n) => n.why(),
+        }
+    }
 }
 
 /// What to do.
@@ -210,17 +392,30 @@ pub enum Command {
     /// The leg is done for good: the plan hears of it now.
     Settled { leg: String, outcome: Outcome, reason: Option<String> },
     Timer { at: i64 },
+    /// What became of a leg's work in demands, and why (W28-R45).
+    Demand { leg: String, decision: Decision },
+    /// An adopter's execution ended: it's done, reused from `from`, as `from` ended (W28-R44).
+    Adopted { leg: String, from: String, outcome: Outcome },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum State {
     /// Waiting in its concurrency group.
     Pending,
+    /// Held by admission (W28-R60).
+    Held,
     Queued,
     Retrying { at: i64 },
     Assigned { runner: String },
+    /// It adopted `exec` (W28-R42): it waits for it, holding no runner, slot or quota.
+    Adopted { exec: String },
+    /// `from` ended as `outcome`, and it checks what `from` read first (W24-R04).
+    Checking { from: String, outcome: Outcome },
     Done,
 }
+
+/// How long a leg a person's retry placed on a runner waits when that runner refuses it (W05-R28).
+pub const REFUSED_AGAIN_MS: i64 = 15_000;
 
 /// Why a leg stays off a runner (W05-R16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +437,12 @@ struct Leg {
     attempt: u32,
     /// When it was (last) queued, for aging.
     queued_at: i64,
-    key: Option<(i64, u64, u64)>,
+    /// When it arrived: a leg admission held counts its wait from then.
+    arrived: i64,
+    /// Its place: priority, fair-share start, arrival.
+    key: Option<(u8, u64, u64)>,
+    /// Counted among its fair-share levels' active members (W28-R66).
+    counted: bool,
     reason: Option<WaitReason>,
     /// A runner it stays off, and why (W05-R16).
     avoid: Option<(String, Off)>,
@@ -252,6 +452,26 @@ struct Leg {
     cancelling: Option<String>,
     /// Gone with its repository while it ran: its attempt's end frees its runner, nothing else.
     gone: bool,
+    /// When its attempt started (unix ms), while one runs: how long it has left (W28-R43).
+    started: Option<i64>,
+    /// The busy warm runner it waits for (W24-R18).
+    hold: Option<Hold>,
+    /// It waited for a warm runner in this attempt, and doesn't again.
+    held: bool,
+    /// While it runs: when it's expected to end (unix ms), so its runner has room again.
+    ends: Option<i64>,
+}
+
+/// A leg's wait for a busy runner where it would finish sooner (W24-R18).
+#[derive(Debug, Clone, PartialEq)]
+struct Hold {
+    runner: String,
+    /// The runner's name, as the wait reason says it.
+    name: String,
+    saves_s: u64,
+    until: i64,
+    /// The seconds it's expected to take there: another runner where it takes no longer will do.
+    there_s: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -261,14 +481,104 @@ struct Runner {
     used: Resources,
     connected: bool,
     draining: bool,
-    exclusive: bool,
+}
+
+/// What an exclusive leg holds of its runner (W05-R03): asking for CPUs, those and the memory it
+/// asks, for itself alone, other legs running in the rest; asking for none, or on a runner whose
+/// size isn't known, the whole runner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Claim {
+    Share(Resources),
+    Whole,
+}
+
+fn claim(l: &LegIn, size: Option<Resources>) -> Option<Claim> {
+    if !l.exclusive {
+        return None;
+    }
+    Some(if l.request.cpu > 0.0 && size.is_some() { Claim::Share(l.request) } else { Claim::Whole })
+}
+
+/// A runner's own size: its CPUs (threads) and memory, as it offers them in resource mode or else
+/// as its facts say; `None` when they don't.
+fn size(r: &Runner) -> Option<Resources> {
+    if let Some(c) = r.input.capacity {
+        return (c.cpu > 0.0).then_some(c);
+    }
+    let f = &r.input.view.facts;
+    let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
+    (cpus > 0 && f.mem.total > 0).then(|| Resources { cpu: f64::from(cpus), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
+}
+
+/// What a leg coming to a runner holds of it (W05-R03): nothing of its own, the whole runner, or
+/// a share of its CPUs and memory.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Incoming {
+    Ordinary,
+    Whole,
+    Share(Resources),
+}
+
+impl Incoming {
+    /// An exclusive leg asking for CPUs holds them and the memory it asks; asking for none, the
+    /// whole runner; any other leg, nothing.
+    pub fn of(exclusive: bool, request: &Resources) -> Self {
+        match (exclusive, request.cpu > 0.0) {
+            (false, _) => Incoming::Ordinary,
+            (true, true) => Incoming::Share(*request),
+            (true, false) => Incoming::Whole,
+        }
+    }
+}
+
+/// The rule both dispatchers and a runner's own admission use, counting in slots (W05-R03):
+/// whether a runner of `slots` and `size` (its CPUs and memory; `None` not known) has room for
+/// one more, its exclusive legs holding `held` (one holding it `whole`), `ordinary` of its
+/// `running` legs running beside them. An ordinary leg takes a slot of what isn't held; one
+/// holding the whole runner needs it empty; a share needs as much neither held nor taken by the
+/// ordinary legs there (a slot's share each), never more than the runner is, and on a runner
+/// whose size isn't known, the runner empty.
+pub fn room(slots: u32, size: Option<Resources>, held: &Resources, whole: bool, ordinary: usize, running: usize, incoming: Incoming) -> bool {
+    if whole {
+        return false;
+    }
+    match incoming {
+        Incoming::Ordinary => ordinary < slots_left(slots, size, held),
+        Incoming::Whole => running == 0,
+        Incoming::Share(q) => {
+            let Some(s) = size else { return running == 0 };
+            let each = 1.0 / f64::from(slots.max(1));
+            let (cpu, mem) = (ordinary as f64 * s.cpu * each, (ordinary as f64 * s.mem as f64 * each) as u64);
+            held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
+        }
+    }
+}
+
+/// The slots a runner keeps for ordinary legs beside what's held of it: its slots in the share of
+/// its CPUs and memory no exclusive leg holds.
+pub fn slots_left(slots: u32, size: Option<Resources>, held: &Resources) -> usize {
+    let slots = slots.max(1) as usize;
+    let Some(s) = size else { return slots };
+    if held.cpu <= 0.0 && held.mem == 0 {
+        return slots;
+    }
+    let cpu = ((s.cpu - held.cpu) / s.cpu).clamp(0.0, 1.0);
+    let mem = if s.mem == 0 { 1.0 } else { (s.mem.saturating_sub(held.mem) as f64 / s.mem as f64).clamp(0.0, 1.0) };
+    (slots as f64 * cpu.min(mem) + 1e-9).floor() as usize
 }
 
 #[derive(Debug, Clone, Default)]
 struct Sig {
     req: Requirement,
     eligible: BTreeSet<String>,
-    queue: BTreeSet<(i64, u64, u64, String)>,
+    /// Its legs queued, by priority, each ordered by fair-share start and arrival.
+    queue: BTreeMap<u8, BTreeSet<(u64, u64, String)>>,
+}
+
+impl Sig {
+    fn len(&self) -> usize {
+        self.queue.values().map(BTreeSet::len).sum()
+    }
 }
 
 /// The scheduler.
@@ -296,11 +606,30 @@ pub struct Scheduler {
     /// The reservations' windows open now (index, end), and when they're next looked at (W05-R12).
     windows: Vec<(usize, i64)>,
     windows_at: Option<i64>,
+    /// Demands and the work in flight (W28-R40 to R45).
+    demands: Demands,
+    /// Each leg's last decision in demands, said once.
+    decided: HashMap<String, Decision>,
+    /// What waits to be admitted, and what admission knows of the legs it let through (W28-R60).
+    admit: Admit,
+    /// Runners kept from other work while an exclusive leg on a cadence waits for them (W28-R62):
+    /// runner, leg.
+    drained: BTreeMap<String, String>,
+    /// Exclusive legs on a cadence that are queued.
+    cadenced: BTreeSet<String>,
+    /// Fair share's active members under each parent, and their legs (W28-R66): `repo` →
+    /// actors, `repo\0actor` → lanes.
+    members: HashMap<String, HashMap<String, usize>>,
+    /// What each runner holds warm, by runner (W24-R18).
+    warm: HashMap<String, WarmHeld>,
+    /// The time of the last input: explanations reckon waits from it.
+    now: i64,
 }
 
 impl Scheduler {
     pub fn new(cfg: Config) -> Scheduler {
-        Scheduler { cfg, ..Scheduler::default() }
+        let admit = Admit::new(cfg.window);
+        Scheduler { cfg, admit, ..Scheduler::default() }
     }
 
     fn config(&self) -> &Config {
@@ -310,6 +639,7 @@ impl Scheduler {
     /// Handles one input at `now` (unix milliseconds).
     pub fn handle(&mut self, input: Input, now: i64) -> Vec<Command> {
         let mut out = Vec::new();
+        self.now = now;
         // Reservations' windows that opened or closed since: what may run where changes.
         if !self.cfg.reservations.is_empty() && self.windows_at.is_none_or(|at| now >= at) {
             self.refresh_windows(now, &mut out);
@@ -325,19 +655,48 @@ impl Scheduler {
                         self.group_action(a, now, &mut out);
                     }
                 }
+                self.demands.leave(&run);
+            }
+            Input::Demand(d) => {
+                let _ = self.demands.arrive(*d, false);
+            }
+            Input::Checked { leg, matched } => {
+                let outcome = match self.legs.get(&leg).map(|l| &l.state) {
+                    Some(State::Checking { outcome, .. }) => Some(outcome.clone()),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome
+                    && let Some(next) = self.demands.checked(&leg, matched)
+                {
+                    self.next_for(&leg, next, Some(&outcome), now, &mut out);
+                }
             }
             Input::LegQueued(leg) => self.leg_queued(*leg, now, &mut out),
-            Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt),
+            Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt, now, &mut out),
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
             Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
             Input::Rejected { leg } => {
                 if let Some(runner) = self.release(&leg) {
+                    self.stopped(&leg);
                     self.discard_used(&leg, &mut out);
-                    if let Some(l) = self.legs.get_mut(&leg) {
-                        l.avoid = Some((runner.clone(), Off::Refused));
+                    // Refused by the runner a person's retry asked for (W05-R28): only it may run
+                    // the leg, so it's asked again in a while, as v1 offers a declined job again.
+                    if self.legs.get(&leg).is_some_and(|l| l.input.placement.runner.as_deref() == Some(runner.as_str())) {
+                        let at = now + REFUSED_AGAIN_MS;
+                        if let Some(l) = self.legs.get_mut(&leg) {
+                            l.state = State::Retrying { at };
+                        }
+                        self.timers.entry(at).or_default().push(leg.clone());
+                        out.push(Command::Timer { at });
+                        let name = self.runners.get(&runner).map_or_else(|| runner.clone(), |r| r.input.view.name.clone());
+                        self.set_reason(&leg, WaitReason::Pinned { runner: name, state: PinnedState::Busy }, &mut out);
+                    } else {
+                        if let Some(l) = self.legs.get_mut(&leg) {
+                            l.avoid = Some((runner.clone(), Off::Refused));
+                        }
+                        self.enqueue(&leg, now, &mut out);
                     }
-                    self.enqueue(&leg, now, &mut out);
                     self.try_runner(&runner, now, &mut out);
                 }
             }
@@ -347,6 +706,7 @@ impl Scheduler {
                 if let Some(r) = self.runners.get_mut(&runner) {
                     r.draining = true;
                 }
+                self.release_holds(now, &mut out);
                 self.try_avoided(now, &mut out);
             }
             Input::RulesChanged(rules) => self.rules_changed(rules, now, &mut out),
@@ -368,19 +728,25 @@ impl Scheduler {
                 self.scale_all(now, &mut out);
             }
             Input::Tick => self.tick(now, &mut out),
+            Input::Warm { runner, held } => self.warm_changed(runner, held),
         }
         out
     }
 
     fn run_queued(&mut self, run: String, group: Option<(String, String, GroupConfig)>, supersede: Option<(String, Supersede)>, now: i64, out: &mut Vec<Command>) {
         if let Some((key, action)) = supersede {
-            let older = self.superseding.entry(key).or_default();
-            let olds: Vec<String> = std::mem::take(older);
-            older.push(run.clone());
-            for o in olds {
-                match action {
-                    Supersede::Cancel => out.push(Command::CancelRun { run: o, reason: "superseded by a newer run".into() }),
-                    Supersede::Deprioritize => self.deprioritize(&o),
+            if action == Supersede::Adopt {
+                self.withdraw(&run, key, now, out);
+            } else {
+                let older = self.superseding.entry(key).or_default();
+                let olds: Vec<String> = std::mem::take(older);
+                older.push(run.clone());
+                for o in olds {
+                    if action == Supersede::Cancel {
+                        out.push(Command::CancelRun { run: o, reason: "superseded by a newer run".into() });
+                    } else {
+                        self.deprioritize(&o);
+                    }
                 }
             }
         }
@@ -415,7 +781,7 @@ impl Scheduler {
                 if let Some(run) = m.strip_prefix("run:") {
                     out.push(Command::StartRun { run: run.to_owned() });
                 } else if let Some(leg) = m.strip_prefix("leg:") {
-                    self.enqueue(leg, now, out);
+                    self.arrive(leg, now, out);
                 }
             }
             GroupAction::Cancel { member, running, reason } => {
@@ -431,8 +797,11 @@ impl Scheduler {
                         }
                     } else {
                         self.unqueue(&leg);
-                        let _ = self.legs.remove(&leg);
-                        out.push(Command::Settled { leg, outcome: Outcome::Cancelled, reason: Some(reason) });
+                        if let Some(l) = self.legs.remove(&leg) {
+                            self.uncount(&l);
+                        }
+                        out.push(Command::Settled { leg: leg.clone(), outcome: Outcome::Cancelled, reason: Some(reason) });
+                        self.left_admission(&leg, None, now, out);
                     }
                 }
             }
@@ -488,7 +857,7 @@ impl Scheduler {
         let group = input.group.clone();
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false },
+            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -502,11 +871,114 @@ impl Scheduler {
                     self.set_reason(&id, WaitReason::Concurrency { group: name, holders }, out);
                 }
             }
-            None => self.enqueue(&id, now, out),
+            None => self.arrive(&id, now, out),
         }
     }
 
-    fn adopt(&mut self, input: LegIn, runner: String, attempt: u32) {
+    // ------------------------------------------------------------------ admission (W28-R60)
+
+    /// A leg ready to queue goes through admission first, when its workflow asks for it.
+    fn arrive(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(d) = self.legs.get(id).and_then(|l| l.input.admission.clone()) else { return self.enqueue(id, now, out) };
+        if let Some(l) = self.legs.get_mut(id) {
+            l.arrived = now;
+        }
+        let saturated = self.saturated(id);
+        let ds = self.admit.arrive(id, d, saturated, now);
+        self.admitted(ds, now, out);
+    }
+
+    /// Whether a leg would wait for capacity now: no runner that could take it has room for it.
+    fn saturated(&self, id: &str) -> bool {
+        let Some(l) = self.legs.get(id) else { return false };
+        let Some(s) = self.sigs.get(&l.sig) else { return true };
+        !s.eligible.iter().filter_map(|r| self.runners.get(r)).any(|r| self.fits(r, l))
+    }
+
+    /// Carries out admission's decisions.
+    fn admitted(&mut self, ds: Vec<admit::Decision>, now: i64, out: &mut Vec<Command>) {
+        // A leg that takes the place of one on the cadence keeps that one's wait.
+        let mut inherit: HashMap<String, i64> = HashMap::new();
+        for d in ds {
+            match d {
+                admit::Decision::Admit { id } => {
+                    let Some(l) = self.legs.get(&id) else { continue };
+                    if !matches!(l.state, State::Pending | State::Held) {
+                        continue;
+                    }
+                    let since = inherit.get(&id).copied().map_or(l.arrived, |t| t.min(l.arrived));
+                    self.enqueue_since(&id, now, since, out);
+                }
+                admit::Decision::Hold { id, held } => {
+                    if let Some(l) = self.legs.get_mut(&id) {
+                        l.state = State::Held;
+                    }
+                    self.set_reason(&id, held.into(), out);
+                }
+                admit::Decision::Skip { id, by, why } => {
+                    let Some(l) = self.legs.get(&id) else { continue };
+                    let (queued, since) = (l.state == State::Queued, l.queued_at);
+                    if why == Skipped::Cadence && queued {
+                        inherit.insert(by.clone(), since);
+                    }
+                    let run = self.legs.get(&by).map_or(by.clone(), |b| b.input.run.clone());
+                    let reason = match why {
+                        Skipped::Coalesced => format!("coalesced into run {run}, newer in its lane, while the runners it needs were busy"),
+                        Skipped::Cadence => format!("skipped by its workflow's cadence for run {run}, newer in its lane"),
+                    };
+                    if queued {
+                        self.unqueue(&id);
+                    }
+                    self.settle(&id, Outcome::Cancelled, Some(reason), now, out);
+                }
+                admit::Decision::Timer { at } => {
+                    self.timers.entry(at).or_default();
+                    out.push(Command::Timer { at });
+                }
+            }
+        }
+    }
+
+    /// Lets go what admission held that may go now: its time came, the runners it needs freed, or
+    /// its window has room.
+    fn review_admission(&mut self, now: i64, out: &mut Vec<Command>) {
+        self.refresh_drains();
+        if self.admit.idle() {
+            return;
+        }
+        let free: BTreeSet<String> = self.admit.coalescing().filter(|id| !self.saturated(id)).map(str::to_owned).collect();
+        let ds = self.admit.review(now, &|id| free.contains(id));
+        self.admitted(ds, now, out);
+    }
+
+    /// Exclusive legs on a cadence each keep one runner from other work until it's theirs
+    /// (W28-R62): the least busy that could take them, then by name.
+    fn refresh_drains(&mut self) {
+        if self.drained.is_empty() && self.cadenced.is_empty() {
+            return;
+        }
+        let legs = &self.legs;
+        let runners = &self.runners;
+        self.cadenced.retain(|id| legs.get(id).is_some_and(|l| l.state == State::Queued));
+        let cadenced = &self.cadenced;
+        self.drained.retain(|r, id| cadenced.contains(id) && runners.get(r).is_some_and(|x| x.connected && !x.draining));
+        let waiting: Vec<String> = self.cadenced.iter().filter(|id| !self.drained.values().any(|l| l == *id)).cloned().collect();
+        for id in waiting {
+            let Some(s) = self.legs.get(&id).and_then(|l| self.sigs.get(&l.sig)) else { continue };
+            let target = s
+                .eligible
+                .iter()
+                .filter_map(|r| self.runners.get(r))
+                .filter(|r| r.connected && !r.draining && !self.drained.contains_key(&r.input.id))
+                .min_by(|a, b| a.running.len().cmp(&b.running.len()).then_with(|| a.input.id.cmp(&b.input.id)))
+                .map(|r| r.input.id.clone());
+            if let Some(t) = target {
+                self.drained.insert(t, id);
+            }
+        }
+    }
+
+    fn adopt(&mut self, input: LegIn, runner: String, attempt: u32, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
         let req = self.requirement(&input);
         let sig = req.signature();
@@ -516,6 +988,7 @@ impl Scheduler {
         }
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
+        let (work, run, priority, started) = (input.work.clone(), input.run.clone(), input.priority, input.started);
         self.legs.insert(
             id.clone(),
             Leg {
@@ -525,19 +998,41 @@ impl Scheduler {
                 state: State::Assigned { runner: runner.clone() },
                 attempt,
                 queued_at: 0,
+                arrived: 0,
                 key: None,
+                counted: false,
                 reason: None,
                 avoid: None,
                 pin: None,
                 last_runner: Some(runner.clone()),
                 cancelling: None,
                 gone: false,
+                started,
+                hold: None,
+                held: false,
+                ends: None,
             },
         );
+        // When it started isn't known: it's expected to take its whole run from now (W24-R18).
+        let ends = self.legs.get(&id).map(|l| now.saturating_add(ms(self.expected_s(l, &runner))));
+        if let Some(l) = self.legs.get_mut(&id) {
+            l.ends = ends;
+        }
         // The runner may not have reconnected yet: keep what it runs until it does.
-        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, exclusive: false });
-        r.running.push(id);
+        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false });
+        r.running.push(id.clone());
         add(&mut r.used, &request);
+        // W28-R42: what its runner still runs is the execution of its work. A queued duplicate
+        // asked for before this was announced adopts it instead, with its adopters.
+        let Some(work) = work else { return };
+        if let Running::Took { .. } = self.demands.running(&id, &run, &work, priority, started.unwrap_or(now)) {
+            for a in self.demands.adopters(&id).into_iter().map(str::to_owned).collect::<Vec<_>>() {
+                if self.legs.get(&a).is_some_and(|l| l.state != State::Adopted { exec: id.clone() }) {
+                    self.decide(&a, Decision::Asked(Ask::Adopt { exec: id.clone(), run: run.clone() }), out);
+                    self.adopted(&a, id.clone(), run.clone(), now, out);
+                }
+            }
+        }
     }
 
     fn ensure_sig(&mut self, sig: &str, req: &Requirement) {
@@ -545,32 +1040,68 @@ impl Scheduler {
             return;
         }
         let eligible: BTreeSet<String> = self.runners.iter().filter(|(_, r)| self.eligible_for(req, r)).map(|(k, _)| k.clone()).collect();
-        self.sigs.insert(sig.to_owned(), Sig { req: req.clone(), eligible, queue: BTreeSet::new() });
+        self.sigs.insert(sig.to_owned(), Sig { req: req.clone(), eligible, queue: BTreeMap::new() });
     }
 
     fn weight(&self, repo: &str) -> f64 {
         self.config().weights.get(repo).copied().filter(|w| *w > 0.0).unwrap_or(1.0)
     }
 
-    /// Puts a leg in its signature's queue and tries the runners that could take it.
+    /// Puts a leg in its signature's queue and tries the runners that could take it. A leg with
+    /// work first adopts the execution of its key in flight, if there's one its domain may adopt
+    /// (W28-R42); live work that can't be placed then contends for the capacity of work no one
+    /// wants (W28-R43).
     fn enqueue(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        self.enqueue_since(id, now, now, out);
+    }
+
+    /// [`Self::enqueue`], its wait counted from `since` (a leg admission held, from its arrival).
+    fn enqueue_since(&mut self, id: &str, now: i64, since: i64, out: &mut Vec<Command>) {
         let Some(leg) = self.legs.get(id) else { return };
         if leg.state == State::Done {
             return;
         }
-        let (repo, cost) = (leg.input.repo.clone(), leg.input.cost.unwrap_or(self.config().default_cost));
-        // Start-time fair queuing across repositories (W05-R10).
-        let start = self.vtime.max(self.finish.get(&repo).copied().unwrap_or(0.0));
-        self.finish.insert(repo.clone(), start + cost / self.weight(&repo));
+        if let Some(work) = leg.input.work.clone()
+            && !self.demands.is_execution(id)
+        {
+            let (run, priority) = (leg.input.run.clone(), leg.input.priority);
+            let ask = self.demands.ask(id, &run, &work, priority);
+            self.decide(id, Decision::Asked(ask.clone()), out);
+            match ask {
+                Ask::Adopt { exec, run } => return self.adopted(id, exec, run, now, out),
+                Ask::Drop => return self.settle(id, Outcome::Cancelled, Some(Ask::Drop.why()), now, out),
+                Ask::Execute => {}
+            }
+        }
+        self.queue(id, now, since, out);
+        if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
+            self.contend(id, now, out);
+        }
+    }
+
+    fn queue(&mut self, id: &str, now: i64, since: i64, out: &mut Vec<Command>) {
+        let Some(leg) = self.legs.get(id) else { return };
+        let cost = leg.input.cost.unwrap_or(self.config().default_cost);
+        let cadenced = leg.input.exclusive && leg.input.admission.as_ref().is_some_and(|a| a.cadence.is_some());
+        self.count(id);
+        // Start-time fair queuing across repositories (W05-R10), and inside each by actor and lane
+        // as `fair_by` says (W28-R66).
+        let (flow, weight) = self.flow(id);
+        let start = self.vtime.max(self.finish.get(&flow).copied().unwrap_or(0.0));
+        self.finish.insert(flow, start + cost / weight);
         if let Some(l) = self.legs.get_mut(id) {
-            l.queued_at = now;
+            l.queued_at = since;
         }
         self.set_key(id, (start * 1000.0) as u64);
         self.insert_queue(id);
-        // The runners with room, best first.
+        if cadenced {
+            self.cadenced.insert(id.to_owned());
+            self.refresh_drains();
+        }
+        // The runners with room, best first; none once it waits for a busy warm one (W24-R18).
         let candidates = self.candidates(id);
         for r in candidates {
-            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
+            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
                 break;
             }
             self.try_runner(&r, now, out);
@@ -584,35 +1115,108 @@ impl Scheduler {
         }
     }
 
-    /// The queue key: aged priority (higher first; `priority − aging × minutes since queued`, an
-    /// order that holds as time passes), fair-share start, arrival.
+    /// The queue key: its priority, fair-share start, arrival. Aging is applied between
+    /// priorities as legs are picked ([`Self::try_runner`]).
     fn set_key(&mut self, id: &str, fair: u64) {
-        let aging = self.config().aging_per_minute;
         self.seq += 1;
         let seq = self.seq;
         if let Some(l) = self.legs.get_mut(id) {
-            let minutes = l.queued_at as f64 / 60_000.0;
-            let bucket = (f64::from(l.input.priority) - aging * minutes).floor() as i64;
-            l.key = Some((bucket.saturating_neg(), fair, seq));
+            l.key = Some((l.input.priority, fair, seq));
             l.state = State::Queued;
         }
     }
 
     fn insert_queue(&mut self, id: &str) {
         let Some(l) = self.legs.get(id) else { return };
-        let Some((a, b, c)) = l.key else { return };
+        let Some((p, f, q)) = l.key else { return };
         let sig = l.sig.clone();
         if let Some(s) = self.sigs.get_mut(&sig) {
-            s.queue.insert((a, b, c, id.to_owned()));
+            s.queue.entry(p).or_default().insert((f, q, id.to_owned()));
         }
     }
 
     fn unqueue(&mut self, id: &str) {
         let Some(l) = self.legs.get(id) else { return };
-        let Some((a, b, c)) = l.key else { return };
+        let Some((p, f, q)) = l.key else { return };
         let sig = l.sig.clone();
-        if let Some(s) = self.sigs.get_mut(&sig) {
-            s.queue.remove(&(a, b, c, id.to_owned()));
+        if let Some(s) = self.sigs.get_mut(&sig)
+            && let Some(sub) = s.queue.get_mut(&p)
+        {
+            sub.remove(&(f, q, id.to_owned()));
+            if sub.is_empty() {
+                s.queue.remove(&p);
+            }
+        }
+    }
+
+    /// A leg's fair-share flow and its weight (W05-R10, W28-R66): its repository's weight, split
+    /// equally among the repository's active actors, and an actor's among its active lanes, as far
+    /// as `fair_by` goes.
+    fn flow(&self, id: &str) -> (String, f64) {
+        let Some(l) = self.legs.get(id) else { return (String::new(), 1.0) };
+        let repo = l.input.repo.clone();
+        let mut weight = self.weight(&repo);
+        let mut path = repo;
+        for level in self.config().fair_by.iter().skip_while(|f| **f == FairBy::Repo) {
+            let member = match level {
+                FairBy::Actor => l.input.actor.as_str(),
+                FairBy::Lane => l.input.lane.as_str(),
+                FairBy::Repo => continue,
+            };
+            let active = self.members.get(&path).map_or(1, |m| m.len().max(1));
+            weight /= active as f64;
+            path = format!("{path}\0{member}");
+        }
+        (path, weight)
+    }
+
+    /// The members path of a leg's levels below its repository: (parent, member) per level.
+    fn levels(&self, l: &Leg) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut path = l.input.repo.clone();
+        for level in self.config().fair_by.iter().skip_while(|f| **f == FairBy::Repo) {
+            let member = match level {
+                FairBy::Actor => l.input.actor.clone(),
+                FairBy::Lane => l.input.lane.clone(),
+                FairBy::Repo => continue,
+            };
+            out.push((path.clone(), member.clone()));
+            path = format!("{path}\0{member}");
+        }
+        out
+    }
+
+    /// Counts a leg among its levels' active members, once (W28-R66).
+    fn count(&mut self, id: &str) {
+        let Some(l) = self.legs.get(id) else { return };
+        if l.counted {
+            return;
+        }
+        for (parent, member) in self.levels(l) {
+            *self.members.entry(parent).or_default().entry(member).or_default() += 1;
+        }
+        if let Some(l) = self.legs.get_mut(id) {
+            l.counted = true;
+        }
+    }
+
+    /// A leg gone: no longer among its levels' active members.
+    fn uncount(&mut self, l: &Leg) {
+        if !l.counted {
+            return;
+        }
+        for (parent, member) in self.levels(l) {
+            if let Some(m) = self.members.get_mut(&parent) {
+                if let Some(n) = m.get_mut(&member) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        m.remove(&member);
+                    }
+                }
+                if m.is_empty() {
+                    self.members.remove(&parent);
+                }
+            }
         }
     }
 
@@ -622,8 +1226,7 @@ impl Scheduler {
         let Some(l) = self.legs.get(id) else { return Vec::new() };
         let Some(s) = self.sigs.get(&l.sig) else { return Vec::new() };
         let rooms: Vec<&Runner> = s.eligible.iter().filter_map(|r| self.runners.get(r)).filter(|r| self.fits(r, l)).collect();
-        let views: Vec<&RunnerView> = rooms.iter().map(|r| &r.input.view).collect();
-        let scores = routing::scores(&l.req.prefer, &views);
+        let scores = self.scores(l, &rooms, None);
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
         order.sort_by(|(i, a), (j, b)| {
             let (sa, sb) = (scores.get(*i).copied().unwrap_or(0.0), scores.get(*j).copied().unwrap_or(0.0));
@@ -632,10 +1235,10 @@ impl Scheduler {
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
 
-    /// Whether a runner other than `avoided` could take a leg: one connected, eligible for it and
-    /// not draining, with room now or not.
+    /// Whether a runner other than `avoided` could take a leg: one connected, eligible for it, not
+    /// draining and allowed by its placement, with room now or not.
     fn another_could(&self, l: &Leg, avoided: &str) -> bool {
-        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && self.runners.get(id).is_some_and(|r| !r.draining)))
+        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && l.input.placement.allows(id) && self.runners.get(id).is_some_and(|r| !r.draining)))
     }
 
     /// Tries again the runners that queued legs stay off only while another could take them
@@ -647,8 +1250,55 @@ impl Scheduler {
         }
     }
 
+    /// What a runner's legs hold of it now: the share its exclusive legs hold, whether one holds
+    /// it whole, and how many ordinary legs of its own run beside them (a pool's legs run in their
+    /// executors). Read from the legs it runs, so a leg adopted after a restart holds as it did.
+    fn holding(&self, r: &Runner) -> (Resources, bool, usize) {
+        let size = size(r);
+        let mut held = Resources::default();
+        let (mut whole, mut ordinary) = (false, 0);
+        for id in &r.running {
+            let Some(l) = self.legs.get(id) else {
+                ordinary += 1;
+                continue;
+            };
+            if l.req.pool.is_some() {
+                continue;
+            }
+            match claim(&l.input, size) {
+                Some(Claim::Share(q)) => add(&mut held, &q),
+                Some(Claim::Whole) => whole = true,
+                None => ordinary += 1,
+            }
+        }
+        (held, whole, ordinary)
+    }
+
+    /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a
+    /// busy warm runner, it's that one or one where the leg would take no longer (W24-R18).
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
-        if !r.connected || r.draining || r.exclusive {
+        self.room(r, l) && l.hold.as_ref().is_none_or(|h| h.runner == r.input.id || self.estimate(l, &r.input.id, &Self::wants(l)).busy_s() <= h.there_s)
+    }
+
+    /// Whether a runner could take a leg now: it would ([`Self::admits`]), and has room for it
+    /// ([`Self::capacity`]).
+    fn room(&self, r: &Runner, l: &Leg) -> bool {
+        self.admits(r, l) && self.capacity(r, l)
+    }
+
+    /// Whether a runner would take a leg once it has room: connected, not draining, not past
+    /// admission's limits for a heavy leg (W24-R19), not kept for other legs, not one the leg stays
+    /// off, the one it's pinned to, and the repository within its quota.
+    fn admits(&self, r: &Runner, l: &Leg) -> bool {
+        if !r.connected || r.draining {
+            return false;
+        }
+        // A heavy leg isn't started on a runner past admission's limits (W24-R19).
+        if self.held_by_load(r, l).is_some() {
+            return false;
+        }
+        // Kept for an exclusive leg on a cadence (W28-R62).
+        if self.drained.get(&r.input.id).is_some_and(|owner| *owner != l.input.id) {
             return false;
         }
         if self.reserved_against(r, l).is_some() {
@@ -656,6 +1306,8 @@ impl Scheduler {
         }
         if let Some((a, off)) = &l.avoid
             && *a == r.input.id
+            // The runner a person's retry asked for (W05-R28): the leg waits for it, not another.
+            && l.input.placement.runner.as_deref() != Some(a.as_str())
             && (*off != Off::Lost || self.another_could(l, a))
         {
             return false;
@@ -663,12 +1315,24 @@ impl Scheduler {
         if l.pin.as_deref().is_some_and(|p| p != r.input.id) {
             return false;
         }
-        if l.input.exclusive && !r.running.is_empty() {
+        if !l.input.placement.allows(&r.input.id) {
             return false;
         }
         if let Some(q) = self.config().quotas.get(&l.input.repo)
             && self.in_progress.get(&l.input.repo).copied().unwrap_or(0) >= *q
         {
+            return false;
+        }
+        true
+    }
+
+    /// Whether a runner has room for a leg now: none while an exclusive leg holds it whole; one of
+    /// a pool's idle executors there for a pool's leg; for an exclusive leg, the whole runner
+    /// empty when it asks for nothing, else a share of what no other share holds and the ordinary
+    /// legs there don't take; for an ordinary leg, a slot or the resources beside what's held.
+    fn capacity(&self, r: &Runner, l: &Leg) -> bool {
+        let (held, whole, ordinary) = self.holding(r);
+        if whole {
             return false;
         }
         // A pool's leg runs in one of its idle executors on that host: one made for it when it
@@ -678,63 +1342,138 @@ impl Scheduler {
             return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own);
         }
         let c = self.config();
+        let size = size(r);
+        match claim(&l.input, size) {
+            // The whole runner: it waits for it to be empty.
+            Some(Claim::Whole) => return r.running.is_empty(),
+            // A share: what it holds is its own, so of the runner's CPUs and memory that no other
+            // share holds and the ordinary legs there don't take, never more than the runner is.
+            Some(Claim::Share(q)) => {
+                let Some(s) = size else { return false };
+                return match (c.resources, r.input.capacity) {
+                    (true, Some(_)) => {
+                        let (cpu, mem) = ((r.used.cpu - held.cpu).max(0.0), r.used.mem.saturating_sub(held.mem));
+                        held.cpu + cpu + q.cpu <= s.cpu + 1e-9 && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
+                    }
+                    _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Share(q)),
+                };
+            }
+            None => {}
+        }
+        // An ordinary leg: in what no exclusive leg holds.
         match (c.resources, r.input.capacity) {
             (true, Some(cap)) => {
                 let q = &l.input.request;
-                r.used.cpu + q.cpu <= cap.cpu * c.overcommit_cpu
-                    && (r.used.mem + q.mem) as f64 <= cap.mem as f64 * c.overcommit_mem
+                (r.used.cpu - held.cpu).max(0.0) + q.cpu <= (cap.cpu - held.cpu).max(0.0) * c.overcommit_cpu
+                    && (r.used.mem.saturating_sub(held.mem) + q.mem) as f64 <= cap.mem.saturating_sub(held.mem) as f64 * c.overcommit_mem
                     && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
                     && r.used.gpu + q.gpu <= cap.gpu
             }
-            _ => self.own_legs(r) < r.input.slots.max(1) as usize,
+            _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Ordinary),
         }
     }
 
-    /// The legs a runner runs in its own slots (a pool's run in their executors).
-    fn own_legs(&self, r: &Runner) -> usize {
-        r.running.iter().filter(|x| !self.legs.get(*x).is_some_and(|l| l.req.pool.is_some())).count()
+    /// What holds a heavy leg off a runner by the runner's load, when admission is on (W24-R19).
+    fn held_by_load(&self, r: &Runner, l: &Leg) -> Option<super::load::Held> {
+        super::load::held(self.cfg.admission.as_ref(), &l.input.load, l.input.cost, &r.input.view.name, &r.input.view.facts)
     }
 
-    /// Gives a runner the best queued legs that fit it, until none does.
+    /// When not one of the runners that could take `l` (`eligible`) could hold it even idle, in
+    /// resource mode: what each has of what it's short of ("small has 16 GiB of memory"), by name.
+    /// `None` when one could, or one counts slots.
+    fn oversized(&self, eligible: &[&Runner], l: &Leg) -> Option<Vec<String>> {
+        let c = self.config();
+        if !c.resources {
+            return None;
+        }
+        let q = &l.input.request;
+        let mut short = Vec::new();
+        for r in eligible {
+            let cap = r.input.capacity?;
+            let mut has = Vec::new();
+            if q.cpu > cap.cpu * c.overcommit_cpu {
+                has.push(needs::cpus(cap.cpu));
+            }
+            if q.mem as f64 > cap.mem as f64 * c.overcommit_mem {
+                has.push(format!("{} of memory", needs::show_size(cap.mem)));
+            }
+            if q.disk as f64 > cap.disk as f64 * c.overcommit_disk {
+                has.push(format!("{} of disk", needs::show_size(cap.disk)));
+            }
+            if q.gpu > cap.gpu {
+                has.push(needs::gpus(cap.gpu));
+            }
+            if has.is_empty() {
+                return None;
+            }
+            short.push(format!("{} has {}", r.input.view.name, has.join(", ")));
+        }
+        short.sort();
+        Some(short)
+    }
+
+    /// Gives a runner the best queued legs that fit it, until none does: of each signature's
+    /// priorities the effective highest (`priority + aging × minutes its next leg has waited`,
+    /// W05-R09), and in it the earliest fair-share start, then arrival.
     fn try_runner(&mut self, runner: &str, now: i64, out: &mut Vec<Command>) {
+        let aging = self.config().aging_per_minute;
         loop {
             let Some(r) = self.runners.get(runner) else { return };
-            let mut best: Option<((i64, u64, u64), String)> = None;
+            let mut best: Option<((f64, u64, u64), String)> = None;
             for s in self.sigs.values() {
                 if !s.eligible.contains(runner) {
                     continue;
                 }
-                for (a, b, c, id) in &s.queue {
-                    if best.as_ref().is_some_and(|(k, _)| *k <= (*a, *b, *c)) {
-                        break;
-                    }
-                    if self.legs.get(id).is_some_and(|l| self.fits(r, l)) {
-                        best = Some(((*a, *b, *c), id.clone()));
-                        break;
+                for (p, sub) in s.queue.iter().rev() {
+                    let Some((_, _, head)) = sub.iter().next() else { continue };
+                    let waited = self.legs.get(head).map_or(0, |l| (now - l.queued_at).max(0));
+                    let e = f64::from(*p) + aging * waited as f64 / 60_000.0;
+                    for (f, q, id) in sub {
+                        if best.as_ref().is_some_and(|(k, _)| !ahead((e, *f, *q), *k)) {
+                            break;
+                        }
+                        if self.legs.get(id).is_some_and(|l| self.fits(r, l)) {
+                            best = Some(((e, *f, *q), id.clone()));
+                            break;
+                        }
                     }
                 }
             }
             let Some((_, id)) = best else { return };
+            // One that would rather wait for a busy runner where it's warm holds out for it, and
+            // then fits this one no more (W24-R18).
+            if self.hold_for_warm(&id, runner, now, out) {
+                continue;
+            }
             self.assign(&id, runner, now, out);
         }
     }
 
     fn assign(&mut self, id: &str, runner: &str, now: i64, out: &mut Vec<Command>) {
         self.unqueue(id);
+        let expected = self.legs.get(id).map(|l| self.expected_s(l, runner));
         let Some(l) = self.legs.get_mut(id) else { return };
         l.state = State::Assigned { runner: runner.to_owned() };
         l.reason = None;
+        l.hold = None;
+        l.ends = expected.map(|s| now.saturating_add(ms(s)));
         l.last_runner = Some(runner.to_owned());
-        let (attempt, request, exclusive, repo, fair) = (l.attempt, l.input.request, l.input.exclusive, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
+        l.started = Some(now);
+        self.demands.started(id, now);
+        let Some(l) = self.legs.get_mut(id) else { return };
+        let (attempt, request, repo, fair) = (l.attempt, l.input.request, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
         let req = l.req.clone();
         let (image, docker) = (req.image.clone(), req.docker.clone());
         self.vtime = self.vtime.max(fair as f64 / 1000.0);
         *self.in_progress.entry(repo).or_default() += 1;
+        self.admit.started(id, now);
+        if self.cadenced.remove(id) {
+            self.drained.retain(|_, owner| owner.as_str() != id);
+        }
         let mut executor = None;
         if let Some(r) = self.runners.get_mut(runner) {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
-            r.exclusive = exclusive;
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
         // Its pool's idle executor there, which it alone uses.
@@ -757,9 +1496,6 @@ impl Scheduler {
         if let Some(r) = self.runners.get_mut(&runner) {
             r.running.retain(|x| x != id);
             sub(&mut r.used, &request);
-            if r.running.is_empty() {
-                r.exclusive = false;
-            }
         }
         Some(runner)
     }
@@ -786,6 +1522,7 @@ impl Scheduler {
             return;
         }
         let runner = self.release(id);
+        self.stopped(id);
         self.discard_used(id, out);
         // Cancelled while it ran: a failure now (killed, its runner gone) is the cancel's doing.
         if let Some(why) = self.legs.get(id).and_then(|l| l.cancelling.clone()) {
@@ -798,6 +1535,7 @@ impl Scheduler {
                 self.try_runner(&r, now, out);
             }
             self.scale_all(now, out);
+            self.review_admission(now, out);
             return;
         }
         let decision = match &outcome {
@@ -812,6 +1550,8 @@ impl Scheduler {
                     l.state = State::Retrying { at };
                     l.avoid = None;
                     l.pin = None;
+                    // A new attempt may wait for a warm runner again (W24-R18).
+                    l.held = false;
                     match d.runner {
                         RunnerChoice::Different => l.avoid = runner.clone().map(|r| (r, Off::Different)),
                         RunnerChoice::Another => l.avoid = runner.clone().map(|r| (r, Off::Lost)),
@@ -834,16 +1574,229 @@ impl Scheduler {
             self.try_runner(&r, now, out);
         }
         self.scale_all(now, out);
+        self.review_admission(now, out);
     }
 
     fn settle(&mut self, id: &str, outcome: Outcome, reason: Option<String>, now: i64, out: &mut Vec<Command>) {
         // An executor made for it goes with it (a pod still starting for a cancelled leg).
         self.discard_used(id, out);
-        let group = self.legs.remove(id).and_then(|l| l.input.group);
-        out.push(Command::Settled { leg: id.to_owned(), outcome, reason });
+        let passed = match &outcome {
+            Outcome::Success => Some(true),
+            Outcome::Failed(_) => Some(false),
+            Outcome::Cancelled => None,
+        };
+        let gone = self.legs.remove(id);
+        if let Some(l) = &gone {
+            self.uncount(l);
+        }
+        let group = gone.and_then(|l| l.input.group);
+        self.decided.remove(id);
+        out.push(Command::Settled { leg: id.to_owned(), outcome: outcome.clone(), reason });
         if let Some((key, _, _)) = group {
             for a in self.groups.leave(&key, &format!("leg:{id}")) {
                 self.group_action(a, now, out);
+            }
+        }
+        self.left_admission(id, passed, now, out);
+        self.answer(id, &outcome, now, out);
+    }
+
+    /// A leg is gone from the scheduler: admission hears how it ended (W28-R68's window learns
+    /// from it), and lets go what it held back for it.
+    fn left_admission(&mut self, id: &str, passed: Option<bool>, now: i64, out: &mut Vec<Command>) {
+        if self.cadenced.remove(id) {
+            self.drained.retain(|_, owner| owner.as_str() != id);
+        }
+        let ds = self.admit.ended(id, passed, now);
+        self.admitted(ds, now, out);
+    }
+
+    // ------------------------------------------------------------------ demands (W28-R40 to R45)
+
+    /// Its attempt ended: until the next starts, it has no time left to count (W28-R43).
+    fn stopped(&mut self, id: &str) {
+        if let Some(l) = self.legs.get_mut(id) {
+            l.started = None;
+        }
+        self.demands.stopped(id);
+    }
+
+    /// Says a leg's decision in demands, once (W28-R45).
+    fn decide(&mut self, leg: &str, d: Decision, out: &mut Vec<Command>) {
+        if self.decided.get(leg) != Some(&d) {
+            self.decided.insert(leg.to_owned(), d.clone());
+            out.push(Command::Demand { leg: leg.to_owned(), decision: d });
+        }
+    }
+
+    /// `run`'s demand arrives on `lane` and withdraws the older ones there (W28-R40); what answered
+    /// them is decided again (W28-R43).
+    fn withdraw(&mut self, run: &str, lane: String, now: i64, out: &mut Vec<Command>) {
+        let mut d = self.demands.demand(run).cloned().unwrap_or_else(|| Demand { run: run.to_owned(), at: now, ..Demand::default() });
+        d.lane = lane;
+        let withdrawn = self.demands.arrive(d, true);
+        for exec in self.demands.affected(&withdrawn) {
+            self.reconsider(&exec, false, now, out);
+        }
+    }
+
+    /// The seconds an execution is expected to take still: its cost (history, W19) less its
+    /// attempt's time so far; `None` while no attempt of it runs.
+    fn left(&self, id: &str, now: i64) -> Option<i64> {
+        let l = self.legs.get(id)?;
+        let started = l.started?;
+        let cost = l.input.cost.unwrap_or(self.config().default_cost);
+        Some((cost - (now - started) as f64 / 1000.0).round() as i64)
+    }
+
+    /// Decides what becomes of an execution (W28-R43), and carries it out: kept at the highest
+    /// priority its live demands give, dropped, run on, finished, or cancelled through the
+    /// cancelling path.
+    fn reconsider(&mut self, exec: &str, contended: bool, now: i64, out: &mut Vec<Command>) -> Option<Fate> {
+        let left = self.left(exec, now);
+        let finish_within = self.legs.get(exec).and_then(|l| l.input.finish_within).unwrap_or(self.config().finish_within);
+        let fate = self.demands.fate(exec, left, contended, finish_within)?;
+        self.decide(exec, Decision::Fate(fate.clone()), out);
+        match &fate {
+            Fate::Kept { priority, .. } => self.rekey(exec, *priority),
+            Fate::Drop { .. } => self.cancel(exec, fate.why(), now, out),
+            Fate::Cancel { .. } => {
+                // What's being cancelled is over as far as its work goes: no one adopts it now.
+                for (leg, next) in self.demands.ended(exec, End::Cancelled) {
+                    self.next_for(&leg, next, None, now, out);
+                }
+                self.cancel(exec, fate.why(), now, out);
+            }
+            Fate::Run { .. } | Fate::Finish { .. } => {}
+        }
+        Some(fate)
+    }
+
+    /// A queued execution takes `priority`, the highest its live demands give (W28-R42, R43).
+    fn rekey(&mut self, exec: &str, priority: u8) {
+        if !self.legs.get(exec).is_some_and(|l| l.state == State::Queued && l.input.priority != priority) {
+            return;
+        }
+        self.unqueue(exec);
+        let fair = self.legs.get_mut(exec).map_or(0, |l| {
+            l.input.priority = priority;
+            l.key.map_or(0, |k| k.1)
+        });
+        self.set_key(exec, fair);
+        self.insert_queue(exec);
+    }
+
+    /// `id` adopted `exec` of `run` (W28-R42): it waits for it, holding no runner, slot or quota,
+    /// and `exec` takes its priority if that's higher. Wanted again, `exec` says so.
+    fn adopted(&mut self, id: &str, exec: String, run: String, now: i64, out: &mut Vec<Command>) {
+        self.unqueue(id);
+        if let Some(l) = self.legs.get_mut(id) {
+            l.state = State::Adopted { exec: exec.clone() };
+            l.key = None;
+        }
+        self.set_reason(id, WaitReason::Adopted { leg: exec.clone(), run }, out);
+        if matches!(self.decided.get(&exec), Some(Decision::Fate(Fate::Run { .. } | Fate::Finish { .. }))) {
+            self.reconsider(&exec, false, now, out);
+        } else if let Some(p) = self.demands.priority(&exec) {
+            self.rekey(&exec, p);
+        }
+    }
+
+    /// A leg left (settled, gone): if it executed work, its adopters take its result over or carry
+    /// on without it (W28-R44); if it adopted, its execution may be wanted no more (W28-R43).
+    fn answer(&mut self, id: &str, outcome: &Outcome, now: i64, out: &mut Vec<Command>) {
+        if self.demands.is_execution(id) {
+            let end = match outcome {
+                Outcome::Success => End::Success,
+                Outcome::Failed(f) => End::Failed(f.class),
+                Outcome::Cancelled => End::Cancelled,
+            };
+            for (leg, next) in self.demands.ended(id, end) {
+                self.next_for(&leg, next, Some(outcome), now, out);
+            }
+        } else if let Some(exec) = self.demands.forget(id) {
+            self.reconsider(&exec, false, now, out);
+        }
+    }
+
+    /// What an adopter does once its execution ended (as `outcome`), or its check came back
+    /// (W28-R44).
+    fn next_for(&mut self, leg: &str, next: Next, outcome: Option<&Outcome>, now: i64, out: &mut Vec<Command>) {
+        if !self.legs.contains_key(leg) {
+            return;
+        }
+        self.decide(leg, Decision::Next(next.clone()), out);
+        match next {
+            Next::Reuse { from } => self.reused(leg, from, outcome.cloned().unwrap_or(Outcome::Cancelled), now, out),
+            Next::Check { from } => {
+                if let Some(l) = self.legs.get_mut(leg) {
+                    l.state = State::Checking { from, outcome: outcome.cloned().unwrap_or(Outcome::Cancelled) };
+                }
+            }
+            Next::Execute => {
+                if let Some(l) = self.legs.get_mut(leg) {
+                    l.state = State::Pending;
+                }
+                self.enqueue(leg, now, out);
+            }
+            Next::Adopt { exec, run } => self.adopted(leg, exec, run, now, out),
+            Next::Drop => self.settle(leg, Outcome::Cancelled, Some(Next::Drop.why()), now, out),
+        }
+    }
+
+    /// An adopter takes its execution's result over: it's done, reused from `from`, as `from`
+    /// ended (W28-R44).
+    fn reused(&mut self, id: &str, from: String, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
+        self.discard_used(id, out);
+        let passed = match &outcome {
+            Outcome::Success => Some(true),
+            Outcome::Failed(_) => Some(false),
+            Outcome::Cancelled => None,
+        };
+        let gone = self.legs.remove(id);
+        if let Some(l) = &gone {
+            self.uncount(l);
+        }
+        let group = gone.and_then(|l| l.input.group);
+        self.decided.remove(id);
+        out.push(Command::Adopted { leg: id.to_owned(), from, outcome });
+        if let Some((key, _, _)) = group {
+            for a in self.groups.leave(&key, &format!("leg:{id}")) {
+                self.group_action(a, now, out);
+            }
+        }
+        self.left_admission(id, passed, now, out);
+    }
+
+    /// Live work that can't be placed contends for the capacity of running work no live demand
+    /// wants (W28-R43): of that on a runner it could use, or in its pool, the one with the most
+    /// time left is cancelled, unless it finishes within finish_within, seeding trusted entries.
+    fn contend(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(l) = self.legs.get(id) else { return };
+        if !self.demands.live(&l.input.run) {
+            return;
+        }
+        let pool = l.req.pool.clone();
+        let eligible = self.sigs.get(&l.sig).map(|s| s.eligible.clone()).unwrap_or_default();
+        let mut unwanted: Vec<(i64, String)> = self
+            .demands
+            .unwanted_running()
+            .into_iter()
+            .filter_map(|x| {
+                let u = self.legs.get(&x)?;
+                let State::Assigned { runner } = &u.state else { return None };
+                let could = match (&pool, &u.req.pool) {
+                    (Some(p), Some(q)) => p == q,
+                    (None, None) => eligible.contains(runner),
+                    _ => false,
+                };
+                (could && u.cancelling.is_none()).then(|| (self.left(&x, now).unwrap_or(i64::MAX), x))
+            })
+            .collect();
+        unwanted.sort_by(|a, b| b.cmp(a));
+        for (_, x) in unwanted {
+            if matches!(self.reconsider(&x, true, now, out), Some(Fate::Cancel { .. })) {
+                return;
             }
         }
     }
@@ -861,18 +1814,27 @@ impl Scheduler {
     }
 
     /// A leg gone with its repository, off its runner and out of the scheduler: nothing settled.
+    /// Its adopters, in other runs, carry on without it (W28-R44).
     fn drop_gone(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
         let runner = self.release(id);
         self.discard_used(id, out);
-        let group = self.legs.remove(id).and_then(|l| l.input.group);
+        let gone = self.legs.remove(id);
+        if let Some(l) = &gone {
+            self.uncount(l);
+        }
+        let group = gone.and_then(|l| l.input.group);
+        self.decided.remove(id);
         if let Some((key, _, _)) = group {
             for a in self.groups.leave(&key, &format!("leg:{id}")) {
                 self.group_action(a, now, out);
             }
         }
+        self.left_admission(id, None, now, out);
+        self.answer(id, &Outcome::Cancelled, now, out);
         if let Some(r) = runner {
             self.try_runner(&r, now, out);
         }
+        self.review_admission(now, out);
     }
 
     fn cancel(&mut self, id: &str, reason: String, now: i64, out: &mut Vec<Command>) {
@@ -888,7 +1850,8 @@ impl Scheduler {
                 self.unqueue(id);
                 self.settle(id, Outcome::Cancelled, Some(reason), now, out);
             }
-            State::Pending | State::Retrying { .. } => self.settle(id, Outcome::Cancelled, Some(reason), now, out),
+            // An adopter stops waiting: what it adopted may be wanted no more (W28-R43).
+            State::Pending | State::Held | State::Retrying { .. } | State::Adopted { .. } | State::Checking { .. } => self.settle(id, Outcome::Cancelled, Some(reason), now, out),
             State::Done => {}
         }
     }
@@ -914,13 +1877,15 @@ impl Scheduler {
                 None => {}
             }
         }
-        let (running, used, exclusive) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.exclusive)).unwrap_or_default();
-        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false, exclusive });
+        let (running, used) = self.runners.get(&id).map(|x| (x.running.clone(), x.used)).unwrap_or_default();
+        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false });
         self.refresh_eligibility(&id);
+        self.release_holds(now, out);
         self.try_avoided(now, out);
         self.try_runner(&id, now, out);
         self.scale_all(now, out);
         self.refresh_reasons(out);
+        self.review_admission(now, out);
     }
 
     fn refresh_eligibility(&mut self, runner: &str) {
@@ -937,12 +1902,14 @@ impl Scheduler {
         }
     }
 
-    /// Whether a runner may take legs of `req`: a hosted executor's own runner only its pool's
-    /// (W13-R07), and no other runner those; the rest as routing decides.
+    /// Whether a runner may take legs of `req`: connected, and [`Scheduler::routable`].
     fn eligible_for(&self, req: &Requirement, r: &Runner) -> bool {
-        if !r.connected {
-            return false;
-        }
+        r.connected && self.routable(req, r)
+    }
+
+    /// Whether a runner, connected or not, could take legs of `req`: a hosted executor's own
+    /// runner only its pool's (W13-R07), and no other runner those; the rest as routing decides.
+    fn routable(&self, req: &Requirement, r: &Runner) -> bool {
         let hosted = req.pool.as_deref().and_then(|p| self.pool(p)).is_some_and(|p| p.hosted);
         match r.input.executor.as_deref() {
             Some(e) => hosted && self.executors.get(e).is_some_and(|x| Some(x.pool.as_str()) == req.pool.as_deref()),
@@ -959,6 +1926,7 @@ impl Scheduler {
             None => return,
         };
         self.refresh_eligibility(runner);
+        self.release_holds(now, out);
         // The legs that stayed off another runner only while this one could take them go there
         // first: they waited longer than the legs this one loses now.
         self.try_avoided(now, out);
@@ -973,6 +1941,7 @@ impl Scheduler {
         }
         self.scale_all(now, out);
         self.refresh_reasons(out);
+        self.review_admission(now, out);
     }
 
     fn rules_changed(&mut self, rules: Vec<Rule>, now: i64, out: &mut Vec<Command>) {
@@ -1000,6 +1969,7 @@ impl Scheduler {
         for r in &runners {
             self.refresh_eligibility(r);
         }
+        self.release_holds(now, out);
         for r in runners {
             self.try_runner(&r, now, out);
         }
@@ -1010,13 +1980,236 @@ impl Scheduler {
         let due: Vec<i64> = self.timers.range(..=now).map(|(k, _)| *k).collect();
         for at in due {
             for id in self.timers.remove(&at).unwrap_or_default() {
-                if matches!(self.legs.get(&id).map(|l| &l.state), Some(State::Retrying { .. })) {
+                let (retrying, waited) = self.legs.get(&id).map_or((false, false), |l| (matches!(l.state, State::Retrying { .. }), l.hold.as_ref().is_some_and(|h| h.until <= now)));
+                if retrying {
                     self.enqueue(&id, now, out);
+                } else if waited {
+                    // Its wait for a warm runner is up (W24-R18).
+                    self.unhold(&id, now, out);
                 }
             }
         }
         self.reap_idle(now, out);
         self.scale_all(now, out);
+        self.review_admission(now, out);
+    }
+
+    // ------------------------------------------------------------------ warm placement (W24-R18)
+
+    /// What a runner holds warm now. Legs already placed stay; the next decisions use it.
+    fn warm_changed(&mut self, runner: String, held: WarmHeld) {
+        if held.workspaces.is_empty() && held.bandwidth.is_none() {
+            self.warm.remove(&runner);
+        } else {
+            self.warm.insert(runner, held);
+        }
+    }
+
+    /// A leg's `warm` and `affinity` terms, each with its weight and the workspaces it looks at:
+    /// `warm`, its lane's (its job's when it has no lane); `affinity: { job }`, that job's in its
+    /// repository and workflow (W05-R23's affinity, backed by real workspaces).
+    fn terms(l: &Leg) -> Vec<(f64, Wants<'_>)> {
+        let mine = match &l.input.warm_lane {
+            Some(lane) => Wants::Lane(lane),
+            None => Wants::Job { repo: &l.input.repo, workflow: &l.input.workflow_file, job: &l.input.route.job },
+        };
+        let mut out = Vec::new();
+        for p in &l.req.prefer {
+            let w = p.weight.unwrap_or(1.0);
+            if p.warm {
+                out.push((w, mine));
+            }
+            if let Some(a) = &p.affinity {
+                out.push((w, Wants::Job { repo: &l.input.repo, workflow: &l.input.workflow_file, job: &a.job }));
+            }
+        }
+        out
+    }
+
+    /// What a leg's terms look at together: on each runner, the workspace that would finish it
+    /// first.
+    fn wants(l: &Leg) -> Vec<Wants<'_>> {
+        let mut out: Vec<Wants<'_>> = Vec::new();
+        for (_, w) in Self::terms(l) {
+            if !out.contains(&w) {
+                out.push(w);
+            }
+        }
+        out
+    }
+
+    /// A leg's cold duration in seconds: as history has it, else its cost, else the default.
+    fn cold_s(&self, l: &Leg) -> f64 {
+        l.input.cold.or(l.input.cost).filter(|c| c.is_finite() && *c >= 0.0).unwrap_or(self.cfg.default_cost)
+    }
+
+    /// The share of what a busy warm runner saves that a leg may wait for it: the most its terms
+    /// give (`patience:`, else the server's), 0 without terms.
+    fn patience(&self, l: &Leg) -> f64 {
+        let most = l.req.prefer.iter().filter(|p| p.warm || p.affinity.is_some()).map(|p| p.patience.unwrap_or(self.cfg.warm.patience)).filter(|p| !p.is_nan()).fold(0.0, f64::max);
+        most.clamp(0.0, 1.0)
+    }
+
+    /// A leg's estimate on a runner, from the workspaces `wants` names there: of its lane's, those
+    /// made with the toolchain it would run with there.
+    fn estimate(&self, l: &Leg, runner: &str, wants: &[Wants]) -> warm::Estimate {
+        let toolchain = self.runners.get(runner).map(|r| Self::toolchain(l, r));
+        warm::estimate(self.warm.get(runner), wants, self.cold_s(l), &self.cfg.warm, toolchain.as_deref())
+    }
+
+    /// The toolchain a leg would run with on a runner (W24-R11): the first executor its rules
+    /// allow that the runner has (the host where they name none), as an assignment there would
+    /// carry it, that executor's image where it runs one, and the job's container.
+    fn toolchain(l: &Leg, r: &Runner) -> String {
+        let executor = l.req.executors.iter().find(|e| routing::usable(&l.req, &r.input.view.facts, e)).map_or("host", String::as_str);
+        let image = matches!(executor, "docker" | "firecracker").then_some(l.req.image.as_deref()).flatten();
+        crate::work::slots::toolchain(executor, image, l.input.container.as_deref())
+    }
+
+    /// How long a leg is expected to take on a runner, in seconds, for when that runner will have
+    /// room again: its estimate there from its lane and terms, else its cold duration.
+    fn expected_s(&self, l: &Leg, runner: &str) -> f64 {
+        let mut wants = Self::wants(l);
+        if let Some(lane) = &l.input.warm_lane
+            && !wants.contains(&Wants::Lane(lane))
+        {
+            wants.push(Wants::Lane(lane));
+        }
+        if wants.is_empty() { self.cold_s(l) } else { self.estimate(l, runner, &wants).busy_s() }
+    }
+
+    /// When a busy runner is expected to have room (unix ms): as the first leg in its own slots
+    /// is expected to end, and not before `now`. `None` when it runs none.
+    fn free_at(&self, r: &Runner, now: i64) -> Option<i64> {
+        r.running.iter().filter_map(|id| self.legs.get(id)).filter(|l| l.req.pool.is_none()).map(|l| l.ends.unwrap_or(now)).min().map(|t| t.max(now))
+    }
+
+    /// The seconds a leg is expected to wait for room on a runner that would take it: none with
+    /// room now; `None` for one that wouldn't take it, or busy with no end in view.
+    fn wait_s(&self, l: &Leg, r: &Runner, now: i64) -> Option<f64> {
+        if !self.admits(r, l) || !self.sigs.get(&l.sig).is_some_and(|s| s.eligible.contains(&r.input.id)) {
+            return None;
+        }
+        if self.capacity(r, l) {
+            return Some(0.0);
+        }
+        self.free_at(r, now).map(|t| t.saturating_sub(now) as f64 / 1000.0)
+    }
+
+    /// Each runner's preference score for a leg (W05-R23): its fact and label terms
+    /// ([`routing::scores`]), then its `warm` and `affinity` terms, each its weight × how soon it's
+    /// expected to finish there, normalized across `runners` (W24-R18). With `now`, a busy
+    /// runner's expected wait counts; without, every runner has room. Empty without preferences.
+    fn scores(&self, l: &Leg, runners: &[&Runner], now: Option<i64>) -> Vec<f64> {
+        let views: Vec<&RunnerView> = runners.iter().map(|r| &r.input.view).collect();
+        let mut total = routing::scores(&l.req.prefer, &views);
+        for (weight, wants) in Self::terms(l) {
+            let finish: Vec<Option<f64>> = runners
+                .iter()
+                .map(|r| {
+                    let wait = match now {
+                        Some(now) => self.wait_s(l, r, now)?,
+                        None => 0.0,
+                    };
+                    Some(wait + self.estimate(l, &r.input.id, std::slice::from_ref(&wants)).busy_s())
+                })
+                .collect();
+            for (t, v) in total.iter_mut().zip(warm::sooner(&finish)) {
+                *t += weight * v;
+            }
+        }
+        total
+    }
+
+    /// A leg's warm side of one runner, for explanations.
+    fn seen(&self, l: &Leg, r: &Runner, wants: &[Wants], now: i64) -> Warmth {
+        let estimate = self.estimate(l, &r.input.id, wants);
+        let wait_s = self.wait_s(l, r, now).unwrap_or(0.0);
+        Warmth { finish_s: wait_s + estimate.busy_s(), wait_s, estimate }
+    }
+
+    /// Patience, as `offered` would take a leg now: the busy runner it waits for instead, if any
+    /// ([`warm::patience`]). Of those that would take it once they have room, and where it would
+    /// take less time than on any runner with room now, the one where it's expected to finish
+    /// first, wait included; never a pool's leg, nor twice in an attempt.
+    fn warm_hold(&self, id: &str, offered: &str, now: i64) -> Option<Hold> {
+        let l = self.legs.get(id)?;
+        let share = self.patience(l);
+        if l.held || l.hold.is_some() || l.req.pool.is_some() || share <= 0.0 {
+            return None;
+        }
+        let wants = Self::wants(l);
+        let here = self.estimate(l, offered, &wants).busy_s();
+        let eligible: Vec<&Runner> = self.sigs.get(&l.sig)?.eligible.iter().filter_map(|r| self.runners.get(r)).collect();
+        let soonest_free = eligible.iter().filter(|r| self.room(r, l)).map(|r| self.estimate(l, &r.input.id, &wants).busy_s()).fold(here, f64::min);
+        let mut best: Option<(f64, Hold)> = None;
+        for r in eligible.into_iter().filter(|r| r.input.id != offered) {
+            if !self.admits(r, l) || self.capacity(r, l) {
+                continue;
+            }
+            let Some(free) = self.free_at(r, now) else { continue };
+            let wait = free.saturating_sub(now) as f64 / 1000.0;
+            let there = self.estimate(l, &r.input.id, &wants).busy_s();
+            if there >= soonest_free {
+                continue;
+            }
+            let Some((saves_s, until)) = warm::patience(here, there, wait, share, now) else { continue };
+            let finish = wait + there;
+            if best.as_ref().is_none_or(|(f, _)| finish < *f) {
+                best = Some((finish, Hold { runner: r.input.id.clone(), name: r.input.view.name.clone(), saves_s, until, there_s: there }));
+            }
+        }
+        best.map(|(_, h)| h)
+    }
+
+    /// Holds a leg out for a busy warm runner rather than start on `offered` now, when its
+    /// patience says so: its wait reason says for which runner, what it saves and until when, and
+    /// a timer ends the wait then. Whether it holds.
+    fn hold_for_warm(&mut self, id: &str, offered: &str, now: i64, out: &mut Vec<Command>) -> bool {
+        let Some(h) = self.warm_hold(id, offered, now) else { return false };
+        let reason = WaitReason::Warm { runner: h.name.clone(), saves_s: h.saves_s, until: h.until };
+        self.timers.entry(h.until).or_default().push(id.to_owned());
+        out.push(Command::Timer { at: h.until });
+        if let Some(l) = self.legs.get_mut(id) {
+            l.held = true;
+            l.hold = Some(h);
+        }
+        self.set_reason(id, reason, out);
+        true
+    }
+
+    /// A leg's wait for a warm runner ends (its time is up, or that runner can't take it): it goes
+    /// where it can now, as any queued leg, and doesn't wait for one again in this attempt.
+    fn unhold(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(l) = self.legs.get_mut(id) else { return };
+        if l.hold.take().is_none() || l.state != State::Queued {
+            return;
+        }
+        for r in self.candidates(id) {
+            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
+                break;
+            }
+            self.try_runner(&r, now, out);
+        }
+        if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
+            let reason = self.wait_reason(id);
+            self.set_reason(id, reason, out);
+        }
+    }
+
+    /// Ends the waits for warm runners that can't take their legs any more: lost, draining, or no
+    /// longer eligible. In queue order, so the first in line goes first.
+    fn release_holds(&mut self, now: i64, out: &mut Vec<Command>) {
+        let mut ended: Vec<(_, String)> = self
+            .legs
+            .iter()
+            .filter(|(_, l)| l.hold.as_ref().is_some_and(|h| !self.sigs.get(&l.sig).is_some_and(|s| s.eligible.contains(&h.runner)) || !self.runners.get(&h.runner).is_some_and(|r| self.admits(r, l))))
+            .map(|(id, l)| (l.key.unwrap_or_default(), id.clone()))
+            .collect();
+        ended.sort();
+        for (_, id) in ended {
+            self.unhold(&id, now, out);
+        }
     }
 
     // ------------------------------------------------------------------ reservations (W05-R12)
@@ -1069,7 +2262,7 @@ impl Scheduler {
 
     /// Legs queued for `pool`.
     fn waiting_for(&self, pool: &str) -> usize {
-        self.sigs.values().filter(|s| s.req.pool.as_deref() == Some(pool)).map(|s| s.queue.len()).sum()
+        self.sigs.values().filter(|s| s.req.pool.as_deref() == Some(pool)).map(Sig::len).sum()
     }
 
     /// The hosts that may run `pool`'s executors now, with room for another: connected, not
@@ -1089,9 +2282,12 @@ impl Scheduler {
                 }
                 let c = self.config();
                 if let (true, Some(cap)) = (c.resources, r.input.capacity) {
+                    // Beside what exclusive legs hold there, never in it.
                     let q = &p.request;
-                    let fits = r.used.cpu + q.cpu <= cap.cpu * c.overcommit_cpu
-                        && (r.used.mem + q.mem) as f64 <= cap.mem as f64 * c.overcommit_mem
+                    let (held, whole, _) = self.holding(r);
+                    let fits = !whole
+                        && (r.used.cpu - held.cpu).max(0.0) + q.cpu <= (cap.cpu - held.cpu).max(0.0) * c.overcommit_cpu
+                        && (r.used.mem.saturating_sub(held.mem) + q.mem) as f64 <= cap.mem.saturating_sub(held.mem) as f64 * c.overcommit_mem
                         && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
                         && r.used.gpu + q.gpu <= cap.gpu;
                     if !fits {
@@ -1123,7 +2319,7 @@ impl Scheduler {
                 .sigs
                 .values()
                 .filter(|s| s.req.pool.as_deref() == Some(pool))
-                .flat_map(|s| s.queue.iter().map(|(_, _, _, id)| id.clone()))
+                .flat_map(|s| s.queue.values().flat_map(|sub| sub.iter().map(|(_, _, id)| id.clone())))
                 .filter_map(|id| self.legs.get(&id).map(|l| (id, l.input.own_executor)))
                 .collect();
             let mut room = p.max.saturating_sub(self.executors.values().filter(|e| e.pool == pool).count());
@@ -1193,6 +2389,7 @@ impl Scheduler {
         self.try_runner(&runner, now, out);
         self.idle_timer(&pool, now, out);
         self.refresh_reasons(out);
+        self.review_admission(now, out);
     }
 
     fn executor_failed(&mut self, id: &str, error: String, now: i64, out: &mut Vec<Command>) {
@@ -1304,12 +2501,34 @@ impl Scheduler {
         {
             return WaitReason::Quota { limit: *q };
         }
-        let eligible: Vec<&Runner> = self.sigs.get(&l.sig).map(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).collect()).unwrap_or_default();
+        if let Some(h) = &l.hold {
+            return WaitReason::Warm { runner: h.name.clone(), saves_s: h.saves_s, until: h.until };
+        }
+        let routed: Vec<&Runner> = self.sigs.get(&l.sig).map(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).collect()).unwrap_or_default();
+        // Of those, the ones a person's retry lets it run on (W05-R28).
+        let eligible: Vec<&Runner> = routed.iter().copied().filter(|r| l.input.placement.allows(&r.input.id)).collect();
         // Every runner that could take it is kept for other legs: until the first window ends.
         if !eligible.is_empty()
             && let Some((name, until)) = eligible.iter().map(|r| self.reserved_against(r, l)).collect::<Option<Vec<_>>>().and_then(|all| all.into_iter().min_by_key(|(_, u)| *u))
         {
             return WaitReason::Reservation { reservation: name, until };
+        }
+        let name = |id: &str| self.runners.get(id).map_or_else(|| id.to_owned(), |r| r.input.view.name.clone());
+        if let Some(p) = &l.input.placement.runner {
+            let state = match self.runners.get(p) {
+                Some(r) if !r.connected => PinnedState::Offline,
+                Some(r) if !self.routable(&l.req, r) => PinnedState::Unable,
+                Some(r) if r.draining => PinnedState::Draining,
+                Some(_) => PinnedState::Busy,
+                None => PinnedState::Offline,
+            };
+            return WaitReason::Pinned { runner: name(p), state };
+        }
+        if let Some(a) = &l.input.placement.avoid
+            && eligible.is_empty()
+            && !routed.is_empty()
+        {
+            return WaitReason::OtherRunner { avoided: name(a), refused: false, asked: true };
         }
         if let (Some(pool), false) = (&l.req.pool, eligible.is_empty()) {
             let mine: Vec<&Executor> = self.executors.values().filter(|e| e.pool == *pool).collect();
@@ -1326,11 +2545,23 @@ impl Scheduler {
             && !eligible.is_empty()
             && eligible.iter().all(|r| r.input.id == *a)
         {
-            let avoided = self.runners.get(a).map_or_else(|| a.clone(), |r| r.input.view.name.clone());
-            return WaitReason::OtherRunner { avoided, refused: *off == Off::Refused };
+            return WaitReason::OtherRunner { avoided: name(a), refused: *off == Off::Refused, asked: false };
+        }
+        // Heavy, and held off by their load the runners that could take it (W24-R19).
+        let held: Vec<super::load::Held> = eligible.iter().filter(|r| r.connected && !r.draining).filter_map(|r| self.held_by_load(r, l)).collect();
+        if !held.is_empty() {
+            return WaitReason::Load { held };
         }
         if !eligible.is_empty() {
-            if l.input.exclusive && eligible.iter().all(|r| !r.running.is_empty() || r.draining) {
+            // A share no runner it could run on is big enough to hold.
+            let q = &l.input.request;
+            if l.input.exclusive && q.cpu > 0.0 && eligible.iter().all(|r| size(r).is_some_and(|s| q.cpu > s.cpu + 1e-9 || q.mem > s.mem)) {
+                return WaitReason::Unroutable { failing: vec![format!("{} CPUs and {} MiB held for it alone: no runner it could run on is that big", q.cpu, q.mem >> 20)] };
+            }
+            if let Some(short) = self.oversized(&eligible, l) {
+                return WaitReason::Oversized { asked: needs::request_words(&l.input.request).join(", "), short };
+            }
+            if l.input.exclusive && eligible.iter().all(|r| matches!(claim(&l.input, size(r)), Some(Claim::Whole)) && (!r.running.is_empty() || r.draining)) {
                 return WaitReason::Exclusive;
             }
             let draining = eligible.iter().filter(|r| r.draining).count();
@@ -1360,24 +2591,28 @@ impl Scheduler {
         WaitReason::Unroutable { failing }
     }
 
-    /// Why each runner can or can't take a leg (W05-R20).
+    /// Why each runner can or can't take a leg (W05-R20), and for a leg with `warm` or `affinity`
+    /// terms what each one's warm state makes of it (W24-R18).
     pub fn explain(&self, id: &str) -> Vec<Explained> {
         let Some(l) = self.legs.get(id) else { return Vec::new() };
-        let views: Vec<&RunnerView> = self.runners.values().map(|r| &r.input.view).collect();
-        let scores = routing::scores(&l.req.prefer, &views);
+        let all: Vec<&Runner> = self.runners.values().collect();
+        let scores = self.scores(l, &all, Some(self.now));
+        let wants = Self::wants(l);
         self.runners
             .values()
             .enumerate()
             .map(|(i, r)| {
-                let checks = routing::checks(&l.req, &r.input.view);
+                let mut checks = routing::checks(&l.req, &r.input.view);
+                checks.extend(placement_check(&l.input.placement, r));
                 Explained {
                     runner: r.input.id.clone(),
                     name: r.input.view.name.clone(),
                     connected: r.connected,
                     eligible: checks.iter().all(|c| c.pass),
-                    room: self.fits(r, l),
+                    room: self.room(r, l),
                     score: scores.get(i).copied(),
                     checks,
+                    warm: (!wants.is_empty()).then(|| self.seen(l, r, &wants, self.now)),
                 }
             })
             .collect()
@@ -1400,13 +2635,24 @@ impl Scheduler {
                     name: r.input.view.name.clone(),
                     connected: r.connected,
                     eligible: checks.iter().all(|c| c.pass),
-                    room: r.connected && !r.draining && r.running.len() < r.input.slots as usize,
+                    room: r.connected && !r.draining && {
+                        let (held, whole, ordinary) = self.holding(r);
+                        !whole && ordinary < slots_left(r.input.slots, size(r), &held)
+                    },
                     score: scores.get(i).copied(),
                     checks,
+                    warm: None,
                 }
             })
             .collect();
         (req, list)
+    }
+
+    /// Why a leg stands where it does among those waiting (W28-R64, R66, R67): its priority, its
+    /// intent class and why, whose it is, its lane.
+    pub fn standing(&self, id: &str) -> Option<Standing> {
+        let l = self.legs.get(id)?;
+        Some(Standing { priority: l.input.priority, intent: l.input.intent.clone(), actor: l.input.actor.clone(), lane: l.input.lane.clone() })
     }
 
     /// The current wait reason of a leg, if it waits.
@@ -1416,8 +2662,17 @@ impl Scheduler {
 
     /// Legs queued now (for metrics).
     pub fn queued(&self) -> usize {
-        self.sigs.values().map(|s| s.queue.len()).sum()
+        self.sigs.values().map(Sig::len).sum()
     }
+}
+
+/// Where a leg stands among those waiting ([`Scheduler::standing`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Standing {
+    pub priority: u8,
+    pub intent: Option<(super::intent::Intent, String)>,
+    pub actor: String,
+    pub lane: String,
 }
 
 /// One runner in a routing explanation.
@@ -1430,6 +2685,36 @@ pub struct Explained {
     pub room: bool,
     pub score: Option<f64>,
     pub checks: Vec<Check>,
+    /// For a leg with `warm` or `affinity` terms: the workspace it would start from here, and when
+    /// it's expected to finish (W24-R18).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warm: Option<Warmth>,
+}
+
+/// What one runner's warm state makes of a leg (W24-R18): the workspace it would start from, how
+/// warm, and the expected seconds: waiting for room, running, fetching what it lacks, and the
+/// finish they add up to.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Warmth {
+    #[serde(flatten)]
+    pub estimate: warm::Estimate,
+    pub wait_s: f64,
+    pub finish_s: f64,
+}
+
+/// Seconds as whole milliseconds.
+fn ms(s: f64) -> i64 {
+    (s * 1000.0).round() as i64
+}
+
+/// A person's retry's placement as one more check of a runner, for explanations (W05-R28).
+fn placement_check(p: &Placement, r: &Runner) -> Option<Check> {
+    let (requirement, pass) = match (&p.runner, &p.avoid) {
+        (Some(x), _) => (format!("runner == {x} (asked by its retry)"), r.input.id == *x),
+        (None, Some(x)) => (format!("runner != {x} (asked by its retry)"), r.input.id != *x),
+        (None, None) => return None,
+    };
+    Some(Check { requirement, value: format!("runner = {}", r.input.view.name), pass })
 }
 
 fn add(a: &mut Resources, b: &Resources) {
@@ -1444,6 +2729,16 @@ fn sub(a: &mut Resources, b: &Resources) {
     a.mem = a.mem.saturating_sub(b.mem);
     a.disk = a.disk.saturating_sub(b.disk);
     a.gpu = a.gpu.saturating_sub(b.gpu);
+}
+
+/// Whether `a` goes before `b`: the higher effective priority, then the earlier fair-share start,
+/// then the earlier arrival.
+fn ahead(a: (f64, u64, u64), b: (f64, u64, u64)) -> bool {
+    match a.0.total_cmp(&b.0) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => (a.1, a.2) < (b.1, b.2),
+    }
 }
 
 fn load(r: &Runner) -> f64 {

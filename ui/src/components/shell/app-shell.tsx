@@ -122,8 +122,9 @@ function fitTheWindow(el: HTMLElement | null) {
 export function AppShell({ me }: { me: Me | null }) {
   const location = useLocation();
   const onTerminal = location.pathname.startsWith("/terminal");
-  // An agent's workspace fills the window like the terminal does (no footer, no page scroll).
-  const fullHeight = onTerminal || /^\/agents\/(?!sessions(?:\/|$))[^/]+/.test(location.pathname);
+  // An agent's workspace fills the window like the terminal does (no footer, no page scroll);
+  // plans, research and the rest under /agents are ordinary pages and keep the window's scroll.
+  const fullHeight = onTerminal || /^\/agents\/(?!(?:sessions|plans|research)(?:\/|$))[^/]+\/?$/.test(location.pathname);
   // The terminal stays mounted once opened, so its sessions live on while you're elsewhere.
   const [termMounted, setTermMounted] = React.useState(onTerminal);
   if (onTerminal && !termMounted) setTermMounted(true);
@@ -245,7 +246,7 @@ export function AppShell({ me }: { me: Me | null }) {
         <CommandPalette />
       </header>
 
-      <main id="main" ref={fullHeight || away ? fitTheWindow : undefined} className={fullHeight || away ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
+      <main id="main" ref={fullHeight || away ? fitTheWindow : undefined} className={fullHeight || away ? "relative flex min-h-0 min-w-0 flex-1 flex-col" : "page-main min-w-0 flex-1"}>
         <div className={away ? "hidden" : "contents"}>
           {!onTerminal && (
             <ErrorBoundary resetKey={location.pathname}>

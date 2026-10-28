@@ -132,6 +132,11 @@ impl Gitlab {
         self.call_as(&self.token, method, path, body).await
     }
 
+    /// The `Authorization` header kiln's token makes.
+    pub(crate) fn auth_header(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+
     /// One call with someone's own token (W23-R08: what they do from kiln is theirs).
     pub async fn call_as(&self, token: &str, method: Method, path: &str, body: Option<&Value>) -> anyhow::Result<(u16, Value)> {
         let (status, bytes) = self.raw(token, method, path, body, 32 << 20).await?;

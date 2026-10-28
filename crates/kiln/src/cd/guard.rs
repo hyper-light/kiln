@@ -848,7 +848,7 @@ impl Cd {
         if self.holds(&m)
             && let Some(event) = said.as_deref().and_then(notice)
         {
-            crate::rt::spawn(crate::ci::notify::self_deploy(Arc::clone(&self.hub), event, json!({ "app": m.app, "from": m.from, "to": m.to, "revision": m.revision }), message.clone()));
+            crate::rt::spawn(crate::ci::notify::self_deploy(Arc::clone(&self.hub), event, crate::wire::events::SelfDeploy { app: m.app.clone(), from: m.from.clone(), to: m.to.clone(), revision: m.revision.clone() }, message.clone()));
         }
         self.record_self_deploy(&m, succeeded, message).await;
     }
@@ -908,11 +908,12 @@ impl Cd {
 
 /// The notification a guard's outcome asks for: a deploy of kiln that didn't simply take
 /// (docs/resilience.md, G7).
-fn notice(result: &str) -> Option<&'static str> {
+fn notice(result: &str) -> Option<crate::wire::events::SelfDeployKind> {
+    use crate::wire::events::SelfDeployKind;
     match result {
-        "held" | "rollback-blocked" => Some("deploy.held"),
-        "rolled-back" => Some("deploy.rolled_back"),
-        "rolled-forward" | "rollback-failed" => Some("deploy.rollback_failed"),
+        "held" | "rollback-blocked" => Some(SelfDeployKind::Held),
+        "rolled-back" => Some(SelfDeployKind::RolledBack),
+        "rolled-forward" | "rollback-failed" => Some(SelfDeployKind::RollbackFailed),
         _ => None,
     }
 }
@@ -1214,7 +1215,7 @@ mod tests {
     /// its work done, had gone: now it puts back the version that served.
     #[test]
     fn a_rollback_that_cant_start_goes_forward_again() {
-        assert_eq!(["ready", "watching", "held", "rollback-blocked", "rolled-back", "rolled-forward", "rollback-failed"].map(notice), [None, None, Some("deploy.held"), Some("deploy.held"), Some("deploy.rolled_back"), Some("deploy.rollback_failed"), Some("deploy.rollback_failed")]);
+        assert_eq!(["ready", "watching", "held", "rollback-blocked", "rolled-back", "rolled-forward", "rollback-failed"].map(|r| notice(r).map(crate::wire::events::SelfDeployKind::as_str)), [None, None, Some("deploy.held"), Some("deploy.held"), Some("deploy.rolled_back"), Some("deploy.rollback_failed"), Some("deploy.rollback_failed")]);
         assert_eq!(after_rollback(Start::Up, true), AfterRollback::Back);
         assert_eq!(after_rollback(Start::Moved, true), AfterRollback::Moved);
         assert_eq!(after_rollback(Start::Failed("crash loop".into()), true), AfterRollback::Forward("crash loop".into()));

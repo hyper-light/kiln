@@ -54,14 +54,17 @@
   background: #a6b2c6;
 }
 
-
 /* ---------------------------------------------------------------- agent page head */
 .ag-ready {
   animation: ag-ready 0.18s ease-out;
 }
 @keyframes ag-ready {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 .ag-loading {
   display: flex;
@@ -235,20 +238,41 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   --ag-spark: 83s;
 }
 @keyframes ag-rim-current {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
 /* Unevenly spaced highlights pass the underlying gradient at changing speeds (their strength per
    state is the glint's alpha: plain numbers here keep the animation on the GPU). */
 @keyframes ag-rim-shimmer {
-  0%, 100% { opacity: 0.45; }
-  17% { opacity: 1; }
-  43% { opacity: 0.3; }
-  71% { opacity: 0.8; }
-  0% { transform: rotate(0deg); }
-  21% { transform: rotate(41deg); }
-  47% { transform: rotate(192deg); }
-  68% { transform: rotate(243deg); }
-  100% { transform: rotate(360deg); }
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  17% {
+    opacity: 1;
+  }
+  43% {
+    opacity: 0.3;
+  }
+  71% {
+    opacity: 0.8;
+  }
+  0% {
+    transform: rotate(0deg);
+  }
+  21% {
+    transform: rotate(41deg);
+  }
+  47% {
+    transform: rotate(192deg);
+  }
+  68% {
+    transform: rotate(243deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
 }
 :root[data-motion="paused"] .ag-turn-control::before,
 :root[data-motion="paused"] .ag-turn-control::after {
@@ -289,13 +313,15 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   .ag-actions .ag-wide {
     display: none;
   }
-
 }
 
 /* ---------------------------------------------------------------- phone tabs: the site's step rail */
 .pt {
   display: flex;
   align-items: stretch;
+  min-width: 0;
+  /* More tabs than the window is wide: the rail scrolls them itself, the page never does. */
+  overflow-x: auto;
   border-top: 1px solid #222a33;
   border-bottom: 1px solid #222a33;
 }
@@ -698,6 +724,9 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   display: flex;
   flex-direction: column;
   gap: 30px;
+}
+.in-secs > * {
+  min-width: 0;
 }
 .in-sec-head {
   display: flex;
@@ -1320,9 +1349,15 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   letter-spacing: inherit;
   text-transform: inherit;
 }
-.ag-run .hx-limit-badge[data-tone="warn"] { color: #ead8bd; }
-.ag-run .hx-limit-badge[data-tone="fail"] { color: #ecc9cb; }
-.ag-run .hx-limit-badge[aria-expanded="true"] { color: var(--color-bright); }
+.ag-run .hx-limit-badge[data-tone="warn"] {
+  color: #ead8bd;
+}
+.ag-run .hx-limit-badge[data-tone="fail"] {
+  color: #ecc9cb;
+}
+.ag-run .hx-limit-badge[aria-expanded="true"] {
+  color: var(--color-bright);
+}
 .ag-run .hx-limit-badge > span {
   display: block;
   overflow: hidden;
@@ -1747,4 +1782,15 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   .name-field.ag-title-field {
     font-size: 18px;
   }
+}
+
+/* Opened from Mission control's composer (new-agent.tsx): what the view transition lands the composer's parts on (mission.css). */
+:root[data-opening] .ag-run {
+  view-transition-name: kiln-run;
+}
+:root[data-opening] .hx-dock .hx-compose-box {
+  view-transition-name: kiln-composer;
+}
+:root[data-opening] .ag-eyebrow {
+  view-transition-name: kiln-where;
 }

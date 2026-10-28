@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The UI's wire types (kiln's `wire::ts`, in its test builds alone).
+ts-rs = { version = "12.0.1", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 hyper-raft = "=0.1.0"
 hyper-durable = "=0.1.0"
 hyper-log = "=0.1.0"
@@ -36,6 +38,8 @@ default-features = false
 [features]
 # The benchmark binary's allocator, to measure what the allocator costs (`--features mimalloc`).
 mimalloc = ["dep:mimalloc"]
+# TypeScript for the types kiln's UI reads (kiln's `wire::ts`).
+ts = ["dep:ts-rs"]
 
 [lints]
 workspace = true

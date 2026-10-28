@@ -89,7 +89,9 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/runs/:id` | `{ run: Run, jobs: Job[] }` |
 | POST | `/api/runs/:id/cancel` | |
 | POST | `/api/runs/:id/retry` | `{ only_failed: bool }` |
-| GET | `/api/jobs/:id` | `Job` with `spec` |
+| GET | `/api/ci/legs/:id/runners` | where a finished job could run again: `{ kind, ran_on, elsewhere, retry: { can, why }, runners: [{ name, connected, draining, busy, slots, able, why }] }` ([ci.md](ci.md) W05-R28) |
+| POST | `/api/ci/legs/:id/retry` | `{ runner?, elsewhere? }`: a finished job again, on any runner that can run it, on any but the one it ran on, or on `runner` → 201 (a pipeline's job: its next attempt in its run, with the jobs that need it) |
+| GET | `/api/jobs/:id` | `Job` with `spec` (and `placement`, `{ runner }` or `{ avoid }`, while a retry placed it) |
 | GET | `/api/jobs/:id/logs?step=N` | raw bytes (ANSI) of that step |
 | GET | `/api/jobs/:id/tools` | `{ job, missing: { tools, on, why, no_agent, runners: [{ runner, unmet, tools, fixable, no_agent }] }, fix }`: what the job lacks to run, from its failed step's log (`tools`, `on` the runner, `why` the line) or, waiting on its `requires`, from each runner's facts; why no agent can install it there (`no_agent`: a pod, a runner away or without terminals); and the agent installing it (see [pipelines.md](pipelines.md#runners)) |
 | POST | `/api/jobs/:id/tools/fix` | `{ runner?, kind?, mode? }` → `{ fix }`: an agent, as the caller, installs what the job lacks on that runner; then kiln probes the runner's facts and runs the run's failed jobs again (`runs.rerun` on its repository, and `agents.run` as for any agent) |
@@ -99,6 +101,8 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/api/agents/:name/diagnose` | what's wrong with that runner, worst first, each with its repair ([releases.md](releases.md#diagnosing-and-repairing-a-runner)) |
 | POST | `/api/agents/:name/repair` | `{ action, way? }`: a repair a diagnosis offers |
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
+| GET | `/api/runners/:name/agent-limit` | `{ runner, own, connected, runs_agents, supported, max_sessions, held: { max_sessions, from: "server" \| "config" \| "default", config? } \| null, working, waiting, sessions, default, max }`: the most agent sessions the runner has at work at once, what's set here (`max_sessions`, null for none), what it holds and why as it last said, how many of its sessions are at work now (`working`, what the limit counts) and wait for room to go to work (`waiting`; both null while it's offline), and how many it has in all (`sessions`, finished, paused and ended ones too) ([agents.md](agents.md#how-many-agents-a-machine-runs)); 404 for an unknown runner |
+| PUT | `/api/runners/:name/agent-limit` | `{ max_sessions: n }` (1 to 4096), or `{ max_sessions: null }` to take it away (its config's, or kiln's default of 64, holds again) → the same view. Wins over the runner's config; stored and pushed to the runner (held when it next connects if it's offline). 400 for anything else, saying why; audited `agent_limit.update` |
 | GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
 | GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
 | PUT | `/api/runners/:name/front-door` | `FrontDoorSettings` → `FrontDoorView`. Checked, stored and pushed to the runner (applied when it next connects if it is offline); 400 with the reason (`Domain: kiln needs a dot, like kiln.dev`); audited `front_door.update` |

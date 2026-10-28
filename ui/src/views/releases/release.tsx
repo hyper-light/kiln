@@ -21,6 +21,7 @@ import { RelTime } from "@/views/shared";
 import { Answer, DEPLOY_EVENTS, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
+import { Highlighted } from "@/components/code/highlighted";
 
 function Head({ r }: { r: Release | null; id: number }) {
   return (
@@ -60,7 +61,9 @@ function Evidence({ e }: { e: Record<string, unknown> }) {
         {signer && `signed by ${signer} · `}
         evidence
       </summary>
-      <pre className="rel-log">{JSON.stringify(e, null, 2)}</pre>
+      <pre className="rel-log">
+        <Highlighted text={JSON.stringify(e, null, 2)} lang="json" />
+      </pre>
     </details>
   );
 }
@@ -214,12 +217,16 @@ function ReleaseView({ id }: { id: number }) {
         <Gates r={r} />
         {r.values && (
           <Panel eyebrow="Values" title="The environment's values.yaml it sets">
-            <pre className="rel-pre">{r.values}</pre>
+            <pre className="rel-pre">
+              <Highlighted text={r.values} lang="yaml" />
+            </pre>
           </Panel>
         )}
         {r.provider && (
           <Panel eyebrow="Provider" title="What its provider last said">
-            <pre className="rel-pre">{JSON.stringify(r.provider, null, 2)}</pre>
+            <pre className="rel-pre">
+              <Highlighted text={JSON.stringify(r.provider, null, 2)} lang="json" />
+            </pre>
           </Panel>
         )}
       </div>

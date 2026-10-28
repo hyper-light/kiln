@@ -22,6 +22,8 @@
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
 //! - [`rollback`]: where a rollback goes (a deployment, a commit, a tag), and whether kiln goes
 //!   back on its own.
+//! - [`deploys`]: which deploys run at once, which wait and which a newer one supersedes
+//!   (docs/ci.md W28).
 //! - [`rollout`]: canary, linear and blue/green rollouts with checks, as a state machine.
 //! - [`engine`]: the controller.
 //! - [`tree`]: an app's resource tree: its objects and the live objects they own.
@@ -31,6 +33,7 @@
 
 pub mod apps;
 pub mod bench;
+pub mod deploys;
 pub mod diff;
 pub mod engine;
 pub mod git;

@@ -1150,7 +1150,7 @@ function DiffList({ id, only, onAll }: { id: string; only: Fix | null; onAll: ()
       {list.map((d) => (
         <div key={objectKey(d.key)} className="cd-diff">
           {d.why && <p className="cd-why">{d.why}</p>}
-          <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.hunks }} label={objectLabel(d.key)} defaultOpen={list.length <= 4} />
+          <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.hunks }} label={objectLabel(d.key)} defaultOpen={list.length <= 4} language="yaml" />
         </div>
       ))}
     </div>

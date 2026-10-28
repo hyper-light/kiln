@@ -77,6 +77,12 @@ pub const BUILTINS: &[Builtin] = &[
         ],
     },
     Builtin {
+        name: "keep",
+        description: "v1's `cache: [dirs]` (W02-R06, W24-R11): folders this runner keeps per repository and job. A trusted leg gets what the job's last leg here kept, moved into place, and keeps it again after its steps; an untrusted leg gets them empty, and nothing it writes is kept.",
+        inputs: &[Input { name: "path", description: "Folders, one a line (`~` is the home directory, others the workspace's).", default: None, required: true }],
+        outputs: &[],
+    },
+    Builtin {
         name: "upload",
         description: "Upload an artifact (W08): the files zipped as `actions/upload-artifact@v4` keeps them, so `actions/download-artifact` reads it too, uploaded by the runner itself (no Node), its SHA-256 checked by the server. The files' root is the deepest directory every path is under.",
         inputs: &[

@@ -29,6 +29,33 @@ UI. It runs the same way on bare metal and on Kubernetes.
 
 ```sh
 cargo build --release              # after building the UI: npm --prefix ui ci && npm --prefix ui run build
+./target/release/kiln setup        # a guide: kiln on this machine, its own signature on a Mac, HTTPS for your devices and tailnet, a password
+```
+
+`kiln setup` looks at the machine, asks a few questions, shows everything it will do, and does it
+once you say so:
+
+* **Where kiln runs:** this machine by default, as a service started at boot, whatever kubeconfig
+  is here; or Docker on it, Kubernetes, or a kiln server it finds on the network, to join.
+* **Upgrades:** on a Mac, kiln's own code signature (`kiln signing setup`). macOS lets programs
+  onto the local network by their signature, and kiln's builds are signed ad hoc: without one,
+  every upgrade is cut off from the local network, and from the kiln server, until you allow it
+  again.
+* **The front door:** DNS and HTTPS for kiln under a name of your own (`kiln.internal` unless you
+  choose), with a certificate from kiln's own root, on your tailnet too where Tailscale runs
+  ([docs/front-door.md](docs/front-door.md), [docs/tailscale.md](docs/tailscale.md)). Phones need
+  HTTPS for voice input. On Linux it shows the one-time steps that takes root for, and runs them
+  with sudo once you say so.
+* **Signing in:** a password, for any device.
+
+It ends with a sign-in link, and what's left for you (trusting kiln's root on your devices, your
+router's DNS). Run it again any time: what's done stays done. `--dry-run` says what it would do;
+`--unattended` asks nothing (`--on`, `--server`, `--domain` and `--sudo` say what it would have
+asked).
+
+Without the guide, `kiln install` installs on the target you name:
+
+```sh
 ./target/release/kiln install      # the cluster of your kubeconfig's current context (the default; without one, this machine)
 ./target/release/kiln install --on docker    # a container on this machine
 ./target/release/kiln install --on machine   # this machine: ~/.local/bin, ~/.config/kiln/kiln.toml, start on boot, start now
@@ -57,6 +84,9 @@ To add another machine with a join token, such as a benchmark box, copy the comm
 ```sh
 curl -fsSL http://<server>:7070/install.sh | sh -s -- --token <join-token> --labels baremetal,bench
 ```
+
+At a terminal the script hands over to `kiln setup`, which says what it will do first (and on a
+Mac gives kiln its own signature); without one it asks nothing.
 
 ## Platforms
 

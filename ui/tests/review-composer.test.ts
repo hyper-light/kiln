@@ -22,7 +22,8 @@ const browser = Object.assign(new EventTarget(), {
   },
   clearTimeout: (id: number) => timers.delete(id),
 });
-Object.assign(globalThis, { window: browser, localStorage: storage, sessionStorage: storage });
+// A document too, as the other tests' browsers have: api/events.ts listens on it once it has a window.
+Object.assign(globalThis, { window: browser, document: new EventTarget(), localStorage: storage, sessionStorage: storage });
 const flush = () => {
   const queued = [...timers.values()];
   timers.clear();

@@ -169,7 +169,7 @@ impl Cd {
     /// Whether a local image is ready at `revision`: the run of its pipeline at that commit, in
     /// the app's repository, succeeded. Waiting (none yet, or still running) and failure are
     /// errors that say which.
-    pub(crate) async fn published_locally(&self, def: &AppDef, pipeline: &str, revision: &str) -> Result<()> {
+    pub(crate) async fn published_locally(&self, def: &AppDef, image: &str, pipeline: &str, revision: &str) -> Result<()> {
         let Origin::Deploy { repo: url } = &def.origin else {
             bail!("a published image needs an app from a repository's .kiln/deploy.yaml, whose pipeline builds it");
         };
@@ -181,7 +181,7 @@ impl Cd {
         match run {
             None => bail!("waiting for the {pipeline} pipeline to run at {short}"),
             Some(r) => match r.status {
-                Status::Succeeded => Ok(()),
+                Status::Succeeded => self.on_the_nodes(def, image, revision).await,
                 Status::Failed | Status::Cancelled | Status::TimedOut | Status::Skipped => {
                     bail!("the {pipeline} pipeline didn't build {short} (run #{}, {}): run it again, or deploy another commit", r.number, r.status.as_str())
                 }
@@ -189,6 +189,66 @@ impl Cd {
             },
         }
     }
+}
+
+impl Cd {
+    /// Whether `image:revision` is still on the app's cluster's nodes: the pipeline prunes old
+    /// images, so a run that succeeded once doesn't mean its image is there now, and a pod told to
+    /// run a pruned one can't start (kiln itself went down so, 2026-10-26). Ready when a node
+    /// lists it; an error when every node shows it isn't there; ready too when kiln can't tell
+    /// (no cluster, nodes it can't read, lists that may be cut short), as before this check.
+    async fn on_the_nodes(&self, def: &AppDef, image: &str, revision: &str) -> Result<()> {
+        let cluster = self.clusters.read().get(&def.destination.cluster).cloned();
+        let Some(cluster) = cluster else { return Ok(()) };
+        let nodes = match cluster.get_path("/api/v1/nodes").await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(image, revision, "cd: couldn't read the nodes to look for a published image: {e:#}");
+                return Ok(());
+            }
+        };
+        match on_nodes(&nodes, image, revision) {
+            Some(false) => bail!(
+                "{image}:{} isn't on the cluster's nodes any more (older images are pruned): build it again (run the image pipeline at that commit), or deploy another commit",
+                revision.get(..7).unwrap_or(revision)
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The most images a kubelet lists in a node's status by default (`nodeStatusMaxImages`), the
+/// largest first.
+const NODE_IMAGES_LISTED: usize = 50;
+
+/// Whether `image:tag` is on any of `nodes` (a NodeList): `Some(true)` when one lists it,
+/// `Some(false)` when every node's list shows it isn't there, `None` when kiln can't tell. A list
+/// cut short at [`NODE_IMAGES_LISTED`] still shows it when it holds smaller images than every
+/// other `image` it lists: a pruned one would be about their size, and so listed.
+fn on_nodes(nodes: &Value, image: &str, tag: &str) -> Option<bool> {
+    let items = nodes.get("items")?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    let want = format!("{image}:{tag}");
+    let same = |n: &str, w: &str| n == w || n.strip_prefix("docker.io/library/").or_else(|| n.strip_prefix("docker.io/")) == Some(w);
+    let mut complete = true;
+    for node in items {
+        let images = node.pointer("/status/images").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        let names = |i: &Value| i.get("names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
+        let size = |i: &Value| i.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0);
+        if images.iter().any(|i| names(i).iter().any(|n| same(n, &want))) {
+            return Some(true);
+        }
+        if images.len() >= NODE_IMAGES_LISTED {
+            let ours = images.iter().filter(|i| names(i).iter().any(|n| n.rsplit_once(':').is_some_and(|(r, _)| same(r, image)))).map(size).min();
+            let smallest = images.iter().map(size).min().unwrap_or(0);
+            if !ours.is_some_and(|o| smallest < o / 2) {
+                complete = false;
+            }
+        }
+    }
+    complete.then_some(false)
 }
 
 /// The images API's view: every image people set, by name.
@@ -209,5 +269,25 @@ mod tests {
         let h: Home = serde_json::from_value(serde_json::json!({ "kind": "registry", "repository": "docker.io/acme/kiln" })).unwrap_or_default();
         assert_eq!(h, Home::Registry { repository: "docker.io/acme/kiln".into(), integration: None });
         assert_eq!(serde_json::from_value::<Home>(serde_json::json!({ "kind": "local" })).ok(), Some(Home::Local));
+    }
+
+    #[test]
+    fn a_pruned_image_is_off_the_nodes() {
+        let node = |images: Vec<Value>| serde_json::json!({ "status": { "images": images } });
+        let img = |name: &str, mib: u64| serde_json::json!({ "names": [name], "sizeBytes": mib << 20 });
+        let list = |nodes: Vec<Value>| serde_json::json!({ "items": nodes });
+        let few = node(vec![img("kiln:aaa", 300), img("docker.io/library/kiln:bbb", 300), img("busybox:1", 5)]);
+        assert_eq!(on_nodes(&list(vec![few.clone()]), "kiln", "aaa"), Some(true));
+        assert_eq!(on_nodes(&list(vec![few.clone()]), "kiln", "bbb"), Some(true));
+        assert_eq!(on_nodes(&list(vec![few.clone()]), "kiln", "old"), Some(false));
+        // One node has it: ready.
+        assert_eq!(on_nodes(&list(vec![node(vec![]), node(vec![img("kiln:old", 300)])]), "kiln", "old"), Some(true));
+        // A list cut short, but down to images far smaller than kiln's: it would show.
+        let cut = |last: Value| -> Vec<Value> { (0..48).map(|i| img(&format!("x{i}:1"), 200)).chain([img("kiln:aaa", 300), last]).collect() };
+        assert_eq!(on_nodes(&list(vec![node(cut(img("small:1", 100)))]), "kiln", "old"), Some(false));
+        // Cut short at images as large as kiln's: can't tell.
+        assert_eq!(on_nodes(&list(vec![node(cut(img("big:1", 250)))]), "kiln", "old"), None);
+        assert_eq!(on_nodes(&list(vec![]), "kiln", "old"), None);
+        assert_eq!(on_nodes(&serde_json::json!({}), "kiln", "old"), None);
     }
 }

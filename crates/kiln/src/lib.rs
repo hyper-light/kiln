@@ -63,6 +63,7 @@ pub mod rt;
 pub mod ship;
 pub mod secrets;
 pub mod server;
+pub mod setup;
 #[cfg(test)]
 mod sim;
 pub mod skew;

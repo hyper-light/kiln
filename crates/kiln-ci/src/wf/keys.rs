@@ -292,6 +292,19 @@ pub const STEP: &[Key] = &[
     kiln("test-results", Ty::Any, "kiln: test reports this step writes (W16-R01)."),
     kiln("integrations", Ty::StrList, "kiln: integrations this step authenticates to (W11-R03)."),
     kiln_only("tty", Ty::Bool, "kiln v1: run under a pseudo-terminal."),
+    kiln("memo", Ty::StrOrMap(MEMO), "kiln: reuse the step's earlier success while its inputs are unchanged: `check` (nothing to restore), or `{ inputs, outputs, env, max-age, platform, tools }` (W24-R07, W28-R70)."),
+    kiln("tests", Ty::Any, "kiln: run a build's test binaries, those whose binary or what they read changed, and replay the others' recorded passes: `{ cargo: [args] }` (W24-R10)."),
+];
+
+/// A step's `memo:` (W24-R07).
+pub const MEMO: &[Key] = &[
+    kiln("inputs", Ty::StrList, "Paths and globs whose git trees the step depends on (the whole tree when none)."),
+    kiln("outputs", Ty::StrList, "Paths in the workspace the step leaves for later steps: kept, and put in place when a later step runs."),
+    kiln("env", Ty::StrList, "Variables the step depends on besides those the workflow declares."),
+    kiln("max-age", Ty::Str, "How long a result stays reusable (`14d` by default)."),
+    kiln("secrets", Ty::Str, "`hmac`: a step that receives secrets keyed by their HMAC (W24-R05)."),
+    kiln("platform", Ty::Any, "The platform facets the key keeps (`[os, arch]`; `any` for none): the step keys by what it declares only, so pipelines share it (W28-R70)."),
+    kiln("tools", Ty::Any, "Toolchains whose identity the key keeps, each at a precision: `{ node: major, rustc: full }` (W28-R71)."),
 ];
 
 pub const JOB: &[Key] = &[
@@ -327,6 +340,7 @@ pub const JOB: &[Key] = &[
     kiln("retry", Ty::Any, "kiln: the retry policy (W05-R14)."),
     kiln_only("retries", Ty::Num, "kiln v1: retries after a lost runner."),
     kiln("reuse", Ty::Any, "kiln: reuse an earlier result when the inputs are unchanged (W08-R10)."),
+    kiln("work", Ty::Any, "kiln: doing the least work (W24): `memo` takes an earlier result when the inputs are unchanged, as `reuse:` (W24-R06); `warm: [folders]` or `warm: { paths, budget }` keeps the job's workspace on its runner for its next leg, those folders kept (W24-R11)."),
     kiln("cache", Ty::Any, "kiln: caches (W08-R09), or v1's list of kept directories."),
     kiln("exports", Ty::Any, "kiln: `{ env: [names] }` published to later jobs (W04-R21)."),
     kiln("env-from", Ty::StrList, "kiln: import jobs' exported environment (W04-R21)."),
@@ -356,6 +370,8 @@ pub const WORKFLOW: &[Key] = &[
     gha("cache-mode", Ty::Str, "Cache access for every job: `read`, `write`, `write-only` or `none` (low-trust events default to `read`)."),
     kiln_only("secrets", Ty::Any, "kiln: the secrets this workflow uses (W09-R06)."),
     kiln("supersede", Ty::Any, "kiln: cancel or deprioritize older runs (W05-R08)."),
+    kiln_only("coalesce", Ty::Any, "kiln: `{ quiet, max-wait, when }`: a burst of pushes runs its newest commit while the runners it needs are busy (W28-R61)."),
+    kiln_only("cadence", Ty::Any, "kiln: `{ on: free }` or `{ every }`: the newest commit runs when its runner frees, or once per interval (W28-R62)."),
     kiln("routing", Ty::Any, "kiln: `{ infer: true }` (W05-R19)."),
     kiln_only("run-env", Ty::Bool, "kiln: collect `$KILN_RUN_ENV` into `run.env` (W04-R21)."),
     kiln("kiln", Ty::Any, "kiln: `{ honour-skip-ci, chain-depth }` (W03-R06, R13)."),

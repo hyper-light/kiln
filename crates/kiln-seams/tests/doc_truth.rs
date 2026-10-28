@@ -205,6 +205,22 @@ fn seams() -> Vec<Seam> {
             )],
         },
         Seam {
+            title: "Forge",
+            file: "forge.rs",
+            tr: "Forge",
+            more: &[],
+            cases: said(&forge::cases::<forge::SimForgeFixture>()),
+            bounds: vec![
+                format!("{} changes and {} commits a repository", count(forge::SIM_CHANGES as u64), count(forge::SIM_COMMITS as u64)),
+                format!("{} drafts a change", count(forge::SIM_DRAFTS as u64)),
+                format!("the last {} background merges", count(forge::SIM_TICKETS as u64)),
+                format!("comments to {}", size(forge::BODY_MAX as u64)),
+                format!("titles to {} bytes", forge::TITLE_MAX),
+                format!("{} merge requests a stack at most", forge::GITLAB_STACK_MOST),
+                format!("GitHub {} requests an hour, GitLab {}, Bitbucket {}", forge::GITHUB_HOURLY, forge::GITLAB_HOURLY, forge::BITBUCKET_HOURLY),
+            ],
+        },
+        Seam {
             title: "Search",
             file: "search.rs",
             tr: "Search",

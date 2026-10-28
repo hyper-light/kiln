@@ -15,7 +15,8 @@ import { Chips, StatusBadge, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { upsert } from "@/lib/data";
-import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, shortSha, spanSeconds } from "@/lib/format";
+import { placementWords } from "@/api/retry";
+import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, isTerminal, shortSha, spanSeconds } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -24,6 +25,7 @@ import { EventIcon, LiveDuration, RelTime } from "../shared";
 import { AttemptSelect, CiLegExtras, CiRunActions, CiRunParts, CompareLink, criticalKeys, EditWorkflowLink, WorkflowInsightsLink } from "./ci";
 import { JobDag } from "./dag";
 import { MissingTools } from "./missing-tools";
+import { JobRetry } from "./retry";
 
 const LogViewer = React.lazy(() => import("./log-viewer"));
 
@@ -100,8 +102,10 @@ function RunBody({ id }: { id: string }) {
   }
 
   const { run, jobs } = res.data;
-  // Without a job in the URL, the one picked first stays picked as statuses change (no jumping).
-  const selected = jobs.find((j) => j.id === jobId) ?? jobs.find((j) => j.id === firstPick) ?? pickDefaultJob(jobs);
+  // Without a job in the URL, the one picked first stays picked as statuses change (no jumping);
+  // a leg just retried (`?key=`) is its leg in the run's new attempt (docs/ci.md W05-R28).
+  const keyed = search.get("key");
+  const selected = jobs.find((j) => j.id === jobId) ?? (keyed ? jobs.find((j) => j.key === keyed) : undefined) ?? jobs.find((j) => j.id === firstPick) ?? pickDefaultJob(jobs);
   const select = (jid: string) => navigate(`/runs/${id}/jobs/${jid}${asked ? `?attempt=${asked}` : ""}`, { replace: true });
   const shownAttempt = asked ?? ciDetail?.run.attempt ?? 1;
   const setAttempt = (n: number) => setSearch(n === ciDetail?.run.attempt ? {} : { attempt: String(n) }, { replace: true });
@@ -440,6 +444,7 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
               tone: job.exit_code === null ? undefined : job.exit_code === 0 ? "pass" : "fail",
             },
             { label: "Labels", value: job.labels.length ? <Chips labels={job.labels} /> : "—" },
+            ...(job.placement ? [{ label: "Retry asked", value: placementWords(job.placement) ?? "—" }] : []),
           ]}
         />
         {job.needs.length > 0 && (
@@ -453,6 +458,15 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
           </div>
         )}
       </div>
+
+      {/* A finished job again, here or elsewhere: a leg of the run's latest attempt, or a pipeline's job (W05-R28). */}
+      {isTerminal(job.status) && (!ciDetail || attempt === undefined || attempt === ciDetail.run.attempt) && (
+        <div className="border-t border-[#28313d]">
+          <Loadable label="where it could run again" fallback={<Hold height={57} />}>
+            <JobRetry jobId={job.id} runId={job.run_id} />
+          </Loadable>
+        </div>
+      )}
 
       {ciDetail && (
         <Loadable label="the leg's notes" fallback={null}>

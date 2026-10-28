@@ -202,6 +202,8 @@ fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "RunStatus"))]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Pending,
@@ -281,6 +283,7 @@ fn upstream() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Run {
     pub id: String,
     pub repo_id: String,
@@ -301,6 +304,7 @@ pub struct Run {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Job {
     pub id: String,
     pub run_id: String,
@@ -320,15 +324,32 @@ pub struct Job {
     pub peak_rss: Option<u64>,
     pub cpu_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub spec: Option<PlannedJob>,
     pub steps: Vec<Step>,
     /// A CI matrix leg's values, by axis: where it sits in its job's grid on the run graph
     /// (docs/ci.md W21-R04).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "Record<string, unknown>"))]
     pub matrix: Option<serde_json::Value>,
+    /// Where a person's retry asked it to run (docs/ci.md W05-R28).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<kiln_ci::sched::Placement>,
+}
+
+/// What [`Store::retry_job`] did (docs/ci.md W05-R28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobRetry {
+    /// Its new attempt, and the jobs that need it sent back to wait for it.
+    Again { run: String, attempt: u32, waiting: Vec<String> },
+    NoSuchJob,
+    /// Why it can't run again now.
+    Refused(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "JobStep"))]
 pub struct Step {
     pub idx: u32,
     pub name: String,
@@ -338,6 +359,7 @@ pub struct Step {
     pub exit_code: Option<i32>,
     /// The order it started in among the job's steps (CI legs; docs/ci.md W21).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub seq: Option<i64>,
 }
 
@@ -1227,7 +1249,7 @@ impl Store {
                 &format!(
                     "UPDATE jobs SET status = CASE WHEN needs = '[]' THEN 'queued' ELSE 'pending' END,
                        attempt = attempt + 1, agent = NULL, started_at = NULL, finished_at = NULL,
-                       exit_code = NULL, error = NULL, queued_at = ?2
+                       exit_code = NULL, error = NULL, queued_at = ?2, placement = NULL
                      WHERE run_id = ?1 AND {filter}"
                 ),
                 params![run_id, now],
@@ -1245,6 +1267,72 @@ impl Store {
             advance_run(&tx, &run_id, now)?;
             tx.commit()?;
             Ok(u32::try_from(n).unwrap_or(u32::MAX))
+        })
+        .await
+    }
+
+    /// A finished v1 job run again in place (docs/ci.md W05-R28): its next attempt, placed as
+    /// asked, queued once what it needs has succeeded; and every job that needs it, directly or
+    /// not, back to wait for it (one that had finished, on a new attempt of its own). Its run, if
+    /// it had finished, goes on again; one still going keeps going. A job yet to finish, a skipped
+    /// one (its retry is that of the job it needs) and one a running job needs are refused.
+    pub async fn retry_job(&self, id: String, placement: Option<kiln_ci::sched::Placement>) -> anyhow::Result<JobRetry> {
+        self.call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let now = crate::util::now_unix();
+            let found: Option<(String, String, String, u32)> =
+                tx.query_row("SELECT run_id, key, status, attempt FROM jobs WHERE id = ?1 AND job_id IS NULL", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+            let Some((run_id, key, status, attempt)) = found else { return Ok(JobRetry::NoSuchJob) };
+            let status = Status::parse(&status);
+            if !status.is_terminal() {
+                return Ok(JobRetry::Refused(format!("`{key}` hasn't finished: it's {}", status.as_str())));
+            }
+            if status == Status::Skipped {
+                return Ok(JobRetry::Refused(format!("`{key}` was skipped: retry the job it needs, or the run")));
+            }
+            let jobs: Vec<(String, String, Status, Vec<String>)> = {
+                let mut st = tx.prepare("SELECT id, key, status, needs FROM jobs WHERE run_id = ?1")?;
+                let rows = st.query_map([&run_id], |r| Ok((r.get(0)?, r.get(1)?, Status::parse(&r.get::<_, String>(2)?), from_json::<Vec<String>>(&r.get::<_, String>(3)?))))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            // Every job that needs it, directly or not, by key.
+            let mut needing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut next = vec![key.clone()];
+            while let Some(k) = next.pop() {
+                for (_, jk, _, needs) in &jobs {
+                    if needs.contains(&k) && needing.insert(jk.clone()) {
+                        next.push(jk.clone());
+                    }
+                }
+            }
+            if let Some((_, k, ..)) = jobs.iter().find(|(_, k, s, _)| needing.contains(k) && *s == Status::Running) {
+                return Ok(JobRetry::Refused(format!("`{k}` needs `{key}` and is running: wait for it, or cancel the run")));
+            }
+            const AGAIN: &str = "status = 'pending', attempt = attempt + 1, agent = NULL, executor = NULL, queued_at = NULL, started_at = NULL,
+                finished_at = NULL, exit_code = NULL, error = NULL, peak_rss = NULL, cpu_seconds = NULL";
+            let placement = placement.filter(|p| !p.is_empty()).map(|p| json(&p));
+            tx.execute(&format!("UPDATE jobs SET {AGAIN}, placement = ?2 WHERE id = ?1"), params![id, placement])?;
+            let mut waiting = Vec::new();
+            for (jid, _, s, _) in jobs.iter().filter(|(_, k, ..)| needing.contains(k)) {
+                if s.is_terminal() {
+                    tx.execute(&format!("UPDATE jobs SET {AGAIN}, placement = NULL WHERE id = ?1"), [jid])?;
+                } else if *s == Status::Queued {
+                    tx.execute("UPDATE jobs SET status = 'pending', queued_at = NULL WHERE id = ?1", [jid])?;
+                } else {
+                    continue;
+                }
+                waiting.push(jid.clone());
+            }
+            let again: Vec<&String> = std::iter::once(&id).chain(&waiting).collect();
+            tx.execute(
+                "UPDATE steps SET status = 'pending', started_at = NULL, finished_at = NULL, exit_code = NULL WHERE job_id IN (SELECT value FROM json_each(?1))",
+                [json(&again)],
+            )?;
+            tx.execute("UPDATE runs SET status = 'queued', finished_at = NULL, error = NULL WHERE id = ?1 AND status IN ('succeeded','failed','cancelled','skipped','timed_out')", [&run_id])?;
+            // It, its needs succeeded, is queued at once.
+            advance_run(&tx, &run_id, now)?;
+            tx.commit()?;
+            Ok(JobRetry::Again { run: run_id, attempt: attempt.saturating_add(1), waiting })
         })
         .await
     }
@@ -1513,7 +1601,7 @@ impl Store {
 }
 
 const JOB_SELECT: &str = "SELECT id, run_id, key, display, status, labels, needs, agent, executor,
-    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec, matrix FROM jobs";
+    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec, matrix, placement FROM jobs";
 
 fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -1561,6 +1649,7 @@ fn row_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
             .get::<_, Option<String>>(18)?
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .filter(|v| v.as_object().is_some_and(|o| !o.is_empty())),
+        placement: r.get::<_, Option<String>>(19)?.and_then(|s| serde_json::from_str::<kiln_ci::sched::Placement>(&s).ok()).filter(|p| !p.is_empty()),
     })
 }
 
@@ -1831,6 +1920,85 @@ mod tests {
         assert_eq!(s.queued_jobs(10).await?.len(), 1);
         Ok(())
     })
+    }
+
+    /// W05-R28: a v1 job retried in place: its next attempt queued with its placement, the jobs
+    /// that need it back to wait for it, its finished run going again; refused for a job yet to
+    /// finish, a skipped one, and one a running job needs.
+    #[test]
+    fn w05_r28_a_job_retried_in_place() -> anyhow::Result<()> {
+        use kiln_ci::sched::Placement;
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let repo = s
+                .upsert_repo(Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                .await?;
+            let p = pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {needs: [a], steps: [{run: y}]}\n  c: {steps: [{run: z}]}\n")?;
+            let planned = pipeline::plan(&p, &pipeline::Context::default())?;
+            let run = Run {
+                id: "run1".into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 0,
+                pipeline: "ci".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: "abc".into(),
+                message: String::new(),
+                author: String::new(),
+                status: Status::Queued,
+                created_at: 0,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: None,
+            };
+            s.create_run(run, planned).await?;
+            let jobs = s.jobs("run1".into(), false).await?;
+            let id = |k: &str| jobs.iter().find(|j| j.key == k).map(|j| j.id.clone()).unwrap_or_default();
+            let (a, b, c) = (id("a"), id("b"), id("c"));
+            let job = |j: &str| {
+                let (s, j) = (s.clone(), j.to_owned());
+                async move { s.job(j).await?.ok_or_else(|| anyhow::anyhow!("no job")) }
+            };
+            let refused = |r: JobRetry, says: &str| matches!(r, JobRetry::Refused(why) if why.contains(says));
+            // a fails on ag1 (b is skipped with it) while c runs.
+            assert!(s.claim_job(a.clone(), "ag1".into(), "baremetal".into()).await?);
+            s.finish_job(a.clone(), Status::Failed, Some(1), None, None, None).await?;
+            assert!(s.claim_job(c.clone(), "ag2".into(), "baremetal".into()).await?);
+            assert!(refused(s.retry_job(b.clone(), None).await?, "skipped"));
+            assert!(refused(s.retry_job(c.clone(), None).await?, "hasn't finished"));
+            assert_eq!(s.retry_job("nope".into(), None).await?, JobRetry::NoSuchJob);
+            // Anywhere but ag1: queued at once, b back to wait for it, the run still running c.
+            let elsewhere = Placement { runner: None, avoid: Some("ag1".into()) };
+            assert_eq!(s.retry_job(a.clone(), Some(elsewhere.clone())).await?, JobRetry::Again { run: "run1".into(), attempt: 1, waiting: vec![b.clone()] });
+            let (ja, jb) = (job(&a).await?, job(&b).await?);
+            assert_eq!((ja.status, ja.attempt, ja.agent.as_deref(), ja.placement.as_ref()), (Status::Queued, 1, None, Some(&elsewhere)));
+            assert!(ja.steps.iter().all(|st| st.status == Status::Pending), "{:?}", ja.steps);
+            assert_eq!((jb.status, jb.attempt, jb.error.as_deref()), (Status::Pending, 1, None));
+            assert_eq!(s.run("run1".into()).await?.map(|r| r.status), Some(Status::Running));
+            // It passes on ag2 and b is queued; retried on ag3 before b starts, b waits again.
+            s.finish_job(c.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            assert!(s.claim_job(a.clone(), "ag2".into(), "baremetal".into()).await?);
+            s.finish_job(a.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            assert_eq!(job(&b).await?.status, Status::Queued);
+            let on = Placement { runner: Some("ag3".into()), avoid: None };
+            assert_eq!(s.retry_job(a.clone(), Some(on.clone())).await?, JobRetry::Again { run: "run1".into(), attempt: 2, waiting: vec![b.clone()] });
+            assert_eq!((job(&a).await?.placement, job(&b).await?.status), (Some(on), Status::Pending));
+            // While b runs, a can't run again under it.
+            assert!(s.claim_job(a.clone(), "ag3".into(), "baremetal".into()).await?);
+            s.finish_job(a.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            assert!(s.claim_job(b.clone(), "ag3".into(), "baremetal".into()).await?);
+            assert!(refused(s.retry_job(a.clone(), None).await?, "`b` needs `a` and is running"));
+            // The run finished, c retried: the run goes on again, c on any runner.
+            let (_, settled) = s.finish_job(b.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            assert_eq!(settled, Some(Status::Succeeded));
+            assert_eq!(s.retry_job(c.clone(), None).await?, JobRetry::Again { run: "run1".into(), attempt: 1, waiting: vec![] });
+            let jc = job(&c).await?;
+            assert_eq!((jc.status, jc.placement), (Status::Queued, None));
+            assert_eq!(s.run("run1".into()).await?.map(|r| (r.status, r.finished_at)), Some((Status::Queued, None)));
+            Ok(())
+        })
     }
 
     /// A learner's copy holds every table that replicates, row for row with its rowids, and their

@@ -2278,6 +2278,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "ts-rs",
  "tungstenite",
  "turso_core",
  "uuid",
@@ -2311,6 +2312,7 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+ "ts-rs",
  "xxhash-rust",
 ]
 
@@ -2319,6 +2321,7 @@ name = "kiln-ci"
 version = "0.2.0"
 dependencies = [
  "aho-corasick",
+ "anyhow",
  "base64 0.23.1",
  "fancy-regex",
  "jiff",
@@ -2330,6 +2333,7 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "toml",
+ "ts-rs",
  "yaml-rust2",
 ]
 
@@ -2555,9 +2559,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memmap2"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
 ]
@@ -4196,6 +4200,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "termcolor"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4553,6 +4566,29 @@ version = "0.7.2"
 dependencies = [
  "cc",
  "tree-sitter-language",
+]
+
+[[package]]
+name = "ts-rs"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "756050066659291d47a554a9f558125db17428b073c5ffce1daf5dcb0f7231d8"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
+ "ts-rs-macros",
+]
+
+[[package]]
+name = "ts-rs-macros"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d90eea51bc7988ef9e674bf80a85ba6804739e535e9cab48e4bb34a8b652aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "termcolor",
 ]
 
 [[package]]

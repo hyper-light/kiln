@@ -7,7 +7,7 @@ import * as React from "react";
 import { Check } from "lucide-react";
 import type { Suggestion } from "@/api/review";
 import { CopyIcon } from "@/components/ui/copy-block";
-import { CodeBlock } from "@/lib/markdown";
+import { CommentCode } from "@/lib/markdown";
 
 /** Lines of a file by its own numbers: the first one's number, and their text. */
 export interface Lines {
@@ -45,7 +45,7 @@ export function SuggestionBlock({
   const [applying, startApply] = React.useTransition();
   const [made, setMade] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
-  if (!old) return <CodeBlock body={lines.join("\n")} lang="suggestion" />;
+  if (!old) return <CommentCode body={lines.join("\n")} lang="suggestion" />;
   const applied = state?.applied?.version ?? made;
   const apply = () => {
     if (!onApply) return;

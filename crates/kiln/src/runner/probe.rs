@@ -21,6 +21,10 @@ pub struct Declared {
     /// The most `kiln/cache@v1`'s local tier keeps in `<work>/_cache` (`cache_max = "20G"`; 10G
     /// when unset, docs/ci.md W08-R09).
     pub cache_max: Option<String>,
+    /// The most agent sessions this machine has at work at once (`max_agent_sessions = 128`; from 1
+    /// to 4096, kiln's default of 64 when unset): finished, paused and ended ones don't count.
+    /// What's set for it on the server's Runners page wins over it (`crate::harness::limit`).
+    pub max_agent_sessions: Option<usize>,
 }
 
 impl Declared {
@@ -85,7 +89,9 @@ async fn tools() -> BTreeMap<String, String> {
 /// The executors this runner can run legs on right now, each probed: the host always; Firecracker
 /// when its microVMs can run here (KVM, Firecracker, its guest kernel and e2fsprogs: W13-R05), with
 /// its version and kernel; Docker (or Podman) when its engine answers, with its version and whether
-/// it runs rootless. shards is reported as a tool until this runner can run legs on it.
+/// it runs rootless. shards is reported as a tool until this runner can run legs on it. Docker
+/// isn't one on Windows: a leg in it keeps the host's paths (`C:\…`), which its Linux container
+/// has no place for (a job's own containers still run there).
 async fn executors() -> BTreeMap<String, Executor> {
     let mut out = BTreeMap::new();
     out.insert("host".to_owned(), Executor::default());
@@ -97,8 +103,11 @@ async fn executors() -> BTreeMap<String, Executor> {
         let version = crate::rt::blocking(move || m.version()).await.ok().flatten();
         out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel), ("jail".to_owned(), jail)].into() });
     }
+    if cfg!(windows) {
+        return out;
+    }
     let Ok(Some(bin)) = crate::rt::blocking(super::docker::find).await else { return out };
-    let engine = if bin.ends_with("podman") { "podman" } else { "docker" };
+    let engine = if super::docker::is_podman(&bin) { "podman" } else { "docker" };
     let mut version = None;
     for format in ["{{.Server.Version}}", "{{.Version}}"] {
         if let Some(v) = output(&bin, &["version", "--format", format]).await.as_deref().and_then(version_in) {
@@ -219,6 +228,32 @@ pub(crate) fn volume(dir: &Path) -> Option<Disk> {
     Some(Disk { total, free })
 }
 
+/// The machine's I/O pressure (docs/ci.md W24-R19): Linux's pressure stall information, the `full`
+/// line's `avg10` of `/proc/pressure/io` (the share of the last 10 s in which all non-idle tasks
+/// were stalled on I/O at once), in percent. `None` where the kernel doesn't report it.
+fn io_pressure() -> Option<f64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::fs::read_to_string("/proc/pressure/io").ok().as_deref().and_then(io_full)
+}
+
+/// `full avg10` of a PSI file (`some avg10=0.00 avg60=0.00 avg300=0.00 total=0`, then the same
+/// for `full`).
+fn io_full(text: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.split_whitespace().next() == Some("full"))?;
+    line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// This machine's size, as its facts give it: its CPUs (threads) and memory. What a runner's own
+/// admission counts what exclusive legs hold against (docs/ci.md W05-R03).
+pub(crate) fn size() -> Option<kiln_ci::sched::state::Resources> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    (threads > 0 && sys.total_memory() > 0).then(|| kiln_ci::sched::state::Resources { cpu: threads as f64, mem: sys.total_memory(), ..Default::default() })
+}
+
 /// The machine: its OS, CPU, memory, the work directory's volume, virtualization and emulation.
 fn machine(work_dir: &Path) -> RunnerFacts {
     use sysinfo::{Disks, System};
@@ -251,6 +286,8 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         disk,
         virt: Virt { kvm, hvf: false, nested },
         binfmt: binfmt(),
+        // Its load, for admission (W24-R19).
+        work: Some(kiln_ci::facts::WorkFacts { io_full: io_pressure() }),
         ..RunnerFacts::default()
     }
 }
@@ -335,7 +372,25 @@ mod tests {
         std::fs::write(&path, "[server]\nhttp_addr = \"0.0.0.0:1\"\n\n[agent.facts]\nlocation = \"rack-2\"\n\n[agent.probes]\ncuda = \"nvcc --version\"\n")?;
         let d = Declared::from_file(&path);
         assert_eq!((d.facts.get("location").map(String::as_str), d.probes.get("cuda").map(String::as_str)), (Some("rack-2"), Some("nvcc --version")));
+        assert_eq!(d.max_agent_sessions, None);
         assert_eq!(Declared::from_file(&dir.path().join("none.toml")), Declared::default());
+        // Beside them, how many agent sessions it has at work at once (docs/agents.md).
+        std::fs::write(&path, "[agent]\nmax_agent_sessions = 128\n\n[agent.facts]\nlocation = \"rack-2\"\n")?;
+        let d = Declared::from_file(&path);
+        assert_eq!((d.max_agent_sessions, d.facts.get("location").map(String::as_str)), (Some(128), Some("rack-2")));
         Ok(())
+    }
+
+    /// W24-R19: the I/O pressure a runner reports is PSI's `full avg10`.
+    #[test]
+    fn w24_r19_io_pressure() {
+        let psi = "some avg10=12.50 avg60=8.00 avg300=2.10 total=123456\nfull avg10=7.25 avg60=3.00 avg300=1.00 total=65432\n";
+        assert_eq!(io_full(psi), Some(7.25));
+        assert_eq!(io_full("some avg10=1.00 avg60=0.00 avg300=0.00 total=1\n"), None, "a kernel without `full`");
+        assert_eq!(io_full("full avg10=nan avg60=0.00\n"), None);
+        assert_eq!(io_full(""), None);
+        if cfg!(target_os = "linux") && std::path::Path::new("/proc/pressure/io").exists() {
+            assert!(io_pressure().is_some_and(|p| (0.0..=100.0).contains(&p)), "{:?}", io_pressure());
+        }
     }
 }

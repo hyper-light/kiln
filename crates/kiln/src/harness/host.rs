@@ -11,7 +11,7 @@
 //! time. A message goes through the session's inbox first (CP-T3.2, `super::inbox`): taken once,
 //! fenced by the session's epoch, its answer said back as [`Update::Inbox`](super::core::Update).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -30,15 +30,54 @@ use super::session::{self, Info, Session, Sink, Spec};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Agent sessions on this machine.
+    /// Agent sessions at work on this machine at once ([`Info::at_work`]): finished, paused and
+    /// ended ones don't count.
     pub per_machine: usize,
-    /// Agent sessions in one shell.
-    pub per_shell: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { per_machine: 64, per_shell: 32 }
+        Self { per_machine: super::limit::DEFAULT }
+    }
+}
+
+/// A machine's room for agent sessions at work (`super::limit`): its limit, who's at work, and
+/// who waits for room to go to work, the longest first. Its lock is taken last, nothing else
+/// locked while it's held, so a session asks with its own state in hand.
+#[derive(Debug, Default)]
+struct Room {
+    limits: Limits,
+    /// At work, as each last said, or let go to work (before it says so).
+    working: HashSet<String>,
+    /// Waiting for room to go to work, the longest first.
+    waiting: VecDeque<String>,
+}
+
+impl Room {
+    /// Room for `id` to go to work: at work already, or a place free with nobody waiting longer.
+    /// Let go, it's at work from now on; not, it waits in line.
+    fn take(&mut self, id: &str) -> bool {
+        if self.working.contains(id) {
+            return true;
+        }
+        let free = self.limits.per_machine.saturating_sub(self.working.len());
+        let ahead = self.waiting.iter().position(|w| w == id).unwrap_or(self.waiting.len());
+        if ahead < free {
+            self.waiting.retain(|w| w != id);
+            self.working.insert(id.to_owned());
+            return true;
+        }
+        if ahead == self.waiting.len() {
+            self.waiting.push_back(id.to_owned());
+        }
+        false
+    }
+
+    /// Those told there may be room for them now: as many of the longest waiting as places are
+    /// free.
+    fn wakeable(&self) -> Vec<String> {
+        let free = self.limits.per_machine.saturating_sub(self.working.len());
+        self.waiting.iter().take(free).cloned().collect()
     }
 }
 
@@ -339,7 +378,9 @@ const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through yo
 pub struct Host {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     sink: Sink,
-    pub limits: Limits,
+    /// What its sessions are held to, who's at work and who waits for room ([`Room`]): its most
+    /// at work at once can change as it runs (`super::limit`).
+    room: Mutex<Room>,
     file: Option<PathBuf>,
     dirty: AtomicBool,
     /// What the sessions' harnesses run is being looked at (`watch`).
@@ -439,7 +480,7 @@ impl Host {
         Arc::new_cyclic(|me| Self {
             sessions: Mutex::new(HashMap::new()),
             sink,
-            limits,
+            room: Mutex::new(Room { limits, ..Room::default() }),
             file,
             dirty: AtomicBool::new(false),
             watching: AtomicBool::new(false),
@@ -469,6 +510,86 @@ impl Host {
     /// It takes no messages now ([`Host::hold`]).
     pub fn is_held(&self) -> bool {
         self.held.load(Ordering::Acquire)
+    }
+
+    /// What sessions new to this machine are held to now.
+    pub fn limits(&self) -> Limits {
+        self.room.lock().limits
+    }
+
+    /// At most `n` of its sessions at work from now on (`super::limit`): those at work go on,
+    /// however many are; raised, those waiting longest are told there may be room. Whether that
+    /// changed it.
+    pub fn set_max_sessions(&self, n: usize) -> bool {
+        let (changed, wake) = {
+            let mut r = self.room.lock();
+            let changed = r.limits.per_machine != n;
+            r.limits.per_machine = n;
+            (changed, r.wakeable())
+        };
+        self.wake(wake);
+        changed
+    }
+
+    /// How many of its sessions are at work, and how many wait for room (`super::limit`).
+    pub fn room_counts(&self) -> (usize, usize) {
+        let r = self.room.lock();
+        (r.working.len(), r.waiting.len())
+    }
+
+    /// Whether session `id` may go to work now (`super::limit`): at work already, or room for one
+    /// more with nobody waiting longer, it may, and it's at work from now on; else it waits in
+    /// line, told when there may be room ([`Session::room`]).
+    pub fn room_for(&self, id: &str) -> bool {
+        self.room.lock().take(id)
+    }
+
+    /// How session `id` stands now, and whether anything waits to go to its harness: one at work
+    /// no longer frees its place, one with nothing to go leaves the line, and those waiting longest
+    /// are told there may be room.
+    pub fn stands(&self, id: &str, work: session::Work, waits: bool) {
+        let wake = {
+            let mut r = self.room.lock();
+            let mut moved = false;
+            match work {
+                session::Work::Yes => {
+                    r.waiting.retain(|w| w != id);
+                    r.working.insert(id.to_owned());
+                }
+                // Let go to work, it keeps its place till it's on a turn or isn't.
+                session::Work::Starting => {}
+                session::Work::No => moved = r.working.remove(id),
+            }
+            if work != session::Work::Yes && !waits {
+                let before = r.waiting.len();
+                r.waiting.retain(|w| w != id);
+                moved |= r.waiting.len() != before;
+            }
+            if moved { r.wakeable() } else { Vec::new() }
+        };
+        self.wake(wake);
+    }
+
+    /// Session `id` is this machine's no longer (closed, gone on elsewhere): its place, and its
+    /// place in line, go.
+    fn leave(&self, id: &str) {
+        let wake = {
+            let mut r = self.room.lock();
+            let freed = r.working.remove(id);
+            let before = r.waiting.len();
+            r.waiting.retain(|w| w != id);
+            if freed || r.waiting.len() != before { r.wakeable() } else { Vec::new() }
+        };
+        self.wake(wake);
+    }
+
+    /// Tells sessions `ids` there may be room on this machine for them to go to work.
+    fn wake(&self, ids: Vec<String>) {
+        for id in ids {
+            if let Some(s) = self.get(&id) {
+                s.room();
+            }
+        }
     }
 
     /// Its sessions' inboxes, when it keeps them.
@@ -679,9 +800,32 @@ impl Host {
         self.sessions.lock().values().filter(|s| matches!(s.core.lock().state.status, Status::Running | Status::Waiting)).count()
     }
 
-    /// Start a session (`id` keeps a known one's identity, e.g. one the server named).
+    /// Start a session (`id` keeps a known one's identity, e.g. one the server named). A subagent
+    /// opens as its parent runs here ([`Host::like_its_parent`]).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
-        self.open_seeded(id, spec, None, None, Vec::new(), false)
+        let spec = self.like_its_parent(spec);
+        self.open_seeded(id, spec, None, None, Vec::new(), false, true)
+    }
+
+    /// A subagent (`Spec::subagent`) whose parent runs on this machine takes what only the machine
+    /// knows of how its parent runs: the environment its parent was given (its shell's, or what a
+    /// take-over found: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, an API's address), so it has its parent's
+    /// account and configuration, and, in its parent's harness, its parent's program. What its own
+    /// spec says stays.
+    fn like_its_parent(&self, mut spec: Spec) -> Spec {
+        if !spec.subagent {
+            return spec;
+        }
+        let Some(parent) = spec.parent.as_deref().and_then(|p| self.get(p)) else { return spec };
+        let theirs = parent.spec.lock();
+        if spec.env.is_empty() {
+            spec.env.clone_from(&theirs.env);
+        }
+        if spec.program.is_none() && theirs.kind == spec.kind {
+            spec.program.clone_from(&theirs.program);
+        }
+        drop(theirs);
+        spec
     }
 
     /// Take over a session another runner handed this one (`super::moving`): its record where its
@@ -819,11 +963,14 @@ impl Host {
             std::fs::create_dir_all(&dir).and_then(|()| super::moving::keep_private(&super::moving::moved_git(&dir), &serde_json::to_vec(&kept).unwrap_or_default())).map_err(|e| Refused::NotTaken(format!("keeping its repository's state: {e}")))?;
         }
         let id = pkg.id.clone();
+        // One this machine ran already (its older runner process handed it over) isn't new here:
+        // it's never refused for the machine's limits.
+        let new = !pkg.handover;
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         // Taken over, written so before anything of it runs here: no other process of the machine
         // takes this try over, and the one that handed it over doesn't go on with it.
         taken(&id)?;
-        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None, kept_pairs(pkg.inbox, pkg.inbox_digests), false).map_err(|e| Refused::NotTaken(format!("{e:#}")))?;
+        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None, kept_pairs(pkg.inbox, pkg.inbox_digests), false, new).map_err(|e| Refused::NotTaken(format!("{e:#}")))?;
         // Its record written as it arrives, with the ids it brought until they're taken in: a
         // restart a moment later still has them (CP-T3.2).
         self.save_now();
@@ -859,6 +1006,7 @@ impl Host {
     pub fn release(&self, id: &str) {
         let gone = self.sessions.lock().remove(id);
         self.end_lane(id, Lane::Fence { epoch: gone.as_ref().map_or(0, |s| s.epoch()), handover: false });
+        self.leave(id);
         if gone.is_some() {
             self.mark_dirty();
         }
@@ -867,29 +1015,36 @@ impl Host {
     /// `brought`: the ids of the messages it had where it was before (its inbox's newest, from a
     /// move or blue/green), taken by its inbox here; a seed brings more (its queue and its
     /// timeline's messages). `back`: this host takes it back at the epoch it left at (blue/green
-    /// that never happened), lifting its inbox's fence.
-    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool) -> anyhow::Result<Arc<Session>> {
+    /// that never happened), lifting its inbox's fence. `new`: it's new to this machine, so held to
+    /// its limits; one it ran already (continued after a restart, taken back, handed over by
+    /// another of its runner processes) never is, whatever its limits say now (`super::limit`).
+    #[allow(clippy::too_many_arguments, reason = "each says how the session comes to be here")]
+    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool, new: bool) -> anyhow::Result<Arc<Session>> {
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
+        let id = id.unwrap_or_else(crate::util::new_id);
         {
             let g = self.sessions.lock();
-            if let Some(id) = &id
-                && let Some(s) = g.get(id)
-            {
+            if let Some(s) = g.get(&id) {
                 return Ok(Arc::clone(s));
             }
-            if g.len() >= self.limits.per_machine {
-                anyhow::bail!("this machine already runs {} agent sessions (the limit)", g.len());
-            }
-            if let Some(shell) = &spec.shell {
-                let n = g.values().filter(|s| s.spec.lock().shell.as_deref() == Some(shell.as_str())).count();
-                if n >= self.limits.per_shell {
-                    anyhow::bail!("that shell already has {n} agent sessions (the limit)");
+            // A new one goes to work at once (its harness starting, its first message): it takes a
+            // place, refused while the machine is full. Those at work count, and those waiting for
+            // room; finished, ready, paused and ended ones don't.
+            if new {
+                let mut r = self.room.lock();
+                let (working, waiting, max) = (r.working.len(), r.waiting.len(), r.limits.per_machine);
+                if working + waiting >= max {
+                    let waiting = if waiting == 0 { String::new() } else { format!(" and {waiting} waiting for room") };
+                    anyhow::bail!(
+                        "this machine already has {working} agent{} at work{waiting} (its limit is {max}): wait for one to finish, or raise the limit on the Runners page or with [agent] max_agent_sessions",
+                        if working == 1 { "" } else { "s" },
+                    );
                 }
+                r.working.insert(id.clone());
             }
         }
-        let id = id.unwrap_or_else(crate::util::new_id);
         let me = self.me.clone();
         let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(h) = me.upgrade() {
@@ -945,6 +1100,18 @@ impl Host {
                     }
                 })
             }),
+            room: {
+                let (me, id) = (self.me.clone(), id.clone());
+                Arc::new(move || me.upgrade().is_none_or(|h| h.room_for(&id)))
+            },
+            work: {
+                let (me, id) = (self.me.clone(), id.clone());
+                Arc::new(move |work, waits| {
+                    if let Some(h) = me.upgrade() {
+                        h.stands(&id, work, waits);
+                    }
+                })
+            },
         };
         // What its timeline and queue show first, what its inbox took last (in its own order, the
         // newest last): past its inbox's bound, the newest are the ones its inbox here keeps.
@@ -962,9 +1129,19 @@ impl Host {
         if let Some(s) = self.sessions.lock().get(&id) {
             return Ok(Arc::clone(s));
         }
-        let s = match handed {
-            Some(h) => session::start_handed(id.clone(), spec, self.sink.clone(), on_change, files, h)?,
-            None => session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?,
+        let started = match handed {
+            Some(h) => session::start_handed(id.clone(), spec, self.sink.clone(), on_change, files, h),
+            None => session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed),
+        };
+        let s = match started {
+            Ok(s) => s,
+            Err(e) => {
+                // Not started: the place it took goes.
+                if new {
+                    self.leave(&id);
+                }
+                return Err(e);
+            }
         };
         let epoch = s.epoch();
         // The ids it brought wait in its inbox until they're taken in (its lane's first word): its
@@ -1146,6 +1323,7 @@ impl Host {
     pub fn close(&self, id: &str) -> bool {
         let s = self.sessions.lock().remove(id);
         self.end_lane(id, Lane::Forget);
+        self.leave(id);
         let found = s.is_some();
         if let Some(s) = s {
             s.close();
@@ -1271,6 +1449,7 @@ impl Host {
                 (rec.inbox, rec.inbox_digests) = split_kept(kept);
             }
             self.sessions.lock().remove(&s.id);
+            self.leave(&s.id);
             // A handover's fence: started again with its session (the handover never finished),
             // this runner goes on with it.
             self.end_lane(&s.id, Lane::Fence { epoch: s.epoch(), handover: true });
@@ -1287,7 +1466,7 @@ impl Host {
         match handed {
             Some(h) => {
                 let (harness, ran) = (rec.harness.clone(), rec.ran.clone());
-                let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h), kept_pairs(rec.inbox, rec.inbox_digests), true)?;
+                let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h), kept_pairs(rec.inbox, rec.inbox_digests), true, false)?;
                 // What its harness runs stays under it; the watch finds the rest again.
                 *session.ran.lock() = (harness, ran);
                 Ok(())
@@ -1309,6 +1488,12 @@ impl Host {
     /// them, their processes included.
     pub fn take_back(&self) {
         self.sessions.lock().clear();
+        // Each says how it stands again as it goes on.
+        {
+            let mut r = self.room.lock();
+            r.working.clear();
+            r.waiting.clear();
+        }
         // Their lanes end as what they hold is done, and each session's next lane waits for its
         // last: what it was sent before goes first.
         let lanes: Vec<(String, (async_channel::Sender<Lane>, async_channel::Receiver<()>))> = self.lanes.lock().drain().collect();
@@ -1375,7 +1560,7 @@ impl Host {
             if let Some(h) = handed.remove(&id) {
                 let pid = h.process.pid;
                 // With the ids it brought and hasn't taken in, which its record keeps (CP-T3.2).
-                match self.open_seeded(Some(s.id.clone()), s.spec.clone(), None, Some(h), kept_pairs(s.inbox.clone(), s.inbox_digests.clone()), false) {
+                match self.open_seeded(Some(s.id.clone()), s.spec.clone(), None, Some(h), kept_pairs(s.inbox.clone(), s.inbox_digests.clone()), false, false) {
                     Ok(session) => {
                         // What its harness runs stays under it; the watch finds the rest again.
                         *session.ran.lock() = (s.harness.clone(), s.ran.clone());
@@ -1421,7 +1606,7 @@ impl Host {
             alive.retain(|r| r.pid != h.pid);
         }
         let trees = super::survivors::trees(&alive);
-        let session = self.open_seeded(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back)?;
+        let session = self.open_seeded(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back, false)?;
         let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
         if !trees.is_empty() {
             session.ran.lock().1.clone_from(&alive);
@@ -1941,15 +2126,19 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        room_wait: None,
         last_turn: None,
         keep_off: false,
         held: None,
+        refused: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
         max_subagents: None,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        helper: spec.helper.clone(),
+        subagent: spec.subagent,
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
@@ -1981,6 +2170,17 @@ mod tests {
             program: Some(dir.join("no-such-claude").to_string_lossy().into_owned()),
             ..Spec::default()
         }
+    }
+
+    /// Waits until `holds`: 30 s at most, which no passing run comes near.
+    async fn soon(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
+        crate::rt::timeout(Duration::from_secs(30), async {
+            while !holds() {
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} never came"))
     }
 
     /// The watch looks at what the harnesses run every 10 s by the host's clock: not before
@@ -2074,7 +2274,7 @@ mod tests {
     fn limits_and_unknown_kinds_are_refused() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (tx, _rx) = async_channel::unbounded();
-            let host = sim(tx, None, Limits { per_machine: 1, per_shell: 1 });
+            let host = sim(tx, None, Limits { per_machine: 1 });
             assert!(host.open(None, Spec { kind: "nope".into(), ..Spec::default() }).is_err());
             let dir = tempfile::tempdir()?;
             // A program that does not exist: the session reports why it is down, nothing runs.
@@ -2086,12 +2286,95 @@ mod tests {
             };
             let s = host.open(Some("limits".into()), spec.clone())?;
             assert_eq!(s.id, "limits");
-            // The same id again is the same session; another one is over the limit.
+            // The same id again is the same session. Down, it's at work no longer; another at work,
+            // a new one is over the limit.
             assert_eq!(host.open(Some("limits".into()), spec.clone())?.id, "limits");
+            soon("its place free once it's down", || host.room_counts() == (0, 0)).await?;
+            assert!(host.room_for("elsewhere"));
             assert!(host.open(None, spec).is_err());
             assert_eq!(host.inventory().sessions, vec!["limits".to_owned()]);
             assert!(host.close("limits"));
             assert!(host.list().is_empty());
+            Ok(())
+        })
+    }
+
+    /// A machine's room (docs/agents.md, "How many agents a machine runs"): so many at work at
+    /// once, one at work already going on; the next wait in line, the longest first, and one with
+    /// nothing to go leaves it. Starting, one keeps its place; at work without asking (after a
+    /// restart), it counts. Raised, there's room for the one waiting longest.
+    #[test]
+    fn a_machines_room_lets_so_many_at_work_and_the_rest_wait_their_turn() {
+        let (tx, _rx) = async_channel::unbounded();
+        let host = sim(tx, None, Limits { per_machine: 2 });
+        assert!(host.room_for("a") && host.room_for("b"), "two places");
+        assert!(host.room_for("a"), "at work already, it goes on");
+        assert!(!host.room_for("c") && !host.room_for("d"), "full: they wait, c first");
+        assert!(!host.room_for("c"), "asking again, it keeps its place in line");
+        assert_eq!(host.room_counts(), (2, 2));
+        host.stands("a", session::Work::No, false);
+        assert!(!host.room_for("d"), "a's place is c's, which waits longer");
+        assert!(host.room_for("c"));
+        host.stands("d", session::Work::No, false);
+        assert_eq!(host.room_counts(), (2, 0), "nothing waits to go for d: it left the line");
+        assert!(!host.room_for("e"));
+        host.stands("b", session::Work::Starting, true);
+        assert_eq!(host.room_counts(), (2, 1), "starting, b keeps its place");
+        assert!(host.set_max_sessions(3), "raised");
+        assert!(host.room_for("e"), "room for e, waiting longest");
+        host.stands("x", session::Work::Yes, false);
+        assert_eq!(host.room_counts(), (4, 0), "at work without asking, x counts");
+        host.stands("b", session::Work::No, false);
+        assert!(!host.room_for("f"), "three at work: no room yet");
+        host.stands("f", session::Work::No, false);
+        host.stands("c", session::Work::No, false);
+        assert!(host.room_for("f"), "two at work: room");
+    }
+
+    /// Only sessions at work count toward a machine's limit, and those waiting for room (docs/
+    /// agents.md, "How many agents a machine runs"): while it's full a new one is refused, saying
+    /// how to raise it; one that went down frees its place. Lowered under what's at work, those go
+    /// on. Started again, every session it ran comes back, however few its limit says.
+    #[test]
+    fn only_sessions_at_work_count_toward_a_machines_limit_and_a_restart_brings_back_all_it_ran() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            {
+                let (tx, _rx) = async_channel::unbounded();
+                let host = sim(tx, Some(file.clone()), Limits { per_machine: 1 });
+                let refused = |host: &Host, id: &str| host.open(Some(id.into()), no_harness(dir.path())).err().map(|e| format!("{e:#}")).unwrap_or_default();
+                // One at work, as a session on a turn says it.
+                host.stands("busy", session::Work::Yes, false);
+                let why = refused(&host, "one");
+                assert!(why.contains("already has 1 agent at work (its limit is 1)") && why.contains("[agent] max_agent_sessions"), "{why}");
+                // Raised, one waiting for room has the place free first.
+                assert!(!host.room_for("next"));
+                assert!(host.set_max_sessions(2));
+                assert!(!host.set_max_sessions(2), "the same again changes nothing");
+                let why = refused(&host, "one");
+                assert!(why.contains("already has 1 agent at work and 1 waiting for room (its limit is 2)"), "{why}");
+                host.stands("next", session::Work::No, false);
+                // A new one takes its place at once; down (its harness won't start), it frees it.
+                for id in ["one", "two", "three"] {
+                    host.open(Some(id.into()), no_harness(dir.path()))?;
+                    soon(&format!("{id}'s place free once it's down"), || host.room_counts() == (1, 0)).await?;
+                }
+                host.stands("more", session::Work::Yes, false);
+                host.set_max_sessions(1);
+                assert_eq!(host.limits().per_machine, 1);
+                assert!(refused(&host, "four").contains("already has 2 agents at work (its limit is 1)"));
+                assert_eq!(host.list().len(), 3, "those it has go on");
+                host.save_now();
+            }
+            let (tx, _rx) = async_channel::unbounded();
+            let again = sim(tx, Some(file), Limits { per_machine: 1 });
+            again.stands("busy", session::Work::Yes, false);
+            again.restore();
+            let mut ids: Vec<String> = again.list().into_iter().map(|i| i.id).collect();
+            ids.sort();
+            assert_eq!(ids, ["one", "three", "two"], "every session it ran came back");
+            assert!(again.open(None, no_harness(dir.path())).is_err(), "a new one is held to its limit");
             Ok(())
         })
     }
@@ -3235,5 +3518,40 @@ while True:
     /// machine's record says it was taken over, and m2 reaches one harness.
     fn a_late_refusal_of_a_local_hand_over_taken_over_is_one_prompt() -> anyhow::Result<()> {
         local_hand_over(5)
+    }
+
+    /// A subagent opened beside its parent runs as its parent does here: its parent's environment
+    /// (the account and configuration it was given) and, in its harness, its program; what its own
+    /// spec says stays. An agent its parent started that isn't its subagent, and a subagent whose
+    /// parent runs elsewhere, open as they're asked.
+    #[test]
+    fn a_subagent_opens_with_its_parent_s_environment_and_program() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, None, Limits::default());
+            let env = vec![("CLAUDE_CONFIG_DIR".to_owned(), dir.path().join("work-account").to_string_lossy().into_owned())];
+            let parent = Spec { env: env.clone(), ..no_harness(dir.path()) };
+            let program = parent.program.clone();
+            host.open(Some("main".into()), parent)?;
+            let child = |subagent: bool| Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), parent: Some("main".into()), subagent, ..Spec::default() };
+            // Opened: it runs as its parent does (its parent's program, which can't start here).
+            host.open(Some("sub".into()), child(true))?;
+            let sub = host.get("sub").map(|s| s.spec.lock().clone()).ok_or_else(|| anyhow::anyhow!("the subagent didn't open"))?;
+            assert_eq!((&sub.env, &sub.program), (&env, &program), "its parent's account and program");
+            // The rest as each would open (none started: a spec without a program runs the machine's own harness).
+            let own = host.like_its_parent(Spec { env: vec![("CLAUDE_CONFIG_DIR".into(), "/its/own".into())], program: Some("/its/own/claude".into()), ..child(true) });
+            assert_eq!((own.env.first().map(|(_, v)| v.as_str()), own.program.as_deref()), (Some("/its/own"), Some("/its/own/claude")), "what it was given stays");
+            let other = host.like_its_parent(Spec { kind: "codex".into(), ..child(true) });
+            assert_eq!((&other.env, other.program.as_deref()), (&env, None), "in another harness, its parent's account but not its program");
+            let plain = host.like_its_parent(child(false));
+            assert!(plain.env.is_empty() && plain.program.is_none(), "an agent of its own opens as asked");
+            let far = host.like_its_parent(Spec { parent: Some("elsewhere".into()), ..child(true) });
+            assert!(far.env.is_empty() && far.program.is_none(), "its parent runs on another machine: nothing to copy");
+            for id in ["main", "sub"] {
+                let _ = host.close(id);
+            }
+            Ok(())
+        })
     }
 }

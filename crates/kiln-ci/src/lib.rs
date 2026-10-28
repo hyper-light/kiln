@@ -27,6 +27,7 @@
 //! - [`facts`]: what runners report about themselves (W13).
 //! - [`graphql`]: GraphQL documents, for the facade's GraphQL (W14).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
+//! - [`work`]: fingerprints for doing the least work a change needs (W24).
 
 pub mod attest;
 pub mod compare;
@@ -57,3 +58,4 @@ pub mod trust;
 pub mod turn;
 pub mod wf;
 pub mod wire;
+pub mod work;

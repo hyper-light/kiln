@@ -1,6 +1,6 @@
 [package]
 name = "kiln-seams"
-description = "The seams kiln reaches every product through (Clock, Spawn, Records, Bus, Blobs, Secrets, Artifacts, Sandbox, Placement, HarnessPort, Search): each trait, its simulator, and the conformance suite every implementation passes"
+description = "The seams kiln reaches every product through (Clock, Spawn, Records, Bus, Blobs, Secrets, Artifacts, Sandbox, Placement, HarnessPort, Forge, Search): each trait, its simulator, and the conformance suite every implementation passes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

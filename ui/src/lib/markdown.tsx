@@ -1,13 +1,15 @@
 /**
  * kiln's markdown: GitHub-flavored (tables, lists, task lists, quotes, code), drawn the console's
- * way. Text only: HTML in it is never injected. No hooks, so it renders in the browser (the agent's
- * live conversation) and in server components (pages that send no markdown code at all).
+ * way, a fenced block's code in its language's colours (components/code/highlighted.tsx). Text
+ * only: HTML in it is never injected. No hooks, so it renders in the browser (the agent's live
+ * conversation) and in server components (pages that send no markdown code at all).
  */
 import * as React from "react";
 import type { Element, ElementContent, Root, RootContent } from "hast";
 import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CopyBlock, CopyIcon } from "@/components/ui/copy-block";
+import { CodeBlock } from "@/components/code/highlighted";
 
 /** A table cell keeps its words whole (harness.css), so a long run in one (a path, a URL, a digest)
  *  gets places to wrap: after its slashes, then (where a piece is still long) its other separators,
@@ -166,9 +168,7 @@ const MARKDOWN: Components = {
           <span className="hx-block-tag">{lang ?? "code"}</span>
           <CopyBlock text={body} />
         </div>
-        <pre className="hx-pre" data-lang={lang}>
-          {children}
-        </pre>
+        <CodeBlock text={body} lang={lang} className={code?.props.className} />
       </div>
     );
   },
@@ -308,7 +308,7 @@ function remarkSuggestions() {
 
 /** A fenced block of code in a comment (W26-R09): its language and a copy icon at its top right, and its
  *  lines numbered (the numbers are drawn, so they're never copied with the code). */
-export function CodeBlock({ body, lang }: { body: string; lang?: string }) {
+export function CommentCode({ body, lang }: { body: string; lang?: string }) {
   return (
     <div className="md-code" data-lang={lang}>
       <div className="md-code-head">
@@ -339,7 +339,7 @@ const commentPre =
     const code: CodeProps = React.isValidElement<CodeProps>(children) ? children.props : {};
     const n = code["data-suggestion"];
     if (Suggestion && n != null) return <Suggestion n={Number(n)} lines={JSON.parse(code["data-lines"] ?? "[]") as string[]} />;
-    return <CodeBlock body={String(code.children ?? "").replace(/\n$/, "")} lang={/language-(\S+)/.exec(code.className ?? "")?.[1]} />;
+    return <CommentCode body={String(code.children ?? "").replace(/\n$/, "")} lang={/language-(\S+)/.exec(code.className ?? "")?.[1]} />;
   };
 
 /** A comment's link keeps its title, as GitHub's do. */

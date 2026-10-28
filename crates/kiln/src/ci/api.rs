@@ -41,6 +41,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         ["_kiln", "deploy", rest @ ..] => Some(super::deploy_step::route(hub, rest, req).await),
         // W08-R09: kiln's chunked cache, for `kiln/cache@v1`.
         ["_kiln", "cache", rest @ ..] => Some(super::services::chunks::route(hub, rest, req).await),
+        // W24-R07: the work ledger, for steps' reuse.
+        ["_kiln", "work", "v1", rest @ ..] => Some(super::services::memo::route(hub, rest, req).await),
         ["twirp", service, method] => Some(super::services::twirp::route(hub, service, method, req).await),
         // W14: GitHub's REST API (as GHES serves it, at /api/v3) and GraphQL, for a leg's token.
         ["api", "v3", rest @ ..] => Some(super::rest::route(hub, rest, req).await),
@@ -136,6 +138,7 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (&Method::GET, ["runs", _, "pending" | "artifacts"])
             | (&Method::GET, ["runs", _, "artifacts", _, "download"])
             | (&Method::POST, ["runs", _, "cancel" | "rerun" | "approve"])
+            | (&Method::POST, ["legs", _, "retry"])
             | (&Method::GET, ["legs", _, "logs"])
             | (&Method::GET, ["environments"])
     )
@@ -200,6 +203,8 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
         (&Method::POST, ["runs", id, "rerun"]) => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
+        // W05-R28: a finished job again, here or elsewhere (another provider's, by its provider).
+        (&Method::POST, ["legs", id, "retry"]) => super::retry::retry(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
         (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
         (&Method::GET, ["environments"]) => super::environments::route(hub, method, &[], q, body, caller).await,
         _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
@@ -304,6 +309,13 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let c = boxed(|| super::services::cas::collect(hub)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "objects": c.objects, "bytes": c.bytes })))
         }
+        // W24-R31: the reaper's policies.
+        (&Method::GET, ["work", "reap", "policies"]) => boxed(|| super::reap::get(hub, q)).await,
+        (&Method::PUT, ["work", "reap", "policies"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 1 << 16)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| super::reap::put(hub, q, body, caller.as_ref())).await
+        }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => boxed(|| super::routing::get(hub)).await,
         (&Method::PUT, ["routing", "rules"]) => {
@@ -365,6 +377,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["runs", id, which @ ("annotations" | "summary")]) => boxed(|| super::runs_api::part(hub, id, which, q)).await,
         (&Method::GET, ["legs", id]) => boxed(|| super::runs_api::leg(hub, id)).await,
         (&Method::GET, ["legs", id, "routing"]) => boxed(|| super::runs_api::routing(hub, id)).await,
+        (&Method::GET, ["legs", id, "runners"]) => boxed(|| super::retry::runners(hub, id)).await,
         (&Method::POST, ["legs", id, "rerun-step"]) => {
             let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
             let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 1 << 16)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;

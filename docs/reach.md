@@ -5,9 +5,10 @@ from a Mac, a test on the machine with the GPU, `uptime` on a box by name — ov
 encrypted link the kiln server only relays.
 
 ```text
-kiln run --on linux/amd64 -- cargo test      # this machine if it is one, else the idlest; this repo synced over first
-kiln run --on adacachy --no-sync -- uptime   # a runner by name, in its home folder
-kiln runners linux                           # the Linux runners, best first, and why others don't suit
+kiln run --needs linux/amd64 -- cargo test           # this machine if it is one, else the idlest; this repo synced over first
+kiln run --needs cpus=8,mem=32g,linux/amd64 -- make  # one with 8 cores idle and 32 GiB free
+kiln run --on adacachy --no-sync -- uptime           # a runner by name, in its home folder
+kiln runners linux                                   # the Linux runners, best first, and why others don't suit
 ```
 
 Agents get the same through kiln's MCP server (§7): one command at a time (`runners`, `run`,
@@ -31,13 +32,26 @@ on their own lane (`LANE_REACH`, interactive class, so output never queues behin
 
 ## 2. Picking a runner
 
-`--on` (or the tool's `on`) is a runner's name or what it must be: `linux/amd64`, `macos`,
-`arm64`, `+gpu` (a label), `cpus>=16`, `mem>=32g`, `harness=codex`, `-name` to exclude one; words
-separated by commas or spaces. Aliases are understood (`amd64`, `x64` → `x86_64`; `arm64` →
-`aarch64`; `darwin`, `mac` → `macos`).
+`--needs` (or the tools' `needs`) says what the work needs, in the spelling CI's jobs use too
+(`kiln_ci::sched::needs`): what the runner must be and have — `linux/amd64`, `macos`, `arm64`,
+`+gpu` (a label), `tool:cargo`, `executor:docker`, `flag:avx2`, `binfmt:linux/arm64`, `cpus>=16`
+(cores in all), `mem>=32g` (memory free), any fact routing knows (`disk.free>=50Gi`,
+`custom.rack==a3`) — and the room it asks for, idle and free on the runner as it's picked:
+`cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive` takes a runner with no CI work on it. Reach
+holds nothing for the work: the room is what's idle then. Words are separated by commas or spaces,
+and one that isn't a need is an error that names it (`memm=4g: no such need`). Aliases are
+understood (`amd64`, `x64` → `x86_64`; `arm64` → `aarch64`; `darwin`, `mac` → `macos`). The
+constraints are checked against the facts each runner reports (docs/ci.md W13-R01), its platform,
+cores and memory from its latest sample; one that hasn't reported facts (an older runner) meets
+only those.
+
+`--on` (or the tools' `on`) names a runner, for work that has to happen on that machine; it must
+still meet `--needs`. It takes what `--needs` does too, as it did before needs, and `harness=codex`
+and `-name` to exclude one. A runner older than the needs spelling reads a word it doesn't know as a
+runner's name, so it refuses such a run rather than running it where it doesn't suit.
 
 Of the connected runners that take reach links and suit, the asking machine itself comes first
-while it has 4 GiB of memory free and isn't overloaded (nothing crosses the network — it then runs
+while it has 4 GiB of memory free beyond what the work asks and isn't overloaded (nothing crosses the network — it then runs
 locally — and another machine's resources stay its own): work goes elsewhere only when it asks for
 what this machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others,
 the one with the most idle cores wins (by its busy share or its load average, whichever leaves
@@ -147,12 +161,108 @@ repository, `--no-sync` to skip):
 The copy lives at `~/.kiln/reach/<asking runner>/<tree>-<hash>` and is kept, so the next sync
 sends only what changed: the asker sends the list (path, size, time, mode), the doer asks for the
 files that differ, the asker sends them (256 KiB pieces, at most 4 MiB unacknowledged), and on
-commit the copy is made to match exactly. The command then runs in the copy's folder matching
+commit the copy is made to match the list: what was sent before and is no longer listed goes,
+while what was never sent (untracked and ignored build output such as `target/`, `ui/dist` and
+`node_modules`) stays, so builds over there stay incremental (docs/ci.md W24-R24). The list last
+applied is kept beside the copy (`<copy>.kiln-sent`), never in it; a copy without one is made to
+match exactly, once. The command then runs in the copy's folder matching
 where the asker was. Paths are checked (relative, plain, never through a symlink) so a list can't
 write outside the copy.
 
 Measured on this repository (8,100 files, 36 MB, through the relay): first sync 2.5 s, an
 unchanged tree 0.5 s.
+
+### 5.1 Keeping copies
+
+A copy stays until something lets it go: every worktree an agent ran a command for leaves one on
+each runner it ran on, and a build there leaves its output in it. People set **rules** for when
+copies go, and each runner applies them to its own (`reach/keep.rs` decides, `reach/keeper.rs`
+does it on the runner, `reach/copies.rs` keeps the rules and what runners say on the server).
+
+**Rules.** Each scope sets any of them; one it leaves unset is the scope above's, and `0`, `""` or
+`false` says none here:
+
+| Scope | Set from | Counts its newest among |
+| --- | --- | --- |
+| an agent | its settings (Agent settings → Copies on other runners) | the copies it used last |
+| a repository | its row in Repositories | the copies of it (`github.com/hyper-light/kiln`, as places name it) |
+| a runner | System → Copies of other runners' trees, its row | the runner's own |
+| every runner | System → Copies of other runners' trees | each runner's own |
+
+The most particular scope that sets a rule wins, rule by rule: an agent's over its copy's
+repository's, over its runner's, over every runner's.
+
+| rule | |
+| --- | --- |
+| `newest` | keep the newest this many copies, by when each was last used (a sync into it, a run in it) |
+| `hours` | keep the copies used within this many hours |
+| `both` | with both rules, a copy stays only when both keep it; else when either does |
+| `schedule`, `timezone` | a five-field cron (CI's, `kiln_ci::trigger::cron`) and the zone it's read in (UTC without one): when it comes round, what the rules don't keep goes |
+| `free_percent`, `free_gib` | too little room: while the disk the copies are on has less than this share free, or this many GiB, what the rules don't keep goes, least recently used first, until there's room |
+| `beyond` | with too little room still once that went, what the rules keep goes too, least recently used first, until there's room |
+
+**Opt-in.** Nothing goes until a schedule or a room limit says when, or a person asks (*Let go now*
+on a runner's row, `POST /api/reach/keep/runners/:name/now`; it applies the rules at once). Never
+a copy a sync or a run is at, nor one used in the last ten minutes, whatever the rules say.
+
+**On the runner.** The node holds a copy in use while a sync is at it and while a run in it goes on,
+and notes the agent that asked: `kiln run` and the agents' `run` tool pass the agent's session as
+`KILN_REACH_AGENT` in the run's environment (the command sees it too). Every 20 seconds the runner
+looks at its copies (`~/.kiln/reach/<runner>/<folder>`), measures those that changed, reads the
+room on their disk, and lets go of what the rules and their triggers say, oldest first: each copy
+is moved aside (`.letting-go`) under the lock a new sync or run takes, so none starts on it halfway
+(one that starts after makes a copy afresh), then deleted. A copy from before kiln kept records
+counts as used when its folder last changed. It keeps its records, the rules and the last 50 copies
+it let go, each with why and what made it go (`schedule`, `room`, `asked`), beside the copies
+(`.keep.json`), so the rules apply while the server is away and a late look catches up on a
+schedule (a day at most); one runner process of a machine keeps them at a time (`.keep.lock`), and
+one that handed everything to a newer build lets that one keep them.
+
+**With the server.** After each look the runner says what it holds and let go (a reach question,
+`{"op": "keep", "report": …}`) and the server answers with the rules it's to weigh (every runner's,
+its own, every repository's, those of the agents its copies were used by) and the last ask to let go
+now. A server from before this doesn't know the question: the runner goes on with the rules it kept.
+The server keeps what each runner last said (`<data>/reach/copies.json`), and shows ahead what each
+copy's rules say of it and what *Let go now* would let go, with the same function the runner decides
+with. Changes to the rules are audited (`reach.keep`, `reach.keep.now`).
+
+| Method | Path | |
+| --- | --- | --- |
+| GET | `/api/reach/keep` | every runner's rules, each repository's, and each runner: its own rules, its disk, its copies (each with `kept` and `why`), what it let go, when a schedule next comes round, what letting go now would let go (`runners.read`) |
+| PUT, DELETE | `/api/reach/keep/rules` | every runner's rules (the body: the rules; DELETE: none) |
+| PUT, DELETE | `/api/reach/keep/runners/:name` | a runner's own (`runners.manage` on it); DELETE: every runner's apply |
+| PUT, DELETE | `/api/reach/keep/repos/:key…` | a repository's (`/api/reach/keep/repos/github.com/hyper-light/kiln`) |
+| POST | `/api/reach/keep/runners/:name/now`, `/api/reach/keep/now` | that runner (or every one) lets go now of what its rules don't keep, within 20 seconds |
+| GET, PUT, DELETE | `/api/harness/sessions/:id/keep` | an agent's own rules and its copies on every runner; closing it for good forgets its rules |
+
+**Watching it.** Each runner's `/metrics`: `kiln_reach_copies` and `kiln_reach_copies_bytes` (by
+`from`, the runner whose tree it is), `kiln_reach_copies_let_go_total` and
+`kiln_reach_copies_let_go_bytes_total` (by `trigger`). Logs on target `kiln.reach`, event
+`let_go` with the copy, the trigger, its bytes and why.
+
+### 5.2 Reuse
+
+`kiln run --reuse` (the `run` tool's `reuse`) gives back the result of an identical run instead
+of running again (docs/ci.md W24-R24): the same command, in the same folder of the tree, with the
+same `-e` variables, on the same machine, over an identical tree (what sync sends, by content,
+`.git` aside). The asking runner keys the run on the work ledger (`reach/reuse.rs`, a unit of kind
+`run` whose tree is an input) and looks it up before it syncs; a hit replays the recorded output
+and exits 0, saying `[kiln] reused: …`, and nothing is synced or run. Only a success is recorded,
+with its output (up to 16 MiB) in the runner's content store (`<work>/_cas`); a failure always runs
+again. Results are the machine user's own (`person:<user>`), never trusted ones. A run that reads
+input (`-i`), runs in a named shell, is detached, or has no tree (`--no-sync` elsewhere, outside a
+git repository) isn't keyed: it runs, saying why. The runner's cache service opens the first time
+it's asked to reuse.
+
+### 5.3 Objects from peers
+
+An object a runner's cache lacks (docs/ci.md W24-R27) is asked of runners that hold it before the
+server: the server's directory says which (`reach/directory.rs`, from what each runner said it
+holds, by repository, as `holds` and `holders` questions), and the object comes over the reach
+link (`Ask::Object`, `Say::ObjectData`, `Say::ObjectMissing`), a window at a time from the offset
+asked, in pieces of 1 MiB. The holder serves only an object held for the repository asked about,
+from a local file of it beside its cache, put together once. The asker hashes what came before it
+keeps it: a copy that isn't what its digest says is refused, never kept, and the next holder asked.
 
 ## 6. Local socket
 
@@ -219,7 +329,7 @@ the MCP server's resources too.
 The timeline shows a `run` as the command itself, with its output, its exit code and "on beta", and a
 program by its first line.
 
-Per agent (New agents → More → Commands; `Spec.reach`): any runner it needs (the default), a
+Per agent (Mission control's composer → More options → Commands; `Spec.reach`): any runner it needs (the default), a
 runner or platform it prefers (`run` goes there unless the agent says otherwise), or only its own
 machine (no tools). An agent's **Where commands run…** changes it while it lives (the `reach`
 control): its harness takes the tools when it starts, so it starts again once its turn is over, the
@@ -236,6 +346,16 @@ and is answered over there.
 When the agent's machine is away, it can't hand the agent over. The move then goes on from the
 server's copy of the conversation instead, its transcript included (`{"from_store": true}`; see
 [conversations.md](conversations.md), "Resuming on another machine").
+
+An agent that isn't running moves too: one that crashed or couldn't start on its runner goes as
+any other (its runner hands it over), and starts again where it goes, with the first message it
+was given when its harness never got it. The kiln server keeps the
+agents it runs once they've started; one whose harness never started there (the server hasn't it)
+moves all the same, the server packing it itself, with the first message it was given, and
+handing it to the runner (`{"from_server": true}`). It starts there under the same id, its plan
+step, goals and parent kept, in the same folder where that runner has it (under the server's home,
+the same place under the runner's), else in its home. The page of an agent that couldn't start
+offers **Move to…** beside **Start a new one**.
 
 1. **The folder** (`harness/relocate.rs`, on the server). An agent working in a git repository goes
    on in that repository's copy on the other machine, kept in step by sync (*Repositories on
@@ -343,8 +463,9 @@ What stays, and why:
 
 **Into another harness.** `move {"to": …, "kind": "codex", "model": "…"}` moves it to a runner that
 has that harness instead of its own, the conversation carried over as a switch of harness carries it
-(Claude Code ⇄ Codex: read from the harness's own record, fitted, written the way the other keeps
-its own; the permission mode never wider, the nearest effort). The timeline says it goes on in the
+(any harness into any other: read from Claude Code's or Codex's own record, else kiln's timeline,
+fitted, and written the way the other keeps its own, or in words for an ACP agent or Antigravity;
+the permission mode never wider, the nearest effort). The timeline says it goes on in the
 other harness, there too. Not from the server's copy: a machine that's away moves an agent only in its
 own harness.
 

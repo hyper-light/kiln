@@ -26,6 +26,7 @@ import { DEPLOY_EVENTS, environmentsRes, ReleaseState, templatesRes } from "./in
 import { toYaml, yamlMap, YamlEditor } from "./yaml";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
+import { Highlighted } from "@/components/code/highlighted";
 
 type Mode = "version" | "values" | "promote" | "rollback";
 
@@ -396,7 +397,9 @@ function CatalogYaml({ app }: { app: string }) {
         <span className="cd-meta">catalog-info.yaml</span>
         <CopyButton text={text} className="cd-copy" />
       </div>
-      <pre className="cd-yaml">{text}</pre>
+      <pre className="cd-yaml">
+        <Highlighted text={text} lang="yaml" />
+      </pre>
     </div>
   );
 }
