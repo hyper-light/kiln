@@ -33,6 +33,32 @@ export interface FilesCtx {
   q: string;
   /** The lines a span holds, as a file's rows have them (stable, for the memoized threads). */
   linesOf: LinesOf;
+  /** Marks a file viewed, or not, where kiln keeps it (a kiln change's, POST /api/diffs/:key/viewed); left out where nothing keeps it. */
+  viewed?: (file: string, on: boolean) => void;
+}
+
+/** A file's status in words, as kiln's review page says it: the server's when it says one (git's
+ * letter, R100 or C75, or a host's word), else its patch's (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2). */
+export function statusOf(file: PatchFile, given?: string): string {
+  const s = given ?? "";
+  const n = s.slice(1);
+  switch (s[0]) {
+    case "A":
+      return "added";
+    case "D":
+      return "deleted";
+    case "M":
+      return "modified";
+    case "R":
+      return n && n !== "100" ? `renamed ${n}%` : "renamed";
+    case "C":
+      return n ? `copied ${n}%` : "copied";
+    case "T":
+      return "type changed";
+  }
+  if (s === "removed") return "deleted";
+  if (s) return s;
+  return file.similarity != null && (file.status === "renamed" || file.status === "copied") && file.similarity !== 100 ? `${file.status} ${file.similarity}%` : file.status;
 }
 
 /** Threads by the line they end on, in the version shown. */
@@ -75,10 +101,13 @@ export const FileDiff = React.memo(function FileDiff({
   file: PatchFile;
   ctx: FilesCtx;
   map: Map<string, { t: Thread; a: Anchor }[]>;
-  meta?: { binary?: boolean; generated?: boolean; status?: string };
+  meta?: { binary?: boolean; generated?: boolean; status?: string; viewed?: boolean };
 }) {
   counted("ship/filediff");
-  const [open, setOpen] = React.useState(!(meta?.generated ?? false));
+  // Viewed folds the file, as on GitHub and kiln's review page; one viewed before opens folded.
+  const [viewed, setViewed] = React.useState(meta?.viewed ?? false);
+  const [open, setOpen] = React.useState(!(meta?.generated ?? false) && !(meta?.viewed ?? false));
+  const status = statusOf(file, meta?.status);
   const rows = ctx.rowsByFile.get(file.path) ?? [];
   const add = rows.filter((r) => r.kind === "add").length;
   const del = rows.filter((r) => r.kind === "del").length;
@@ -95,9 +124,27 @@ export const FileDiff = React.memo(function FileDiff({
       <summary>
         <span className="rv-path">{file.oldPath && file.oldPath !== file.path ? `${file.oldPath} → ${file.path}` : file.path}</span>
         <span className="rv-stat">
-          {meta?.status && meta.status !== "M" && <span className="rv-chip">{meta.status}</span>}
+          <span className="rv-chip" data-status={status.split(" ")[0]}>
+            {status}
+          </span>
           <span className="rv-add">+{add}</span> <span className="rv-del">−{del}</span>
         </span>
+        {ctx.viewed && (
+          <label className="rv-viewed">
+            <input
+              type="checkbox"
+              className="check"
+              checked={viewed}
+              onChange={(e) => {
+                const on = e.currentTarget.checked;
+                setViewed(on);
+                setOpen(!on);
+                ctx.viewed?.(file.path, on);
+              }}
+            />
+            Viewed
+          </label>
+        )}
         <button
           type="button"
           className="rv-ib"

@@ -568,7 +568,9 @@
   list-style: none;
   cursor: pointer;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-columns: auto;
+  grid-auto-flow: column;
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
@@ -602,6 +604,17 @@
   background: rgb(255 255 255 / 6%);
   font-size: 10.5px;
   color: #a1a4ad;
+}
+/* A file's Viewed, as kiln's review page has it: ticked, the file folds. */
+.rv-viewed {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  white-space: nowrap;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  color: #a1a4ad;
+  cursor: pointer;
 }
 .rv-f > summary .rv-ib {
   margin: -6px -6px -6px 0;
