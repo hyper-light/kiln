@@ -7,21 +7,28 @@
  * each environment stands from it with the one image they run, and links to its runs (step 3). Its
  * Build names each platform its release built, the image, and builds a newer push superseded, and for
  * kiln's own commits, from System's builds, which platforms' runners get its binary (Build and
- * replant plan 01a175b7f27570ee9f5b248d7bb40c0f, step 1).
+ * replant plan 01a175b7f27570ee9f5b248d7bb40c0f, step 1). Its Replant names the server's build, then
+ * each runner (replanted, replanting, didn't replant with why, offline), with Retry and Diagnose
+ * through System's own actions (step 2).
  */
 import * as React from "react";
-import { shipApi } from "@/api/ship";
+import { api } from "@/api/client";
+import { shipApi, type ShipDetail } from "@/api/ship";
+import type { RunnerFinding } from "@/api/types";
+import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
 import { clockTime } from "@/lib/format";
 import { updatesRes, useRes } from "@/lib/data";
-import { useSuspenseResource } from "@/lib/resource";
+import { errorMessage } from "@/lib/hooks";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
 import { cardsOf } from "./jobs";
 import { platformsOf } from "@/views/updates/words";
-import { buildWord, environmentsOf, failuresOf, keptBuildsOf, ridesOf, shipGroups, standWord, strip, traceOf } from "./model";
+import { buildWord, environmentsOf, failuresOf, keptBuildsOf, replantGlyph, replantWord, ridesOf, shipGroups, standWord, strip, traceOf } from "./model";
 import { horizonOf, LaneBar, reviewGroup, type ShipLaneGroup } from "./review/lanes";
 import "./ship.css";
 
@@ -202,6 +209,15 @@ function Commit({ repo, sha }: { repo: string; sha: string }) {
           )}
         </p>
       </section>
+      <section className="ship-sec" aria-label="Replant">
+        <h2>Replant</h2>
+        <Quiet>
+          <React.Suspense fallback={null}>
+            <ServerBuild repo={repo} sha={c.sha} />
+          </React.Suspense>
+        </Quiet>
+        <Runners detail={c} />
+      </section>
       <section className="ship-sec" aria-label="Runs">
         <h2>Runs</h2>
         {(c.runs ?? []).length === 0 ? (
@@ -247,4 +263,93 @@ class Quiet extends React.Component<{ children: React.ReactNode }, { failed: boo
   render() {
     return this.state.failed ? null : this.props.children;
   }
+}
+
+/** For a commit of kiln's own: the build the server runs, and whether it is this commit. */
+function ServerBuild({ repo, sha }: { repo: string; sha: string }) {
+  const data = useRes(updatesRes).data;
+  if (data.build?.repo !== repo) return null;
+  const built = data.server.build.split("+")[1] ?? "";
+  const ours = built.length >= 7 && sha.toLowerCase().startsWith(built.toLowerCase());
+  return (
+    <p className="ship-commit__server">
+      The server runs build <code>{data.server.build}</code>
+      {ours ? ", this commit." : "."}
+    </p>
+  );
+}
+
+/** Each runner replanting onto the commit, as the read model has it from runner versions. */
+function Runners({ detail }: { detail: ShipDetail }) {
+  const runners = detail.replant ?? [];
+  if (runners.length === 0) return <p>{detail.environments?.some((e) => e.production) ? "No runners replant onto it." : "Runners replant once it's in production."}</p>;
+  return (
+    <ul className="ship-commit__replant">
+      {runners.map((r) => (
+        <Runner key={r.name} runner={r} />
+      ))}
+    </ul>
+  );
+}
+
+/** One runner: replanted, replanting, didn't replant (with why), or offline; one that didn't is retried, and either looked at, through System's own actions. */
+function Runner({ runner }: { runner: { name: string; state: string; why: string } }) {
+  const [busy, setBusy] = React.useState<"retry" | "diagnose" | null>(null);
+  const [said, setSaid] = React.useState<string | null>(null);
+  const [found, setFound] = React.useState<RunnerFinding[] | null>(null);
+  const retry = async () => {
+    setBusy("retry");
+    try {
+      await api.upgradeRunner(runner.name);
+      setSaid("Its upgrade started again.");
+      invalidate("ship/");
+      invalidate("updates");
+    } catch (e) {
+      toast({ title: `Couldn't retry ${runner.name}`, description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(null);
+    }
+  };
+  const diagnose = async () => {
+    setBusy("diagnose");
+    try {
+      setFound((await api.diagnoseRunner(runner.name)).findings);
+    } catch (e) {
+      toast({ title: `Couldn't diagnose ${runner.name}`, description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(null);
+    }
+  };
+  const state = replantGlyph(runner.state);
+  return (
+    <li data-state={state}>
+      <StatusGlyph state={state as keyof typeof GLYPHS} size={14} />
+      <span className="ship-commit__env">{runner.name}</span>
+      <span>{replantWord(runner.state)}</span>
+      {runner.why ? <span className="ship-commit__env-note">{runner.why}</span> : null}
+      {runner.state === "failed" || runner.state === "offline" ? (
+        <span className="ship-commit__acts">
+          {runner.state === "failed" && (
+            <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => void retry()}>
+              Retry
+            </Button>
+          )}
+          <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => void diagnose()}>
+            Diagnose
+          </Button>
+        </span>
+      ) : null}
+      {said ? <span role="status">{said}</span> : null}
+      {found ? (
+        <ul className="ship-commit__found" aria-label={`What kiln found on ${runner.name}`}>
+          {found.map((f) => (
+            <li key={f.id} data-level={f.level}>
+              {f.title}
+              {f.detail ? <span className="ship-commit__env-note"> {f.detail}</span> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </li>
+  );
 }

@@ -1,7 +1,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { buildWord, environmentsOf, failuresOf, fold, keptBuildsOf, keyOf, order, pickCard, ridesOf, shipGroups, standWord, strip, traceOf } from "../src/views/ship/model.ts";
+import {
+  buildWord,
+  environmentsOf,
+  failuresOf,
+  fold,
+  keptBuildsOf,
+  keyOf,
+  order,
+  pickCard,
+  replantGlyph,
+  replantWord,
+  ridesOf,
+  shipGroups,
+  standWord,
+  strip,
+  traceOf,
+} from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -242,4 +258,12 @@ test("from System's builds: the platforms whose runners get a commit's binary, a
   ]);
   assert.deepEqual(keptBuildsOf(platforms, "aaaa1111"), [{ label: "linux · x86_64 · gnu", target: "x86_64-unknown-linux-gnu", state: "current" }]);
   assert.deepEqual(keptBuildsOf(platforms, "ffff0000"), []);
+});
+
+test("a runner's replant, as the read model says it, in glyphs and words, and in the Lanes", () => {
+  const states = ["on", "waiting", "failed", "offline"];
+  assert.deepEqual(states.map(replantGlyph), ["replanted", "replanting", "failed", "offline"]);
+  assert.deepEqual(states.map(replantWord), ["replanted", "replanting", "didn't replant", "offline"]);
+  const lanes = shipGroups({ ...c("r", "shipped"), replant: [{ name: "pi", state: "failed", why: "timed out" }] })[5]?.lanes;
+  assert.deepEqual(lanes, [{ id: "runner/pi", name: "pi", state: "failed", start: null, end: null, note: "timed out" }]);
 });

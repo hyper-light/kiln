@@ -6,7 +6,8 @@
  * first; one nothing failed in starts at its stages (step 2). It says what ships with it, where each
  * environment stands from it with the one image they run, and its runs link to their pages (step 3).
  * Its Build names which platforms built and shows a build a newer push superseded as superseded
- * (Build and replant plan 01a175b7f27570ee9f5b248d7bb40c0f, step 1).
+ * (Build and replant plan 01a175b7f27570ee9f5b248d7bb40c0f, step 1); its Replant names a runner that
+ * didn't replant, with why, and System's Retry and Diagnose work on it (step 2).
  */
 import { expect, test } from "@playwright/test";
 
@@ -118,7 +119,7 @@ for (const width of [1280, 390]) {
       const { sections } = await pageOf(page, message);
       await expect(sections.first(), `${message}'s first section`).toHaveAttribute("aria-label", first, { timeout: 15_000 });
       const labels = await sections.evaluateAll((els) => els.map((el) => el.getAttribute("aria-label")));
-      expect(labels.slice(labels.indexOf("Stages"))).toEqual(["Stages", "Build", "Trace", "Ships with", "Environments", "Runs"]);
+      expect(labels.slice(labels.indexOf("Stages"))).toEqual(["Stages", "Build", "Trace", "Ships with", "Environments", "Replant", "Runs"]);
       const w = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
       expect(w.scroll, `${message} at ${width}`).toBe(w.client);
     }
@@ -137,4 +138,25 @@ test("its Build names which platforms built, and a build a newer push superseded
   const built = other.commit.getByRole("region", { name: "Build" });
   await expect(built.locator('li[data-state="passed"]')).toHaveCount(2, { timeout: 15_000 });
   await expect(built.locator('li[data-state="superseded"]')).toHaveCount(0);
+});
+
+test("a runner that didn't replant is named with why, Diagnose finds why, and Retry starts it again", async ({ page }) => {
+  await page.request.post("/api/mock/ship/replant?reset=1");
+  try {
+    const { commit } = await pageOf(page, "ci: a landed change");
+    const replant = commit.getByRole("region", { name: "Replant" });
+    const pi = replant.locator("li", { hasText: "pi-kitchen" }).first();
+    await expect(pi).toHaveAttribute("data-state", "failed", { timeout: 15_000 });
+    await expect(pi).toContainText("didn't replant");
+    await expect(pi).toContainText("the upgrade timed out");
+    await expect(replant.locator("li", { hasText: "metal-ryzen-01" }).first()).toHaveAttribute("data-state", "replanted");
+    await expect(replant.locator("li", { hasText: "metal-nuc-old" }).first()).toHaveAttribute("data-state", "offline");
+    await pi.getByRole("button", { name: "Diagnose" }).click();
+    await expect(pi.getByRole("list", { name: "What kiln found on pi-kitchen" })).toContainText("Its last upgrade timed out");
+    await pi.getByRole("button", { name: "Retry" }).click();
+    await expect(replant.getByRole("status")).toContainText("Its upgrade started again.");
+    await expect(replant.locator("li", { hasText: "pi-kitchen" }).first()).toHaveAttribute("data-state", "replanting", { timeout: 15_000 });
+  } finally {
+    await page.request.post("/api/mock/ship/replant?reset=1");
+  }
 });

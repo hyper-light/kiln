@@ -210,6 +210,23 @@ function commits(): ShipCommit[] {
   ];
 }
 
+/**
+ * The fixed rows' runners, replanting onto "ci: a landed change", the newest in production (the
+ * commit page's Replant; Build and replant plan, step 2): one replanted, one Pi whose upgrade timed
+ * out until System's Retry starts it again, one offline.
+ */
+const PI = "pi-kitchen";
+/** Retried, by browser (its User-Agent), so the e2e projects running side by side each have their own Pi. */
+const piRetried = new Set<string>();
+const replantOf = (row: ShipCommit, ua: string) =>
+  row.short === "6666666"
+    ? [
+        { name: "metal-ryzen-01", state: "on", why: "" },
+        { name: PI, state: piRetried.has(ua) ? "waiting" : "failed", why: piRetried.has(ua) ? "" : "the upgrade timed out: it didn't come back on the new build within 10 minutes" },
+        { name: "metal-nuc-old", state: "offline", why: "offline since 3d" },
+      ]
+    : null;
+
 /** Commits a test adds on top (`POST /api/mock/ship/arrive`, `?clear=1` to take them away), newest first. */
 const arrived: ShipCommit[] = [];
 const arrival = (n: number): ShipCommit => ({
@@ -305,6 +322,7 @@ const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...com
  * `ship-rel-…`, a trunk runner whose upgrade failed), so they answer before the routes the rest of
  * the mock keeps for those paths. True when it answered. */
 export async function handleShip(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
+  const ua = String(req.headers["user-agent"] ?? "");
   const p = url.pathname;
   const m = req.method ?? "GET";
   const q = url.searchParams;
@@ -361,6 +379,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
                 },
               ]
             : [],
+          ...(replantOf(row, ua) ? { replant: replantOf(row, ua) ?? [] } : {}),
           // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
           runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
           // A commit in production went through staging, built once: its deploys and the one image they run.
@@ -390,6 +409,37 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
   if (p === "/api/mock/ship/arrive" && m === "POST") {
     if (q.get("clear")) arrived.length = 0;
     else arrived.unshift(arrival(arrived.length + 1));
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
+  // The fixed rows' Pi, through System's own actions: Retry (POST /api/updates/runners/:name) starts
+  // its upgrade again, Diagnose (GET /api/agents/:name/diagnose) finds the timeout; a test resets it.
+  if (p === `/api/updates/runners/${PI}` && m === "POST") {
+    piRetried.add(ua);
+    ctx.json(res, 200, { id: "upg-pi-kitchen", kind: "runner", target: PI, method: "download", state: "running", started_at: now(), ended_at: null, from_build: "0.1.0+0f1e2d3", to_build: null });
+    return true;
+  }
+  if (p === `/api/agents/${PI}/diagnose` && m === "GET") {
+    ctx.json(res, 200, {
+      runner: PI,
+      at: Date.now(),
+      worst: "fail",
+      findings: [
+        {
+          id: "upgrade.last",
+          level: "fail",
+          title: "Its last upgrade timed out",
+          detail: "It went down to swap in the new build and didn't answer again within 10 minutes: a Pi on an SD card can take longer.",
+          fix: { action: "retry-upgrade", label: "Upgrade it again", way: "download" },
+        },
+      ],
+      machine_checked: false,
+      why: "It hasn't answered since its upgrade.",
+    });
+    return true;
+  }
+  if (p === "/api/mock/ship/replant" && m === "POST") {
+    if (q.get("reset")) piRetried.delete(ua);
     ctx.json(res, 200, { ok: true });
     return true;
   }

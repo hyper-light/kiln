@@ -238,7 +238,7 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
         { id: "image", name: "image", state: glyph(built.image.state), start: null, end: null },
       ]
     : [];
-  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: glyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
+  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: replantGlyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
   const deploys = (production: boolean): ShipLane[] =>
     (detail.deployments ?? [])
       .filter((d) => d.production === production)
@@ -352,3 +352,8 @@ export function keptBuildsOf(platforms: readonly { label: string; target: string
     of(p.binary) ? [{ label: p.label, target: p.target, state: "current" }] : p.shadowed.some(of) ? [{ label: p.label, target: p.target, state: "replaced" }] : [],
   );
 }
+
+/** A runner's replant as the read model says it (on, waiting, failed, offline), as a glyph and in words (Build and replant plan, step 2). */
+const REPLANT: Record<string, [string, string]> = { on: ["replanted", "replanted"], waiting: ["replanting", "replanting"], failed: ["failed", "didn't replant"], offline: ["offline", "offline"] };
+export const replantGlyph = (state: string) => REPLANT[state]?.[0] ?? (state in GLYPHS ? state : "none");
+export const replantWord = (state: string) => REPLANT[state]?.[1] ?? state;

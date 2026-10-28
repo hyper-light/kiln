@@ -611,3 +611,32 @@
   margin-top: 8px;
   color: #a1a4ad;
 }
+
+/* The commit page's Replant (Build and replant plan, step 2): the server's build, then each runner. */
+.ship-commit__replant,
+.ship-commit__found {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__replant > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__acts {
+  display: inline-flex;
+  gap: 6px;
+}
+.ship-commit__found {
+  flex-basis: 100%;
+  padding-left: 24px;
+  color: #a1a4ad;
+}
+.ship-commit__server {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
