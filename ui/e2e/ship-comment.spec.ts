@@ -37,13 +37,13 @@ for (const width of [1280, 390])
       await row.locator(".ship-go").click();
       const files = row.locator('section[aria-label="Files"]');
       await expect(files.locator(".rv-sum")).toBeVisible({ timeout: 15_000 });
-      // Two lines next to each other on the new side of one file, with no thread under either: the last
+      // Two lines next to each other on the new side of an open file (a generated one starts folded), with no thread under either: the last
       // such pair, after every thread D41 has. The mock keeps a thread with a reply once its comments are
       // deleted (they're marked deleted), so this one stays after the test: placed last, the threads other
       // tests take first (kim's) are still first.
       const pick = await files.evaluate((sec) => {
         const free = [...sec.querySelectorAll<HTMLElement>(".rv-l[data-rvl*='|new:']")].filter(
-          (r) => !(r.querySelector<HTMLButtonElement>(".rv-ln")?.disabled ?? true) && !r.nextElementSibling?.classList.contains("rv-thread"),
+          (r) => (r.closest("details")?.open ?? true) && !(r.querySelector<HTMLButtonElement>(".rv-ln")?.disabled ?? true) && !r.nextElementSibling?.classList.contains("rv-thread"),
         );
         for (let i = free.length - 2; i >= 0; i--) {
           const [fa, la] = (free[i]?.dataset.rvl ?? "").split("|new:");

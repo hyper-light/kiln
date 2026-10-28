@@ -39,6 +39,8 @@ for (const width of [1280, 390])
         await expect(f.locator("summary .rv-del")).toHaveText(/^−\d+$/);
         await expect(f.getByRole("checkbox", { name: "Viewed" })).toBeVisible();
       }
+      // A rename says how much of it stayed, as a number (git's R092 is 92%).
+      await expect(each.filter({ hasText: "graph.tsx" }).locator("summary .rv-chip").first()).toHaveText("renamed 92%");
       // The Files section and the lanes card (the Lanes section, a card as Output and Jobs are), edge to edge, within 1 px.
       const card = row.locator('section[aria-label="Lanes"]');
       await expect(card.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });

@@ -41,7 +41,8 @@ export interface FilesCtx {
  * letter, R100 or C75, or a host's word), else its patch's (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2). */
 export function statusOf(file: PatchFile, given?: string): string {
   const s = given ?? "";
-  const n = s.slice(1);
+  // Git's score, zero-padded (R092): a number.
+  const n = Number(s.slice(1)) || 0;
   switch (s[0]) {
     case "A":
       return "added";
@@ -50,7 +51,7 @@ export function statusOf(file: PatchFile, given?: string): string {
     case "M":
       return "modified";
     case "R":
-      return n && n !== "100" ? `renamed ${n}%` : "renamed";
+      return n && n !== 100 ? `renamed ${n}%` : "renamed";
     case "C":
       return n ? `copied ${n}%` : "copied";
     case "T":
