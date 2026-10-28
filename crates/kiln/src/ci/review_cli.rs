@@ -140,7 +140,8 @@ pub struct GitCredentialArgs {
 }
 
 /// git's credential helper (`credential.<server>.helper = !kiln git-credential`): this machine's
-/// kiln token for the server git asks about.
+/// kiln token for the server git asks about. On the way, this device's certificate from that
+/// server is renewed while its person stays signed in (docs/ci.md W27-R02).
 pub async fn git_credential(args: GitCredentialArgs, cfg: &Config) -> Result<()> {
     if args.op != "get" {
         return Ok(());
@@ -150,6 +151,9 @@ pub async fn git_credential(args: GitCredentialArgs, cfg: &Config) -> Result<()>
     let field = |k: &str| input.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).map(str::to_owned);
     let (Some(protocol), Some(host)) = (field("protocol"), field("host")) else { return Ok(()) };
     let url = format!("{protocol}://{host}");
+    if let Some(note) = crate::identities::renew_device(cfg, &url).await {
+        eprintln!("{note}");
+    }
     // Only a kiln server's own token, for that server: `KILN_TOKEN` (a personal or agent token)
     // or `KILN_ADMIN_TOKEN` when set, else what this machine has.
     let given = std::env::var("KILN_TOKEN").ok().or_else(|| std::env::var("KILN_ADMIN_TOKEN").ok()).filter(|t| !t.trim().is_empty());

@@ -410,13 +410,23 @@ fn call(port: u16, method: &str, path: &str, cookie: Option<&str>, body: Option<
     Ok((status, body, head.to_owned()))
 }
 
-/// Person `name` added and signed in with the one-time link the owner makes: their cookie.
-fn signed_in(s: &Server, name: &str) -> anyhow::Result<String> {
+/// Person `name` added by the owner, as a developer.
+fn add_person(s: &Server, name: &str) -> anyhow::Result<()> {
     let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&serde_json::json!({ "name": name, "grants": ["developer"] })))?;
     anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+    Ok(())
+}
+
+/// The one-time sign-in link the owner makes for `name`, to hand them.
+fn sign_in_link(s: &Server, name: &str) -> anyhow::Result<String> {
     let (st, body) = http(s.port, "POST", &format!("/api/users/{name}/link"), &s.admin, None)?;
     anyhow::ensure!(st == 200, "{name}'s link: {st} {body}");
-    let url = serde_json::from_str::<Value>(&body)?.get("url").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no link: {body}"))?;
+    serde_json::from_str::<Value>(&body)?.get("url").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no link: {body}"))
+}
+
+/// `name` signed in in a browser with the sign-in link the owner made: their session's cookie.
+fn browser_session(s: &Server, name: &str) -> anyhow::Result<String> {
+    let url = sign_in_link(s, name)?;
     let path = url.find("/api/").and_then(|at| url.get(at..)).ok_or_else(|| anyhow::anyhow!("a link without a path: {url}"))?;
     let (_, _, head) = call(s.port, "GET", path, None, None)?;
     head.lines()
@@ -426,57 +436,267 @@ fn signed_in(s: &Server, name: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{name} wasn't signed in: {head}"))
 }
 
-/// W27-R01, R02: a person's key is made on their own device and certified for a few hours after
-/// they sign in; disabling them refuses their certificates from then.
+/// A person's own device: its home and config, where `kiln` keeps their key.
+struct Device {
+    home: std::path::PathBuf,
+    config: std::path::PathBuf,
+}
+
+impl Device {
+    fn new(dir: &Path, name: &str) -> anyhow::Result<Device> {
+        let d = Device { home: dir.join(name).join("home"), config: dir.join(name).join("config") };
+        std::fs::create_dir_all(&d.home)?;
+        std::fs::create_dir_all(&d.config)?;
+        Ok(d)
+    }
+
+    /// `kiln args` run here (`stdin` its input): whether it succeeded, and what it said. No token
+    /// of this machine's reaches it (git's credential helper is given one that isn't anyone's).
+    fn kiln(&self, args: &[&str], stdin: Option<&str>) -> anyhow::Result<(bool, String)> {
+        use std::io::Write as _;
+        let mut child = common::kiln()
+            .args(args)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("KILN_TOKEN", "nobody")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut input) = child.stdin.take() {
+            input.write_all(stdin.unwrap_or_default().as_bytes())?;
+        }
+        let out = child.wait_with_output()?;
+        Ok((out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))))
+    }
+
+    /// git asking this device's credential helper about the server on `port`.
+    fn credential_helper(&self, port: u16) -> anyhow::Result<String> {
+        Ok(self.kiln(&["git-credential", "get"], Some(&format!("protocol=http\nhost=127.0.0.1:{port}\n\n")))?.1)
+    }
+
+    fn file(&self, name: &str) -> std::path::PathBuf {
+        self.config.join("kiln").join(name)
+    }
+}
+
+/// kiln's root: its CA's certificate, as the server publishes it.
+fn root(s: &Server) -> anyhow::Result<Vec<u8>> {
+    let (st, pem) = http(s.port, "GET", "/ca.pem", "", None)?;
+    anyhow::ensure!(st == 200, "{st} {pem}");
+    kiln::pki::der_of(&pem)
+}
+
+/// Every revocation kiln recorded, for the chain checker.
+fn revocations_now(s: &Server) -> anyhow::Result<Vec<kiln_ci::identity::chain::Revocation>> {
+    let (st, body) = http(s.port, "GET", "/api/identities/revocations", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let rows = serde_json::from_str::<Value>(&body)?.get("revocations").and_then(Value::as_array).cloned().unwrap_or_default();
+    Ok(rows
+        .iter()
+        .map(|r| kiln_ci::identity::chain::Revocation {
+            serial: r.get("serial").and_then(Value::as_str).map(str::to_owned),
+            key: r.get("key").and_then(Value::as_str).map(str::to_owned),
+            at: r.get("at").and_then(Value::as_i64).unwrap_or_default(),
+            reason: field(r, "reason").to_owned(),
+            by: field(r, "by").to_owned(),
+        })
+        .collect())
+}
+
+fn unix_now() -> anyhow::Result<i64> {
+    Ok(i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?)
+}
+
+/// That no file under `paths` holds the private key `key_pem`: its DER or a line of its PEM.
+fn nowhere(paths: &[std::path::PathBuf], key_pem: &str) -> anyhow::Result<()> {
+    use base64::Engine as _;
+    let body: String = key_pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = base64::engine::general_purpose::STANDARD.decode(&body)?;
+    let lines: Vec<&str> = key_pem.lines().filter(|l| !l.starts_with("-----") && l.len() >= 32).collect();
+    anyhow::ensure!(!der.is_empty() && !lines.is_empty(), "not a key: {key_pem}");
+    for p in paths {
+        let files = if p.is_dir() { walk(p)? } else { vec![p.clone()] };
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!bytes.windows(der.len()).any(|w| w == der.as_slice()), "the key's DER in {}", f.display());
+            assert!(!lines.iter().any(|l| text.contains(l)), "the key's PEM in {}", f.display());
+        }
+    }
+    Ok(())
+}
+
+/// W27-R01, R02: a person signs in from the CLI on their own device and gets a certificate for a
+/// key made there. It verifies to kiln's root as the person, of their organization, for hours at
+/// most; the key is in their config, theirs alone (0600), and nowhere on the server, which keeps
+/// the certificate. They sign in with a sign-in link, a password or a personal access token; the
+/// credential helper renews the certificate while they stay signed in, and not after.
 #[test]
-fn w27_r01_people_certified_after_sign_in() -> anyhow::Result<()> {
+fn w27_r01_person_login() -> anyhow::Result<()> {
+    use kiln_ci::identity::chain::{Actor, Identity, verify};
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options::default())?;
+    let url = format!("http://127.0.0.1:{}", s.port);
+    let root = root(&s)?;
 
-    // The owner, from the CLI: the key stays in its config, 0600; the server keeps the certificate.
-    let config = dir.path().join("owner-config");
-    let out = common::kiln()
-        .args(["login", "--certificate", "--url", &format!("http://127.0.0.1:{}", s.port), "--token", &s.admin])
-        .env("XDG_CONFIG_HOME", &config)
-        .env("HOME", dir.path().join("home"))
-        .output()?;
-    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    anyhow::ensure!(out.status.success(), "kiln login --certificate: {said}");
-    assert!(said.contains("Certified: admin of hyper-light"), "{said}");
-    let key = config.join("kiln/identity.key");
-    assert_eq!(std::fs::metadata(&key)?.permissions().mode() & 0o777, 0o600);
-    assert!(config.join("kiln/identity.pem").exists());
-    let people = until_identities(&s, "person", Duration::from_secs(10), |l| !l.is_empty())?;
-    let owner = people.first().cloned().unwrap_or_default();
-    assert_eq!(field(&owner, "verified"), "admin of hyper-light");
-    let lived = owner.get("not_after").and_then(Value::as_i64).unwrap_or_default() - owner.get("not_before").and_then(Value::as_i64).unwrap_or_default();
-    assert!(lived <= 24 * 3600, "a day at most: {lived} s");
+    // sam signs in on their laptop with the sign-in link they were given.
+    add_person(&s, "sam")?;
+    let link = sign_in_link(&s, "sam")?;
+    let laptop = Device::new(dir.path(), "sam-laptop")?;
+    let (ok, said) = laptop.kiln(&["login", "--link", &link], None)?;
+    anyhow::ensure!(ok, "kiln login --link: {said}");
+    assert!(said.contains("Certified: sam of hyper-light until "), "{said}");
 
-    // A person signed in, their key made on their side.
-    let cookie = signed_in(&s, "ada")?;
-    let kp = rcgen::KeyPair::generate()?;
-    let csr = rcgen::CertificateParams::new(vec!["ada-laptop".to_owned()])?.serialize_request(&kp)?.pem()?;
-    let (st, body, _) = call(s.port, "POST", "/api/me/identity", Some(&cookie), Some(&serde_json::json!({ "csr": csr })))?;
-    anyhow::ensure!(st == 200, "{st} {body}");
-    let v: Value = serde_json::from_str(&body)?;
-    assert_eq!(field(&v, "identity"), "ada of hyper-light");
-    let ada_uri = field(&v, "uri").to_owned();
-    // Nobody signed in gets none.
-    let (st, _, _) = call(s.port, "POST", "/api/me/identity", None, Some(&serde_json::json!({ "csr": csr })))?;
-    assert!(st == 401 || st == 403, "{st}");
+    // The key is the laptop's, its owner's alone; the certificate is for it.
+    let key = std::fs::read_to_string(laptop.file("identity.key"))?;
+    assert!(key.contains("PRIVATE KEY"));
+    assert_eq!(std::fs::metadata(laptop.file("identity.key"))?.permissions().mode() & 0o777, 0o600, "0600");
+    let cert = std::fs::read_to_string(laptop.file("identity.pem"))?;
+    assert!(kiln::pki::cert_matches_key(&cert, &key), "the certificate is for the laptop's key");
 
-    // Disabled: refused from then.
-    let (st, body) = http(s.port, "DELETE", "/api/users/ada", &s.admin, None)?;
+    // It verifies to kiln's root as sam, of hyper-light, for hours.
+    let v = verify(&[&kiln::pki::der_of(&cert)?], &root, &revocations_now(&s)?, unix_now()?)?;
+    assert_eq!(v.identity, Identity::new("hyper-light", Actor::Person { name: "sam".into() }));
+    assert_eq!(v.to_string(), "sam of hyper-light");
+    assert!(v.identity.is_person("sam") && v.acts_for().is_empty(), "sam, acting for no one but themself, of hyper-light");
+    let lived = v.not_after - v.not_before;
+    assert!(lived > 3600 && lived <= 24 * 3600, "hours, never past a day: {lived} s");
+
+    // The server keeps the certificate and never the key: not in its store (nor the store's
+    // write-ahead log), its data or its log.
+    let kept = identities(&s, "person")?;
+    assert!(kept.iter().any(|i| field(i, "serial") == v.serial && field(i, "key") == v.key && field(i, "verified") == "sam of hyper-light"), "{kept:?}");
+    for f in walk(&dir.path().join("data"))?.into_iter().filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("kiln.db"))) {
+        assert!(!String::from_utf8_lossy(&std::fs::read(&f)?).contains("PRIVATE KEY"), "a private key in the store: {}", f.display());
+    }
+    nowhere(&[dir.path().join("data"), dir.path().join("server.log")], &key)?;
+
+    // Renewed while sam stays signed in: git's credential helper asks again once it's due (here,
+    // gone), for the same key.
+    std::fs::remove_file(laptop.file("identity.pem"))?;
+    let said = laptop.credential_helper(s.port)?;
+    let renewed = std::fs::read_to_string(laptop.file("identity.pem")).map_err(|e| anyhow::anyhow!("the credential helper didn't renew it ({e}): {said}"))?;
+    let r = verify(&[&kiln::pki::der_of(&renewed)?], &root, &revocations_now(&s)?, unix_now()?)?;
+    assert_eq!(r.to_string(), "sam of hyper-light");
+    assert_ne!(r.serial, v.serial, "a new certificate");
+    assert_eq!(r.key, v.key, "for the same key");
+    // Not before it's due: nothing new.
+    laptop.credential_helper(s.port)?;
+    assert_eq!(std::fs::read_to_string(laptop.file("identity.pem"))?, renewed);
+
+    // Signed out everywhere: no longer renewed. The helper says so once and forgets the sign-in.
+    let (st, body) = http(s.port, "POST", "/api/users/sam/sign-out", &s.admin, None)?;
     anyhow::ensure!((200..300).contains(&st), "{st} {body}");
-    let after = identities(&s, "person")?;
-    let ada = after.iter().find(|i| field(i, "subject") == ada_uri).cloned().unwrap_or_default();
-    assert!(field(&ada, "refused").contains("person disabled"), "{ada}");
-    assert!(!field(after.iter().find(|i| field(i, "subject").ends_with("/person/admin")).unwrap_or(&Value::Null), "verified").is_empty());
+    std::fs::remove_file(laptop.file("identity.pem"))?;
+    let said = laptop.credential_helper(s.port)?;
+    assert!(said.contains("no longer signed in"), "{said}");
+    assert!(!laptop.file("identity.pem").exists() && !laptop.file("identity.json").exists(), "{said}");
+    // A used link signs no one in.
+    let (ok, said) = Device::new(dir.path(), "elsewhere")?.kiln(&["login", "--link", &link], None)?;
+    assert!(!ok && said.contains("not signed in"), "{said}");
 
-    // No private key reached the server.
-    let db = std::fs::read(dir.path().join("data/kiln.db")).unwrap_or_default();
-    assert!(!String::from_utf8_lossy(&db).contains("PRIVATE KEY"));
+    // ada with her password, on her desktop.
+    add_person(&s, "ada")?;
+    let cookie = browser_session(&s, "ada")?;
+    let password = "a long passphrase of ada's";
+    let (st, body, _) = call(s.port, "PUT", "/api/me/password", Some(&cookie), Some(&serde_json::json!({ "password": password })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let desk = Device::new(dir.path(), "ada-desk")?;
+    let (ok, said) = desk.kiln(&["login", "--url", &url, "--name", "ada", "--password-stdin"], Some(&format!("{password}\n")))?;
+    anyhow::ensure!(ok, "kiln login --name: {said}");
+    assert!(said.contains("Certified: ada of hyper-light"), "{said}");
+
+    // The owner with a personal access token, on their phone: the owner's tokens name the owner.
+    let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&serde_json::json!({ "kind": "pat", "grants": ["owner"], "expires_in_days": 1 })))?;
+    anyhow::ensure!(st == 201, "{st} {body}");
+    let pat = field(&serde_json::from_str::<Value>(&body)?, "token").to_owned();
+    let phone = Device::new(dir.path(), "owner-phone")?;
+    let (ok, said) = phone.kiln(&["login", "--url", &url, "--token", &pat], None)?;
+    anyhow::ensure!(ok, "kiln login --token: {said}");
+    assert!(said.contains("Certified: admin of hyper-light"), "{said}");
+    let p = verify(&[&kiln::pki::der_of(&std::fs::read_to_string(phone.file("identity.pem"))?)?], &root, &revocations_now(&s)?, unix_now()?)?;
+    assert!(p.identity.is_person("admin"), "{p}");
+    for (device, key) in [(&desk, desk.file("identity.key")), (&phone, phone.file("identity.key"))] {
+        assert_eq!(std::fs::metadata(&key)?.permissions().mode() & 0o777, 0o600, "{}", device.config.display());
+        nowhere(&[dir.path().join("data"), dir.path().join("server.log")], &std::fs::read_to_string(&key)?)?;
+    }
+
+    // Only after a sign-in, and only a person's: nobody signed in gets none, nor does an agent.
+    let kp = rcgen::KeyPair::generate()?;
+    let csr = rcgen::CertificateParams::new(Vec::<String>::new())?.serialize_request(&kp)?.pem()?;
+    let (st, _, _) = call(s.port, "POST", "/api/me/identity", None, Some(&serde_json::json!({ "csr": csr })))?;
+    assert_eq!(st, 401);
+    let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&serde_json::json!({ "kind": "agent", "agent": "matrix", "grants": ["owner"] })))?;
+    anyhow::ensure!(st == 201, "{st} {body}");
+    let agent = field(&serde_json::from_str::<Value>(&body)?, "token").to_owned();
+    let (st, body) = http(s.port, "POST", "/api/me/identity", &agent, Some(&serde_json::json!({ "csr": csr })))?;
+    assert_eq!(st, 403, "{body}");
+    assert_eq!(field(&serde_json::from_str::<Value>(&body)?, "code"), "not_a_person", "{body}");
+    Ok(())
+}
+
+/// W27-R01: disabling a person refuses their signatures from that moment, naming it: what sam's
+/// laptop signed before still verifies as sam; what it signs from then is refused, saying when,
+/// why and by whom; and sam is certified no more.
+#[test]
+fn w27_r01_person_disabled() -> anyhow::Result<()> {
+    use kiln_ci::identity::chain::{Refusal, verify_signed};
+    use rcgen::SigningKey as _;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let root = root(&s)?;
+    add_person(&s, "sam")?;
+    let laptop = Device::new(dir.path(), "sam-laptop")?;
+    let (ok, said) = laptop.kiln(&["login", "--link", &sign_in_link(&s, "sam")?], None)?;
+    anyhow::ensure!(ok, "kiln login --link: {said}");
+    let cert = kiln::pki::der_of(&std::fs::read_to_string(laptop.file("identity.pem"))?)?;
+    let key = rcgen::KeyPair::from_pem(&std::fs::read_to_string(laptop.file("identity.key"))?)?;
+
+    // sam signs a statement on the laptop: it's sam's.
+    let early = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n";
+    let (early_at, early_sig) = (unix_now()?, key.sign(early)?);
+    let v = verify_signed(&[&cert], &root, &revocations_now(&s)?, early_at, early, &early_sig)?;
+    assert_eq!(v.to_string(), "sam of hyper-light");
+
+    // A moment later the owner disables sam (10:02, in the plan's words).
+    std::thread::sleep(Duration::from_millis(1100));
+    let before = unix_now()?;
+    let (st, body) = http(s.port, "DELETE", "/api/users/sam", &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let after = unix_now()?;
+    let revs = revocations_now(&s)?;
+    let disabled = revs.iter().find(|r| r.reason == "person disabled").cloned().ok_or_else(|| anyhow::anyhow!("no revocation: {revs:?}"))?;
+    assert!(disabled.at >= before && disabled.at <= after, "revoked at the moment sam was disabled: {disabled:?}");
+    assert_eq!(disabled.by, "admin");
+    let when = time::OffsetDateTime::from_unix_timestamp(disabled.at)?.format(&time::format_description::well_known::Rfc3339)?;
+
+    // What the laptop signs from that moment is refused, naming it; what it signed before still
+    // verifies.
+    let late = b"tree 9bfc3e3f0b6a17e8b4c5d6a7e8f9012345678901\n";
+    let late_sig = key.sign(late)?;
+    for at in [disabled.at, unix_now()?.max(disabled.at) + 60] {
+        let got = verify_signed(&[&cert], &root, &revs, at, late, &late_sig);
+        assert!(
+            matches!(&got, Err(e @ Refusal::Revoked { revoked_at, reason, by, .. })
+                if *revoked_at == when && reason == "person disabled" && by == "admin" && e.to_string().contains(&format!("was revoked at {when} (person disabled, by admin)"))),
+            "a signature at {at}: {got:?}"
+        );
+    }
+    assert!(early_at < disabled.at, "signed before");
+    assert_eq!(verify_signed(&[&cert], &root, &revs, early_at, early, &early_sig)?.to_string(), "sam of hyper-light", "what sam signed before still verifies");
+    let listed = identities(&s, "person")?;
+    let sams = listed.iter().find(|i| field(i, "subject") == "kiln://hyper-light/person/sam").cloned().unwrap_or_default();
+    assert!(field(&sams, "refused").contains(&format!("revoked at {when} (person disabled, by admin)")), "{sams}");
+
+    // sam is certified no more: the laptop's sign-in ended with them.
+    std::fs::remove_file(laptop.file("identity.pem"))?;
+    let said = laptop.credential_helper(s.port)?;
+    assert!(said.contains("no longer signed in"), "{said}");
+    assert!(!laptop.file("identity.pem").exists(), "{said}");
+    let (st, _) = http(s.port, "POST", "/api/users/sam/link", &s.admin, None)?;
+    assert_eq!(st, 404, "no sign-in link for someone disabled");
     Ok(())
 }
 

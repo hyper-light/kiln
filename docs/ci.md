@@ -8499,9 +8499,24 @@ research `01a17947fdad71e5a4f15866e3541c41`.
 - *Keys stay put.* Every kind is issued from a CSR only (`Pki::issue_identity`). A runner process
   makes keys in its own memory for itself, for each agent session it holds at each epoch, and for
   each leg it runs, and asks for their certificates over its channel (`AgentMsg::Identity`,
-  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). A person's key is made by
-  `kiln login --certificate` in their config and certified for 12 hours (`POST /api/me/identity`,
-  a person signed in only). The server's and CD's keys are in `<data>/pki` (0600).
+  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). The server's and CD's keys are in
+  `<data>/pki` (0600).
+- *People.* A person's key is made on their own device by `kiln login`, in their config
+  (`~/.config/kiln/identity.key`, 0600), after they sign in there: with the sign-in link they were
+  given (`--link`), their name and password (`--name`), or a personal access token (`--token`; with a
+  passkey, one made in Settings after signing in with it: a passkey signs only WebAuthn's
+  challenges, so it proves the person and the device's key signs). Only a CSR goes
+  (`POST /api/me/identity`), from a person signed in (the owner, a user's session or personal access
+  token; never an agent, a job or a peer). The certificate (`identity.pem`) names them and their
+  organization (`kiln://<org>/person/<name>`: the owner, and the owner's tokens, `admin`; a user
+  their name exactly, so a name that would have to change to fit, or that reads as the owner's, isn't
+  certified) for 12 hours; kiln keeps it, never the key, and certifies no key that was revoked or
+  certifies another identity (the CLI makes a new one). The sign-in is kept beside it
+  (`identity.json`, 0600), and git's credential helper (`kiln git-credential`) renews the certificate
+  once half its life has gone, while that sign-in lasts; signed out, disabled or its token revoked,
+  it's forgotten and the certificate lapses. Disabling a person revokes their certificates at the
+  moment they're disabled, and none is issued after: one is recorded only in the transaction that
+  finds them still enabled.
 - *Revocations* are rows with when, why and by whom (migration `w27_identities`):
   forgetting a runner, a runner process retiring, a session moving to a new epoch (the epochs it
   left), a session ending, a person disabled, or `POST /api/identities/revoke` (`kiln identities
@@ -8517,15 +8532,18 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   same suite.
 - *Tests.* `kiln-ci` `w27_r01_*` (each kind; expired, revoked, wrongly issued);
   `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys`, one per kind,
-  `w27_r01_revocation_survives_restart` and `w27_r01_reenroll_keeps_revocation`, an agent's
-  `w27_r01_agent_epochs` (started, then moved twice: three epochs, each named by the process
-  holding it, the one left refused saying both epochs) and, in a build with `chaos`,
-  `w27_r02_agent_key_stays` (every frame each runner process sent, and everything on disk: none
-  holds the session's keys, as PEM, PEM body or DER); the migration's
-  `w27_r01_identities_and_revocations_tables`; `ci::signing`'s `w27_r12_*` (keyless signing
-  through the simulator verifies; kiln's client passes the Sigstore suite).
+  `w27_r01_revocation_survives_restart` and `w27_r01_reenroll_keeps_revocation`, for people
+  `w27_r01_person_login` and `w27_r01_person_disabled`, an agent's `w27_r01_agent_epochs`
+  (started, then moved twice: three epochs, each named by the process holding it, the one left
+  refused saying both epochs) and, in a build with `chaos`, `w27_r02_agent_key_stays` (every frame
+  each runner process sent, and everything on disk: none holds the session's keys, as PEM, PEM
+  body or DER); the migration's `w27_r01_identities_and_revocations_tables`; `identities.rs`'s
+  `w27_r02_*`; `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's
+  client passes the Sigstore suite).
 - *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; nothing
-  signs with these identities yet (commits, reviews, CI output, lands and deploys: R03 to R11).
+  signs with these identities yet (commits, reviews, CI output, lands and deploys: R03 to R11); the
+  CLI signs in with a passkey only through a personal access token (no approving a device from the
+  browser yet).
 
 ## 4. API, events, CLI and MCP reference
 

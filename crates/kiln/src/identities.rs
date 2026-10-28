@@ -54,54 +54,394 @@ pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Res
 
 /// How long a CI leg's certificate lasts: the leg's attempt, with room.
 pub const LEG_HOURS: i64 = 24;
-/// How long a person's certificate lasts after they sign in: hours, never past a day.
+/// How long a person's certificate lasts after they sign in: hours, never past a day. Their CLI
+/// asks again once half of it has gone, while they stay signed in ([`renewal_due`]).
 pub const PERSON_HOURS: i64 = 12;
+
+/// A person's certificate, as kiln issued it (W27-R02).
+#[derive(Clone, Debug)]
+pub struct Issued {
+    pub uri: String,
+    /// Who it names: `sam of hyper-light`.
+    pub identity: String,
+    pub cert_pem: String,
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+/// Why kiln didn't certify a person's key (W27-R02).
+#[derive(Debug, thiserror::Error)]
+pub enum PersonRefused {
+    #[error("a person's certificate is for a person signed in (a passkey, a password, a sign-in link or a personal access token), never an agent, a job or a peer")]
+    NotAPerson,
+    #[error("this person was disabled: kiln certifies them no more")]
+    Disabled,
+    #[error("{0}")]
+    Unnamed(String),
+    #[error("this key was {0}: make a new one")]
+    KeyRevoked(String),
+    #[error("this key is already certified as {0}, and a key certifies one identity: make a new one")]
+    KeyTaken(String),
+    #[error("not a certificate request: {0}")]
+    BadCsr(String),
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+impl PersonRefused {
+    /// The API's `code` for it: the CLI makes a new key for `key_revoked` and `key_taken`, and
+    /// takes `not_a_person` and `disabled` (and a 401) as its person no longer signed in.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotAPerson => "not_a_person",
+            Self::Disabled => "disabled",
+            Self::Unnamed(_) => "unnamed",
+            Self::KeyRevoked(_) => "key_revoked",
+            Self::KeyTaken(_) => "key_taken",
+            Self::BadCsr(_) => "bad_csr",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    pub fn status(&self) -> http::StatusCode {
+        use http::StatusCode;
+        match self {
+            Self::NotAPerson | Self::Disabled | Self::Unnamed(_) => StatusCode::FORBIDDEN,
+            Self::KeyRevoked(_) | Self::KeyTaken(_) => StatusCode::CONFLICT,
+            Self::BadCsr(_) => StatusCode::BAD_REQUEST,
+            Self::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// The name a person's identity gives them (W27-R01, R02): the owner's is `admin`; a user's is
+/// their name exactly, which kiln gives no one else (names are never reused, nor told apart by
+/// case). A name that can't be an identity's part as it is (`sam@acme`, `.`), or that reads as
+/// the owner's (`Admin`), gets none: changed to fit, it could name someone else.
+pub fn person_name(user: Option<&str>) -> Result<String, String> {
+    let Some(name) = user else { return Ok("admin".to_owned()) };
+    if name.eq_ignore_ascii_case("admin") || name.eq_ignore_ascii_case("owner") {
+        return Err(format!("`{name}` reads as the owner's name, and kiln certifies only the owner as admin"));
+    }
+    match Identity::new("kiln", Actor::Person { name: name.to_owned() }).uri() {
+        Ok(_) => Ok(name.to_owned()),
+        Err(kiln_ci::identity::chain::Refusal::BadIdentity { why, .. }) => Err(format!("kiln can't name `{name}` in an identity as it is ({why}), and changed to fit it could name someone else")),
+        Err(e) => Err(format!("kiln can't name `{name}` in an identity: {e}")),
+    }
+}
 
 /// A person's identity for a key made on their own device (W27-R02): issued to a person signed
 /// in (the owner, a user, a user's personal access token), never to an agent, a job or a peer.
-/// Returns the identity's URI and its certificate.
-pub async fn issue_person(hub: &Hub, caller: &crate::authz::Caller, csr: &str) -> anyhow::Result<(String, String)> {
+pub async fn issue_person(hub: &Hub, caller: &crate::authz::Caller, csr: &str) -> Result<Issued, PersonRefused> {
     use crate::authz::gate::Kind;
-    anyhow::ensure!(caller.agent.is_none() && matches!(caller.kind, Kind::Owner | Kind::User | Kind::Pat), "a person's certificate is for a person signed in, never an agent, a job or a peer");
-    let identity = Identity::new(hub.pki.organization(), Actor::Person { name: person_of(&caller.name) });
-    let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let pem = hub.pki.issue_identity(csr, &identity, &[], time::Duration::hours(PERSON_HOURS))?;
-    record(&hub.store, "person", &uri, &pem).await?;
-    Ok((uri, pem))
+    if caller.agent.is_some() || !matches!(caller.kind, Kind::Owner | Kind::User | Kind::Pat) {
+        return Err(PersonRefused::NotAPerson);
+    }
+    // A user's session or token names them; the owner's (and the owner's tokens) name no user.
+    certify_person(&hub.store, &hub.pki, caller.user.as_deref(), csr).await
 }
 
-/// Person `name` was disabled: their certificates are refused from now (W27-R01).
-pub async fn person_disabled(hub: &Hub, name: &str, by: &str) -> anyhow::Result<()> {
-    let uri = Identity::new(hub.pki.organization(), Actor::Person { name: person_of(name) }).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    revoke(&hub.store, Target::Subject(uri), "person disabled", by, crate::util::now_unix()).await?;
+/// A person's certificate for the key of `csr`, made on their device and never sent: for user
+/// `user` (their id; `None`: the owner), for [`PERSON_HOURS`], recorded. It's recorded in the
+/// transaction that checks they're still enabled, so none is issued once they're disabled; a key
+/// that was revoked, or certifies another identity, isn't certified again.
+pub async fn certify_person(store: &Store, pki: &crate::pki::Pki, user: Option<&str>, csr: &str) -> Result<Issued, PersonRefused> {
+    let name = match user {
+        None => None,
+        Some(uid) => {
+            let uid = uid.to_owned();
+            let live: Option<String> = store.call(move |c| Ok(c.query_row("SELECT name FROM users WHERE id = ?1 AND disabled_at IS NULL", [uid], |r| r.get(0)).optional()?)).await?;
+            Some(live.ok_or(PersonRefused::Disabled)?)
+        }
+    };
+    let identity = Identity::new(pki.organization(), Actor::Person { name: person_name(name.as_deref()).map_err(PersonRefused::Unnamed)? });
+    let uri = identity.uri().map_err(|e| PersonRefused::Unnamed(e.to_string()))?;
+    let pem = pki.issue_identity(csr, &identity, &[], time::Duration::hours(PERSON_HOURS)).map_err(|e| PersonRefused::BadCsr(format!("{e:#}")))?;
+    let f = crate::pki::fingerprints(&pem)?;
+    let (uid, subject, cert, fp) = (user.map(str::to_owned), uri.clone(), pem.clone(), f.clone());
+    let refused = store
+        .call(move |c| {
+            // A savepoint: the store may already run this inside its own transaction (the cluster group).
+            let tx = c.savepoint()?;
+            if let Some(uid) = &uid
+                && !tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND disabled_at IS NULL)", [uid], |r| r.get::<_, bool>(0))?
+            {
+                return Ok(Some(PersonRefused::Disabled));
+            }
+            let revoked: Option<(i64, String, String)> =
+                tx.query_row("SELECT at, reason, by FROM revocations WHERE key_sha256 = ?1 ORDER BY at, id LIMIT 1", [&fp.key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+            if let Some((at, reason, by)) = revoked {
+                return Ok(Some(PersonRefused::KeyRevoked(refusal(at, &reason, &by))));
+            }
+            let other: Option<String> = tx.query_row("SELECT subject FROM identities WHERE key_sha256 = ?1 AND subject <> ?2 LIMIT 1", params![fp.key, subject], |r| r.get(0)).optional()?;
+            if let Some(other) = other {
+                return Ok(Some(PersonRefused::KeyTaken(Identity::parse(&other).map_or(other, |i| i.to_string()))));
+            }
+            tx.execute(
+                "INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at, cert_pem) VALUES (?1, 'person', ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![fp.serial, subject, fp.key, fp.not_before, fp.not_after, crate::util::now_unix(), cert],
+            )?;
+            tx.commit()?;
+            Ok(None)
+        })
+        .await?;
+    match refused {
+        Some(r) => Err(r),
+        None => Ok(Issued { identity: identity.to_string(), uri, cert_pem: pem, not_before: f.not_before, not_after: f.not_after }),
+    }
+}
+
+/// Person `name` was disabled at `at`, the moment kiln recorded it: their certificates are
+/// refused from then (W27-R01), whatever device holds their keys. A name kiln never certified
+/// ([`person_name`]) has none.
+pub async fn person_disabled(store: &Store, pki: &crate::pki::Pki, name: &str, by: &str, at: i64) -> anyhow::Result<()> {
+    let Ok(name) = person_name(Some(name)) else { return Ok(()) };
+    let uri = Identity::new(pki.organization(), Actor::Person { name }).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+    revoke(store, Target::Subject(uri), "person disabled", by, at).await?;
     Ok(())
 }
 
-/// `kiln login --certificate`: a key made here, on this device (`<config>/kiln/identity.key`,
-/// 0600, never sent), and the short-lived certificate the server issues for it to whoever
-/// `target`'s token signs in as (`identity.pem` beside it). Returns who it names and where.
-pub async fn login_certificate(target: &crate::access::Target) -> anyhow::Result<String> {
-    let dir = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map_or_else(|| crate::os::home_dir().join(".config"), std::path::PathBuf::from).join("kiln");
-    std::fs::create_dir_all(&dir)?;
-    let key_path = dir.join("identity.key");
-    let key = match std::fs::read_to_string(&key_path) {
-        Ok(k) => k,
-        Err(_) => {
-            let k = crate::pki::new_key_pem()?;
-            crate::util::write_secret(&key_path, k.as_bytes(), 0o600)?;
-            k
+// ------------------------------------------------------------------ a person's device (the CLI)
+
+/// Where a person's device keeps their identity (W27-R02): `<config>/kiln` (`~/.config/kiln`).
+/// `identity.key` is its key (0600, made here, never sent); `identity.pem` the certificate kiln
+/// issued for it; `identity.json` (0600) the server that was and the sign-in it was asked with, so
+/// the certificate is renewed while that sign-in lasts.
+pub fn device_dir() -> std::path::PathBuf {
+    crate::os::config_home().join("kiln")
+}
+
+/// How `kiln login` signed in to have this device's key certified, kept to renew it.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignIn {
+    /// A personal access token (or the owner's admin token), given to `kiln login`.
+    Token(String),
+    /// A session, from a sign-in link or a password: it lasts until it expires, they sign out or
+    /// they're disabled.
+    Session(String),
+    /// The admin token this machine has (the server's token file, the cluster's credentials),
+    /// found again each time.
+    Found,
+}
+
+/// `identity.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    url: String,
+    sign_in: SignIn,
+}
+
+/// What a request for this device's certificate is signed in with.
+enum Cred<'a> {
+    Bearer(&'a str),
+    Cookie(&'a str),
+}
+
+/// This device's certificate, as kiln issued it.
+pub struct Certified {
+    pub identity: String,
+    pub not_after: i64,
+    pub path: std::path::PathBuf,
+}
+
+impl std::fmt::Display for Certified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} until {} ({}; its key stays on this device, renewed while you stay signed in)", self.identity, crate::ci::cli::when(Some(self.not_after)), self.path.display())
+    }
+}
+
+/// kiln's answer when it didn't certify this device's key: its status, `code` and why.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct Refused {
+    pub status: u16,
+    pub code: String,
+    pub error: String,
+}
+
+impl Refused {
+    /// Whether the sign-in no longer holds: signed out, disabled, a token revoked or expired.
+    fn signed_out(&self) -> bool {
+        self.status == 401 || matches!(self.code.as_str(), "not_a_person" | "disabled")
+    }
+}
+
+/// Whether a token is a person's own (a personal access token) or an agent's, not the owner's
+/// admin token: `kiln login` with one certifies this device instead of printing the owner's links.
+pub fn personal_token(token: &str) -> bool {
+    token.starts_with(crate::authz::gate::PAT_PREFIX) || token.starts_with(crate::authz::gate::AGENT_PREFIX)
+}
+
+/// Whether this device's certificate should be asked for again at `now`: it's missing, isn't for
+/// its key, or half of its life has gone.
+pub fn renewal_due(cert_pem: Option<&str>, key_pem: Option<&str>, now: i64) -> bool {
+    let (Some(cert), Some(key)) = (cert_pem, key_pem) else { return true };
+    if !crate::pki::cert_matches_key(cert, key) {
+        return true;
+    }
+    crate::pki::fingerprints(cert).map_or(true, |f| now >= f.not_before + (f.not_after - f.not_before) / 2)
+}
+
+/// `scheme://host[:port]` of a URL, lowercase, without a default port or credentials: the server
+/// it names, as git's credential helper is asked about one.
+fn origin(url: &str) -> String {
+    let (scheme, rest) = url.trim().split_once("://").unwrap_or(("http", url.trim()));
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h).to_ascii_lowercase();
+    let default = if scheme == "https" { ":443" } else { ":80" };
+    format!("{scheme}://{}", host.strip_suffix(default).unwrap_or(&host))
+}
+
+/// This device's key (`identity.key`): made here when there's none, it's unreadable, or `fresh`.
+/// One already here is kept to its owner (0600).
+fn device_key(dir: &std::path::Path, fresh: bool) -> anyhow::Result<String> {
+    let path = dir.join("identity.key");
+    if !fresh
+        && let Ok(key) = std::fs::read_to_string(&path)
+        && rcgen::KeyPair::from_pem(&key).is_ok()
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if std::fs::metadata(&path)?.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        return Ok(key);
+    }
+    let key = crate::pki::new_key_pem()?;
+    crate::util::write_secret(&path, key.as_bytes(), 0o600)?;
+    Ok(key)
+}
+
+/// `POST <base>/api/me/identity` with a CSR for `key`: kiln's answer, or why it refused.
+async fn ask(client: &crate::http::client::Client, base: &str, cred: &Cred<'_>, key: &str) -> anyhow::Result<Result<serde_json::Value, Refused>> {
+    use serde_json::Value;
+    let csr = crate::pki::make_csr_with_key("kiln-identity", key)?;
+    let req = client.post(&format!("{}/api/me/identity", base.trim_end_matches('/'))).json(&serde_json::json!({ "csr": csr }));
+    let req = match cred {
+        Cred::Bearer(t) => req.bearer(t),
+        Cred::Cookie(s) => req.header("Cookie", &format!("kiln_session={s}")),
+    };
+    let resp = req.send().await?;
+    let status = resp.status();
+    let v: Value = resp.json(1 << 20).await.unwrap_or_default();
+    if (200..300).contains(&status) {
+        return Ok(Ok(v));
+    }
+    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let error = if s("error").is_empty() { format!("HTTP {status}") } else { s("error") };
+    Ok(Err(Refused { status, code: s("code"), error }))
+}
+
+/// This device's key certified at `base` as whoever `cred` signs in as (W27-R02): the key is made
+/// here (a new one when kiln says this one was revoked or certifies someone else) and only a CSR
+/// goes. Keeps the certificate (`identity.pem`) and `keep`, to renew it.
+async fn certify_device(base: &str, cred: &Cred<'_>, keep: &SignIn) -> anyhow::Result<Certified> {
+    let dir = device_dir();
+    let client = crate::http::client::Client::public()?;
+    let mut key = device_key(&dir, false)?;
+    let mut answer = ask(&client, base, cred, &key).await?;
+    if let Err(r) = &answer
+        && matches!(r.code.as_str(), "key_revoked" | "key_taken")
+    {
+        key = device_key(&dir, true)?;
+        answer = ask(&client, base, cred, &key).await?;
+    }
+    let v = answer?;
+    let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+    let pem = field("cert_pem");
+    anyhow::ensure!(crate::pki::cert_matches_key(&pem, &key), "the server sent no certificate for this device's key");
+    let path = dir.join("identity.pem");
+    crate::util::write_secret(&path, pem.as_bytes(), 0o644)?;
+    let kept = serde_json::to_vec(&Kept { url: base.trim_end_matches('/').to_owned(), sign_in: keep.clone() })?;
+    crate::util::write_secret(&dir.join("identity.json"), &kept, 0o600)?;
+    Ok(Certified { identity: field("identity"), not_after: v.get("not_after").and_then(serde_json::Value::as_i64).unwrap_or_default(), path })
+}
+
+/// `kiln login --certificate`, or `kiln login` with a personal access token: this device's key
+/// certified as whoever `t`'s token signs in as. A token `given` (`--token`, `KILN_ADMIN_TOKEN`)
+/// is kept to renew the certificate; one this machine has is found again each time.
+pub async fn login_certificate(t: &crate::access::Target, given: bool) -> anyhow::Result<Certified> {
+    let keep = if given { SignIn::Token(t.token.clone()) } else { SignIn::Found };
+    certify_device(&t.url, &Cred::Bearer(&t.token), &keep).await
+}
+
+/// `kiln login --link <link>` or `--name <name>`: a person signs in on their own device with a
+/// sign-in link or their password (W27-R02), and this device's key is certified as them; the
+/// session is kept to renew the certificate while it lasts. `url`: the server (a link names its
+/// own).
+pub async fn login_person(url: Option<&str>, link: Option<&str>, name: Option<&str>, password_stdin: bool) -> anyhow::Result<Certified> {
+    let client = crate::http::client::Client::public()?;
+    let (base, resp) = match (link, name) {
+        (Some(link), _) => {
+            let base = url.map_or_else(|| origin(link), |u| u.trim_end_matches('/').to_owned());
+            let path = link.trim().split_once("://").and_then(|(_, rest)| rest.find('/').and_then(|at| rest.get(at..))).unwrap_or_default();
+            anyhow::ensure!(path.starts_with("/api/auth/otp?"), "that isn't a kiln sign-in link (…/api/auth/otp?code=…)");
+            (base.clone(), client.get(&format!("{base}{path}")).send().await?)
+        }
+        (None, Some(name)) => {
+            let base = url.map(|u| u.trim_end_matches('/').to_owned()).ok_or_else(|| anyhow::anyhow!("say which server (--url, or KILN_URL)"))?;
+            let password = if password_stdin {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line.trim_end_matches(['\r', '\n']).to_owned()
+            } else {
+                rpassword::prompt_password(format!("{name}'s password for {base}: "))?
+            };
+            (base.clone(), client.post(&format!("{base}/api/auth/password")).json(&serde_json::json!({ "name": name, "password": password })).send().await?)
+        }
+        (None, None) => anyhow::bail!("sign in with a sign-in link (--link) or your name and password (--name)"),
+    };
+    let session = resp
+        .headers()
+        .into_iter()
+        .filter(|(k, _)| k == "set-cookie")
+        .find_map(|(_, v)| v.split(';').next().and_then(|c| c.trim().strip_prefix("kiln_session=")).filter(|s| !s.is_empty()).map(str::to_owned));
+    let Some(session) = session else {
+        let v: serde_json::Value = resp.json(64 << 10).await.unwrap_or_default();
+        let why = v.get("error").and_then(serde_json::Value::as_str).map(str::to_owned);
+        anyhow::bail!("not signed in: {}", why.unwrap_or_else(|| "the sign-in link was used already, expired, or is another server's".to_owned()));
+    };
+    certify_device(&base, &Cred::Cookie(&session), &SignIn::Session(session.clone())).await
+}
+
+/// The credential helper's part (W27-R02): when this device's certificate is from the server git
+/// asks about (`url`) and half its life has gone, it's asked for again with the sign-in `kiln
+/// login` kept, so it's renewed while that sign-in lasts. A device `kiln login` didn't certify is
+/// left alone. A sign-in that no longer holds (signed out, disabled, its token revoked) is
+/// forgotten, and the certificate lapses. What to tell the person, if anything.
+pub async fn renew_device(cfg: &crate::config::Config, url: &str) -> Option<String> {
+    let dir = device_dir();
+    let kept: Kept = serde_json::from_str(&std::fs::read_to_string(dir.join("identity.json")).ok()?).ok()?;
+    if origin(&kept.url) != origin(url) {
+        return None;
+    }
+    let (cert, key) = (std::fs::read_to_string(dir.join("identity.pem")).ok(), std::fs::read_to_string(dir.join("identity.key")).ok());
+    if !renewal_due(cert.as_deref(), key.as_deref(), crate::util::now_unix()) {
+        return None;
+    }
+    let found;
+    let cred = match &kept.sign_in {
+        SignIn::Token(t) => Cred::Bearer(t),
+        SignIn::Session(s) => Cred::Cookie(s),
+        SignIn::Found => {
+            found = crate::access::resolve(cfg, Some(&kept.url), None).await.ok()?.token;
+            Cred::Bearer(&found)
         }
     };
-    let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
-    let client = crate::http::client::Client::public()?;
-    let resp = client.post(&format!("{}/api/me/identity", target.url.trim_end_matches('/'))).bearer(&target.token).json(&serde_json::json!({ "csr": csr })).send().await?;
-    let ok = resp.is_success();
-    let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
-    anyhow::ensure!(ok, "no certificate: {}", v.get("error").and_then(serde_json::Value::as_str).unwrap_or("refused"));
-    let pem = v.get("cert_pem").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("the server sent no certificate"))?;
-    let cert_path = dir.join("identity.pem");
-    crate::util::write_secret(&cert_path, pem.as_bytes(), 0o644)?;
-    Ok(format!("{} until {} ({})", v.get("identity").and_then(serde_json::Value::as_str).unwrap_or_default(), v.get("not_after").and_then(serde_json::Value::as_i64).unwrap_or_default(), cert_path.display()))
+    let e = certify_device(&kept.url, &cred, &kept.sign_in).await.err()?;
+    match e.downcast_ref::<Refused>() {
+        Some(r) if r.signed_out() => {
+            let _ = std::fs::remove_file(dir.join("identity.json"));
+            Some(format!("kiln: no longer signed in to {} ({r}): this device's certificate isn't renewed; `kiln login` signs in again", kept.url))
+        }
+        Some(r) => Some(format!("kiln: this device's certificate wasn't renewed: {r}")),
+        // The server out of reach: the next time.
+        None => None,
+    }
 }
 
 /// What a revocation names.
@@ -561,6 +901,112 @@ mod tests {
     fn cert(pki: &crate::pki::Pki, name: &str) -> anyhow::Result<String> {
         let (csr, _key) = crate::pki::make_csr(name)?;
         pki.sign_csr(&csr, name, 30)
+    }
+
+    #[test]
+    fn w27_r02_a_persons_name_in_their_identity() {
+        assert_eq!(person_name(None).as_deref(), Ok("admin"), "the owner");
+        assert_eq!(person_name(Some("sam")).as_deref(), Ok("sam"));
+        assert_eq!(person_name(Some("sam.lee_2-x")).as_deref(), Ok("sam.lee_2-x"));
+        // Exactly: `sam-` isn't `sam`.
+        assert_eq!(person_name(Some("sam-")).as_deref(), Ok("sam-"));
+        // None for a name that would have to change to fit (and could then be someone else's), or
+        // that reads as the owner's.
+        for name in ["sam@acme", "@", ".", "..", "", "sam o'neil", "Admin", "ADMIN", "owner"] {
+            assert!(person_name(Some(name)).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn w27_r02_renewed_once_half_its_life_has_gone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+        let key = crate::pki::new_key_pem()?;
+        let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
+        let cert = pki.issue_identity(&csr, &Identity::new("hyper-light", Actor::Person { name: "sam".into() }), &[], time::Duration::hours(PERSON_HOURS))?;
+        let f = crate::pki::fingerprints(&cert)?;
+        let half = f.not_before + (f.not_after - f.not_before) / 2;
+        assert!(!renewal_due(Some(&cert), Some(&key), f.not_before + 60));
+        assert!(!renewal_due(Some(&cert), Some(&key), half - 1));
+        assert!(renewal_due(Some(&cert), Some(&key), half));
+        assert!(renewal_due(Some(&cert), Some(&key), f.not_after + 1), "expired");
+        assert!(renewal_due(None, Some(&key), f.not_before + 60), "none yet");
+        assert!(renewal_due(Some(&cert), None, f.not_before + 60), "its key gone");
+        assert!(renewal_due(Some(&cert), Some(&crate::pki::new_key_pem()?), f.not_before + 60), "not for this key");
+        Ok(())
+    }
+
+    #[test]
+    fn w27_r02_the_server_a_url_names() {
+        assert_eq!(origin("http://127.0.0.1:7070/api/auth/otp?code=u.1.2"), "http://127.0.0.1:7070");
+        assert_eq!(origin("HTTPS://Kiln.Example:443/"), "https://kiln.example");
+        assert_eq!(origin("http://x:secret@kiln.home:80"), "http://kiln.home");
+        assert_eq!(origin("https://kiln.home"), origin("https://kiln.home/git/acme/app.git"));
+        assert_ne!(origin("http://kiln.home:7070"), origin("http://kiln.home:7071"));
+    }
+
+    /// W27-R01, R02: a person is certified for a key of their own, for hours, while they're
+    /// enabled; never under another's name or for another identity's key, nor for a key revoked;
+    /// disabled at T, what their keys sign from T is refused, naming T.
+    #[test]
+    fn w27_r02_people_certified_while_enabled() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{Refusal, verify_signed};
+        use rcgen::SigningKey as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            store
+                .call(|c| {
+                    c.execute_batch("INSERT INTO users (id, name, created_at, created_by) VALUES ('u1', 'sam', 0, 'admin'), ('u2', 'sam@acme', 0, 'admin'), ('u3', 'Admin', 0, 'admin');")?;
+                    Ok(())
+                })
+                .await?;
+            let csr = |key: &str| crate::pki::make_csr_with_key("kiln-identity", key);
+            let (owners, laptop) = (crate::pki::new_key_pem()?, crate::pki::new_key_pem()?);
+            let owner = certify_person(&store, &pki, None, &csr(&owners)?).await?;
+            assert_eq!((owner.identity.as_str(), owner.uri.as_str()), ("admin of hyper-light", "kiln://hyper-light/person/admin"));
+            let sam = certify_person(&store, &pki, Some("u1"), &csr(&laptop)?).await?;
+            assert_eq!((sam.identity.as_str(), sam.uri.as_str()), ("sam of hyper-light", "kiln://hyper-light/person/sam"));
+            assert!(sam.not_after - sam.not_before <= 24 * 3600, "hours");
+            assert!(crate::pki::cert_matches_key(&sam.cert_pem, &laptop));
+            // Asked again, renewed for the same key.
+            let again = certify_person(&store, &pki, Some("u1"), &csr(&laptop)?).await?;
+            assert_ne!(crate::pki::fingerprints(&again.cert_pem)?.serial, crate::pki::fingerprints(&sam.cert_pem)?.serial);
+            // A name kiln can't give as it is, or the owner's.
+            for uid in ["u2", "u3"] {
+                assert!(matches!(certify_person(&store, &pki, Some(uid), &csr(&crate::pki::new_key_pem()?)?).await, Err(PersonRefused::Unnamed(_))), "{uid}");
+            }
+            // One key, one identity: the owner's key isn't sam's too.
+            assert!(matches!(certify_person(&store, &pki, Some("u1"), &csr(&owners)?).await, Err(PersonRefused::KeyTaken(who)) if who == "admin of hyper-light"));
+            // A key revoked (lost) isn't certified again.
+            revoke(&store, Target::Key(crate::pki::fingerprints(&sam.cert_pem)?.key), "key lost", "sam", 1_790_000_000).await?;
+            assert!(matches!(certify_person(&store, &pki, Some("u1"), &csr(&laptop)?).await, Err(PersonRefused::KeyRevoked(why)) if why.contains("(key lost, by sam)")));
+            assert!(matches!(certify_person(&store, &pki, Some("u1"), "not a request").await, Err(PersonRefused::BadCsr(_))));
+
+            // Disabled at T, on a new key's certificate: signed before T, sam's; at T or after,
+            // refused, naming T. None is issued after.
+            let desk = crate::pki::new_key_pem()?;
+            let before = certify_person(&store, &pki, Some("u1"), &csr(&desk)?).await?;
+            let t = crate::util::now_unix() + 60;
+            store.call(move |c| Ok(c.execute("UPDATE users SET disabled_at = ?1 WHERE id = 'u1'", [t]).map(|_| ())?)).await?;
+            person_disabled(&store, &pki, "sam", "admin", t).await?;
+            assert!(matches!(certify_person(&store, &pki, Some("u1"), &csr(&crate::pki::new_key_pem()?)?).await, Err(PersonRefused::Disabled)));
+            let (revs, der, msg) = (revocations(&store).await?, crate::pki::der_of(&before.cert_pem)?, b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n");
+            let sig = rcgen::KeyPair::from_pem(&desk)?.sign(msg)?;
+            assert_eq!(verify_signed(&[&der], &pki.ca_der, &revs, t - 1, msg, &sig)?.to_string(), "sam of hyper-light");
+            let named = refusal(t, "person disabled", "admin");
+            for at in [t, t + 3600] {
+                let got = verify_signed(&[&der], &pki.ca_der, &revs, at, msg, &sig);
+                assert!(matches!(&got, Err(e @ Refusal::Revoked { .. }) if e.to_string().contains(&named)), "{got:?}");
+            }
+            // The owner, disabled by no one, is still certified.
+            assert!(verify_signed(&[&crate::pki::der_of(&owner.cert_pem)?], &pki.ca_der, &revs, t + 3600, msg, &rcgen::KeyPair::from_pem(&owners)?.sign(msg)?).is_ok());
+            // A name never certified has nothing to revoke.
+            person_disabled(&store, &pki, "sam@acme", "admin", t).await?;
+            assert_eq!(revocations(&store).await?.len(), revs.len());
+            Ok(())
+        })
     }
 
     #[test]

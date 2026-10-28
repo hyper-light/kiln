@@ -62,6 +62,9 @@ enum Cmd {
         agent: bool,
     },
     /// Print one-time sign-in links for the UI (this machine and the LAN) and open the local one.
+    /// A person on their own device signs in with a sign-in link, their password or a personal
+    /// access token instead, and gets a short-lived certificate for a key made here, naming them
+    /// (docs/ci.md W27-R02).
     Login {
         /// Only print the links; do not open a browser.
         #[arg(long)]
@@ -70,6 +73,16 @@ enum Cmd {
         /// you (docs/ci.md W27-R02): the key stays here.
         #[arg(long)]
         certificate: bool,
+        /// Sign in with the one-time sign-in link you were given, and certify this device's key
+        /// as you.
+        #[arg(long, conflicts_with = "name")]
+        link: Option<String>,
+        /// Sign in with your name and password (asked for), and certify this device's key as you.
+        #[arg(long)]
+        name: Option<String>,
+        /// With --name: read the password from stdin instead of asking for it.
+        #[arg(long, requires = "name")]
+        password_stdin: bool,
         #[command(flatten)]
         server: ServerArgs,
     },
@@ -694,11 +707,16 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Install(a) => boxed(|| install::install(a)).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
-        Cmd::Login { print, certificate, server } => {
+        Cmd::Login { print, certificate, link, name, password_stdin, server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
+            // A person on their own device (docs/ci.md W27-R02): the key is made here, only a CSR goes.
+            if link.is_some() || name.is_some() {
+                out(&format!("Certified: {}", boxed(|| kiln::identities::login_person(server.url.as_deref(), link.as_deref(), name.as_deref(), password_stdin)).await?));
+                return Ok(());
+            }
             let t = boxed(|| server.resolve(&cfg)).await?;
-            if certificate {
-                out(&format!("Certified: {}", boxed(|| kiln::identities::login_certificate(&t)).await?));
+            if certificate || kiln::identities::personal_token(&t.token) {
+                out(&format!("Certified: {}", boxed(|| kiln::identities::login_certificate(&t, server.token.is_some())).await?));
                 return Ok(());
             }
             let url = kiln::api::otp_url(&t.token, &t.url);
