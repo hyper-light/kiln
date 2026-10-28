@@ -47,8 +47,9 @@ async function nothingSideways(page: Page) {
 
 /**
  * Where things are: a row of the list from the page's top (scrolling doesn't count, moving does), how
- * big the list's head is, and Clear selection and each button from the head's top (the head is held
- * in view by touch while selecting, so where it is on the page goes with the scroll).
+ * big the list's head and the composer's To line are, and Clear selection and each button from the
+ * head's top (the head is held in view by touch while selecting, so where it is on the page goes with
+ * the scroll).
  */
 function places(page: Page, row: string) {
   return page.evaluate((row) => {
@@ -61,9 +62,12 @@ function places(page: Page, row: string) {
     };
     const r = document.querySelector(`li.ms-row[data-agent="${row}"]`)?.getBoundingClientRect();
     const h = head?.getBoundingClientRect();
+    // The composer's To line: one line, however many are picked.
+    const to = document.querySelector(".ms-to")?.getBoundingClientRect();
     return {
       row: r ? `${Math.round(r.x)},${Math.round(r.y + scrollY)}` : null,
       head: h ? `${Math.round(h.width)}x${Math.round(h.height)}` : null,
+      to: to ? `${Math.round(to.width)}x${Math.round(to.height)}` : null,
       clear: inHead(document.querySelector(".ms-all + .ms-link")),
       buttons: [...document.querySelectorAll(".ms-bulk > *")].map((b) => `${(b.textContent ?? "").trim()} ${inHead(b)}`),
     };

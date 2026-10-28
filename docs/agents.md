@@ -206,7 +206,8 @@ server says, and counts every session it has, ended ones included, until it's up
   by as much). With a mouse, rows keep their checkboxes.
 - **What to do with those selected.** The list's head has the same buttons, in the same places,
   from the moment selecting starts until it ends (by touch, from Select or a row held, before any is
-  picked): **Resume** (those paused at a usage limit, and those whose goals are paused part-way),
+  picked), each one of its links, like Select all and Done, on a line of its own on a phone:
+  **Resume** (those paused at a usage limit, and those whose goals are paused part-way),
   **Pause** (their goals running), **Move to…**, **End…** and **More**, which holds **Stop their
   turns**, **Restart** and **Remove** (those stopped or ended), where their commands run, keeping
   them going, and muting their notifications. A button none of those selected take is turned off,
@@ -240,8 +241,9 @@ server says, and counts every session it has, ended ones included, until it's up
 - **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
   or harness), the same composer writes to them, each named in the To line where the folder was,
   in the order they were picked (each new one at the end), put back with its ×, Clear for them
-  all; what's written stays as it turns, and it keeps the height it had starting an agent, so the
-  list under it doesn't move as the first is picked or the last put back. A prompt goes with
+  all. The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
+  written stays as it turns, and it keeps the height it had starting an agent, so the list under
+  it doesn't move as the first is picked or the last put back. A prompt goes with
   files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
   now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
   chosen (the speed too), only the agents that have it are sent to, and given it first (Reset

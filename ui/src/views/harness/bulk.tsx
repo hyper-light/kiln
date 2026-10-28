@@ -196,18 +196,18 @@ export function BulkBar({ agents, all, open, onGone }: { agents: AgentInfo[]; al
     const resumes = resumable(of);
     return (
       <>
-        <Button
-          size="xs"
-          variant="secondary"
+        <button
+          type="button"
+          className="ms-link ms-bulk-act"
           disabled={disabled || resumes.length === 0}
           onClick={() => resume(stacks)}
           title={n === 0 ? undefined : resumes.length > 0 ? `Resume ${them(resumes.length)}: those paused at a usage limit, and the goals of those whose goals are paused` : "None of them is paused"}
         >
           Resume
-        </Button>
-        <Button
-          size="xs"
-          variant="secondary"
+        </button>
+        <button
+          type="button"
+          className="ms-link ms-bulk-act"
           disabled={disabled || of.goalsRunning.length === 0}
           onClick={() => pause(stacks)}
           title={
@@ -219,7 +219,7 @@ export function BulkBar({ agents, all, open, onGone }: { agents: AgentInfo[]; al
           }
         >
           Pause
-        </Button>
+        </button>
       </>
     );
   };
@@ -235,9 +235,9 @@ export function BulkBar({ agents, all, open, onGone }: { agents: AgentInfo[]; al
           ) : (
             goalButtons()
           )}
-          <Button
-            size="xs"
-            variant="secondary"
+          <button
+            type="button"
+            className="ms-link ms-bulk-act"
             disabled={disabled || acts.movable.length === 0}
             aria-expanded={asking === "move"}
             onClick={() => setAsk(asking === "move" ? null : "move")}
@@ -250,20 +250,20 @@ export function BulkBar({ agents, all, open, onGone }: { agents: AgentInfo[]; al
             }
           >
             Move to…
-          </Button>
-          <Button
-            size="xs"
-            variant="danger"
+          </button>
+          <button
+            type="button"
+            className="ms-link ms-bulk-act ms-danger"
             disabled={disabled || acts.live.length === 0}
             aria-expanded={asking === "end"}
             onClick={() => setAsk(asking === "end" ? null : "end")}
             title={n === 0 ? undefined : acts.live.length > 0 ? `End ${them(acts.live.length)}` : "They've all ended"}
           >
             End…
-          </Button>
-          <button type="button" className="ms-link ms-bulk-more" aria-expanded={more} disabled={n === 0} onClick={() => setMore(!more)}>
-            <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
+          </button>
+          <button type="button" className="ms-link ms-bulk-act ms-bulk-more" aria-expanded={more} disabled={n === 0} onClick={() => setMore(!more)}>
             More
+            <ChevronDown size={13} className="ms-chev" aria-hidden="true" />
           </button>
         </div>
       )}
@@ -282,33 +282,33 @@ export function BulkBar({ agents, all, open, onGone }: { agents: AgentInfo[]; al
       {/* Each always there, turned off where none of them takes it, the one that can change last. */}
       {open && more && n > 0 && (
         <div className="ms-bulk-row" role="group" aria-label="More for the selected agents">
-          <Button
-            size="xs"
-            variant="secondary"
+          <button
+            type="button"
+            className="ms-link ms-bulk-act"
             disabled={disabled || acts.working.length === 0}
             onClick={stop}
             title={acts.working.length > 0 ? `Stop the turns of ${them(acts.working.length)}` : "None of them is working"}
           >
             Stop their turns
-          </Button>
-          <Button
-            size="xs"
-            variant="secondary"
+          </button>
+          <button
+            type="button"
+            className="ms-link ms-bulk-act"
             disabled={disabled || acts.exited.length === 0}
             onClick={restart}
             title={acts.exited.length > 0 ? `Start ${them(acts.exited.length)} again` : "None of them has stopped or ended"}
           >
             Restart
-          </Button>
-          <Button
-            size="xs"
-            variant="ghost-danger"
+          </button>
+          <button
+            type="button"
+            className="ms-link ms-bulk-act ms-danger"
             disabled={disabled || acts.exited.length === 0}
             onClick={remove}
             title={acts.exited.length > 0 ? `Take ${them(acts.exited.length)} off the board` : "None of them has stopped or ended"}
           >
             Remove
-          </Button>
+          </button>
           <label className="ms-bulk-check">
             <input
               type="checkbox"
@@ -531,9 +531,9 @@ function ReachPick({ agents, disabled, onChange }: { agents: AgentInfo[]; disabl
           </option>
         ))}
       </Pick>
-      <Button size="xs" variant="secondary" disabled={off || picked === null || picked === now} onClick={() => picked !== null && onChange(picked, can, skipped)}>
+      <button type="button" className="ms-link ms-bulk-act" disabled={off || picked === null || picked === now} onClick={() => picked !== null && onChange(picked, can, skipped)}>
         Change
-      </Button>
+      </button>
     </span>
   );
 }
@@ -556,8 +556,14 @@ function Mute({ agents, disabled, run }: { agents: AgentInfo[]; disabled: boolea
     });
   };
   return (
-    <Button size="xs" variant="secondary" disabled={disabled} onClick={go} title={unmute ? undefined : targets.length < agents.length ? `${targets.length} of them aren't muted yet` : undefined}>
+    <button
+      type="button"
+      className="ms-link ms-bulk-act"
+      disabled={disabled}
+      onClick={go}
+      title={unmute ? undefined : targets.length < agents.length ? `${targets.length} of them aren't muted yet` : undefined}
+    >
       {unmute ? "Unmute notifications" : "Mute notifications"}
-    </Button>
+    </button>
   );
 }

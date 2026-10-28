@@ -751,12 +751,13 @@ a.ms-why:hover {
   font-size: 12px;
 }
 
-/* Over the list: check them all, how many there are, and the list's own refresh. */
+/* Over the list: check them all, how many there are, and the list's own refresh. Each of its lines
+   a finger's height (40 px), its controls all links of one size. */
 .ms-listhead {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 18px;
+  gap: 0 22px;
   min-height: 40px;
   padding: 0 8px 0 9px;
 }
@@ -764,27 +765,30 @@ a.ms-why:hover {
   display: inline-flex;
   align-items: center;
   gap: 13px;
-  min-height: 36px;
+  min-height: 40px;
   color: #a1a4ad;
   font-size: 12.5px;
   cursor: pointer;
 }
-/* What to do with the agents selected (bulk.tsx): the same buttons, in the same places, while
-   selecting, at the end of the head's line (or, narrow, a line of their own, there from the moment
-   selecting starts); what's asked, More, and how it went each take a line across the head. */
+/* What to do with the agents selected (bulk.tsx): the same actions, in the same places, while
+   selecting, in the head's own voice (its links: one size, one colour, End's a warning's), at the end
+   of the head's line, or, narrow, a line of their own, edge to edge with the line above and there from
+   the moment selecting starts; what's asked, More, and how it went each take a line across the head. */
 .ms-bulk {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 22px;
   margin-left: auto;
 }
-.ms-bulk-more {
-  margin-left: 4px;
-  font-size: 12.5px;
+.ms-bulk-act {
+  min-height: 40px;
 }
-.ms-bulk-more:disabled {
-  color: #6c6f78;
+.ms-link.ms-bulk-act:disabled {
+  color: #5f626b;
+  cursor: default;
+}
+.ms-bulk-more .ms-chev {
+  transition: transform 0.2s;
 }
 /* How many are selected, its digits one width and its room as wide as it can get: nothing beside it moves as more are picked. */
 .ms-n {
@@ -796,7 +800,7 @@ a.ms-why:hover {
   font-variant-numeric: tabular-nums;
 }
 .ms-bulk-more[aria-expanded="true"] .ms-chev {
-  transform: rotate(90deg);
+  transform: rotate(180deg);
 }
 .ms-bulk-ask,
 .ms-bulk-row,
@@ -807,10 +811,11 @@ a.ms-why:hover {
   align-items: center;
   gap: 8px 10px;
   min-width: 0;
-  padding: 2px 0 6px;
+  padding: 0 0 10px;
 }
+/* More: its actions the bar's own, one gap between them. */
 .ms-bulk-row {
-  gap: 8px 22px;
+  gap: 0 22px;
 }
 /* How it went: a long line wraps beside its ×, from the left. */
 .ms-bulk-said {
@@ -869,16 +874,20 @@ a.ms-why:hover {
 .ms-msg-outcomes > li[data-result="done"] .ms-msg-o-result {
   color: #a8c9bc;
 }
-/* Too narrow for the head's line and the buttons together: the buttons take a line of their own, a
-   little closer together, so they're one line on a phone. */
+/* Too narrow for the head's line and the actions together: they take a line of their own, spread
+   from the head's left edge to its right, as the line above is. */
 @container (max-width: 660px) {
   .ms-bulk {
     flex: 1 1 100%;
-    gap: 6px;
+    justify-content: space-between;
+    gap: 12px;
     margin-left: 0;
   }
-  .ms-bulk-more {
-    margin-left: 0;
+}
+/* By touch with room for both, the actions follow Select all and Done along the one line. */
+@container (min-width: 661px) {
+  .ms-listhead[data-selecting] .ms-bulk {
+    margin-left: 28px;
   }
 }
 @media (pointer: coarse) {
@@ -1006,14 +1015,19 @@ a.ms-why:hover {
       padding-left: 12px;
     }
   }
+  /* Held in view, its own hairline under it (over the list's, where the list starts: nothing moves). */
   .ms-listhead[data-selecting] {
     position: sticky;
     z-index: 3;
     top: var(--header-h);
     background: #08090a;
+    box-shadow: 0 1px 0 #2b2d32;
   }
 }
 .ms-count {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
   color: #a1a4ad;
   font-size: 12.5px;
 }
@@ -1022,10 +1036,13 @@ a.ms-why:hover {
 }
 .ms-picks {
   display: inline-flex;
-  gap: 18px;
+  align-items: center;
+  gap: 22px;
+  min-height: 40px;
   margin-left: auto;
 }
 .ms-select {
+  min-height: 40px;
   margin-left: auto;
 }
 .ms-done {
@@ -1092,14 +1109,47 @@ html[data-motion="paused"] .ms-pick::before {
 
 /* ---------------------------------------------------------------- the message box's To line: those picked
    (each with its ×; @ in the field finds more), or everyone the list shows */
+/* One line, whatever is picked: the chips that fit, then "+N more" (broadcast.tsx's ToChips), Clear at its end. */
 .ms-to {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   min-height: 26px;
   padding: 8px 12px 0;
   font-size: 12px;
+}
+.ms-to > * {
+  flex: none;
+}
+.ms-to > .ms-to-chips {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.ms-to-chips > * {
+  flex: none;
+}
+/* Unseen, out of the line: each chip at its own width, what the fold is measured from (clipped to the
+   line, so the copy never makes the page wider than it is). */
+.ms-to-measure {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+.ms-to-measure > * {
+  flex: none;
+}
+.ms-to-more {
+  white-space: nowrap;
 }
 .ms-to-label {
   margin-right: 2px;
@@ -1121,7 +1171,7 @@ html[data-motion="paused"] .ms-pick::before {
   background: #121318;
   color: #dfe1e6;
 }
-.ms-to-chip > button {
+.ms-to-chip > :is(button, .ms-to-x) {
   display: inline-grid;
   place-items: center;
   width: 18px;
@@ -1144,7 +1194,7 @@ html[data-motion="paused"] .ms-pick::before {
   .ms-to-chip {
     height: 30px;
   }
-  .ms-to-chip > button {
+  .ms-to-chip > :is(button, .ms-to-x) {
     width: 24px;
     height: 24px;
   }
