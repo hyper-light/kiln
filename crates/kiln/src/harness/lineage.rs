@@ -474,6 +474,7 @@ fn server_as_runner(hub: &Hub) -> Option<crate::reach::directory::RunnerInfo> {
     Some(crate::reach::directory::RunnerInfo {
         name: "local".to_owned(),
         hostname: crate::os::hostname(),
+        label: None,
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         connected: true,
@@ -530,9 +531,11 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
     // A machine named, and nothing else asked of it: that one (it says itself if it can't start
     // the harness), whatever its list of harnesses says yet.
     if let Some(name) = want.name.clone().filter(|_| want == crate::reach::directory::Want { name: want.name.clone(), ..Default::default() }) {
-        if matches!(name.as_str(), "local" | "server") || (name == crate::os::hostname() && !hub.agents.lock().contains_key(&name)) {
+        if matches!(name.as_str(), "local" | "server") || (name == crate::os::hostname() && hub.machine_named(&name).is_none()) {
             return Ok("local".to_owned());
         }
+        // A runner kiln knows by its machine id is named by its label too (docs/machines.md).
+        let name = hub.machine_named(&name).unwrap_or(name);
         return match hub.agents.lock().get(&name) {
             Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
             Some(_) => Err((StatusCode::CONFLICT, format!("{name} isn't connected (or doesn't run agents): pick another machine"))),
@@ -1245,6 +1248,24 @@ mod tests {
             anyhow::ensure!(!hub.harness.lacks("agent:new", "devin") && !hub.harness.lacks("agent:box", "devin") && hub.harness.lacks("agent:box", "codex"));
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             anyhow::ensure!(!hub.harness.lacks("agent:studio", "devin"), "tests' sessions run no harness, whatever the machine has");
+            Ok(())
+        })
+    }
+
+    /// docs/machines.md: a runner kiln knows by its machine id is picked by its label as by its id.
+    #[test]
+    fn a_runner_known_by_its_machine_id_is_picked_by_the_name_people_see() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+            let mut laptop = crate::hub::tests::live_runner(id, "macos", "aarch64");
+            laptop.label = Some("adas-macbook-pro-3.local".into());
+            hub.agents.lock().insert(id.into(), laptop);
+            let there = format!("agent:{id}");
+            for on in ["adas-macbook-pro-3.local", id] {
+                anyhow::ensure!(pick(&hub, Some(on), "claude", None).ok().as_ref() == Some(&there), "{on}");
+            }
+            anyhow::ensure!(pick(&hub, Some("adas-macbook-pro.local"), "claude", None).is_err(), "another machine's name");
             Ok(())
         })
     }

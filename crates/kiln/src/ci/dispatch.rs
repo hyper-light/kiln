@@ -1257,7 +1257,7 @@ impl Dispatch {
             facts.executors.remove("firecracker");
         }
         facts.executors.entry("host".to_owned()).or_default();
-        RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
+        RunnerView { name: a.name.clone(), label: a.label.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
     }
 
     /// The `k8s` pool's executor a runner is (W13-R07): its pod's, by the name it enrolled

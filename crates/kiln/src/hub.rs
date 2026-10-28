@@ -271,6 +271,11 @@ fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AgentLive {
     pub name: String,
+    /// The name people see, for an agent kiln knows by its machine id (its `name`,
+    /// docs/machines.md); none for one known by its name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub label: Option<String>,
     #[serde(skip)]
     pub peer: Option<PeerId>,
     pub labels: Vec<String>,
@@ -703,21 +708,21 @@ impl Hub {
     fn mirrors_seen(&self) {
         let Some(m) = &self.harness.copies else { return };
         // One lock at a time: the machines first, then their runner processes.
-        let machines: Vec<(String, u64)> = self
+        let machines: Vec<(String, Option<String>, u64)> = self
             .agents
             .lock()
             .values()
             .filter(|a| a.connected && !a.ephemeral && !a.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
-            .map(|a| (a.name.clone(), a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used))))
+            .map(|a| (a.name.clone(), a.label.clone(), a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used))))
             .collect();
         let candidates: Vec<crate::convo::mirror::Candidate> = {
             let inst = self.instances.lock();
             machines
                 .into_iter()
-                .filter_map(|(machine, disk_free)| {
+                .filter_map(|(machine, label, disk_free)| {
                     let peer = inst.newest_with(&machine, proto::CAP_CONVO)?;
                     let connected_at = inst.get(peer).map_or(0, |i| i.connected_at);
-                    Some(crate::convo::mirror::Candidate { machine, peer, connected_at, disk_free })
+                    Some(crate::convo::mirror::Candidate { machine, label, peer, connected_at, disk_free })
                 })
                 .collect()
         };
@@ -800,6 +805,43 @@ impl Hub {
         self.emit(&ServerEvent::Agent { agent: Box::new(a.clone()) });
     }
 
+    /// Agent `name` is shown as `label` from now on (docs/machines.md): kept (an agent not known yet
+    /// with `hostname`, until its runner connects), and its pages told.
+    pub async fn set_label(&self, name: &str, label: &str, hostname: &str) -> anyhow::Result<()> {
+        self.store.set_agent_label(name.to_owned(), label.to_owned(), hostname.to_owned()).await?;
+        let live = self.agents.lock().get_mut(name).map(|a| {
+            a.label = Some(label.to_owned());
+            a.clone()
+        });
+        if let Some(a) = live {
+            self.emit_agent(&a);
+        }
+        self.note_machine(name);
+        Ok(())
+    }
+
+    /// The runner people mean by `typed`: the one kiln knows by that name, else the one shown by it
+    /// (its label, docs/machines.md).
+    pub fn machine_named(&self, typed: &str) -> Option<String> {
+        let g = self.agents.lock();
+        if g.contains_key(typed) {
+            return Some(typed.to_owned());
+        }
+        g.values().find(|a| a.label.as_deref() == Some(typed)).map(|a| a.name.clone())
+    }
+
+    /// The labels the metrics give runner `name`'s series ([`crate::metrics::set_machine`]): its
+    /// machine's id (the one it's known by, else the one it said) and the name people see.
+    fn note_machine(&self, name: &str) {
+        let known = self.agents.lock().get(name).map(|a| {
+            let id = if crate::join::is_machine_key(name) { name.to_owned() } else { a.facts.as_ref().and_then(|f| f.machine_id.clone()).unwrap_or_default() };
+            (id, a.label.clone().unwrap_or_else(|| name.to_owned()))
+        });
+        if let Some((id, shown)) = known {
+            crate::metrics::set_machine(name, &id, &shown);
+        }
+    }
+
     /// A message a wire couldn't read (`crate::wire::unread`): counted, kept for its sender's page
     /// and `on`'s, audited, and each page it changed told. Some: tell its sender now, of how many
     /// before it it wasn't told; None: not now.
@@ -874,12 +916,14 @@ impl Hub {
     /// Persistent agents from the DB merged with live sessions.
     pub async fn agent_list(&self) -> Vec<AgentLive> {
         let rows = self.store.agents().await.unwrap_or_default();
+        let labels = self.store.agent_labels().await.unwrap_or_default();
         let live = self.agents.lock().clone();
         let mut out: Vec<AgentLive> = rows
             .into_iter()
             .map(|r| match live.get(&r.name) {
-                Some(l) => l.clone(),
+                Some(l) => AgentLive { label: labels.get(&r.name).cloned(), ..l.clone() },
                 None => AgentLive {
+                    label: labels.get(&r.name).cloned(),
                     name: r.name,
                     peer: None,
                     outpost: is_outpost(&r.labels, r.slots),
@@ -1391,6 +1435,7 @@ impl Hub {
                 crate::reach::directory::RunnerInfo {
                     name: a.name.clone(),
                     hostname: a.hostname.clone(),
+                    label: a.label.clone(),
                     os: a.os.clone(),
                     arch: a.arch.clone(),
                     labels: a.labels.clone(),
@@ -1925,6 +1970,7 @@ impl Hub {
                         {
                             tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's machine id");
                         }
+                        self.note_machine(&agent);
                     }
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable runner facts"),
@@ -2238,8 +2284,10 @@ impl Hub {
             }
         }
         let outpost = is_outpost(&h.labels, h.slots);
+        let label = self.store.agent_label(name.clone()).await.ok().flatten();
         let live = AgentLive {
             name: name.clone(),
+            label,
             peer: Some(peer),
             labels: h.labels.clone(),
             // An outpost takes no jobs: it keeps no slots (`pick_agent`, CI's dispatch).
@@ -2316,6 +2364,7 @@ impl Hub {
         self.peers.lock().insert(peer, name.clone());
         self.pending_peers.lock().remove(&peer);
         self.agents.lock().insert(name.clone(), live.clone());
+        self.note_machine(&name);
         if let Some(j) = &h.dedicated_job {
             self.launching.lock().remove(j);
         }
@@ -3234,6 +3283,7 @@ pub(crate) mod tests {
     pub(crate) fn live_runner(name: &str, os: &str, arch: &str) -> AgentLive {
         AgentLive {
             name: name.into(),
+            label: None,
             peer: None,
             labels: vec![],
             slots: 1,

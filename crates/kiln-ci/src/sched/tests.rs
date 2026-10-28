@@ -14,7 +14,7 @@ const MIN: i64 = 60_000;
 fn linux(name: &str, slots: u32) -> RunnerIn {
     RunnerIn {
         id: name.into(),
-        view: RunnerView { name: name.into(), labels: vec!["k8s".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, caps: 1 << 10, pool: None },
+        view: RunnerView { name: name.into(), label: None, labels: vec!["k8s".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, caps: 1 << 10, pool: None },
         slots,
         capacity: None,
         executor: None,

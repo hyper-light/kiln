@@ -113,7 +113,11 @@ pub struct EnrollResponse {
     pub cert_pem: String,
     pub ca_pem: String,
     pub quic: String,
+    /// The name the certificate carries: the machine's id when it sent one (docs/machines.md).
     pub name: String,
+    /// The name people see, when `name` is the machine's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 fn ca_der(pem: &str) -> anyhow::Result<Vec<u8>> {

@@ -1431,6 +1431,7 @@ mod tests {
 
     fn live(name: &str, os: &str, arch: &str, tools: &[&str]) -> crate::hub::AgentLive {
         crate::hub::AgentLive {
+            label: None,
             name: name.into(),
             peer: None,
             labels: Vec::new(),

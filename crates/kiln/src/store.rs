@@ -1533,6 +1533,37 @@ impl Store {
         .await
     }
 
+    /// The name people see for agent `name`, which kiln knows by its machine id
+    /// (docs/machines.md). An agent not connected yet gets a row of its own, with `hostname`, until
+    /// its runner connects and says the rest; its connecting never changes its label.
+    pub async fn set_agent_label(&self, name: String, label: String, hostname: String) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute(
+                "INSERT INTO agents (name, labels, slots, hostname, os, arch, version, ephemeral, connected, last_seen, enrolled_at, label)
+                 VALUES (?1, '[]', 0, ?3, '', '', '', 0, 0, ?4, ?4, ?2)
+                 ON CONFLICT(name) DO UPDATE SET label = excluded.label",
+                params![name, label, hostname, crate::util::now_unix()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The name people see for agent `name`, if it has one other than its name.
+    pub async fn agent_label(&self, name: String) -> anyhow::Result<Option<String>> {
+        self.call(move |c| Ok(c.query_row("SELECT label FROM agents WHERE name = ?1", [name], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
+    }
+
+    /// Each agent's label, by name: those that have one.
+    pub async fn agent_labels(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT name, label FROM agents WHERE label IS NOT NULL")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
     /// Each agent's machine, by name: those whose runner said it.
     pub async fn agent_machines(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
         self.call(|c| {
@@ -1882,6 +1913,46 @@ mod tests {
             anyhow::ensure!(s.agent_machines().await?.get("mbp").map(String::as_str) == Some("cccc"));
             s.delete_agent("mbp".into()).await?;
             anyhow::ensure!(s.agent_machines().await?.is_empty(), "forgotten with its name");
+            anyhow::Ok(())
+        })
+    }
+
+    /// A runner kiln knows by its machine id has a label, the name people see (docs/machines.md):
+    /// kept from its approval, before it connects, across its connecting, until it's renamed.
+    #[test]
+    fn a_runner_known_by_its_machine_id_is_shown_by_its_label() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b".to_owned();
+            // Approved: a row of its own, before its runner connects.
+            s.set_agent_label(id.clone(), "adas-macbook-pro-3.local".into(), "Adas-MacBook-Pro-3.local".into()).await?;
+            anyhow::ensure!(s.agents().await?.iter().any(|a| a.name == id && !a.connected), "listed before it connects");
+            anyhow::ensure!(s.agent_label(id.clone()).await?.as_deref() == Some("adas-macbook-pro-3.local"));
+            // Its runner connects: what it says fills the row, its label stays.
+            let row = AgentRow {
+                name: id.clone(),
+                labels: vec!["macos".into()],
+                slots: 3,
+                hostname: "Adas-MacBook-Pro-3.local".into(),
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                version: "1".into(),
+                ephemeral: false,
+                connected: true,
+                last_seen: 1,
+                enrolled_at: 1,
+            };
+            s.upsert_agent(row).await?;
+            anyhow::ensure!(s.agent_label(id.clone()).await?.as_deref() == Some("adas-macbook-pro-3.local"), "connecting keeps its label");
+            anyhow::ensure!(s.agents().await?.iter().any(|a| a.name == id && a.os == "macos" && a.slots == 3));
+            // Renamed.
+            s.set_agent_label(id.clone(), "studio-desk".into(), String::new()).await?;
+            let labels = s.agent_labels().await?;
+            anyhow::ensure!(labels.len() == 1 && labels.get(&id).map(String::as_str) == Some("studio-desk"), "{labels:?}");
+            // A runner known by its name has none.
+            anyhow::ensure!(s.agent_label("old-box".into()).await?.is_none());
+            s.delete_agent(id.clone()).await?;
+            anyhow::ensure!(s.agent_labels().await?.is_empty(), "forgotten with it");
             anyhow::Ok(())
         })
     }

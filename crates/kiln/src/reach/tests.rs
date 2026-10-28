@@ -39,6 +39,7 @@ fn info(name: &str, fp: &str) -> RunnerInfo {
     RunnerInfo {
         name: name.into(),
         hostname: format!("{name}.lan"),
+        label: None,
         os: if name == "mac" { "macos".into() } else { "linux".into() },
         arch: if name == "mac" { "aarch64".into() } else { "x86_64".into() },
         connected: true,

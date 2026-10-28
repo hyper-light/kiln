@@ -635,6 +635,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let name = (*name).to_owned();
             boxed(|| drain_agent(&hub, &name, req)).await
         }
+        (&Method::POST, ["api", "agents", name, "label"]) => {
+            let name = (*name).to_owned();
+            boxed(|| label_agent(&hub, &name, req)).await
+        }
         (&Method::POST, ["api", "agents", name, "probe"]) => boxed(|| probe_agent(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "front-doors"]) => front_door(boxed(|| crate::frontdoor::control::list(&hub)).await),
         (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(boxed(|| crate::frontdoor::control::get(&hub, name)).await),
@@ -2954,6 +2958,32 @@ struct DrainReq {
     draining: bool,
 }
 
+#[derive(Deserialize)]
+struct LabelReq {
+    label: String,
+}
+
+/// `POST /api/agents/:name/label` (docs/machines.md): the name people see for runner `name`, which
+/// kiln goes on knowing by `name`. A name another runner has, as its own or as its label, is
+/// refused: what people type means one machine.
+async fn label_agent(hub: &Hub, name: &str, req: Request) -> R {
+    let want: LabelReq = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let label = crate::pki::sanitize_name(want.label.trim());
+    if want.label.trim().is_empty() || crate::pki::reserved(&label) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("{:?} can't be a runner's name", want.label)));
+    }
+    let agents = hub.agent_list().await;
+    let Some(me) = agents.iter().find(|a| a.name == name) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("no runner `{name}`")));
+    };
+    if let Some(other) = agents.iter().find(|a| a.name != name && (a.name == label || a.label.as_deref() == Some(label.as_str()))) {
+        return Err(err(StatusCode::CONFLICT, format!("{label} is another runner's name ({})", shown(&other.name, other.label.as_deref()))));
+    }
+    hub.set_label(name, &label, &me.hostname).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "agent.label".into(), format!("{} is shown as {label}", shown(name, me.label.as_deref()))).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "name": name, "label": label })))
+}
+
 async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
     let d: DrainReq = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if hub.set_draining(name, d.draining).await {
@@ -3062,10 +3092,24 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         }
         None => crate::pki::sanitize_name(&r.name),
     };
-    // A machine enrolling with the join token, or an outpost, never takes another machine's name,
-    // as a joining one doesn't: the same machine enrolling again keeps its own, another one gets
-    // `<name>-2`. A job's pod has its pod's name.
-    let name = if persistent || outpost { free_agent_name(hub, &name, &r.hostname, crate::join::clean_machine_id(r.machine_id.as_deref()).as_deref()).await } else { name };
+    // A machine enrolling with the join token, or an outpost, is named as a joining one is: known
+    // by its machine id when it sent one, shown by the name it asked for unless another machine
+    // has it. A job's pod has its pod's name.
+    let (name, label) = if persistent || outpost {
+        let (name, label) = name_and_label(hub, &name, &r.hostname, crate::join::clean_machine_id(r.machine_id.as_deref()).as_deref()).await;
+        if let Some(why) = a_copy_of_a_connected_machine(hub, &name) {
+            return Err(err(StatusCode::CONFLICT, why));
+        }
+        let label = (label != name).then_some(label);
+        (name, label)
+    } else {
+        (name, None)
+    };
+    if let Some(l) = &label
+        && let Err(e) = hub.set_label(&name, l, &r.hostname).await
+    {
+        tracing::warn!(agent = %name, label = %l, error = %format!("{e:#}"), "couldn't keep the enrolling machine's label");
+    }
     let days = if ephemeral {
         crate::pki::EPHEMERAL_DAYS
     } else if outpost {
@@ -3089,10 +3133,10 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     };
     if persistent || outpost {
         let what = if outpost { "outpost.enroll" } else { "agent.enroll" };
-        hub.store.audit(name.clone(), what.into(), String::new()).await;
-        tracing::info!(agent = %name, outpost, "agent enrolled");
+        hub.store.audit(name.clone(), what.into(), shown(&name, label.as_deref())).await;
+        tracing::info!(agent = %name, label = label.as_deref().unwrap_or(""), outpost, "agent enrolled");
     }
-    Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
+    Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name, label }))
 }
 
 /// `GET /api/reach/runners?want=linux/amd64`: reach's directory, ranked for `want` (every runner
@@ -3131,7 +3175,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
     tracing::info!(agent = %name, "issued a certificate for a second runner process");
     Ok(srv::json(
         StatusCode::OK,
-        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name },
+        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name, label: None },
     ))
 }
 
@@ -3448,9 +3492,46 @@ async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str, machine_id: Op
     let agents = hub.agent_list().await;
     let machines = hub.store.agent_machines().await.unwrap_or_default();
     let local = hub.cfg.local_agent.enabled.then(|| crate::pki::sanitize_name(&hub.cfg.local_agent_name()));
-    let holders: Vec<crate::join::Holder<'_>> =
-        agents.iter().map(|a| crate::join::Holder { name: &a.name, hostname: &a.hostname, machine_id: machines.get(&a.name).map(String::as_str) }).collect();
+    // Each agent holds its name and, one known by its machine id, its label too; its machine is
+    // the one its runner said, else the id it's known by.
+    let holders: Vec<crate::join::Holder<'_>> = agents
+        .iter()
+        .flat_map(|a| {
+            let machine_id = machines.get(&a.name).map(String::as_str).or_else(|| crate::join::is_machine_key(&a.name).then_some(a.name.as_str()));
+            let named = crate::join::Holder { name: &a.name, hostname: &a.hostname, machine_id };
+            let labeled = a.label.as_deref().map(|l| crate::join::Holder { name: l, hostname: &a.hostname, machine_id });
+            std::iter::once(named).chain(labeled)
+        })
+        .collect();
     crate::join::free_name(wanted, hostname, machine_id, local.as_deref(), &holders)
+}
+
+/// What a machine that's approved or enrolls is known by, and shown as (docs/machines.md): its
+/// label is the name it asked for unless another machine has it ([`free_agent_name`]); its name,
+/// the key every part of kiln knows it by, is its machine id when it sent one, else that label.
+async fn name_and_label(hub: &Hub, wanted: &str, hostname: &str, machine_id: Option<&str>) -> (String, String) {
+    let label = free_agent_name(hub, wanted, hostname, machine_id).await;
+    let name = crate::join::machine_key(machine_id).unwrap_or_else(|| label.clone());
+    (name, label)
+}
+
+/// Why a machine asking to be known by `name`, a machine id, isn't: a machine known by that id is
+/// connected now, so this one is a copy of it (a VM cloned with its `/etc/machine-id`), and the
+/// two would be one runner (docs/machines.md). The same machine joining again has its runner
+/// stopped first.
+fn a_copy_of_a_connected_machine(hub: &Hub, name: &str) -> Option<String> {
+    let connected = crate::join::is_machine_key(name) && hub.agents.lock().get(name).is_some_and(|a| a.connected);
+    connected.then(|| {
+        format!(
+            "a machine known by this machine's id ({name}) is connected now: if this one is a copy of it, give it an id of its own \
+             (`systemd-machine-id-setup` on Linux, sysprep on Windows) and ask again"
+        )
+    })
+}
+
+/// How the audit and the logs say which agent: its label and its id, else its name.
+fn shown(name: &str, label: Option<&str>) -> String {
+    label.map_or_else(|| name.to_owned(), |l| format!("{l} ({name})"))
 }
 
 /// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
@@ -3466,7 +3547,11 @@ async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
         all.iter().find(|i| crate::discovery::invite::request_for(i, &all, std::slice::from_ref(&listed)).is_some()).map(|i| i.id.clone())
     });
     let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
-    let name = free_agent_name(hub, &wanted, &c.hostname, c.machine_id.as_deref()).await;
+    let (name, label) = name_and_label(hub, &wanted, &c.hostname, c.machine_id.as_deref()).await;
+    if let Some(why) = a_copy_of_a_connected_machine(hub, &name) {
+        return Err(err(StatusCode::CONFLICT, why));
+    }
+    let label = (label != name).then_some(label);
     // An outpost that asked instead of bringing an invite gets what an invited one gets.
     let outpost = c.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL);
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
@@ -3476,6 +3561,12 @@ async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
     crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let quic = hub.cfg.server.quic_advertise.clone();
     let quic_port = hub.discovery.advert.lock().quic;
+    // Known by its machine id: the name people see is kept with it before it can connect.
+    if let Some(l) = &label
+        && let Err(e) = hub.set_label(&name, l, &c.hostname).await
+    {
+        tracing::warn!(agent = %name, label = %l, error = %format!("{e:#}"), "couldn't keep the approved machine's label");
+    }
     let approval = crate::join::Approval {
         name: name.clone(),
         labels: labels.clone(),
@@ -3483,6 +3574,7 @@ async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
         ca_pem: hub.pki.ca_pem.clone(),
         quic,
         quic_port,
+        label: label.clone(),
     };
     if let Err(r) = hub.joins.approve(id, approval, Instant::now()) {
         return Ok(refused(&r));
@@ -3490,14 +3582,14 @@ async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
     // A name forgotten earlier in this server's life is welcome again.
     hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
     let what = if outpost { "outpost.join.approve" } else { "agent.join.approve" };
-    hub.store.audit("admin".into(), what.into(), format!("{name} ({})", c.hostname)).await;
-    tracing::info!(agent = %name, host = %c.hostname, outpost, "join request approved");
+    hub.store.audit("admin".into(), what.into(), format!("{} ({})", shown(&name, label.as_deref()), c.hostname)).await;
+    tracing::info!(agent = %name, label = label.as_deref().unwrap_or(""), host = %c.hostname, outpost, "join request approved");
     if let Some(instance) = asked {
         hub.discovery.invites.revoke(&instance);
     }
     hub.emit(&crate::wire::events::ServerEvent::JoinRequests);
     hub.emit(&crate::wire::events::ServerEvent::Discovery);
-    Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "approved", "name": name, "labels": labels })))
+    Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "approved", "name": name, "label": label, "labels": labels })))
 }
 
 /// `POST /api/join-requests/:id/deny`.

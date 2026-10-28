@@ -67,7 +67,7 @@ fn view(r: &Runner) -> RunnerView {
     let mut facts = r.facts.clone().unwrap_or_else(|| RunnerFacts { os: r.os.clone(), arch: r.arch.clone(), ..RunnerFacts::default() });
     facts.executors.entry("host".to_owned()).or_default();
     let docker = if facts.executors.contains_key("docker") { crate::proto::CAP_DOCKER } else { 0 };
-    RunnerView { name: r.name.clone(), labels: r.labels.clone(), pool: None, facts, caps: u64::from(crate::updates::RUNNER_CAPS | docker) }
+    RunnerView { name: r.name.clone(), label: None, labels: r.labels.clone(), pool: None, facts, caps: u64::from(crate::updates::RUNNER_CAPS | docker) }
 }
 
 /// A runner as the store keeps it, for `KCI6007`.

@@ -261,16 +261,20 @@ Joining is never automatic: a machine asks, an admin decides.
    make the two codes agree except by a one-in-a-million guess per (rate-limited) attempt. The admin
    approves only when the UI shows the code the machine shows. The machine also refuses to continue
    if the server reports a different code, a different CA, or a certificate for another key.
-5. **Approval** signs the CSR with the kiln CA exactly as enrollment does (365 days). The agent's
-   name is the requested one unless another machine's agent (or the server's local agent) already
-   has it; then it becomes `<name>-2`, `-3`, …, and the agent takes its name from the certificate.
-   The name is for people; which machine an agent is, its machine id says. Each runner reports its
-   id with its facts (W13-R01) and the server keeps it with the runner's name, so a machine with
+5. **Approval** signs the CSR with the kiln CA exactly as enrollment does (365 days). A machine
+   that sent its machine id is known by it ([machines.md](machines.md)): the certificate carries the
+   id as the agent's name, the key every part of kiln knows it by (its connections, rows, routes,
+   sessions, its member in the cluster group), and the requested name becomes its **label**, the
+   name people see in the UI, the CLI and the metrics. The label is the requested one unless
+   another machine's agent (or the server's local agent) already has it, as its name or its label;
+   then it becomes `<name>-2`, `-3`, …. Which machine an agent is, its machine id says: one with
    another id is another machine whatever its host name (macOS names two Macs "Ada's MacBook Pro"
-   alike until one of them notices), and the same machine joining again keeps its name. A runner
-   from before that never said its id, or a machine that doesn't send one, is told apart by host
-   name. A machine enrolling with the join token (`kiln install --agent --token`), and an outpost,
-   are named the same way.
+   alike until one of them notices), and the same machine joining again is the same agent. A
+   machine that doesn't send an id (a kiln from before) is named as before: its name is the
+   requested one, told apart from others by host name, and the agent takes it from the
+   certificate. A machine enrolling with the join token (`kiln install --agent --token`), and an
+   outpost, are named the same way. A runner's label is changed under Runners (its details) or by
+   `POST /api/agents/:name/label`; nothing kiln keys by its name moves.
    The answer carries the certificate, the CA and the QUIC address (the address the machine reached
    the HTTP API at, when that is an IP, else the advertised one).
 6. The machine stores the credentials in the agent state directory like enrollment

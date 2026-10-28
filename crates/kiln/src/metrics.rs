@@ -101,15 +101,54 @@ impl Histogram {
     }
 }
 
+/// Each runner's machine id and the name people see, by the name kiln knows it by
+/// (docs/machines.md): every series of a machine carries both, `machine_id` and `machine_name`, so
+/// metrics group by either.
+fn machines() -> &'static RwLock<std::collections::HashMap<String, (String, String)>> {
+    static M: OnceLock<RwLock<std::collections::HashMap<String, (String, String)>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// Runner `key` is machine `machine_id` (empty when kiln doesn't know it), shown as `name`.
+pub fn set_machine(key: &str, machine_id: &str, name: &str) {
+    machines().write().insert(key.to_owned(), (machine_id.to_owned(), name.to_owned()));
+}
+
+/// The labels of runner `key`'s machine, to follow a series' own: its id (empty when kiln doesn't
+/// know it) and the name people see (`key`, when it has no other).
+fn machine_labels(key: &str) -> String {
+    let g = machines().read();
+    let (id, name) = g.get(key).map_or(("", key), |(i, n)| (i.as_str(), n.as_str()));
+    format!(",machine_id=\"{}\",machine_name=\"{}\"", escape(id), escape(name))
+}
+
+/// A series' labels, and its machine's when one of them (`machine`, its place in `keys`) is a
+/// runner's name.
+fn labels_with_machine(keys: &[&str], vals: &[String], machine: Option<usize>) -> String {
+    let own = labels(keys, vals);
+    match machine.and_then(|i| vals.get(i)) {
+        Some(key) => own + &machine_labels(key),
+        None => own,
+    }
+}
+
 /// A label-keyed family, e.g. job results by `(repo, status)`.
 pub struct CounterVec {
     keys: &'static [&'static str],
+    /// Which label is a runner's name ([`machine_labels`]).
+    machine: Option<usize>,
     series: RwLock<BTreeMap<Vec<String>, u64>>,
 }
 
 impl CounterVec {
     pub fn new(keys: &'static [&'static str]) -> Self {
-        Self { keys, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: None, series: RwLock::new(BTreeMap::new()) }
+    }
+
+    /// A family of runners' series (a runner's name at `at` in `keys`): each carries its machine's
+    /// id and name too.
+    pub fn of_machines(keys: &'static [&'static str], at: usize) -> Self {
+        Self { keys, machine: Some(at), series: RwLock::new(BTreeMap::new()) }
     }
 
     pub fn inc(&self, values: &[&str]) {
@@ -134,7 +173,7 @@ impl CounterVec {
 
     fn render(&self, out: &mut String, name: &str) {
         for (vals, n) in self.series.read().iter() {
-            let _ = writeln!(out, "{name}{{{}}} {n}", labels(self.keys, vals));
+            let _ = writeln!(out, "{name}{{{}}} {n}", labels_with_machine(self.keys, vals, self.machine));
         }
     }
 }
@@ -143,12 +182,20 @@ impl CounterVec {
 /// that went) goes from it.
 pub struct GaugeVec {
     keys: &'static [&'static str],
+    /// Which label is a runner's name ([`machine_labels`]).
+    machine: Option<usize>,
     series: RwLock<BTreeMap<Vec<String>, i64>>,
 }
 
 impl GaugeVec {
     pub fn new(keys: &'static [&'static str]) -> Self {
-        Self { keys, series: RwLock::new(BTreeMap::new()) }
+        Self { keys, machine: None, series: RwLock::new(BTreeMap::new()) }
+    }
+
+    /// A family of runners' series (a runner's name at `at` in `keys`): each carries its machine's
+    /// id and name too.
+    pub fn of_machines(keys: &'static [&'static str], at: usize) -> Self {
+        Self { keys, machine: Some(at), series: RwLock::new(BTreeMap::new()) }
     }
 
     /// Every series, as just measured: label values (in `keys` order) and value.
@@ -167,7 +214,7 @@ impl GaugeVec {
 
     fn render(&self, out: &mut String, name: &str) {
         for (vals, v) in self.series.read().iter() {
-            let _ = writeln!(out, "{name}{{{}}} {v}", labels(self.keys, vals));
+            let _ = writeln!(out, "{name}{{{}}} {v}", labels_with_machine(self.keys, vals, self.machine));
         }
     }
 }
@@ -285,11 +332,11 @@ pub fn global() -> &'static Metrics {
         panics_caught: Counter::default(),
         quic_streams: Counter::default(),
         k8s_pods_launched: CounterVec::new(&["result"]),
-        runner_up: GaugeVec::new(&["runner"]),
-        runner_behind: GaugeVec::new(&["runner"]),
-        runner_update_policy: GaugeVec::new(&["runner", "policy"]),
-        runner_version_info: GaugeVec::new(&["runner", "version"]),
-        runner_net_dropped: GaugeVec::new(&["runner", "lane", "reason"]),
+        runner_up: GaugeVec::of_machines(&["runner"], 0),
+        runner_behind: GaugeVec::of_machines(&["runner"], 0),
+        runner_update_policy: GaugeVec::of_machines(&["runner", "policy"], 0),
+        runner_version_info: GaugeVec::of_machines(&["runner", "version"], 0),
+        runner_net_dropped: GaugeVec::of_machines(&["runner", "lane", "reason"], 0),
         ci_cache: CounterVec::new(&["result"]),
         ci_attempts: CounterVec::new(&["conclusion", "class"]),
         ci_wait_seconds: CounterVec::new(&["reason"]),
@@ -377,14 +424,14 @@ pub fn sync() -> &'static SyncMetrics {
         retries: CounterVec::new(&["repo", "what"]),
         errors: CounterVec::new(&["repo", "kind"]),
         commit_seconds: HistogramVec::new(&["repo"], LATENCY_BUCKETS),
-        copy_lag_steps: GaugeVec::new(&["repo", "machine"]),
-        copy_unsent_steps: GaugeVec::new(&["repo", "machine"]),
-        copy_waiting_blobs: GaugeVec::new(&["repo", "machine"]),
-        copy_state: GaugeVec::new(&["repo", "machine", "state"]),
-        copy_heard_age: GaugeVec::new(&["repo", "machine"]),
+        copy_lag_steps: GaugeVec::of_machines(&["repo", "machine"], 1),
+        copy_unsent_steps: GaugeVec::of_machines(&["repo", "machine"], 1),
+        copy_waiting_blobs: GaugeVec::of_machines(&["repo", "machine"], 1),
+        copy_state: GaugeVec::of_machines(&["repo", "machine", "state"], 1),
+        copy_heard_age: GaugeVec::of_machines(&["repo", "machine"], 1),
         conflict_files: GaugeVec::new(&["repo"]),
-        blob_requests: CounterVec::new(&["machine", "direction", "result"]),
-        blob_bytes: CounterVec::new(&["machine", "direction"]),
+        blob_requests: CounterVec::of_machines(&["machine", "direction", "result"], 0),
+        blob_bytes: CounterVec::of_machines(&["machine", "direction"], 0),
         proposed: CounterVec::new(&["repo"]),
         applied: CounterVec::new(&["repo"]),
         folder_writes: CounterVec::new(&["repo", "outcome"]),
@@ -808,6 +855,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_runners_series_carry_its_machines_id_and_name() {
+        set_machine("5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "adas-macbook-pro-3.local");
+        let up = GaugeVec::of_machines(&["runner"], 0);
+        up.replace([(vec!["5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b".to_owned()], 1), (vec!["box-never-seen".to_owned()], 0)]);
+        let mut out = String::new();
+        up.render(&mut out, "kiln_runner_up");
+        assert!(out.contains(r#"kiln_runner_up{runner="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_id="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_name="adas-macbook-pro-3.local"} 1"#), "{out}");
+        // One kiln knows no more of: its name, and no id.
+        assert!(out.contains(r#"kiln_runner_up{runner="box-never-seen",machine_id="",machine_name="box-never-seen"} 0"#), "{out}");
+        // A family whose runner isn't its first label.
+        let lag = GaugeVec::of_machines(&["repo", "machine"], 1);
+        lag.replace([(vec!["hyper-light/kiln".to_owned(), "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b".to_owned()], 3)]);
+        let mut out = String::new();
+        lag.render(&mut out, "kiln_sync_copy_lag_steps");
+        assert!(out.contains(r#"{repo="hyper-light/kiln",machine="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_id="5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b",machine_name="adas-macbook-pro-3.local"} 3"#), "{out}");
+    }
+
+    #[test]
     fn a_labelled_histogram_renders_each_series_whole() {
         let h = HistogramVec::new(&["repo"], LATENCY_BUCKETS);
         h.observe(&["a"], 0.0004);
@@ -1139,7 +1204,7 @@ pub fn render() -> String {
                     #[allow(clippy::cast_precision_loss)]
                     _ => s.net_tx as f64,
                 };
-                let _ = writeln!(o, "{name}{{agent=\"{}\"}} {v}", escape(agent));
+                let _ = writeln!(o, "{name}{{agent=\"{}\"{}}} {v}", escape(agent), machine_labels(agent));
             }
         }
     }
@@ -1149,7 +1214,7 @@ pub fn render() -> String {
             help(&mut o, name, kind, h);
             for (l, values) in convo.iter() {
                 if let Some(v) = values.get(i).copied().flatten() {
-                    let _ = writeln!(o, "{name}{{{}}} {v}", labels(&["store", "role", "machine"], l));
+                    let _ = writeln!(o, "{name}{{{}}} {v}", labels_with_machine(&["store", "role", "machine"], l, Some(2)));
                 }
             }
         }

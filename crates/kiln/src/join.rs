@@ -161,7 +161,8 @@ impl Status {
 /// What an approved machine receives: its certificate and where to connect.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Approval {
-    /// The agent name the certificate carries (the requested one, or a free variant of it).
+    /// The agent name the certificate carries: the machine's id when it sent one
+    /// (docs/machines.md), else the requested name or a free variant of it.
     pub name: String,
     pub labels: Vec<String>,
     pub cert_pem: String,
@@ -169,6 +170,10 @@ pub struct Approval {
     /// The QUIC address the server advertises, and its port.
     pub quic: String,
     pub quic_port: u16,
+    /// The name people see, when `name` is the machine's id. None from a server from before, whose
+    /// `name` is both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// `GET /api/join-requests/<id>` with the machine's secret.
@@ -370,6 +375,18 @@ pub fn default_labels(os: &str, arch: &str) -> Vec<String> {
 pub fn clean_machine_id(id: Option<&str>) -> Option<String> {
     let id: String = id?.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(64).collect::<String>().to_ascii_lowercase();
     (!id.is_empty()).then_some(id)
+}
+
+/// What kiln knows a machine by when it sent its machine id ([`crate::os::machine_id`], 32 hex
+/// digits): that id, the name its certificate carries, with the name it asked for as its label
+/// (docs/machines.md). None otherwise: it is known by its name, as before.
+pub fn machine_key(id: Option<&str>) -> Option<String> {
+    clean_machine_id(id).filter(|k| k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Whether `name` is a machine's id rather than a name ([`machine_key`]).
+pub fn is_machine_key(name: &str) -> bool {
+    machine_key(Some(name)).as_deref() == Some(name)
 }
 
 /// One of the server's agents, as [`free_name`] weighs it.
@@ -596,6 +613,8 @@ impl Machine {
 pub struct Joined {
     pub server: String,
     pub name: String,
+    /// The name people see, when `name` is the machine's id.
+    pub label: Option<String>,
     pub labels: Vec<String>,
     pub quic: String,
     pub ca_der: Vec<u8>,
@@ -805,7 +824,7 @@ pub async fn request(server: &str, me: &Machine, state_dir: &Path, say: &(dyn Fn
                             let quic = quic_address(&server, &a).await;
                             store(state_dir, &server, &key_pem, &a, &quic)?;
                             say(&format!("Approved: this machine is agent \"{}\" (labels {}).", a.name, a.labels.join(", ")));
-                            return Ok(Joined { server, name: a.name, labels: a.labels, quic, ca_der });
+                            return Ok(Joined { server, name: a.name, label: a.label, labels: a.labels, quic, ca_der });
                         }
                     }
                 }
@@ -1114,7 +1133,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
     })
     .await?;
     // When it starts (at boot, or at sign-in) is the install's to say: it's the `boot` line above.
-    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}.", joined.name, joined.server));
+    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}.", joined.label.as_deref().unwrap_or(&joined.name), joined.server));
     Ok(None)
 }
 
@@ -1191,6 +1210,11 @@ mod tests {
         let two = [h("box", "box", Some("aaaa")), h("box-2", "box-2", Some("bbbb"))];
         assert_eq!(free_name("box", "box", Some("cccc"), Some("box-3"), &two), "box-4");
         assert_eq!(free_name("solo", "solo", Some("cccc"), Some("solo"), &[]), "solo-2");
+        // A machine that sends its id is known by it; one that sends none, or no id, by its name.
+        assert_eq!(machine_key(Some("5F2A9C3E0B1D4E6F8A7C9B0D1E2F3A4B")).as_deref(), Some("5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b"));
+        assert_eq!(machine_key(Some("a1b2-c3")), None, "only the 32 hex digits kiln makes");
+        assert_eq!(machine_key(None), None);
+        assert!(is_machine_key("5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b") && !is_machine_key("5F2A9C3E0B1D4E6F8A7C9B0D1E2F3A4B") && !is_machine_key("adas-macbook-pro.local"));
         // Ids as requests give them.
         assert_eq!(clean_machine_id(Some(" A1b2-C3; ")).as_deref(), Some("a1b2-c3"));
         assert_eq!(clean_machine_id(Some(" ;; ")), None);
@@ -1228,7 +1252,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let pki = crate::pki::Pki::open(dir.path())?;
         let cert = pki.sign_csr(&c.csr, &c.name, 365)?;
-        let approval = Approval { name: c.name, labels: c.labels, cert_pem: cert, ca_pem: pki.ca_pem.clone(), quic: "box:7071".into(), quic_port: 7071 };
+        let approval = Approval { name: c.name, labels: c.labels, cert_pem: cert, ca_pem: pki.ca_pem.clone(), quic: "box:7071".into(), quic_port: 7071, label: None };
         r.approve(&id, approval, now).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let (p, _) = r.poll(&id, "s3cret", now, ca).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         assert_eq!(p.status, Status::Approved);
@@ -1315,7 +1339,7 @@ mod tests {
         assert_eq!(host_of("http://[fe80::1]:7070/").as_deref(), Some("fe80::1"));
         assert_eq!(host_of("https://ci.example").as_deref(), Some("ci.example"));
         crate::rt::block_on(async {
-            let a = Approval { name: "n".into(), labels: vec![], cert_pem: String::new(), ca_pem: String::new(), quic: "srv-host:7071".into(), quic_port: 7071 };
+            let a = Approval { name: "n".into(), labels: vec![], cert_pem: String::new(), ca_pem: String::new(), quic: "srv-host:7071".into(), quic_port: 7071, label: None };
             // An IP the machine reached HTTP at beats an advertised host name.
             assert_eq!(quic_address("http://192.168.1.7:7070", &a).await, "192.168.1.7:7071");
             assert_eq!(quic_address("http://[fe80::1]:7070", &a).await, "[fe80::1]:7071");
