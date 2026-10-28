@@ -485,7 +485,8 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
               </button>
             </Tip>
             <MicButton field={field} setText={(t) => setText(t)} onNote={setNote} disabled={n === 0} />
-            {working > 0 && <SendModes modes={MODES} mode={mode} onMode={setMode} />}
+            {/* Always there, as when starting an agent: with none of them working, each sends at once. */}
+            <SendModes modes={MODES} mode={mode} onMode={setMode} />
             <span className="cp-gap" />
             {working > 0 && (
               <Tip content={`Stop the turn of ${count(working, "working agent")}`}>

@@ -157,8 +157,9 @@ counted.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
   it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
   many, with Select all and Done. With a mouse, rows keep their checkboxes.
-- **The composer.** At the top of the page, on a desktop and a phone alike (where it's one line
-  until it's used). There is no New agents button and no dialog: with nothing selected it starts an
+- **The composer.** At the top of the page, on a desktop and a phone alike, whole and the agent
+  page's composer's size from the start, Queue · Steer · Now in its bar in both of its turns (when
+  starting an agent they're shown but not in play: its first message goes at once). There is no New agents button and no dialog: with nothing selected it starts an
   agent, its words the agent's first message. Above the box is the agent page's own line,
   permissions · model · effort, and the bolt where the model goes faster (the speeds each model
   runs at come with the machine's models, `KindInfo.models[].speeds`), each opened in place with

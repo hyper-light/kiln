@@ -1260,34 +1260,22 @@ html[data-motion="paused"] .ms-pick {
     gap: 0 18px;
   }
 }
-/* A phone: at the top as on a desktop, one line (the field and Start) until it's used. */
-.mc[data-quiet] .mc-how,
-.mc[data-quiet] .mc-slot,
-.mc[data-quiet] .mc-under,
-.mc[data-quiet] .cp-icon,
-.mc[data-quiet] .cp-gap {
-  display: none;
-}
-.mc[data-quiet] .hx-compose-box {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding-right: 6px;
-}
-.mc[data-quiet] .hx-compose-input {
-  flex: 1;
-  min-height: 44px;
-}
-.mc[data-quiet] .cp-bar {
+/* Queue · Steer · Now when starting an agent: shown as messaging shows them, not in play. */
+.mc-modes {
+  display: contents;
+  margin: 0;
   padding: 0;
+  border: 0;
+  min-width: 0;
 }
-.mc[data-quiet] .cp-send {
-  width: 34px;
-  padding: 0;
-  justify-content: center;
+.mc-modes button,
+.mc-modes .cp-mode-pick {
+  opacity: 0.45;
+  cursor: default;
 }
-.mc[data-quiet] .cp-send > span {
-  display: none;
+/* The field is the agent composer's own height from the start, so nothing moves as it's used. */
+.mc .hx-compose-input {
+  min-height: 46px;
 }
 /* Opening the agent it started: one view transition, each part landing where it goes on the agent's page (console.css names those). */
 :root[data-opening] .mc .mc-how {
