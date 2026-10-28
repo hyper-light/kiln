@@ -5056,6 +5056,17 @@ flood, where 1,691,670 had taken 76.4 s there at 5a74e409. kiln CD's scenario ra
 Max Mac Studio, its cluster kind 0.33's on Docker Desktop, at 4af1134e (this branch with main
 merged into it): it passes there too (216 s), its cluster removed after.
 
+Then, with main merged in as observe lands (2026-10-28, at 67c0778c8e), the loads in a release build
+on a 15-core M-series MacBook Pro, each in its own run: the points' flood took 167.0 M points in
+20.1 s (8.29 M a second), none refused, a request's p50 0.51 ms and p99 3.11 ms, every sender's
+newest points readable 11 ms after; the logs' took 3.23 M records (160 k a second), 2.27% of its
+requests refused and sent again, its monitors' first evaluation after it finding every record 6.3 s
+after and its metrics from logs counting each record once 4.6 s after; the traces' took 10.6 M spans
+(527 k a second), 0.65% of its requests refused, a trace found by its id at a p50 of 8.47 ms and
+its trace metrics counted 4.5 s after; and a runner whose server went away refused 0.46 s after it
+did (its queue's target: 1 s), every point it took stored once. Each one's replicas agreed. What
+they cost in CPU and memory is read from Linux's `/proc`, so not on a Mac.
+
 **On Linux**, where every scenario below was first written (2026-10-25, adacachy: CachyOS, x86_64,
 32 cores shared with others' builds): the whole set as the last changes went in, at e1d39d2c:
 kiln's observe tests (268), every live file, and the browser suite against a seeded server (its 45
