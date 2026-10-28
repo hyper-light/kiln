@@ -1053,12 +1053,15 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
       return (ctx.json(res, 200, { id: b, thread: t.id, state: t.state, kind: t.kind }), true);
     }
     if (m === "DELETE") {
-      if (cm) {
-        if (t.comments.length === 1) t.comments = [];
-        else cm.deleted = true;
-      }
+      // As the server takes a comment back (ci::review::delete): a thread with no other live comment
+      // goes; else its first comment stays, deleted, while replies remain; a reply goes.
+      if (!cm || cm.deleted) return (ctx.err(res, 404, "no such comment: it was deleted"), true);
+      const gone = !t.comments.some((x) => x !== cm && !x.deleted);
+      if (gone) t.comments = [];
+      else if (t.comments[0] === cm) cm.deleted = true;
+      else t.comments = t.comments.filter((x) => x !== cm);
       ctx.emit({ type: "comment", diff: t.diff });
-      return (ctx.json(res, 200, { id: b, thread: t.id, deleted: true, thread_deleted: t.comments.length === 0 }), true);
+      return (ctx.json(res, 200, { id: b, thread: t.id, deleted: true, thread_deleted: gone }), true);
     }
     if (m === "POST" && c === "apply") {
       const body = await ctx.body<{ suggestion?: number }>(req);
