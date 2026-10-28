@@ -166,10 +166,11 @@
 .md-copy[data-done] {
   color: var(--color-ok);
 }
+/* Nothing scrolls sideways (W21-AC01): a long line wraps within its own row, under its text, its
+   number once at its top, as the diff's lines do. */
 .md-code-body {
   margin: 0;
   padding: 4px 0;
-  overflow-x: auto;
   border: 0;
   background: none;
   font-family: var(--font-mono);
@@ -179,17 +180,16 @@
 }
 .md-code-body > code {
   display: grid;
-  width: max-content;
-  min-width: 100%;
   padding: 0;
   background: none;
   font: inherit;
 }
 .md-ln {
   display: grid;
-  grid-template-columns: 38px max-content;
+  grid-template-columns: 38px minmax(0, 1fr);
   padding-right: 12px;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .md-ln::before {
   padding-right: 10px;
@@ -201,7 +201,7 @@
 
 /* A suggestion (W26-R10): each line by the file's own number, the old ones − and the new ones +. */
 .md-sug .md-ln {
-  grid-template-columns: 58px max-content;
+  grid-template-columns: 58px minmax(0, 1fr);
 }
 .md-sug .md-ln::before {
   content: attr(data-n) "\a0" attr(data-sign);

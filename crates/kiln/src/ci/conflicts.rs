@@ -27,6 +27,7 @@ use super::Fail;
 use super::diffs::{self, Diff, Version};
 use super::revision;
 use crate::authz::{Caller, Scope};
+use crate::wire::events::{Conflict, ServerEvent};
 use crate::gitops::{self, LS_REMOTE_TIMEOUT};
 use crate::hub::Hub;
 
@@ -469,7 +470,7 @@ async fn record(hub: &Hub, d: &Diff, v: &Version, onto: &Onto, tree: &str, found
         .await
         .map_err(fail)?;
     if replay.state == "conflicted" {
-        hub.emit(&json!({ "type": "conflict", "repo": d.repo, "diff": d.name, "replay": replay.id, "version": replay.version, "state": replay.state }));
+        hub.emit(&ServerEvent::Conflict(Box::new(Conflict { version: Some(replay.version), state: Some(replay.state.clone()), ..changed(d, &replay.id) })));
     }
     Ok(replay)
 }
@@ -548,6 +549,11 @@ pub async fn list(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     Ok(view(d, latest, replay.as_ref(), &rows))
 }
 
+/// The event saying `d`'s conflicts in `replay` changed (W26-R12), its other parts to fill in.
+fn changed(d: &Diff, replay: &str) -> Conflict {
+    Conflict { repo: d.repo.clone(), diff: d.name.clone(), replay: replay.to_owned(), version: None, state: None, conflict: None, take: None, by: None, agent: None }
+}
+
 /// Conflict `id` of `d`'s replay now, with the replay: refused when there's nothing to resolve, or
 /// it isn't this replay's (what it goes onto moved: it was replayed again).
 async fn open_conflict(hub: &Hub, d: &Diff, id: &str) -> Result<(Replay, Kept), Fail> {
@@ -620,7 +626,7 @@ pub async fn resolve(hub: &Hub, d: &Diff, id: &str, caller: &Caller, body: &Valu
         .map_err(fail)?;
     let whose = if agent { "an agent's resolution" } else { "resolved" };
     hub.store.audit(caller.name.clone(), "diffs.conflict.resolve".into(), format!("{} {} v{} ({place}): {whose}, taking {taken}", d.repo, d.name, replay.version)).await;
-    hub.emit(&json!({ "type": "conflict", "repo": d.repo, "diff": d.name, "replay": replay.id, "conflict": c.id, "take": taken, "agent": agent, "by": me }));
+    hub.emit(&ServerEvent::Conflict(Box::new(Conflict { conflict: Some(c.id.clone()), take: Some(taken.to_owned()), by: Some(me.clone()), agent: Some(agent), ..changed(d, &replay.id) })));
     let rows = kept(hub, &replay.id).await?;
     Ok(view(d, Some(replay.version), Some(&replay), &rows))
 }
@@ -645,7 +651,7 @@ pub async fn undo(hub: &Hub, d: &Diff, id: &str, caller: &Caller) -> Result<Valu
         .await
         .map_err(fail)?;
     hub.store.audit(caller.name.clone(), "diffs.conflict.undo".into(), format!("{} {} v{} ({})", d.repo, d.name, replay.version, c.place())).await;
-    hub.emit(&json!({ "type": "conflict", "repo": d.repo, "diff": d.name, "replay": replay.id, "conflict": c.id, "take": Value::Null, "agent": agent, "by": me }));
+    hub.emit(&ServerEvent::Conflict(Box::new(Conflict { conflict: Some(c.id.clone()), by: Some(me.clone()), agent: Some(agent), ..changed(d, &replay.id) })));
     let rows = kept(hub, &replay.id).await?;
     Ok(view(d, Some(replay.version), Some(&replay), &rows))
 }
@@ -821,6 +827,6 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
     hub.store.audit(caller.name.clone(), "diffs.conflicts.commit".into(), format!("{} {} v{n}: {} conflicts resolved onto {} ({})", d.repo, d.name, rows.len(), onto.name, made.sha)).await;
     // What waits on the gate asks it again: an automatic merge goes once it clears.
     super::land::kick();
-    hub.emit(&json!({ "type": "conflict", "repo": d.repo, "diff": d.name, "replay": replay.id, "state": "resolved", "version": n, "by": me }));
+    hub.emit(&ServerEvent::Conflict(Box::new(Conflict { version: Some(n), state: Some("resolved".to_owned()), by: Some(me.clone()), ..changed(d, &replay.id) })));
     Ok(json!({ "diff": d.name, "version": n, "why": WHY, "commit": made.sha, "by": me, "signer": made.signer, "replay": replay.id, "conflicts": rows.len() }))
 }

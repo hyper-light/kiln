@@ -31,6 +31,7 @@ export type { Cmd } from "./Cmd";
 export type { Command } from "./Command";
 export type { Comment } from "./Comment";
 export type { Compacting } from "./Compacting";
+export type { Conflict } from "./Conflict";
 export type { Control } from "./Control";
 export type { ControlKind } from "./ControlKind";
 export type { ControlOption } from "./ControlOption";
