@@ -272,8 +272,10 @@ Joining is never automatic: a machine asks, an admin decides.
    alike until one of them notices), and the same machine joining again is the same agent. A
    machine that doesn't send an id (a kiln from before) is named as before: its name is the
    requested one, told apart from others by host name, and the agent takes it from the
-   certificate. A machine enrolling with the join token (`kiln install --agent --token`), and an
-   outpost, are named the same way. A runner's label is changed under Runners (its details) or by
+   certificate; once it runs a kiln that sends one, it moves to its id as it starts, what kiln
+   kept under its name with it ([machines.md](machines.md#runners-from-before)). A machine
+   enrolling with the join token (`kiln install --agent --token`), and an outpost, are named the
+   same way. A runner's label is changed under Runners (its details) or by
    `POST /api/agents/:name/label`; nothing kiln keys by its name moves.
    The answer carries the certificate, the CA and the QUIC address (the address the machine reached
    the HTTP API at, when that is an IP, else the advertised one).

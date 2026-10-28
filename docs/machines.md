@@ -2,7 +2,7 @@
 
 > **Built** (2026-10-28), on Ada's word: "The name should just be for user benefit, machine id is
 > what we use in all systems." The decisions it took are under [Decisions](#decisions). A runner
-> that enrolled before keeps its name as its key until it joins again
+> that enrolled before moves to its machine id as it starts
 > ([Runners from before](#runners-from-before)).
 
 kiln knows a runner by one name: its certificate's, the key its connections, processes, agent
@@ -34,14 +34,21 @@ approved under the first one's runner name. From then on:
   (`upgrade::install_alongside`) gets its certificate from the machine's, id included. The same
   machine joining again is the same runner.
 - **Its name is a label, for people.** The name it asked for becomes its label
-  (`agents.label`), which the UI, the CLI (`kiln runners`, `kiln join`) and the metrics show; a
-  runner without one is shown by its name. A label is the machine's own: one another runner has,
+  (`agents.label`), which the UI, the CLI (`kiln runners`, `kiln join`), the metrics and the
+  server's own sentences (its errors, wait reasons, findings and notifications) show; a runner
+  without one is shown by its name. A label is the machine's own: one another runner has,
   as its name or its label, gets `-2`, `-3`, … It's changed under Runners (the runner's details) or
   by `POST /api/agents/:name/label`, and nothing kiln keys by the id moves.
 - **Names are resolved where people type them:** `kiln run --on`, `kiln spawn --on` and MCP's `on`
   find a runner by its name, its label or its host name; `runs-on: <name>` names a runner by its
-  label as by its name (its one label, as GitHub's runner names do); `[conversations] mirror_on`
-  takes labels too.
+  label as by its name (its one label, as GitHub's runner names do); `[conversations] mirror_on`,
+  an agent's `agent:<name>` target, where a session moves to, the runner a retry asks for and
+  `kiln reach forget` take labels too. A grant on `runner:<label>` is kept as the grant on the
+  runner's id, so it holds whatever the runner is renamed to.
+- **History shows the name it has now.** What kiln keeps names a runner by its id, so a list of
+  runs, jobs or sessions shows its label as it is now, after a rename too; so do the notes a
+  runner writes into a session's timeline ("Moved here from …"), which only have the ids. Words
+  kiln already wrote in a job's log keep the name they said then.
 - **Metrics carry both:** every series of a machine (`kiln_runner_*`, `kiln_agent_*`, sync's copies
   and blobs, the conversation stores') has `machine_id` and `machine_name` beside its own labels,
   so they group by either.
@@ -61,6 +68,7 @@ it.
 | A Linux machine or VM | its `/etc/machine-id`: made at its first boot, from the hypervisor's own UUID for the VM where it gives one (systemd does), so each VM has its own. One that says `uninitialized` is none |
 | A Windows machine or VM | its `MachineGuid`, made when Windows was installed (sysprep makes a new one for a copy) |
 | A container (Docker's, Podman's, a Kubernetes pod's) | one kept in `machine-id` in its data directory, on its volume where it has one, made the first time from its pod's UID (`KILN_POD_UID`, from the Downward API: kiln's pods, its chart and `kiln install --on kubernetes` give it) or at random. The same volume is the same machine; a container made again with none is a new one, as it keeps nothing |
+| Any, said outright | `KILN_MACHINE_ID` in its environment: a machine of its own whatever the OS says, as each runner a test starts on one machine is, or a second runner someone runs on one machine on purpose |
 
 Each runner also reports its id with its facts (`RunnerFacts.machine_id`, W13-R01), and the server
 keeps it with the runner (`agents.machine_id`): for a runner from before, that's what tells
@@ -68,13 +76,27 @@ whether a machine joining under its name is the same machine.
 
 ## Runners from before
 
-A runner that enrolled before this keeps its name as its key: it sent no id when it joined. It
-works as it did; renaming it gives it a label, so it's shown by another name while kept by its
-old one. It moves to its id by joining again (`kiln uninstall --agent`, then
-`kiln join --server <url> --yes`), as a new runner known by its id: what kiln kept under its old
-name (its history, its offline row) stays there until it's forgotten.
+A runner that enrolled before this is known by its name: it sent no id when it joined. As it
+starts, before it connects or holds anything, it asks to be known by its machine id
+(`POST /api/agents/rekey`), proving itself with its certificate and key as a second runner process
+of a machine does (`Pki::sign_moved`). The server moves what it kept under the name to the id
+(`Hub::move_runner`), and the name becomes its label:
 
-The server's own local agent keeps its configured name.
+- its agent row, the jobs it ran and the retries placed on it or away from it, its attempts, its
+  insights and preview removals, its reap policy, the grants on it (`runner:<name>`), and what's
+  set for it: its front door, its agent limit, its upgrade policy;
+- its agent sessions (and so the conversation store's rows of them), its synced copies and places;
+- its member in the cluster group, which it joins again as it is now.
+
+The runner keeps its new certificate in place of the old one. It's refused while a process of it
+is connected, for an id other than the one its facts said, for an id another runner is known by,
+and for a runner the server doesn't know (one that never connected, or one forgotten); it then goes
+on by its name and asks again as it starts next. Its old name isn't revoked, so a machine on an
+older kiln that shares it keeps working.
+
+The server's own runner (`[local_agent]`) is known by its machine's id too
+(`Config::local_agent_key`), shown by its configured name; what was kept under that name moves the
+first time the server starts.
 
 ## Compatibility
 
@@ -87,9 +109,7 @@ The server's own local agent keeps its configured name.
 
 ## What's next
 
-- Moving a runner from before to its id without joining again: its rows, its sessions' holders,
-  its member in the cluster group and its synced copies re-keyed, with its history.
-- The server's local agent by its machine's id.
+Nothing planned. A runner on a kiln from before moves once it's upgraded.
 
 ## Decisions
 
