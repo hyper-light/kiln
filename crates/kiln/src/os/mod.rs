@@ -352,8 +352,15 @@ fn raw_machine_id() -> Option<String> {
         ioreg_platform_uuid(&output("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])?)
     } else {
         // systemd's, else D-Bus's (the same id, where systemd isn't).
-        ["/etc/machine-id", "/var/lib/dbus/machine-id"].into_iter().find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
+        ["/etc/machine-id", "/var/lib/dbus/machine-id"].into_iter().find_map(|p| std::fs::read_to_string(p).ok().and_then(|s| etc_machine_id(&s)))
     }
+}
+
+/// The id in an `/etc/machine-id`: none when it's empty, or `uninitialized` (an image made to get
+/// its id at first boot, which every container of that image says alike).
+fn etc_machine_id(file: &str) -> Option<String> {
+    let id = file.trim();
+    (!id.is_empty() && id != "uninitialized").then(|| id.to_owned())
 }
 
 /// macOS's hardware UUID in `ioreg -rd1 -c IOPlatformExpertDevice`'s output
@@ -387,6 +394,9 @@ mod tests {
         let win = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    1b2c3d4e-0000-4000-8000-123456789abc\r\n\r\n";
         assert_eq!(reg_query_value(win, "MachineGuid").as_deref(), Some("1b2c3d4e-0000-4000-8000-123456789abc"));
         assert_eq!(reg_query_value(win, "ProductId"), None);
+        assert_eq!(etc_machine_id("4b1c0e2a9f3d4c5b8a7e6f5d4c3b2a19\n").as_deref(), Some("4b1c0e2a9f3d4c5b8a7e6f5d4c3b2a19"));
+        assert_eq!(etc_machine_id("uninitialized\n"), None, "an image's, alike in every container of it");
+        assert_eq!(etc_machine_id("\n"), None);
         // What leaves the machine is a hash: the same for the same id in any case, never the id.
         let id = machine_id_of("0A1B2C3D-4E5F-6A7B-8C9D-0E1F2A3B4C5D");
         assert_eq!(id, machine_id_of(" 0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d\n"));
