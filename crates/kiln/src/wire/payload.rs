@@ -923,6 +923,24 @@ mod tests {
         })
     }
 
+    /// A live page's event that's JSON but not one of `StreamSaid`'s kinds goes to no viewer, and
+    /// is refused to its runner as a payload that can't be read is: `ServerMsg::Unread` to one that
+    /// takes it, noted for its page.
+    #[test]
+    fn a_live_pages_event_of_a_kind_it_doesnt_know_is_refused_to_its_runner() -> anyhow::Result<()> {
+        use crate::hub::tests::{hear, hub_with_runner};
+        use crate::proto::{CAP_UNREAD, CAP_WIRE, LANE_CONTROL};
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(Arc::new(SimClock::new()), "fedora", CAP_UNREAD | CAP_WIRE).await?;
+            hear(&hub, 1, LANE_CONTROL, &AgentMsg::StreamEvent { stream: "st1".into(), json: r#"{"hologram":{}}"#.into() }).await?;
+            let told = hub.sent.lock().iter().any(|(p, m)| matches!(m, ServerMsg::Unread { wire: Wire::RunnerPayload, what, code: Code::Unknown, .. } if *p == 1 && what == "StreamEvent hologram"));
+            anyhow::ensure!(told, "the runner is told: {:?}", hub.sent.lock());
+            let kept = hub.refusals.lock().kept(&Page::Runner("fedora".into())).map(crate::wire::unread::Kept::total);
+            anyhow::ensure!(kept == Some(1), "kept for the runner's page: {kept:?}");
+            Ok(())
+        })
+    }
+
     /// No handler reads JSON of its own: in the hub, the runner and the harness's host, a read of
     /// what came on a wire is [`payload`]'s, and every other read is of something of the machine's
     /// own (a file, a socket of its own, what it's about to send), each named here.

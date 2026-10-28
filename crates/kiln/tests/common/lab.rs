@@ -185,6 +185,10 @@ impl Viewer {
             match g {
                 Got::Text(payload) => {
                     self.bytes += payload.len();
+                    // Every frame reads as the session socket's down type (typed messages, step 6).
+                    if let Err(e) = serde_json::from_slice::<kiln::wire::ui::SessionDown>(&payload) {
+                        anyhow::bail!("{} got a frame that isn't a SessionDown ({e}): {}", self.name, String::from_utf8_lossy(&payload).chars().take(300).collect::<String>());
+                    }
                     let f: Value = serde_json::from_slice(&payload)?;
                     self.apply(&f, payload.len());
                 }

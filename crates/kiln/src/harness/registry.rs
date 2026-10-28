@@ -316,7 +316,7 @@ impl Mirror {
     fn resync(&mut self) {
         self.started_over();
         if self.feed.viewers() > 0 {
-            self.feed.publish(&Frame::of(super::live::RESYNC.to_owned()));
+            self.feed.publish(&Frame::resync());
         }
     }
 
@@ -495,10 +495,13 @@ pub struct Attachment {
     pub rev: u64,
 }
 
-/// A live frame for a session's viewers. A state comes as well as only what changed since the
-/// last one (`patch`), for a viewer that takes that: during a turn its usage and activity change
-/// all the time, its skills, plugins and servers seldom. So does a changeset: an agent touches a
-/// file or two of the hundreds it may have changed.
+/// A live frame for a session's viewers: a frame of the session socket's ([`SessionDown`],
+/// serialized), as the session's feed carries it, so the registry and its viewers share the type. A
+/// state comes as well as only what changed since the last one (`patch`), for a viewer that takes
+/// that: during a turn its usage and activity change all the time, its skills, plugins and servers
+/// seldom. So does a changeset: an agent touches a file or two of the hundreds it may have changed.
+///
+/// [`SessionDown`]: crate::wire::ui::SessionDown
 #[derive(Clone)]
 pub struct Frame {
     pub text: Arc<str>,
@@ -545,11 +548,27 @@ impl Patches {
 }
 
 impl Frame {
-    pub fn of(text: String) -> Self {
+    /// `down`, as the feed carries it.
+    pub fn of(down: crate::wire::ui::SessionDown) -> Self {
+        Self { text: Arc::from(down.text()), patch: None, patch_of: PatchOf::State, rev: down.rev.unwrap_or(0) }
+    }
+
+    /// The feed's resync marker ([`super::live::RESYNC`]): its viewers start over from a snapshot.
+    /// It's the feed's own, never sent to a viewer.
+    pub fn resync() -> Self {
+        Self { text: Arc::from(super::live::RESYNC), patch: None, patch_of: PatchOf::State, rev: 0 }
+    }
+
+    /// Any text as a frame: the feed's tests, which carry words of their own.
+    #[cfg(test)]
+    pub fn text(text: &str) -> Self {
         Self { text: Arc::from(text), patch: None, patch_of: PatchOf::State, rev: 0 }
     }
 
-    /// The frame with its copy's revision in it, as `"rev"`.
+    /// The frame with its copy's revision in it, as `"rev"`: as [`SessionDown`] says it, its last
+    /// field (`a_frame_says_its_copys_revision`).
+    ///
+    /// [`SessionDown`]: crate::wire::ui::SessionDown
     fn stamped(self, rev: u64) -> Self {
         let stamp = |t: &str| -> Arc<str> {
             match t.strip_suffix('}') {
@@ -1587,7 +1606,7 @@ impl Registry {
                 Update::Open { since: Some(_), .. } => None,
                 Update::State { .. } => m.state_frame(),
                 Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
-                _ if m.feed.viewers() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
+                _ if m.feed.viewers() > 0 => Some(Frame::of(crate::wire::ui::SessionFrame::of(&u).into())),
                 _ => None,
             };
             if let Some(frame) = frame {
@@ -1694,7 +1713,7 @@ impl Registry {
             for id in &gone {
                 if let Some(mut m) = g.remove(id) {
                     // Its feed's topic goes with it once its viewers are told.
-                    m.feed.publish(&Frame::of(super::live::CLOSED.to_owned()));
+                    m.feed.publish(&Frame::of(crate::wire::ui::SessionFrame::Closed.into()));
                 }
             }
             gone
@@ -1841,7 +1860,7 @@ impl Registry {
         if let Some(m) = self.mirrors.lock().get_mut(id) {
             // A revision of its own, past what its viewers have: else they'd take it as had.
             m.rev = m.rev.saturating_add(1);
-            m.send(Frame::of(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Files { files: added.to_vec() }).text()));
+            m.send(Frame::of(crate::wire::ui::SessionFrame::Files { files: added.to_vec() }.into()));
         }
     }
 
@@ -2506,7 +2525,7 @@ impl Registry {
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(mut m) = self.mirrors.lock().remove(id) {
                 // Its feed's topic goes with it once its viewers are told.
-                m.feed.publish(&Frame::of(super::live::CLOSED.to_owned()));
+                m.feed.publish(&Frame::of(crate::wire::ui::SessionFrame::Closed.into()));
             }
             self.keeper.forget(id);
             self.visuals.forget(id);
@@ -2700,10 +2719,16 @@ mod tests {
 
     #[test]
     fn a_frame_says_its_copys_revision() -> anyhow::Result<()> {
-        let f = Frame::of(json!({"t": "events", "events": []}).to_string()).stamped(7);
+        use crate::wire::ui::{SessionDown, SessionFrame};
+        let f = Frame::of(SessionFrame::Events { events: Vec::new() }.into()).stamped(7);
         let v: Value = serde_json::from_str(&f.text)?;
         assert_eq!(v.get("rev").and_then(Value::as_u64), Some(7));
         assert_eq!(f.rev, 7);
+        // Stamped, a frame is its type's with its revision.
+        for frame in [SessionFrame::Events { events: vec![json!({"id": "e1"})] }, SessionFrame::Closed, SessionFrame::Stream { id: "e1".into(), text: "}".into() }] {
+            let stamped = Frame::of(frame.clone().into()).stamped(7);
+            assert_eq!(stamped.text.as_ref(), SessionDown { frame, rev: Some(7) }.text());
+        }
         Ok(())
     }
 
@@ -3007,7 +3032,7 @@ mod tests {
             // Its viewer hears it's gone: its feed's last frame.
             let read = futures::executor::block_on(kiln_seams::Bus::read(&hub.bus, &att.topic, at, 100))?;
             let said: Vec<String> = read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect();
-            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::CLOSED), "its viewer heard {said:?}");
+            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::closed()), "its viewer heard {said:?}");
             // Its machine announces it: from then on its reports count.
             hub.harness.ingest(&hub, &there, "opened", Update::Open { info: Box::new(info("opened")), since: None });
             hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default());

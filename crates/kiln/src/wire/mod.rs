@@ -402,14 +402,23 @@ const fn msg(socket: &'static str, way: Way, name: &'static str, class: Class) -
 }
 
 const SESSION: &str = "/api/harness/sessions/:id/ws";
+const EVENTS: &str = "/api/events";
 const TERMINAL: &str = "/api/terminal/ws";
 const LEG_TERMINAL: &str = "/api/ci/legs/:id/terminal";
+const JOB_LOG: &str = "/api/jobs/:id/logs/ws";
+const STREAM: &str = "/api/harness/sessions/:id/streams/:sid/ws";
+const DEPLOY_LOG: &str = "/api/cd/apps/:app/resources/:key/logs/ws";
+const TUNNEL: &str = "/api/agents/tunnel";
 
 /// Every kind of message on the UI's sockets. A session socket's commands up are [`Command`]s,
 /// each classed by [`command_class`]: under an id their client made (`cmd`), each answered `ack`
-/// or `nack`, or bare, as clients from before ids send them.
+/// or `nack`, or bare, as clients from before ids send them. A frame a page couldn't read of what
+/// came down goes up as `unread` on any of them, and what a socket couldn't read of what came up
+/// is answered: on the session socket with a `nack`, on the others with `refused`
+/// (`crate::wire::ui`).
 pub const SOCKETS: &[SocketMsg] = &[
     msg(SESSION, Way::Up, "cmd", Class::Command(Away::AsItsCommand)),
+    msg(SESSION, Way::Up, "unread", Class::Ack),
     msg(SESSION, Way::Down, "ack", Class::Ack),
     msg(SESSION, Way::Down, "nack", Class::Ack),
     msg(SESSION, Way::Down, "open", Class::Stream),
@@ -423,20 +432,34 @@ pub const SOCKETS: &[SocketMsg] = &[
     msg(SESSION, Way::Down, "synced", Class::Stream),
     msg(SESSION, Way::Down, "closed", Class::Stream),
     msg(SESSION, Way::Down, "error", Class::Answer),
-    msg("/api/events", Way::Down, "event", Class::Stream),
+    msg(EVENTS, Way::Up, "unread", Class::Ack),
+    msg(EVENTS, Way::Down, "event", Class::Stream),
+    msg(EVENTS, Way::Down, "refused", Class::Ack),
     msg(TERMINAL, Way::Up, "input", REFUSED),
     msg(TERMINAL, Way::Up, "resize", Class::State),
+    msg(TERMINAL, Way::Up, "unread", Class::Ack),
     msg(TERMINAL, Way::Down, "output", Class::Stream),
+    msg(TERMINAL, Way::Down, "refused", Class::Ack),
     msg(LEG_TERMINAL, Way::Up, "input", REFUSED),
     msg(LEG_TERMINAL, Way::Up, "resize", Class::State),
+    msg(LEG_TERMINAL, Way::Up, "unread", Class::Ack),
     msg(LEG_TERMINAL, Way::Down, "output", Class::Stream),
-    msg("/api/jobs/:id/logs/ws", Way::Down, "log", Class::Stream),
-    msg("/api/harness/sessions/:id/streams/:sid/ws", Way::Up, "input", REFUSED),
-    msg("/api/harness/sessions/:id/streams/:sid/ws", Way::Down, "frame", Class::Media),
-    msg("/api/harness/sessions/:id/streams/:sid/ws", Way::Down, "event", Class::Stream),
-    msg("/api/deploy/apps/:app/logs/follow", Way::Down, "log", Class::Stream),
-    msg("/api/tunnel", Way::Up, "datagram", Class::Carried("tunnel")),
-    msg("/api/tunnel", Way::Down, "datagram", Class::Carried("tunnel")),
+    msg(LEG_TERMINAL, Way::Down, "refused", Class::Ack),
+    msg(JOB_LOG, Way::Up, "unread", Class::Ack),
+    msg(JOB_LOG, Way::Down, "log", Class::Stream),
+    msg(JOB_LOG, Way::Down, "refused", Class::Ack),
+    msg(STREAM, Way::Up, "input", REFUSED),
+    msg(STREAM, Way::Up, "unread", Class::Ack),
+    msg(STREAM, Way::Down, "frame", Class::Media),
+    msg(STREAM, Way::Down, "event", Class::Stream),
+    msg(STREAM, Way::Down, "refused", Class::Ack),
+    msg(DEPLOY_LOG, Way::Up, "unread", Class::Ack),
+    msg(DEPLOY_LOG, Way::Down, "log", Class::Stream),
+    msg(DEPLOY_LOG, Way::Down, "refused", Class::Ack),
+    msg(TUNNEL, Way::Up, "datagram", Class::Carried("tunnel")),
+    msg(TUNNEL, Way::Up, "unread", Class::Ack),
+    msg(TUNNEL, Way::Down, "datagram", Class::Carried("tunnel")),
+    msg(TUNNEL, Way::Down, "refused", Class::Ack),
 ];
 
 #[cfg(test)]

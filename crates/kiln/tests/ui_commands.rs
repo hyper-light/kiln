@@ -4,8 +4,9 @@
 //! (everything it sends waits 2 s first), so a viewer's socket drops before its command's answer
 //! comes. Sent again under the same id on the client's next socket, the command isn't applied
 //! again, and that socket gets its answer, once. Sent again after that, the kept answer comes at
-//! once. What can't be read is answered too: `nack`, `malformed`. A command over the API under an
-//! Idempotency-Key is taken once the same way.
+//! once. What can't be read is answered too: `nack`, `unsupported` for a command type the server
+//! doesn't know, `malformed` for the rest (docs/wire.md, "What can't be read"). A command over the
+//! API under an Idempotency-Key is taken once the same way.
 //!
 //! `cargo test -p kiln --features chaos --test ui_commands`
 
@@ -157,6 +158,9 @@ fn a_viewers_command_is_taken_once_and_answered_once_across_its_sockets() -> any
     anyhow::ensure!(bad.first().is_some_and(|v| v.get("t") == Some(&json!("nack")) && v.get("code") == Some(&json!("malformed")) && v.get("id") == Some(&Value::Null)), "{bad:?}");
     second.command("c2", &json!({"type": "no_such_command"}))?;
     let bad = second.answers(Some("c2"), Duration::from_secs(5), true);
+    anyhow::ensure!(bad.first().is_some_and(|v| v.get("t") == Some(&json!("nack")) && v.get("code") == Some(&json!("unsupported"))), "{bad:?}");
+    second.command("c3", &json!({"type": "set_model"}))?;
+    let bad = second.answers(Some("c3"), Duration::from_secs(5), true);
     anyhow::ensure!(bad.first().is_some_and(|v| v.get("t") == Some(&json!("nack")) && v.get("code") == Some(&json!("malformed"))), "{bad:?}");
 
     // Over the API under a key: taken once, the same.

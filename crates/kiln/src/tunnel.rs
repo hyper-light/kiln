@@ -14,7 +14,13 @@
 //! One binary message is one datagram, either way. The agent's text message `bind <hex>` names the
 //! TLS exporter value of the QUIC connection the tunnel carries ([`crate::net::BINDING_LABEL`]),
 //! which only the two ends of that connection know: the server matches it against its own
-//! connections' to report which runners are tunnelled (`transport` in `GET /api/agents`).
+//! connections' to report which runners are tunnelled (`transport` in `GET /api/agents`). What the
+//! server can't read of what comes up (an empty datagram, text that isn't a binding) it answers
+//! with a `refused` text frame (`{"type": "refused", "of", "code", "why"}`), which a runner reads
+//! and logs; what a runner can't read of what comes down it tells the server, up the tunnel, as a
+//! page does (`{"t": "unread", "of", "why"}`). The server notes both from the tunnel's address
+//! (docs/wire.md, "What can't be read"); a message past either end's bound closes the tunnel with
+//! 1009.
 //!
 //! An agent ([`Paths`]) dials UDP first, takes the tunnel after [`DIRECT_TRIES`] direct dials in a
 //! row get no answer (or [`DIRECT_PATIENCE`] of them), and while tunnelled checks every
@@ -37,11 +43,16 @@ use http::StatusCode;
 use hyper_rt::udp::UdpSocket;
 use hyper_transport::PeerId;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use tungstenite::protocol::CloseFrame;
+use tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::http::client::Client;
 use crate::http::server::{Request, Response};
 use crate::http::ws::{self, Message};
+use crate::wire::ui::{Refused, UnreadFrame, UnreadTag};
+use crate::wire::unread::{Code, Sender, Unread, Wire};
 
 /// The tunnel's route on the server's HTTP port.
 pub const PATH: &str = "/api/agents/tunnel";
@@ -86,28 +97,92 @@ impl fmt::Display for Transport {
 
 // ------------------------------------------------------------------ framing
 
-/// What one WebSocket message on a tunnel carries.
+/// What one WebSocket message on a tunnel carries: `T` is what its end reads in text, beside the
+/// datagrams ([`TunnelUp`] on the server's, [`TunnelDown`] on a runner's).
 #[derive(Debug, PartialEq, Eq)]
-enum Inbound<'a> {
+enum Inbound<'a, T> {
     /// One datagram.
     Datagram(&'a [u8]),
-    /// The binding of the QUIC connection the tunnel carries (text `bind <64 hex digits>`).
-    Bind([u8; 32]),
+    /// Text this end reads.
+    Said(T),
     /// The other end is closing.
     Close,
-    /// Nothing to relay: pings and pongs (tungstenite answers pings itself), an empty or
-    /// oversized datagram, text that is not a binding.
+    /// Nothing to relay: pings and pongs (tungstenite answers pings itself).
     Skip,
+    /// What can't be read: an empty or oversized datagram, text that isn't one of this end's frames.
+    Unread(Refused),
 }
 
-fn inbound(msg: &Message) -> Inbound<'_> {
+/// `msg` as its end reads it, its text read by `text`.
+fn inbound<T>(msg: &Message, text: fn(&str) -> Result<T, Refused>) -> Inbound<'_, T> {
     match msg {
         Message::Binary(b) if !b.is_empty() && b.len() <= MAX_DATAGRAM => Inbound::Datagram(b),
-        Message::Text(t) => parse_bind(t.as_str()).map_or(Inbound::Skip, Inbound::Bind),
+        Message::Binary(b) => Inbound::Unread(Refused::malformed("datagram", format!("a datagram is 1 to {MAX_DATAGRAM} bytes, not {}", b.len()))),
+        Message::Text(t) => text(t.as_str()).map_or_else(Inbound::Unread, Inbound::Said),
         Message::Close(_) => Inbound::Close,
-        Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Inbound::Skip,
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Inbound::Skip,
     }
 }
+
+/// What comes up a tunnel as text, beside its datagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TunnelUp {
+    /// The binding of the QUIC connection the tunnel carries (`bind <64 hex digits>`).
+    Bind([u8; 32]),
+    /// A frame that came down that the runner couldn't read (`{"t": "unread", "of", "why"}`): the
+    /// server, which sent it, notes it.
+    Unread(UnreadFrame),
+}
+
+impl TunnelUp {
+    /// Text that came up a tunnel, read; or why it can't be.
+    fn read(text: &str) -> Result<Self, Refused> {
+        if let Some(b) = parse_bind(text) {
+            return Ok(Self::Bind(b));
+        }
+        if text.trim_start().starts_with('{') {
+            return crate::wire::ui::unread_up(text).map(Self::Unread);
+        }
+        Err(match text.split_whitespace().next() {
+            Some("bind") => Refused::malformed("bind", "a binding is 64 hex digits"),
+            Some(kind) => Refused::unknown(kind, format!("no frame {kind}")),
+            None => Refused::malformed("text", "empty text"),
+        })
+    }
+}
+
+/// What goes down a tunnel as text, beside its datagrams: what the server couldn't read of what
+/// came up. A runner tells the server of what it can't read of the rest ([`told`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TunnelDown {
+    Refused(Refused),
+}
+
+impl TunnelDown {
+    fn text(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Text that came down a tunnel, read; or why it can't be.
+    fn read(text: &str) -> Result<Self, Refused> {
+        let v = serde_json::from_str(text).map_err(|e| Refused::malformed("text", format!("not JSON: {e}")))?;
+        crate::wire::ui::tagged(v, "type", "frame")
+    }
+}
+
+/// What a runner sends up its tunnel for what came down that it couldn't read: the frame's tag when
+/// it read that far (`unknown`), nothing when it didn't (`malformed`, what it was in `why`).
+fn told(r: Refused) -> Message {
+    let f = match r.code {
+        Code::Unknown => UnreadFrame { t: UnreadTag::Unread, of: r.of, why: r.why },
+        Code::Malformed => UnreadFrame { t: UnreadTag::Unread, of: String::new(), why: format!("{}: {}", r.of, r.why) },
+    };
+    ws::text(serde_json::to_string(&f).unwrap_or_default())
+}
+
+/// Why a tunnel's reading ended, and the close it ends with when what came couldn't be read.
+type Ended = (&'static str, Option<CloseFrame>);
 
 /// One datagram as a message; `None` for an empty one or one larger than a tunnel carries (it is
 /// dropped, as a link with a smaller MTU would).
@@ -132,32 +207,44 @@ fn send_datagram(udp: &UdpSocket, datagram: &[u8], to: SocketAddr) {
     }
 }
 
-/// Relay a tunnel's messages to UDP: each datagram to `to()` (none known yet: dropped), each
-/// binding to `on_bind`. Returns why the tunnel ended.
-async fn ws_to_udp<S>(
+/// Relay a tunnel's messages to UDP: each datagram to `to()` (none known yet: dropped), its text read
+/// by `text` to `on_said`, what can't be read to `on_unread`. Returns why the tunnel ended, and, for
+/// a message past its bound, the close it ends with (1009, as RFC 6455 says).
+async fn ws_to_udp<S, T>(
     rx: &mut WebSocketReceiver<S>,
     udp: &UdpSocket,
     to: impl Fn() -> Option<SocketAddr>,
-    on_bind: impl Fn([u8; 32]),
+    text: fn(&str) -> Result<T, Refused>,
+    on_said: impl Fn(T),
+    on_unread: impl Fn(Refused),
     activity: &Activity,
-) -> anyhow::Result<&'static str>
+) -> anyhow::Result<Ended>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     while let Some(msg) = rx.next().await {
-        match inbound(&msg?) {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(tungstenite::Error::Capacity(e)) => {
+                on_unread(Refused::malformed("frame", format!("past the tunnel's bound: {e}")));
+                return Ok(("a message past its bound", Some(CloseFrame { code: CloseCode::Size, reason: "a frame past this socket's limit".into() })));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match inbound(&msg, text) {
             Inbound::Datagram(d) => {
                 activity.touch();
                 if let Some(to) = to() {
                     send_datagram(udp, d, to);
                 }
             }
-            Inbound::Bind(b) => on_bind(b),
-            Inbound::Close => return Ok("closed by the other end"),
+            Inbound::Said(t) => on_said(t),
+            Inbound::Close => return Ok(("closed by the other end", None)),
             Inbound::Skip => {}
+            Inbound::Unread(r) => on_unread(r),
         }
     }
-    Ok("the other end went away")
+    Ok(("the other end went away", None))
 }
 
 /// When a tunnel last carried something.
@@ -313,8 +400,10 @@ fn local_end(to: SocketAddr) -> SocketAddr {
 }
 
 /// `GET /api/agents/tunnel`: accept a tunnel to the QUIC listener at `listener` (see the module
-/// docs). Refusals come back as a status and a reason.
-pub fn serve(registry: &Arc<Registry>, listener: SocketAddr, req: Request) -> Result<Response, (StatusCode, &'static str)> {
+/// docs). Refusals come back as a status and a reason. What it can't read of what comes up, and what
+/// its runner says it couldn't read of what came down, go to `note` (`crate::wire::unread`), from
+/// the tunnel's address: it's open, and nobody's yet.
+pub fn serve(registry: &Arc<Registry>, listener: SocketAddr, req: Request, note: impl Fn(Unread) + Send + Sync + 'static) -> Result<Response, (StatusCode, &'static str)> {
     if !ws::is_upgrade(&req) {
         return Err((StatusCode::BAD_REQUEST, "expected a WebSocket upgrade"));
     }
@@ -325,10 +414,11 @@ pub fn serve(registry: &Arc<Registry>, listener: SocketAddr, req: Request) -> Re
     })?;
     let (resp, upgrade) = ws::accept_limited(req, MAX_DATAGRAM).map_err(|r| (r.status, r.reason))?;
     let open = registry.open();
+    let sock = crate::wire::ui::Socket { up: Wire::TunnelUp, down: Wire::TunnelDown, from: Sender::Address { addr: from.map_or_else(|| "unknown".to_owned(), |ip| ip.to_string()) }, page: None };
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         tracing::info!(from = ?from, open, "runner tunnel opened");
-        match relay_server(socket, listener, &slot).await {
+        match relay_server(socket, listener, &slot, &sock, note).await {
             Ok(why) => tracing::info!(from = ?from, why, "runner tunnel closed"),
             Err(e) => tracing::info!(from = ?from, error = %format!("{e:#}"), "runner tunnel ended"),
         }
@@ -336,32 +426,54 @@ pub fn serve(registry: &Arc<Registry>, listener: SocketAddr, req: Request) -> Re
     Ok(resp)
 }
 
-/// Relay one tunnel to `listener` until either end closes, an error, or [`IDLE`].
-async fn relay_server(socket: ws::WebSocket, listener: SocketAddr, slot: &Slot) -> anyhow::Result<&'static str> {
+/// Relay one tunnel to `listener` until either end closes, an error, or [`IDLE`]. What it can't read
+/// of what comes up is noted (`note`, as `sock`'s) and answered `refused`; what its runner says it
+/// couldn't read of what came down is noted.
+async fn relay_server(socket: ws::WebSocket, listener: SocketAddr, slot: &Slot, sock: &crate::wire::ui::Socket, note: impl Fn(Unread)) -> anyhow::Result<&'static str> {
     let udp = UdpSocket::bind(local_end(listener)).map_err(|e| anyhow::anyhow!("bind a socket toward {listener}: {e}"))?;
     let (mut tx, mut rx) = socket.split();
     let activity = Activity::new();
+    // The answers to what couldn't be read, for the writer beside the datagrams: a writer that
+    // can't keep up with them can't with the tunnel either, and one past these is let go.
+    let (answers, answered) = async_channel::bounded::<Message>(16);
+    let unread = |r: Refused| {
+        note(sock.refused(&r));
+        let _ = answers.try_send(ws::text(TunnelDown::Refused(r).text()));
+    };
+    let said = |t: TunnelUp| match t {
+        TunnelUp::Bind(b) => slot.bind(b),
+        TunnelUp::Unread(f) => note(sock.unread(&f)),
+    };
     let ended = {
-        let up = ws_to_udp(&mut rx, &udp, || Some(listener), |b| slot.bind(b), &activity).fuse();
-        let down = listener_to_ws(&mut tx, &udp, listener, &activity).fuse();
+        let up = ws_to_udp(&mut rx, &udp, || Some(listener), TunnelUp::read, said, unread, &activity).fuse();
+        let down = listener_to_ws(&mut tx, &udp, listener, &activity, &answered).fuse();
         let idle = activity.idle(IDLE).fuse();
         futures::pin_mut!(up, down, idle);
         futures::select! {
             r = up => r,
-            r = down => r,
-            () = idle => Ok("idle"),
+            r = down => r.map(|why| (why, None)),
+            () = idle => Ok(("idle", None)),
         }
     };
-    let _ = crate::rt::timeout(Duration::from_secs(2), tx.close(None)).await;
-    ended
+    let close = ended.as_ref().ok().and_then(|(_, close)| close.clone());
+    let _ = crate::rt::timeout(Duration::from_secs(2), tx.close(close)).await;
+    ended.map(|(why, _)| why)
 }
 
-/// The listener's datagrams (only its) back through the tunnel.
+/// What the server's side of a tunnel sends next.
+enum Down {
+    Datagram(anyhow::Result<(usize, SocketAddr)>),
+    Answer(Option<Message>),
+}
+
+/// The listener's datagrams (only its) back through the tunnel, and the answers to what couldn't be
+/// read (`answered`).
 async fn listener_to_ws<S>(
     tx: &mut WebSocketSender<S>,
     udp: &UdpSocket,
     listener: SocketAddr,
     activity: &Activity,
+    answered: &async_channel::Receiver<Message>,
 ) -> anyhow::Result<&'static str>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -369,7 +481,24 @@ where
     // One byte more than a tunnel carries, so a longer datagram shows (truncated) and is dropped.
     let mut buf = vec![0u8; MAX_DATAGRAM + 1];
     loop {
-        let (n, from) = udp.recv_from(&mut buf).await.map_err(|e| anyhow::anyhow!("receive: {e}"))?;
+        let next = {
+            let datagram = udp.recv_from(&mut buf).fuse();
+            let answer = answered.recv().fuse();
+            futures::pin_mut!(datagram, answer);
+            futures::select_biased! {
+                a = answer => Down::Answer(a.ok()),
+                r = datagram => Down::Datagram(r.map_err(|e| anyhow::anyhow!("receive: {e}"))),
+            }
+        };
+        let (n, from) = match next {
+            Down::Answer(Some(m)) => {
+                tx.send(m).await?;
+                continue;
+            }
+            // The reader that answers is gone: so is the tunnel.
+            Down::Answer(None) => return Ok("closed"),
+            Down::Datagram(r) => r?,
+        };
         if from != listener {
             continue;
         }
@@ -444,33 +573,54 @@ async fn relay_agent(
     // The endpoint's address, learned from what it sends (a rebuilt endpoint has a new port).
     let endpoint: Mutex<Option<SocketAddr>> = Mutex::new(None);
     let activity = Activity::new();
+    // What it couldn't read of what came down, for the writer beside the datagrams to tell the
+    // server (`unread`): a writer that can't keep up with them can't with the tunnel either, and one
+    // past these is let go.
+    let (tell, to_tell) = async_channel::bounded::<Message>(16);
+    let unread = |r: Refused| {
+        let _ = tell.try_send(told(r));
+    };
+    let said = |d: TunnelDown| match d {
+        TunnelDown::Refused(r) => tracing::warn!(of = %r.of, code = r.code.name(), why = %r.why, "the server couldn't read what this runner sent up its tunnel"),
+    };
     let ended = {
-        let up = endpoint_to_ws(&mut tx, &udp, &bindings, &endpoint).fuse();
-        let down = ws_to_udp(&mut rx, &udp, || *endpoint.lock(), |_| {}, &activity).fuse();
+        let up = endpoint_to_ws(&mut tx, &udp, &bindings, &endpoint, &to_tell).fuse();
+        let down = ws_to_udp(&mut rx, &udp, || *endpoint.lock(), TunnelDown::read, said, unread, &activity).fuse();
         futures::pin_mut!(up, down);
         futures::select! {
-            r = up => r,
+            r = up => r.map(|why| (why, None)),
             r = down => r,
         }
     };
-    let _ = crate::rt::timeout(Duration::from_secs(2), tx.close(None)).await;
-    ended
+    // What's still to tell (one past its bound ends the tunnel) goes before it closes.
+    while let Ok(m) = to_tell.try_recv() {
+        if !matches!(crate::rt::timeout(Duration::from_secs(2), tx.send(m)).await, Ok(Ok(()))) {
+            break;
+        }
+    }
+    let close = ended.as_ref().ok().and_then(|(_, close)| close.clone());
+    let _ = crate::rt::timeout(Duration::from_secs(2), tx.close(close)).await;
+    ended.map(|(why, _)| why)
 }
 
 /// What the agent side sends next.
 enum Up {
     Datagram(usize, SocketAddr),
     Bind([u8; 32]),
+    /// What it couldn't read of what came down, said ([`told`]).
+    Tell(Message),
     /// The [`Relay`] was dropped.
     Done,
 }
 
-/// The endpoint's datagrams, and the bindings the agent names, into the tunnel.
+/// The endpoint's datagrams, the bindings the agent names, and what it couldn't read of what came
+/// down (`to_tell`), into the tunnel.
 async fn endpoint_to_ws<S>(
     tx: &mut WebSocketSender<S>,
     udp: &UdpSocket,
     bindings: &async_channel::Receiver<[u8; 32]>,
     endpoint: &Mutex<Option<SocketAddr>>,
+    to_tell: &async_channel::Receiver<Message>,
 ) -> anyhow::Result<&'static str>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -480,9 +630,11 @@ where
         let next = {
             let datagram = udp.recv_from(&mut buf).fuse();
             let binding = bindings.recv().fuse();
-            futures::pin_mut!(datagram, binding);
+            let telling = to_tell.recv().fuse();
+            futures::pin_mut!(datagram, binding, telling);
             futures::select_biased! {
                 b = binding => b.map_or(Up::Done, Up::Bind),
+                t = telling => t.map_or(Up::Done, Up::Tell),
                 r = datagram => {
                     let (n, from) = r.map_err(|e| anyhow::anyhow!("receive: {e}"))?;
                     Up::Datagram(n, from)
@@ -492,6 +644,7 @@ where
         match next {
             Up::Done => return Ok("closed by this runner"),
             Up::Bind(b) => tx.send(bind_text(&b)).await?,
+            Up::Tell(m) => tx.send(m).await?,
             Up::Datagram(n, from) => {
                 *endpoint.lock() = Some(from);
                 if let Some(msg) = buf.get(..n).and_then(outbound) {
@@ -766,28 +919,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn datagrams_and_bindings_frame_as_messages() {
+    fn datagrams_bindings_and_what_wasnt_read_frame_as_messages() {
+        fn up(m: &Message) -> Inbound<'_, TunnelUp> {
+            inbound(m, TunnelUp::read)
+        }
+        fn down(m: &Message) -> Inbound<'_, TunnelDown> {
+            inbound(m, TunnelDown::read)
+        }
         // One datagram is one binary message, up to the bound; empty and longer ones are dropped.
         let d = vec![7u8; MAX_DATAGRAM];
         let m = outbound(&d);
         assert!(matches!(&m, Some(Message::Binary(b)) if b.as_ref() == d.as_slice()));
-        assert_eq!(m.as_ref().map(inbound), Some(Inbound::Datagram(&d)));
+        assert_eq!(m.as_ref().map(up), Some(Inbound::Datagram(&d)));
+        assert_eq!(m.as_ref().map(down), Some(Inbound::Datagram(&d)));
         assert!(outbound(&[]).is_none());
         assert!(outbound(&vec![1u8; MAX_DATAGRAM + 1]).is_none());
-        assert_eq!(inbound(&ws::binary(vec![1u8; MAX_DATAGRAM + 1])), Inbound::Skip);
-        assert_eq!(inbound(&ws::binary(Vec::new())), Inbound::Skip);
+        fn code<T>(i: Inbound<'_, T>) -> Option<(String, Code)> {
+            match i {
+                Inbound::Unread(r) => Some((r.of, r.code)),
+                _ => None,
+            }
+        }
+        for m in [ws::binary(vec![1u8; MAX_DATAGRAM + 1]), ws::binary(Vec::new())] {
+            assert_eq!(code(up(&m)), Some(("datagram".into(), Code::Malformed)));
+            assert_eq!(code(down(&m)), Some(("datagram".into(), Code::Malformed)));
+        }
 
-        // A binding round-trips through its text form; anything else in text is ignored.
+        // Up, a binding round-trips through its text form, and a frame that came down that the
+        // runner couldn't read is read; anything else in text can't be.
         let b: [u8; 32] = std::array::from_fn(|i| u8::try_from(i).unwrap_or(0).wrapping_mul(7));
-        assert_eq!(inbound(&bind_text(&b)), Inbound::Bind(b));
-        assert_eq!(inbound(&ws::text("bind 00")), Inbound::Skip);
-        assert_eq!(inbound(&ws::text(format!("bind {}", "zz".repeat(32)))), Inbound::Skip);
-        assert_eq!(inbound(&ws::text("hello")), Inbound::Skip);
+        assert_eq!(up(&bind_text(&b)), Inbound::Said(TunnelUp::Bind(b)));
+        assert_eq!(code(up(&ws::text("bind 00"))), Some(("bind".into(), Code::Malformed)));
+        assert_eq!(code(up(&ws::text(format!("bind {}", "zz".repeat(32))))), Some(("bind".into(), Code::Malformed)));
+        assert_eq!(code(up(&ws::text("hello"))), Some(("hello".into(), Code::Unknown)));
+        assert_eq!(code(up(&ws::text(""))), Some(("text".into(), Code::Malformed)));
+        let hologram = UnreadFrame { t: UnreadTag::Unread, of: "hologram".into(), why: "no frame hologram".into() };
+        assert_eq!(up(&told(Refused::unknown("hologram", "no frame hologram"))), Inbound::Said(TunnelUp::Unread(hologram)));
+        assert_eq!(code(up(&ws::text(r#"{"t":"hologram"}"#))), Some(("hologram".into(), Code::Unknown)));
+        assert_eq!(code(up(&ws::text(r#"{"t":"unread","of":7}"#))), Some(("unread".into(), Code::Malformed)));
+        assert_eq!(code(up(&ws::text("{not json"))), Some(("text".into(), Code::Malformed)));
+
+        // Down, the server's `refused` is read; anything else in text can't be, and what the runner
+        // tells of it names its tag when it read that far, nothing (malformed) when it didn't.
+        let refused = TunnelDown::Refused(Refused::unknown("hello", "no frame hello"));
+        assert_eq!(refused.text(), r#"{"type":"refused","of":"hello","code":"unknown","why":"no frame hello"}"#);
+        assert_eq!(down(&ws::text(refused.text())), Inbound::Said(refused));
+        assert_eq!(code(down(&ws::text(r#"{"type":"hologram"}"#))), Some(("hologram".into(), Code::Unknown)));
+        assert_eq!(code(down(&ws::text(r#"{"type":"refused","of":1}"#))), Some(("refused".into(), Code::Malformed)));
+        assert_eq!(code(down(&bind_text(&b))), Some(("text".into(), Code::Malformed)));
+        let tells = |r: Refused| match told(r) {
+            Message::Text(t) => serde_json::from_str::<UnreadFrame>(t.as_str()).ok().map(|f| (f.code(), f.of)),
+            _ => None,
+        };
+        assert_eq!(tells(Refused::unknown("hologram", "no frame hologram")), Some((Code::Unknown, "hologram".into())));
+        assert_eq!(tells(Refused::malformed("datagram", "a datagram is 1 to 1500 bytes, not 0")), Some((Code::Malformed, String::new())));
 
         // Control frames carry nothing to relay; a close ends the tunnel.
-        assert_eq!(inbound(&Message::Ping(vec![1].into())), Inbound::Skip);
-        assert_eq!(inbound(&Message::Pong(vec![1].into())), Inbound::Skip);
-        assert_eq!(inbound(&Message::Close(None)), Inbound::Close);
+        assert_eq!(up(&Message::Ping(vec![1].into())), Inbound::Skip);
+        assert_eq!(down(&Message::Pong(vec![1].into())), Inbound::Skip);
+        assert_eq!(up(&Message::Close(None)), Inbound::Close);
     }
 
     #[test]
@@ -914,7 +1104,7 @@ mod tests {
 
     impl crate::http::server::Handler for TunnelOnly {
         async fn handle(self: Arc<Self>, req: Request) -> Response {
-            serve(&self.registry, self.listener, req).unwrap_or_else(|(status, why)| crate::http::server::text(status, why))
+            serve(&self.registry, self.listener, req, |_| {}).unwrap_or_else(|(status, why)| crate::http::server::text(status, why))
         }
     }
 
@@ -933,18 +1123,78 @@ mod tests {
 
     /// A server's HTTP port serving only the tunnel route, relaying to `listener`.
     fn tunnel_server(listener: SocketAddr) -> anyhow::Result<(SocketAddr, Arc<Registry>)> {
+        let registry = Arc::new(Registry::default());
+        let http = http_server(Arc::new(TunnelOnly { registry: Arc::clone(&registry), listener }))?;
+        Ok((http, registry))
+    }
+
+    /// An HTTP port of `handler`'s.
+    fn http_server<H: crate::http::server::Handler>(handler: Arc<H>) -> anyhow::Result<SocketAddr> {
         let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
         let http = tcp.local_addr()?;
         let tcp = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(tcp), 16).map_err(rt)?;
-        let registry = Arc::new(Registry::default());
-        let handler = Arc::new(TunnelOnly { registry: Arc::clone(&registry), listener });
         crate::rt::spawn(async move {
             while let Ok(stream) = tcp.accept().await {
                 let (h, remote) = (Arc::clone(&handler), stream.peer_addr().ok());
                 crate::rt::spawn(crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), h, remote));
             }
         });
-        Ok((http, registry))
+        Ok(http)
+    }
+
+    /// A tunnel route that sends a runner, down its tunnel, a `refused` it can read, then a frame of a
+    /// kind it doesn't know, text that isn't JSON and an empty datagram; the text that comes up goes
+    /// to `heard`.
+    struct Garbling {
+        heard: async_channel::Sender<String>,
+    }
+
+    impl crate::http::server::Handler for Garbling {
+        async fn handle(self: Arc<Self>, req: Request) -> Response {
+            let (resp, upgrade) = match ws::accept_limited(req, MAX_DATAGRAM) {
+                Ok(a) => a,
+                Err(r) => return crate::http::server::text(r.status, r.reason),
+            };
+            crate::rt::spawn(async move {
+                let Ok(socket) = upgrade.await else { return };
+                let (mut tx, mut rx) = socket.split();
+                let refused = TunnelDown::Refused(Refused::malformed("datagram", "a datagram is 1 to 1500 bytes, not 0"));
+                for m in [ws::text(refused.text()), ws::text(r#"{"type":"hologram"}"#), ws::text("not json"), ws::binary(Vec::new())] {
+                    if tx.send(m).await.is_err() {
+                        return;
+                    }
+                }
+                while let Some(Ok(m)) = rx.next().await {
+                    if let Message::Text(t) = m
+                        && self.heard.send(t.as_str().to_owned()).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            resp
+        }
+    }
+
+    #[test]
+    fn a_runner_tells_the_server_what_it_couldnt_read_of_what_came_down() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (heard, came) = async_channel::unbounded();
+            let http = http_server(Arc::new(Garbling { heard }))?;
+            let _relay = Relay::open(&Client::public()?, &format!("http://{http}/")).await?;
+            let mut told = Vec::new();
+            while told.len() < 3 {
+                let text = crate::rt::timeout(Duration::from_secs(5), came.recv()).await.map_err(|_| anyhow::anyhow!("only {told:?} came up"))??;
+                let f: UnreadFrame = serde_json::from_str(&text)?;
+                told.push((f.code(), f.of.clone(), f.why.split(':').next().unwrap_or_default().to_owned()));
+            }
+            // What it couldn't read is told, in order: the unknown kind by its tag, the rest malformed,
+            // saying what they were. The server's `refused` it read: no answer.
+            let want = [(Code::Unknown, "hologram", "no frame hologram"), (Code::Malformed, "", "text"), (Code::Malformed, "", "datagram")];
+            assert_eq!(told, want.map(|(c, of, why)| (c, of.to_owned(), why.to_owned())));
+            assert!(crate::rt::timeout(Duration::from_millis(500), came.recv()).await.is_err(), "the server's refused was answered");
+            Ok(())
+        })
     }
 
     #[test]

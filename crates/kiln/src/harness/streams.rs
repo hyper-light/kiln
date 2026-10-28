@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 
 use crate::hub::Hub;
 use crate::proto::{CAP_STREAM, ServerMsg};
+use crate::wire::ui::{StreamDown, StreamSaid};
 
 /// A stream nobody has looked at for this long closes.
 const UNWATCHED: Duration = Duration::from_secs(600);
@@ -77,11 +78,14 @@ pub struct Relay {
 }
 
 /// What's left to do once a runner's event is relayed ([`Relay::event`]).
+#[derive(Default)]
 pub struct Evented {
     /// As it opens, the stream and the size its viewer asked for meanwhile, to ask of it again.
     pub again: Option<(Arc<Live>, Value)>,
     /// A recording that ended, with its session, for its files to be kept ([`Relay::keep`]).
     pub ended: Option<(String, Recording)>,
+    /// What couldn't be read ([`StreamSaid::read`]): not sent on, and noted from its runner.
+    pub refused: Option<crate::wire::ui::Refused>,
 }
 
 /// Whose a stream is: its session, its machine, its profile.
@@ -213,46 +217,56 @@ impl Relay {
         live.send(&ToViewer::Chunk(data));
     }
 
-    /// An event from a runner: kept when a joining viewer needs it, sent on to each viewer; a
-    /// stream that closed or failed to open goes. What's left to do is answered ([`Evented`]).
-    pub fn event(&self, machine: &str, id: &str, mut v: Value) -> Evented {
+    /// An event from a runner (its JSON, as `crate::wire::payload` read it), read as what a page is
+    /// told of a live page ([`StreamSaid`]): kept when a joining viewer needs it, sent on to each
+    /// viewer as a frame of its socket's type; a stream that closed or failed to open goes. One of
+    /// a kind this build doesn't know, or that isn't one, isn't sent on. What's left to do is
+    /// answered ([`Evented`]).
+    pub fn event(&self, machine: &str, id: &str, v: Value) -> Evented {
+        let mut said = match StreamSaid::read(&v.to_string()) {
+            Ok(said) => said,
+            Err(r) => return Evented { refused: Some(r), ..Evented::default() },
+        };
         // A recording's end: kept, and said to its viewers with the id to get its files by.
-        let ended = v.get("recorded").and_then(|r| self.recorded(machine, id, r));
-        if let Some((_, rec)) = &ended
-            && let Some(r) = v.get_mut("recorded").and_then(Value::as_object_mut)
+        let ended = match &said {
+            StreamSaid::Recorded(r) => self.recorded(machine, id, r),
+            _ => None,
+        };
+        if let (Some((_, rec)), StreamSaid::Recorded(r)) = (&ended, &mut said)
+            && let Some(r) = r.as_object_mut()
         {
             r.insert("id".into(), json!(rec.id));
         }
-        let json = v.to_string();
-        let mut after = Evented { again: None, ended };
+        let mut after = Evented { ended, ..Evented::default() };
         let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return after };
         // Its tabs as they were before the ones it said last (said later, arrived first): no news.
         let seq = |v: &Value| v.pointer("/tabs/seq").and_then(Value::as_u64);
-        if let Some(new) = seq(&v)
+        if let StreamSaid::Tabs(t) = &said
+            && let Some(new) = t.get("seq").and_then(Value::as_u64)
             && live.said.lock().get("tabs").and_then(|kept| serde_json::from_str::<Value>(kept).ok()).and_then(|kept| seq(&kept)).is_some_and(|kept| kept > new)
         {
             return after;
         }
-        if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
-            if k == "opened"
-                && let Some(r) = live.resized.lock().clone()
-            {
-                after.again = Some((live.clone(), json!({"resize": r})));
-            }
-            // What a viewer joining later needs to show it as it is now (whether its window can be
-            // seen where it runs, too: Safari's on a locked Mac; its tabs).
-            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected" | "hidden" | "tabs") {
-                live.said.lock().insert(k.clone(), json.clone());
-            }
-            if matches!(k.as_str(), "closed" | "error") {
-                self.live.lock().remove(id);
-                self.ended(&live);
-            }
-            if k == "error" {
-                tracing::warn!(stream = id, machine, error = %v.get("error").map(|e| e.to_string()).unwrap_or_default(), "a stream couldn't open");
-            }
+        let k = said.kind();
+        if k == "opened"
+            && let Some(r) = live.resized.lock().clone()
+        {
+            after.again = Some((live.clone(), json!({"resize": r})));
         }
-        live.send(&ToViewer::Event(json));
+        if let StreamSaid::Error(e) = &said {
+            tracing::warn!(stream = id, machine, error = %e, "a stream couldn't open");
+        }
+        let text = StreamDown::Said(said).text();
+        // What a viewer joining later needs to show it as it is now (whether its window can be
+        // seen where it runs, too: Safari's on a locked Mac; its tabs).
+        if matches!(k, "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected" | "hidden" | "tabs") {
+            live.said.lock().insert(k.to_owned(), text.clone());
+        }
+        if matches!(k, "closed" | "error") {
+            self.live.lock().remove(id);
+            self.ended(&live);
+        }
+        live.send(&ToViewer::Event(text));
         after
     }
 
@@ -357,7 +371,7 @@ impl Relay {
         let Some(live) = self.live.lock().remove(id) else { return false };
         self.ended(&live);
         hub.command_start(&live.machine, &ServerMsg::StreamClose { stream: live.id.clone(), session: live.session.clone() }).await.log_when_answered(crate::hub::LOG_WITHIN);
-        live.send(&ToViewer::Event(json!({"closed": {"why": "it was closed"}}).to_string()));
+        live.send(&ToViewer::Event(StreamDown::Said(StreamSaid::Closed(json!({"why": "it was closed"}))).text()));
         true
     }
 
@@ -399,7 +413,7 @@ impl Relay {
             self.ended(l);
         }
         for l in gone {
-            l.send(&ToViewer::Event(json!({"closed": {"why": format!("{machine} went away")}}).to_string()));
+            l.send(&ToViewer::Event(StreamDown::Said(StreamSaid::Closed(json!({"why": format!("{machine} went away")}))).text()));
         }
     }
 }
@@ -670,6 +684,35 @@ mod tests {
         r.event("m1", "v1", json!({"closed": {"why": "the page went away"}}));
         assert!(r.get("v1").is_none());
         assert_eq!(rx.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn what_a_runner_says_that_cant_be_read_isnt_sent_on() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let r = Relay::default();
+        let l = live("v1", "m1");
+        r.live.lock().insert("v1".into(), l.clone());
+        let (tx, rx) = async_channel::bounded(16);
+        l.viewers.lock().push((1, tx));
+        // A kind this build doesn't know, more than one key, not an object: refused, and no viewer
+        // is sent it. (What isn't JSON `crate::wire::payload` refuses before it comes here.)
+        for (v, of, code) in [
+            (json!({"hologram": {}}), "hologram", Code::Unknown),
+            (json!({"navigated": {}, "loaded": {}}), "text", Code::Malformed),
+            (json!(["navigated"]), "text", Code::Malformed),
+        ] {
+            let refused = r.event("m1", "v1", v.clone()).refused;
+            assert_eq!(refused.map(|x| (x.of, x.code)), Some((of.to_owned(), code)), "{v}");
+        }
+        assert!(rx.is_empty() && l.said.lock().is_empty());
+        // What it can read goes as a frame of the socket's type, built from it.
+        assert!(r.event("m1", "v1", json!({"loaded": {"title": "A"}})).refused.is_none());
+        let sent = match rx.try_recv() {
+            Ok(ToViewer::Event(e)) => e,
+            _ => String::new(),
+        };
+        assert_eq!(sent, StreamDown::Said(StreamSaid::Loaded(json!({"title": "A"}))).text());
         Ok(())
     }
 

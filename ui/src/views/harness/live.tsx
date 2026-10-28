@@ -16,7 +16,9 @@
  */
 import * as React from "react";
 import { ArrowLeft, ArrowRight, Circle, Copy, Keyboard, Plus, RotateCw, Square, Volume2, VolumeX, X } from "lucide-react";
-import { harnessApi, recordingUrl, type Recording, type StreamDown, type StreamUp, type ToolCall, type WebrtcDown } from "@/api/harness";
+import { readStreamFrame } from "@/api/frames";
+import { harnessApi, recordingUrl, type Recording, type StreamUp, type ToolCall, type WebrtcDown } from "@/api/harness";
+import type { UnreadFrame } from "@/api/wire";
 import { SelectField } from "@/components/ui/misc";
 import { formatBytes } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
@@ -48,8 +50,14 @@ let rtcMisses = 0;
 /** Why it can't be shown here, and what to do (`rtc`: what became of WebRTC, when it was the one
  *  way left). */
 function cantShow(rtc?: "off" | "missed"): string {
-  if (!rtcs) return insecure ? "This browser can't show live pages from kiln at a plain http:// address. Open kiln over https, or at localhost on kiln's own computer." : "This browser can't show live pages. Use a current Chrome, Edge, Firefox or Safari.";
-  if (!insecure) return rtc === "off" ? "This browser is too old to show live pages without WebRTC, and this kiln's server doesn't have WebRTC turned on. Use a current browser, or turn WebRTC on for the server (webrtc_addr, docs/previews.md)." : "This browser is too old to show live pages without WebRTC, and WebRTC couldn't reach this kiln's server from here. Use a current browser.";
+  if (!rtcs)
+    return insecure
+      ? "This browser can't show live pages from kiln at a plain http:// address. Open kiln over https, or at localhost on kiln's own computer."
+      : "This browser can't show live pages. Use a current Chrome, Edge, Firefox or Safari.";
+  if (!insecure)
+    return rtc === "off"
+      ? "This browser is too old to show live pages without WebRTC, and this kiln's server doesn't have WebRTC turned on. Use a current browser, or turn WebRTC on for the server (webrtc_addr, docs/previews.md)."
+      : "This browser is too old to show live pages without WebRTC, and WebRTC couldn't reach this kiln's server from here. Use a current browser.";
   return rtc === "off"
     ? "At a plain http:// address this browser shows live pages only over WebRTC (an iPhone needs iOS 17.1 or later for more), and this kiln's server doesn't have WebRTC turned on. Open kiln over https, or turn WebRTC on for the server (webrtc_addr, docs/previews.md)."
     : "At a plain http:// address this browser shows live pages only over WebRTC (an iPhone needs iOS 17.1 or later for more), and WebRTC couldn't reach this kiln's server from here: its UDP port may be blocked between you. Open kiln over https, or let that port through (docs/previews.md, “WebRTC”).";
@@ -88,7 +96,13 @@ class Viewing {
     private canvas: HTMLCanvasElement,
     private player: HTMLVideoElement | null,
     private sourced: HTMLVideoElement | null,
-    private on: { open: () => void; status: (s: Status, why?: string) => void; event: (e: Record<string, unknown>) => void; fps: (n: number) => void; path: (p: "webrtc" | "socket" | "source") => void },
+    private on: {
+      open: () => void;
+      status: (s: Status, why?: string) => void;
+      event: (e: Record<string, unknown>) => void;
+      fps: (n: number) => void;
+      path: (p: "webrtc" | "socket" | "source") => void;
+    },
   ) {
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
@@ -110,6 +124,11 @@ class Viewing {
 
   send(m: StreamUp) {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m));
+  }
+
+  /** A frame that came down and couldn't be read: the server, which sent it, is told. */
+  private told(f: UnreadFrame) {
+    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(f));
   }
 
   sound(on: boolean) {
@@ -142,13 +161,14 @@ class Viewing {
   }
 
   private event(text: string) {
-    let e: StreamDown;
-    try {
-      e = JSON.parse(text) as StreamDown;
-    } catch {
-      return; // Not one kiln sends.
-    }
-    // The server's WebRTC, or what the stream's runner said (one key naming what).
+    // Every frame is one of the socket's (`StreamDown`): one key naming it. One that isn't isn't
+    // applied, and the server, which sent it, is told.
+    const read = readStreamFrame(text);
+    if ("unread" in read) return this.told(read.unread);
+    const e = read.frame;
+    // What the server couldn't read of what this page sent: noted there, on the agent's page.
+    if ("refused" in e) return;
+    // The server's WebRTC, or what the stream's runner said (one of `StreamSaid`'s kinds).
     const w = (e as { webrtc?: WebrtcDown }).webrtc;
     if (!w) return this.on.event(e as Record<string, unknown>);
     if ("can" in w && w.can) void this.offer();
@@ -490,8 +510,27 @@ function fieldWord(f: PageField | null): string {
 
 /** What the agent did, in a few words ("the agent clicked, typed"). */
 function agentWords(did: Record<string, unknown>[]): string {
-  const verbs: Record<string, string> = { click: "clicked", tap: "tapped", type: "typed", key: "pressed a key", scroll: "scrolled", go: "went to a page", back: "went back", forward: "went forward", reload: "reloaded", tab: "changed tabs" };
-  const said = [...new Set(did.flatMap((d) => Object.keys(d).map((k) => verbs[k]).filter(Boolean)))];
+  const verbs: Record<string, string> = {
+    click: "clicked",
+    tap: "tapped",
+    type: "typed",
+    key: "pressed a key",
+    scroll: "scrolled",
+    go: "went to a page",
+    back: "went back",
+    forward: "went forward",
+    reload: "reloaded",
+    tab: "changed tabs",
+  };
+  const said = [
+    ...new Set(
+      did.flatMap((d) =>
+        Object.keys(d)
+          .map((k) => verbs[k])
+          .filter(Boolean),
+      ),
+    ),
+  ];
   return said.length ? `the agent ${said.join(", ")}` : "";
 }
 
@@ -739,28 +778,31 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   // has one of its own. What comes within a frame goes as one, its deltas summed (in pixels: a
   // line is 40, a page the frame's height).
   const wheeled = React.useRef<{ x: number; y: number; dx: number; dy: number; mods: number } | null>(null);
-  const canvasEl = React.useCallback((c: HTMLCanvasElement | null) => {
-    canvas.current = c;
-    if (!c) return;
-    const on = (e: WheelEvent) => {
-      e.preventDefault();
-      const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? c.clientHeight || 800 : 1;
-      const p = at({ clientX: e.clientX, clientY: e.clientY, currentTarget: c });
-      const w = wheeled.current;
-      if (w) {
-        Object.assign(w, p, { dx: w.dx + e.deltaX * k, dy: w.dy + e.deltaY * k, mods: mods(e) });
-        return;
-      }
-      wheeled.current = { ...p, dx: e.deltaX * k, dy: e.deltaY * k, mods: mods(e) };
-      requestAnimationFrame(() => {
+  const canvasEl = React.useCallback(
+    (c: HTMLCanvasElement | null) => {
+      canvas.current = c;
+      if (!c) return;
+      const on = (e: WheelEvent) => {
+        e.preventDefault();
+        const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? c.clientHeight || 800 : 1;
+        const p = at({ clientX: e.clientX, clientY: e.clientY, currentTarget: c });
         const w = wheeled.current;
-        wheeled.current = null;
-        if (w) input([{ t: "w", ...w }]);
-      });
-    };
-    c.addEventListener("wheel", on, { passive: false });
-    return () => c.removeEventListener("wheel", on);
-  }, [input]);
+        if (w) {
+          Object.assign(w, p, { dx: w.dx + e.deltaX * k, dy: w.dy + e.deltaY * k, mods: mods(e) });
+          return;
+        }
+        wheeled.current = { ...p, dx: e.deltaX * k, dy: e.deltaY * k, mods: mods(e) };
+        requestAnimationFrame(() => {
+          const w = wheeled.current;
+          wheeled.current = null;
+          if (w) input([{ t: "w", ...w }]);
+        });
+      };
+      c.addEventListener("wheel", on, { passive: false });
+      return () => c.removeEventListener("wheel", on);
+    },
+    [input],
+  );
   const pointer = (k: "down" | "move" | "up" | "cancel") => (e: React.PointerEvent<HTMLCanvasElement>) => {
     const p = { t: "p", k, ...at(e), button: e.button, buttons: e.buttons, pt: e.pointerType, id: e.pointerId, mods: mods(e), clicks: k === "move" ? 0 : Math.max(1, e.detail || 1) };
     if (k === "down") {
@@ -796,7 +838,11 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     }
   };
   // A key by name, down and up.
-  const press = (name: string, text = "") => input([{ t: "k", k: "down", key: name, code: name, text }, { t: "k", k: "up", key: name, code: name }]);
+  const press = (name: string, text = "") =>
+    input([
+      { t: "k", k: "down", key: name, code: name, text },
+      { t: "k", k: "up", key: name, code: name },
+    ]);
   // What's selected in the page, to the viewer's clipboard: asked of the page now, written as it
   // answers (a clipboard item that waits for it, where the browser lets one; else its text then).
   const copyOut = () => {
@@ -851,7 +897,8 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     const el = boxEl.current;
     const vv = window.visualViewport;
     if (!el || !vv) return;
-    if (document.activeElement === mirror.current && vv.height < window.innerHeight * 0.85) el.style.setProperty("--lv-kb-h", `${Math.max(160, Math.round(vv.offsetTop + vv.height - el.getBoundingClientRect().top - 8))}px`);
+    if (document.activeElement === mirror.current && vv.height < window.innerHeight * 0.85)
+      el.style.setProperty("--lv-kb-h", `${Math.max(160, Math.round(vv.offsetTop + vv.height - el.getBoundingClientRect().top - 8))}px`);
     else el.style.removeProperty("--lv-kb-h");
   }, []);
 
@@ -869,7 +916,11 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     addressEl.current?.focus();
   };
   const startAgain = async () => {
-    const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600, profile: stream.profile, engine: stream.engine, device: stream.device }) });
+    const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600, profile: stream.profile, engine: stream.engine, device: stream.device }),
+    });
     if (!r.ok) {
       setWhy((await r.text()) || "It couldn't start again.");
       return;
@@ -891,7 +942,17 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const seenThere = !hidden || status === "ended" || status === "unsupported";
   const word =
     (what ? `${what} · ` : "") +
-    (!seenThere ? "its Mac is locked or asleep: its pictures come slowly" : status === "live" && fps > 0 ? `live · ${fps} fps` : status === "live" || status === "still" ? "live · still" : status === "connecting" ? "connecting" : status === "unsupported" ? "this browser can't show it" : "ended");
+    (!seenThere
+      ? "its Mac is locked or asleep: its pictures come slowly"
+      : status === "live" && fps > 0
+        ? `live · ${fps} fps`
+        : status === "live" || status === "still"
+          ? "live · still"
+          : status === "connecting"
+            ? "connecting"
+            : status === "unsupported"
+              ? "this browser can't show it"
+              : "ended");
   return (
     <div className="pg lv" data-ev={ev} data-ev-live={stream.id} data-status={status} data-path={path}>
       <div className="pg-head">

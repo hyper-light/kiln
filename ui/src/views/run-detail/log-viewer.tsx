@@ -1,11 +1,16 @@
 import * as React from "react";
 import { ArrowDownToLine, ChevronDown, ChevronUp, Download, Search, X } from "lucide-react";
 import { api, wsUrl } from "@/api/client";
+import { readFrame } from "@/api/frames";
 import type { LogControlFrame, Status } from "@/api/types";
+import type { UnreadFrame } from "@/api/wire";
 import { createTerminal, ensureFont, safeFit, SEARCH_DECORATIONS, type KilnTerminal } from "@/components/terminal/xterm-setup";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/format";
+
+/** A job log socket's text frames, by tag: a frame with another isn't applied (`api/frames.ts`). */
+const LOG_FRAMES = { step: true, end: true, refused: true } satisfies Record<LogControlFrame["type"], true>;
 
 const MAX_ROWS = 38;
 const MIN_ROWS = 4;
@@ -190,13 +195,15 @@ export default function LogViewer({
           ws.binaryType = "arraybuffer";
           ws.onmessage = (ev) => {
             if (typeof ev.data === "string") {
-              try {
-                const msg = JSON.parse(ev.data) as LogControlFrame;
-                if (msg.type === "end") setEnded(true);
-                else if (msg.type === "step") cb.current?.(msg.idx, msg.status);
-              } catch {
-                write(ev.data);
+              // Applied only when it reads as one of the socket's frames; else the server, which sent it, is told.
+              const read = readFrame<LogControlFrame>(ev.data, "type", LOG_FRAMES);
+              if ("unread" in read) {
+                if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(read.unread satisfies UnreadFrame));
+                return;
               }
+              const msg = read.frame;
+              if (msg.type === "end") setEnded(true);
+              else if (msg.type === "step") cb.current?.(msg.idx, msg.status);
               return;
             }
             write(new Uint8Array(ev.data as ArrayBuffer));
@@ -284,9 +291,7 @@ export default function LogViewer({
                 }
               }}
             />
-            <span className="shrink-0 pr-2 font-mono text-[10px] text-[#7f838d]">
-              {matches && query ? (matches.count ? `${matches.idx + 1}/${matches.count}` : "0") : ""}
-            </span>
+            <span className="shrink-0 pr-2 font-mono text-[10px] text-[#7f838d]">{matches && query ? (matches.count ? `${matches.idx + 1}/${matches.count}` : "0") : ""}</span>
           </div>
         )}
         {searchOpen && (

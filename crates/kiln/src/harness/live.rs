@@ -25,12 +25,16 @@ use super::registry::Frame;
 /// Frames a session's topic keeps: a viewer further behind starts over from a snapshot.
 pub const RETAIN: usize = 2048;
 
-/// The marker a feed publishes after a frame the bus refused: its viewers start over.
+/// The marker a feed publishes after a frame the bus refused: its viewers start over. The feed's
+/// own, never sent to a viewer: every other frame on a feed is one of the session socket's
+/// ([`SessionDown`](crate::wire::ui::SessionDown)).
 pub const RESYNC: &str = r#"{"t":"resync"}"#;
 
-/// A session's last frame: its viewers end with it.
-pub const CLOSED: &str = r#"{"t":"closed"}"#;
-
+/// A session's last frame, as its feed carries it: its viewers end with it.
+pub fn closed() -> &'static str {
+    static CLOSED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Closed).text());
+    &CLOSED
+}
 
 /// Feeds made in this process: each takes the next, so a session's mirror made again (a restart
 /// of its machine's link) has a topic of its own and never shares one it could delete.
@@ -129,7 +133,7 @@ fn delete(bus: &dyn Bus, topic: &str) {
 
 /// One session's live feed, as its mirror holds it. Dropped (its mirror let go: the session
 /// ended or went away), its topic goes once its viewers have: each reads on to the session's last
-/// frame ([`CLOSED`]) and ends with it, so none misses the frames it hadn't read yet.
+/// frame ([`closed`]) and ends with it, so none misses the frames it hadn't read yet.
 pub struct Feed {
     shared: Arc<Shared>,
     /// A frame was refused: the next publish goes after [`RESYNC`]. Set too while the topic
@@ -254,7 +258,7 @@ impl Feed {
         }
         let m = crate::metrics::bus();
         if self.broken {
-            match at_once(self.shared.bus.publish(&self.shared.topic, None, encode(&Frame::of(RESYNC.to_owned())))) {
+            match at_once(self.shared.bus.publish(&self.shared.topic, None, encode(&Frame::resync()))) {
                 Ok(_) => {
                     self.broken = false;
                     m.published.inc();
@@ -307,7 +311,7 @@ mod tests {
     fn a_frame_comes_back_from_the_bus_as_it_went() {
         use super::super::registry::PatchOf;
         let frames = [
-            Frame::of(r#"{"t":"events","events":[]}"#.to_owned()),
+            Frame::text(r#"{"t":"events","events":[]}"#),
             Frame { text: Arc::from(r#"{"t":"state","state":{"a":1},"rev":42}"#), patch: Some(Arc::from(r#"{"t":"state_patch","set":{"a":1},"rev":42}"#)), patch_of: PatchOf::State, rev: 42 },
             Frame { text: Arc::from(r#"{"t":"changes","files":[],"rev":43}"#), patch: Some(Arc::from(r#"{"t":"changes_patch","gone":[{"path":"a"}],"rev":43}"#)), patch_of: PatchOf::Changes, rev: 43 },
         ];
@@ -325,7 +329,7 @@ mod tests {
     #[test]
     fn a_frame_carries_the_microsecond_it_was_published() {
         let before = now_us();
-        let bytes = encode(&Frame::of(r#"{"t":"events","events":[]}"#.to_owned()));
+        let bytes = encode(&Frame::text(r#"{"t":"events","events":[]}"#));
         let after = now_us();
         let at = published_us(&bytes);
         assert!(at.is_some_and(|at| (before..=after).contains(&at)), "{at:?} not in {before}..={after}");
@@ -355,13 +359,13 @@ mod tests {
     fn a_feed_publishes_only_to_viewers_and_a_refused_frame_sends_them_back_to_a_snapshot() -> anyhow::Result<()> {
         let b = bus()?;
         let mut feed = Feed::open(Arc::clone(&b), "s1");
-        assert_eq!(feed.publish(&Frame::of("unwatched".to_owned())), Published::Unwatched);
+        assert_eq!(feed.publish(&Frame::text("unwatched")), Published::Unwatched);
         let (viewer, at) = feed.attach();
         assert_eq!(at, Some(0));
-        assert_eq!(feed.publish(&Frame::of("first".to_owned())), Published::Sent);
-        let huge = Frame::of("x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
+        assert_eq!(feed.publish(&Frame::text("first")), Published::Sent);
+        let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
         assert_eq!(feed.publish(&huge), Published::Refused);
-        assert_eq!(feed.publish(&Frame::of("after".to_owned())), Published::Sent);
+        assert_eq!(feed.publish(&Frame::text("after")), Published::Sent);
         let read = futures::executor::block_on(b.read(feed.topic(), 0, 10))?;
         let texts: Vec<String> = read.messages.iter().map(|m| decode(&m.payload).map(|f| f.text.to_string()).unwrap_or_default()).collect();
         assert_eq!(texts, ["first", RESYNC, "after"]);
@@ -379,14 +383,14 @@ mod tests {
         let b = bus()?;
         let mut feed = Feed::open(Arc::clone(&b), "s1");
         let (viewer, _) = feed.attach();
-        assert_eq!(feed.publish(&Frame::of("seen".to_owned())), Published::Sent);
+        assert_eq!(feed.publish(&Frame::text("seen")), Published::Sent);
         drop(viewer);
-        assert_eq!(feed.publish(&Frame::of("unseen".to_owned())), Published::Unwatched);
+        assert_eq!(feed.publish(&Frame::text("unseen")), Published::Unwatched);
         let topic = feed.topic().to_owned();
         assert_eq!(futures::executor::block_on(b.bounds(&topic)), Err(Refusal::NoTopic(topic.clone())));
         let (_viewer, at) = feed.attach();
         assert_eq!(at, Some(0));
-        assert_eq!(feed.publish(&Frame::of("again".to_owned())), Published::Sent);
+        assert_eq!(feed.publish(&Frame::text("again")), Published::Sent);
         let read = futures::executor::block_on(b.read(&topic, 0, 10))?;
         let texts: Vec<String> = read.messages.iter().filter_map(|m| decode(&m.payload)).map(|f| f.text.to_string()).collect();
         assert_eq!(texts, ["again"]);
@@ -402,7 +406,7 @@ mod tests {
         let (viewer, _) = feed.attach();
         let before = viewer.refusals();
         assert_eq!(feed.refusals(), before);
-        let huge = Frame::of("x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
+        let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
         assert_eq!(feed.publish(&huge), Published::Refused);
         assert_eq!(feed.publish(&huge), Published::Refused);
         assert!(viewer.refusals() > before, "the viewer sees the refusals");
@@ -410,7 +414,7 @@ mod tests {
     }
 
     /// An ended session's topic stays while a viewer reads it, so the frames it hadn't read yet,
-    /// the session's last ([`CLOSED`]) among them, still reach it; it goes with the last viewer.
+    /// the session's last ([`closed`]) among them, still reach it; it goes with the last viewer.
     #[test]
     fn an_ended_sessions_topic_stays_until_its_last_viewer_goes() -> anyhow::Result<()> {
         let b = bus()?;
@@ -418,13 +422,13 @@ mod tests {
         let (first, at) = feed.attach();
         let (second, _) = feed.attach();
         let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
-        assert_eq!(feed.publish(&Frame::of("last words".to_owned())), Published::Sent);
-        assert_eq!(feed.publish(&Frame::of(CLOSED.to_owned())), Published::Sent);
+        assert_eq!(feed.publish(&Frame::text("last words")), Published::Sent);
+        assert_eq!(feed.publish(&Frame::text(closed())), Published::Sent);
         let topic = feed.topic().to_owned();
         drop(feed);
         let read = futures::executor::block_on(b.read(&topic, at, 10))?;
         let texts: Vec<String> = read.messages.iter().filter_map(|m| decode(&m.payload)).map(|f| f.text.to_string()).collect();
-        assert_eq!(texts, ["last words", CLOSED]);
+        assert_eq!(texts, ["last words", closed()]);
         drop(first);
         assert!(futures::executor::block_on(b.bounds(&topic)).is_ok(), "one viewer still reads");
         drop(second);
@@ -447,7 +451,7 @@ mod tests {
         }
         let frames = 3000;
         for n in 0..frames {
-            assert_eq!(feed.publish(&Frame::of(format!("frame {n}"))), Published::Sent, "frame {n} went at once");
+            assert_eq!(feed.publish(&Frame::text(&format!("frame {n}"))), Published::Sent, "frame {n} went at once");
             // The 99: each reads what's there, as its socket's loop does.
             for (_, at, got) in viewers.iter_mut().skip(1) {
                 let read = futures::executor::block_on(b.read(feed.topic(), *at, 1000))?;

@@ -262,6 +262,24 @@ Each refusal noted:
   rest are counted and folded into the next. Only those count toward it, so a `folded` is how
   many went untold: one answered another way (a NACK), or a runner's word of a frame of the
   server's, is never among them.
+  A page's socket is the exception: it answers each frame it can't read on the socket it came on,
+  every time, as a command's answer must come.
+
+The UI's sockets read what comes up into their types (`crate::wire::ui`), and what they can't
+read they answer on the socket, typed. The session socket answers with a `nack`. The others answer
+with a `refused` frame: `of` (the frame's tag, or `text` or `binary` when it couldn't be read that
+far), `code` and `why`. A binary frame on a socket that takes text alone is `malformed`. A frame
+past a socket's limit closes it with 1009, text that isn't UTF-8 with 1007, and what isn't a
+WebSocket frame with 1002, as RFC 6455 says. Each is noted from the person on the socket, as the
+audit log names them (`admin`, `user:<name>` ...): on the agent's page for a session's sockets (its
+session socket and its live pages'), on the runner's page for its terminals (a leg's too). A
+runner's tunnel is open, and what it can't read is noted from its address; what the runner can't
+read of what comes down it tells the server up the tunnel, as a page does (below).
+
+A page that can't read a frame that came down (a tag its client doesn't know, or not JSON) doesn't
+apply it, and says so up the same socket: `{"t": "unread", "of", "why"}`, `of` the frame's tag when
+it could read one (`unknown`), or empty when it couldn't (`malformed`). The server, which sent the
+frame, notes it on the socket's `*_down` wire, from the person, on the same page.
 
 An `unknown` one is a newer build's kind, and a skew between builds can last days on frames sent
 many a second (a raft's heartbeats, say). Each kind (its `what`) from a sender on a wire is audited
@@ -279,22 +297,22 @@ What each wire's sender is told. The later steps of the typed-messages plan move
 | `server` | The server's frames, as a runner reads them. | The runner says so (`AgentMsg::Unread`, to a server that says `CAP_UNREAD`), and the server notes it against the runner. |
 | `runner_item` | The items of a runner's channel streams, as the server reads them. | A NACK: `unsupported` for a variant the server doesn't know, `malformed` for the rest. |
 | `server_item` | The items of the server's channel streams, as a runner reads them. | A NACK, as for `runner_item`, and `AgentMsg::Unread` to a server that says `CAP_UNREAD`. |
-| `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | On the channel (a session's updates), its item's NACK: `unsupported` for a kind the server doesn't know, `malformed` for the rest. Off it, `ServerMsg::Unread`, if it says `CAP_UNREAD`, and a question it asked (`ReachAsk`) is answered with why. A session's update is kept for the session's page too. |
+| `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | On the channel (a session's updates), its item's NACK: `unsupported` for a kind the server doesn't know, `malformed` for the rest. Off it, `ServerMsg::Unread`, if it says `CAP_UNREAD`, and a question it asked (`ReachAsk`) is answered with why. A session's update is kept for the session's page too. A live page's event (`StreamEvent`) that's JSON but not one of `StreamSaid`'s kinds goes to no viewer, and is refused as the rest are: the runner is told (`ServerMsg::Unread`) if it says `CAP_UNREAD`, and it's noted, on the stream's session's page too. |
 | `server_payload` | The JSON the server's frame carries (a session's commands), as a runner reads it. | On the channel (a command), its NACK, as for `runner_payload`. Either way the runner says so (`AgentMsg::Unread`, to a server that says `CAP_UNREAD`), and the server notes it against the runner. A question (`Preview`, `Workspace`) is answered with why, a stream to open is said to have failed, and a session to start is said refused. |
 | `relay` | What runners send the server's relay for one another. | One from a runner that isn't an end of the link it names, or from a job's pod, goes nowhere: `ServerMsg::Unread`, `malformed`, if it says `CAP_UNREAD`, and noted naming the link's ends. The relay's other refusals are said with a code (`ReachRefused`) to a runner that says `CAP_UNREAD`, in words (`Reach`'s `close`) to one from before. |
 | `reach_link` | What a runner reads inside a reach link, from the runner at its other end. | `Say::Unread` or `Ask::Unread` in the link, then the link ends; a runner from before ends it on that as on any garbage. The server hears of it (`AgentMsg::LinkUnread`, if it says `CAP_UNREAD`) and notes it against the runner that sent it, on both runners' pages. |
-| `session_up` | The session socket: what a page sends up. | A nack, `malformed`. |
-| `session_down` | The session socket: what a page couldn't read of what came down. | Nothing yet. |
-| `terminal_up` | A terminal's socket (a session's, a runner's, a CI leg's): what a page sends up. | Nothing yet. |
-| `terminal_down` | A terminal's socket: what a page couldn't read of what came down. | Nothing yet. |
-| `stream_up` | A stream's socket: what a page sends up. | Nothing yet. |
-| `stream_down` | A stream's socket: what a page couldn't read of what came down. | Nothing yet. |
-| `events_up` | The events socket: what a page sends up. | Nothing yet. |
-| `events_down` | The events socket: what a page couldn't read of what came down. | Nothing yet. |
-| `log_up` | A log's socket: what a page sends up. | Nothing yet. |
-| `log_down` | A log's socket: what a page couldn't read of what came down. | Nothing yet. |
-| `tunnel_up` | A tunnel's socket: what a page sends up. | Nothing yet. |
-| `tunnel_down` | A tunnel's socket: what a page couldn't read of what came down. | Nothing yet. |
+| `session_up` | The session socket: what a page sends up. | A `nack`: `unsupported` for a command type or a frame the server doesn't know (`{"t":"cmd","id":"c1","c":{"type":"teleport"}}` is answered `no command teleport` under `c1`), `malformed` for the rest, a binary frame among them; under the command's id, or `id` null when it couldn't be read that far. Past the socket's limit, closed with 1009. On the agent's page. |
+| `session_down` | The session socket: what a page couldn't read of what came down. | Not applied; the page sends `unread` up, noted on the agent's page. |
+| `terminal_up` | A terminal's socket (a session's, a runner's, a CI leg's): what a page sends up. | A `refused` frame (`{"type": "refused", "of", "code", "why"}`); binary frames are keystrokes. Past the socket's limit, closed with 1009. On the runner's page. |
+| `terminal_down` | A terminal's socket: what a page couldn't read of what came down. | Not applied; the page sends `unread` up, noted on the runner's page. |
+| `stream_up` | A stream's socket: what a page sends up. | A `refused` frame (`{"refused": {"of", "code", "why"}}`); a binary frame is `malformed`. Past the socket's limit (1 MiB), closed with 1009. On the agent's page. |
+| `stream_down` | A stream's socket: what a page couldn't read of what came down (a frame whose one key isn't `StreamDown`'s). | Not applied; the page sends `unread` up, noted on the agent's page. |
+| `events_up` | The events socket: what a page sends up. | A `refused` frame (`{"type": "refused", "of", "code", "why"}`), to that socket alone; a binary frame is `malformed`. Past the socket's limit, closed with 1009. |
+| `events_down` | The events socket: what a page couldn't read of what came down. | Not applied; the page sends `unread` up, noted. |
+| `log_up` | A log's socket (a job step's, a deployment's): what a page sends up. | A `refused` frame (`{"type": "refused", "of", "code", "why"}`); a binary frame is `malformed`. Past the socket's limit, closed with 1009. |
+| `log_down` | A log's socket: what a page couldn't read of what came down. | Not applied; the page sends `unread` up, noted. |
+| `tunnel_up` | A runner's tunnel: what the runner sends up. | A `refused` text frame (`{"type": "refused", "of", "code", "why"}`), which the runner reads and logs: for an empty datagram, or text that isn't a binding or an `unread`. Past its bound (1,500 bytes), closed with 1009. Noted from its address: the tunnel is open, and nobody's yet. |
+| `tunnel_down` | A runner's tunnel: what the runner couldn't read of what came down. | Not relayed; the runner sends `unread` up the tunnel, as a page does, and the server notes it from the tunnel's address. Past the runner's bound, it says so and closes the tunnel with 1009. |
 | `mcp_http` | kiln's MCP endpoint, over HTTP. | Nothing yet. |
 | `mcp_reach` | kiln's MCP calls a runner makes through reach. | Nothing yet. |
 
@@ -666,13 +684,14 @@ under an id it makes, `{"t": "cmd", "id", "c"}`, and the server answers each tim
   refusal's kind: `unknown`, `malformed`, `refused`, `stale_epoch`, `unsupported`, `unanswered`,
   `unreachable` or `no_session`, or an inbox refusal's by its tag (`stale_epoch`, `behind`,
   `moved`, `reused`, `invalid`, `full`, `no_session`, `unavailable`), with the inbox's own under
-  `refused`. `invalid` is an inbox refusing a message; `malformed`, a frame the server can't read
-  (`id` null when it couldn't read that much).
+  `refused`. `invalid` is an inbox refusing a message; `unsupported`, a command type (or a frame)
+  the server doesn't know; `malformed`, a frame the server can't read (`id` null when it couldn't
+  read that much; "What can't be read").
 
 Each answer is final, for now, or not this time, agreed with T3 for CP-T3.4's composer outbox
 (`crate::harness::asked`):
-- **Final:** the acks but `parked` and `pending`, and the nacks `unknown`, `refused`, `malformed`,
-  `reused`, `invalid` and `no_session`. It's kept under the id, and a client stops.
+- **Final:** the acks but `parked` and `pending`, and the nacks `unknown`, `refused`,
+  `unsupported`, `malformed`, `reused`, `invalid` and `no_session`. It's kept under the id, and a client stops.
 - **For now:** `parked`. Sent again, the command is answered `parked`, until its runner's answer
   comes and takes its place.
 - **Not this time:** `pending`, and the nacks with `again: true`: a message's `unreachable`,
@@ -700,7 +719,14 @@ its ids, so a command sent again to it goes on again. A message's inbox still ta
 Each socket's frames are a Rust type each way, and the server builds what it sends from them:
 `crate::wire::ui` for the session, terminal, stream and log sockets (`SessionDown` and `SessionUp`
 for a session's, its `ack` and `nack` among them), `crate::wire::events::ServerEvent` for
-`/api/events`. The UI reads them, and the `Command`s, `Update`s and runner records they carry, as
+`/api/events`. Every frame a session socket sends is a `SessionDown`, `synced` and `closed`
+included, and a session's feed on the bus carries its frames as that type serialized: inside the
+server's process its copy and its viewers share the type. What comes up each socket is read into
+its type, and what can't be is answered typed and noted ("What can't be read"). In the browser,
+each socket's client checks a frame's tag against the generated type's tags (a table written
+`satisfies Record<Tag, true>`, so it can't drift from the type, `ui/src/api/frames.ts`) and reads
+it whole: a frame with an unknown tag, or one that isn't JSON, isn't applied, and the client sends
+`unread` up. The UI reads them, and the `Command`s, `Update`s and runner records they carry, as
 TypeScript made from those types with ts-rs, checked in under `ui/src/api/wire/`; it writes no copy
 of its own. `cargo test -p kiln wire::ts` fails, naming the file and its first difference, when a
 type changes without its file, and `KILN_WRITE_TS=1 cargo test -p kiln wire::ts` writes them. Both
@@ -709,6 +735,7 @@ CIs typecheck the UI against them.
 | Socket | Way | Message | Class | Why | Today |
 |---|---|---|---|---|---|
 | `/api/harness/sessions/:id/ws` | up | `cmd` | command, as its `Command` says | A command under the id its client made. | Taken once per id, answered `ack` or `nack`, and sent again by the client on its next socket until then (plan step 7). |
+| `/api/harness/sessions/:id/ws` | up | `unread` | ack | A frame that came down that the page couldn't read: its tag (`of`) and why. | Noted on the agent's page (`session_down`); nothing goes back. |
 | `/api/harness/sessions/:id/ws` | down | `ack` | ack | A command under its id was taken. | Sent once to each socket that sent it, once its runner (or the server) answered. |
 | `/api/harness/sessions/:id/ws` | down | `nack` | ack | A command under its id was refused, saying how and why. | As `ack`. |
 | `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`). | Sent on an attach without `after=`, or when the copy can't resume it. |
@@ -723,17 +750,31 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
+| `/api/events` | up | `unread` | ack | As the session socket's. | Noted (`events_down`). |
 | `/api/events` | down | `event` | stream | Kiln's events for the UI. | Not resumed after a reconnect. |
+| `/api/events` | down | `refused` | ack | What the page sent up that couldn't be read. | To that socket alone. |
 | `/api/terminal/ws` | up | `input` | command, refused while away | Keystrokes, never replayed later. | Not answered. |
 | `/api/terminal/ws` | up | `resize` | state | The newest wins. | Not answered. |
+| `/api/terminal/ws` | up | `unread` | ack | As the session socket's. | Noted on the runner's page (`terminal_down`). |
 | `/api/terminal/ws` | down | `output` | stream | By byte offset. | A reconnect attaches again from a replay. |
+| `/api/terminal/ws` | down | `refused` | ack | What the page sent as text that couldn't be read. | Noted on the runner's page too (`terminal_up`). |
 | `/api/ci/legs/:id/terminal` | up | `input` | command, refused while away | As the terminal's. | Not answered. |
 | `/api/ci/legs/:id/terminal` | up | `resize` | state | As the terminal's. | Not answered. |
+| `/api/ci/legs/:id/terminal` | up | `unread` | ack | As the terminal's. | As the terminal's. |
 | `/api/ci/legs/:id/terminal` | down | `output` | stream | As the terminal's. | As the terminal's. |
+| `/api/ci/legs/:id/terminal` | down | `refused` | ack | As the terminal's. | As the terminal's. |
+| `/api/jobs/:id/logs/ws` | up | `unread` | ack | As the session socket's. | Noted (`log_down`). |
 | `/api/jobs/:id/logs/ws` | down | `log` | stream | A step's log, by offset. | As its class says. |
+| `/api/jobs/:id/logs/ws` | down | `refused` | ack | What the page sent up that couldn't be read. | As its class says. |
 | `/api/harness/sessions/:id/streams/:sid/ws` | up | `input` | command, refused while away | What the viewer did. | Not answered. |
+| `/api/harness/sessions/:id/streams/:sid/ws` | up | `unread` | ack | As the session socket's. | Noted on the agent's page (`stream_down`). |
 | `/api/harness/sessions/:id/streams/:sid/ws` | down | `frame` | media | Picture and sound. | As its class says. |
-| `/api/harness/sessions/:id/streams/:sid/ws` | down | `event` | stream | What the stream says. | Not resumed. |
-| `/api/deploy/apps/:app/logs/follow` | down | `log` | stream | A deployment's logs, followed. | As its class says. |
-| `/api/tunnel` | up | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
-| `/api/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
+| `/api/harness/sessions/:id/streams/:sid/ws` | down | `event` | stream | What the stream says: one of `StreamSaid`'s kinds, one key naming it (`opened`, `navigated`, `loaded`, `focus`, `fields`, `selected`, `hidden`, `tabs`, `dialog`, `stats`, `recording`, `recorded`, `copied`, `agent`, `error`, `closed`). | Not resumed. A runner's of a kind the server doesn't know goes to no viewer (`runner_payload`). |
+| `/api/harness/sessions/:id/streams/:sid/ws` | down | `refused` | ack | What the page sent up that couldn't be read. | Noted on the agent's page too (`stream_up`). |
+| `/api/cd/apps/:app/resources/:key/logs/ws` | up | `unread` | ack | As the session socket's. | Noted (`log_down`). |
+| `/api/cd/apps/:app/resources/:key/logs/ws` | down | `log` | stream | A deployment's logs, followed. | As its class says. |
+| `/api/cd/apps/:app/resources/:key/logs/ws` | down | `refused` | ack | What the page sent up that couldn't be read. | As its class says. |
+| `/api/agents/tunnel` | up | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
+| `/api/agents/tunnel` | up | `unread` | ack | A frame that came down that the runner couldn't read: its tag (`of`) and why. | Noted from the tunnel's address (`tunnel_down`); nothing goes back. |
+| `/api/agents/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
+| `/api/agents/tunnel` | down | `refused` | ack | What the runner sent that couldn't be read. | Read and logged by the runner. |

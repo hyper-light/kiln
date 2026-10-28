@@ -24,7 +24,8 @@ use crate::http::ws::{self, Message};
 use crate::hub::Hub;
 use crate::logs::LogEvent;
 use crate::store::Repo;
-use crate::wire::ui::{LogDown, SessionDown, SessionFrame, SessionUp, StreamDown, StreamUp, TerminalDown, TerminalUp, WebrtcDown};
+use crate::wire::ui::{self, Came, LogDown, SessionDown, SessionFrame, SessionUp, StreamDown, TerminalDown, TerminalUp, Up, WebrtcDown};
+use crate::wire::unread::{Page, Wire};
 
 pub struct ApiError(StatusCode, String);
 
@@ -2730,11 +2731,12 @@ async fn job_log_times(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
 }
 
 fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {
+    let sock = ui::Socket::of(Wire::LogUp, Wire::LogDown, &caller_name(&req), None);
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         match upgrade.await {
             Ok(socket) => {
-                if let Err(e) = stream_logs(hub, job, step, socket).await {
+                if let Err(e) = stream_logs(hub, job, step, socket, &sock).await {
                     tracing::debug!(error = %e, "log stream ended");
                 }
             }
@@ -2744,7 +2746,7 @@ fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {
     Ok(resp)
 }
 
-async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocket) -> anyhow::Result<()> {
+async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocket, sock: &ui::Socket) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let live = hub.logs.is_live(&job);
@@ -2776,10 +2778,11 @@ async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocke
                     tx.send(ws::binary(note.into_bytes())).await?;
                 }
             },
-            msg = rx_ws.next().fuse() => match msg {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                _ => {}
-            },
+            msg = rx_ws.next().fuse() => {
+                if hub.unread_only(sock, &mut tx, ui::came(msg), |r| LogDown::Refused(r).text()).await? {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -4027,7 +4030,14 @@ fn agent_tunnel(hub: &Arc<Hub>, req: Request) -> R {
         .quic_addr
         .parse()
         .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the QUIC listener address is not an address"))?;
-    crate::tunnel::serve(&hub.tunnels, crate::tunnel::listener_for(bind), req).map_err(|(status, why)| err(status, why))
+    let h = Arc::clone(hub);
+    let note = move |u| {
+        let h = Arc::clone(&h);
+        crate::rt::spawn(async move {
+            let _ = h.note_unread(u, None).await;
+        });
+    };
+    crate::tunnel::serve(&hub.tunnels, crate::tunnel::listener_for(bind), req, note).map_err(|(status, why)| err(status, why))
 }
 
 // ------------------------------------------------------------------ events ws
@@ -4104,12 +4114,13 @@ impl Narrow {
 }
 
 fn events_ws(hub: Arc<Hub>, req: Request, narrow: Option<Narrow>, agents: Option<AgentsSeen>) -> R {
+    let sock = ui::Socket::of(Wire::EventsUp, Wire::EventsDown, &caller_name(&req), None);
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
         m.ws_clients.add(1);
-        if let Err(e) = pump_events(&hub, socket, narrow, agents).await {
+        if let Err(e) = pump_events(&hub, socket, &sock, narrow, agents).await {
             tracing::debug!(error = %e, "events stream ended");
         }
         m.ws_clients.add(-1);
@@ -4117,7 +4128,12 @@ fn events_ws(hub: Arc<Hub>, req: Request, narrow: Option<Narrow>, agents: Option
     Ok(resp)
 }
 
-async fn pump_events(hub: &Hub, socket: ws::WebSocket, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
+/// Who a request is, as the audit log names them (`admin`, `user:<name>` ...).
+fn caller_name(req: &Request) -> String {
+    req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone())
+}
+
+async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let mut rx = hub.events.subscribe();
@@ -4142,10 +4158,11 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, mut narrow: Option<Narrow
                 }
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },
-            msg = rx_ws.next().fuse() => match msg {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                _ => {}
-            },
+            msg = rx_ws.next().fuse() => {
+                if hub.unread_only(sock, &mut tx, ui::came(msg), |r| crate::wire::events::ServerEvent::Refused(r).text()).await? {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -4226,14 +4243,17 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     if existing.is_none() && hub.terminals.live() >= hub.cfg.terminal.max_sessions {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
     }
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     let target = q.get("target").cloned().unwrap_or_else(|| "local".into());
+    // What it can't read shows on the page of the runner it's on.
+    let on = existing.as_deref().and_then(|s| hub.terminals.get(s)).map_or_else(|| target.clone(), |t| t.target.clone());
+    let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller_name(&req), terminal_page(&on));
+    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let cmd = q.get("cmd").cloned();
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), socket).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), socket, sock).await {
             tracing::debug!(error = %format!("{e:#}"), "terminal websocket ended");
         }
     });
@@ -4273,19 +4293,29 @@ async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, ca
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
+    let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller.name, Some(Page::Runner(agent.clone())));
     let (target, actor) = (format!("leg:{id}@{agent}"), caller.name.clone());
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, socket).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, socket, sock).await {
             tracing::debug!(error = %format!("{e:#}"), "leg terminal websocket ended");
         }
     });
     Ok(resp)
 }
 
+/// The page a terminal on `target` shows what it can't read on: its runner's (`agent:<name>`, a leg's
+/// `leg:<job>@<name>`); none for the server's own.
+fn terminal_page(target: &str) -> Option<Page> {
+    let runner = target.strip_prefix("agent:").or_else(|| target.strip_prefix("leg:").and_then(|t| t.split_once('@')).map(|(_, m)| m));
+    runner.map(|m| Page::Runner(m.to_owned()))
+}
+
 /// One browser on one session: identity, replay, then live output; input both ways. Closing the
-/// socket only detaches — the shell keeps running for the next attach.
-async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, socket: ws::WebSocket) -> anyhow::Result<()> {
+/// socket only detaches — the shell keeps running for the next attach. What it sends that can't be
+/// read is answered `refused` and noted (`sock`).
+#[allow(clippy::too_many_arguments)]
+async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, socket: ws::WebSocket, sock: ui::Socket) -> anyhow::Result<()> {
     use crate::termsess::{Frame, Input};
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
@@ -4361,15 +4391,27 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
                     }
                     Err(async_broadcast::RecvError::Closed) => return Ok(()),
                 },
-                m = rx.next().fuse() => match m {
-                    Some(Ok(Message::Binary(b))) => session.send(Input::Data(b.to_vec())),
-                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<TerminalUp>(t.as_str()) {
-                        Ok(TerminalUp::Resize { cols, rows }) => session.send(Input::Resize { cols, rows }),
-                        Ok(TerminalUp::Input { data }) => session.send(Input::Data(data.into_bytes())),
-                        Ok(TerminalUp::Ping) | Err(_) => {}
+                m = rx.next().fuse() => match ui::came(m) {
+                    // Keystrokes.
+                    Came::Binary(b) => session.send(Input::Data(b.to_vec())),
+                    Came::Text(t) => match ui::terminal_up(t.as_str()) {
+                        Ok(Up::Frame(TerminalUp::Resize { cols, rows })) => session.send(Input::Resize { cols, rows }),
+                        Ok(Up::Frame(TerminalUp::Input { data })) => session.send(Input::Data(data.into_bytes())),
+                        // It keeps the socket alive; nothing to do.
+                        Ok(Up::Frame(TerminalUp::Ping)) => {}
+                        Ok(Up::Unread(f)) => hub.note_told(&sock, &f).await,
+                        Err(r) => {
+                            hub.note_refused(&sock, &r).await;
+                            tx.send(ws::text(TerminalDown::Refused(r).text())).await?;
+                        }
                     },
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                    _ => {}
+                    Came::Control => {}
+                    Came::Gone => return Ok(()),
+                    Came::Ends { close, refused } => {
+                        hub.note_refused(&sock, &refused).await;
+                        let _ = tx.close(Some(close)).await;
+                        return Ok(());
+                    }
                 },
             }
         }
@@ -5019,17 +5061,19 @@ async fn page_seen(hub: &Arc<Hub>, session: &str, page: &str, req: Request) -> R
 fn stream_ws(hub: Arc<Hub>, id: &str, sid: &str, req: Request) -> R {
     let me = person(&req);
     let live = hub.harness.streams.get(sid).filter(|l| l.session == id && l.for_whom(me.as_deref())).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such stream"))?;
+    // What it can't read shows on its agent's page.
+    let sock = ui::Socket::of(Wire::StreamUp, Wire::StreamDown, &caller_name(&req), Some(Page::Session(id.to_owned())));
     let (resp, upgrade) = ws::accept_limited(req, 1 << 20).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = stream_view(hub, live, socket).await {
+        if let Err(e) = stream_view(hub, live, socket, sock).await {
             tracing::debug!(error = %format!("{e:#}"), "stream websocket ended");
         }
     });
     Ok(resp)
 }
 
-async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, socket: ws::WebSocket) -> anyhow::Result<()> {
+async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, socket: ws::WebSocket, sock: ui::Socket) -> anyhow::Result<()> {
     use crate::harness::streams::ToViewer;
     use crate::harness::webrtc::{Peer, Said};
     use futures::FutureExt as _;
@@ -5068,8 +5112,34 @@ async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, so
                 }
             };
             match next {
-                Next::Socket(Some(Ok(Message::Text(t)))) => {
-                    let up: StreamUp = serde_json::from_str(t.as_str()).unwrap_or_default();
+                Next::Socket(m) => {
+                    let read = match ui::came(m) {
+                        Came::Text(t) => match ui::stream_up(t.as_str()) {
+                            Ok(Up::Frame(up)) => Ok(up),
+                            // A frame that came down that the page couldn't read: noted.
+                            Ok(Up::Unread(f)) => {
+                                hub.note_told(&sock, &f).await;
+                                continue;
+                            }
+                            Err(r) => Err(r),
+                        },
+                        Came::Binary(_) => Err(ui::Refused::binary()),
+                        Came::Control => continue,
+                        Came::Gone => return Ok(()),
+                        Came::Ends { close, refused } => {
+                            hub.note_refused(&sock, &refused).await;
+                            let _ = tx.close(Some(close)).await;
+                            return Ok(());
+                        }
+                    };
+                    let up = match read {
+                        Ok(up) => up,
+                        Err(refused) => {
+                            hub.note_refused(&sock, &refused).await;
+                            tx.send(ws::text(StreamDown::Refused { refused }.text())).await?;
+                            continue;
+                        }
+                    };
                     if let Some(events) = up.input {
                         live.input(&hub, &serde_json::Value::Array(events)).await;
                     }
@@ -5103,8 +5173,6 @@ async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, so
                         live.control(&hub, &serde_json::json!({"keyframe": true})).await;
                     }
                 }
-                Next::Socket(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => return Ok(()),
-                Next::Socket(_) => {}
                 // Connected, it starts from a key frame; one lost, a key frame mends it.
                 Next::Said(Some(Said::Connected)) => {
                     keyed = Some(std::time::Instant::now());
@@ -5147,9 +5215,10 @@ async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, so
     r
 }
 
-/// After a snapshot on an agent session's socket: what was resent is complete
-/// ([`SessionFrame::Synced`], as `synced_is_its_frame` holds it).
-const SYNCED: &str = r#"{"t":"synced"}"#;
+/// After a snapshot on an agent session's socket: what was resent is complete.
+fn synced() -> String {
+    SessionDown::from(SessionFrame::Synced).text()
+}
 
 /// What a viewer of an agent session takes, as its socket's query says.
 #[derive(Debug, Clone, Copy, Default)]
@@ -5207,7 +5276,7 @@ fn pack_snapshot(frames: &[String]) -> std::io::Result<Vec<u8>> {
         gz.write_all(f.as_bytes())?;
         gz.write_all(b"\n")?;
     }
-    gz.write_all(SYNCED.as_bytes())?;
+    gz.write_all(synced().as_bytes())?;
     gz.finish()
 }
 
@@ -5222,7 +5291,7 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
     for f in frames {
         tx.send(ws::text(f)).await?;
     }
-    tx.send(ws::text(SYNCED)).await?;
+    tx.send(ws::text(synced())).await?;
     Ok(())
 }
 
@@ -5257,23 +5326,8 @@ async fn audit_command(hub: &Hub, audit: &mut Option<async_channel::Sender<Strin
     }
 }
 
-/// What a viewer sent, read; or why it couldn't be, with the command's id when that much could be
-/// read.
-fn from_viewer(text: &str) -> Result<SessionUp, (Option<String>, String)> {
-    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| (None, e.to_string()))?;
-    if v.get("t").and_then(serde_json::Value::as_str) != Some("cmd") {
-        return serde_json::from_value(v).map(SessionUp::Bare).map_err(|e| (None, e.to_string()));
-    }
-    let id = v.get("id").and_then(serde_json::Value::as_str).filter(|i| !i.is_empty() && i.len() <= crate::harness::ops::KEY_MAX && !i.chars().any(char::is_control));
-    let Some(id) = id.map(str::to_owned) else {
-        return Err((None, format!("a command's id is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
-    };
-    let Some(c) = v.get("c").cloned() else { return Err((Some(id), "no command (`c`)".into())) };
-    match serde_json::from_value(c) {
-        Ok(c) => Ok(SessionUp::Under { t: crate::wire::ui::Cmd::Cmd, id, c }),
-        Err(e) => Err((Some(id), e.to_string())),
-    }
-}
+/// What a viewer that may watch an agent but not command it is told of a command.
+const WATCHING: &str = "you may watch this agent but not command it: an agent commands only itself and the agents it started";
 
 /// The frame that answers command `cmd` (of `kind`) once `rx` says what became of it.
 fn answer_of(cmd: String, rx: futures::channel::oneshot::Receiver<crate::harness::registry::Sent>, kind: crate::harness::asked::Kind) -> futures::future::BoxFuture<'static, Option<String>> {
@@ -5339,6 +5393,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     use kiln_seams::Bus as _;
     use kiln_seams::bus::Refusal;
     let (mut tx, mut rx) = socket.split();
+    // What it can't read of what its person sends, and what they can't read of what it sends,
+    // shows on the agent's page.
+    let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
     let Some(att) = hub.harness.attach_from(&id, takes.after) else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
@@ -5407,7 +5464,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                                 }
                                 // The session's last frame: the viewer ends with it, and its
                                 // place, given back, lets the topic go.
-                                Some(frame) if frame.text.as_ref() == crate::harness::live::CLOSED => {
+                                Some(frame) if frame.text.as_ref() == crate::harness::live::closed() => {
                                     tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
                                     return Ok(());
                                 }
@@ -5453,19 +5510,17 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 Live::Feedless => start_over = true,
                 Live::Quiet => start_over = viewer.refusals() != refusals,
             },
-            m = rx.next().fuse() => match m {
-                // Watching isn't commanding: refused, under its id when it came under one.
-                Some(Ok(Message::Text(t))) if !acts => {
-                    let why = "you may watch this agent but not command it: an agent commands only itself and the agents it started";
-                    match from_viewer(t.as_str()) {
-                        Ok(SessionUp::Under { id: cmd, .. }) => tx.send(ws::text(crate::harness::asked::nack(Some(&cmd), "refused", why))).await?,
-                        _ => tx.send(ws::text(session_error(why.into()))).await?,
-                    }
-                }
-                // Sent now, in the order the viewer sent them; each answer comes later.
-                Some(Ok(Message::Text(t))) => match from_viewer(t.as_str()) {
-                    // Under its client's id (docs/wire.md, "The UI's sockets"): taken once however
-                    // often it comes, and answered on this socket once, `ack` or `nack`.
+            m = rx.next().fuse() => match ui::came(m) {
+                Came::Text(t) => match ui::session_up(t.as_str()) {
+                    // A frame that came down that the page couldn't read: the server, which sent it,
+                    // notes it.
+                    Ok(SessionUp::Unread(f)) => hub.note_told(&sock, &f).await,
+                    // Watching isn't commanding: refused, under its id when it came under one.
+                    Ok(SessionUp::Under { id: cmd, .. }) if !acts => tx.send(ws::text(crate::harness::asked::nack(Some(&cmd), "refused", WATCHING))).await?,
+                    Ok(SessionUp::Bare(_)) if !acts => tx.send(ws::text(session_error(WATCHING.into()))).await?,
+                    // Sent now, in the order the viewer sent them; each answer comes later. Under
+                    // its client's id (docs/wire.md, "The UI's sockets"): taken once however often
+                    // it comes, and answered on this socket once, `ack` or `nack`.
                     Ok(SessionUp::Under { id: cmd, c, .. }) => {
                         use crate::harness::asked::{Taken, frame};
                         let kind = hub.harness.kind_of(&hub, &id, &c);
@@ -5487,16 +5542,29 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         let (h, session) = (Arc::clone(&hub), id.clone());
                         answers.push(async move { refusal_frame(h.harness.resolve(&h, &session, c, pending).await) }.boxed());
                     }
-                    Err((cmd, why)) => {
-                        // Told as clients from before ids are, too, when it came as theirs do.
-                        if cmd.is_none() {
-                            tx.send(ws::text(session_error(format!("bad command: {why}")))).await?;
+                    // What couldn't be read: noted, and answered `nack`, `unsupported` or
+                    // `malformed`; told as clients from before ids are, too, when it came as theirs do.
+                    Err(u) => {
+                        hub.note_refused(&sock, &u.refused).await;
+                        if u.bare {
+                            tx.send(ws::text(session_error(format!("bad command: {}", u.refused.why)))).await?;
                         }
-                        tx.send(ws::text(crate::harness::asked::unreadable(cmd.as_deref(), &why))).await?;
+                        tx.send(ws::text(crate::harness::asked::unreadable(u.id.as_deref(), u.refused.code, &u.refused.why))).await?;
                     }
                 },
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                _ => {}
+                Came::Binary(_) => {
+                    let r = ui::Refused::binary();
+                    hub.note_refused(&sock, &r).await;
+                    tx.send(ws::text(crate::harness::asked::unreadable(None, r.code, &r.why))).await?;
+                }
+                Came::Control => {}
+                Came::Gone => return Ok(()),
+                // Past its limit (or not a WebSocket frame): noted, and closed as RFC 6455 says.
+                Came::Ends { close, refused } => {
+                    hub.note_refused(&sock, &refused).await;
+                    let _ = tx.close(Some(close)).await;
+                    return Ok(());
+                }
             },
         }
         if start_over {
@@ -5625,11 +5693,6 @@ mod tests {
     }
 
     #[test]
-    fn synced_is_its_frame() {
-        assert_eq!(SYNCED, SessionDown::from(SessionFrame::Synced).text());
-    }
-
-    #[test]
     fn a_packed_snapshot_unpacks_to_its_frames_then_synced() -> anyhow::Result<()> {
         use std::io::Read as _;
         let long = format!(r#"{{"t":"events","events":[{{"id":"e1","text":"{}\nsecond line"}}]}}"#, "word ".repeat(4000));
@@ -5640,8 +5703,8 @@ mod tests {
         let mut text = String::new();
         flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut text)?;
         let lines: Vec<&str> = text.split('\n').collect();
-        let mut want: Vec<&str> = frames.iter().map(String::as_str).collect();
-        want.push(SYNCED);
+        let mut want: Vec<String> = frames.clone();
+        want.push(synced());
         assert_eq!(lines, want);
         Ok(())
     }

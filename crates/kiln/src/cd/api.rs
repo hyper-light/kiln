@@ -85,8 +85,12 @@ fn res_input(p: &str, n: &str, key: &str, q: &HashMap<String, String>, keys: &[&
 }
 
 /// Follows the logs of an object's pods over a WebSocket (docs/cd.md): the pods are found once,
-/// then their lines arrive as they are written (`live::follow`).
-fn follow_logs(cd: Arc<super::Cd>, input: Value, req: Request) -> Result<Response, Fail> {
+/// then their lines arrive as they are written (`live::follow`). What the page sends up that can't
+/// be read is answered `refused` and noted from its person.
+fn follow_logs(hub: Arc<Hub>, cd: Arc<super::Cd>, input: Value, req: Request) -> Result<Response, Fail> {
+    use crate::wire::unread::Wire;
+    let person = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let sock = crate::wire::ui::Socket::of(Wire::LogUp, Wire::LogDown, &person, None);
     let (resp, upgrade) = ws::accept(req).map_err(|r| (r.status, r.reason.to_owned()))?;
     crate::rt::spawn(async move {
         let socket = match upgrade.await {
@@ -114,13 +118,13 @@ fn follow_logs(cd: Arc<super::Cd>, input: Value, req: Request) -> Result<Respons
         };
         match found.await {
             Ok((c, pods, q)) => {
-                if let Err(e) = super::live::follow(c, pods, q, socket).await {
+                if let Err(e) = super::live::follow(&hub, &sock, c, pods, q, socket).await {
                     tracing::debug!(error = %format!("{e:#}"), "a log stream ended");
                 }
             }
             Err((_, e)) => {
                 let (mut tx, _) = socket.split();
-                let _ = tx.send(ws::text(json!({"type": "error", "message": e}).to_string())).await;
+                let _ = tx.send(ws::text(crate::wire::ui::CdLogDown::Error { pod: String::new(), message: e }.text())).await;
                 let _ = tx.close(None).await;
             }
         }
@@ -136,7 +140,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
     let method = req.method().clone();
     if let (&Method::GET, ["apps", p, n, "resources", key, "logs", "ws"]) = (&method, rest) {
         let input = res_input(p, n, key, q, &["container", "pod", "tail_lines", "since_seconds"])?;
-        return follow_logs(cd, input, req);
+        return follow_logs(Arc::clone(hub), cd, input, req);
     }
     let body: Incoming = req.into_body();
     let cx = Cx { hub: hub.clone(), cd, actor: "admin".into() };

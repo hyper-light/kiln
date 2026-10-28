@@ -875,6 +875,46 @@ impl Hub {
         }
     }
 
+    /// What came up a page's socket that couldn't be read (`crate::wire::ui`), noted from whoever's
+    /// on it, on the socket's page. The socket answers it itself, each time, on the socket it came on.
+    pub async fn note_refused(&self, s: &crate::wire::ui::Socket, r: &crate::wire::ui::Refused) {
+        let _ = self.note_unread(s.refused(r), s.page.clone()).await;
+    }
+
+    /// A frame the server sent down a page's socket that the page couldn't read, as the page said
+    /// (`crate::wire::ui::UnreadFrame`): noted, on the socket's page.
+    pub async fn note_told(&self, s: &crate::wire::ui::Socket, f: &crate::wire::ui::UnreadFrame) {
+        let _ = self.note_unread(s.unread(f), s.page.clone()).await;
+    }
+
+    /// What came up a page's socket whose only frame up is `unread` (the events and log sockets): a
+    /// frame the page couldn't read of what came down, noted; anything else noted and answered with
+    /// the socket's `refused` frame (`refused` makes it), or the socket closed, past its limit. True:
+    /// the socket is done.
+    pub async fn unread_only(&self, sock: &crate::wire::ui::Socket, tx: &mut crate::http::ws::Sender, came: crate::wire::ui::Came, refused: impl Fn(crate::wire::ui::Refused) -> String) -> anyhow::Result<bool> {
+        use crate::wire::ui::{Came, Refused};
+        let r = match came {
+            Came::Text(t) => match crate::wire::ui::unread_up(t.as_str()) {
+                Ok(f) => {
+                    self.note_told(sock, &f).await;
+                    return Ok(false);
+                }
+                Err(r) => r,
+            },
+            Came::Binary(_) => Refused::binary(),
+            Came::Control => return Ok(false),
+            Came::Gone => return Ok(true),
+            Came::Ends { close, refused } => {
+                self.note_refused(sock, &refused).await;
+                let _ = tx.close(Some(close)).await;
+                return Ok(true);
+            }
+        };
+        self.note_refused(sock, &r).await;
+        tx.send(crate::http::ws::text(refused(r))).await?;
+        Ok(false)
+    }
+
     /// The audit log's rows a minute for what the wires couldn't read, as they come due.
     pub(crate) async fn tick_unread(&self) {
         let rows = self.refusals.lock().tick();
@@ -2127,6 +2167,14 @@ impl Hub {
             // A streamed page's events (`crate::harness::streams`): to its viewers.
             FromRunner::StreamEvent { stream, event } => {
                 let after = self.harness.streams.event(agent, &stream, event);
+                // What it said of a live page that can't be read went to no viewer: refused to it
+                // (told, if it takes word of it), noted, on its page and the stream's session's.
+                if let Some(r) = after.refused {
+                    use crate::wire::unread::{Page, Unread, Wire};
+                    let session = self.harness.streams.get(&stream).map(|l| Page::Session(l.session.clone()));
+                    let what = if r.of == "text" { "StreamEvent".to_owned() } else { format!("StreamEvent {}", r.of) };
+                    self.refuse_unread(peer, Unread { wire: Wire::RunnerPayload, from: self.sender_of(peer), what, code: r.code, why: r.why }, session, true).await;
+                }
                 // A recording that ended: its files kept in kiln's store of bytes.
                 if let Some((session, rec)) = after.ended {
                     self.harness.streams.keep(self, session, rec);
