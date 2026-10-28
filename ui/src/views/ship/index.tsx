@@ -182,6 +182,8 @@ function ShipList() {
 function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
   const c = item.head;
   const [riders, setRiders] = React.useState(false);
+  // Each press of the Diff (Review) button, counted, so a press with the row open asks again.
+  const [reveal, setReveal] = React.useState(0);
   // One environment flag: production when it runs there, else the first it runs in.
   const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
   const n = item.riders.length;
@@ -228,7 +230,14 @@ function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; o
             <span className="ship-sha">{c.short}</span>
           </span>
         </span>
-        <Actions commit={c} reload={reload} onReview={() => onOpen(true)} />
+        <Actions
+          commit={c}
+          reload={reload}
+          onReview={() => {
+            onOpen(true);
+            setReveal((n) => n + 1);
+          }}
+        />
         <button type="button" className="ship-go" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${c.short}`} onClick={() => onOpen(!open)}>
           <ChevronDown size={16} />
         </button>
@@ -251,7 +260,7 @@ function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; o
           ))}
         </ul>
       )}
-      {open && <Dropdown commit={c} />}
+      {open && <Dropdown commit={c} reveal={reveal} />}
     </li>
   );
 }
@@ -305,13 +314,42 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
   );
 }
 
+/**
+ * Brings the dropdown's Files into view and focuses it (the Diff button, Changes plan
+ * 01a17bd748ff73d98f09996ecdc6873d step 4): at once if Review has drawn it, else as soon as it
+ * does, past its loading. The item's diff lives in one place, Review's Files (Ada, 2026-10-27).
+ */
+function showFiles(open: HTMLElement): (() => void) | undefined {
+  const show = () => {
+    const files = open.querySelector<HTMLElement>('section[aria-label="Files"]');
+    if (!files) return false;
+    if (!files.hasAttribute("tabindex")) files.tabIndex = -1;
+    files.scrollIntoView({ block: "start", behavior: document.documentElement.dataset.motion === "paused" ? "auto" : "smooth" });
+    files.focus({ preventScroll: true });
+    return true;
+  };
+  if (show()) return undefined;
+  const watch = new MutationObserver(() => {
+    if (show()) watch.disconnect();
+  });
+  watch.observe(open, { childList: true, subtree: true });
+  // Not drawn within 15 s: stop waiting (its section says why when it comes).
+  const timer = window.setTimeout(() => watch.disconnect(), 15_000);
+  return () => {
+    watch.disconnect();
+    window.clearTimeout(timer);
+  };
+}
+
 /** An item's dropdown, in its order: Files (with the Conversation), Output, Jobs, Lanes. */
-function Dropdown({ commit }: { commit: ShipCommit }) {
+function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
   // The picked job card: yours once you click one, else the cards' rule; Output shows its job.
   const [stage, setStage] = React.useState<string | null>(null);
   const shown = stage ?? firstStage(commit);
+  // A Diff press (reveal counts them) brings Files into view; opening the row any other way doesn't.
+  const files = React.useCallback((el: HTMLDivElement | null) => (el && reveal > 0 ? showFiles(el) : undefined), [reveal]);
   return (
-    <div className="ship-open">
+    <div className="ship-open" ref={files}>
       {/* Dropdown boundary agreed with the Ship agent 01a1748c, 2026-10-26 20:28 PDT (NOTES.md):
           Files (with the Conversation) first, owned by Review. */}
       <ReviewFiles item={commit} />

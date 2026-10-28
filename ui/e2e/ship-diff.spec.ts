@@ -1,0 +1,38 @@
+/**
+ * The Diff button (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 4), against the mock's fixed
+ * rows. An item's diff lives in one place, Review's Files first in its dropdown (Ada, 2026-10-27):
+ * a change's Review opens its row in place and brings that Files into view, focused, without leaving
+ * /ship; opening a row any other way leaves the page where it is.
+ */
+import { expect, test } from "@playwright/test";
+
+const REAL = !!process.env.E2E_BASE_URL;
+test.skip(REAL, "drives the mock's commits");
+
+test("a change's Review opens its row at its one Files section, in view and focused, on /ship", async ({ page }) => {
+  await page.goto("/ship");
+  const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
+  await expect(row).toBeVisible({ timeout: 15_000 });
+  await row.getByRole("button", { name: "Review", exact: true }).click();
+  await expect(row.locator(".ship-go")).toHaveAttribute("aria-expanded", "true");
+  const files = row.locator('section[aria-label="Files"]');
+  await expect(files).toHaveCount(1);
+  await expect(files).toBeInViewport();
+  await expect(files).toBeFocused();
+  expect(new URL(page.url()).pathname).toBe("/ship");
+});
+
+test("opening a row by its chevron leaves the page where it is", async ({ page }) => {
+  await page.goto("/ship");
+  const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
+  await expect(row).toBeVisible({ timeout: 15_000 });
+  // The chevron in view first (a click would scroll to it), so what's measured is the app's own move.
+  const chevron = row.locator(".ship-go");
+  await chevron.scrollIntoViewIfNeeded();
+  const before = await page.evaluate(() => window.scrollY);
+  await chevron.click();
+  const files = row.locator('section[aria-label="Files"]');
+  await expect(files).toHaveCount(1);
+  await expect(files).not.toBeFocused();
+  expect(await page.evaluate(() => window.scrollY)).toBe(before);
+});

@@ -495,3 +495,12 @@
   font-variant-numeric: tabular-nums;
   text-align: end;
 }
+
+/* The Diff button brings Files into view below the page's sticky header (Changes plan step 4); the
+   focus ring shows for the keyboard, not after a click. */
+.ship-open section[aria-label="Files"] {
+  scroll-margin-top: calc(var(--header-h, 64px) + 12px);
+}
+.ship-open section[aria-label="Files"]:focus:not(:focus-visible) {
+  outline: none;
+}

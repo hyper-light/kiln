@@ -29,6 +29,8 @@ for (const width of [1280, 1000, 800, 600, 390]) {
     const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
     await row.getByRole("button", { name: /^Open / }).click();
     await expect(row.locator(".ship-output .xterm")).toBeVisible({ timeout: 15_000 });
+    // Review's Files above it drawn first: what's measured is lines arriving, not Files finishing its load.
+    await expect(row.locator('section[aria-label="Files"]')).toBeVisible({ timeout: 15_000 });
     const first = await measure(row);
     expect(first).not.toBeNull();
     expect(Math.abs((first?.width ?? 0) - (first?.lanes ?? 0))).toBeLessThanOrEqual(1);
