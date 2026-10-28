@@ -1,7 +1,9 @@
 /**
- * A commit's own page (Commit page plan 01a175b7f26e724d9159b4120a514fee, step 1), against the mock's
- * fixed rows: an opened row's Commit link leads to /ship/{owner}/{name}/{sha}, which loads; every
- * commit Ship lists has its page; one kiln doesn't know says so instead of breaking.
+ * A commit's own page (Commit page plan 01a175b7f26e724d9159b4120a514fee), against the mock's fixed
+ * rows: an opened row's Commit link leads to /ship/{owner}/{name}/{sha}, which loads; every commit
+ * Ship lists has its page; one kiln doesn't know says so instead of breaking (step 1). A failing
+ * commit shows what failed before anything else, then its six stage cards and its trace, failures
+ * first; one nothing failed in starts at its stages (step 2).
  */
 import { expect, test } from "@playwright/test";
 
@@ -35,4 +37,33 @@ test("every commit Ship lists has its page, and one kiln doesn't know says so", 
   }
   await page.goto("/ship/hyper-light/kiln/0000000000000000000000000000000000000000");
   await expect(page.getByRole("alert")).toContainText("Couldn't load the commit");
+});
+
+/** The page of the listed commit with this message (the first, newest, when two share it). */
+const pageOf = async (page: import("@playwright/test").Page, message: string) => {
+  const list = (await (await page.request.get("/api/ship/commits")).json()) as { commits: { repo: string; sha: string; message: string }[] };
+  const c = list.commits.find((x) => x.message === message);
+  if (!c) throw new Error(`no commit "${message}"`);
+  await page.goto(`/ship/${c.repo}/${c.sha}`);
+  const commit = page.getByRole("region", { name: "Commit" });
+  return { commit, sections: commit.locator(":scope > section") };
+};
+
+test("a failing commit shows what failed before anything else, then its stages and its trace, failures first", async ({ page }) => {
+  const { commit, sections } = await pageOf(page, "sync: a move carries its homes");
+  await expect(sections.first()).toHaveAttribute("aria-label", "Errors", { timeout: 15_000 });
+  const errors = commit.getByRole("region", { name: "Errors" });
+  await expect(errors).toContainText("rust lint + test");
+  await expect(errors).toContainText("assertion failed in sync::reconnect");
+  await expect(errors.getByRole("link", { name: "Its log" })).toHaveAttribute("href", /\/runs\/[^/]+\/jobs\/[^/]+$/);
+  await expect(sections.nth(1)).toHaveAttribute("aria-label", "Stages");
+  await expect(commit.getByRole("region", { name: "Stages" }).locator(".ship-job")).toHaveCount(6);
+  await expect(sections.nth(2)).toHaveAttribute("aria-label", "Trace");
+  await expect(commit.getByRole("region", { name: "Trace" }).locator(".ship-lane__name").first()).toContainText("rust lint + test");
+});
+
+test("a commit nothing failed in starts at its stages", async ({ page }) => {
+  const { commit, sections } = await pageOf(page, "deploy: a rollback holds");
+  await expect(sections.first()).toHaveAttribute("aria-label", "Stages", { timeout: 15_000 });
+  await expect(commit.getByRole("region", { name: "Errors" })).toHaveCount(0);
 });

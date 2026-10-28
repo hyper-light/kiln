@@ -331,6 +331,22 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
                 {
                   pipeline: "ci",
                   legs: [
+                    // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
+                    // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
+                    ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
+                      ? [
+                          {
+                            name: row.line.split(" · ")[0] ?? "checks",
+                            state: "failed",
+                            attempts: 2,
+                            note: row.line.split(" · ").slice(1).join(" · "),
+                            job: live.job,
+                            run: live.run,
+                            start: T0 - 900,
+                            end: T0 - 840,
+                          },
+                        ]
+                      : []),
                     {
                       name: live.name,
                       state: live.state === "running" ? "running" : "passed",

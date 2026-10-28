@@ -523,3 +523,44 @@
   margin: 0;
   font-size: 0.8125rem;
 }
+
+/* The commit page's sections (its step 2): what failed first, the six stage cards, the trace. */
+.ship-commit .ship-sec > h2 {
+  margin: 0 0 8px;
+  color: #e4e5e9;
+  font-size: 13px;
+  font-weight: 500;
+}
+.ship-commit__errors {
+  border-color: rgb(229 115 115 / 0.45);
+}
+.ship-commit__errors ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__error-name {
+  color: #e4e5e9;
+  font-weight: 500;
+}
+.ship-commit__error-stage,
+.ship-commit__error-note {
+  color: #a1a4ad;
+  overflow-wrap: anywhere;
+}
+.ship-commit__stages {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}

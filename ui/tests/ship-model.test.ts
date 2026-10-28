@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { fold, keyOf, order, pickCard, shipGroups, standWord, strip } from "../src/views/ship/model.ts";
+import { failuresOf, fold, keyOf, order, pickCard, shipGroups, standWord, strip, traceOf } from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -138,4 +138,59 @@ test("an open row never folds: not under the approval it rides with, nor into a 
     ["s2", []],
   ]);
   assert.ok(open.has("r/rider") && open.has("r/s2"));
+});
+
+test("the commit page's Errors: every failing leg with its log, then each platform, deploy and runner that failed", () => {
+  const detail = {
+    ...c("f1", "needs_you"),
+    checks: [
+      {
+        pipeline: "ci",
+        legs: [
+          { name: "lint", state: "passed", attempts: 1, note: "" },
+          { name: "rust lint + test", state: "failed", attempts: 2, note: "assertion failed", job: "j9", run: "r9" },
+          { name: "flaky", state: "error", attempts: 1, note: "runner lost", run: "r9" },
+        ],
+      },
+    ],
+    build: {
+      platforms: [
+        { name: "linux/amd64", state: "failed" as const },
+        { name: "macos/arm64", state: "passed" as const },
+      ],
+      image: { state: "queued" as const, digest: null },
+    },
+    deployments: [{ environment: "staging", production: false, state: "failure", description: "health check failed", at: 300 }],
+    replant: [{ name: "adacachy", state: "failed", why: "upgrade refused" }],
+  };
+  assert.deepEqual(failuresOf(detail), [
+    { stage: "checks", name: "rust lint + test", note: "assertion failed", href: "/runs/r9/jobs/j9" },
+    { stage: "checks", name: "flaky", note: "runner lost", href: "/runs/r9" },
+    { stage: "build", name: "linux/amd64", note: "", href: null },
+    { stage: "staging", name: "staging", note: "health check failed", href: null },
+    { stage: "replant", name: "adacachy", note: "upgrade refused", href: null },
+  ]);
+  assert.deepEqual(failuresOf(c("ok", "shipped")), []);
+});
+
+test("the commit page's trace: every lane of every group, failures first, then by when it started", () => {
+  const spans = traceOf([
+    { group: "review", label: "Review", state: "passed", note: "", lanes: [{ id: "m1", name: "v1 · pushed", state: "passed", start: 10, end: 10 }] },
+    {
+      group: "checks",
+      label: "Checks",
+      state: "failed",
+      note: "",
+      lanes: [
+        { id: "ci/lint", name: "lint", state: "passed", start: 20, end: 30 },
+        { id: "ci/test", name: "test", state: "failed", start: 25, end: 40 },
+        { id: "ci/later", name: "later", state: "queued", start: null, end: null },
+      ],
+    },
+  ]);
+  assert.deepEqual(
+    spans.map((x) => x.name),
+    ["Checks · test", "Review · v1 · pushed", "Checks · lint", "Checks · later"],
+  );
+  assert.equal(spans[0]?.id, "checks/ci/test");
 });

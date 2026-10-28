@@ -196,6 +196,9 @@ export function standCounts(commits: readonly ShipCommit[]): Record<ShipShown, n
 const UNDER_WAY = new Set(["running", "soaking", "guard", "replanting"]);
 const FELL = new Set(["failed", "error", "rolledback", "partial"]);
 
+/** Whether a state is a failure: failed, kiln's own error, rolled back, partly. */
+export const fell = (state: string) => FELL.has(state);
+
 /**
  * The card picked first, as kiln's stepToShow picks a step: the running one, else the one that
  * failed, else the last that ran (the first when none has).
@@ -242,4 +245,41 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
       .map((d) => ({ id: `${d.environment}@${d.at}`, name: d.environment, state: DEPLOY_GLYPH[d.state ?? ""] ?? "none", start: d.at, end: d.at, ...(d.description ? { note: d.description } : {}) }));
   const group = (stage: Stage, lanes: ShipLane[]): ShipLaneGroup => ({ group: stage, label: STAGE_WORD[stage], state: pip(stage), note: "", lanes });
   return [group("land", []), group("checks", legs), group("build", build), group("staging", deploys(false)), group("production", deploys(true)), group("replant", replant)];
+}
+
+/** What failed in a commit, each with its stage, its words and where its log is (the commit page's Errors, its step 2). */
+export interface Failure {
+  stage: Stage;
+  name: string;
+  note: string;
+  /** Its job's page, or its run's; null where it has no log of its own. */
+  href: string | null;
+}
+
+/** Everything that failed: each Checks leg, the build's platforms and image, each deploy, each runner replanted. */
+export function failuresOf(detail: ShipDetail): Failure[] {
+  const legs = (detail.checks ?? []).flatMap((c) =>
+    c.legs.filter((l) => fell(l.state)).map((l): Failure => ({ stage: "checks", name: l.name, note: l.note, href: l.run && l.job ? `/runs/${l.run}/jobs/${l.job}` : l.run ? `/runs/${l.run}` : null })),
+  );
+  const built = detail.build;
+  const build: Failure[] = built
+    ? [...built.platforms.filter((p) => p.state === "failed").map((p) => p.name), ...(built.image.state === "failed" ? ["image"] : [])].map((name) => ({ stage: "build", name, note: "", href: null }))
+    : [];
+  const deploys = (detail.deployments ?? [])
+    .filter((d) => fell(DEPLOY_GLYPH[d.state ?? ""] ?? "none"))
+    .map((d): Failure => ({ stage: d.production ? "production" : "staging", name: d.environment, note: d.description ?? "", href: null }));
+  const runners = (detail.replant ?? []).filter((r) => fell(r.state)).map((r): Failure => ({ stage: "replant", name: r.name, note: r.why, href: null }));
+  return [...legs, ...build, ...deploys, ...runners];
+}
+
+/** One span of the commit's trace: a lane, named with its group. */
+export type Span = ShipLane & { group: string };
+
+/** Every lane of every group as one trace, failures first, then by when each started (those not yet started last). */
+export function traceOf(groups: readonly ShipLaneGroup[]): Span[] {
+  const spans = groups.flatMap((g) => g.lanes.map((l): Span => ({ ...l, id: `${g.group}/${l.id}`, name: `${g.label} · ${l.name}`, group: g.group })));
+  return spans
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => Number(fell(b.s.state)) - Number(fell(a.s.state)) || (a.s.start ?? Infinity) - (b.s.start ?? Infinity) || a.i - b.i)
+    .map((x) => x.s);
 }
