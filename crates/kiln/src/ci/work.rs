@@ -44,6 +44,12 @@
 //! conflict, and a conflict has the entry judged again on all its runs ([`verdict`]): a unit whose
 //! outputs differ is marked nondeterministic ([`nondeterministic`]), and an entry in doubt has its
 //! lineage quarantined ([`quarantined`]), which lookups pass over.
+//!
+//! The one path is written once over [`ledger::Rows`] (W24-R02): it runs on kiln's `work_records`
+//! table (a connection to kiln's store is `Rows`) or on the `Records` seam ([`ledger::OnRecords`]),
+//! and decides alike on either.
+
+pub mod ledger;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +65,7 @@ use kiln_ci::work::tests as test_results;
 use kiln_ci::work::tests::{Binary, Choice, Context, Kept, Marks, Ran};
 use kiln_ci::work::trust::{self, Comparison, Domain, Found, Outcome, Passed, Quotas, Usage};
 use kiln_ci::work::verify::{self, Verdict};
+use ledger::{Audit, Rows};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +101,9 @@ pub enum Family {
 }
 
 impl Family {
+    /// Every family, in order.
+    pub const ALL: [Family; 10] = [Family::Result, Family::Weak, Family::PathSet, Family::Snapshot, Family::Lane, Family::Test, Family::EClass, Family::Object, Family::Verify, Family::Entry];
+
     pub fn name(self) -> &'static str {
         match self {
             Family::Result => "work.result",
@@ -234,27 +244,27 @@ fn weak_prefix(scope: &str, weak: &Key) -> String {
 }
 
 /// A weak key's path sets, by digest, newest first.
-pub fn path_sets(c: &Connection, scope: &str, weak: &Key) -> rusqlite::Result<Vec<String>> {
+pub fn path_sets(c: &dyn Rows, scope: &str, weak: &Key) -> anyhow::Result<Vec<String>> {
     listed(c, Family::Weak, &weak_prefix(scope, weak))
 }
 
 /// The path sets listed under `prefix`, newest first.
-fn listed(c: &Connection, family: Family, prefix: &str) -> rusqlite::Result<Vec<String>> {
-    Ok(scan(c, family, prefix)?.into_iter().map(|(_, id, _)| String::from_utf8_lossy(&id).into_owned()).collect())
+fn listed(c: &dyn Rows, family: Family, prefix: &str) -> anyhow::Result<Vec<String>> {
+    Ok(c.scan(family, prefix)?.into_iter().map(|(_, id, _)| String::from_utf8_lossy(&id).into_owned()).collect())
 }
 
 /// Lists a path set under `prefix` as the newest, keeping the newest [`PATH_SETS`].
-fn list(c: &Connection, family: Family, prefix: &str, id: &str) -> rusqlite::Result<()> {
-    let next = scan(c, family, prefix)?.first().map_or(1, |(_, _, at)| at + 1);
-    put(c, family, &format!("{prefix}{id}"), id.as_bytes(), next)?;
-    for (old, _, _) in scan(c, family, prefix)?.iter().skip(PATH_SETS) {
-        delete(c, family, old)?;
+fn list(c: &dyn Rows, family: Family, prefix: &str, id: &str) -> anyhow::Result<()> {
+    let next = c.scan(family, prefix)?.first().map_or(1, |(_, _, at)| at + 1);
+    c.put(family, &format!("{prefix}{id}"), id.as_bytes(), next)?;
+    for (old, _, _) in c.scan(family, prefix)?.iter().skip(PATH_SETS) {
+        c.delete(family, old)?;
     }
     Ok(())
 }
 
-fn path_set(c: &Connection, id: &str) -> anyhow::Result<Option<PathSet>> {
-    Ok(get(c, Family::PathSet, id)?.map(|set| serde_json::from_slice(&set)).transpose()?)
+fn path_set(c: &dyn Rows, id: &str) -> anyhow::Result<Option<PathSet>> {
+    Ok(c.get(Family::PathSet, id)?.map(|set| serde_json::from_slice(&set)).transpose()?)
 }
 
 /// How the ledger keys a unit (W24-R30): the one path [`record`] and [`lookup`] share, as Dagger's
@@ -272,8 +282,8 @@ pub struct Keyed {
 
 /// Keys a unit in `scope` (W24-R30): its weak key, and its canonical form's under the rules
 /// registered for the scope and the classes its upstream units named by key are in now.
-pub fn keyed(c: &Connection, scope: &str, unit: &Unit) -> anyhow::Result<Keyed> {
-    let (rules, rows) = (rules(c, scope)?, Rows { c, scope });
+pub fn keyed(c: &dyn Rows, scope: &str, unit: &Unit) -> anyhow::Result<Keyed> {
+    let (rules, rows) = (rules(c, scope)?, ClassRows { c, scope });
     let mut held = BTreeMap::new();
     for k in unit.upstream.values().filter_map(|v| eclass::reference(v)) {
         if let Some(m) = rows.entry(&k)? {
@@ -329,9 +339,9 @@ fn verify_prefix(scope: &str, strong: &Key) -> String {
 }
 
 /// The reproductions beside an entry, each runner once (W24-R23).
-fn reproductions(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Vec<Verification>> {
+fn reproductions(c: &dyn Rows, scope: &str, strong: &Key) -> anyhow::Result<Vec<Verification>> {
     let mut out: Vec<Verification> = Vec::new();
-    for (_, v, _) in scan(c, Family::Verify, &format!("{}by|", verify_prefix(scope, strong)))? {
+    for (_, v, _) in c.scan(Family::Verify, &format!("{}by|", verify_prefix(scope, strong)))? {
         let v: Verification = serde_json::from_slice(&v)?;
         if !out.iter().any(|o| o.runner == v.runner) {
             out.push(v);
@@ -341,7 +351,7 @@ fn reproductions(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Ve
 }
 
 /// The runners that produced an entry: the one that recorded it, then each that reproduced it.
-fn runners(c: &Connection, scope: &str, strong: &Key, entry: &Recorded) -> anyhow::Result<Vec<String>> {
+fn runners(c: &dyn Rows, scope: &str, strong: &Key, entry: &Recorded) -> anyhow::Result<Vec<String>> {
     let mut out = vec![entry.provenance.runner.clone()];
     for v in reproductions(c, scope, strong)? {
         if !out.contains(&v.runner) {
@@ -353,16 +363,14 @@ fn runners(c: &Connection, scope: &str, strong: &Key, entry: &Recorded) -> anyho
 
 /// A row of the audit log (W19-R05) for what the ledger refused or passed over as a breach of the
 /// trust rules (W24-R21, AC06). It's no request's, so it's a row of its own.
-fn audit(c: &Connection, principal: &str, action: &str, target: &str, detail: &str) -> rusqlite::Result<()> {
+fn audit(c: &dyn Rows, principal: &str, action: &str, target: &str, detail: &str) -> anyhow::Result<()> {
     audit_as(c, principal, action, target, "refused", detail)
 }
 
 /// A row of the audit log with how it ended: what the ledger did on its own (W24-R23's
 /// quarantines) says so there, and why.
-fn audit_as(c: &Connection, principal: &str, action: &str, target: &str, result: &str, detail: &str) -> rusqlite::Result<()> {
-    let principal = if principal.is_empty() { "kiln" } else { principal };
-    c.execute("INSERT INTO audit2 (ts, principal, action, target, result, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![crate::util::now_unix(), principal, action, target, result, detail])?;
-    Ok(())
+fn audit_as(c: &dyn Rows, principal: &str, action: &str, target: &str, result: &str, detail: &str) -> anyhow::Result<()> {
+    c.audit(Audit { principal: principal.to_owned(), action: action.to_owned(), target: target.to_owned(), result: result.to_owned(), detail: detail.to_owned() })
 }
 
 /// Why `result` isn't `scope`'s to take (W24-R21), when it isn't.
@@ -396,7 +404,7 @@ fn refusal(scope: &str, result: &Recorded) -> Option<String> {
 /// With a [`Seal`] (W24-R22), the result's runner signature is checked against the key the server
 /// knows for its runner, a bad one refused (and audited), and the result countersigned into the
 /// scope before it's kept, as an entry or as a reproduction beside one.
-pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Written> {
+pub fn write(c: &dyn Rows, seal: Option<&Seal>, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Written> {
     let refuse = |why: String| -> anyhow::Result<Written> {
         let p = &result.provenance;
         audit(c, &p.runner, "work.record", scope, &format!("{why} (run {}, leg {}, attempt {})", p.run, p.leg, p.attempt))?;
@@ -406,68 +414,77 @@ pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read
     if let Some(why) = refusal(scope, result) {
         return refuse(why);
     }
-    let tx = crate::store::tx(c)?;
-    let keyed = keyed(&tx, scope, unit)?;
+    let mut out = None;
+    c.atomically(&mut |tx| {
+        out = Some(write_in(tx, seal, scope, unit, read, result)?);
+        Ok(())
+    })?;
+    match out {
+        Some(Ok(written)) => Ok(written),
+        // Nothing of it is kept: the transaction wrote nothing before the audit log says why.
+        Some(Err(why)) => refuse(why),
+        None => anyhow::bail!("the work ledger's transaction ended without its write"),
+    }
+}
+
+/// [`write`]'s transaction: what it wrote, or (before writing anything) why a signature refuses it.
+fn write_in(tx: &dyn Rows, seal: Option<&Seal>, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Result<Written, String>> {
+    let keyed = keyed(tx, scope, unit)?;
     let weak = &keyed.weak;
     let strong = key::strong(weak, read);
     let result = match seal {
         None => Cow::Borrowed(result),
         Some(seal) => match seal.countersign(scope, &strong, result)? {
             Ok(signatures) => Cow::Owned(Recorded { signatures, ..result.clone() }),
-            Err(why) => {
-                // Nothing of it is kept: the transaction is let go before the audit log says why.
-                drop(tx);
-                return refuse(why);
-            }
+            Err(why) => return Ok(Err(why)),
         },
     };
     let result = result.as_ref();
     let now = crate::util::now_unix();
     let set = serde_json::to_vec(read)?;
     let id = crate::util::sha256_hex(&set);
-    put(&tx, Family::PathSet, &id, &set, now)?;
-    list(&tx, Family::Weak, &weak_prefix(scope, weak), &id)?;
+    tx.put(Family::PathSet, &id, &set, now)?;
+    list(tx, Family::Weak, &weak_prefix(scope, weak), &id)?;
     let at = format!("{scope}{}", strong.hex());
     let entry = Recorded { verified_by: Vec::new(), ..result.clone() };
-    let written = if put_new(&tx, Family::Result, &at, &serde_json::to_vec(&entry)?, now)? {
+    let written = if tx.put_new(Family::Result, &at, &serde_json::to_vec(&entry)?, now)? {
         Written::New(strong)
     } else {
-        let kept = get(&tx, Family::Result, &at)?.ok_or_else(|| anyhow::anyhow!("{strong}'s entry went while it was recorded again"))?;
+        let kept = tx.get(Family::Result, &at)?.ok_or_else(|| anyhow::anyhow!("{strong}'s entry went while it was recorded again"))?;
         let kept: Recorded = serde_json::from_slice(&kept)?;
         let p = &result.provenance;
         let verification = |kind: &str, comparison: Option<Comparison>, evidence: Option<Recorded>| Verification { kind: kind.to_owned(), runner: p.runner.clone(), run: p.run.clone(), leg: p.leg.clone(), attempt: p.attempt, at: now, comparison, result: evidence };
         match trust::compare(&kept.outcome(), &result.outcome()) {
             Comparison::Same => {
-                let known = runners(&tx, scope, &strong, &kept)?;
+                let known = runners(tx, scope, &strong, &kept)?;
                 let by_another = !p.runner.is_empty() && !known.contains(&p.runner);
                 if by_another {
                     let reproduced = Recorded { verified_by: Vec::new(), ..result.clone() };
-                    put(&tx, Family::Verify, &format!("{}by|{}", verify_prefix(scope, &strong), p.runner), &serde_json::to_vec(&verification("reproduced", Some(Comparison::Same), Some(reproduced)))?, now)?;
+                    tx.put(Family::Verify, &format!("{}by|{}", verify_prefix(scope, &strong), p.runner), &serde_json::to_vec(&verification("reproduced", Some(Comparison::Same), Some(reproduced)))?, now)?;
                     // A reproduction of an entry already in doubt tells nondeterminism from corruption.
-                    if !conflicts(&tx, scope, &strong)?.is_empty() {
-                        judge_again(&tx, scope, weak, &strong)?;
+                    if !conflicts(tx, scope, &strong)?.is_empty() {
+                        judge_again(tx, scope, weak, &strong)?;
                     }
                 }
                 // The newest run that gave the same result is the entry's current one (its leg,
                 // its time, its notes), kept beside it apart from the runners that verified it,
                 // so it never counts as one of them (W24-R30).
                 let fresh = Recorded { verified_by: Vec::new(), ..result.clone() };
-                put(&tx, Family::Verify, &format!("{}fresh", verify_prefix(scope, &strong)), &serde_json::to_vec(&verification("fresh", Some(Comparison::Same), Some(fresh)))?, now)?;
+                tx.put(Family::Verify, &format!("{}fresh", verify_prefix(scope, &strong)), &serde_json::to_vec(&verification("fresh", Some(Comparison::Same), Some(fresh)))?, now)?;
                 Written::Reproduced { strong, by_another }
             }
             comparison => {
                 let evidence = Recorded { verified_by: Vec::new(), ..result.clone() };
                 let row = format!("{}conflict|{}|{}|{}|{}", verify_prefix(scope, &strong), p.runner, p.run, p.leg, p.attempt);
-                put(&tx, Family::Verify, &row, &serde_json::to_vec(&verification("conflict", Some(comparison.clone()), Some(evidence)))?, now)?;
+                tx.put(Family::Verify, &row, &serde_json::to_vec(&verification("conflict", Some(comparison.clone()), Some(evidence)))?, now)?;
                 tracing::warn!(scope, strong = %strong, ?comparison, run = %p.run, leg = %p.leg, "a result differs from the entry its key holds; the entry stands (W24-R22)");
-                let verdict = judge_again(&tx, scope, weak, &strong)?;
+                let verdict = judge_again(tx, scope, weak, &strong)?;
                 Written::Conflict { strong, comparison, verdict }
             }
         }
     };
-    join(&mut Rows { c: &tx, scope }, &keyed, &strong, read, &id, &result.domain, &digest(result), layer(unit.kind))?;
-    tx.commit()?;
-    Ok(written)
+    join(&mut ClassRows { c: tx, scope }, &keyed, &strong, read, &id, &result.domain, &digest(result), layer(unit.kind))?;
+    Ok(Ok(written))
 }
 
 /// [`write`], for callers that only need the strong key (W24-R22). A new entry and a reproduction
@@ -475,7 +492,7 @@ pub fn write(c: &Connection, seal: Option<&Seal>, scope: &str, unit: &Unit, read
 /// a refusal (not the scope's to take, audited) are errors saying so, so a caller that kept the
 /// result elsewhere too (W08-R10's own table) learns it isn't the one reused here. It neither
 /// signs nor checks signatures: it's W08-R10's leg reuse, which no runner signs yet.
-pub fn record(c: &Connection, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Key> {
+pub fn record(c: &dyn Rows, scope: &str, unit: &Unit, read: &PathSet, result: &Recorded) -> anyhow::Result<Key> {
     match write(c, None, scope, unit, read, result)? {
         Written::New(strong) | Written::Reproduced { strong, .. } => Ok(strong),
         Written::Conflict { strong, comparison, verdict } => anyhow::bail!("{strong} already holds another result ({comparison:?}); entries are never overwritten (W24-R22), and it's judged again: {}", verdict.why()),
@@ -499,7 +516,7 @@ pub fn layer(kind: kiln_ci::work::key::Kind) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn join(rows: &mut Rows, keyed: &Keyed, strong: &Key, read: &PathSet, set: &str, writer: &str, produced: &str, layer: &str) -> anyhow::Result<()> {
+fn join(rows: &mut ClassRows, keyed: &Keyed, strong: &Key, read: &PathSet, set: &str, writer: &str, produced: &str, layer: &str) -> anyhow::Result<()> {
     match eclass::producing(strong, rows.entry(strong)?.as_ref(), writer, produced) {
         Ok(member) => rows.place(strong, &Placed { member, source: None })?,
         // Its unit produced other outputs before, or its class holds others: the class splits
@@ -592,12 +609,12 @@ pub struct Lookup {
 
 /// The entries a weak key's path sets lead to in `scope`, newest first, each with the strong key
 /// that found it, until `take` says which to stop at.
-fn candidates(c: &Connection, scope: &str, weak: &Key, now: &dyn Fn(&PathSet) -> PathSet, take: &mut dyn FnMut(Key, Recorded) -> anyhow::Result<Option<Hit>>) -> anyhow::Result<Option<Hit>> {
+fn candidates(c: &dyn Rows, scope: &str, weak: &Key, now: &dyn Fn(&PathSet) -> PathSet, take: &mut dyn FnMut(Key, Recorded) -> anyhow::Result<Option<Hit>>) -> anyhow::Result<Option<Hit>> {
     for id in path_sets(c, scope, weak)? {
-        let Some(set) = get(c, Family::PathSet, &id)? else { continue };
+        let Some(set) = c.get(Family::PathSet, &id)? else { continue };
         let recorded: PathSet = serde_json::from_slice(&set)?;
         let strong = key::strong(weak, &now(&recorded));
-        if let Some(found) = get(c, Family::Result, &format!("{scope}{}", strong.hex()))?
+        if let Some(found) = c.get(Family::Result, &format!("{scope}{}", strong.hex()))?
             && let Some(hit) = take(strong, serde_json::from_slice(&found)?)?
         {
             return Ok(Some(hit));
@@ -613,7 +630,7 @@ fn candidates(c: &Connection, scope: &str, weak: &Key, now: &dyn Fn(&PathSet) ->
 /// verify. A quarantined entry is passed over (W24-R23). A breach of the trust rules is audited
 /// (AC06).
 #[allow(clippy::too_many_arguments)]
-fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reader: &Domain, weak: &Key, strong: Key, mut entry: Recorded) -> anyhow::Result<Result<Hit, Passed>> {
+fn judge(c: &dyn Rows, seal: Option<&Seal>, scope: &str, domain: &Domain, reader: &Domain, weak: &Key, strong: Key, mut entry: Recorded) -> anyhow::Result<Result<Hit, Passed>> {
     let named = runners(c, scope, &strong, &entry)?;
     let mut keyed = Vec::new();
     let mut verdict = Ok(());
@@ -641,7 +658,7 @@ fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, read
     entry.verified_by = named.into_iter().skip(1).collect();
     // The newest run that gave the same result stands for the entry now: its leg, its time, its
     // notes. What it produced is the entry's (W24-R30).
-    if let Some(v) = get(c, Family::Verify, &format!("{}fresh", verify_prefix(scope, &strong)))?
+    if let Some(v) = c.get(Family::Verify, &format!("{}fresh", verify_prefix(scope, &strong)))?
         && let Ok(Verification { result: Some(newer), .. }) = serde_json::from_slice::<Verification>(&v)
         && trust::compare(&entry.outcome(), &newer.outcome()) == Comparison::Same
     {
@@ -662,7 +679,7 @@ fn judge(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, read
 /// form's strong key the same way, and the first whose member serves a class-based hit, with its
 /// class's result, if `reader` takes that. What it passes over goes to `passed`.
 #[allow(clippy::too_many_arguments)]
-fn find(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reader: &Domain, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet, passed: &mut dyn FnMut(Key, Passed)) -> anyhow::Result<Option<Hit>> {
+fn find(c: &dyn Rows, seal: Option<&Seal>, scope: &str, domain: &Domain, reader: &Domain, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet, passed: &mut dyn FnMut(Key, Passed)) -> anyhow::Result<Option<Hit>> {
     let keyed = keyed(c, scope, unit)?;
     let own = candidates(c, scope, &keyed.weak, now, &mut |strong, entry| {
         Ok(match judge(c, seal, scope, domain, reader, &keyed.weak, strong, entry)? {
@@ -676,7 +693,7 @@ fn find(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reade
     if own.is_some() {
         return Ok(own);
     }
-    let rows = Rows { c, scope };
+    let rows = ClassRows { c, scope };
     let canonical = &keyed.canonical.key;
     // The canonical form's own path sets, when it isn't the unit's (those were tried), then those
     // of the units claimed into its classes.
@@ -692,7 +709,7 @@ fn find(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reade
         let Some(p) = rows.placed(&at)?.filter(|p| p.member.serves()) else { continue };
         let source = if p.member.anchored() { Some(at) } else { p.source.as_deref().and_then(eclass::parse_key) };
         let Some(source) = source else { continue };
-        let Some(found) = get(c, Family::Result, &format!("{scope}{}", source.hex()))? else { continue };
+        let Some(found) = c.get(Family::Result, &format!("{scope}{}", source.hex()))? else { continue };
         let recorded: Recorded = serde_json::from_slice(&found)?;
         // What its source holds now must be its class's outputs.
         if p.member.class.output() != Some(digest(&recorded).as_str()) {
@@ -716,7 +733,7 @@ fn find(c: &Connection, seal: Option<&Seal>, scope: &str, domain: &Domain, reade
 /// one two runners produced), on the ledger's one path ([`find`]): under its strong key, then by
 /// class. The entry's `verified_by` is filled in. Signatures aren't checked: this is [`record`]'s
 /// reader (W08-R10's leg reuse); [`lookup_as`] checks them.
-pub fn lookup(c: &Connection, scope: &str, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Option<Hit>> {
+pub fn lookup(c: &dyn Rows, scope: &str, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Option<Hit>> {
     let Some(domain) = scope_domain(scope) else { return Ok(None) };
     find(c, None, scope, &domain, &domain, unit, now, &mut |strong, why| tracing::debug!(scope, strong = %strong, why = %why, "an entry passed over"))
 }
@@ -725,7 +742,7 @@ pub fn lookup(c: &Connection, scope: &str, unit: &Unit, now: &dyn Fn(&PathSet) -
 /// trusted first ([`Domain::lookups`]), keyed as that domain keys the unit (its trust component
 /// that domain) on the ledger's one path ([`find`]), and the first entry [`trust::admit`] takes,
 /// its signatures checked with `seal` (W24-R22). What it passes over, and why, it says.
-pub fn lookup_as(c: &Connection, seal: Option<&Seal>, repo: &str, reader: &Domain, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Lookup> {
+pub fn lookup_as(c: &dyn Rows, seal: Option<&Seal>, repo: &str, reader: &Domain, unit: &Unit, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Lookup> {
     let mut out = Lookup::default();
     for domain in reader.lookups() {
         let sc = scope(repo, &domain.to_string());
@@ -743,11 +760,11 @@ pub fn lookup_as(c: &Connection, seal: Option<&Seal>, repo: &str, reader: &Domai
 /// What quotas say must go (W24-R21, AC12): `repo`'s entries, each domain weighed alone by
 /// [`trust::evict`] (a byte is the entry's row and its outputs, a hit saves its unit's time), its
 /// results deleted with what's beside them. The keys of the entries gone.
-pub fn evict(c: &Connection, repo: &str, quotas: &Quotas) -> anyhow::Result<Vec<String>> {
+pub fn evict(c: &dyn Rows, repo: &str, quotas: &Quotas) -> anyhow::Result<Vec<String>> {
     let prefix = format!("{repo}|");
     let mut keys = Vec::new();
     let mut usage = Vec::new();
-    for (k, v, at) in scan(c, Family::Result, &prefix)? {
+    for (k, v, at) in c.scan(Family::Result, &prefix)? {
         let Some(domain) = k.strip_prefix(&prefix).and_then(|rest| rest.split_once('|')).and_then(|(d, _)| Domain::parse(d).ok()) else { continue };
         let entry: Recorded = serde_json::from_slice(&v).unwrap_or_default();
         usage.push(Usage { domain, bytes: (v.len() as u64).saturating_add(entry.size), saved_ms: entry.provenance.ms, hits: hits_of(c, &k)?, last_used: at });
@@ -764,14 +781,18 @@ pub fn evict(c: &Connection, repo: &str, quotas: &Quotas) -> anyhow::Result<Vec<
 
 /// An entry (`owner/repo|domain|strong`) deleted with what's beside it: its verifications and hits,
 /// and the files it kept (the content store collects those nothing else holds).
-fn remove_entry(c: &Connection, k: &str) -> anyhow::Result<()> {
-    delete(c, Family::Result, k)?;
-    for (v, _, _) in scan(c, Family::Verify, &format!("{k}|"))? {
-        delete(c, Family::Verify, &v)?;
+fn remove_entry(c: &dyn Rows, k: &str) -> anyhow::Result<()> {
+    c.delete(Family::Result, k)?;
+    for (v, _, _) in c.scan(Family::Verify, &format!("{k}|"))? {
+        c.delete(Family::Verify, &v)?;
     }
+    // The scope's objects that refer to it: their value is its strong key.
     if let Some((sc, strong)) = k.rsplit_once('|') {
-        let sc = format!("{sc}|");
-        c.execute("DELETE FROM work_records WHERE family = ?1 AND substr(key, 1, length(?2)) = ?2 AND value = ?3", rusqlite::params![Family::Object.name(), sc, strong.as_bytes()])?;
+        for (o, v, _) in c.scan(Family::Object, &format!("{sc}|"))? {
+            if v == strong.as_bytes() {
+                c.delete(Family::Object, &o)?;
+            }
+        }
     }
     Ok(())
 }
@@ -782,10 +803,10 @@ fn remove_entry(c: &Connection, k: &str) -> anyhow::Result<()> {
 /// rules name (`repos`, resolved for it); then the system's policy, with `free` bytes free on the
 /// data volume, decides what else goes. Each eviction is deleted with what's beside it. What went,
 /// each with why.
-pub fn reap(c: &Connection, system: &kiln_ci::work::reap::Resolved, repos: &BTreeMap<String, kiln_ci::work::reap::Resolved>, free: u64, now: i64) -> anyhow::Result<Vec<kiln_ci::work::reap::Eviction>> {
+pub fn reap(c: &dyn Rows, system: &kiln_ci::work::reap::Resolved, repos: &BTreeMap<String, kiln_ci::work::reap::Resolved>, free: u64, now: i64) -> anyhow::Result<Vec<kiln_ci::work::reap::Eviction>> {
     use kiln_ci::work::reap::{Entry, plan};
     let mut entries: Vec<Entry> = Vec::new();
-    for (k, v, at) in scan(c, Family::Result, "")? {
+    for (k, v, at) in c.scan(Family::Result, "")? {
         let entry: Recorded = serde_json::from_slice(&v).unwrap_or_default();
         let group = k.rsplit_once('|').map_or_else(String::new, |(sc, _)| sc.to_owned());
         let hits = hits_of(c, &k)?;
@@ -809,16 +830,16 @@ pub fn reap(c: &Connection, system: &kiln_ci::work::reap::Resolved, repos: &BTre
 }
 
 /// One more hit of `scope`'s entry `strong` (W24-R28, AC12): what its worth under quota counts.
-fn bump_hits(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<()> {
+fn bump_hits(c: &dyn Rows, scope: &str, strong: &Key) -> anyhow::Result<()> {
     let at = format!("{}hits", verify_prefix(scope, strong));
-    let n: u64 = get(c, Family::Verify, &at)?.and_then(|v| String::from_utf8(v).ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
-    put(c, Family::Verify, &at, n.saturating_add(1).to_string().as_bytes(), crate::util::now_unix())?;
+    let n: u64 = c.get(Family::Verify, &at)?.and_then(|v| String::from_utf8(v).ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
+    c.put(Family::Verify, &at, n.saturating_add(1).to_string().as_bytes(), crate::util::now_unix())?;
     Ok(())
 }
 
 /// The hits `scope`'s entry at `entry` (`<scope><strong>`) has had.
-fn hits_of(c: &Connection, entry: &str) -> anyhow::Result<u64> {
-    Ok(get(c, Family::Verify, &format!("{entry}|hits"))?.and_then(|v| String::from_utf8(v).ok()).and_then(|s| s.parse().ok()).unwrap_or(0))
+fn hits_of(c: &dyn Rows, entry: &str) -> anyhow::Result<u64> {
+    Ok(c.get(Family::Verify, &format!("{entry}|hits"))?.and_then(|v| String::from_utf8(v).ok()).and_then(|s| s.parse().ok()).unwrap_or(0))
 }
 
 // ------------------------------------------------------------------ signatures (W24-R22)
@@ -996,19 +1017,19 @@ fn entry_key(scope: &str, strong: &Key) -> String {
 }
 
 /// What quarantined the entry `scope` holds under `strong`, if anything did.
-pub fn quarantined(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Option<Quarantine>> {
-    Ok(get(c, Family::Verify, &format!("{}quarantine", verify_prefix(scope, strong)))?.map(|v| serde_json::from_slice(&v)).transpose()?)
+pub fn quarantined(c: &dyn Rows, scope: &str, strong: &Key) -> anyhow::Result<Option<Quarantine>> {
+    Ok(c.get(Family::Verify, &format!("{}quarantine", verify_prefix(scope, strong)))?.map(|v| serde_json::from_slice(&v)).transpose()?)
 }
 
 /// Whether verification marked the unit of `weak` nondeterministic in `scope`.
-pub fn nondeterministic(c: &Connection, scope: &str, weak: &Key) -> anyhow::Result<Option<Nondeterministic>> {
-    Ok(get(c, Family::Verify, &format!("{}nondeterministic", weak_prefix(scope, weak)))?.map(|v| serde_json::from_slice(&v)).transpose()?)
+pub fn nondeterministic(c: &dyn Rows, scope: &str, weak: &Key) -> anyhow::Result<Option<Nondeterministic>> {
+    Ok(c.get(Family::Verify, &format!("{}nondeterministic", weak_prefix(scope, weak)))?.map(|v| serde_json::from_slice(&v)).transpose()?)
 }
 
 /// The results an entry's key refused, kept as evidence.
-fn conflicts(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Vec<Recorded>> {
+fn conflicts(c: &dyn Rows, scope: &str, strong: &Key) -> anyhow::Result<Vec<Recorded>> {
     let mut out = Vec::new();
-    for (_, v, _) in scan(c, Family::Verify, &format!("{}conflict|", verify_prefix(scope, strong)))? {
+    for (_, v, _) in c.scan(Family::Verify, &format!("{}conflict|", verify_prefix(scope, strong)))? {
         let v: Verification = serde_json::from_slice(&v)?;
         out.extend(v.result);
     }
@@ -1018,8 +1039,8 @@ fn conflicts(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Vec<Re
 /// What every other run of an entry's key says of it (W24-R23, [`verify::judge`]): its
 /// reproductions, which gave its outcome and outputs, and the results its key refused. `None` when
 /// the key holds no entry.
-pub fn verdict(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Option<Verdict>> {
-    let Some(entry) = get(c, Family::Result, &entry_key(scope, strong))? else { return Ok(None) };
+pub fn verdict(c: &dyn Rows, scope: &str, strong: &Key) -> anyhow::Result<Option<Verdict>> {
+    let Some(entry) = c.get(Family::Result, &entry_key(scope, strong))? else { return Ok(None) };
     let entry: Recorded = serde_json::from_slice(&entry)?;
     let mut runs: Vec<Recorded> = reproductions(c, scope, strong)?.into_iter().map(|v| v.result.unwrap_or_else(|| entry.clone())).collect();
     runs.extend(conflicts(c, scope, strong)?);
@@ -1031,23 +1052,23 @@ pub fn verdict(c: &Connection, scope: &str, strong: &Key) -> anyhow::Result<Opti
 /// verdict does (W24-R23): a nondeterministic unit is marked; an entry in doubt has its lineage
 /// quarantined, the entry and every entry of the repository built on it, through what each says
 /// it reused, in whatever domain. Kiln decides this on its own, so it writes why to the audit log.
-fn judge_again(c: &Connection, scope: &str, weak: &Key, strong: &Key) -> anyhow::Result<Verdict> {
+fn judge_again(c: &dyn Rows, scope: &str, weak: &Key, strong: &Key) -> anyhow::Result<Verdict> {
     let Some(verdict) = verdict(c, scope, strong)? else { return Ok(Verdict::Verified) };
     let now = crate::util::now_unix();
     let root = entry_key(scope, strong);
     let marked = format!("{}nondeterministic", weak_prefix(scope, weak));
     if let Verdict::Nondeterministic { names } = &verdict {
         let mark = Nondeterministic { outputs: names.clone(), entry: root.clone(), at: now };
-        put(c, Family::Verify, &marked, &serde_json::to_vec(&mark)?, now)?;
+        c.put(Family::Verify, &marked, &serde_json::to_vec(&mark)?, now)?;
     } else if matches!(verdict, Verdict::Corrupted { .. }) && nondeterministic(c, scope, weak)?.is_some_and(|m| m.entry == root) {
         // Its first run again only said it differed; now runs agree that the entry is what's
         // wrong, so the unit loses the mark that run gave it.
-        delete(c, Family::Verify, &marked)?;
+        c.delete(Family::Verify, &marked)?;
     }
     if verdict.quarantines() {
         let repo = scope.strip_suffix('|').and_then(|s| s.rsplit_once('|')).map_or(scope, |(repo, _)| repo);
         let mut reused: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (k, v, _) in scan(c, Family::Result, &format!("{repo}|"))? {
+        for (k, v, _) in c.scan(Family::Result, &format!("{repo}|"))? {
             let r: Recorded = serde_json::from_slice(&v).unwrap_or_default();
             if !r.reused.is_empty() {
                 reused.insert(k, r.reused);
@@ -1057,7 +1078,7 @@ fn judge_again(c: &Connection, scope: &str, weak: &Key, strong: &Key) -> anyhow:
         let why = verdict.why();
         let q = serde_json::to_vec(&Quarantine { why: why.clone(), root: root.clone(), at: now })?;
         for entry in &lineage {
-            put(c, Family::Verify, &format!("{entry}|quarantine"), &q, now)?;
+            c.put(Family::Verify, &format!("{entry}|quarantine"), &q, now)?;
         }
         audit_as(c, "kiln", "work.verify", &root, "quarantined", &format!("{why}; its lineage quarantined: {}", lineage.join(", ")))?;
         tracing::warn!(entry = %root, why = %why, entries = lineage.len(), "an entry's lineage quarantined (W24-R23)");
@@ -1071,29 +1092,30 @@ fn judge_again(c: &Connection, scope: &str, weak: &Key, strong: &Key) -> anyhow:
 /// the claims that made it are refuted, and the classes it took upstream units by split too. Each
 /// split quarantines its lineage, so none of them serves a class-based hit again. Returns the keys
 /// quarantined.
-pub fn verified(c: &Connection, scope: &str, hit: &Hit, observed: &str) -> anyhow::Result<BTreeSet<Key>> {
+pub fn verified(c: &dyn Rows, scope: &str, hit: &Hit, observed: &str) -> anyhow::Result<BTreeSet<Key>> {
     let mut quarantined = BTreeSet::new();
     if digest(&hit.recorded) == observed {
         return Ok(quarantined);
     }
-    let tx = crate::store::tx(c)?;
-    let mut rows = Rows { c: &tx, scope };
     let at: Vec<(Key, Option<&str>)> = match &hit.class {
         None => vec![(hit.key, Some(observed))],
         Some(by) => std::iter::once(hit.key).chain(by.took.iter().copied()).map(|k| (k, None)).collect(),
     };
-    for (k, seen) in at {
-        if rows.entry(&k)?.is_some() {
-            quarantined.extend(eclass::split(&mut rows, &k, seen)?);
+    c.atomically(&mut |tx| {
+        let mut rows = ClassRows { c: tx, scope };
+        for (k, seen) in &at {
+            if rows.entry(k)?.is_some() {
+                quarantined.extend(eclass::split(&mut rows, k, *seen)?);
+            }
         }
-    }
-    tx.commit()?;
+        Ok(())
+    })?;
     Ok(quarantined)
 }
 
 /// A key's member in its scope's e-classes (W24-R30), if it has one.
-pub fn member(c: &Connection, scope: &str, k: &Key) -> anyhow::Result<Option<Member>> {
-    Rows { c, scope }.entry(k)
+pub fn member(c: &dyn Rows, scope: &str, k: &Key) -> anyhow::Result<Option<Member>> {
+    ClassRows { c, scope }.entry(k)
 }
 
 /// A rewrite rule as `work.eclass` keeps it, with the witness it was registered with.
@@ -1104,9 +1126,9 @@ struct Registered {
 }
 
 /// The rewrite rules registered for a scope's units (W24-R30).
-pub fn rules(c: &Connection, scope: &str) -> anyhow::Result<Rules> {
+pub fn rules(c: &dyn Rows, scope: &str) -> anyhow::Result<Rules> {
     let mut held = Vec::new();
-    for (_, value, _) in scan(c, Family::EClass, &format!("{scope}r|"))? {
+    for (_, value, _) in c.scan(Family::EClass, &format!("{scope}r|"))? {
         held.push(serde_json::from_slice::<Registered>(&value)?);
     }
     held.sort_by(|a, b| a.rule.name.cmp(&b.rule.name));
@@ -1120,10 +1142,10 @@ pub fn rules(c: &Connection, scope: &str) -> anyhow::Result<Rules> {
 /// Registers a rewrite rule for a scope's units with its differential test's witness (W24-R30),
 /// refused as [`Rules::register`] refuses one (a rule without a witness among others). From then on
 /// the scope's units also key in its normal form, and a unit it rewrites finds its class's result.
-pub fn register(c: &Connection, scope: &str, rule: &Rule, witness: &Witness) -> anyhow::Result<()> {
+pub fn register(c: &dyn Rows, scope: &str, rule: &Rule, witness: &Witness) -> anyhow::Result<()> {
     rules(c, scope)?.register(rule.clone(), witness.clone())?;
     let row = Registered { rule: rule.clone(), witness: witness.clone() };
-    put(c, Family::EClass, &format!("{scope}r|{}", rule.name), &serde_json::to_vec(&row)?, crate::util::now_unix())?;
+    c.put(Family::EClass, &format!("{scope}r|{}", rule.name), &serde_json::to_vec(&row)?, crate::util::now_unix())?;
     Ok(())
 }
 
@@ -1138,32 +1160,32 @@ struct Placed {
 }
 
 /// A scope's e-classes in `work.eclass` (W24-R30), for the ledger and for [`eclass::split`].
-struct Rows<'a> {
-    c: &'a Connection,
+struct ClassRows<'a> {
+    c: &'a dyn Rows,
     scope: &'a str,
 }
 
-impl Rows<'_> {
+impl ClassRows<'_> {
     fn key(&self, tag: &str, rest: &str) -> String {
         format!("{}{tag}|{rest}", self.scope)
     }
 
     fn placed(&self, k: &Key) -> anyhow::Result<Option<Placed>> {
-        Ok(get(self.c, Family::EClass, &self.key("m", &k.hex()))?.map(|p| serde_json::from_slice(&p)).transpose()?)
+        Ok(self.c.get(Family::EClass, &self.key("m", &k.hex()))?.map(|p| serde_json::from_slice(&p)).transpose()?)
     }
 
     fn place(&self, k: &Key, p: &Placed) -> anyhow::Result<()> {
-        Ok(put(self.c, Family::EClass, &self.key("m", &k.hex()), &serde_json::to_vec(p)?, crate::util::now_unix())?)
+        self.c.put(Family::EClass, &self.key("m", &k.hex()), &serde_json::to_vec(p)?, crate::util::now_unix())
     }
 
-    fn pair(&self, tag: &str, a: &Key, b: &Key, value: &[u8]) -> rusqlite::Result<()> {
-        put(self.c, Family::EClass, &self.key(tag, &format!("{}|{}", a.hex(), b.hex())), value, crate::util::now_unix())
+    fn pair(&self, tag: &str, a: &Key, b: &Key, value: &[u8]) -> anyhow::Result<()> {
+        self.c.put(Family::EClass, &self.key(tag, &format!("{}|{}", a.hex(), b.hex())), value, crate::util::now_unix())
     }
 
     /// The keys paired with `a` under `tag`.
     fn paired(&self, tag: &str, a: &Key) -> anyhow::Result<BTreeSet<Key>> {
         let prefix = self.key(tag, &format!("{}|", a.hex()));
-        Ok(scan(self.c, Family::EClass, &prefix)?.into_iter().filter_map(|(k, _, _)| k.strip_prefix(prefix.as_str()).and_then(eclass::parse_key)).collect())
+        Ok(self.c.scan(Family::EClass, &prefix)?.into_iter().filter_map(|(k, _, _)| k.strip_prefix(prefix.as_str()).and_then(eclass::parse_key)).collect())
     }
 
     fn claim(&self, a: &Key, b: &Key, why: &Why) -> anyhow::Result<()> {
@@ -1174,7 +1196,7 @@ impl Rows<'_> {
     }
 }
 
-impl eclass::Classes for Rows<'_> {
+impl eclass::Classes for ClassRows<'_> {
     type Error = anyhow::Error;
 
     fn entry(&self, k: &Key) -> anyhow::Result<Option<Member>> {
@@ -1192,8 +1214,8 @@ impl eclass::Classes for Rows<'_> {
     /// A split's members: what their own outputs show, so none serves through another's result.
     fn apply(&mut self, split: &Split) -> anyhow::Result<()> {
         for (a, b) in &split.dropped {
-            delete(self.c, Family::EClass, &self.key("c", &format!("{}|{}", a.hex(), b.hex())))?;
-            delete(self.c, Family::EClass, &self.key("c", &format!("{}|{}", b.hex(), a.hex())))?;
+            self.c.delete(Family::EClass, &self.key("c", &format!("{}|{}", a.hex(), b.hex())))?;
+            self.c.delete(Family::EClass, &self.key("c", &format!("{}|{}", b.hex(), a.hex())))?;
         }
         for (k, member) in &split.members {
             self.place(k, &Placed { member: member.clone(), source: None })?;
@@ -1212,8 +1234,8 @@ fn last_at(scope: &str, b: &Binary, cx: &Context) -> String {
     format!("{scope}last|{}", test_results::identity(b, cx).hex())
 }
 
-fn marks(c: &Connection, scope: &str, key: &Key) -> anyhow::Result<Marks> {
-    Ok(get(c, Family::Test, &marks_at(scope, key))?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or_default())
+fn marks(c: &dyn Rows, scope: &str, key: &Key) -> anyhow::Result<Marks> {
+    Ok(c.get(Family::Test, &marks_at(scope, key))?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or_default())
 }
 
 /// Records a test binary's run (W24-R10) through the ledger's one path: a pass goes in by
@@ -1223,12 +1245,12 @@ fn marks(c: &Connection, scope: &str, key: &Key) -> anyhow::Result<Marks> {
 /// never does. Every run counts towards its test key's flaky marks (W16-R04), and a pass is kept as
 /// its binary's identity's newest, with what it read, for a run that doesn't rebuild it. Returns the
 /// test key of a pass.
-pub fn record_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, read: &PathSet, ran: &Ran, provenance: &Provenance) -> anyhow::Result<Option<Key>> {
+pub fn record_test(c: &dyn Rows, scope: &str, b: &Binary, cx: &Context, read: &PathSet, ran: &Ran, provenance: &Provenance) -> anyhow::Result<Option<Key>> {
     let now = crate::util::now_unix();
     let at = test_results::key(b, cx, read);
     let mut counted = marks(c, scope, &at)?;
     counted.add(ran);
-    put(c, Family::Test, &marks_at(scope, &at), &serde_json::to_vec(&counted)?, now)?;
+    c.put(Family::Test, &marks_at(scope, &at), &serde_json::to_vec(&counted)?, now)?;
     if !ran.passed() {
         return Ok(None);
     }
@@ -1245,11 +1267,11 @@ pub fn record_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, read: 
     // one differs from it only in its run, leg and time, not in what the binary did, so it isn't
     // recorded again, which the ledger would take for a conflict and judge (W24-R23); it's its
     // identity's newest all the same.
-    let strong = match get(c, Family::Result, &format!("{scope}{}", at.hex()))? {
+    let strong = match c.get(Family::Result, &format!("{scope}{}", at.hex()))? {
         Some(_) => at,
         None => record(c, scope, &test_results::unit(b, cx), read, &result)?,
     };
-    put(c, Family::Test, &last_at(scope, b, cx), &serde_json::to_vec(&(&kept, read))?, now)?;
+    c.put(Family::Test, &last_at(scope, b, cx), &serde_json::to_vec(&(&kept, read))?, now)?;
     Ok(Some(strong))
 }
 
@@ -1257,7 +1279,7 @@ pub fn record_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, read: 
 /// pass found for its unit by [`lookup`] (only for a binary with its digest), with the flaky tests
 /// of the key it was found under as they are now; and its identity's newest pass, with whether what
 /// that read holds. `now` gives a path set as it is now.
-pub fn found_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<test_results::Found> {
+pub fn found_test(c: &dyn Rows, scope: &str, b: &Binary, cx: &Context, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<test_results::Found> {
     let mut by_key = None;
     if b.digest.is_some()
         && let Some(hit) = lookup(c, scope, &test_results::unit(b, cx), now)?
@@ -1265,14 +1287,14 @@ pub fn found_test(c: &Connection, scope: &str, b: &Binary, cx: &Context, now: &d
     {
         by_key = Some(Kept { flaky: marks(c, scope, &hit.key)?.flaky(), ..kept });
     }
-    let last: Option<(Kept, PathSet)> = get(c, Family::Test, &last_at(scope, b, cx))?.map(|v| serde_json::from_slice(&v)).transpose()?;
+    let last: Option<(Kept, PathSet)> = c.get(Family::Test, &last_at(scope, b, cx))?.map(|v| serde_json::from_slice(&v)).transpose()?;
     let last_holds = last.as_ref().is_some_and(|(_, read)| now(read) == *read);
     Ok(test_results::Found { by_key, last: last.map(|(k, _)| k), last_holds })
 }
 
 /// Which of a run's test binaries run and which replay their passes (W24-R10), each saying why:
 /// [`kiln_ci::work::tests::select`] over what the ledger has for each ([`found_test`]).
-pub fn select_tests(c: &Connection, scope: &str, binaries: &[Binary], cx: &Context, affected: &BTreeSet<String>, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Vec<(Binary, Choice)>> {
+pub fn select_tests(c: &dyn Rows, scope: &str, binaries: &[Binary], cx: &Context, affected: &BTreeSet<String>, now: &dyn Fn(&PathSet) -> PathSet) -> anyhow::Result<Vec<(Binary, Choice)>> {
     let found: Vec<test_results::Found> = binaries.iter().map(|b| found_test(c, scope, b, cx, now)).collect::<anyhow::Result<_>>()?;
     let answer = |b: &Binary| binaries.iter().position(|x| x == b).and_then(|i| found.get(i)).cloned().unwrap_or_default();
     Ok(test_results::select(binaries, affected, &answer))
