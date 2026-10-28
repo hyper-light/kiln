@@ -325,6 +325,11 @@ pub fn program_stem(program: &str) -> String {
 pub fn machine_id() -> Option<String> {
     static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
+        // Said outright (`KILN_MACHINE_ID`): a machine of its own whatever the OS says, as each runner
+        // a test starts on one machine is, or a second runner someone runs on one machine on purpose.
+        if let Some(said) = std::env::var("KILN_MACHINE_ID").ok().filter(|v| !v.trim().is_empty()) {
+            return machine_id_of(&said);
+        }
         if in_container() {
             let data = std::env::var_os("KILN_DATA_DIR").map(PathBuf::from).unwrap_or_else(crate::config::default_data_dir);
             kept_machine_id(&data, std::env::var("KILN_POD_UID").ok().as_deref())

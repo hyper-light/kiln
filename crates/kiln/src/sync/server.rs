@@ -191,6 +191,8 @@ enum Input {
     Wake,
     From { machine: String, msg: Msg, raft: Vec<u8> },
     Machine { machine: String, up: bool },
+    /// A machine known by another name from now on (docs/machines.md).
+    Moved { from: String, to: String },
     Ask { ask: Ask, reply: futures::channel::oneshot::Sender<Result<String, String>> },
     /// Save what isn't saved yet: the server is stopping.
     Flush(futures::channel::oneshot::Sender<()>),
@@ -284,6 +286,12 @@ impl Sync {
     /// A machine has a syncing runner process connected now (`up`), or none any more.
     pub fn machine(&self, machine: &str, up: bool) {
         let _ = self.tx.send(Input::Machine { machine: machine.to_owned(), up });
+    }
+
+    /// Machine `from` is known as `to` from now on (docs/machines.md): its copies are `to`'s, their
+    /// members the same.
+    pub fn moved(&self, from: &str, to: &str) {
+        let _ = self.tx.send(Input::Moved { from: from.to_owned(), to: to.to_owned() });
     }
 
     pub async fn ask(&self, ask: Ask) -> Result<String, String> {
@@ -501,6 +509,15 @@ impl Owner {
                     self.tell_copies(&machine);
                 } else {
                     self.up.remove(&machine);
+                }
+                self.changed = true;
+            }
+            Input::Moved { from, to } => {
+                for c in self.repos.iter_mut().flat_map(|r| r.copies.iter_mut()).filter(|c| c.machine == from) {
+                    c.machine = to.clone();
+                }
+                if self.up.remove(&from) {
+                    self.up.insert(to);
                 }
                 self.changed = true;
             }

@@ -385,7 +385,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
 
     // In-process bare-metal agent, connected over loopback QUIC like any other agent.
     if cfg.local_agent.enabled {
-        let name = crate::pki::sanitize_name(&cfg.local_agent_name());
+        // Known by its machine's id and shown by its name (docs/machines.md): what kiln kept under
+        // its name moves to the id (the first time; after that there's nothing left to move).
+        let shown = crate::pki::sanitize_name(&cfg.local_agent_name());
+        let name = cfg.local_agent_key();
+        if name != shown
+            && let Err(e) = hub.move_runner(&shown, &name, &shown, &crate::os::hostname()).await
+        {
+            tracing::warn!(from = %shown, to = %name, error = %format!("{e:#}"), "the server's own runner didn't move to its machine id");
+        }
         let creds = (pki.ca_der.clone(), pki.issue_local(&name)?);
         let http_port = cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p).to_owned();
         let opts = crate::agent::Opts {

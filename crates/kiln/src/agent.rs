@@ -108,6 +108,16 @@ pub struct InstanceRequest {
     pub csr: String,
 }
 
+/// `POST /api/agents/rekey` (docs/machines.md): a runner known by its name asks to be known by its
+/// machine id, proving itself as a second runner process does; see `api::rekey_agent`.
+#[derive(Serialize, Deserialize)]
+pub struct RekeyRequest {
+    pub cert_pem: String,
+    pub csr: String,
+    /// The machine's id ([`crate::os::machine_id`]): what it asks to be known by.
+    pub machine_id: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct EnrollResponse {
     pub cert_pem: String,
@@ -124,6 +134,51 @@ fn ca_der(pem: &str) -> anyhow::Result<Vec<u8>> {
     use hyper_quic::rustls::pki_types::CertificateDer;
     use hyper_quic::rustls::pki_types::pem::PemObject as _;
     Ok(CertificateDer::from_pem_slice(pem.as_bytes()).map_err(|e| anyhow::anyhow!("ca pem: {e:?}"))?.to_vec())
+}
+
+/// The certificate of a runner known by its name, for its machine id instead (docs/machines.md):
+/// asked for as the runner starts, before it connects or holds anything, proving itself as a
+/// second runner process does (`/api/agents/rekey`), and kept in place of the one it had. What the
+/// server kept under its name goes to the id, and its name becomes its label. None when it's known
+/// by its id already, has no id, is a job's pod or an outpost, or the server can't move it now (a
+/// server from before, a process of it still connected): it goes on by its name, and asks again as
+/// it starts next.
+async fn moved_to_its_id(o: &Opts, cert: &str, key: &str, ca: &str, cert_p: &std::path::Path) -> Option<String> {
+    use crate::http::client::{Client, Roots};
+    if o.ephemeral || o.outpost {
+        return None;
+    }
+    let id = crate::rt::blocking(crate::os::machine_id).await.ok().flatten()?;
+    let to = crate::join::machine_key(Some(&id))?;
+    let name = crate::pki::leaf_name(&Leaf { cert_pem: cert.to_owned(), key_pem: String::new() })?;
+    if name == to {
+        return None;
+    }
+    let csr = crate::pki::make_csr_with_key(&to, key).ok()?;
+    let http = Client::new(Roots::WebPkiPlusDer(crate::join::pem_der(ca).ok()?), None).ok()?;
+    let url = format!("{}/api/agents/rekey", o.server_url.trim_end_matches('/'));
+    let asked = http.post(&url).json(&RekeyRequest { cert_pem: cert.to_owned(), csr, machine_id: id }).timeout(Duration::from_secs(20)).send().await;
+    match asked {
+        Ok(resp) if resp.is_success() => {
+            let e: EnrollResponse = resp.json(1 << 20).await.ok()?;
+            if let Err(err) = crate::util::write_secret(cert_p, e.cert_pem.as_bytes(), 0o644) {
+                tracing::warn!(error = %err, "couldn't keep the certificate for this runner's machine id; it goes on by its name");
+                return None;
+            }
+            tracing::info!(was = %name, now = %e.name, label = e.label.as_deref().unwrap_or(""), "this runner is known by its machine id now");
+            Some(e.cert_pem)
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let why = String::from_utf8_lossy(&resp.bytes(1 << 12).await.unwrap_or_default()).trim().to_owned();
+            tracing::info!(status, why = %why, "the server didn't move this runner to its machine id now; it goes on by its name");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "couldn't ask to move this runner to its machine id");
+            None
+        }
+    }
 }
 
 /// Load stored credentials, enrolling (or renewing) when needed. Retries until it succeeds.
@@ -145,6 +200,8 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
     )
         && (!crate::pki::needs_renewal(&c) || o.join_token.is_none()) {
             let quic = std::fs::read_to_string(&quic_p).ok().map(|s| s.trim().to_owned());
+            // Known by its name: it moves to its machine id now, as it starts, holding nothing yet.
+            let c = moved_to_its_id(o, &c, &k, &ca, &cert_p).await.unwrap_or(c);
             return Ok((ca_der(&ca)?, Leaf { cert_pem: c, key_pem: k }, quic));
         }
     let token = o

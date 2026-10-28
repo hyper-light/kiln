@@ -33,7 +33,7 @@ use crate::proto::{CAP_FRONT_DOOR, ServerMsg};
 
 use super::{CertMode, CustomCert, Push, Settings, Status};
 
-const KEY_PREFIX: &str = "front_door/";
+pub(crate) const KEY_PREFIX: &str = "front_door/";
 /// At most one certificate a minute for a runner.
 const ISSUE_EVERY: Duration = Duration::from_secs(60);
 /// An uploaded chain and key, as JSON.
@@ -145,6 +145,15 @@ impl FrontDoors {
         let mut v: Vec<String> = self.inner.lock().iter().filter(|(_, e)| e.settings != Settings::default() || e.status.is_some()).map(|(k, _)| k.clone()).collect();
         v.sort();
         v
+    }
+
+    /// A runner known by another name from now on (docs/machines.md): its settings go with it (their
+    /// row moves with the store's, `Store::move_runner`).
+    pub fn moved(&self, from: &str, to: &str) {
+        let mut g = self.inner.lock();
+        if let Some(e) = g.remove(from) {
+            g.entry(to.to_owned()).or_insert(e);
+        }
     }
 
     /// Forget a runner (it was forgotten itself).

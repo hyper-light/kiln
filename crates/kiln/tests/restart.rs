@@ -83,7 +83,7 @@ fn w05_ac09_a_restart_rebuilds_the_queue() -> anyhow::Result<()> {
     std::fs::create_dir_all(&home)?;
     let log = std::fs::File::create(dir.path().join("runner.log"))?;
     let child = common::kiln()
-        .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "2", "--no-terminal"])
+        .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "2", "--no-terminal"]).env("KILN_MACHINE_ID", "keeper")
         .arg("--work-dir")
         .arg(dir.path().join("runner-work"))
         .arg("--state-dir")
@@ -393,7 +393,7 @@ fn w05_r05_a_runner_gone_over_a_restart_loses_its_legs() -> anyhow::Result<()> {
     std::fs::create_dir_all(&home)?;
     let log = std::fs::File::create(dir.path().join("runner.log"))?;
     let child = common::kiln()
-        .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "goner", "--labels", "gone", "--slots", "1", "--no-terminal"])
+        .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "goner", "--labels", "gone", "--slots", "1", "--no-terminal"]).env("KILN_MACHINE_ID", "goner")
         .arg("--work-dir")
         .arg(dir.path().join("runner-work"))
         .arg("--state-dir")

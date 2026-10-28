@@ -1410,8 +1410,11 @@ impl Policy {
 }
 
 /// Where a runner's policy is kept (none: the default).
+/// Where a machine's upgrade policy is kept, its name after it.
+pub(crate) const POLICY_PREFIX: &str = "updates/policy/";
+
 fn policy_key(machine: &str) -> String {
-    format!("updates/policy/{machine}")
+    format!("{POLICY_PREFIX}{machine}")
 }
 
 /// `machine`'s update policy: Notify unless someone chose otherwise.

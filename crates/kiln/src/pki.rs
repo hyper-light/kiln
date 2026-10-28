@@ -405,6 +405,28 @@ impl Pki {
     /// CSR for that same key, whose signature shows the requester holds the private key. Returns
     /// the machine's name and the new certificate.
     pub fn sign_instance(&self, cert_pem: &str, csr_pem: &str) -> anyhow::Result<(String, String)> {
+        let (name, csr) = self.proven(cert_pem, csr_pem)?;
+        let signed = CertificateSigningRequestParams { params: machine_params(name.clone(), LEAF_DAYS)?, public_key: csr.public_key }
+            .signed_by(&self.issuer)
+            .context("sign CSR")?;
+        Ok((name, signed.pem()))
+    }
+
+    /// A machine known by its name moving to its machine id (docs/machines.md): the same proof as
+    /// [`Self::sign_instance`], and a certificate for the same key named `to`. Returns the name it
+    /// had and the new certificate.
+    pub fn sign_moved(&self, cert_pem: &str, csr_pem: &str, to: &str) -> anyhow::Result<(String, String)> {
+        let (name, csr) = self.proven(cert_pem, csr_pem)?;
+        let signed = CertificateSigningRequestParams { params: machine_params(sanitize_name(to), LEAF_DAYS)?, public_key: csr.public_key }
+            .signed_by(&self.issuer)
+            .context("sign CSR")?;
+        Ok((name, signed.pem()))
+    }
+
+    /// The machine a request proves it is: its current certificate, issued by this CA and still
+    /// valid, and a CSR for that certificate's key (whose signature shows the requester holds the
+    /// private key). Returns the certificate's name and the CSR.
+    fn proven(&self, cert_pem: &str, csr_pem: &str) -> anyhow::Result<(String, CertificateSigningRequestParams)> {
         let der = pem_to_der(cert_pem)?;
         let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow::anyhow!("parse certificate: {e}"))?;
         let (_, ca) = x509_parser::parse_x509_certificate(&self.ca_der).map_err(|e| anyhow::anyhow!("parse CA: {e}"))?;
@@ -418,10 +440,7 @@ impl Pki {
             csr.public_key.der_bytes() == cert.public_key().subject_public_key.data.as_ref(),
             "the CSR is for a different key than the certificate"
         );
-        let signed = CertificateSigningRequestParams { params: machine_params(name.clone(), LEAF_DAYS)?, public_key: csr.public_key }
-            .signed_by(&self.issuer)
-            .context("sign CSR")?;
-        Ok((name, signed.pem()))
+        Ok((name, csr))
     }
 
     /// Sign a runner's CSR for its front door: a TLS server certificate for exactly `names` (DNS
@@ -740,6 +759,24 @@ mod tests {
         let (_, other_key) = make_csr("x")?;
         let forged = make_csr_with_key("x", &other_key)?.replace("BEGIN CERTIFICATE REQUEST-----\n", "BEGIN CERTIFICATE REQUEST-----\nAAAA");
         assert!(pki.issue_identity(&forged, &agent, &[], Duration::hours(1)).is_err());
+        Ok(())
+    }
+
+    /// docs/machines.md: a machine known by its name moves to its machine id with the same proof a
+    /// second runner process gives, and keeps its key.
+    #[test]
+    fn a_machine_moves_to_its_id_with_its_own_key_and_certificate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(dir.path())?;
+        let (csr, key) = make_csr("adas-macbook-pro.local")?;
+        let cert = pki.sign_csr(&csr, "adas-macbook-pro.local", 30)?;
+        let again = make_csr_with_key("adas-macbook-pro.local", &key)?;
+        let (was, moved) = pki.sign_moved(&cert, &again, "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b")?;
+        assert_eq!(was, "adas-macbook-pro.local");
+        assert_eq!(leaf_name(&Leaf { cert_pem: moved, key_pem: key }).as_deref(), Some("5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b"));
+        let (other_csr, _) = make_csr("adas-macbook-pro.local")?;
+        assert!(pki.sign_moved(&cert, &other_csr, "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b").is_err(), "another key");
+        assert!(pki.sign_moved(&cert, &again, SERVER_NAME).is_err(), "the server's name is no machine's");
         Ok(())
     }
 }

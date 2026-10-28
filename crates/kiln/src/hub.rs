@@ -681,7 +681,7 @@ impl Hub {
     /// replica's files.
     async fn cluster_announced(&self, machine: &str) {
         // The server's own runner, in its process, reads kiln.db as it is.
-        let own = self.cfg.local_agent.enabled && machine == crate::pki::sanitize_name(&self.cfg.local_agent_name());
+        let own = self.cfg.local_agent.enabled && machine == self.cfg.local_agent_key();
         let group = self.store.group().filter(|_| self.cfg.cluster.learners && !own);
         let (newest, mut others) = self.instances.lock().holder_of(machine, proto::CAP_CLUSTER);
         // With learners off, the newest lets its replica go too: its front door pipes to the
@@ -1413,6 +1413,32 @@ impl Hub {
         self.agent_limits.forget(&self.store, agent).await;
         self.places.forget(agent);
         self.tailnet.wake.notify();
+        self.update_slot_gauges();
+        Ok(())
+    }
+
+    /// Runner `from` is known as `to` from now on, shown as `label` (docs/machines.md: a machine known
+    /// by its name moving to its machine id): its rows and what's set for it, its agent sessions, its
+    /// synced copies and places, and its member in the cluster group go with it. Refused while a
+    /// process of it is connected: what it holds would move from under it.
+    pub async fn move_runner(&self, from: &str, to: &str, label: &str, hostname: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(from != to, "{from} is known by that name already");
+        let connected = !self.instances.lock().of(from).is_empty() || self.agents.lock().get(from).is_some_and(|a| a.connected);
+        anyhow::ensure!(!connected, "{from} has a runner process connected: it moves to its machine id once none is");
+        let prefixes = vec![crate::frontdoor::control::KEY_PREFIX, crate::harness::limit::KEY_PREFIX, crate::updates::POLICY_PREFIX];
+        self.store.move_runner(from.to_owned(), to.to_owned(), label.to_owned(), hostname.to_owned(), prefixes).await?;
+        self.agents.lock().remove(from);
+        self.away_peers.lock().remove(from);
+        self.reach.lock().forget(from);
+        metrics::agent_samples().write().remove(from);
+        self.front_doors.moved(from, to);
+        self.agent_limits.moved(from, to);
+        self.places.moved(from, to);
+        self.sync.moved(from, to);
+        self.harness.move_machine(self, from, to);
+        if let Some(group) = self.store.group() {
+            self.cluster.moved(group, from);
+        }
         self.update_slot_gauges();
         Ok(())
     }
@@ -2869,7 +2895,7 @@ impl Hub {
     /// The HTTP base URL an agent should use: loopback for the in-process agent, the in-cluster
     /// service for pods, the public URL for everyone else.
     fn server_url_for(&self, agent: &str) -> String {
-        let local = crate::pki::sanitize_name(&self.cfg.local_agent_name());
+        let local = self.cfg.local_agent_key();
         if self.cfg.local_agent.enabled && agent == local {
             let port = self.cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p);
             return format!("http://127.0.0.1:{port}");

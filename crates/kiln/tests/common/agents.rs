@@ -58,6 +58,8 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
     let mut cmd = super::kiln();
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name]);
+    // A machine of its own (docs/machines.md): runners a test starts share one machine.
+    cmd.env("KILN_MACHINE_ID", name);
     if let Some(c) = chaos {
         cmd.args(["--chaos", c]);
     }

@@ -185,7 +185,7 @@ fn w04_ac07_previews_are_runs() -> anyhow::Result<()> {
         std::fs::create_dir_all(base.join("home"))?;
         let log = std::fs::File::create(base.join("agent.log"))?;
         let child = common::kiln()
-            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", &name, "--labels", "posing", "--slots", "3", "--no-terminal", "--chaos", &format!("platform={platform}")])
+            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", &name, "--labels", "posing", "--slots", "3", "--no-terminal", "--chaos", &format!("platform={platform}")]).env("KILN_MACHINE_ID", &name)
             .arg("--work-dir")
             .arg(base.join("work"))
             .arg("--state-dir")

@@ -1597,6 +1597,36 @@ impl Registry {
         }
     }
 
+    /// Machine `from` is known as `to` from now on (docs/machines.md): its sessions are there (and
+    /// kept so in the conversation store), and what it offers is its. Its runner, coming back as
+    /// `to`, finds them its own.
+    pub fn move_machine(&self, hub: &Hub, from: &str, to: &str) {
+        let (at, now) = (Location::Machine(from.to_owned()), Location::Machine(to.to_owned()));
+        let moved: Vec<Info> = {
+            let mut g = self.mirrors.lock();
+            g.values_mut()
+                .filter(|m| m.location == at)
+                .map(|m| {
+                    m.location = now.clone();
+                    m.info.target = now.target();
+                    m.info.clone()
+                })
+                .collect()
+        };
+        {
+            let mut k = self.kinds.lock();
+            if let Some(v) = k.remove(&at.target()) {
+                k.entry(now.target()).or_insert(v);
+            }
+        }
+        if let Some(st) = &self.convo {
+            st.put(moved.iter().map(|i| crate::convo::rows::Row::Machine { session: i.id.clone(), machine: to.to_owned() }).collect());
+        }
+        for info in moved {
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        }
+    }
+
     /// The machine went away: its sessions keep running there and come back when it reconnects.
     pub fn machine_lost(&self, hub: &Hub, machine: &str) {
         self.streams.machine_lost(machine);

@@ -284,6 +284,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "me"]) => return Ok(boxed(|| me(&hub, req.headers())).await),
         (&Method::POST, ["api", "agents", "enroll"]) => return boxed(|| enroll(&hub, req)).await,
         (&Method::POST, ["api", "agents", "instance"]) => return boxed(|| enroll_instance(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
         (&Method::GET, ["api", "join-requests", id]) => {
@@ -3176,6 +3177,51 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
     Ok(srv::json(
         StatusCode::OK,
         &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name, label: None },
+    ))
+}
+
+/// `POST /api/agents/rekey` (docs/machines.md): a runner known by its name moves to its machine id.
+/// Needs no token: the request carries the machine's current certificate and a CSR signed with its
+/// key, as `/api/agents/instance`'s does ([`crate::pki::Pki::sign_moved`]). What kiln kept under its
+/// name goes to the id ([`Hub::move_runner`]), its name becomes its label, and the answer carries
+/// its certificate for the id. Refused for a machine this server doesn't know, for an id other than
+/// the one its facts said, for an id another runner is known by, and while a process of it is
+/// connected (what it holds would move from under it).
+async fn rekey_agent(hub: &Hub, req: Request) -> R {
+    let r: crate::agent::RekeyRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let Some(to) = crate::join::machine_key(Some(&r.machine_id)) else {
+        return Err(err(StatusCode::BAD_REQUEST, "that isn't a machine id kiln makes"));
+    };
+    let (from, cert) = match hub.pki.sign_moved(&r.cert_pem, &r.csr, &to) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            return Err(err(StatusCode::FORBIDDEN, format!("{e:#}")));
+        }
+    };
+    if from == to {
+        return Err(err(StatusCode::CONFLICT, format!("{to} is known by its machine id already")));
+    }
+    let agents = hub.agent_list().await;
+    let Some(me) = agents.iter().find(|a| a.name == from) else {
+        return Err(err(StatusCode::FORBIDDEN, format!("{from} is not enrolled here any more; enroll it again")));
+    };
+    if let Some(said) = hub.store.agent_machines().await.ok().and_then(|m| m.get(&from).cloned()).filter(|s| *s != to) {
+        return Err(err(StatusCode::FORBIDDEN, format!("{from} said it is machine {said}, not {to}")));
+    }
+    if agents.iter().any(|a| a.name == to) {
+        return Err(err(StatusCode::CONFLICT, format!("a runner is known by {to} already")));
+    }
+    // Its name, as its label, unless another machine shows by it.
+    let label = free_agent_name(hub, &from, &me.hostname, Some(&to)).await;
+    if let Err(e) = hub.move_runner(&from, &to, &label, &me.hostname).await {
+        return Err(err(StatusCode::CONFLICT, format!("{e:#}")));
+    }
+    hub.store.audit("kiln".into(), "agent.moved".into(), format!("{from} is known by its machine id {to}, shown as {label}")).await;
+    tracing::info!(from = %from, to = %to, label = %label, "a runner moved to its machine id");
+    Ok(srv::json(
+        StatusCode::OK,
+        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to, label: Some(label) },
     ))
 }
 

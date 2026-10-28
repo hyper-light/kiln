@@ -41,6 +41,7 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_INSTANCE",
     "KILN_LOG",
     "KILN_CHAOS",
+    "KILN_MACHINE_ID",
 ];
 
 /// This build's `kiln`, as a test starts it: with none of [`NOT_INHERITED`] (what the test sets
@@ -236,7 +237,7 @@ fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
     let mut cmd = kiln();
-    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
+    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env("KILN_MACHINE_ID", format!("server {}", dir.display())).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     Ok(cmd)

@@ -1549,6 +1549,46 @@ impl Store {
         .await
     }
 
+    /// Runner `from`'s rows, kept under `to` from now on (docs/machines.md: a machine known by its
+    /// name moving to its machine id), shown as `label` unless `to` has a label of its own: its
+    /// agent row, the jobs it ran and the ones a retry asked to run on it or anywhere but it, its
+    /// attempts, its insights, its preview removals, its reap policy, its grants, and what kiln keeps
+    /// for it under `prefixes` and its name (`front_door/`, …). What `to` has already wins over
+    /// `from`'s; `to` ends with a row, one of its own (with `hostname`) when neither had one.
+    pub async fn move_runner(&self, from: String, to: String, label: String, hostname: String, prefixes: Vec<&'static str>) -> anyhow::Result<()> {
+        self.call(move |c| {
+            let t = tx(c)?;
+            t.execute("UPDATE OR IGNORE agents SET name = ?2 WHERE name = ?1", params![from, to])?;
+            t.execute("DELETE FROM agents WHERE name = ?1", [&from])?;
+            t.execute(
+                "INSERT INTO agents (name, labels, slots, hostname, os, arch, version, ephemeral, connected, last_seen, enrolled_at, label, machine_id)
+                 VALUES (?1, '[]', 0, ?3, '', '', '', 0, 0, ?4, ?4, ?2, ?1)
+                 ON CONFLICT(name) DO UPDATE SET label = COALESCE(agents.label, excluded.label), machine_id = excluded.machine_id",
+                params![to, label, hostname, crate::util::now_unix()],
+            )?;
+            t.execute("UPDATE jobs SET agent = ?2 WHERE agent = ?1", params![from, to])?;
+            for at in ["$.runner", "$.avoid"] {
+                t.execute(&format!("UPDATE jobs SET placement = json_set(placement, '{at}', ?2) WHERE json_extract(placement, '{at}') = ?1"), params![from, to])?;
+            }
+            t.execute("UPDATE ci_attempts SET runner = ?2 WHERE runner = ?1", params![from, to])?;
+            for table in ["ci_rollups", "ci_runner_time", "ci_preview_removals"] {
+                t.execute(&format!("UPDATE OR IGNORE {table} SET runner = ?2 WHERE runner = ?1"), params![from, to])?;
+                t.execute(&format!("DELETE FROM {table} WHERE runner = ?1"), [&from])?;
+            }
+            t.execute("UPDATE OR IGNORE work_reap_policies SET target = ?2 WHERE scope = 'runner' AND target = ?1", params![from, to])?;
+            t.execute("DELETE FROM work_reap_policies WHERE scope = 'runner' AND target = ?1", [&from])?;
+            t.execute("UPDATE grants SET scope = 'runner:' || ?2 WHERE scope = 'runner:' || ?1", params![from, to])?;
+            for prefix in &prefixes {
+                let (was, now) = (format!("{prefix}{from}"), format!("{prefix}{to}"));
+                t.execute("UPDATE OR IGNORE kv SET k = ?2 WHERE k = ?1", params![was, now])?;
+                t.execute("DELETE FROM kv WHERE k = ?1", [&was])?;
+            }
+            t.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     /// The name people see for agent `name`, if it has one other than its name.
     pub async fn agent_label(&self, name: String) -> anyhow::Result<Option<String>> {
         self.call(move |c| Ok(c.query_row("SELECT label FROM agents WHERE name = ?1", [name], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
@@ -1953,6 +1993,61 @@ mod tests {
             anyhow::ensure!(s.agent_label("old-box".into()).await?.is_none());
             s.delete_agent(id.clone()).await?;
             anyhow::ensure!(s.agent_labels().await?.is_empty(), "forgotten with it");
+            anyhow::Ok(())
+        })
+    }
+
+    /// docs/machines.md: a runner known by its name moves to its machine id, its rows with it, and
+    /// its name becomes its label; another runner's stay where they are.
+    #[test]
+    fn a_runner_moves_to_its_machine_id_with_its_rows() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let row = |name: &str| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots: 2,
+                hostname: "Adas-MacBook-Pro.local".into(),
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                version: "1".into(),
+                ephemeral: false,
+                connected: false,
+                last_seen: 5,
+                enrolled_at: 1,
+            };
+            s.upsert_agent(row("adas-macbook-pro.local")).await?;
+            s.upsert_agent(row("box")).await?;
+            s.call(|c| {
+                c.execute_batch(
+                    "INSERT INTO ci_runner_time (bucket, runner, connected) VALUES (1, 'adas-macbook-pro.local', 1.0), (1, 'box', 1.0);
+                     INSERT INTO ci_preview_removals (runner, kind, repo, environment, created_at) VALUES ('adas-macbook-pro.local', 'container', 'acme/app', 'pr-1', 1);
+                     INSERT INTO work_reap_policies (scope, target, policy, updated_at, updated_by) VALUES ('runner', 'adas-macbook-pro.local', '{}', 1, 'ada');
+                     INSERT INTO grants (principal, what, scope, created_at, created_by) VALUES ('user:1', 'viewer', 'runner:adas-macbook-pro.local', 1, 'ada');
+                     INSERT INTO kv (k, v) VALUES ('front_door/adas-macbook-pro.local', '{}'), ('front_door/box', '{}');",
+                )?;
+                Ok(())
+            })
+            .await?;
+            let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+            s.move_runner("adas-macbook-pro.local".into(), id.into(), "adas-macbook-pro.local".into(), String::new(), vec!["front_door/"]).await?;
+            let agents = s.agents().await?;
+            anyhow::ensure!(agents.iter().any(|a| a.name == id && a.slots == 2 && a.last_seen == 5), "its row moved whole: {agents:?}");
+            anyhow::ensure!(!agents.iter().any(|a| a.name == "adas-macbook-pro.local") && agents.iter().any(|a| a.name == "box"));
+            anyhow::ensure!(s.agent_label(id.into()).await?.as_deref() == Some("adas-macbook-pro.local"), "its name is its label");
+            anyhow::ensure!(s.agent_machines().await?.get(id).map(String::as_str) == Some(id));
+            let count = |sql: String| s.call(move |c| Ok(c.query_row(&sql, [], |r| r.get::<_, i64>(0))?));
+            for table in ["ci_runner_time WHERE runner", "ci_preview_removals WHERE runner", "work_reap_policies WHERE scope = 'runner' AND target"] {
+                anyhow::ensure!(count(format!("SELECT COUNT(*) FROM {table} = '{id}'")).await? == 1, "{table}: moved");
+                anyhow::ensure!(count(format!("SELECT COUNT(*) FROM {table} = 'adas-macbook-pro.local'")).await? == 0, "{table}: none left");
+            }
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM grants WHERE scope = 'runner:{id}'")).await? == 1);
+            anyhow::ensure!(count("SELECT COUNT(*) FROM ci_runner_time WHERE runner = 'box'".into()).await? == 1, "another runner's stay");
+            anyhow::ensure!(s.kv_get(format!("front_door/{id}")).await?.is_some() && s.kv_get("front_door/adas-macbook-pro.local".into()).await?.is_none());
+            // Moved again (its runner asked twice): nothing more to move, and its label stays its own.
+            s.set_agent_label(id.into(), "studio".into(), String::new()).await?;
+            s.move_runner("adas-macbook-pro.local".into(), id.into(), "adas-macbook-pro.local".into(), String::new(), vec!["front_door/"]).await?;
+            anyhow::ensure!(s.agent_label(id.into()).await?.as_deref() == Some("studio"));
             anyhow::Ok(())
         })
     }

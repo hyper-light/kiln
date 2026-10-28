@@ -66,7 +66,7 @@ fn w22_ac09_mixed_fleet() -> anyhow::Result<()> {
     std::fs::create_dir_all(&home)?;
     let log = std::fs::File::create(dir.path().join("old-agent.log"))?;
     let child = Command::new(&old)
-        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", "old-runner", "--labels", "old", "--no-terminal"])
+        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", "old-runner", "--labels", "old", "--no-terminal"]).env("KILN_MACHINE_ID", "old-runner")
         .arg("--work-dir")
         .arg(dir.path().join("old-work"))
         .arg("--state-dir")

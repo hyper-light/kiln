@@ -390,7 +390,7 @@ impl Runner {
         }
         let log = std::fs::File::create(dir.join("runner.log"))?;
         let mut cmd = common::kiln();
-        cmd.args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", token.trim(), "--name", name, "--labels", "lab"])
+        cmd.args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", token.trim(), "--name", name, "--labels", "lab"]).env("KILN_MACHINE_ID", name)
             .arg("--state-dir")
             .arg(&state)
             .arg("--work-dir")
