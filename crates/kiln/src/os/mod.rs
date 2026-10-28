@@ -319,11 +319,43 @@ pub fn program_stem(program: &str) -> String {
 
 /// This machine, as kiln tells machines apart: a hash of the id its OS keeps for it (macOS's
 /// hardware UUID, Linux's `/etc/machine-id`, Windows' `MachineGuid`), so two machines with one host
-/// name (two Macs both named "Ada's MacBook Pro") are still two. `None` where the OS keeps none (a
-/// container without a machine id). Read once.
+/// name (two Macs both named "Ada's MacBook Pro") are still two. A container has no machine of its
+/// own: its id is the one kept with its data ([`kept_machine_id`]). `None` where there is none to
+/// read. Read once.
 pub fn machine_id() -> Option<String> {
     static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    ID.get_or_init(|| raw_machine_id().as_deref().and_then(machine_id_of)).clone()
+    ID.get_or_init(|| {
+        if in_container() {
+            let data = std::env::var_os("KILN_DATA_DIR").map(PathBuf::from).unwrap_or_else(crate::config::default_data_dir);
+            kept_machine_id(&data, std::env::var("KILN_POD_UID").ok().as_deref())
+        } else {
+            raw_machine_id().as_deref().and_then(machine_id_of)
+        }
+    })
+    .clone()
+}
+
+/// Whether kiln runs in a container (Docker's, Podman's, a Kubernetes pod's), whose
+/// `/etc/machine-id` is missing or its image's, alike in every container of it.
+fn in_container() -> bool {
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists() || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+}
+
+/// A container's machine id: the one kept in its data (`data`, its volume where it has one), made
+/// the first time from its pod's UID (`KILN_POD_UID`, from Kubernetes' Downward API) or at random.
+/// Started again with the same volume, it's the same machine; made again with a new one (or none),
+/// a new machine, as it keeps nothing.
+fn kept_machine_id(data: &Path, pod_uid: Option<&str>) -> Option<String> {
+    let file = data.join("machine-id");
+    let kept = std::fs::read_to_string(&file).ok().map(|s| s.trim().to_ascii_lowercase());
+    if let Some(id) = kept.filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Some(id);
+    }
+    let made = pod_uid.and_then(machine_id_of).or_else(|| machine_id_of(&crate::util::new_id()))?;
+    if let Err(e) = std::fs::create_dir_all(data).and_then(|()| std::fs::write(&file, format!("{made}\n"))) {
+        tracing::debug!(error = %e, file = %file.display(), "couldn't keep this container's machine id");
+    }
+    Some(made)
 }
 
 /// The id kiln gives a machine whose OS's own is `raw`: a hash of it, so the OS's id itself never
@@ -405,6 +437,26 @@ mod tests {
         assert_eq!(machine_id_of(" \n"), None);
         // Read once: it holds still for the process's life.
         assert_eq!(machine_id(), machine_id());
+    }
+
+    #[test]
+    fn a_containers_machine_is_the_one_kept_with_its_data() -> anyhow::Result<()> {
+        // A pod's: made from its UID, and kept.
+        let volume = tempfile::tempdir()?;
+        let pod = kept_machine_id(volume.path(), Some("8f2b4c1e-1d2a-4f3b-9c8d-7e6f5a4b3c2d"));
+        assert_eq!(pod, machine_id_of("8f2b4c1e-1d2a-4f3b-9c8d-7e6f5a4b3c2d"));
+        // Its pod made again with the same volume (a StatefulSet's): the same machine.
+        assert_eq!(kept_machine_id(volume.path(), Some("a1b2c3d4-0000-4000-8000-000000000001")), pod);
+        // A container that isn't a pod: made once, at random, and kept.
+        let other = tempfile::tempdir()?;
+        let made = kept_machine_id(other.path(), None);
+        assert!(made.is_some() && made != pod);
+        assert_eq!(kept_machine_id(other.path(), None), made);
+        // What isn't an id kept there is made again.
+        std::fs::write(other.path().join("machine-id"), "uninitialized\n")?;
+        let again = kept_machine_id(other.path(), None);
+        assert!(again.is_some() && again != made, "{again:?}");
+        Ok(())
     }
 
     #[test]

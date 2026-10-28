@@ -243,7 +243,11 @@ Joining is never automatic: a machine asks, an admin decides.
    `POST /api/join-requests` with its name, host name, machine id, OS, architecture, labels
    (default `[baremetal, <os>, <arch>]`), the CSR and the SHA-256 of the secret. The machine id is a
    hash of the id the OS keeps for the machine (macOS's hardware UUID, Linux's `/etc/machine-id`,
-   Windows' `MachineGuid`); the OS's id itself never leaves the machine.
+   Windows' `MachineGuid`); the OS's id itself never leaves the machine. A container (Docker's,
+   Podman's, a Kubernetes pod's) has no machine of its own: its id is one kept with its data
+   (`machine-id` in kiln's data directory, on its volume), made the first time from its pod's UID
+   (`KILN_POD_UID`, which kiln's pods and chart give it from the Downward API) or at random. The
+   same volume is the same machine.
 2. The server keeps the request in memory for 10 minutes and answers with an id, a random nonce and
    its CA certificate. At most 20 requests wait at once and each source address may send one every
    5 seconds (HTTP 429 with `Retry-After` otherwise).

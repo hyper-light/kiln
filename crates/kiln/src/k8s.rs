@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{
-    Affinity, Container, ContainerPort, EnvVar, ExecAction, HostAlias, HostPathVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeClaimVolumeSource,
-    Pod, PodSpec, PreferredSchedulingTerm, Probe, ResourceRequirements, SecurityContext, Volume, VolumeMount,
+    Affinity, Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, HostAlias, HostPathVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+    ObjectFieldSelector, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PreferredSchedulingTerm, Probe, ResourceRequirements, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -316,7 +316,8 @@ fn cache_volume(cfg: &KCfg) -> Option<Volume> {
 fn job_pod(cfg: &KCfg, job: &Job, spec: &crate::pipeline::PlannedJob, run: &Run, name: &str, token: &str, (server_url, server_quic): (&str, &str)) -> Pod {
     let image = spec.image.clone().unwrap_or_else(|| crate::pipeline::toolchain_image(spec.toolchain.as_deref()).to_owned());
     let labels: Vec<String> = spec.labels.iter().cloned().chain(["k8s".to_owned()]).collect();
-    let mut env = vec![env_var("KILN_JOIN_TOKEN", token), env_var("KILN_SERVER", server_url), env_var("KILN_QUIC", server_quic)];
+    // Its pod's UID is its machine id (`crate::os::machine_id`).
+    let mut env = vec![env_var("KILN_JOIN_TOKEN", token), env_var("KILN_SERVER", server_url), env_var("KILN_QUIC", server_quic), field_env("KILN_POD_UID", "metadata.uid")];
     let mut mounts = vec![mount("kiln-bin", "/kiln-bin"), mount("work", "/work")];
     let mut volumes = vec![empty_dir("kiln-bin"), empty_dir("work")];
     if let Some(v) = cache_volume(cfg) {
@@ -402,7 +403,14 @@ fn job_pod(cfg: &KCfg, job: &Job, spec: &crate::pipeline::PlannedJob, run: &Run,
 /// CPU and memory over the pool's, the toolchains' caches and v1's deadline.
 pub(crate) fn pool_pod(cfg: &KCfg, executor: &str, name: &str, token: &str, (server_url, server_quic): (&str, &str), pool: &kiln_ci::sched::pools::PoolSpec, pod: Option<&crate::ci::pools::LegPod>) -> Pod {
     let image = pod.and_then(|p| p.image.clone()).or_else(|| pool.image.clone().filter(|i| !i.trim().is_empty())).unwrap_or_else(|| crate::pipeline::toolchain_image(None).to_owned());
-    let mut env = vec![env_var("KILN_JOIN_TOKEN", token), env_var("KILN_SERVER", server_url), env_var("KILN_QUIC", server_quic), env_var("KILN_POD", "1")];
+    let mut env = vec![
+        env_var("KILN_JOIN_TOKEN", token),
+        env_var("KILN_SERVER", server_url),
+        env_var("KILN_QUIC", server_quic),
+        env_var("KILN_POD", "1"),
+        // Its pod's UID is its machine id (`crate::os::machine_id`).
+        field_env("KILN_POD_UID", "metadata.uid"),
+    ];
     // The leg's containers are the pod's.
     let services = pod.map(|p| p.services.clone()).unwrap_or_default();
     if let Some(p) = pod {
@@ -635,6 +643,12 @@ fn remember(nodes: &mut HashMap<String, Vec<String>>, pool: &str, node: &str) {
 
 fn env_var(k: &str, v: &str) -> EnvVar {
     EnvVar { name: k.to_owned(), value: Some(v.to_owned()), ..Default::default() }
+}
+
+/// A variable Kubernetes fills from the pod itself (`path`, the Downward API).
+fn field_env(k: &str, path: &str) -> EnvVar {
+    let field_ref = ObjectFieldSelector { field_path: path.to_owned(), ..Default::default() };
+    EnvVar { name: k.to_owned(), value_from: Some(EnvVarSource { field_ref: Some(field_ref), ..Default::default() }), ..Default::default() }
 }
 
 fn mount(name: &str, path: &str) -> VolumeMount {
