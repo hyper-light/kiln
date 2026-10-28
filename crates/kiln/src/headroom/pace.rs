@@ -830,13 +830,16 @@ mod portable_tests {
             let exe = std::env::current_exe()?;
             let dir = tempfile::tempdir_in(exe.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?)?;
             let me = format!("{}::{test}", module_path!().split_once("::").map_or("", |(_, m)| m));
+            let file = dir.path().join("w");
             let child = std::process::Command::new(&exe)
                 .args([me.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-                .env(WRITER, dir.path().join("w"))
+                .env(WRITER, &file)
                 .stdout(std::process::Stdio::null())
                 .spawn()?;
-            std::thread::sleep(Duration::from_millis(300));
-            Ok(Self { child, _dir: dir })
+            let w = Self { child, _dir: dir };
+            // Once it writes: a loaded machine can take a while to start a test binary.
+            anyhow::ensure!(within(Duration::from_secs(60), || std::fs::metadata(&file).is_ok_and(|m| m.len() > 0)), "the writer never wrote");
+            Ok(w)
         }
 
         fn pid(&self) -> [u32; 1] {
