@@ -1,8 +1,8 @@
 # Machines by id
 
-> **Proposed** (2026-10-27), for Ada's review: nothing below past phase 1 is built. Phase 1 is
-> branch `runner-machine-ids` (machine ids reported and kept, and used when a machine joins). The
-> decisions this needs are under [Decisions](#decisions).
+> **Proposed** (2026-10-27), for Ada's review, with its [decisions](#decisions) taken: nothing
+> below past phase 1 is built. Phase 1 is branch `runner-machine-ids` (machine ids reported and
+> kept, and used when a machine joins).
 
 Today a runner's **name** is its identity everywhere. The name comes from the machine's host name
 when it joins, and kiln keys its certificate, its connections, its processes, its agent sessions,
@@ -50,14 +50,21 @@ machine's certificate when it enrolls the machine, as a second subject alternati
 beside the usual one (`upgrade::install_alongside`) gets its certificate from the machine's, id
 included, as it gets the name now.
 
-Where the OS keeps no usable id, the machine still gets one:
+Every kind of machine gets one of its own:
 
 | Machine | Its id |
 | --- | --- |
-| A container without `/etc/machine-id` | a hash of its enrollment key's public key: a new key is a new machine |
-| A job's pod (`[kubernetes]` executors) | its pod's own (ephemeral, forgotten when it goes, as now) |
+| A Mac, or a Mac VM | its `IOPlatformUUID` (a VM's comes from its hypervisor) |
+| A Linux machine or VM | its `/etc/machine-id`: made at its first boot, from the hypervisor's own UUID for the VM where it gives one (systemd does), so each VM has its own |
+| A Windows machine or VM | its `MachineGuid`, made when Windows was installed (sysprep makes a new one for a copy) |
+| A container | one kiln makes the first time it starts there, kept on the container's data volume with the rest of its state: the same volume is the same machine, a new volume a new machine. A container has no hardware of its own, its `/etc/machine-id` is missing or its image's (the same in every container of that image), and its runtime's own id (Docker's, a pod's UID) changes each time it's made again, as an upgrade does |
+| A job's pod (`[kubernetes]` executors) | its pod's UID: it lives for one job and is forgotten when it goes, as now |
 | The server's local agent | the server machine's: it is that machine's runner |
-| A VM cloned with its image's `/etc/machine-id` | the id it says, until enrollment finds it held: [Decisions](#decisions) 1 |
+
+A VM copied after it first booted carries the original's id. Enrollment catches it: an id that a
+machine with another key already holds and that was connected in the last 30 days is refused, and
+kiln says how to give the copy its own (`systemd-machine-id-setup` on Linux, sysprep on Windows),
+unless an admin says it is that machine, replaced. Nothing is knocked offline on the way.
 
 ### Names
 
@@ -81,15 +88,15 @@ Where the OS keeps no usable id, the machine still gets one:
 | Hand-overs | `handovers.rs`, `MoveTo { to: <name> }` | by id; a session moves between processes of one id only |
 | Agent sessions | `Location::Machine(name)`, the `agent:<name>` target (Rust, the UI, authorization, session specs: ~100 places), inventories, `holders.json` | `Machine(id)` and `agent:<id>`; holders by id |
 | The cluster group | member = hash of the name, persisted in `cluster_conf`; the copy token is a MAC of the name | member = hash of the id: one membership change per runner; tokens of the id |
-| Sync | `repos.json`'s `CopyRef.machine`, blob tokens and `?machine=`, `places.json`, `tasks.json`, `Step.by` | by id; `Step.by` and conflict copies keep the name, for people |
+| Sync | `repos.json`'s `CopyRef.machine`, blob tokens and `?machine=`, `places.json`, `tasks.json`, `Step.by`, the refs kiln keeps in people's repositories (`refs/remotes/kiln/<machine>/…`, `refs/kiln/wip/<machine>/…`) | by id |
 | Reach and the front door | the relay's links, `AgentMsg::Reach.to`, `ServerMsg::Reach.from`, each runner's `pins.json`, `front_door/<name>` | by id; pins by id with the name beside it |
 | Conversations | `sessions.machine`, `peers.peer = <machine>/<store>`, `Row::Machine`, `mirrors.json` | by id |
 | Fleet, updates, doctor | upgrade jobs' `target`, `updates/policy/<name>`, the fleet's tries | by id |
 | CI | the scheduler's `RunnerIn.id`, `jobs.agent`, `jobs.placement`, `ci_attempts.runner`, `ci_rollups`, `ci_runner_time`, `ci_preview_removals`, `work_reap_policies`, the W24 ledger's runner, `grants` `runner:<name>`, `on: runner:<name>` attachments | by id; `runs-on: <name>` resolves to an id when a job is routed, as GitHub's labels mean |
-| The store | `agents.name` the primary key, the rest bare text (no foreign keys) | `agents.machine_id` the key; history keeps the name it had, beside the id |
-| Metrics | `{agent=}`, `{runner=}`, `{machine=}` labels | the name stays the label people read; `machine_id` added where series must survive a rename |
+| The store | `agents.name` the primary key, the rest bare text (no foreign keys) | `agents.machine_id` the key; history shows each machine's name now |
+| Metrics | `{agent=}`, `{runner=}`, `{machine=}` labels: the name | two labels on every series of a machine, its name and its id, so metrics group by either |
 | API, UI, CLI | `/api/agents/:name/*`, `/api/runners/:name/*`, `?agent=`, `?runner=`, `/terminal?open=agent:<name>`, `kiln runners facts <name>`, `kiln reach forget <runner>`, `kiln updates … <runners>` | routes by id, names accepted and resolved; the UI routes by id and shows names |
-| Outside kiln | git refs in people's repositories (`refs/remotes/kiln/<machine>/…`, `refs/kiln/wip/<machine>/…`), conflict copies' names, webhook payloads and links, Prometheus series | names, for people: a rename moves the refs; webhooks carry both |
+| Webhooks | the `runner.offline` payload and link | the id, with the name beside it |
 
 ## Compatibility
 
@@ -102,7 +109,7 @@ Where the OS keeps no usable id, the machine still gets one:
   their id from phase 1's `agents.machine_id` (what their facts said), and treats them by name as
   now. On their first start on a new build they ask for a certificate with their id, proving their
   key as an upgrade's new process does (`/api/agents/instance`); the server writes the id they
-  reported, or refuses one another key holds ([Decisions](#decisions) 1).
+  reported, or refuses one another key holds, as enrollment does ([The machine id](#the-machine-id)).
 - **The store changes by migrations that older builds can live with** (`store/migrations.rs`):
   nullable `machine_id` columns beside the name columns, filled from `agents.machine_id`, read by
   the new build; a table re-keyed by id is a new table, with `-- kiln:epoch N`, once every
@@ -124,15 +131,13 @@ Each ships, is checked live, then the next starts.
 
 ## Decisions
 
-1. **Two machines report one id** (VMs cloned from one image without a new `/etc/machine-id`).
-   Proposed: enrollment refuses an id another key holds that was connected in the last 30 days,
-   saying to regenerate the machine id (`systemd-machine-id-setup`), unless an admin says it's
-   that machine, replaced. The other way, a new key is a new machine.
-2. **What history says after a rename:** runs, legs and audit rows show the name the runner had
-   then, or its name now. Proposed: its name now, with the old one in the audit trail.
-3. **Metrics:** keep `runner=<name>` as the label (series change on a rename), or label by id and
-   add the name. Proposed: the name, plus `machine_id` on the runner series only.
-4. **Git refs in people's repositories:** keep names (people read them) and move them on a rename,
-   or use ids. Proposed: names.
-5. **Join-token enrollments** (`kiln install --agent --token`) take the name asked, even another
-   machine's. Proposed: from phase 2, by id as joins are.
+Taken on 2026-10-27:
+
+1. **VMs and containers** have ids of their own ([The machine id](#the-machine-id)): a VM its
+   OS's, made from its hypervisor's UUID; a container one kiln keeps on its data volume. A copied
+   VM is caught when it enrolls.
+2. **History shows each machine's name now**, after a rename too.
+3. **Metrics carry both labels**, the machine's name and its id, so they group by either.
+4. **Every way in is named by id:** a machine enrolling with a join token
+   (`kiln install --agent --token`), which today takes whatever name it asks for, is named as a
+   joining machine is.
