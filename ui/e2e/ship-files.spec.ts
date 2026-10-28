@@ -6,17 +6,26 @@
  * 1440 px for a commit, a change and a host's pull request (Opened commit plan
  * 01a175b7f21b7455bcdcd71e94ecdce0, step 1, Files).
  */
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's review");
+
+/** A row opened by its chevron: clicked again if a click as the list settles didn't take (WebKit). */
+const openRow = async (row: Locator) => {
+  const go = row.locator(".ship-go");
+  await expect(async () => {
+    if ((await go.getAttribute("aria-expanded")) !== "true") await go.click({ timeout: 2_000 });
+    await expect(go).toHaveAttribute("aria-expanded", "true", { timeout: 1_000 });
+  }).toPass({ timeout: 15_000 });
+};
 
 /** D41's row opened, its Files drawn. */
 const openD41 = async (page: Page) => {
   await page.goto("/ship");
   const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
   await expect(row).toBeVisible({ timeout: 15_000 });
-  await row.locator(".ship-go").click();
+  await openRow(row);
   const files = row.locator('section[aria-label="Files"]');
   await expect(files.locator(".rv-sum")).toBeVisible({ timeout: 15_000 });
   return { row, files, each: files.locator("details.rv-f") };
@@ -80,7 +89,7 @@ test("from 320 to 1440 px, every item's Files is the lanes card's width within 1
       await page.goto("/ship");
       const row = page.locator(".ship-row").filter({ hasText: name }).first();
       await expect(row).toBeVisible({ timeout: 15_000 });
-      await row.locator(".ship-go").click();
+      await openRow(row);
       const files = row.locator('section[aria-label="Files"]');
       const card = row.locator('section[aria-label="Lanes"]');
       await expect(files.locator(".rv-sum")).toBeVisible({ timeout: 15_000 });
