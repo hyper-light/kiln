@@ -128,16 +128,6 @@ test("a machine in the slot, short: no domain, its host's name only when that's 
   assert.equal(shortMachineLabel("local", machines), "kiln server");
 });
 
-test("a deep folder, short: its last folder under …", async () => {
-  const { shortPath } = await import("../src/views/harness/spawn-setup.ts");
-  assert.equal(shortPath("~/Projects/kiln/.claude/worktrees/mission-composer/ui/src/views/harness"), "~/…/harness");
-  assert.equal(shortPath("~/Projects/kiln"), "~/…/kiln");
-  assert.equal(shortPath("~/kiln"), "~/kiln");
-  assert.equal(shortPath("/srv/app"), "/srv/app");
-  assert.equal(shortPath("/a/b/c"), "/…/c");
-  assert.equal(shortPath(""), "~");
-});
-
 test("fast mode: as the model lists it; a machine that lists no model's speeds gives Claude Code's Opus it", () => {
   const fast = { id: "fast", label: "Fast", description: "" };
   const old = claude({

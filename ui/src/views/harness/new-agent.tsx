@@ -32,24 +32,7 @@ import { usePrefill, type Prefill } from "./new-agent-draft";
 import { machineName } from "./parts";
 import { RunSettings, WordRow } from "./run-settings";
 import { effortsFor, resumeEffort } from "./spawn-efforts";
-import {
-  harnessesOf,
-  kindOf,
-  machineLabel,
-  machinesWithAny,
-  shortMachineLabel,
-  shortPath,
-  modeOf,
-  modelOf,
-  modesFor,
-  onMachine,
-  oneOf,
-  reachChoices,
-  specOf,
-  speedsFor,
-  targetOf,
-  withDir,
-} from "./spawn-setup";
+import { harnessesOf, kindOf, machineLabel, machinesWithAny, shortMachineLabel, modeOf, modelOf, modesFor, onMachine, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "./spawn-setup";
 import { useHeld } from "./state";
 import { MicButton } from "./voice";
 
@@ -330,7 +313,7 @@ function Opens({ c, part, text, title }: { c: Choices; part: Exclude<Part, null>
  * (the machine, the folder, how many), then the rest. The agent is picked as the agent page switches
  * one: by a model of its in the model select above the box.
  */
-function Options({ c, s }: { c: Choices; s: Setup }) {
+function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past: boolean; setPast: (o: boolean) => void; onResume: (s: Setup, p: PastSession) => void }) {
   const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
   return (
     <div className="mc-opts">
@@ -363,7 +346,7 @@ function Options({ c, s }: { c: Choices; s: Setup }) {
               <span>Shell: {shell?.title || "this shell"}</span>
             </button>
           ) : s.target ? (
-            <InlinePath target={s.target} value={s.cwd} onChange={(v) => c.setFolder({ target: s.target, cwd: v })} recent={s.recent} label="Folder" className="mc-where" />
+            <InlinePath target={s.target} value={s.cwd} onChange={(v) => c.setFolder({ target: s.target, cwd: v })} recent={s.recent} label="Folder" />
           ) : (
             <span className="mc-none">—</span>
           )}
@@ -440,6 +423,24 @@ function Options({ c, s }: { c: Choices; s: Setup }) {
           />
         </div>
       </div>
+      {s.target && (
+        <div className="mc-opt">
+          <span className="mc-opt-key">Continue</span>
+          <div className="mc-opt-val">
+            <button type="button" className="mc-pick" aria-expanded={past} onClick={() => setPast(!past)}>
+              <span>A past session on {s.machine}</span>
+              <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      )}
+      {past && s.target && (
+        <div className="ps-body mc-past mc-opt-panel">
+          <Loadable label="Loading past sessions" fallback={<p className="ps-none">Looking…</p>}>
+            <PastList target={s.target} kind={s.kind} kindName={s.kindName} onPick={(p) => onResume(s, p)} />
+          </Loadable>
+        </div>
+      )}
     </div>
   );
 }
@@ -490,7 +491,6 @@ function Under({
 }) {
   const s = useSetup(c);
   // What More options holds that isn't as it starts out, said while it's closed.
-  const where = `${s.kindName}${c.count > 1 ? ` ×${c.count}` : ""} on ${s.machine || "no machine"} ${c.shell ? "in a shell" : `in ${shortPath(tildify(s.cwd))}`}`;
   const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${c.reach}`)].filter(Boolean).join(" · ");
   return (
     <>
@@ -503,33 +503,13 @@ function Under({
             </button>
           </span>
         )}
-        <button
-          type="button"
-          className="mc-toggle mc-where-sum"
-          aria-expanded={more}
-          aria-label={`${where}${summary ? `, ${summary}` : ""}: change where it starts and more`}
-          title={s.machineFull}
-          onClick={() => setMore(!more)}
-        >
-          <span className="mc-where-text">{where}</span>
+        <button type="button" className="mc-toggle" aria-expanded={more} onClick={() => setMore(!more)}>
+          More options
           {!more && summary && <span className="mc-sum">{summary}</span>}
           <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
         </button>
-        {s.target && (
-          <button type="button" className="mc-toggle" aria-expanded={past} onClick={() => setPast(!past)}>
-            Continue a past session on {s.machine}
-            <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
-          </button>
-        )}
       </div>
-      {more && <Options c={c} s={s} />}
-      {past && s.target && (
-        <div className="ps-body mc-past">
-          <Loadable label="Loading past sessions" fallback={<p className="ps-none">Looking…</p>}>
-            <PastList target={s.target} kind={s.kind} kindName={s.kindName} onPick={(p) => onResume(s, p)} />
-          </Loadable>
-        </div>
-      )}
+      {more && <Options c={c} s={s} past={past} setPast={setPast} onResume={onResume} />}
       {s.stale.length > 0 ? (
         <p className="mc-note">
           <b>{s.stale.map((m) => m.name).join(", ")}</b> {s.stale.length === 1 ? "is" : "are"} connected, but {s.stale.length === 1 ? "its kiln runner is" : "their kiln runners are"} too old to run

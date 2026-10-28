@@ -1167,17 +1167,6 @@ html[data-motion="paused"] .ms-pick {
     color: #ededee;
   }
 }
-/* Where it starts, on one line: a long machine or folder gives way, the chevron stays. */
-.mc-where-sum {
-  min-width: 0;
-  max-width: 100%;
-}
-.mc-where-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .mc-sum {
   color: #ededee;
 }
@@ -1351,9 +1340,6 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 }
 :root[data-opening] .mc .hx-compose-box {
   view-transition-name: kiln-composer;
-}
-:root[data-opening] .mc-where-sum {
-  view-transition-name: kiln-where;
 }
 ::view-transition-group(*) {
   animation-duration: 0.22s;
