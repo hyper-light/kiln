@@ -12,6 +12,7 @@
  */
 import * as React from "react";
 import { Fold } from "@/views/harness/fold";
+import { labelOf, useLabels } from "@/lib/data";
 import { useParams, Link } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { planHref } from "@/api/plans";
@@ -168,6 +169,7 @@ function ResearchHead({ r, live }: { r: Research; live?: boolean }) {
 
 /** Research, graded, its sources numbered. `live`: it's still being done. */
 export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
+  useLabels();
   const s = r.summary;
   return (
     <div className="rs">
@@ -207,7 +209,7 @@ export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
                   {src.title !== src.locator && <span className="rs-title">{src.title}</span>} <Locator s={src} />
                   {src.published && <span className="rs-dim"> · {src.published}</span>}
                   {src.dated && <span className="rs-bad"> · out of date</span>}
-                  {src.machine && <span className="rs-dim"> · on {src.machine}</span>}
+                  {src.machine && <span className="rs-dim"> · on {labelOf(src.machine)}</span>}
                 </span>
               </li>
             ))}

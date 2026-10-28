@@ -4,6 +4,7 @@
  * happen in place above the list. Waiting to join: requests from machines discovery doesn't hear.
  */
 import * as React from "react";
+import { labelOf, noteLabels, shownName, useLabels } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { ArrowDown, ArrowRight, ArrowUpRight, Check, Pencil, Plus, Radar, Send, X } from "lucide-react";
 import { api, discoveryApi } from "@/api/client";
@@ -348,7 +349,17 @@ function ProbeForm({ probe, onProbe }: { probe: Probe | null; onProbe: (p: Probe
   );
 }
 
-function ProbeResult({ probe, found, row, onClose }: { probe: Probe; found: { i: DiscoveredInstance; stand: Stand }[]; row: (x: { i: DiscoveredInstance; stand: Stand }) => React.ReactNode; onClose: () => void }) {
+function ProbeResult({
+  probe,
+  found,
+  row,
+  onClose,
+}: {
+  probe: Probe;
+  found: { i: DiscoveredInstance; stand: Stand }[];
+  row: (x: { i: DiscoveredInstance; stand: Stand }) => React.ReactNode;
+  onClose: () => void;
+}) {
   return (
     <div className="am-probed" aria-live="polite">
       {probe.state === "asking" ? (
@@ -456,6 +467,7 @@ function InstanceAction({
   onPatch: (id: string, p: Partial<DiscoveredInstance>) => void;
   onChanged: () => void;
 }) {
+  useLabels();
   const name = displayName(i);
   const [busy, setBusy] = React.useState(false);
 
@@ -501,8 +513,8 @@ function InstanceAction({
       ) : null;
     case "here":
       return i.agent ? (
-        <Link className="am-act" to={`/runners?agent=${encodeURIComponent(i.agent)}`} aria-label={`Open runner ${i.agent}`}>
-          {i.agent} <ArrowRight aria-hidden="true" />
+        <Link className="am-act" to={`/runners?agent=${encodeURIComponent(i.agent)}`} aria-label={`Open runner ${labelOf(i.agent)}`}>
+          {labelOf(i.agent)} <ArrowRight aria-hidden="true" />
         </Link>
       ) : null;
     case "self":
@@ -520,7 +532,9 @@ function Decide({ request: r, onDecided }: { request: JoinRequest; onDecided: ()
     try {
       if (what === "approve") {
         const res = await api.approveJoin(r.id);
-        toast.success(`${res.name} approved`, "It connects as a runner in a moment.");
+        // Known by its machine id, it's shown by the name it asked for.
+        noteLabels([res]);
+        toast.success(`${shownName(res)} approved`, "It connects as a runner in a moment.");
       } else {
         await api.denyJoin(r.id);
         toast({ title: `${r.name} denied`, tone: "info" });
@@ -559,16 +573,7 @@ function Decide({ request: r, onDecided }: { request: JoinRequest; onDecided: ()
 export function WaitingSection({ index, requests, onDecided }: { index: string; requests: JoinRequest[]; onDecided: () => void }) {
   return (
     <section className="am-section" aria-labelledby="am-waiting">
-      <SectionHeading
-        index={index}
-        label="Requests"
-        title={<span id="am-waiting">Waiting to join</span>}
-        aside={
-          <span className="am-aside">
-            {requests.length} waiting
-          </span>
-        }
-      />
+      <SectionHeading index={index} label="Requests" title={<span id="am-waiting">Waiting to join</span>} aside={<span className="am-aside">{requests.length} waiting</span>} />
       <p className="am-hint">
         Asking to join, but not heard on this network. Approve one only when its code matches the one <code>kiln join</code> shows on it.
       </p>

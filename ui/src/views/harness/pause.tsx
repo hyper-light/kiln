@@ -8,6 +8,7 @@ import * as React from "react";
 import { ChevronRight, CirclePause, LogIn } from "lucide-react";
 import { useSession, type Command, type Pause, type SessionStore } from "@/api/harness";
 import { Button } from "@/components/ui/button";
+import { labelOf, useLabels } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { useClock } from "./dom";
 import { GoOnNow } from "./elsewhere";
@@ -33,6 +34,7 @@ export function pauseLine(p: Pause, now: number): string {
 
 /** Above the composer while the agent is paused. */
 export function PausedLine({ store, send, onLogin }: { store: SessionStore; send: (c: Command) => void; onLogin: () => void }) {
+  useLabels();
   const pause = useSession(store, (s) => s.state?.pause);
   const queued = useSession(store, (s) => s.state?.queue?.length ?? 0);
   const info = useSession(store, (s) => s.info);
@@ -54,7 +56,7 @@ export function PausedLine({ store, send, onLogin }: { store: SessionStore; send
   // leaves it be.
   const since = tried ? now - tried.at : 0;
   const stuck = tried !== null && since > 4000 && since < 180_000 && (pause.since === tried.since || pause.since >= tried.at - 1000);
-  const machine = info?.target.startsWith("agent:") ? info.target.slice("agent:".length) : null;
+  const machine = info?.target.startsWith("agent:") ? labelOf(info.target.slice("agent:".length)) : null;
   const waits = queued > 0 ? `${queued} queued message${queued === 1 ? " waits" : "s wait"}` : "What you send waits in the queue";
   return (
     <section className="hx-paused" aria-label="Usage limit" data-open={open || undefined}>
@@ -69,7 +71,8 @@ export function PausedLine({ store, send, onLogin }: { store: SessionStore; send
       <div id={detailsId} className="hx-paused-body" hidden={!open}>
         <p className="hx-paused-what">
           {pause.reason === "threshold" ? "Reached your usage stop point. " : pause.by === "account" ? "Another agent on this account reached the limit. " : ""}
-          {waits}{pause.cut ? "; the interrupted turn continues first." : "."}
+          {waits}
+          {pause.cut ? "; the interrupted turn continues first." : "."}
         </p>
         <div className="hx-paused-do">
           <Button size="xs" variant="secondary" onClick={() => act({ type: "resume" })}>

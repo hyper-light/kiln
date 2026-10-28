@@ -7,17 +7,8 @@ import * as React from "react";
 import { NameField } from "@/components/ui/name-field";
 import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
-import {
-  Bot,
-  ChevronDown,
-  Keyboard,
-  MoreHorizontal,
-  Plus,
-  Server,
-  SquareTerminal,
-  X,
-} from "lucide-react";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { Bot, ChevronDown, Keyboard, MoreHorizontal, Plus, Server, SquareTerminal, X } from "lucide-react";
+import { harnessSessionsRes, labelOf, useLabels, useRes } from "@/lib/data";
 import { cn } from "@/lib/utils";
 import { HarnessMark, StatusPill } from "@/views/harness/parts";
 import { throughSubagents } from "@/views/harness/tasks";
@@ -40,56 +31,26 @@ export interface MoreItem {
   pressed?: boolean;
 }
 
-const dot = (s: string) =>
-  s === "open"
-    ? "succeeded"
-    : s === "connecting" || s === "reconnecting"
-      ? "queued"
-      : s === "error"
-        ? "failed"
-        : "cancelled";
-const targetName = (t: string) =>
-  t === "local" ? "server" : t.replace(/^agent:/, "");
+const dot = (s: string) => (s === "open" ? "succeeded" : s === "connecting" || s === "reconnecting" ? "queued" : s === "error" ? "failed" : "cancelled");
+/** The machine a target is, as people know it (its label). */
+const targetName = (t: string) => (t === "local" ? "server" : labelOf(t.replace(/^agent:/, "")));
 
-function NewMenu({
-  targets,
-  onOpen,
-  onNewAgents,
-  trigger,
-}: {
-  targets: string[];
-  onOpen: (t: string) => void;
-  onNewAgents: () => void;
-  trigger: React.ReactNode;
-}) {
+function NewMenu({ targets, onOpen, onNewAgents, trigger }: { targets: string[]; onOpen: (t: string) => void; onNewAgents: () => void; trigger: React.ReactNode }) {
+  useLabels();
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>{trigger}</DropdownMenu.Trigger>
       <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          className="popover w-64"
-          sideOffset={6}
-          align="end"
-        >
+        <DropdownMenu.Content className="popover w-64" sideOffset={6} align="end">
           <DropdownMenu.Item className="menu-item" onSelect={onNewAgents}>
             <Bot size={14} className="text-[#b9dccb]" />
             <span className="flex-1">New agents…</span>
           </DropdownMenu.Item>
           <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
-          <DropdownMenu.Label className="label px-2.5 pt-1 pb-1">
-            New terminal on
-          </DropdownMenu.Label>
+          <DropdownMenu.Label className="label px-2.5 pt-1 pb-1">New terminal on</DropdownMenu.Label>
           {targets.map((t) => (
-            <DropdownMenu.Item
-              key={t}
-              className="menu-item"
-              onSelect={() => onOpen(t)}
-            >
-              {t === "local" ? (
-                <SquareTerminal size={14} className="text-[#9a9da6]" />
-              ) : (
-                <Server size={14} className="text-[#9a9da6]" />
-              )}
+            <DropdownMenu.Item key={t} className="menu-item" onSelect={() => onOpen(t)}>
+              {t === "local" ? <SquareTerminal size={14} className="text-[#9a9da6]" /> : <Server size={14} className="text-[#9a9da6]" />}
               <span className="flex-1 truncate">{targetName(t)}</span>
             </DropdownMenu.Item>
           ))}
@@ -119,6 +80,7 @@ function SwitcherSheet({
   onOpenTarget: (t: string) => void;
   onNewAgents: () => void;
 }) {
+  useLabels();
   const navigate = useNavigate();
   const list = useRes(harnessSessionsRes).data;
   const agents = list.slice().sort((a, b) => Number(b.approvals.length > 0) - Number(a.approvals.length > 0) || b.last_activity - a.last_activity);
@@ -213,6 +175,7 @@ export function MobileBar({
   onRename?: (name: string) => void;
   onRenameDone?: () => void;
 }) {
+  useLabels();
   const [sheet, setSheet] = React.useState(false);
   const list = useRes(harnessSessionsRes).data;
   const waiting = list.filter((a) => a.approvals.length > 0).length;
@@ -220,148 +183,84 @@ export function MobileBar({
   const current = idx >= 0 ? tabs[idx] : null;
   return (
     <>
-    <div className="sw-bar">
-      {renaming && current ? (
-        <div className="sw-current-btn sw-renaming">
-          <NameField
-            value={current.name ?? ""}
-            placeholder={
-              current.title.replace(/^[^·]*·\s*/, "") || current.title
-            }
-            label="Terminal name"
-            onSave={(n) => onRename?.(n)}
-            onDone={() => onRenameDone?.()}
-            className="sw-name-field"
-          />
-        </div>
-      ) : (
-        <button
-          type="button"
-          className="sw-current-btn"
-          onClick={() => setSheet(!sheet)}
-          aria-label="Switch session"
-          aria-expanded={sheet}
-        >
-          {current ? (
-            <i
-              className="dot"
-              data-status={dot(current.state)}
-              aria-hidden="true"
+      <div className="sw-bar">
+        {renaming && current ? (
+          <div className="sw-current-btn sw-renaming">
+            <NameField
+              value={current.name ?? ""}
+              placeholder={current.title.replace(/^[^·]*·\s*/, "") || current.title}
+              label="Terminal name"
+              onSave={(n) => onRename?.(n)}
+              onDone={() => onRenameDone?.()}
+              className="sw-name-field"
             />
-          ) : null}
-          <span className="sw-label">
-            <span className="sw-title">
-              {current
-                ? current.title.replace(/^[^·]*·\s*/, "") || current.title
-                : "No session"}
+          </div>
+        ) : (
+          <button type="button" className="sw-current-btn" onClick={() => setSheet(!sheet)} aria-label="Switch session" aria-expanded={sheet}>
+            {current ? <i className="dot" data-status={dot(current.state)} aria-hidden="true" /> : null}
+            <span className="sw-label">
+              <span className="sw-title">{current ? current.title.replace(/^[^·]*·\s*/, "") || current.title : "No session"}</span>
+              <span className="sw-meta">
+                {current ? targetName(current.target) : "tap to start one"}
+                {tabs.length > 0 && ` · ${idx + 1} of ${tabs.length}`}
+              </span>
             </span>
-            <span className="sw-meta">
-              {current ? targetName(current.target) : "tap to start one"}
-              {tabs.length > 0 && ` · ${idx + 1} of ${tabs.length}`}
-            </span>
-          </span>
-          {waiting > 0 && (
-            <span
-              className="sw-badge"
-              title={`${waiting} agent${waiting === 1 ? "" : "s"} waiting on you`}
-            >
-              {waiting}
-            </span>
-          )}
-          <ChevronDown size={14} />
+            {waiting > 0 && (
+              <span className="sw-badge" title={`${waiting} agent${waiting === 1 ? "" : "s"} waiting on you`}>
+                {waiting}
+              </span>
+            )}
+            <ChevronDown size={14} />
+          </button>
+        )}
+        <NewMenu
+          targets={targets}
+          onOpen={onOpenTarget}
+          onNewAgents={onNewAgents}
+          trigger={
+            <button type="button" className="sw-icon sw-plus" aria-label="New terminal or agents">
+              <Plus size={17} />
+            </button>
+          }
+        />
+        <button type="button" className={cn("sw-icon", kbVisible && "sw-on")} aria-pressed={kbVisible} aria-label="Toggle on-screen keyboard" onClick={onToggleKb}>
+          <Keyboard size={16} />
         </button>
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button type="button" className="sw-icon" aria-label="More">
+              <MoreHorizontal size={17} />
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content className="popover w-60" sideOffset={6} align="end">
+              {more.map((m) => (
+                <DropdownMenu.Item key={m.label} className="menu-item" disabled={m.disabled} onSelect={m.onSelect}>
+                  {m.icon}
+                  <span className="flex-1">{m.label}</span>
+                  {m.pressed !== undefined && <span className="font-mono text-[10px] text-[#7f838d]">{m.pressed ? "on" : "off"}</span>}
+                </DropdownMenu.Item>
+              ))}
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+      </div>
+      {sheet && (
+        <SwitcherSheet onDone={() => setSheet(false)} tabs={tabs} activeId={activeId} onSelect={onSelect} onClose={onClose} targets={targets} onOpenTarget={onOpenTarget} onNewAgents={onNewAgents} />
       )}
-      <NewMenu
-        targets={targets}
-        onOpen={onOpenTarget}
-        onNewAgents={onNewAgents}
-        trigger={
-          <button
-            type="button"
-            className="sw-icon sw-plus"
-            aria-label="New terminal or agents"
-          >
-            <Plus size={17} />
-          </button>
-        }
-      />
-      <button
-        type="button"
-        className={cn("sw-icon", kbVisible && "sw-on")}
-        aria-pressed={kbVisible}
-        aria-label="Toggle on-screen keyboard"
-        onClick={onToggleKb}
-      >
-        <Keyboard size={16} />
-      </button>
-      <DropdownMenu.Root>
-        <DropdownMenu.Trigger asChild>
-          <button type="button" className="sw-icon" aria-label="More">
-            <MoreHorizontal size={17} />
-          </button>
-        </DropdownMenu.Trigger>
-        <DropdownMenu.Portal>
-          <DropdownMenu.Content
-            className="popover w-60"
-            sideOffset={6}
-            align="end"
-          >
-            {more.map((m) => (
-              <DropdownMenu.Item
-                key={m.label}
-                className="menu-item"
-                disabled={m.disabled}
-                onSelect={m.onSelect}
-              >
-                {m.icon}
-                <span className="flex-1">{m.label}</span>
-                {m.pressed !== undefined && (
-                  <span className="font-mono text-[10px] text-[#7f838d]">
-                    {m.pressed ? "on" : "off"}
-                  </span>
-                )}
-              </DropdownMenu.Item>
-            ))}
-          </DropdownMenu.Content>
-        </DropdownMenu.Portal>
-      </DropdownMenu.Root>
-    </div>
-    {sheet && (
-      <SwitcherSheet
-        onDone={() => setSheet(false)}
-        tabs={tabs}
-        activeId={activeId}
-        onSelect={onSelect}
-        onClose={onClose}
-        targets={targets}
-        onOpenTarget={onOpenTarget}
-        onNewAgents={onNewAgents}
-      />
-    )}
     </>
   );
 }
 
 /** Desktop: "+ New" pinned next to the tabs (never scrolled away), with new agents in it too. */
-export function DesktopNew({
-  targets,
-  onOpenTarget,
-  onNewAgents,
-}: {
-  targets: string[];
-  onOpenTarget: (t: string) => void;
-  onNewAgents: () => void;
-}) {
+export function DesktopNew({ targets, onOpenTarget, onNewAgents }: { targets: string[]; onOpenTarget: (t: string) => void; onNewAgents: () => void }) {
   return (
     <NewMenu
       targets={targets}
       onOpen={onOpenTarget}
       onNewAgents={onNewAgents}
       trigger={
-        <button
-          className="flex shrink-0 items-center gap-1.5 border-l border-[#1d1f23] px-3 text-[12px] text-[#a1a4ad] hover:bg-white/[0.04] hover:text-white"
-          aria-label="New terminal session"
-        >
+        <button className="flex shrink-0 items-center gap-1.5 border-l border-[#1d1f23] px-3 text-[12px] text-[#a1a4ad] hover:bg-white/[0.04] hover:text-white" aria-label="New terminal session">
           <Plus size={14} /> <span>New</span> <ChevronDown size={12} />
         </button>
       }

@@ -1,5 +1,52 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AgentKeep, AgentLimitView, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JobTools, ToolFix, JoinInfo, JoinRequest, KeepRules, KeepView, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunRow, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncMode, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type {
+  Agent,
+  AgentKeep,
+  AgentLimitView,
+  AiSession,
+  AiTranscriptEntry,
+  AuditEntry,
+  ConvoLog,
+  ConvoSeries,
+  ConvoStatus,
+  DirListing,
+  DiscoveryInfo,
+  Job,
+  JobTools,
+  ToolFix,
+  JoinInfo,
+  JoinRequest,
+  KeepRules,
+  KeepView,
+  KilnBinary,
+  Me,
+  MetricsHistory,
+  NewRepo,
+  OutpostInvite,
+  Overview,
+  PlaceAsk,
+  PlacesView,
+  PlaceTask,
+  ReachRunner,
+  Repo,
+  Run,
+  RunDetail,
+  RunRow,
+  RunnerDiagnosis,
+  RunnerRepair,
+  SyncActivity,
+  SyncKeep,
+  SyncMode,
+  SyncView,
+  SystemInfo,
+  TaskKind,
+  TerminalSessionInfo,
+  UpdateJob,
+  UpdatePolicy,
+  UpdatesOverview,
+  UpgradeWaits,
+  UpgradeWay,
+} from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -256,11 +303,15 @@ export const api = {
   agentLimit: (name: string, signal?: AbortSignal) => get<AgentLimitView>(`/api/runners/${enc(name)}/agent-limit`, signal),
   /** Set it here (wins over the runner's config); `null` takes it away, and its config's (or kiln's default) holds again. */
   setAgentLimit: (name: string, max_sessions: number | null) => request<AgentLimitView>("PUT", `/api/runners/${enc(name)}/agent-limit`, { max_sessions }),
+  /** The name people see for runner `name` (docs/machines.md), which kiln goes on knowing by `name`: the label as the server keeps it. */
+  labelAgent: (name: string, label: string) => post<{ name: string; label: string }>(`/api/agents/${enc(name)}/label`, { label }),
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),
   joinRequests: (signal?: AbortSignal) => get<JoinRequest[]>("/api/join-requests", signal),
   /** A one-time invite for an outpost: kiln run on a machine without installing it there. */
   outpostInvite: () => post<OutpostInvite>("/api/outposts/invite"),
-  approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) => post<{ id: string; status: string; name: string; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
+  /** `name`: the agent it is now (its machine id, when it sent one); `label`: the name people see then. */
+  approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) =>
+    post<{ id: string; status: string; name: string; label?: string | null; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
   denyJoin: (id: string) => post<{ id: string; status: string; name: string }>(`/api/join-requests/${enc(id)}/deny`),
   discovery: (signal?: AbortSignal) => get<DiscoveryInfo>("/api/discovery", signal),
 

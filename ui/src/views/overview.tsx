@@ -9,7 +9,7 @@ import { Loadable } from "@/components/ui/loading";
 import { EmptyState, Facts, PageIntro, Panel, SectionHeading } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { useAuth } from "@/lib/auth";
-import { agentsRes, historyRes, lastSamples, overviewRes, recentRunsRes, useAgentsLive, useMetricsHistory, useOverview, useRecentRuns, warm } from "@/lib/data";
+import { agentsRes, historyRes, lastSamples, overviewRes, recentRunsRes, shownName, useAgentsLive, useMetricsHistory, useOverview, useRecentRuns, warm } from "@/lib/data";
 import { formatBytes, formatDuration, formatPct, formatUptime } from "@/lib/format";
 import { AgentMiniCard, RelTime, RunActivityRow, childStatus, diskPct, memPct } from "./shared";
 
@@ -221,7 +221,7 @@ function Fleet() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
           {[...runners]
-            .sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name))
+            .sort((a, b) => Number(b.connected) - Number(a.connected) || shownName(a).localeCompare(shownName(b)))
             .slice(0, 8)
             .map((a) => (
               <AgentMiniCard key={a.name} agent={a} history={lastSamples(history, a.name, SPARK)} onOpen={() => navigate(`/runners?agent=${encodeURIComponent(a.name)}`)} />

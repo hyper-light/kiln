@@ -11,7 +11,7 @@ import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { EmptyState, ErrorState, FilterBar, PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
-import { reposRes, useRepos, warm } from "@/lib/data";
+import { labelOf, reposRes, useLabels, useRepos, warm } from "@/lib/data";
 import { firstLine, shortSha, statusLabel } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -201,22 +201,25 @@ function RunsBody() {
     return c;
   }, [runs, passes]);
   // Each facet's values among the runs loaded, each with how many it would show (the other facets as they are).
+  // A runner is named as people know it (its label); its option keeps its name.
+  const labels = useLabels();
   const facets: Facet[] = React.useMemo(
     () =>
       FACETS.map((f) => {
         const n = new Map<string, number>();
         for (const r of runs) if ((!group || group.includes(r.status)) && passes(r, f.id)) for (const v of f.of(r)) n.set(v, (n.get(v) ?? 0) + 1);
         if (f.id === "repo") for (const r of repos) if (!n.has(r.name)) n.set(r.name, 0);
+        const shown = (v: string) => (f.id === "runner" ? labelOf(v, labels) : v);
         return {
           id: f.id,
           label: f.label,
           options: [...n.entries()]
             .filter(([v]) => v)
-            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-            .map(([v, count]) => ({ id: v, label: v, count })),
+            .sort((a, b) => b[1] - a[1] || shown(a[0]).localeCompare(shown(b[0])))
+            .map(([v, count]) => ({ id: v, label: shown(v), count })),
         };
       }),
-    [runs, repos, group, passes],
+    [runs, repos, group, passes, labels],
   );
 
   const filtered = Boolean(Object.keys(chosen).length || status !== "all" || words);

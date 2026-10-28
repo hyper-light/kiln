@@ -5,6 +5,7 @@
  */
 import type { ControlOption, KindInfo, ModeOption, Spec } from "@/api/harness";
 import type { Agent, ReachRunner } from "@/api/types";
+import { labelOf, shownName } from "@/lib/data";
 
 /** Each harness's own permission modes, as its agents' pages name them (claude.rs and codex.rs `modes`), for runners that don't report them (what the machine reports wins). */
 const MODES: Record<string, ModeOption[]> = {
@@ -70,21 +71,23 @@ export const machinesWith = (byTarget: Record<string, KindInfo[]>, kind: string)
 /** The first of `wanted` (picked, handed over, used last) that has the harness, else the first that does. */
 export const targetOf = (where: string[], wanted: (string | null | undefined)[]): string => wanted.find((t): t is string => Boolean(t) && where.includes(t ?? "")) ?? where[0] ?? "";
 
-/** A machine as people know it: the kiln server, or its name (with its hostname when that differs). */
-/** A machine as the composer's slot says it, short: its name without its domain, and its host's when that's another ("kiln-a094a12d (fedora-2)"). */
+/** A machine as the composer's slot says it, short: the name it's shown by without its domain, and its host's when that's another ("kiln-a094a12d (fedora-2)"). */
 export function shortMachineLabel(target: string, machines: Agent[]): string {
   if (target === "local") return "kiln server";
   const n = target.replace(/^agent:/, "");
   const first = (s: string) => s.split(".")[0] || s;
-  const host = machines.find((x) => x.name === n)?.hostname;
-  return host && first(host).toLowerCase() !== first(n).toLowerCase() ? `${first(n)} (${first(host)})` : first(n);
+  const m = machines.find((x) => x.name === n);
+  const shown = m ? shownName(m) : labelOf(n);
+  return m?.hostname && first(m.hostname).toLowerCase() !== first(shown).toLowerCase() ? `${first(shown)} (${first(m.hostname)})` : first(shown);
 }
 
+/** A machine as people know it: the kiln server, or the name it's shown by (with its hostname when that differs). */
 export function machineLabel(target: string, machines: Agent[]): string {
   if (target === "local") return "kiln server";
   const n = target.replace(/^agent:/, "");
   const m = machines.find((x) => x.name === n);
-  return m?.hostname && m.hostname !== n ? `${n} (${m.hostname})` : n;
+  const shown = m ? shownName(m) : labelOf(n);
+  return m?.hostname && m.hostname !== shown ? `${shown} (${m.hostname})` : shown;
 }
 
 /**
@@ -170,5 +173,5 @@ export function withDir(dirs: Record<string, string[]>, target: string, cwd: str
 export function reachChoices(runners: ReachRunner[], target: string): { value: string; label: string }[] {
   const others = runners.filter((r) => `agent:${r.name}` !== target);
   const platforms = [...new Set(others.map((r) => `${r.os}/${r.arch}`))].sort();
-  return [...platforms.map((p) => ({ value: p, label: `Prefer any ${p}` })), ...others.map((r) => ({ value: r.name, label: `Prefer ${r.name} (${r.os}/${r.arch})` }))];
+  return [...platforms.map((p) => ({ value: p, label: `Prefer any ${p}` })), ...others.map((r) => ({ value: r.name, label: `Prefer ${shownName(r)} (${r.os}/${r.arch})` }))];
 }

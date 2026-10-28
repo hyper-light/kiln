@@ -11,6 +11,7 @@ import type { ConvoLogLine, ConvoStatus } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { EmptyState, FilterBar, SearchField, SectionHeading } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { labelOf, useLabels } from "@/lib/data";
 import { fileStamp, saveFile } from "@/lib/download";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -178,7 +179,7 @@ function readoutOf(status: ConvoStatus, selected: string | null): { title: strin
     const f = s.report?.file;
     const behind = s.mirror?.behind ?? 0;
     return {
-      title: `Mirror · ${s.machine} · ${f ? sizeText(f.bytes) : "—"}`,
+      title: `Mirror · ${labelOf(s.machine)} · ${f ? sizeText(f.bytes) : "—"}`,
       note: !s.connected
         ? "Offline. The server's store waits to send it what it lacks."
         : behind > 0
@@ -190,7 +191,7 @@ function readoutOf(status: ConvoStatus, selected: string | null): { title: strin
     const f = s.report?.file;
     const behind = s.feed?.behind ?? 0;
     return {
-      title: `${s.machine} · ${f ? sizeText(f.bytes) : "keeps no store"}`,
+      title: `${labelOf(s.machine)} · ${f ? sizeText(f.bytes) : "keeps no store"}`,
       note: !s.connected
         ? "Offline. Its history stays kept; its cable comes back with the runner."
         : `${rate(s.rates.writes)} writes/s · ${countText(behind)} to come · ${s.state === "behind" ? "stalled" : behind > 0 ? "catching up" : "in sync"}`,
@@ -205,6 +206,7 @@ function readoutOf(status: ConvoStatus, selected: string | null): { title: strin
 
 /** The figure. `selected`: the store picked (here or in the table), its dashboard shown below. */
 export function ReplicationFigure({ status, selected, onSelect }: { status: ConvoStatus; selected: string | null; onSelect: (key: string | null) => void }) {
+  useLabels();
   const landscape = React.useMemo(() => replicationScene(status, false), [status]);
   const portrait = React.useMemo(() => replicationScene(status, true), [status]);
   const health = healthOf(status);

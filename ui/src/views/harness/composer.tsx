@@ -10,6 +10,7 @@
 import * as React from "react";
 import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type Attachment, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
+import { labelOf, useLabels } from "@/lib/data";
 import { useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
@@ -414,8 +415,10 @@ export function Composer({
   // The agent can't take a message now (its machine away, or the connection down): what you
   // send is kept here, and goes once it can. Typing never stops.
   const reachable = !disabled && status !== "disconnected";
-  // The machine it runs on, by name (none for one on the kiln server itself).
-  const machine = useSession(store, (s) => (s.info?.target?.startsWith("agent:") ? s.info.target.slice(6) : ""));
+  // The machine it runs on, as people know it (none for one on the kiln server itself).
+  const on = useSession(store, (s) => (s.info?.target?.startsWith("agent:") ? s.info.target.slice(6) : ""));
+  const labels = useLabels();
+  const machine = on && labelOf(on, labels);
   const paused = useSession(store, (s) => (s.state?.pause ? (s.state.pause.auto ? "auto" : "manual") : null));
   const held = useHeld((s) => s.held[agent] ?? NO_HELD);
   const queue = useSession(store, (s) => s.state?.queue ?? NO_QUEUE);

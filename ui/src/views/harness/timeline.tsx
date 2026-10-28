@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type Outgoing, type QueueItem, type SessionStore, type Task } from "@/api/harness";
+import { labelOf, useLabels } from "@/lib/data";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -199,7 +200,7 @@ function EditBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
 /** A command that ran (or runs) on another machine (kiln reach). */
 const elsewhere = (c: ToolEvent) => typeof c.runner === "string";
 
-/** Where it ran, as a chip: the runner, what it must be until one is picked, or "another runner". */
+/** Where it ran, as a chip: the runner (as people know it), what it must be until one is picked, or "another runner". */
 function Where({ runner, title }: { runner: string; title?: string }) {
   return (
     <span className="hx-where" title={title ?? (runner ? `Ran on ${runner}, not this agent's machine` : "Runs on another runner")}>
@@ -215,11 +216,12 @@ function Where({ runner, title }: { runner: string; title?: string }) {
  */
 function whereOfStep(calls: ToolEvent[], remote: string[]): string {
   const n = calls.filter(elsewhere).length;
-  const machines = remote.length === 1 ? remote[0] || "another runner" : `${remote.length} machines`;
+  const machines = remote.length === 1 ? (remote[0] ? labelOf(remote[0]) : "another runner") : `${remote.length} machines`;
   return n === calls.length && remote.length === 1 ? machines : `${n} on ${machines}`;
 }
 
 function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
+  useLabels();
   const [open, setOpen] = React.useState(Boolean(initial));
   useRevealed(
     (id) => id === c.id,
@@ -232,7 +234,7 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
     <div className="hx-cmd" data-failed={failed || undefined} data-remote={elsewhere(c) || undefined} data-ev={c.id}>
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
         <i className="dot" data-status={dotFor(failed ? "error" : c.status)} aria-hidden="true" />
-        {typeof c.runner === "string" && <Where runner={c.runner} />}
+        {typeof c.runner === "string" && <Where runner={labelOf(c.runner)} />}
         <code className="hx-cmd-line">
           <Highlighted text={c.title} lang="bash" />
         </code>
@@ -405,6 +407,7 @@ const OPEN_AFTER_MS = 500;
 const RUNNING_BEFORE_MS = 2000;
 
 const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { step: Step; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
+  useLabels();
   const status = stepStatus(step.calls);
   const failures = step.calls.filter((c) => c.status === "error" || (c.tool === "shell" && c.exit_code !== undefined && c.exit_code !== 0)).length;
   const asking = React.useContext(Asking);
@@ -436,6 +439,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const last = step.calls.at(-1);
   // Commands run on other machines: where, in the step's head, so it shows folded too.
   const remote = [...new Set(step.calls.filter(elsewhere).map((c) => c.runner ?? ""))];
+  const remoteNames = remote.filter(Boolean).map((r) => labelOf(r));
   const subtitle =
     step.group === "shell" && step.calls.length === 1
       ? first?.title
@@ -460,7 +464,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
         </span>
         <span className="hx-step-title">{stepSummary(step.group, step.calls)}</span>
         {subtitle && <span className="hx-step-sub">{subtitle}</span>}
-        {remote.length > 0 && <Where runner={whereOfStep(step.calls, remote)} title={remote.filter(Boolean).join(", ") || undefined} />}
+        {remote.length > 0 && <Where runner={whereOfStep(step.calls, remote)} title={remoteNames.join(", ") || undefined} />}
         <span className="hx-step-end">
           {stats && (stats.add > 0 || stats.del > 0) && <DiffStat add={stats.add} del={stats.del} />}
           {status === "pending" && (asked ? <span className="hx-warn text-[11px]">waiting for you</span> : <span className="hx-dim text-[11px]">queued</span>)}

@@ -7,6 +7,7 @@
  * line across the others.
  */
 import type { Stand } from "@/views/plans/status";
+import { labelOf } from "@/lib/data";
 
 /** A step as a goal's plan draws it. */
 export interface GoalStep {
@@ -82,8 +83,10 @@ export function shortTitle(title: string, max = 40): string {
   return head.length > max ? `${head.slice(0, max - 1).replace(/\s+\S*$/, "")}…` : head;
 }
 
-/** Where an agent runs, as a step says who's at it: a runner's name to its first dot, "the server" for kiln's own. */
+/** Where an agent runs, as a step says who's at it: the name a runner is shown by to its first dot, "the server" for kiln's own. */
 export function machineWord(target: string): string {
   const name = target.replace(/^agent:/, "");
-  return name === "local" ? "the server" : (name.split(".")[0] ?? name);
+  if (name === "local") return "the server";
+  const shown = labelOf(name);
+  return shown.split(".")[0] ?? shown;
 }

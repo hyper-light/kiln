@@ -11,6 +11,7 @@ import { Activity, ArrowUpRight, Bot, Box, CornerDownLeft, Cpu, FolderSync, GitB
 import { api } from "@/api/client";
 import type { Agent, Repo, Run } from "@/api/types";
 import { StatusDot } from "@/components/ui/status";
+import { noteLabels, shownName } from "@/lib/data";
 import { relativeTime, shortSha } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -46,7 +47,10 @@ export function setPaletteOpen(open: boolean) {
     () => undefined,
   );
   api.agents(ctl.signal).then(
-    (agents) => usePalette.setState({ agents }),
+    (agents) => {
+      noteLabels(agents);
+      usePalette.setState({ agents });
+    },
     () => undefined,
   );
 }
@@ -116,11 +120,32 @@ function Palette() {
       { id: "p-overview", group: "Pages", label: "Overview", icon: <LayoutGrid size={15} />, run: () => go("/") },
       { id: "p-runs", group: "Pages", label: "Runs", icon: <Activity size={15} />, run: () => go("/runs") },
       { id: "p-deployments", group: "Pages", label: "Deployments", hint: "sync and health", icon: <Rocket size={15} />, run: () => go("/deployments") },
-      { id: "p-environments", group: "Pages", label: "Environments", hint: "what runs in each, what drifts, what waits to deploy", icon: <Rocket size={15} />, run: () => go("/deployments/environments") },
-      { id: "p-releases", group: "Pages", label: "Releases", hint: "apps across environments: deploy, promote, roll back, approve", icon: <Rocket size={15} />, run: () => go("/deployments/releases") },
+      {
+        id: "p-environments",
+        group: "Pages",
+        label: "Environments",
+        hint: "what runs in each, what drifts, what waits to deploy",
+        icon: <Rocket size={15} />,
+        run: () => go("/deployments/environments"),
+      },
+      {
+        id: "p-releases",
+        group: "Pages",
+        label: "Releases",
+        hint: "apps across environments: deploy, promote, roll back, approve",
+        icon: <Rocket size={15} />,
+        run: () => go("/deployments/releases"),
+      },
       { id: "p-deploy-plans", group: "Pages", label: "Deploy plans", hint: "what a branch, commit or pull request would deploy", icon: <GitBranch size={15} />, run: () => go("/deployments/plans") },
       { id: "p-repos", group: "Pages", label: "Repositories", icon: <GitBranch size={15} />, run: () => go("/repos") },
-      { id: "p-sync", group: "Pages", label: "Synced folders", hint: "in Repositories: folders kept the same on several machines", icon: <FolderSync size={15} />, run: () => go("/repos?show=synced") },
+      {
+        id: "p-sync",
+        group: "Pages",
+        label: "Synced folders",
+        hint: "in Repositories: folders kept the same on several machines",
+        icon: <FolderSync size={15} />,
+        run: () => go("/repos?show=synced"),
+      },
       { id: "p-runners", group: "Pages", label: "Runners", icon: <Server size={15} />, run: () => go("/runners") },
       { id: "p-agents", group: "Pages", label: "Agents", hint: "AI sessions", icon: <Bot size={15} />, run: () => go("/agents") },
       { id: "p-term", group: "Pages", label: "Terminal", icon: <SquareTerminal size={15} />, run: () => go("/terminal") },
@@ -166,8 +191,9 @@ function Palette() {
       .map((a) => ({
         id: `ag-${a.name}`,
         group: "Terminals",
-        label: `Terminal on ${a.name}`,
+        label: `Terminal on ${shownName(a)}`,
         hint: a.hostname,
+        keywords: a.label ? a.name : undefined,
         icon: <Play size={15} />,
         run: () => go(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`),
       }));

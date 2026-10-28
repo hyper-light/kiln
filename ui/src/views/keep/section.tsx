@@ -12,7 +12,7 @@ import { Loadable } from "@/components/ui/loading";
 import { EmptyState, FoldSection, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
-import { useRes, type Res } from "@/lib/data";
+import { labelOf, useLabels, useRes, type Res } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -109,6 +109,7 @@ function runnerDot(r: KeepRunner): { status: string; title: string } {
 }
 
 function RunnerRow({ r, open, onOpen }: { r: KeepRunner; open: boolean; onOpen: () => void }) {
+  useLabels();
   const dot = runnerDot(r);
   const t = taking(r.copies);
   const last = r.gone[0];
@@ -118,7 +119,7 @@ function RunnerRow({ r, open, onOpen }: { r: KeepRunner; open: boolean; onOpen: 
     setBusy(true);
     try {
       await api.keepNow(r.name);
-      toast.success(`${r.name} lets go now`, `${r.now.copies} ${r.now.copies === 1 ? "copy" : "copies"} its rules don't keep, within 20 seconds.`);
+      toast.success(`${labelOf(r.name)} lets go now`, `${r.now.copies} ${r.now.copies === 1 ? "copy" : "copies"} its rules don't keep, within 20 seconds.`);
       invalidate("reach/keep");
     } catch (e) {
       toast.error("Couldn't ask it", errorMessage(e));
@@ -133,7 +134,7 @@ function RunnerRow({ r, open, onOpen }: { r: KeepRunner; open: boolean; onOpen: 
       </td>
       <td className="whitespace-nowrap text-[#e4e5e7]">
         <button type="button" className="text-left" aria-expanded={open} onClick={onOpen}>
-          {r.name}
+          {labelOf(r.name)}
         </button>
       </td>
       <td className="num cell-mono">{r.copies.length}</td>
@@ -168,21 +169,23 @@ function RunnerRow({ r, open, onOpen }: { r: KeepRunner; open: boolean; onOpen: 
 }
 
 function RunnerPanel({ view, r }: { view: KeepView; r: KeepRunner }) {
+  useLabels();
+  const shown = labelOf(r.name);
   return (
     <div className="kp-runner">
-      <Panel eyebrow={r.name} title="Its rules" description={r.base ? `Its copies are in ${r.base}.` : undefined}>
+      <Panel eyebrow={shown} title="Its rules" description={r.base ? `Its copies are in ${r.base}.` : undefined}>
         <RulesForm
           rules={r.rules}
           above={view.rules}
           aboveName="every runner's"
-          label={`${r.name}'s rules`}
+          label={`${shown}'s rules`}
           onSave={async (rules) => {
             await api.setRunnerKeep(r.name, rules);
             invalidate("reach/keep");
           }}
         />
       </Panel>
-      <Panel eyebrow={r.name} title="What it holds" description={r.error ? r.error : undefined}>
+      <Panel eyebrow={shown} title="What it holds" description={r.error ? r.error : undefined}>
         <CopyList copies={r.copies} empty={r.heard === null ? "It hasn't said what it holds: an older kiln, or one that never connected." : "No copies of other runners' trees."} />
         <h4 className="field-label mt-6">What it let go</h4>
         <GoneList gone={r.gone} />
@@ -193,6 +196,7 @@ function RunnerPanel({ view, r }: { view: KeepView; r: KeepRunner }) {
 
 /** Copies, each with what the rules say of it now. */
 export function CopyList({ copies, empty, where = false }: { copies: KeepCopy[]; empty: string; where?: boolean }) {
+  useLabels();
   if (!copies.length) return <p className="kp-summary">{empty}</p>;
   const sorted = [...copies].sort((a, b) => b.used - a.used);
   return (
@@ -200,9 +204,9 @@ export function CopyList({ copies, empty, where = false }: { copies: KeepCopy[];
       {sorted.map((c) => (
         <li key={`${c.runner ?? ""}/${c.from}/${c.key}`}>
           <StatusDot status={c.busy ? "running" : c.kept ? "succeeded" : "timed_out"} title={c.busy ? "in use" : c.kept ? "kept" : "goes when a trigger comes"} />
-          <span className="kp-copy-name" title={`${c.from}/${c.key}`}>
-            {where && c.runner ? `${c.runner}: ` : ""}
-            {c.from}/{c.key}
+          <span className="kp-copy-name" title={`${labelOf(c.from)}/${c.key}`}>
+            {where && c.runner ? `${labelOf(c.runner)}: ` : ""}
+            {labelOf(c.from)}/{c.key}
           </span>
           <span className="kp-copy-meta">
             {c.bytes !== undefined ? formatBytes(c.bytes) : "measuring"} · <RelTime ts={c.used} />
@@ -220,14 +224,15 @@ export function CopyList({ copies, empty, where = false }: { copies: KeepCopy[];
 
 /** Copies let go, newest first, with why. */
 export function GoneList({ gone }: { gone: KeepGone[] }) {
+  useLabels();
   if (!gone.length) return <p className="kp-summary">Nothing yet.</p>;
   return (
     <ul className="kp-list">
       {gone.slice(0, 20).map((g, i) => (
         <li key={`${g.at}-${g.from}-${g.key}-${i}`}>
           <StatusDot status={g.error ? "failed" : "skipped"} title={g.error ?? triggerSaid(g.trigger)} />
-          <span className="kp-copy-name" title={`${g.from}/${g.key}`}>
-            {g.from}/{g.key}
+          <span className="kp-copy-name" title={`${labelOf(g.from)}/${g.key}`}>
+            {labelOf(g.from)}/{g.key}
           </span>
           <span className="kp-copy-meta">
             {g.bytes !== undefined ? `${formatBytes(g.bytes)} · ` : ""}

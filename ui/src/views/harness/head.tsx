@@ -14,12 +14,12 @@ import { useClock, useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
 import { AtLimit } from "./elsewhere";
 import { LimitBadge, topLimit, UsagePanel } from "./limits";
-import { machineName } from "./parts";
+import { machineShown } from "./parts";
 import { modelIn, RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
 import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { harnessSessionsRes, useLabels, useRes } from "@/lib/data";
 import "./console.css";
 
 type BorderState = "active" | "stopped" | "finished" | "ready" | "disconnected";
@@ -117,6 +117,7 @@ export function AgentHeader({
   /** Show what it left running in the background. */
   onBackground?: () => void;
 }) {
+  useLabels();
   const navigate = useNavigate();
   const features = meta?.features ?? [];
   const running = status === "running" || status === "waiting";
@@ -203,7 +204,7 @@ export function AgentHeader({
             <span aria-hidden="true">·</span>
           </>
         )}
-        {info && <span title={cwd}>{machineName(info.target)}</span>}
+        {info && <span title={cwd}>{machineShown(info.target)}</span>}
       </p>
       {/* The name and the buttons on one row, centred on each other. */}
       <div className="ag-top">

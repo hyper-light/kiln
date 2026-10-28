@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField, Skeleton } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { useAgentsLive } from "@/lib/data";
+import { labelOf, useAgentsLive, useLabels } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -30,7 +30,7 @@ import { BulkBar } from "./bulk";
 import { DEFAULT_VIEW, isFiltered, ListBar, sortOf, useGlide, useListHold, useShownList, type ListView } from "./list-tools";
 import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
-import { Ago, machineName } from "./parts";
+import { Ago, machineName, machineShown } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
@@ -168,6 +168,7 @@ const Row = React.memo(function Row({
   picking?: boolean;
   onSelect: (id: string, on: boolean) => void;
 }) {
+  useLabels();
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
@@ -208,7 +209,7 @@ const Row = React.memo(function Row({
       )}
       <span className="ms-meta">
         <span>
-          {machineName(a.target)} · <Ago className="ms-time" ts={Math.floor(a.last_activity / 1000)} />
+          {machineShown(a.target)} · <Ago className="ms-time" ts={Math.floor(a.last_activity / 1000)} />
         </span>
         <span className="ms-meta-2">
           {kind && <span className="ms-kind">{a.kind_name}</span>}
@@ -389,10 +390,12 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
 }
 
 function RecoverMachine({ machine, count, since, others }: { machine: string; count: number; since: number; others: string[] }) {
+  useLabels();
   const [to, setTo] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const key = goneKey(machine, since);
   const away = () => markNotices([key], "away");
+  const shown = labelOf(machine);
   const go = async () => {
     setBusy(true);
     try {
@@ -403,14 +406,14 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
       if (n > 0 && failed.length === 0) markNotices([key], "done");
       if (n > 0)
         toast({
-          title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`,
+          title: `${n} agent${n === 1 ? "" : "s"} of ${shown} going on elsewhere`,
           description: failed.length > 0 ? `${failed.length} couldn't: ${failed[0]?.error ?? ""}` : undefined,
           tone: "running",
         });
-      else toast.error(`${machine}'s agents couldn't go on elsewhere`, failed[0]?.error ?? "");
+      else toast.error(`${shown}'s agents couldn't go on elsewhere`, failed[0]?.error ?? "");
       invalidate("harness/agents");
     } catch (e) {
-      toast.error(`${machine}'s agents couldn't go on elsewhere`, errorMessage(e));
+      toast.error(`${shown}'s agents couldn't go on elsewhere`, errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -418,17 +421,17 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
   return (
     <div className="ms-recover" role="status" {...swipeAway<HTMLDivElement>(away)}>
       <span>
-        {machine} has been offline since {relativeTime(since)}. If it&rsquo;s gone, its {count} agent{count === 1 ? "" : "s"} can go on elsewhere from kiln&rsquo;s copy of
+        {shown} has been offline since {relativeTime(since)}. If it&rsquo;s gone, its {count} agent{count === 1 ? "" : "s"} can go on elsewhere from kiln&rsquo;s copy of
         {count === 1 ? " its conversation" : " their conversations"}.
       </span>
       {others.length > 0 ? (
         <span className="ms-recover-go">
           <SelectField
-            label={`Where ${machine}'s agents go on`}
+            label={`Where ${shown}'s agents go on`}
             hideLabel
             value={to}
             onChange={setTo}
-            options={[{ value: "", label: "Each where it suits best" }, ...others.map((m) => ({ value: m, label: `All on ${m}` }))]}
+            options={[{ value: "", label: "Each where it suits best" }, ...others.map((m) => ({ value: m, label: `All on ${labelOf(m)}` }))]}
           />
           <Button size="xs" variant="secondary" disabled={busy} onClick={() => void go()}>
             {busy ? "Moving…" : "Move them on"}
@@ -437,7 +440,7 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
       ) : (
         <span className="ms-recover-none">No other machine is connected to take them.</span>
       )}
-      <button type="button" className="icon-btn ms-recover-close" data-variant="bare" data-size="sm" aria-label={`Put away ${machine}'s notice`} title="Put away" onClick={away}>
+      <button type="button" className="icon-btn ms-recover-close" data-variant="bare" data-size="sm" aria-label={`Put away ${shown}'s notice`} title="Put away" onClick={away}>
         <X size={14} />
       </button>
     </div>

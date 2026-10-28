@@ -14,7 +14,7 @@ import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState } from "@/components/ui/misc";
-import { useRes } from "@/lib/data";
+import { labelOf, useLabels, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -176,6 +176,7 @@ function StepReview({ e, agentId, provider }: { e: StackStep; agentId: string | 
 }
 
 function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; busy: string | null; onAct: (a: "retry" | "take" | "met") => void }) {
+  useLabels();
   const e = stack?.steps.find((x) => x.n === s.n);
   const a = s.agent;
   const live = s.stand === "working" || s.stand === "needs_you";
@@ -196,7 +197,7 @@ function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; b
             {a.name}
           </Link>
           <span className="plan-dim">
-            {a.machine === "local" ? "server" : a.machine} · {a.kind}
+            {a.machine === "local" ? "server" : labelOf(a.machine)} · {a.kind}
             {s.given ? " · on its goal stack" : ""}
             {a.files_changed > 0 ? ` · ${a.files_changed} file${a.files_changed === 1 ? "" : "s"} +${a.lines_added} −${a.lines_removed}` : ""}
             {s.tries > 1 ? ` · try ${s.tries}` : ""}

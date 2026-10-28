@@ -20,7 +20,8 @@ import { Tries } from "@/lib/tries";
 import { cardsOf, heldWords, type Card } from "./cards";
 import { agentLabel } from "./derive";
 import { useClock } from "./dom";
-import { machineName } from "./parts";
+import { machineShown } from "./parts";
+import { useLabels } from "@/lib/data";
 import { pauseLine } from "./pause";
 import { getNoneWaiting, getWaiting, subscribeWaiting } from "./waiting";
 import { answer, useAnswered } from "./answered";
@@ -64,6 +65,8 @@ function asks(ap: NonNullable<Card["ap"]>): React.ReactNode {
 /** A card's frame: its agent and where it runs (and how many more it asks), what it says, what to do about it, and × to put it away. */
 function Shell({ card, line, busy, children }: { card: Card; line?: React.ReactNode; busy?: boolean; children?: React.ReactNode }) {
   const { a, more } = card;
+  // Its machine by the name people see, as labels come (docs/machines.md).
+  useLabels();
   const label = agentLabel(a);
   // A request puts away all its agent asks now; the rest, this one.
   const away = () => putAway(card.kind === "request" ? a.approvals.map((p) => p.id) : [card.key], a.id);
@@ -76,7 +79,7 @@ function Shell({ card, line, busy, children }: { card: Card; line?: React.ReactN
             {label}
           </Link>
           <span className="rq-where">
-            {machineName(a.target)}
+            {machineShown(a.target)}
             {more > 0 && ` · +${more} more`}
           </span>
         </p>

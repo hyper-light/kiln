@@ -1739,7 +1739,10 @@ export interface CdPlanRepo {
 
 /** A runner as reach sees it (`GET /api/reach/runners`). */
 export interface ReachRunner {
+  /** Its key: a machine id for one kiln knows by it (docs/machines.md). */
   name: string;
+  /** The name people see, for one known by its machine id (none for one known by its name). */
+  label?: string;
   hostname: string;
   os: string;
   arch: string;
