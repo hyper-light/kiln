@@ -661,6 +661,13 @@
 .rv-l.d {
   background: rgb(209 170 173 / 7%);
 }
+/* The lines a comment being written is on (a line's number, shift-click another for a range). */
+.rv-l[data-picked] {
+  box-shadow: inset 2px 0 0 #a6c4ed;
+}
+.rv-l[data-picked] .rv-ln {
+  color: #dfe6f2;
+}
 .rv-l.hit code {
   background: rgb(216 203 176 / 18%);
 }
