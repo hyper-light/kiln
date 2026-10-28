@@ -13,6 +13,8 @@ interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   /** One of the mock's own jobs, running if one is (server.ts), for a fixed row's leg to stream. */
   liveJob?: () => { run: string; job: string; name: string; state: string } | null;
+  /** CI starting on a pushed commit (server.ts's run on kiln's repository): its run and job events reach the page as a real push's do. */
+  push?: () => void;
 }
 
 /** kiln's own trunk, simulated (ship-sim.ts); `MOCK_SHIP=static` serves the fixed rows alone, for
@@ -252,6 +254,65 @@ const arrival = (n: number): ShipCommit => ({
 });
 
 /**
+ * A burst of agents' commits (`POST /api/mock/ship/agents?n=14&over=10`; Agent pace and checks,
+ * step 1): first a release production waits on you to approve, then agents' commits that ride with
+ * it (waiting, so they fold under it), every fourth one an agent asking you. Each lands on top of
+ * `arrived`, spread over `over` seconds, and starts CI as a push does (`push`); `arrive?clear=1`
+ * takes them away and stops what's to come.
+ */
+const burstTimers = new Set<ReturnType<typeof setTimeout>>();
+const agentCommit = (k: number): ShipCommit => {
+  const id = sha(`a${k.toString(16)}`);
+  const base = {
+    repo: REPO,
+    sha: id,
+    short: id.slice(0, 7),
+    branch: "main",
+    at: now(),
+    environments: [],
+    tags: [],
+    runs: [],
+    cursor: 200 + k,
+    kind: "commit" as const,
+    host: null,
+    change: null,
+    fold_under: null,
+  };
+  if (k === 1)
+    return {
+      ...base,
+      message: "release: production waits on you",
+      author: "agent:release",
+      stand: "needs_you",
+      line: "In staging and healthy · production waits on your approval",
+      pips: pips("none", "passed", "passed", "passed", "healthy", "needs"),
+      actions: [
+        { name: "approve", method: "POST", path: "/api/deploy/releases/ship-rel-burst/approve", body: {} },
+        { name: "hold", method: "POST", path: "/api/deploy/releases/ship-rel-burst/reject", body: {} },
+      ],
+    };
+  if (k % 4 === 0)
+    return {
+      ...base,
+      message: `agent: asks about flake ${k}`,
+      author: `agent:fix-${k}`,
+      stand: "needs_you",
+      line: `agent:fix-${k} asks: retry the flaky leg?`,
+      pips: pips("none", "passed", "failed"),
+      actions: [{ name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, run: `ship-run-burst-${k}` } }],
+    };
+  return {
+    ...base,
+    message: `agent: rider ${k}`,
+    author: `agent:fix-${k}`,
+    stand: "waiting",
+    line: "Passed and built · rides with the release",
+    pips: pips("none", "passed", "passed", "passed", "healthy"),
+    actions: [],
+  };
+};
+
+/**
  * A fixed row's review marks, oldest first (W26-R14): a commit with no change has one, its push; a
  * change has a push per revision, a comment per open thread, and its approval, asked or given.
  */
@@ -406,9 +467,29 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     else ctx.json(res, 200, detail);
     return true;
   }
+  if (p === "/api/mock/ship/agents" && m === "POST") {
+    const n = Math.min(Math.max(Number(q.get("n") ?? 14) || 14, 1), 100);
+    const over = Math.min(Math.max(Number(q.get("over") ?? 10) || 10, 0), 60);
+    for (let k = 1; k <= n; k++) {
+      const t = setTimeout(
+        () => {
+          burstTimers.delete(t);
+          arrived.unshift(agentCommit(k));
+          ctx.push?.();
+        },
+        ((k - 1) * over * 1000) / Math.max(1, n - 1),
+      );
+      burstTimers.add(t);
+    }
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
   if (p === "/api/mock/ship/arrive" && m === "POST") {
-    if (q.get("clear")) arrived.length = 0;
-    else arrived.unshift(arrival(arrived.length + 1));
+    if (q.get("clear")) {
+      for (const t of burstTimers) clearTimeout(t);
+      burstTimers.clear();
+      arrived.length = 0;
+    } else arrived.unshift(arrival(arrived.length + 1));
     ctx.json(res, 200, { ok: true });
     return true;
   }
