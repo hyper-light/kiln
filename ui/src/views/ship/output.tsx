@@ -23,7 +23,9 @@ export function ShipOutput({ commit, stage }: { commit: ShipCommit; stage: strin
   const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
   // Checks' jobs are its legs, the shown one picked by the same rule as the cards.
   const legs = stage === "checks" ? (detail.data.checks ?? []).flatMap((c) => c.legs) : [];
-  const job = legs[pickCard(legs)]?.job;
+  // As legs come and go the job shown changes: the one shown stays until the next has loaded, so
+  // the card isn't torn down meanwhile and a focus in it survives (opened commit's step 3).
+  const job = React.useDeferredValue(legs[pickCard(legs)]?.job);
   if (!job)
     return (
       <div className="ship-output ship-output--none">

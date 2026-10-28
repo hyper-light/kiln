@@ -72,7 +72,6 @@ function ShipList() {
     kind: (c) => c.kind ?? "commit",
   };
   const commits = all.filter((c) => Object.entries(chosen).every(([k, vs]) => vs.length === 0 || vs.includes(value[k]?.(c) ?? "")));
-  const items = order(fold(commits), sort);
   // Holding still (step 6): while the list is in use or a row is open, the rows keep their places,
   // each with its latest data, and what arrives waits for the release; then the rows glide.
   const [opened, setOpened] = React.useState<ReadonlySet<string>>(() => new Set());
@@ -83,6 +82,8 @@ function ShipList() {
       else next.delete(k);
       return next;
     });
+  // An open row never folds under another, so it keeps taking its latest data.
+  const items = order(fold(commits, opened), sort);
   const hold = useListHold(opened.size > 0);
   const { ref: holdRef, ...holdProps } = hold.bind;
   // Your own change of view (lens, sort, filter) applies at once; only what arrives waits.

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { fold, order, pickCard, shipGroups, standWord, strip } from "../src/views/ship/model.ts";
+import { fold, keyOf, order, pickCard, shipGroups, standWord, strip } from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -99,4 +99,28 @@ test("w26_r14: Ship's stages as the Lanes' groups, a lane for each Checks leg th
   assert.deepEqual(groups[3]?.lanes, [{ id: "staging@200", name: "staging", state: "passed", start: 200, end: 200, note: "synced" }]);
   assert.equal(groups[3]?.state, "soaking");
   assert.deepEqual(groups[4]?.lanes, []);
+});
+
+test("an open row never folds: not under the approval it rides with, nor into a run of shipped commits", () => {
+  const approve = [{ name: "approve", method: "POST", path: "/api/deploy/releases/r1/approve", body: {} }];
+  const commits = [c("ask", "needs_you", { actions: approve }), c("rider", "waiting"), c("s1", "shipped"), c("s2", "shipped")];
+  const rows = (open: ReadonlySet<string>) => fold(commits, open).map((i) => [i.head.sha, i.riders.map((r) => r.sha)]);
+  // Closed, the rider rides with the approval and the older shipped commit folds under the newer.
+  assert.deepEqual(rows(new Set()), [
+    ["ask", ["rider"]],
+    ["s1", ["s2"]],
+  ]);
+  // Open, each keeps its own row.
+  const open = new Set(
+    fold(commits)
+      .flatMap((i) => [i.head, ...i.riders])
+      .map((h) => keyOf({ head: h, riders: [] })),
+  );
+  assert.deepEqual(rows(new Set(["r/rider", "r/s2"])), [
+    ["ask", []],
+    ["rider", []],
+    ["s1", []],
+    ["s2", []],
+  ]);
+  assert.ok(open.has("r/rider") && open.has("r/s2"));
 });

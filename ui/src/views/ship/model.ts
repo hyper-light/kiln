@@ -49,8 +49,15 @@ export interface Item {
   folds?: "change" | "rides" | "shipped";
 }
 
-/** The page's commits as rows: each folds under its change's tip when the page has the tip. */
-export function fold(commits: readonly ShipCommit[]): Item[] {
+/** A row's key, stable as it changes: a change by its name (a new revision patches it in place), a commit by its sha. */
+export const keyOf = (it: Item) => (it.head.change ? `${it.head.repo}/${it.head.change.name}` : `${it.head.repo}/${it.head.sha}`);
+
+/**
+ * The page's commits as rows: each folds under its change's tip when the page has the tip. A row
+ * open on the page (its key in `open`) never folds under another: it keeps its row and its latest
+ * data (opened commit's step 3, plan 01a175b7f21b7455bcdcd71e94ecdce0).
+ */
+export function fold(commits: readonly ShipCommit[], open: ReadonlySet<string> = new Set()): Item[] {
   const tips = new Set(commits.filter((c) => !c.fold_under).map((c) => c.sha));
   const items: Item[] = [];
   const at = new Map<string, Item>();
@@ -71,7 +78,7 @@ export function fold(commits: readonly ShipCommit[]): Item[] {
   // and a run of shipped commits under its newest (plan 01a175b7f20b7277b15bddd2ad001bcc, step 5).
   const approval = new Map<string, Item>();
   for (const it of items) if (it.head.actions?.some((a) => a.name === "approve")) approval.set(it.head.repo, it);
-  const plain = (it: Item) => !it.head.change && it.riders.length === 0;
+  const plain = (it: Item) => !it.head.change && it.riders.length === 0 && !open.has(keyOf(it));
   const out: Item[] = [];
   let shipped: Item | null = null;
   for (const it of items) {
@@ -93,9 +100,6 @@ export function fold(commits: readonly ShipCommit[]): Item[] {
   }
   return out;
 }
-
-/** A row's key, stable as it changes: a change by its name (a new revision patches it in place), a commit by its sha. */
-export const keyOf = (it: Item) => (it.head.change ? `${it.head.repo}/${it.head.change.name}` : `${it.head.repo}/${it.head.sha}`);
 
 export type Sort = "needs" | "newest" | "trunk" | "stage" | "author" | "oldest";
 
