@@ -769,8 +769,9 @@ a.ms-why:hover {
   font-size: 12.5px;
   cursor: pointer;
 }
-/* What to do with the agents selected (bulk.tsx): their buttons end the head's line (or, narrow, take
-   one of their own); what's asked, More, and how it went each take a line across the head. */
+/* What to do with the agents selected (bulk.tsx): the same buttons, in the same places, while
+   selecting, at the end of the head's line (or, narrow, a line of their own, there from the moment
+   selecting starts); what's asked, More, and how it went each take a line across the head. */
 .ms-bulk {
   display: flex;
   flex-wrap: wrap;
@@ -781,6 +782,18 @@ a.ms-why:hover {
 .ms-bulk-more {
   margin-left: 4px;
   font-size: 12.5px;
+}
+.ms-bulk-more:disabled {
+  color: #6c6f78;
+}
+/* How many are selected, its digits one width and its room as wide as it can get: nothing beside it moves as more are picked. */
+.ms-n {
+  display: inline-block;
+  text-align: right;
+}
+.ms-n,
+.ms-count {
+  font-variant-numeric: tabular-nums;
 }
 .ms-bulk-more[aria-expanded="true"] .ms-chev {
   transform: rotate(90deg);
@@ -856,9 +869,15 @@ a.ms-why:hover {
 .ms-msg-outcomes > li[data-result="done"] .ms-msg-o-result {
   color: #a8c9bc;
 }
-@container (max-width: 760px) {
+/* Too narrow for the head's line and the buttons together: the buttons take a line of their own, a
+   little closer together, so they're one line on a phone. */
+@container (max-width: 660px) {
   .ms-bulk {
     flex: 1 1 100%;
+    gap: 6px;
+    margin-left: 0;
+  }
+  .ms-bulk-more {
     margin-left: 0;
   }
 }
@@ -1013,32 +1032,58 @@ a.ms-why:hover {
   color: #eceef2;
   font-weight: 450;
 }
-/* Picking: an open ring beside each name, filled and ticked when it's picked. */
+/* Picking: an open ring beside each name, filled and ticked when it's picked. It's always there, no
+   wider than nothing, and slides open as picking starts, the name easing aside, and shut at Done. */
 .ms-pick {
-  display: inline-grid;
-  flex: none;
-  place-items: center;
-  width: 18px;
+  display: inline-block;
+  width: 0;
   height: 18px;
-  margin: 0 10px -3px 0;
-  border: 1.5px solid rgb(255 255 255 / 34%);
-  border-radius: 50%;
+  margin: 0 0 -3px;
+  overflow: hidden;
   vertical-align: baseline;
   transition:
+    width 0.16s ease,
+    margin-right 0.16s ease;
+}
+.ms-pick[data-on] {
+  width: 18px;
+  margin-right: 10px;
+}
+.ms-pick::before {
+  content: "";
+  display: block;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  border: 1.5px solid rgb(255 255 255 / 34%);
+  border-radius: 50%;
+  opacity: 0;
+  transition:
+    opacity 0.16s ease,
     background-color 0.12s ease,
     border-color 0.12s ease;
 }
-.ms-row[data-selected] .ms-pick {
+.ms-pick[data-on]::before {
+  opacity: 1;
+}
+.ms-row[data-selected] .ms-pick::before {
   border-color: #e7e9ee;
   background: #e7e9ee
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.4l3 3 6-6.4' fill='none' stroke='%2308090a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
     center / 12px no-repeat;
 }
+/* With a mouse, rows keep their checkboxes. */
+@media (pointer: fine) {
+  .ms-pick {
+    display: none;
+  }
+}
 /* Swiped far enough: let go and it's picked (or put back). */
 .ms-row[data-swipe="ready"] {
   box-shadow: inset 3px 0 0 #e7e9ee;
 }
-html[data-motion="paused"] .ms-pick {
+html[data-motion="paused"] .ms-pick,
+html[data-motion="paused"] .ms-pick::before {
   transition: none;
 }
 .ms-select + .ms-msg-open {
@@ -1130,8 +1175,10 @@ html[data-motion="paused"] .ms-pick {
 }
 
 /* ---------------------------------------------------------------- the composer, starting an agent (new-agent.tsx): no dialog, no button */
-/* Turning between starting an agent and messaging those selected: the same lines in the same places, crossfaded. */
+/* Turning between starting an agent and messaging those selected: the same lines in the same places, crossfaded.
+   Its margins kept inside it, so the height held while messaging (mission.tsx) is all the room it took. */
 .mc-mode {
+  display: flow-root;
   animation: mc-in 0.14s ease-out;
 }
 @keyframes mc-in {
