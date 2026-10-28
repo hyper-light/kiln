@@ -630,7 +630,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         if let (Some(at), Some((spec, suffix))) = (at, for_ref(&target.name)) {
             given.extend(suffix);
             let options = kiln_ci::review::options(&given);
-            said.extend(options.unknown.iter().map(|o| format!("push option `{o}` isn't one kiln takes (draft, ready, reviewer=, message=, topic=, title=); ignored")));
+            said.extend(options.unknown.iter().map(|o| format!("push option `{o}` isn't one kiln takes (draft, ready, reviewer=, message=, topic=, title=, change=<commit>:<D12|new>); ignored")));
             let result = match spec.split_once("/branch/") {
                 // A change request (W14-R04): the branch is the commit pushed, then reviewed whole.
                 Some((trunk, branch)) => match crate::gitops::run_git(hub, &["-C", &p, "update-ref", &format!("refs/heads/{branch}"), &target.new], crate::gitops::LS_REMOTE_TIMEOUT).await {
@@ -652,7 +652,10 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
                             "unchanged" => "unchanged",
                             _ => "updated",
                         };
-                        said.push(format!("{} v{} ({what})  {}", o.name, o.version, o.title));
+                        // W26-R03: what it was split from, what it absorbed.
+                        let split = o.split_from.as_ref().map(|f| format!(", split from {f}")).unwrap_or_default();
+                        let absorbed = if o.absorbed.is_empty() { String::new() } else { format!("; absorbed {}", o.absorbed.join(", ")) };
+                        said.push(format!("{} v{} ({what}{split}{absorbed})  {}", o.name, o.version, o.title));
                         said.push(format!("  {}", o.url));
                     }
                 }

@@ -184,6 +184,13 @@ pub fn parent_pid() -> u32 {
     0
 }
 
+/// While `on`, this process's memory is kept from its user's other processes (docs/ci.md W27-R02,
+/// a CI leg's key in it, out of its steps' reach): its DACL lets them only wait on it, ask after
+/// it and end it. Off, as it was.
+pub fn private_memory(on: bool) -> io::Result<()> {
+    super::win32::private_memory(on)
+}
+
 /// Process trees are job objects on Windows; nothing to stop one by one.
 pub fn stop_processes(_pids: &[u32], _keep: Option<u32>, _grace: std::time::Duration) {}
 

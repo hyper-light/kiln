@@ -236,6 +236,14 @@ fn seams() -> Vec<Seam> {
                 format!("{} characters of a hit's line", count(search::LINE_MAX as u64)),
             ],
         },
+        Seam {
+            title: "Sigstore",
+            file: "sigstore.rs",
+            tr: "Sigstore",
+            more: &[],
+            cases: said(&sigstore::cases::<sigstore::SimSigstoreFixture>()),
+            bounds: vec![format!("{} entries", count(sigstore::SIM_ENTRIES as u64))],
+        },
     ]
 }
 

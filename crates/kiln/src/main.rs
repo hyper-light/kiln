@@ -67,10 +67,27 @@ enum Cmd {
         agent: bool,
     },
     /// Print one-time sign-in links for the UI (this machine and the LAN) and open the local one.
+    /// A person on their own device signs in with a sign-in link, their password or a personal
+    /// access token instead, and gets a short-lived certificate for a key made here, naming them
+    /// (docs/ci.md W27-R02).
     Login {
         /// Only print the links; do not open a browser.
         #[arg(long)]
         print: bool,
+        /// Instead, make a key on this device and get a short-lived certificate for it, naming
+        /// you (docs/ci.md W27-R02): the key stays here.
+        #[arg(long)]
+        certificate: bool,
+        /// Sign in with the one-time sign-in link you were given, and certify this device's key
+        /// as you.
+        #[arg(long, conflicts_with = "name")]
+        link: Option<String>,
+        /// Sign in with your name and password (asked for), and certify this device's key as you.
+        #[arg(long)]
+        name: Option<String>,
+        /// With --name: read the password from stdin instead of asking for it.
+        #[arg(long, requires = "name")]
+        password_stdin: bool,
         #[command(flatten)]
         server: ServerArgs,
     },
@@ -192,7 +209,7 @@ enum Cmd {
     /// Repositories: list them; create one kiln hosts, or import one from upstream.
     Repo(kiln::ci::cli::RepoArgs),
     /// Clone a repository kiln hosts, with kiln's credentials and the commit-msg hook that gives
-    /// each commit a Change-Id.
+    /// each commit a Kiln-Change (optional: kiln matches commits without one).
     Clone(kiln::ci::review_cli::CloneArgs),
     /// Send the commits between the trunk and HEAD for review: each a diff, or a new version of
     /// its diff (`git push kiln HEAD:refs/for/<trunk>`).
@@ -232,6 +249,12 @@ enum Cmd {
     Roles(kiln::authz::cli::RolesArgs),
     /// Personal access tokens and agent tokens: create (shown once), list, revoke, rotate.
     Tokens(kiln::authz::cli::TokensArgs),
+    /// The certificates kiln's CA issued (machines, runner processes, agents, legs, people, the
+    /// server and CD): list, revocations, revoke.
+    Identities(kiln::identities::IdentitiesArgs),
+    /// Forget a runner: it's removed and its certificates revoked from now on; enrolling the
+    /// machine again brings a new certificate.
+    Forget(kiln::identities::ForgetArgs),
     /// The fleet's kiln versions and update policies: list, policy, upgrade, build.
     Updates(kiln::updates_cli::UpdatesArgs),
     /// This machine's kiln config: path, show, get, set, unset (by dotted key).
@@ -720,9 +743,18 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Setup(a) => boxed(|| kiln::setup::cli(a)).await,
         Cmd::Install(a) => boxed(|| install::install(a)).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
-        Cmd::Login { print, server } => {
+        Cmd::Login { print, certificate, link, name, password_stdin, server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
+            // A person on their own device (docs/ci.md W27-R02): the key is made here, only a CSR goes.
+            if link.is_some() || name.is_some() {
+                out(&format!("Certified: {}", boxed(|| kiln::identities::login_person(server.url.as_deref(), link.as_deref(), name.as_deref(), password_stdin)).await?));
+                return Ok(());
+            }
             let t = boxed(|| server.resolve(&cfg)).await?;
+            if certificate || kiln::identities::personal_token(&t.token) {
+                out(&format!("Certified: {}", boxed(|| kiln::identities::login_certificate(&t, server.token.is_some())).await?));
+                return Ok(());
+            }
             let url = kiln::api::otp_url(&t.token, &t.url);
             out(&format!("Sign in on this machine (valid 5 minutes):\n  {url}"));
             if let Some(public) = t.public_url.as_deref().filter(|p| !kiln::access::is_loopback(p) && p.trim_end_matches('/') != t.url) {
@@ -1002,6 +1034,14 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Tokens(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::authz::cli::tokens(a, &cfg)).await
+        }
+        Cmd::Identities(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::identities::cli(a, &cfg)).await
+        }
+        Cmd::Forget(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::identities::forget(a, &cfg)).await
         }
         Cmd::Updates(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

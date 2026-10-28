@@ -102,11 +102,24 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     let brought: Vec<String> = s.shas.iter().filter(|h| **h != s.head).cloned().collect();
     let (title_c, summary_c) = (title.clone(), summary.clone());
     let by_text = by.started_by.as_ref().map(serde_json::Value::to_string);
-    let made: (String, u32, u32, &'static str, bool, Vec<String>) = hub
+    let change = diffs::new_kiln_change();
+    let made: (String, u32, u32, &'static str, bool, Vec<String>, String) = hub
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
+            // Its change's identity (W26-R03): the one it has, else a new one.
+            let change: String = match &found {
+                Some((id, number)) => match tx.query_row("SELECT kiln_change FROM diffs WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))? {
+                    Some(k) => k,
+                    None => {
+                        tx.execute("UPDATE diffs SET kiln_change = ?2 WHERE id = ?1", params![id, change])?;
+                        diffs::record_change(&tx, &repo_id, &trunk_s, &change, &format!("CR{number}"), None, now)?;
+                        change
+                    }
+                },
+                None => change,
+            };
             let (id, number, n, kind, rebase_only) = match found {
                 Some((id, number)) => {
                     let last: Option<(u32, String, String, String)> = tx.query_row("SELECT n, commit_sha, base, patch_id FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
@@ -114,7 +127,7 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
                         && *commit == head_s
                     {
                         tx.commit()?;
-                        return Ok((id, number, *n, "unchanged", false, Vec::new()));
+                        return Ok((id, number, *n, "unchanged", false, Vec::new(), change));
                     }
                     let rebase_only = last.as_ref().is_some_and(|(_, _, base, patch)| !patch.is_empty() && *patch == patch_s && *base != base_s);
                     let n = last.map_or(1, |(n, ..)| n + 1);
@@ -129,10 +142,11 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
                     let id = crate::util::new_id();
                     let state = if draft { State::Draft } else { State::NeedsReview };
                     tx.execute(
-                        "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, branch, topic, created_at, updated_at, author_for)
-                         VALUES (?1, ?2, ?3, 'change_request', NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
-                        params![id, repo_id, number, title_c, summary_c, author.0, author.1, state.as_str(), trunk_s, branch_s, topic, now, diffs::acting_for(&pushed_by)],
+                        "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, branch, topic, created_at, updated_at, author_for, kiln_change)
+                         VALUES (?1, ?2, ?3, 'change_request', NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14)",
+                        params![id, repo_id, number, title_c, summary_c, author.0, author.1, state.as_str(), trunk_s, branch_s, topic, now, diffs::acting_for(&pushed_by), change],
                     )?;
+                    diffs::record_change(&tx, &repo_id, &trunk_s, &change, &format!("CR{number}"), None, now)?;
                     (id, number, 1, "new", false)
                 }
             };
@@ -153,11 +167,11 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
                 }
             }
             tx.commit()?;
-            Ok((id, number, n, kind, rebase_only, asked))
+            Ok((id, number, n, kind, rebase_only, asked, change))
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
-    let (id, number, n, kind, rebase_only, asked) = made;
+    let (id, number, n, kind, rebase_only, asked, change) = made;
     if !asked.is_empty() {
         crate::rt::spawn(super::notify::diff_event(
             Arc::clone(hub),
@@ -187,7 +201,8 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     }
     hub.store.audit(by.pushed_by.clone(), "change_requests.submit".into(), format!("{} CR{number} v{n} {kind} ({branch} into {trunk})", repo.name)).await;
     let _ = id;
-    Ok(Outcome { name: format!("CR{number}"), number, version: n, kind, title, url: format!("{base_url}/diffs/CR{number}") })
+    let found = if kind == "new" { "new" } else { "branch" };
+    Ok(Outcome { name: format!("CR{number}"), number, version: n, kind, title, url: format!("{base_url}/diffs/CR{number}"), change, found, split_from: None, absorbed: Vec::new() })
 }
 
 /// After a push to branches of `repo`: each open change request of a pushed branch gets the new

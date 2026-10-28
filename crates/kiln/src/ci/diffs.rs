@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::{Method, StatusCode};
+use kiln_ci::identity;
 use kiln_ci::review::{self, Known, Planned, State, Step};
 use kiln_ci::trigger::context::{self, PullRequest, Side};
 use kiln_ci::trigger::{Event, Source};
@@ -146,16 +147,17 @@ pub(crate) async fn make_commit(hub: &Hub, path: &str, tree: &str, parent: &str,
     Ok(String::from_utf8_lossy(&r.out).trim().to_owned())
 }
 
-/// A Change-Id no commit has yet.
-pub(crate) fn new_change_id() -> String {
-    let h = crate::util::sha256_hex(crate::util::random_token().as_bytes());
-    format!("I{}", h.get(..40).unwrap_or(&h))
+/// A message kiln commits for a change: with a new `Kiln-Change` unless it says which change it
+/// is already (its own trailer, or a Change-Id an older client wrote) (W26-R03).
+pub(crate) fn with_identity(message: &str) -> String {
+    if identity::kiln_changes(message).is_empty() && identity::change_ids(message).is_empty() { identity::with_kiln_change(message, &new_kiln_change()) } else { format!("{}\n", message.trim_end()) }
 }
 
 /// `POST /api/repos/:repo/submit` (W14-R03, for agents without git): `{ trunk?, patches: [{
 /// message, diff, author?, date? }] | mbox: "<git format-patch output>", draft?, reviewers?,
-/// topic?, message? }`. The patches become commits on the trunk's tip, given Change-Ids where
-/// they lack one, and are submitted as a push to `refs/for/<trunk>` is.
+/// topic?, message? }`. The patches become commits on the trunk's tip, given a `Kiln-Change`
+/// where they don't say which change they are (W26-R03), and are submitted as a push to
+/// `refs/for/<trunk>` is.
 /// A submission's repository (one kiln hosts, the caller allowed to submit to it), its path, its
 /// trunk (the body's `trunk`, else its default branch) and the trunk's tip.
 async fn trunk_tip(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, body: &Value) -> Result<(Repo, String, String, String), Fail> {
@@ -209,7 +211,7 @@ pub async fn propose_file(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, file:
     let tree = tree_with(hub, &p, &tip, Edit::Put { file, mode: &mode, content: new.into_bytes() }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let (name, kind) = author_of(&caller.name, Some(caller.kind));
     let me = name.strip_prefix("user:").unwrap_or(&name).to_owned();
-    let message = review::with_change_id(&format!("{title}\n"), &new_change_id());
+    let message = with_identity(&format!("{title}\n"));
     let sha = make_commit(hub, &p, &tree, &tip, (&me, None), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &sha, pushed_by: &caller.name, started_by: caller.started_by(), author: (name, kind), options: push_options(body) }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     Ok(json!({ "diffs": out }))
@@ -230,7 +232,7 @@ pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, bod
     let mut parent = tip;
     for (i, patch) in patches.iter().enumerate() {
         let tree = tree_with(hub, &p, &parent, Edit::Apply(&patch.diff)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("patch {} doesn't apply: {e}", i + 1)))?;
-        let message = if patch.message.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, format!("patch {} has no message", i + 1))) } else { review::with_change_id(&patch.message, &new_change_id()) };
+        let message = if patch.message.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, format!("patch {} has no message", i + 1))) } else { with_identity(&patch.message) };
         let author = patch.author.clone().unwrap_or_else(|| me.clone());
         parent = make_commit(hub, &p, &tree, &parent, (&author, patch.date.as_deref()), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
@@ -282,42 +284,131 @@ pub struct Outcome {
     pub kind: &'static str,
     pub title: String,
     pub url: String,
+    /// Its change's identity (W26-R03).
+    pub change: String,
+    /// How its change was found: `trailer`, `alias`, `patch-id`, `alike`, `answered`, `new`, or
+    /// (a change request's) `branch`.
+    pub found: &'static str,
+    /// The diff a new one was split from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_from: Option<String>,
+    /// The diffs this commit absorbed (a squash): closed, absorbed into it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub absorbed: Vec<String>,
 }
 
-/// The commits between `trunk` and `sha`, bottom first, each with its patch id.
-async fn commits(hub: &Hub, path: &str, trunk_sha: &str, sha: &str) -> anyhow::Result<Vec<review::Commit>> {
+/// A change's identity no change has yet (W26-R03).
+pub(crate) fn new_kiln_change() -> String {
+    let h = crate::util::sha256_hex(crate::util::random_token().as_bytes());
+    kiln_ci::identity::mint(u64::from_str_radix(h.get(..16).unwrap_or("0"), 16).unwrap_or(0))
+}
+
+/// Records a new change of `repo`'s `trunk` and its number on kiln (`D41`, `CR4`).
+pub(crate) fn record_change(tx: &rusqlite::Connection, repo: &str, trunk: &str, change: &str, name: &str, split_from: Option<&str>, now: i64) -> rusqlite::Result<()> {
+    tx.execute("INSERT OR IGNORE INTO changes (repo_id, id, trunk, created_at, split_from) VALUES (?1, ?2, ?3, ?4, ?5)", params![repo, change, trunk, now, split_from])?;
+    tx.execute("INSERT OR IGNORE INTO change_numbers (repo_id, change, host, number, created_at) VALUES (?1, ?2, 'kiln', ?3, ?4)", params![repo, change, name, now])?;
+    Ok(())
+}
+
+/// Gives every diff of `repo` without an identity one (rows an older kiln made since the
+/// migration), with its Change-Id as an alias and its number.
+fn ensure_identities(c: &rusqlite::Connection, repo: &str) -> rusqlite::Result<()> {
+    if c.execute("UPDATE diffs SET kiln_change = 'kc-' || lower(hex(randomblob(8))) WHERE repo_id = ?1 AND kiln_change IS NULL", [repo])? == 0 {
+        return Ok(());
+    }
+    c.execute("INSERT OR IGNORE INTO changes (repo_id, id, trunk, created_at) SELECT repo_id, kiln_change, trunk, created_at FROM diffs WHERE repo_id = ?1", [repo])?;
+    c.execute(
+        "INSERT OR IGNORE INTO change_aliases (repo_id, trunk, kind, alias, change, created_at) SELECT repo_id, trunk, 'change-id', change_id, kiln_change, created_at FROM diffs WHERE repo_id = ?1 AND change_id IS NOT NULL AND change_id != '' ORDER BY number DESC",
+        [repo],
+    )?;
+    c.execute(
+        "INSERT OR IGNORE INTO change_numbers (repo_id, change, host, number, created_at) SELECT repo_id, kiln_change, 'kiln', CASE kind WHEN 'change_request' THEN 'CR' ELSE 'D' END || number, created_at FROM diffs WHERE repo_id = ?1",
+        [repo],
+    )?;
+    Ok(())
+}
+
+/// The commits between `trunk` and `sha`, bottom first, each with its parents and as identity
+/// reads it (W26-R03): its message and headers (`git log --format=raw`, which shows the
+/// `change-id` header jj and GitButler write), its patch id and its patch's lines.
+async fn commits(hub: &Hub, path: &str, trunk_sha: &str, sha: &str) -> anyhow::Result<Vec<(Vec<String>, identity::Pushed)>> {
     let range = format!("{trunk_sha}..{sha}");
     let most = format!("--max-count={}", review::MAX_STACK + 1);
-    let log = gitops::run_git(hub, &["-C", path, "log", "--reverse", "--topo-order", &most, "--format=%H%x1f%P%x1f%B%x1e", &range], LS_REMOTE_TIMEOUT).await?;
-    let mut out: Vec<review::Commit> = String::from_utf8_lossy(&log)
-        .split('\x1e')
-        .filter_map(|rec| {
-            let mut f = rec.trim_start_matches('\n').splitn(3, '\x1f');
-            let (sha, parents, message) = (f.next()?.trim(), f.next()?, f.next().unwrap_or_default());
-            (!sha.is_empty()).then(|| review::Commit { sha: sha.to_owned(), parents: parents.split_whitespace().map(str::to_owned).collect(), message: message.to_owned(), patch_id: String::new() })
+    let log = gitops::run_git(hub, &["-C", path, "log", "--reverse", "--topo-order", &most, "--format=raw", &range], LS_REMOTE_TIMEOUT).await?;
+    let mut out: Vec<(Vec<String>, identity::Pushed)> = identity::parse_raw_log(&String::from_utf8_lossy(&log))
+        .into_iter()
+        .map(|r| {
+            let header = identity::header_change_id(&r.headers);
+            (r.parents, identity::Pushed { sha: r.sha, message: r.message, header, patch_id: String::new(), lines: Vec::new() })
         })
         .collect();
     // `git patch-id --stable` over the same commits' patches: `<patch id> <commit>` each.
     if !out.is_empty() && out.len() <= review::MAX_STACK {
         let patches = gitops::run_git(hub, &["-C", path, "log", "-p", "--no-color", "--reverse", "--topo-order", &most, &range], LS_REMOTE_TIMEOUT).await?;
+        let by_sha = identity::split_log_patches(&String::from_utf8_lossy(&patches));
+        for (_, p) in &mut out {
+            p.lines = by_sha.get(&p.sha).map(|t| identity::patch_lines(t)).unwrap_or_default();
+        }
         if let Ok(ids) = git_with_input(hub, &["-C", path, "patch-id", "--stable"], patches).await {
             let by: HashMap<String, String> = String::from_utf8_lossy(&ids).lines().filter_map(|l| l.split_once(' ')).map(|(p, c)| (c.trim().to_owned(), p.to_owned())).collect();
-            for c in &mut out {
-                c.patch_id = by.get(&c.sha).cloned().unwrap_or_default();
+            for (_, p) in &mut out {
+                p.patch_id = by.get(&p.sha).cloned().unwrap_or_default();
             }
         }
     }
     Ok(out)
 }
 
-/// A diff's latest version, by Change-Id, for each of `ids`: its row id and what [`review::plan`]
+/// The most open changes a push's commits are matched against.
+const MOST_OPEN: usize = 200;
+
+/// What kiln's records say of `trunk`'s changes (each by identity, and each alias's change), and
+/// the latest versions of `author`'s open diffs there: (identity, name, title, patch id, commit).
+fn identities(c: &rusqlite::Connection, repo: &str, trunk: &str, author: &str) -> rusqlite::Result<(identity::Known, Vec<(String, String, String, String, String)>)> {
+    ensure_identities(c, repo)?;
+    let mut known = identity::Known::default();
+    let mut st = c.prepare("SELECT kiln_change, kind, number, state FROM diffs WHERE repo_id = ?1 AND trunk = ?2 AND kiln_change IS NOT NULL ORDER BY number")?;
+    let rows = st.query_map(params![repo, trunk], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?, r.get::<_, String>(3)?)))?;
+    for row in rows {
+        let (kc, kind, number, state) = row?;
+        let name = if kind == "change_request" { format!("CR{number}") } else { format!("D{number}") };
+        known.changes.insert(kc, identity::Change { name, open: kind == "diff" && State::parse(&state).is_some_and(State::is_open) });
+    }
+    let mut st = c.prepare("SELECT kind, alias, change FROM change_aliases WHERE repo_id = ?1 AND trunk = ?2")?;
+    for row in st.query_map(params![repo, trunk], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+        let (kind, alias, change) = row?;
+        if let Some(a) = identity::Alias::parse(&kind, &alias) {
+            known.aliases.insert(a, change);
+        }
+    }
+    let mut st = c.prepare(
+        "SELECT d.kiln_change, d.number, d.title, v.patch_id, v.commit_sha
+         FROM diffs d JOIN diff_versions v ON v.diff_id = d.id AND v.n = (SELECT MAX(n) FROM diff_versions WHERE diff_id = d.id)
+         WHERE d.repo_id = ?1 AND d.trunk = ?2 AND d.kind = 'diff' AND d.author = ?3 AND d.state NOT IN ('landed', 'abandoned') AND d.kiln_change IS NOT NULL
+         ORDER BY d.number DESC LIMIT ?4",
+    )?;
+    let most = i64::try_from(MOST_OPEN).unwrap_or(i64::MAX);
+    let open = st.query_map(params![repo, trunk, author, most], |r| Ok((r.get(0)?, format!("D{}", r.get::<_, u32>(1)?), r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((known, open))
+}
+
+/// The open changes' latest versions, with their patches' lines, for [`identity::identify`].
+async fn open_versions(hub: &Hub, path: &str, rows: Vec<(String, String, String, String, String)>) -> Vec<identity::Open> {
+    let shas: Vec<String> = rows.iter().map(|r| r.4.clone()).collect();
+    let mut args: Vec<&str> = vec!["-C", path, "log", "-p", "--no-color", "--no-walk=unsorted"];
+    args.extend(shas.iter().map(String::as_str));
+    let patches = if shas.is_empty() { BTreeMap::new() } else { gitops::run_git(hub, &args, LS_REMOTE_TIMEOUT).await.map(|o| identity::split_log_patches(&String::from_utf8_lossy(&o))).unwrap_or_default() };
+    rows.into_iter().map(|(change, name, title, patch_id, commit)| identity::Open { lines: patches.get(&commit).map(|t| identity::patch_lines(t)).unwrap_or_default(), change, name, title, patch_id }).collect()
+}
+
+/// A diff's latest version, by change, for each of `ids`: its row id and what [`review::plan`]
 /// needs.
 fn known(c: &rusqlite::Connection, repo: &str, trunk: &str, ids: &[String]) -> rusqlite::Result<BTreeMap<String, (String, Option<String>, Known)>> {
     let mut out = BTreeMap::new();
     let mut st = c.prepare(
-        "SELECT d.id, d.number, d.state, d.stack_id, v.n, v.commit_sha, v.parent, v.patch_id, v.message, v.base, (SELECT b.change_id FROM diffs b WHERE b.id = d.parent_diff)
+        "SELECT d.id, d.number, d.state, d.stack_id, v.n, v.commit_sha, v.parent, v.patch_id, v.message, v.base, (SELECT b.kiln_change FROM diffs b WHERE b.id = d.parent_diff)
          FROM diffs d JOIN diff_versions v ON v.diff_id = d.id AND v.n = (SELECT MAX(n) FROM diff_versions WHERE diff_id = d.id)
-         WHERE d.repo_id = ?1 AND d.trunk = ?2 AND d.kind = 'diff' AND d.change_id = ?3 ORDER BY d.number DESC LIMIT 1",
+         WHERE d.repo_id = ?1 AND d.trunk = ?2 AND d.kind = 'diff' AND d.kiln_change = ?3 ORDER BY d.number DESC LIMIT 1",
     )?;
     for id in ids {
         let row = st
@@ -388,29 +479,61 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
         .await
         .map(|o| String::from_utf8_lossy(&o).trim().to_owned())
         .map_err(|_| format!("{} has no commits yet: push it first", s.trunk))?;
-    let list = commits(hub, s.path, &trunk_sha, s.sha).await.map_err(|e| format!("{e:#}"))?;
+    let pushed = commits(hub, s.path, &trunk_sha, s.sha).await.map_err(|e| format!("{e:#}"))?;
     let base = gitops::run_git(hub, &["-C", s.path, "merge-base", &trunk_sha, s.sha], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_else(|_| trunk_sha.clone());
-    let ids: Vec<String> = list.iter().filter_map(|c| review::change_id(&c.message)).collect();
+
+    // Which change each commit is (W26-R03): its trailer, an alias, or the open change it rewrites.
+    let (repo_id, trunk, author) = (s.repo.id.clone(), s.trunk.to_owned(), s.author.0.clone());
+    let (ids_known, open_rows) = hub.store.call(move |c| Ok(identities(c, &repo_id, &trunk, &author)?)).await.map_err(|e| format!("{e:#}"))?;
+    let open = open_versions(hub, s.path, open_rows).await;
+    let just: Vec<identity::Pushed> = pushed.iter().map(|(_, p)| p.clone()).collect();
+    let identified = identity::identify(&just, &open, &ids_known, &s.options.answers).map_err(|r| r.to_string())?;
+    let name_of = |kc: &str| ids_known.changes.get(kc).map(|c| c.name.clone());
+    let mut ident: HashMap<String, (identity::Identified, String)> = HashMap::new();
+    let mut list: Vec<review::Commit> = Vec::with_capacity(pushed.len());
+    for ((parents, p), x) in pushed.iter().zip(identified) {
+        let change = x.change.clone().unwrap_or_else(new_kiln_change);
+        list.push(review::Commit { sha: p.sha.clone(), parents: parents.clone(), message: p.message.clone(), patch_id: p.patch_id.clone(), change: change.clone() });
+        ident.insert(p.sha.clone(), (x, change));
+    }
+    let ids: Vec<String> = list.iter().map(|c| c.change.clone()).collect();
     let (repo_id, trunk) = (s.repo.id.clone(), s.trunk.to_owned());
     let found = hub.store.call(move |c| Ok(known(c, &repo_id, &trunk, &ids)?)).await.map_err(|e| format!("{e:#}"))?;
     let plain: BTreeMap<String, Known> = found.iter().map(|(k, (_, _, v))| (k.clone(), v.clone())).collect();
     let planned = review::plan(&list, &plain, &base)?;
     let messages: HashMap<String, String> = list.iter().map(|c| (c.sha.clone(), c.message.clone())).collect();
     let patches: HashMap<String, String> = list.iter().map(|c| (c.sha.clone(), c.patch_id.clone())).collect();
+    // What each outcome says of its change: how it was found, what it was split from or absorbed.
+    let said: HashMap<String, (&'static str, Option<String>, Vec<String>)> = ident
+        .iter()
+        .map(|(sha, (x, _))| {
+            let found = match &x.how {
+                identity::How::Trailer => "trailer",
+                identity::How::Alias(_) => "alias",
+                identity::How::PatchId => "patch-id",
+                identity::How::Alike(_) => "alike",
+                identity::How::Answered => "answered",
+                identity::How::New => "new",
+            };
+            (sha.clone(), (found, x.split_from.as_deref().and_then(name_of), x.absorbed.iter().filter_map(|a| name_of(a)).collect()))
+        })
+        .collect();
 
-    // The rows, in one transaction: diffs, versions, the stack.
+    // The rows, in one transaction: diffs, versions, the stack; changes, aliases and squashes.
     let (repo_id, trunk, opts) = (s.repo.id.clone(), s.trunk.to_owned(), s.options.clone());
     let (pushed_by, author, author_kind) = (s.pushed_by.to_owned(), s.author.0.clone(), s.author.1);
     let started_by = s.started_by.clone();
     let by_text = started_by.as_ref().map(Value::to_string);
-    let rows: Vec<(Planned, Option<(String, Option<String>)>)> = planned.into_iter().map(|p| { let f = found.get(&p.change_id).map(|(id, stack, _)| (id.clone(), stack.clone())); (p, f) }).collect();
-    let (outcomes, fresh, asked) = hub
+    let rows: Vec<(Planned, Option<(String, Option<String>)>)> = planned.into_iter().map(|p| { let f = found.get(&p.change).map(|(id, stack, _)| (id.clone(), stack.clone())); (p, f) }).collect();
+    let (outcomes, fresh, asked, absorbed) = hub
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             // Reviewers asked for the first time, by diff: they hear of it (W19-R06).
             let mut asked: Vec<(u32, String, String)> = Vec::new();
+            // Diffs a squash absorbed, closed.
+            let mut absorbed: Vec<String> = Vec::new();
             // The stack: the bottom diff's, or a new one.
             let stack = match rows.first().and_then(|(_, f)| f.as_ref()).and_then(|(_, s)| s.clone()) {
                 Some(s) => s,
@@ -432,11 +555,15 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                         let number: u32 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM diffs", [], |r| r.get(0))?;
                         let id = crate::util::new_id();
                         let state = if opts.draft { State::Draft } else { State::NeedsReview };
+                        // `change_id` keeps the Change-Id the commit carries, as before W26.
+                        let gerrit = ident.get(&p.sha).and_then(|(x, _)| x.aliases.iter().find_map(|a| matches!(a, identity::Alias::ChangeId(_)).then(|| a.value().to_owned())));
                         tx.execute(
-                            "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, stack_id, parent_diff, topic, created_at, updated_at, author_for)
-                             VALUES (?1, ?2, ?3, 'diff', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)",
-                            params![id, repo_id, number, p.change_id, p.title, p.summary, author, author_kind, state.as_str(), trunk, stack, below, opts.topic, now, acting_for(&pushed_by)],
+                            "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, summary, author, author_kind, state, trunk, stack_id, parent_diff, topic, created_at, updated_at, author_for, kiln_change)
+                             VALUES (?1, ?2, ?3, 'diff', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15, ?16)",
+                            params![id, repo_id, number, gerrit, p.title, p.summary, author, author_kind, state.as_str(), trunk, stack, below, opts.topic, now, acting_for(&pushed_by), p.change],
                         )?;
+                        let split_from = ident.get(&p.sha).and_then(|(x, _)| x.split_from.clone());
+                        record_change(&tx, &repo_id, &trunk, &p.change, &format!("D{number}"), split_from.as_deref(), now)?;
                         (id, number, 1u32, "new", false)
                     }
                     (Step::Version { number, n, rebase_only, reordered }, Some((id, _))) => {
@@ -476,11 +603,25 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                         asked.push((number, p.title.clone(), r.clone()));
                     }
                 }
-                outcomes.push((number, n, kind, p.title.clone()));
+                // What the commit carries that points to its change, and what it absorbed (W26-R03).
+                if let Some((x, _)) = ident.get(&p.sha) {
+                    for a in &x.aliases {
+                        tx.execute("INSERT OR IGNORE INTO change_aliases (repo_id, trunk, kind, alias, change, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![repo_id, trunk, a.kind(), a.value(), p.change, now])?;
+                    }
+                    for gone in &x.absorbed {
+                        let closed: Vec<String> = tx
+                            .prepare("UPDATE diffs SET state = 'abandoned', updated_at = ?3 WHERE repo_id = ?1 AND kiln_change = ?2 AND state NOT IN ('landed', 'abandoned') RETURNING id")?
+                            .query_map(params![repo_id, gone, now], |r| r.get(0))?
+                            .collect::<rusqlite::Result<_>>()?;
+                        tx.execute("UPDATE changes SET absorbed_into = ?3 WHERE repo_id = ?1 AND id = ?2", params![repo_id, gone, p.change])?;
+                        absorbed.extend(closed);
+                    }
+                }
+                outcomes.push((number, n, kind, p.title.clone(), p.sha.clone(), p.change.clone()));
                 below = Some(diff_id);
             }
             tx.commit()?;
-            Ok((outcomes, fresh, asked))
+            Ok((outcomes, fresh, asked, absorbed))
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -493,8 +634,24 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
         }
     }
     let base_url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let out: Vec<Outcome> = outcomes.into_iter().map(|(number, version, kind, title)| Outcome { name: format!("D{number}"), number, version, kind, title, url: format!("{base_url}/diffs/D{number}") }).collect();
+    let out: Vec<Outcome> = outcomes
+        .into_iter()
+        .map(|(number, version, kind, title, sha, change)| {
+            let (found, split_from, absorbed) = said.get(&sha).cloned().unwrap_or(("new", None, Vec::new()));
+            Outcome { name: format!("D{number}"), number, version, kind, title, url: format!("{base_url}/diffs/D{number}"), change, found, split_from, absorbed }
+        })
+        .collect();
     hub.store.audit(s.pushed_by.to_owned(), "diffs.submit".into(), format!("{} {}: {}", s.repo.name, s.trunk, out.iter().map(|o| format!("D{} v{} {}", o.number, o.version, o.kind)).collect::<Vec<_>>().join(", "))).await;
+    // A squash's absorbed diffs are closed, as an abandoned diff is (W26-R03).
+    for id in absorbed {
+        if let Ok(Some(d)) = find(hub, &id).await {
+            let into = out.iter().find(|o| o.absorbed.contains(&d.name)).map(|o| o.name.clone()).unwrap_or_default();
+            hub.store.audit(s.pushed_by.to_owned(), "diffs.absorb".into(), format!("{} {} absorbed into {into}", s.repo.name, d.name)).await;
+            if let Err(e) = closed(hub, s.repo, &d, false, s.pushed_by).await {
+                tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "an absorbed diff's close didn't go out");
+            }
+        }
+    }
     let mut by_diff: BTreeMap<u32, (String, Vec<String>)> = BTreeMap::new();
     for (number, title, reviewer) in asked {
         by_diff.entry(number).or_insert_with(|| (title, Vec::new())).1.push(reviewer);
@@ -828,6 +985,12 @@ pub struct Diff {
     pub branch: Option<String>,
     /// Whom the author acts for: an agent's person.
     pub author_for: Option<String>,
+    /// Its change's identity, as commits carry it in `Kiln-Change:` (W26-R03).
+    pub change: Option<String>,
+    /// The diff it was split from.
+    pub split_from: Option<String>,
+    /// The diff a squash absorbed it into.
+    pub absorbed_into: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -852,7 +1015,9 @@ pub struct Version {
     pub thread: Option<String>,
 }
 
-const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for";
+const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for, d.kiln_change,
+    (SELECT CASE s.kind WHEN 'change_request' THEN 'CR' ELSE 'D' END || s.number FROM changes ch JOIN diffs s ON s.repo_id = ch.repo_id AND s.kiln_change = ch.split_from WHERE ch.repo_id = d.repo_id AND ch.id = d.kiln_change ORDER BY s.number LIMIT 1),
+    (SELECT CASE s.kind WHEN 'change_request' THEN 'CR' ELSE 'D' END || s.number FROM changes ch JOIN diffs s ON s.repo_id = ch.repo_id AND s.kiln_change = ch.absorbed_into WHERE ch.repo_id = d.repo_id AND ch.id = d.kiln_change ORDER BY s.number LIMIT 1)";
 const DIFF_FROM: &str = "diffs d JOIN repos p ON p.id = d.repo_id LEFT JOIN diffs pd ON pd.id = d.parent_diff";
 
 fn diff_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Diff> {
@@ -879,6 +1044,9 @@ fn diff_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Diff> {
         updated_at: r.get(15)?,
         branch: r.get(16)?,
         author_for: r.get(17)?,
+        change: r.get(18)?,
+        split_from: r.get(19)?,
+        absorbed_into: r.get(20)?,
     })
 }
 
