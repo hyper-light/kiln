@@ -142,6 +142,9 @@ export const optionsOf = (values: readonly string[], label: (v: string) => strin
 /** The facets Ship filters by, in the list bar's order. */
 export const FACET_KEYS = ["repo", "project", "author", "stand", "host", "kind"] as const;
 
+/** A state as its glyph: one the page has no glyph for yet (a change's "landed") shows as not yet, never a crash. */
+export const glyphOf = (state: string): GlyphState => (state in GLYPHS ? (state as GlyphState) : "none");
+
 /** The pips the journey strip draws, Review first, every one the server sends; a state the page has no glyph for yet shows as not yet. */
 export function strip(pips: readonly ShipPip[]): Pip[] {
   return pips.map((p) => ({ stage: p.stage as Pip["stage"], state: (p.state in GLYPHS ? p.state : "none") as GlyphState, p: p.p }));

@@ -5,12 +5,11 @@
  * label pinned left, the bar wearing its rim, "unsigned" on every seal until W27-R03, its key the
  * mark's id so a live update moves it, never remounts it. Fit squeezes rows; Detail gives each bar
  * its room and its who/when/where. Previous/Now/next walk the horizon. No effects: times tick on
- * the resource's poll; the horizon holds the marks it was given.
+ * the resource's poll; the horizon holds while the row is open, until Now catches it up.
  */
 import { shipApi, type ShipCommit, type ShipMark } from "@/api/ship";
-import { shipGroups } from "../model";
+import { glyphOf, shipGroups } from "../model";
 import { StatusGlyph } from "@/components/ui/status-glyph";
-import type { GlyphState } from "@/components/ui/status-glyph-spec";
 import { clockTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import * as React from "react";
@@ -103,7 +102,7 @@ export function LaneBar({ lane, window, now }: { lane: ShipLane; window: [number
   const b = pos(lane.end ?? now, [lo, hi]);
   return (
     <li className="ship-lane" data-kind={lane.kind}>
-      <StatusGlyph state={lane.state as GlyphState} size={12} />
+      <StatusGlyph state={glyphOf(lane.state)} size={12} />
       <span className="ship-lane__name" title={lane.note}>
         {lane.name}
         {lane.note && !lane.name.includes(lane.note) ? <em className="ship-lane__note"> {lane.note}</em> : null}
@@ -132,7 +131,7 @@ function LaneGroup({ group, window, now }: { group: ShipLaneGroup; window: [numb
   return (
     <div className="ship-lanegroup" data-group={group.group}>
       <p className="ship-lanegroup__head">
-        <StatusGlyph state={group.state as GlyphState} size={12} />
+        <StatusGlyph state={glyphOf(group.state)} size={12} />
         <span>{group.label}</span>
         {group.note ? <em className="ship-lane__note">{group.note}</em> : null}
       </p>
@@ -153,8 +152,12 @@ export function ShipLanes({ commit }: { commit: ShipCommit }) {
   const [fit, setFit] = React.useState(true);
   const groups = React.useMemo(() => [reviewGroup(detail.data), ...shipGroups(detail.data)].filter((g): g is ShipLaneGroup => g != null && g.lanes.length > 0), [detail.data]);
   const now = Math.floor(Date.now() / 1000);
-  const base = horizonOf(groups, now);
-  // A step walks a third of the horizon; Now is always the freshest end.
+  const fresh = horizonOf(groups, now);
+  // The horizon holds while the row is open, as the list holds its rows: what arrives moves no bar
+  // (Agent pace and checks, step 2). A bar under way runs on to the edge; Now takes the horizon as it
+  // is now, and a step walks a third of it.
+  const [base, setBase] = React.useState(fresh);
+  const behind = base[0] !== fresh[0] || base[1] !== fresh[1];
   const step = Math.max(1, Math.round((base[1] - base[0]) / 3));
   const window: [number, number] = walk === 0 ? base : [base[0] + walk * step, base[1] + walk * step];
   if (groups.length === 0) return null;
@@ -164,7 +167,16 @@ export function ShipLanes({ commit }: { commit: ShipCommit }) {
         <button type="button" className="rv-ib" aria-label="Earlier" onClick={() => setWalk(walk - 1)}>
           previous
         </button>
-        <button type="button" className="rv-ib" aria-label="Now" disabled={walk === 0} onClick={() => setWalk(0)}>
+        <button
+          type="button"
+          className="rv-ib"
+          aria-label="Now"
+          disabled={walk === 0 && !behind}
+          onClick={() => {
+            setWalk(0);
+            setBase(fresh);
+          }}
+        >
           Now
         </button>
         <button type="button" className="rv-ib" aria-label="Later" onClick={() => setWalk(walk + 1)}>

@@ -773,11 +773,16 @@
   color: #8fb5a6;
   opacity: 0.55;
 }
+/* Its box one width as it ticks ("9m ago" to "10m ago"), as a row's age is, so pushed right it never
+   moves: nothing on screen moves while a row is open (Agent pace and checks, step 2). */
 .rv-when {
   margin-left: auto;
   display: inline-flex;
   gap: 4px;
   align-items: center;
+  justify-content: flex-end;
+  min-width: 8ch;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .rv-draft {

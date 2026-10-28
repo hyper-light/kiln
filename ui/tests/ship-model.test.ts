@@ -6,6 +6,7 @@ import {
   environmentsOf,
   failuresOf,
   fold,
+  glyphOf,
   keptBuildsOf,
   keyOf,
   order,
@@ -266,4 +267,8 @@ test("a runner's replant, as the read model says it, in glyphs and words, and in
   assert.deepEqual(states.map(replantWord), ["replanted", "replanting", "didn't replant", "offline"]);
   const lanes = shipGroups({ ...c("r", "shipped"), replant: [{ name: "pi", state: "failed", why: "timed out" }] })[5]?.lanes;
   assert.deepEqual(lanes, [{ id: "runner/pi", name: "pi", state: "failed", start: null, end: null, note: "timed out" }]);
+});
+
+test("a lane's state as its glyph: one the page has no glyph for yet, as a landed change's, shows as not yet, never a crash", () => {
+  assert.deepEqual(["passed", "running", "approved", "landed", "", "closed"].map(glyphOf), ["passed", "running", "approved", "none", "none", "none"]);
 });
