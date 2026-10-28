@@ -317,9 +317,85 @@ pub fn program_stem(program: &str) -> String {
     stem.to_ascii_lowercase()
 }
 
+/// This machine, as kiln tells machines apart: a hash of the id its OS keeps for it (macOS's
+/// hardware UUID, Linux's `/etc/machine-id`, Windows' `MachineGuid`), so two machines with one host
+/// name (two Macs both named "Ada's MacBook Pro") are still two. `None` where the OS keeps none (a
+/// container without a machine id). Read once.
+pub fn machine_id() -> Option<String> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| raw_machine_id().as_deref().and_then(machine_id_of)).clone()
+}
+
+/// The id kiln gives a machine whose OS's own is `raw`: a hash of it, so the OS's id itself never
+/// leaves the machine. `None` for an empty one.
+fn machine_id_of(raw: &str) -> Option<String> {
+    let raw = raw.trim().to_ascii_lowercase();
+    (!raw.is_empty()).then(|| crate::util::sha256_hex(format!("kiln machine id\n{raw}").as_bytes()).chars().take(32).collect())
+}
+
+/// The id the OS keeps for this machine.
+fn raw_machine_id() -> Option<String> {
+    let output = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    if cfg!(windows) {
+        // The registry's 64-bit view, which a 32-bit `reg` wouldn't read otherwise.
+        reg_query_value(&output("reg", &["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid", "/reg:64"])?, "MachineGuid")
+    } else if cfg!(target_os = "macos") {
+        ioreg_platform_uuid(&output("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])?)
+    } else {
+        // systemd's, else D-Bus's (the same id, where systemd isn't).
+        ["/etc/machine-id", "/var/lib/dbus/machine-id"].into_iter().find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
+    }
+}
+
+/// macOS's hardware UUID in `ioreg -rd1 -c IOPlatformExpertDevice`'s output
+/// (`"IOPlatformUUID" = "0A1B…"`).
+fn ioreg_platform_uuid(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("\"IOPlatformUUID\"")?.trim_start().strip_prefix('=').map(|v| v.trim().trim_matches('"').to_owned()))
+        .filter(|v| !v.is_empty())
+}
+
+/// Value `name` in `reg query`'s output (`    MachineGuid    REG_SZ    1b2c…`).
+fn reg_query_value(out: &str, name: &str) -> Option<String> {
+    out.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        if words.next()? != name {
+            return None;
+        }
+        words.nth(1).map(str::to_owned)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machines_are_told_apart_by_the_id_their_os_keeps() {
+        let mac = "+-o Mac15,9  <class IOPlatformExpertDevice, id 0x100000253, registered, matched, active, busy 0 (0 ms), retain 39>\n  {\n    \"IOPlatformSerialNumber\" = \"XYZ123\"\n    \"IOPlatformUUID\" = \"0A1B2C3D-4E5F-6A7B-8C9D-0E1F2A3B4C5D\"\n  }\n";
+        assert_eq!(ioreg_platform_uuid(mac).as_deref(), Some("0A1B2C3D-4E5F-6A7B-8C9D-0E1F2A3B4C5D"));
+        assert_eq!(ioreg_platform_uuid("{\n  \"IOPlatformSerialNumber\" = \"XYZ123\"\n}\n"), None);
+        let win = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    1b2c3d4e-0000-4000-8000-123456789abc\r\n\r\n";
+        assert_eq!(reg_query_value(win, "MachineGuid").as_deref(), Some("1b2c3d4e-0000-4000-8000-123456789abc"));
+        assert_eq!(reg_query_value(win, "ProductId"), None);
+        // What leaves the machine is a hash: the same for the same id in any case, never the id.
+        let id = machine_id_of("0A1B2C3D-4E5F-6A7B-8C9D-0E1F2A3B4C5D");
+        assert_eq!(id, machine_id_of(" 0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d\n"));
+        assert_ne!(id, machine_id_of("1b2c3d4e-0000-4000-8000-123456789abc"));
+        assert!(id.as_deref().is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()) && !h.contains("0a1b2c3d")), "{id:?}");
+        assert_eq!(machine_id_of(" \n"), None);
+        // Read once: it holds still for the process's life.
+        assert_eq!(machine_id(), machine_id());
+    }
 
     #[test]
     fn finds_programs_on_path() {

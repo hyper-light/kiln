@@ -3878,6 +3878,7 @@ support (G-11, G-18, G-25, G-27, G-28).
   | `binfmt` | platforms registered for QEMU user emulation |
   | `tools.<name>.version` | `git`, `node`, `python3`, `cargo`, `go`, `java`, `dotnet`, `docker buildx`, `shards`, … found on the `PATH` a leg's steps have (W13-R03): the runner's, then the folders only its user's login shell has |
   | `net.egress` | whether the internet is reachable directly or only through a proxy |
+  | `machine_id` | a hash of the id the OS keeps for the machine: macOS's `IOPlatformUUID`, Linux's `/etc/machine-id`, Windows' `MachineGuid`. The server keeps it with the runner's name and tells machines apart by it when one joins (docs/architecture.md, "Joining"); routing never reads it |
 
 - **W13-R02 Declared facts.** Administrators add facts in the runner's configuration
   (`[agent.facts] location = "rack-2"`) and opt-in probe commands (`[agent.probes] cuda =

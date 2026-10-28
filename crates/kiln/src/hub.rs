@@ -1910,11 +1910,21 @@ impl Hub {
                     }
                     // A probe's whole report (a runner that only said its kiln has no CPU count):
                     // routing decides over it from now on (docs/ci.md W13-R01).
-                    if f.cpu.threads > 0
-                        && let Some(a) = self.agents.lock().get_mut(&agent)
-                    {
-                        a.facts = Some(Box::new(f));
-                        self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
+                    if f.cpu.threads > 0 {
+                        // The machine it is, kept with its name for the joins to come
+                        // (`crate::join::free_name`); a job's pod is its node's, and goes.
+                        let machine = f.machine_id.clone();
+                        let mut kept = false;
+                        if let Some(a) = self.agents.lock().get_mut(&agent) {
+                            kept = !a.ephemeral;
+                            a.facts = Some(Box::new(f));
+                            self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
+                        }
+                        if let Some(m) = machine.filter(|_| kept)
+                            && let Err(e) = self.store.set_agent_machine(agent.clone(), m).await
+                        {
+                            tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's machine id");
+                        }
                     }
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable runner facts"),

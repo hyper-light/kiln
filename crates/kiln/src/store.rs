@@ -1522,6 +1522,27 @@ impl Store {
         .await
     }
 
+    /// The machine agent `name` is, as its runner says ([`crate::os::machine_id`]): kept with the
+    /// name, so a machine joining with the same host name isn't taken for it
+    /// ([`crate::join::free_name`]). Unchanged, nothing is written.
+    pub async fn set_agent_machine(&self, name: String, machine_id: String) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute("UPDATE agents SET machine_id = ?2 WHERE name = ?1 AND machine_id IS NOT ?2", params![name, machine_id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Each agent's machine, by name: those whose runner said it.
+    pub async fn agent_machines(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT name, machine_id FROM agents WHERE machine_id IS NOT NULL")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
     // ---------------------------------------------------------------- key/value
 
     /// The value stored under `key`.
@@ -1825,6 +1846,42 @@ mod tests {
             anyhow::ensure!(s.runners_before(900).await? == 2);
             s.recover().await?;
             anyhow::ensure!(s.runners_before(900).await? == 1, "recovering marks them all gone; read it first");
+            anyhow::Ok(())
+        })
+    }
+
+    /// The machine each runner's name belongs to, as its runner said (W13-R01's `machine_id`): kept
+    /// across its reconnects, changed when it says another, gone with the name.
+    #[test]
+    fn w13_r01_a_runners_machine_is_kept_with_its_name() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let runner = |name: &str| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots: 1,
+                hostname: "Adas-MacBook-Pro.local".into(),
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                version: "1".into(),
+                ephemeral: false,
+                connected: true,
+                last_seen: 0,
+                enrolled_at: 0,
+            };
+            s.upsert_agent(runner("mbp")).await?;
+            s.upsert_agent(runner("old")).await?;
+            anyhow::ensure!(s.agent_machines().await?.is_empty(), "no runner said its machine yet");
+            s.set_agent_machine("mbp".into(), "aaaa".into()).await?;
+            s.set_agent_machine("nobody".into(), "bbbb".into()).await?;
+            // Connecting again doesn't forget it.
+            s.upsert_agent(runner("mbp")).await?;
+            let m = s.agent_machines().await?;
+            anyhow::ensure!(m.len() == 1 && m.get("mbp").map(String::as_str) == Some("aaaa"), "{m:?}");
+            s.set_agent_machine("mbp".into(), "cccc".into()).await?;
+            anyhow::ensure!(s.agent_machines().await?.get("mbp").map(String::as_str) == Some("cccc"));
+            s.delete_agent("mbp".into()).await?;
+            anyhow::ensure!(s.agent_machines().await?.is_empty(), "forgotten with its name");
             anyhow::Ok(())
         })
     }

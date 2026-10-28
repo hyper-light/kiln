@@ -240,8 +240,10 @@ Joining is never automatic: a machine asks, an admin decides.
 1. `kiln join` browses for three seconds (`--server URL` skips that), lists the servers it heard
    (asking which one when there are several; `--yes` takes the only one), generates a key and a
    CSR locally (the private key never leaves the machine) and a random secret, and sends
-   `POST /api/join-requests` with its name, host name, OS, architecture, labels (default
-   `[baremetal, <os>, <arch>]`), the CSR and the SHA-256 of the secret.
+   `POST /api/join-requests` with its name, host name, machine id, OS, architecture, labels
+   (default `[baremetal, <os>, <arch>]`), the CSR and the SHA-256 of the secret. The machine id is a
+   hash of the id the OS keeps for the machine (macOS's hardware UUID, Linux's `/etc/machine-id`,
+   Windows' `MachineGuid`); the OS's id itself never leaves the machine.
 2. The server keeps the request in memory for 10 minutes and answers with an id, a random nonce and
    its CA certificate. At most 20 requests wait at once and each source address may send one every
    5 seconds (HTTP 429 with `Retry-After` otherwise).
@@ -256,8 +258,14 @@ Joining is never automatic: a machine asks, an admin decides.
    approves only when the UI shows the code the machine shows. The machine also refuses to continue
    if the server reports a different code, a different CA, or a certificate for another key.
 5. **Approval** signs the CSR with the kiln CA exactly as enrollment does (365 days). The agent's
-   name is the requested one unless an agent on another host (or the server's local agent) already
+   name is the requested one unless another machine's agent (or the server's local agent) already
    has it; then it becomes `<name>-2`, `-3`, …, and the agent takes its name from the certificate.
+   The name is for people; which machine an agent is, its machine id says. Each runner reports its
+   id with its facts (W13-R01) and the server keeps it with the runner's name, so a machine with
+   another id is another machine whatever its host name (macOS names two Macs "Ada's MacBook Pro"
+   alike until one of them notices), and the same machine joining again keeps its name. A runner
+   from before that never said its id, or a machine that doesn't send one, is told apart by host
+   name. An outpost enrolling again is named the same way.
    The answer carries the certificate, the CA and the QUIC address (the address the machine reached
    the HTTP API at, when that is an IP, else the advertised one).
 6. The machine stores the credentials in the agent state directory like enrollment

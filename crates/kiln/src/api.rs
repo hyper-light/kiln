@@ -3064,7 +3064,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     };
     // An outpost never takes another machine's name: the same machine enrolling again keeps its
     // own, another one gets `<name>-2`.
-    let name = if outpost { free_agent_name(hub, &name, &r.hostname).await } else { name };
+    let name = if outpost { free_agent_name(hub, &name, &r.hostname, crate::join::clean_machine_id(r.machine_id.as_deref()).as_deref()).await } else { name };
     let days = if ephemeral {
         crate::pki::EPHEMERAL_DAYS
     } else if outpost {
@@ -3441,21 +3441,15 @@ async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
 }
 
 /// A name for an approved machine: the one it asked for, unless another machine's agent (or the
-/// server's own local agent) has it, then `<name>-2`, `<name>-3`, …
-async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> String {
+/// server's own local agent) has it, then `<name>-2`, `<name>-3`, … Another machine is one with
+/// another machine id ([`crate::join::free_name`]).
+async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str, machine_id: Option<&str>) -> String {
     let agents = hub.agent_list().await;
+    let machines = hub.store.agent_machines().await.unwrap_or_default();
     let local = hub.cfg.local_agent.enabled.then(|| crate::pki::sanitize_name(&hub.cfg.local_agent_name()));
-    let taken = |n: &str| {
-        local.as_deref() == Some(n) || agents.iter().any(|a| a.name == n && !a.hostname.eq_ignore_ascii_case(hostname))
-    };
-    let mut name = wanted.to_owned();
-    let mut n = 2u32;
-    while taken(&name) && n < 1000 {
-        let suffix = format!("-{n}");
-        name = format!("{}{suffix}", crate::util::truncate(wanted, 63 - suffix.len()));
-        n += 1;
-    }
-    name
+    let holders: Vec<crate::join::Holder<'_>> =
+        agents.iter().map(|a| crate::join::Holder { name: &a.name, hostname: &a.hostname, machine_id: machines.get(&a.name).map(String::as_str) }).collect();
+    crate::join::free_name(wanted, hostname, machine_id, local.as_deref(), &holders)
 }
 
 /// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
@@ -3471,7 +3465,7 @@ async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
         all.iter().find(|i| crate::discovery::invite::request_for(i, &all, std::slice::from_ref(&listed)).is_some()).map(|i| i.id.clone())
     });
     let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
-    let name = free_agent_name(hub, &wanted, &c.hostname).await;
+    let name = free_agent_name(hub, &wanted, &c.hostname, c.machine_id.as_deref()).await;
     // An outpost that asked instead of bringing an invite gets what an invited one gets.
     let outpost = c.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL);
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);

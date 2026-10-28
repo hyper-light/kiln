@@ -95,6 +95,10 @@ pub struct EnrollRequest {
     /// The machine's hostname: an outpost enrolling again keeps its name ([`crate::api`]).
     #[serde(default)]
     pub hostname: String,
+    /// The machine's id ([`crate::os::machine_id`]): another machine's outpost with the same host
+    /// name isn't taken for this one. None from a kiln from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// `POST /api/agents/instance`: see `api::enroll_instance`.
@@ -147,11 +151,13 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
     // Enrollment happens before kiln's CA is known: plain http, or https with a public cert.
     let http = Client::public()?;
     let url = format!("{}/api/agents/enroll", o.server_url.trim_end_matches('/'));
+    // Read off the runtime's threads: it may run a program (macOS's `ioreg`).
+    let machine_id = crate::rt::blocking(crate::os::machine_id).await.ok().flatten();
     let mut backoff = Duration::from_secs(1);
     loop {
         let r = http
             .post(&url)
-            .json(&EnrollRequest { token: token.clone(), name: o.name.clone(), csr: csr.clone(), hostname: crate::config::Config::hostname() })
+            .json(&EnrollRequest { token: token.clone(), name: o.name.clone(), csr: csr.clone(), hostname: crate::config::Config::hostname(), machine_id: machine_id.clone() })
             .send()
             .await;
         match r {

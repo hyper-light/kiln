@@ -120,6 +120,10 @@ pub struct NewRequest {
     pub csr: String,
     /// SHA-256 (hex) of the secret the machine polls with.
     pub commitment: String,
+    /// The machine's id ([`crate::os::machine_id`]), which tells it apart from another machine with
+    /// the same host name. None from a kiln from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// The answer to a new request.
@@ -248,6 +252,7 @@ impl Refusal {
 pub struct Candidate {
     pub name: String,
     pub hostname: String,
+    pub machine_id: Option<String>,
     pub labels: Vec<String>,
     pub csr: String,
 }
@@ -256,6 +261,7 @@ struct Entry {
     id: String,
     name: String,
     hostname: String,
+    machine_id: Option<String>,
     os: String,
     arch: String,
     labels: Vec<String>,
@@ -360,6 +366,42 @@ pub fn default_labels(os: &str, arch: &str) -> Vec<String> {
     clean_labels(&["baremetal".to_owned(), os.to_owned(), arch.to_owned()])
 }
 
+/// A machine id as a request gives it: lowercase `[a-z0-9_-]`, at most 64; none when empty.
+pub fn clean_machine_id(id: Option<&str>) -> Option<String> {
+    let id: String = id?.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(64).collect::<String>().to_ascii_lowercase();
+    (!id.is_empty()).then_some(id)
+}
+
+/// One of the server's agents, as [`free_name`] weighs it.
+pub struct Holder<'a> {
+    pub name: &'a str,
+    pub hostname: &'a str,
+    /// The machine it is, once its runner said ([`crate::os::machine_id`]).
+    pub machine_id: Option<&'a str>,
+}
+
+/// A name for a machine asking for `wanted`: that one, unless another machine's agent (or the
+/// server's own local agent, `local`) has it, then `<name>-2`, `<name>-3`, … The name is for people;
+/// which machine an agent is, its machine id says: one with another id is another machine, whatever
+/// its host name (macOS names two Macs "Ada's MacBook Pro" alike until one of them notices). An
+/// agent that never said its id (a kiln from before), or a machine that doesn't send one, is told
+/// apart by its host name, as before.
+pub fn free_name(wanted: &str, hostname: &str, machine_id: Option<&str>, local: Option<&str>, holders: &[Holder<'_>]) -> String {
+    let another = |h: &Holder<'_>| match (h.machine_id, machine_id) {
+        (Some(theirs), Some(ours)) => theirs != ours,
+        _ => !h.hostname.eq_ignore_ascii_case(hostname),
+    };
+    let taken = |n: &str| local == Some(n) || holders.iter().any(|h| h.name == n && another(h));
+    let mut name = wanted.to_owned();
+    let mut n = 2u32;
+    while taken(&name) && n < 1000 {
+        let suffix = format!("-{n}");
+        name = format!("{}{suffix}", crate::util::truncate(wanted, 63 - suffix.len()));
+        n += 1;
+    }
+    name
+}
+
 impl Requests {
     /// A new request from `from`. Returns its id and the server's nonce.
     pub fn create(&self, req: NewRequest, from: IpAddr, now: Instant) -> Result<(String, [u8; 16]), Refusal> {
@@ -389,6 +431,7 @@ impl Requests {
             return Err(Refusal::Invalid("commitment must be the SHA-256 (hex) of the join secret".to_owned()));
         }
         let hostname = text(&req.hostname, 64);
+        let machine_id = clean_machine_id(req.machine_id.as_deref());
         let wanted = if req.name.trim().is_empty() { hostname.as_str() } else { req.name.as_str() };
         let name = crate::pki::sanitize_name(wanted);
         let os = word(&req.os, 32);
@@ -415,6 +458,7 @@ impl Requests {
                 id: id.clone(),
                 name,
                 hostname,
+                machine_id,
                 os,
                 arch,
                 labels,
@@ -490,7 +534,7 @@ impl Requests {
         if e.secret.is_none() {
             return Err(Refusal::Unconfirmed);
         }
-        Ok(Candidate { name: e.name.clone(), hostname: e.hostname.clone(), labels: e.labels.clone(), csr: e.csr.clone() })
+        Ok(Candidate { name: e.name.clone(), hostname: e.hostname.clone(), machine_id: e.machine_id.clone(), labels: e.labels.clone(), csr: e.csr.clone() })
     }
 
     /// Record the approval (the certificate was signed by the caller).
@@ -526,13 +570,15 @@ impl Requests {
 pub struct Machine {
     pub name: String,
     pub hostname: String,
+    pub machine_id: Option<String>,
     pub os: String,
     pub arch: String,
     pub labels: Vec<String>,
 }
 
 impl Machine {
-    /// This machine: its host name, OS and architecture; labels default to `[baremetal, os, arch]`.
+    /// This machine: its host name, id, OS and architecture; labels default to
+    /// `[baremetal, os, arch]`.
     pub fn this(name: Option<String>, labels: &[String]) -> Self {
         let hostname = crate::config::Config::hostname();
         let os = std::env::consts::OS.to_owned();
@@ -541,7 +587,7 @@ impl Machine {
             l if l.is_empty() => default_labels(&os, &arch),
             l => l,
         };
-        Self { name: crate::pki::sanitize_name(&name.unwrap_or_else(|| hostname.clone())), hostname, os, arch, labels }
+        Self { name: crate::pki::sanitize_name(&name.unwrap_or_else(|| hostname.clone())), hostname, machine_id: crate::os::machine_id(), os, arch, labels }
     }
 }
 
@@ -582,6 +628,7 @@ async fn submit(http: &Client, server: &str, me: &Machine, csr: &str, secret: &s
         version: env!("CARGO_PKG_VERSION").to_owned(),
         csr: csr.to_owned(),
         commitment: crate::util::sha256_hex(secret.as_bytes()),
+        machine_id: me.machine_id.clone(),
     };
     let url = format!("{server}/api/join-requests");
     let mut failures = 0u32;
@@ -1089,6 +1136,7 @@ mod tests {
             version: "0.1.0".into(),
             csr: csr.into(),
             commitment: crate::util::sha256_hex(secret.as_bytes()),
+            machine_id: Some(" 0123ABCD-ef; ".into()),
         }
     }
 
@@ -1125,6 +1173,31 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_never_takes_another_machines_name() {
+        let h = |name, hostname, machine_id| Holder { name, hostname, machine_id };
+        let mbp = [h("adas-macbook-pro.local", "Adas-MacBook-Pro.local", Some("aaaa"))];
+        // Another laptop with the same host name (macOS renames one only once it notices the other):
+        // a name of its own.
+        assert_eq!(free_name("adas-macbook-pro.local", "Adas-MacBook-Pro.local", Some("bbbb"), None, &mbp), "adas-macbook-pro.local-2");
+        // The same machine joining again keeps its name, whatever macOS calls it by now.
+        assert_eq!(free_name("adas-macbook-pro.local", "Adas-MacBook-Pro-3.local", Some("aaaa"), None, &mbp), "adas-macbook-pro.local");
+        // An agent whose runner never said its id, or a machine that doesn't send one: told apart by
+        // host name, as before.
+        let old = [h("box", "box", None)];
+        assert_eq!(free_name("box", "BOX", Some("cccc"), None, &old), "box");
+        assert_eq!(free_name("box", "other", Some("cccc"), None, &old), "box-2");
+        assert_eq!(free_name("adas-macbook-pro.local", "Adas-MacBook-Pro.local", None, None, &mbp), "adas-macbook-pro.local");
+        // The server's own local agent's name is never given out, nor another machine's suffixed one.
+        let two = [h("box", "box", Some("aaaa")), h("box-2", "box-2", Some("bbbb"))];
+        assert_eq!(free_name("box", "box", Some("cccc"), Some("box-3"), &two), "box-4");
+        assert_eq!(free_name("solo", "solo", Some("cccc"), Some("solo"), &[]), "solo-2");
+        // Ids as requests give them.
+        assert_eq!(clean_machine_id(Some(" A1b2-C3; ")).as_deref(), Some("a1b2-c3"));
+        assert_eq!(clean_machine_id(Some(" ;; ")), None);
+        assert_eq!(clean_machine_id(None), None);
+    }
+
+    #[test]
     fn requests_live_through_confirm_and_approve() -> anyhow::Result<()> {
         let r = Requests::default();
         let now = Instant::now();
@@ -1151,6 +1224,7 @@ mod tests {
         assert!(!again);
         // Approval: the admin signs the CSR; the machine receives the certificate.
         let c = r.candidate(&id, now).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(c.machine_id.as_deref(), Some("0123abcd-ef"), "the machine's id, cleaned, goes to the approval");
         let dir = tempfile::tempdir()?;
         let pki = crate::pki::Pki::open(dir.path())?;
         let cert = pki.sign_csr(&c.csr, &c.name, 365)?;
