@@ -5065,7 +5065,11 @@ after and its metrics from logs counting each record once 4.6 s after; the trace
 (527 k a second), 0.65% of its requests refused, a trace found by its id at a p50 of 8.47 ms and
 its trace metrics counted 4.5 s after; and a runner whose server went away refused 0.46 s after it
 did (its queue's target: 1 s), every point it took stored once. Each one's replicas agreed. What
-they cost in CPU and memory is read from Linux's `/proc`, so not on a Mac.
+they cost in CPU and memory is read from Linux's `/proc`, so not on a Mac. And every live file
+that needs no Docker passes on two Mac Studios at c2a8a89b25 and 2b07c7ab0d (docs alone between
+them): 52 scenarios, `observe_live`'s 18, the tail's 4, DogStatsD's 2 and macOS's unified log
+among them, the archives' S3 under Docker Desktop too; kiln-obs's tests (358) and kiln's observe
+tests (274) as well.
 
 **On Linux**, where every scenario below was first written (2026-10-25, adacachy: CachyOS, x86_64,
 32 cores shared with others' builds): the whole set as the last changes went in, at e1d39d2c:
