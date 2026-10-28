@@ -58,7 +58,8 @@ Every kind of machine gets one of its own:
 | A Linux machine or VM | its `/etc/machine-id`: made at its first boot, from the hypervisor's own UUID for the VM where it gives one (systemd does), so each VM has its own |
 | A Windows machine or VM | its `MachineGuid`, made when Windows was installed (sysprep makes a new one for a copy) |
 | A container | one kiln makes the first time it starts there, kept on the container's data volume with the rest of its state: the same volume is the same machine, a new volume a new machine. A container has no hardware of its own, its `/etc/machine-id` is missing or its image's (the same in every container of that image), and its runtime's own id (Docker's, a pod's UID) changes each time it's made again, as an upgrade does |
-| A job's pod (`[kubernetes]` executors) | its pod's UID: it lives for one job and is forgotten when it goes, as now |
+| A pod kiln starts for a job (`[kubernetes]` executors) | its pod's UID: it lives for one job and is forgotten when it goes, as now |
+| A runner in a Kubernetes pod (kiln's chart, a Deployment or a StatefulSet) | its pod's UID, which the pod is given by the Downward API (`KILN_POD_UID` from `metadata.uid`), kept on its volume the first time it starts: a StatefulSet's pod started again with its volume is the same machine, and a pod without one is a new machine each time, as it keeps nothing |
 | The server's local agent | the server machine's: it is that machine's runner |
 
 A VM copied after it first booted carries the original's id. Enrollment catches it: an id that a
@@ -121,7 +122,7 @@ Each ships, is checked live, then the next starts.
 
 | Phase | What | Done when |
 | --- | --- | --- |
-| 1 (built) | Machine ids reported in facts and kept (`agents.machine_id`); a machine joining or an outpost enrolling never gets another machine's name; a server isn't installed beside a runner | two Macs with one host name join as two runners |
+| 1 (built) | Machine ids reported in facts and kept (`agents.machine_id`); a machine joining, enrolling with the join token or enrolling as an outpost never gets another machine's name; a server isn't installed beside a runner | two Macs with one host name join as two runners |
 | 2 | The id in certificates (new enrollments, renewals, and runners from before as they upgrade); revocation by id and serial; the server knows each connection's id before `Hello` | every connected runner's certificate carries its id |
 | 3 | Processes, hand-overs, the hub and agent sessions by id | two machines that report one name both stay connected, each with its own sessions and terminals |
 | 4 | The store by id: new columns filled, readers switched, then the tables re-keyed | no query keys a runner by name |
@@ -133,11 +134,10 @@ Each ships, is checked live, then the next starts.
 
 Taken on 2026-10-27:
 
-1. **VMs and containers** have ids of their own ([The machine id](#the-machine-id)): a VM its
-   OS's, made from its hypervisor's UUID; a container one kiln keeps on its data volume. A copied
-   VM is caught when it enrolls.
+1. **VMs, containers and pods** have ids of their own ([The machine id](#the-machine-id)): a VM
+   its OS's, made from its hypervisor's UUID; a container one kiln keeps on its data volume; a pod
+   its pod's UID, kept on its volume where it has one. A copied VM is caught when it enrolls.
 2. **History shows each machine's name now**, after a rename too.
 3. **Metrics carry both labels**, the machine's name and its id, so they group by either.
-4. **Every way in is named by id:** a machine enrolling with a join token
-   (`kiln install --agent --token`), which today takes whatever name it asks for, is named as a
-   joining machine is.
+4. **Every way in is named by id:** a machine enrolling with the join token
+   (`kiln install --agent --token`) is named as a joining machine is (built in phase 1).
