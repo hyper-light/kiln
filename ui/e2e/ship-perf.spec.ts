@@ -106,22 +106,23 @@ test("typing renders the composer alone, and live updates between keystrokes ren
     // Keystrokes alone: each renders the composer it lands in, and nothing else (W26-AC06). Measured
     // over 12 keystrokes during which the page fetched nothing: data a poll (or another test's live
     // update, on the shared mock) brings in renders the Files section, and that's the next measure's.
-    let fetched = 0;
+    const fetched: string[] = [];
     page.on("request", (r) => {
-      if (new URL(r.url()).pathname.startsWith("/api/")) fetched++;
+      const u = new URL(r.url());
+      if (u.pathname.startsWith("/api/")) fetched.push(`${r.method()} ${u.pathname}${u.search}`);
     });
     let before: Record<string, number> = {};
     let delta: Record<string, number> = {};
-    let clean = false;
-    for (let attempt = 0; attempt < 5 && !clean; attempt++) {
+    let during: string[] = [];
+    for (let attempt = 0; attempt < 8 && (attempt === 0 || during.length); attempt++) {
       before = await renders();
-      const was = fetched;
+      const was = fetched.length;
       for (let i = 0; i < 12; i++) await field.pressSequentially("x", { delay: 40 });
       await page.waitForTimeout(500);
       delta = await since(before);
-      clean = fetched === was;
+      during = fetched.slice(was);
     }
-    expect(clean, "data arrived during every run of 12 keystrokes").toBe(true);
+    expect(during, "data arrived during every run of 12 keystrokes (the last run's requests)").toEqual([]);
     expect(delta["ship/composer"] ?? 0).toBeGreaterThan(0);
     for (const k of Object.keys(delta)) if (k !== "ship/composer") expect(delta[k], `${k} rendered ${delta[k]}× on 12 keystrokes`).toBe(0);
     // Live updates between keystrokes: the Files section takes the data they refetch, and nothing

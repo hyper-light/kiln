@@ -358,6 +358,10 @@
 .rv-s {
   min-width: 0;
 }
+/* Files takes focus when Ship's Diff button brings it into view: a landmark, no ring. */
+.rv-s[tabindex="-1"]:focus {
+  outline: none;
+}
 .rv-h {
   display: flex;
   align-items: baseline;

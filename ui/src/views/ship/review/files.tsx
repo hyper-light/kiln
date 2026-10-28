@@ -24,7 +24,7 @@ import {
   type Thread,
 } from "@/api/review";
 import type { ShipCommit } from "@/api/ship";
-import { Loadable } from "@/components/ui/loading";
+import { Loadable, Loading } from "@/components/ui/loading";
 import { useRes } from "@/lib/data";
 import { invalidate, setData } from "@/lib/resource";
 import { parsePatch, type PatchFile } from "@/views/review/patch";
@@ -43,11 +43,24 @@ export const ReviewFiles = React.memo(function ReviewFiles({ item }: { item: Shi
   const ch = item.change;
   const host = ch?.host;
   return (
-    <Loadable label="Loading its review">
+    <Loadable label="Loading its review" fallback={<FilesHold />}>
       <ReviewBoundary>{ch && host === "kiln" ? <KilnFiles item={item} /> : ch && host ? <HostFiles item={item} /> : <CommitFiles item={item} />}</ReviewBoundary>
     </Loadable>
   );
 });
+
+/**
+ * The Files section while its review loads. Loading, failed or loaded, the dropdown's first section
+ * is `<section aria-label="Files">`, focusable, where Ship's Diff button brings it into view.
+ */
+function FilesHold() {
+  return (
+    <section className="rv-s" aria-label="Files" tabIndex={-1}>
+      <h3 className="rv-h">Files</h3>
+      <Loading label="Loading its review" block />
+    </section>
+  );
+}
 
 /** A change the server doesn't keep (a mock's, a pruned one): the section says so, nothing else breaks. */
 class ReviewBoundary extends React.Component<{ children: React.ReactNode }, { err: unknown }> {
@@ -58,7 +71,7 @@ class ReviewBoundary extends React.Component<{ children: React.ReactNode }, { er
   render() {
     if (this.state.err)
       return (
-        <section className="rv-s" aria-label="Files">
+        <section className="rv-s" aria-label="Files" tabIndex={-1}>
           <h3 className="rv-h">Files</h3>
           <p className="rv-sub">{this.state.err instanceof Error ? this.state.err.message : "its review can't be read"}</p>
         </section>
@@ -109,7 +122,7 @@ interface FrameP {
 function Frame(p: FrameP) {
   return (
     <>
-      <section className="rv-s" aria-label="Files">
+      <section className="rv-s" aria-label="Files" tabIndex={-1}>
         <h3 className="rv-h">
           Files <span className="rv-sum">{p.sum}</span>
         </h3>
