@@ -147,6 +147,12 @@ impl Kind {
             // Model, effort, mode and the conversation are flags: a change starts it again.
             Protocol::AgyStreamJson => {
                 p.args(super::antigravity::args(spec));
+                // kiln's MCP server, which `prepare` put in agy's own config: whom it serves is
+                // this session, by agy's environment, which agy hands on to the servers it starts.
+                #[cfg(unix)]
+                if let Some((_, sock, prefer)) = local_tools(spec) {
+                    p.envs(crate::reach::mcp::agy_env(sock, prefer, session));
+                }
             }
             Protocol::Terminal => {}
         }
@@ -179,7 +185,37 @@ impl Kind {
         p.stdin(std::process::Stdio::null());
         Ok(p)
     }
+
+    /// What a session's start needs before its harness starts: kiln's MCP server put in
+    /// Antigravity's own config, the only place agy reads one from (`crate::reach::mcp::agy_add`),
+    /// unless it's there already or a person turned it off. It names this kiln, so a runner
+    /// upgraded since puts its own. A session whose server couldn't be put there starts without it.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub async fn prepare(&self, spec: &Spec) {
+        #[cfg(unix)]
+        if self.protocol == Protocol::AgyStreamJson
+            && let Some((kiln, _, _)) = local_tools(spec)
+        {
+            let config = crate::os::home_dir().join(".gemini/config/mcp_config.json");
+            let k = kiln.clone();
+            let has = crate::rt::blocking(move || std::fs::read(&config).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|c| crate::reach::mcp::agy_has(&c, &k)));
+            if has.await.unwrap_or(false) {
+                return;
+            }
+            let added = match self.cli(spec, &crate::reach::mcp::agy_add(&kiln)) {
+                Ok(cmd) => crate::proc::output(cmd, AGY_ADD_TIMEOUT).await.and_then(|o| if o.status.success() { Ok(()) } else { Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&o.stderr).trim())) }),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = added {
+                tracing::warn!(error = %format!("{e:#}"), "kiln's MCP server couldn't be put in Antigravity's config: its agents start without kiln's tools");
+            }
+        }
+    }
 }
+
+/// How long `agy mcp add` may take, putting kiln's MCP server in Antigravity's config.
+#[cfg(unix)]
+const AGY_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Whether a session gets the runner's own kiln MCP server (`crate::reach::mcp`), and how to
 /// start it: this kiln binary, the runner's reach socket, the session's preferred runner.

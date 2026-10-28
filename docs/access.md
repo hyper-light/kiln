@@ -115,7 +115,8 @@ kiln machines · kiln tokens create|list|revoke · kiln api GET /api/runs
   operations, which it asks of the server through the runner's own connection.
   - Claude Code through `--mcp-config`;
   - Codex through its configuration;
-  - ACP agents through session parameters.
+  - ACP agents through session parameters;
+  - Antigravity through its own config, each session's identity in its environment.
   Each acts for whoever started it (with their rights), so every call is audited under the agent,
   on behalf of its user (`agent:<session>@<runner> for <user>`). Agents the server itself starts get
   `/api/mcp` with a token of their own (`kiln_mcp_session-<id>_…`, which works only while kiln runs
