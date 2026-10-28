@@ -700,7 +700,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
 
         {tabs.length === 0 && (
           <div className="absolute inset-0 grid place-items-center overflow-y-auto px-4 py-10">
-            <div className="flex max-w-[640px] flex-col items-center text-center">
+            {/* No wider than the page: a long machine name in its list ends in …. */}
+            <div className="flex max-w-[min(640px,100%)] min-w-0 flex-col items-center text-center">
               <Optic size={200} />
               <div className="eyebrow mt-6">
                 <span className="spectrum-rule" /> 07 / Terminal

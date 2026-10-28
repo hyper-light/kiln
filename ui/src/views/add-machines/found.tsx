@@ -514,7 +514,7 @@ function InstanceAction({
     case "here":
       return i.agent ? (
         <Link className="am-act" to={`/runners?agent=${encodeURIComponent(i.agent)}`} aria-label={`Open runner ${labelOf(i.agent)}`}>
-          {labelOf(i.agent)} <ArrowRight aria-hidden="true" />
+          <span className="am-act-name">{labelOf(i.agent)}</span> <ArrowRight aria-hidden="true" />
         </Link>
       ) : null;
     case "self":

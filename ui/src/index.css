@@ -2873,10 +2873,12 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   flex-wrap: wrap;
   gap: 8px;
 }
+/* No wider than the sheet: a long machine name ends in …. */
 .sw-new-btn {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  max-width: 100%;
   height: 40px;
   padding: 0 14px;
   border: 1px solid #2a2c33;
@@ -3010,6 +3012,8 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   padding: 0 !important;
   background: transparent !important;
 }
+/* In a cell of the table: a word that can't break (a runner's name, up to 63 letters) would widen
+   the table past a phone's width, so its words break where they must. */
 .runner-details {
   display: grid;
   gap: 4px;
@@ -3017,6 +3021,7 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   padding: 16px 18px 20px;
   border-left: 2px solid var(--color-accent);
   background: var(--color-surface);
+  overflow-wrap: anywhere;
 }
 .runner-details-head {
   display: flex;
@@ -3087,6 +3092,15 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 .runner-limit-msg[data-tone="error"] {
   color: #d1aaad;
 }
+/* A runner's name (runners.tsx RunnerName): its field as tall as its Save beside it, as the
+   details' other fields and buttons are. */
+.runner-name-field .field {
+  min-height: 32px;
+}
+.runner-name-field .field input {
+  min-height: 30px;
+}
+/* Runners' names, in their lines and sentences, break where they must on a phone. */
 .runner-up {
   display: grid;
   gap: 6px;
@@ -3094,6 +3108,7 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   padding: 12px 0;
   border-top: 1px solid var(--color-line);
   border-bottom: 1px solid var(--color-line);
+  overflow-wrap: anywhere;
 }
 .runner-up-head,
 .runner-up-line,
@@ -3121,6 +3136,7 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   min-height: 32px;
 }
 .runner-up-name {
+  min-width: 0;
   color: var(--color-foreground);
   font-size: 13.5px;
   font-weight: 500;

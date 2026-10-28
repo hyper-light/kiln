@@ -137,7 +137,7 @@ function SwitcherSheet({
         </button>
         {targets.map((t) => (
           <button key={t} type="button" className="sw-new-btn" onClick={done(() => onOpenTarget(t))}>
-            <Plus size={15} /> Terminal on {targetName(t)}
+            <Plus size={15} /> <span className="min-w-0 truncate">Terminal on {targetName(t)}</span>
           </button>
         ))}
       </div>

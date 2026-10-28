@@ -742,7 +742,7 @@ function RunnerName({ agent, onRename }: { agent: Agent; onRename: (a: Agent, la
   };
   return (
     <form className="mt-4 flex flex-wrap items-end gap-2" aria-label={`The name of ${shown}`} onSubmit={(e) => void save(e)}>
-      <TextField label="Name" className="min-w-0 flex-1 sm:max-w-sm" value={draft ?? shown} onChange={(e) => setDraft(e.target.value)} spellCheck={false} autoComplete="off" />
+      <TextField label="Name" className="runner-name-field min-w-0 flex-1 sm:max-w-sm" value={draft ?? shown} onChange={(e) => setDraft(e.target.value)} spellCheck={false} autoComplete="off" />
       <Button type="submit" size="xs" variant="secondary" disabled={saving || !typed || typed === shown}>
         {saving ? "Saving…" : "Save"}
       </Button>

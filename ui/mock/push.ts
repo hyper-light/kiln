@@ -11,6 +11,7 @@ import type http from "node:http";
 import { createECDH, randomBytes } from "node:crypto";
 import type { AgentInfo } from "../src/api/harness.ts";
 import { defaultInfo } from "./defaults.ts";
+import { MAC_MINI } from "./data.ts";
 
 type Kind = "agent.needs_you" | "agent.finished" | "agent.stopped" | "agent.paused" | "machine.battery_low";
 
@@ -154,14 +155,14 @@ const fleet: AgentInfo[] = !FLEET
         approvals: [{ id: "b1", tool: "shell", tool_name: "Bash", title: "cargo test -p kiln http::client", at: t0 }],
       },
       { ...base("fleet-docs", "Docs for reach", "local", "codex", 30), status: "running", activity: "Editing docs/reach.md", doing: "Editing docs/reach.md" },
-      { ...base("fleet-ui", "Phone layout for Runs", "agent:metal-mac-mini", "claude", 25), status: "running", doing: "Running npx vite build" },
+      { ...base("fleet-ui", "Phone layout for Runs", `agent:${MAC_MINI}`, "claude", 25), status: "running", doing: "Running npx vite build" },
       {
         ...base("fleet-slates", "Slates", "agent:adas-macbook-pro-2.local", "claude", 26),
         status: "waiting",
         approvals: [{ id: "pp1", tool: "plan", tool_name: "ExitPlanMode", title: "Fix: a mount taken over by a restarted daemon dropped a store", at: t0 }],
       },
       {
-        ...base("fleet-plan", "Plan QUIC replication", "agent:metal-mac-mini", "claude", 24),
+        ...base("fleet-plan", "Plan QUIC replication", `agent:${MAC_MINI}`, "claude", 24),
         held: { why: 'Paused by the agent: plan "QUIC replication" is ready for you to look at: its steps go to the agent once you resume', plan: "pl_quic", since: t0 - 4 * 60_000 },
       },
       { ...base("fleet-crash", "Upgrade hyper-rt", "agent:metal-epyc-01", "codex", 22), status: "exited", exit: { code: 127, error: "codex: command not found" } },
@@ -187,7 +188,10 @@ for (let i = 0; i < BUSY; i++) {
  * those ways, for a fleet the size of a real one in Mission control's head.
  */
 const TASKS = ["Port the scheduler", "Trim the release notes", "Docs for reach", "Fix the flaky retry test", "Phone layout for Runs", "Benchmark the codec"];
-for (const [stand, n] of (process.env.MOCK_STANDS ?? "").split(",").filter(Boolean).map((s) => s.split(":"))) {
+for (const [stand, n] of (process.env.MOCK_STANDS ?? "")
+  .split(",")
+  .filter(Boolean)
+  .map((s) => s.split(":"))) {
   for (let i = 0; i < Number(n); i++) {
     const a = base(`${stand}-${i}`, TASKS[i % TASKS.length]!, `agent:metal-ryzen-0${(i % 3) + 1}`, i % 2 ? "codex" : "claude", 50 + i);
     if (stand === "paused") fleet.push({ ...a, pause: { reason: "limit", label: "Session", said: "", since: t0, auto: true, by: "harness", tries: 0 } });
@@ -223,7 +227,13 @@ export function fleetCommand(id: string, c: { type?: string; id?: string; decisi
   if (!was) return false;
   if (c.type === "approve") {
     const approvals = was.approvals.filter((p) => p.id !== c.id);
-    const changed: AgentInfo = { ...was, approvals, status: approvals.length > 0 ? "waiting" : "running", doing: approvals.length > 0 ? was.doing : c.decision === "deny" ? "Trying another way" : "Going ahead", last_activity: Date.now() };
+    const changed: AgentInfo = {
+      ...was,
+      approvals,
+      status: approvals.length > 0 ? "waiting" : "running",
+      doing: approvals.length > 0 ? was.doing : c.decision === "deny" ? "Trying another way" : "Going ahead",
+      last_activity: Date.now(),
+    };
     fleet[i] = changed;
     emitFleet(changed);
   }
