@@ -135,11 +135,12 @@ fn glob_files(wd: &Path, pattern: &str) -> Vec<String> {
     glob::glob(&full).map(|paths| paths.flatten().filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()).unwrap_or_default()
 }
 
-/// The leg's `PATH` from `path` (the runner's own by default): with what its steps added
+/// The leg's `PATH` from `path` (by default the runner's own, then the folders only its user's
+/// login shell has: `crate::harness::kinds::search_path`, W13-R03): with what its steps added
 /// (`GITHUB_PATH`), then kiln's own binary (`kiln auth`, its credential helper).
 fn leg_path(st: &State, path: Option<&str>) -> String {
     let sep = if cfg!(windows) { ';' } else { ':' };
-    let base_path = std::env::var("PATH").unwrap_or_default();
+    let base_path = crate::harness::kinds::search_path().map(|p| p.to_string_lossy().into_owned()).or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
     let mut path = st.path.apply(path.unwrap_or(base_path.as_str()), sep);
     if let Some(d) = &st.kiln_bin {
         path = format!("{path}{sep}{}", d.to_string_lossy());
@@ -1339,6 +1340,9 @@ impl Leg {
             std::fs::write(temp.join("_github_workflow").join("event.json"), event)
         })
         .await??;
+        // Its steps' PATH has the folders only the runner's user's login shell has (`leg_path`,
+        // W13-R03): that shell is asked now, unless it answered in the last ten minutes.
+        crate::reach::serve::login_env().await;
         let trust = self.server_trust(&layout).await;
         let secrets: BTreeMap<String, String> = a.secrets.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
         let mut masks: Vec<String> = secrets.iter().filter(|(k, _)| !kiln_ci::secrets::DEBUG_FLAGS.contains(&k.as_str())).map(|(_, v)| v.clone()).collect();

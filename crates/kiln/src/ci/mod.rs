@@ -59,6 +59,7 @@ pub mod review_cli;
 pub mod reuse;
 pub mod reap;
 pub mod routing;
+pub mod rules;
 pub mod runs;
 pub mod runs_api;
 pub mod sbom;

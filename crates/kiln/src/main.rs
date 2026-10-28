@@ -478,6 +478,20 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("vmm-jail") {
         return kiln::runner::jail::main();
     }
+    // `kiln rustc` (docs/ci.md W24-R09): cargo runs a `RUSTC_WRAPPER` as `<wrapper> <rustc> <args>`,
+    // so this binary as one, or `kiln rustc <rustc> <args>`.
+    {
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let rustc = |a: &std::ffi::OsString| std::path::Path::new(a).file_stem().is_some_and(|s| s.to_string_lossy().starts_with("rustc"));
+        let from = match argv.get(1) {
+            Some(a) if a == "rustc" && argv.len() > 2 => Some(2),
+            Some(a) if rustc(a) => Some(1),
+            _ => None,
+        };
+        if let Some(from) = from {
+            return kiln::runner::rustc::main(argv.get(from..).unwrap_or_default());
+        }
+    }
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
         let action = std::env::args().nth(1).unwrap_or_default();
