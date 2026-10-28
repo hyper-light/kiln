@@ -181,6 +181,11 @@ fn instance_with(dir: &Path, port: u16, name: &str, id: &str, chaos: Option<&str
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", dir.join("home"))
         .env("NO_COLOR", "1")
+        // The stand-in harness on its PATH, as its first process has it: a newer process takes an
+        // agent session over only with the session's harness there.
+        .env("PATH", format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
+        .env("FAKE_CLAUDE_LINES", TALK.lines.to_string())
+        .env("FAKE_CLAUDE_EVERY_MS", TALK.every_ms.to_string())
         .stdout(std::process::Stdio::from(log.try_clone()?))
         .stderr(std::process::Stdio::from(log))
         .spawn()?;
