@@ -25,12 +25,11 @@ import { pauseLine } from "./pause";
 import { getNoneWaiting, getWaiting, subscribeWaiting } from "./waiting";
 import { answer, useAnswered } from "./answered";
 import { isMarked, markNotices, useMarks } from "./notices";
+import { swipeAway } from "./swipe-away";
 
 /** Cards at once (one on a phone); past these, one line says how many more agents wait. */
 const MAX = 2;
 const PHONE = "(max-width: 640px)";
-/** How far a finger drags a card sideways to put it away. */
-const SWIPE = 64;
 
 /** Card `keys` of agent `agent` put away (`away`) or dealt with (`done`), wherever you are. */
 function putAway(keys: string[], agent: string, how: "away" | "done" = "away") {
@@ -62,38 +61,6 @@ function asks(ap: NonNullable<Card["ap"]>): React.ReactNode {
   }
 }
 
-/** A finger dragging a card sideways: it follows, and past SWIPE it's put away. */
-function swipe(onAway: () => void): Pick<React.HTMLAttributes<HTMLLIElement>, "onPointerDown" | "onPointerMove" | "onPointerUp" | "onPointerCancel"> {
-  const end = (e: React.PointerEvent<HTMLLIElement>, cancel: boolean) => {
-    const el = e.currentTarget;
-    const dx = Number(el.dataset.dx ?? 0);
-    delete el.dataset.from;
-    delete el.dataset.dx;
-    el.style.transition = "transform 0.2s ease, opacity 0.2s ease";
-    if (!cancel && Math.abs(dx) > SWIPE) {
-      el.style.transform = `translateX(${dx > 0 ? 110 : -110}%)`;
-      el.style.opacity = "0";
-      window.setTimeout(onAway, 180);
-    } else el.style.transform = "";
-  };
-  return {
-    onPointerDown: (e) => {
-      if (e.pointerType !== "touch" || (e.target as Element).closest("button, a")) return;
-      e.currentTarget.dataset.from = String(e.clientX);
-      e.currentTarget.style.transition = "";
-    },
-    onPointerMove: (e) => {
-      const el = e.currentTarget;
-      if (el.dataset.from === undefined) return;
-      const dx = e.clientX - Number(el.dataset.from);
-      el.dataset.dx = String(dx);
-      el.style.transform = dx !== 0 ? `translateX(${dx}px)` : "";
-    },
-    onPointerUp: (e) => end(e, false),
-    onPointerCancel: (e) => end(e, true),
-  };
-}
-
 /** A card's frame: its agent and where it runs (and how many more it asks), what it says, what to do about it, and × to put it away. */
 function Shell({ card, line, busy, children }: { card: Card; line?: React.ReactNode; busy?: boolean; children?: React.ReactNode }) {
   const { a, more } = card;
@@ -101,7 +68,7 @@ function Shell({ card, line, busy, children }: { card: Card; line?: React.ReactN
   // A request puts away all its agent asks now; the rest, this one.
   const away = () => putAway(card.kind === "request" ? a.approvals.map((p) => p.id) : [card.key], a.id);
   return (
-    <li className="toast rq" data-kind={card.kind} aria-busy={busy || undefined} {...swipe(away)}>
+    <li className="toast rq" data-kind={card.kind} aria-busy={busy || undefined} {...swipeAway<HTMLLIElement>(away)}>
       <span className="rq-dot" aria-hidden="true" />
       <div className="rq-body">
         <p className="rq-head">
