@@ -8,6 +8,7 @@ import * as React from "react";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import type { Thread, ThreadKind } from "@/api/review";
+import { useDrafts } from "@/views/harness/state";
 
 /** Where a comment is being written. */
 export interface DraftAt {
@@ -57,6 +58,14 @@ export const useDraftKinds = create<KindsState>()(
     },
   ),
 );
+
+/**
+ * A draft's setter alone (W26-R15): no subscription, so the keystrokes that fill it never render
+ * who holds this. For parts that write a draft they don't show (the ⋯ menu's Quote).
+ */
+export function useDraftSet(key: string): (text: string | ((was: string) => string)) => void {
+  return React.useCallback((t: string | ((was: string) => string)) => useDrafts.getState().setDraft(key, typeof t === "function" ? t(useDrafts.getState().drafts[key] ?? "") : t), [key]);
+}
 
 /** A new thread's kind, by its draft's key: a question until another is chosen. */
 export function useDraftKind(key: string): [ThreadKind, (kind: ThreadKind) => void] {

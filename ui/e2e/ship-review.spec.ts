@@ -19,6 +19,11 @@ test("Files and the Conversation are the dropdown's first sections", async ({ pa
   const secs = row.locator(".ship-open > section");
   await expect(secs.nth(0)).toHaveAttribute("aria-label", "Files");
   await expect(secs.nth(1)).toHaveAttribute("aria-label", "Conversation");
+  // The item's diff is in one place, Files (Ada, 2026-10-27), and Files takes focus: Ship's Diff button brings it there.
+  const files = row.getByRole("region", { name: "Files", exact: true });
+  await expect(files).toHaveCount(1);
+  await files.focus();
+  await expect(files).toBeFocused();
   // The kinds row shows kim's blocking thread holding Approve, in the gate's words.
   await expect(row.locator(".rv-k[data-k='blocking']").first()).toBeVisible();
   const approve = row.locator(".rv-bar .rv-btn", { hasText: "Approve" });

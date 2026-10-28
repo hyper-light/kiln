@@ -36,8 +36,11 @@ const pips = (review: string, land: string, checks: string, build = "none", stag
 /** The fields every row gives; the rest default as a plain commit's. */
 type Row = Pick<ShipCommit, "sha" | "short" | "message" | "author" | "at" | "stand" | "line" | "pips" | "cursor"> & Partial<ShipCommit>;
 
+/** The fixed rows' times: the mock's start, so every read of the page sends the same rows (W26-R15's memo reads "the same" by them). */
+const T0 = now();
+
 function commits(): ShipCommit[] {
-  const t = now();
+  const t = T0;
   const change = (name: string, kind: ShipChange["kind"], host: string, title: string, state: string, turn: string[], open = { question: 0, nit: 0, issue: 0, blocking: 0 }): ShipChange => ({
     name,
     kind,

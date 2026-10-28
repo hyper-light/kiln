@@ -12,12 +12,12 @@ import { whoSaid, type Thread, type ThreadComment } from "@/api/review";
 import { relativeTime } from "@/lib/format";
 import { CommentText } from "./comment";
 import { ReviewComposer } from "./composer";
-import { draftKey, replyAt } from "./draft";
+import { draftKey, replyAt, useDraftSet } from "./draft";
 import { KINDS, KIND_ICON, KIND_SAYS } from "./kinds";
 import type { LinesOf, Ops } from "./ops";
 import type { Side } from "./fold";
 import type { Lines } from "./suggestion";
-import { useDraft } from "@/views/harness/state";
+import { counted } from "./perf";
 import "./review.css";
 
 const said = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -140,7 +140,9 @@ function CommentCard({ c, t, root, ops, linesOf, where, onReplyDraft }: { c: Thr
   const [busy, start] = React.useTransition();
   const { copied, press } = usePressCopy(c.body);
   const key = draftKey(replyAt(ops.item, t));
-  const [, setReplyText] = useDraft(key);
+  // Quote writes the reply's draft but doesn't show it: the setter alone, so typing it elsewhere
+  // never renders this card (W26-R15, AC06).
+  const setReplyText = useDraftSet(key);
   const KindIcon = root && t.kind ? KIND_ICON[t.kind] : null;
   const run = (f: () => Promise<void>) =>
     start(async () => {
@@ -263,86 +265,100 @@ function EditBody({ body, busy, onSave, onCancel }: { body: string; busy: boolea
  * The thread: its comments, then Reply and Resolve aligned under the last, or the composer while
  * its reply is written. A resolved thread folds to one line ("3 · resolved by kim") with Reopen.
  */
-export function ThreadView({
-  t,
-  ops,
-  linesOf,
-  draft,
-  setDraft,
-  where,
-}: {
-  t: Thread;
-  ops: Ops;
-  linesOf: LinesOf;
-  /** The draft open on this thread (its reply's), when it is. */
-  draft: boolean;
-  setDraft: (d: { kind: "reply"; thread: string } | null) => void;
-  /** What names where it sits, in the Conversation (`matrix.rs:42`). */
-  where?: string;
-}) {
-  const resolved = t.state === "resolved";
-  const blocking = t.kind === "blocking" && t.created_by !== ops.me;
-  const [err, setErr] = React.useState<string | null>(null);
-  const [busy, start] = React.useTransition();
-  const at = replyAt(ops.item, t);
-  const send = (body: string) => ops.reply(t, body).then(() => setDraft(null));
-  if (resolved)
-    return (
-      <div className="rv-thread" data-done="1" data-k={t.kind}>
-        <span className="rv-done">
-          <Check size={13} aria-hidden="true" />
-          <span>
-            {t.comments.length} · resolved{t.resolved_by ? ` by ${whoSaid(t.resolved_by)}` : ""}
+export const ThreadView = React.memo(
+  function ThreadView({
+    t,
+    ops,
+    linesOf,
+    draft,
+    setDraft,
+    where,
+  }: {
+    t: Thread;
+    ops: Ops;
+    linesOf: LinesOf;
+    /** The draft open on this thread (its reply's), when it is. */
+    draft: boolean;
+    setDraft: (d: { kind: "reply"; thread: string } | null) => void;
+    /** What names where it sits, in the Conversation (`matrix.rs:42`). */
+    where?: string;
+  }) {
+    counted("ship/threadview");
+    const resolved = t.state === "resolved";
+    const blocking = t.kind === "blocking" && t.created_by !== ops.me;
+    const [err, setErr] = React.useState<string | null>(null);
+    const [busy, start] = React.useTransition();
+    const at = replyAt(ops.item, t);
+    const send = (body: string) => ops.reply(t, body).then(() => setDraft(null));
+    if (resolved)
+      return (
+        <div className="rv-thread" data-done="1" data-k={t.kind}>
+          <span className="rv-done">
+            <Check size={13} aria-hidden="true" />
+            <span>
+              {t.comments.length} · resolved{t.resolved_by ? ` by ${whoSaid(t.resolved_by)}` : ""}
+            </span>
           </span>
-        </span>
-        {ops.kiln && (
-          <button type="button" className="rv-ib" aria-label="Reopen" title="Reopen" disabled={busy} onClick={() => start(async () => ops.resolve(t, false).catch((e) => setErr(said(e))))}>
-            <RotateCcw size={13} aria-hidden="true" />
-          </button>
-        )}
-      </div>
-    );
-  return (
-    <div className="rv-thread" data-k={t.kind}>
-      {t.comments.map((c, i) => (
-        <CommentCard key={c.id} c={c} t={t} root={i === 0} ops={ops} linesOf={linesOf} where={where} onReplyDraft={() => setDraft({ kind: "reply", thread: t.id })} />
-      ))}
-      {err && (
-        <p className="rvc-error" role="alert">
-          {err}
-        </p>
-      )}
-      {draft ? (
-        <ReviewComposer at={at} lines={oldOf(t, linesOf)} placeholder={`Reply to ${whoSaid(t.comments[0]?.author ?? "")}`} sendLabel="Reply" onSend={send} onCancel={() => setDraft(null)} autoFocus />
-      ) : (
-        <div className="rv-btns">
-          <button type="button" className="rv-btn" onClick={() => setDraft({ kind: "reply", thread: t.id })}>
-            <Reply size={13} aria-hidden="true" />
-            <span>Reply</span>
-          </button>
           {ops.kiln && (
-            <button
-              type="button"
-              className="rv-btn"
-              disabled={busy || blocking}
-              title={blocking ? `Only ${whoSaid(t.created_by)} can resolve a blocking comment` : undefined}
-              onClick={() =>
-                start(async () => {
-                  setErr(null);
-                  try {
-                    await ops.resolve(t, true);
-                  } catch (e) {
-                    setErr(said(e));
-                  }
-                })
-              }
-            >
-              <Check size={13} aria-hidden="true" />
-              <span>Resolve</span>
+            <button type="button" className="rv-ib" aria-label="Reopen" title="Reopen" disabled={busy} onClick={() => start(async () => ops.resolve(t, false).catch((e) => setErr(said(e))))}>
+              <RotateCcw size={13} aria-hidden="true" />
             </button>
           )}
         </div>
-      )}
-    </div>
-  );
-}
+      );
+    return (
+      <div className="rv-thread" data-k={t.kind}>
+        {t.comments.map((c, i) => (
+          <CommentCard key={c.id} c={c} t={t} root={i === 0} ops={ops} linesOf={linesOf} where={where} onReplyDraft={() => setDraft({ kind: "reply", thread: t.id })} />
+        ))}
+        {err && (
+          <p className="rvc-error" role="alert">
+            {err}
+          </p>
+        )}
+        {draft ? (
+          <ReviewComposer
+            at={at}
+            lines={oldOf(t, linesOf)}
+            placeholder={`Reply to ${whoSaid(t.comments[0]?.author ?? "")}`}
+            sendLabel="Reply"
+            onSend={send}
+            onCancel={() => setDraft(null)}
+            autoFocus
+          />
+        ) : (
+          <div className="rv-btns">
+            <button type="button" className="rv-btn" onClick={() => setDraft({ kind: "reply", thread: t.id })}>
+              <Reply size={13} aria-hidden="true" />
+              <span>Reply</span>
+            </button>
+            {ops.kiln && (
+              <button
+                type="button"
+                className="rv-btn"
+                disabled={busy || blocking}
+                title={blocking ? `Only ${whoSaid(t.created_by)} can resolve a blocking comment` : undefined}
+                onClick={() =>
+                  start(async () => {
+                    setErr(null);
+                    try {
+                      await ops.resolve(t, true);
+                    } catch (e) {
+                      setErr(said(e));
+                    }
+                  })
+                }
+              >
+                <Check size={13} aria-hidden="true" />
+                <span>Resolve</span>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  },
+  // A thread renders again only when what it draws does; each element's setDraft closes over its own
+  // thread id and the draft setter, which don't change (W26-R15).
+  (a, b) => a.t === b.t && a.ops === b.ops && a.linesOf === b.linesOf && a.draft === b.draft && a.where === b.where,
+);
