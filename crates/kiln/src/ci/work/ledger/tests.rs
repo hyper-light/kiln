@@ -547,9 +547,25 @@ fn w24_r02_digests_bare_or_named_and_nothing_else() {
 /// listing, a path set, a result, what's kept beside it, and its hit counted, a commit), each a
 /// trip to the store's thread. This holds it under twice AC10's bound, against regressions, until
 /// the ledger moves onto Records and Amphora's (CP-T1.5) is measured against AC10 itself.
+///
+/// It measures in a process of its own (this test's binary again, this test alone): the store's
+/// threads are the process's, and in a whole run the tests beside it queue there, which a lookup
+/// of a trip per call would count as its own (p99 16.6 ms in kiln's lib run on fedora, 5.8 ms alone).
 #[test]
 fn w24_ac10_lookup_on_records_p99_under_10ms() -> anyhow::Result<()> {
     use kiln_seams::records::Scan as Page;
+    const ALONE: &str = "KILN_TEST_AC10_ALONE";
+    if std::env::var_os(ALONE).is_none() {
+        let out = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "ci::work::ledger::tests::w24_ac10_lookup_on_records_p99_under_10ms", "--nocapture", "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        println!("{said}");
+        anyhow::ensure!(out.status.success(), "alone, it failed ({}): {said}{}", out.status, String::from_utf8_lossy(&out.stderr));
+        anyhow::ensure!(said.contains("w24_ac10 on Records: "), "alone, it measured nothing: {said}");
+        return Ok(());
+    }
     let dir = tempfile::tempdir()?;
     let kept_store = Store::open(&dir.path().join("kiln.db"))?;
     let kept: Arc<dyn Records> = Arc::new(StoreRecords::open(kept_store.clone())?);
