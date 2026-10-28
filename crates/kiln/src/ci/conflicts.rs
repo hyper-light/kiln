@@ -812,7 +812,7 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
         }
     };
     // Why the revision exists (W26-R04).
-    revision::record(hub, &d.id, n, &made.sha, &revision::Why { why: WHY, thread: None, comment: None, note: None }).await.map_err(fail)?;
+    revision::record(hub, &d.id, n, &made.sha, &revision::Why { why: WHY, thread: None, comment: None, note: Some(WHY) }).await.map_err(fail)?;
     let (rid, me2) = (replay.id.clone(), me.clone());
     hub.store
         .call(move |c| Ok(c.execute("UPDATE review_replays SET state = 'resolved', resolved_version = ?2, resolved_by = ?3, resolved_at = ?4 WHERE id = ?1", params![rid, n, me2, crate::util::now_unix()]).map(|_| ())?))

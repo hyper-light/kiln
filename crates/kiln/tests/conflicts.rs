@@ -296,7 +296,7 @@ fn w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision() -> anyhow::
     assert_eq!((r.get("version"), text(&r, "why"), r.get("signer")), (Some(&json!(2)), "conflict resolved", Some(&Value::Null)), "unsigned until W27-R03: {r}");
     let d = ok(&s, &kim, "GET", "/api/diffs/D1", None)?;
     let v2 = d.pointer("/versions/1").cloned().unwrap_or_default();
-    assert_eq!((v2.get("n"), text(&v2, "why"), v2.get("rebase_only")), (Some(&json!(2)), "conflict resolved", Some(&json!(false))), "{d}");
+    assert_eq!((v2.get("n"), text(&v2, "why"), text(&v2, "note"), v2.get("rebase_only")), (Some(&json!(2)), "conflict resolved", "conflict resolved", Some(&json!(false))), "{d}");
     assert!(text(&v2, "pushed_by").contains("dev"), "{v2}");
     let made = text(&v2, "commit").to_owned();
     assert_eq!(text(&r, "commit"), made);
