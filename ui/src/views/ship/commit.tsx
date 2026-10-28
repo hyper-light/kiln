@@ -3,7 +3,8 @@
  * /ship/{owner}/{name}/{sha}, reached from Commit on an opened row (step 1). Every commit has one,
  * read from its detail (GET /api/ship/commits/{owner}/{name}/{sha}, the same resource the opened row
  * reads); a commit kiln doesn't know says so. What failed comes first, then the six stage cards,
- * then one trace of every span on a time axis, failures first (step 2).
+ * then one trace of every span on a time axis, failures first (step 2); what ships with it, where
+ * each environment stands from it with the one image they run, and links to its runs (step 3).
  */
 import { shipApi } from "@/api/ship";
 import { Loadable } from "@/components/ui/loading";
@@ -14,7 +15,7 @@ import { clockTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
 import { cardsOf } from "./jobs";
-import { failuresOf, shipGroups, standWord, strip, traceOf } from "./model";
+import { environmentsOf, failuresOf, ridesOf, shipGroups, standWord, strip, traceOf } from "./model";
 import { horizonOf, LaneBar, reviewGroup, type ShipLaneGroup } from "./review/lanes";
 import "./ship.css";
 
@@ -38,6 +39,12 @@ function Commit({ repo, sha }: { repo: string; sha: string }) {
     pollMs: 15_000,
     on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"],
   }).data;
+  // What ships with it is how Ship's list folds it: the repository's commits, read as the list reads them.
+  const listed = useSuspenseResource(`ship/commits/${JSON.stringify({ repo, limit: 200 })}`, (s) => shipApi.commits({ repo, limit: 200 }, s), { pollMs: 15_000, on: ["run", "review"] }).data;
+  const rides = ridesOf(listed.commits, c.sha);
+  const envs = environmentsOf(c);
+  const image = c.build?.image.digest ?? null;
+  const runsIt = envs.filter((e) => e.now || e.state === "passed").map((e) => e.environment);
   const failed = failuresOf(c);
   const groups = [reviewGroup(c), ...shipGroups(c)].filter((g): g is ShipLaneGroup => g != null && g.lanes.length > 0);
   const now = Math.floor(Date.now() / 1000);
@@ -103,6 +110,71 @@ function Commit({ repo, sha }: { repo: string; sha: string }) {
               ))}
             </ul>
           </div>
+        )}
+      </section>
+      <section className="ship-sec" aria-label="Ships with">
+        <h2>Ships with</h2>
+        {rides.as === "alone" ? (
+          <p>It ships on its own.</p>
+        ) : (
+          <>
+            {rides.head && (
+              <p>
+                It rides with <Link to={`/ship/${rides.head.repo}/${rides.head.sha}`}>{rides.head.message || rides.head.short}</Link> (<span className="ship-sha">{rides.head.short}</span>).
+              </p>
+            )}
+            {rides.with.length > 0 && (
+              <ul className="ship-commit__rides">
+                {rides.with.map((r) => (
+                  <li key={r.sha}>
+                    <Link to={`/ship/${r.repo}/${r.sha}`}>{r.message || r.short}</Link> <span className="ship-sha">{r.short}</span> · {standWord(r.stand)}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </section>
+      <section className="ship-sec" aria-label="Environments">
+        <h2>Environments</h2>
+        {envs.length === 0 ? (
+          <p>Not in an environment yet.</p>
+        ) : (
+          <ul className="ship-commit__envs">
+            {envs.map((e) => (
+              <li key={e.environment} data-production={e.production || undefined}>
+                <StatusGlyph state={e.state as keyof typeof GLYPHS} size={14} />
+                <span className="ship-commit__env">{e.environment}</span>
+                <span>{e.now ? "runs it now" : (GLYPHS[e.state as keyof typeof GLYPHS]?.word ?? e.state)}</span>
+                {e.description ? <span className="ship-commit__env-note">{e.description}</span> : null}
+                {e.at ? <span className="ship-commit__env-note">{clockTime(e.at * 1000)}</span> : null}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="ship-commit__image">
+          {image ? (
+            <>
+              Built once as <code>{image.slice(0, 19)}</code>
+              {runsIt.length > 1 ? `: ${runsIt.join(" and ")} run the same image.` : runsIt.length === 1 ? `: ${runsIt[0]} runs it.` : "."}
+            </>
+          ) : (
+            "No image built for it yet."
+          )}
+        </p>
+      </section>
+      <section className="ship-sec" aria-label="Runs">
+        <h2>Runs</h2>
+        {(c.runs ?? []).length === 0 ? (
+          <p>No runs yet.</p>
+        ) : (
+          <ul className="ship-commit__runs">
+            {(c.runs ?? []).map((r) => (
+              <li key={r.id}>
+                <Link to={`/runs/${r.id}`}>{r.pipeline}</Link> <span className="ship-sha">{r.id}</span>
+              </li>
+            ))}
+          </ul>
         )}
       </section>
     </section>

@@ -283,3 +283,45 @@ export function traceOf(groups: readonly ShipLaneGroup[]): Span[] {
     .sort((a, b) => Number(fell(b.s.state)) - Number(fell(a.s.state)) || (a.s.start ?? Infinity) - (b.s.start ?? Infinity) || a.i - b.i)
     .map((x) => x.s);
 }
+
+/** What ships with a commit (the commit page's step 3): the commits folded with it, and how. */
+export interface Rides {
+  /** It leads them (the approval they ride with, its change's tip, the newest shipped), rides with `head`, or ships alone. */
+  as: "head" | "rider" | "alone";
+  head: ShipCommit | null;
+  /** The others that ship with it. */
+  with: ShipCommit[];
+  folds: Item["folds"];
+}
+
+/** What ships with `sha`, from the list's commits as Ship folds them. */
+export function ridesOf(commits: readonly ShipCommit[], sha: string): Rides {
+  for (const it of fold(commits)) {
+    if (it.head.sha === sha) return it.riders.length ? { as: "head", head: null, with: it.riders, folds: it.folds } : { as: "alone", head: null, with: [], folds: undefined };
+    if (it.riders.some((r) => r.sha === sha)) return { as: "rider", head: it.head, with: it.riders.filter((r) => r.sha !== sha), folds: it.folds };
+  }
+  return { as: "alone", head: null, with: [], folds: undefined };
+}
+
+/** Where an environment stands from a commit: its latest deploy of it, and whether it runs it now. */
+export interface Standing {
+  environment: string;
+  production: boolean;
+  state: string;
+  description: string;
+  at: number | null;
+  /** It runs this commit now. */
+  now: boolean;
+}
+
+/** Each environment the commit was deployed to or runs in, staging before production, as it stands from it. */
+export function environmentsOf(detail: ShipDetail): Standing[] {
+  const by = new Map<string, Standing>();
+  for (const d of [...(detail.deployments ?? [])].sort((a, b) => a.at - b.at))
+    by.set(d.environment, { environment: d.environment, production: d.production, state: DEPLOY_GLYPH[d.state ?? ""] ?? "none", description: d.description ?? "", at: d.at, now: false });
+  for (const e of detail.environments ?? []) {
+    const was = by.get(e.environment);
+    by.set(e.environment, was ? { ...was, now: true } : { environment: e.environment, production: e.production, state: "passed", description: "", at: null, now: true });
+  }
+  return [...by.values()].sort((a, b) => Number(a.production) - Number(b.production) || a.environment.localeCompare(b.environment));
+}

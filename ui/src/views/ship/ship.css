@@ -564,3 +564,30 @@
   padding: 0;
   list-style: none;
 }
+
+/* The commit page's step 3: what ships with it, its environments and image, its runs. */
+.ship-commit__rides,
+.ship-commit__envs,
+.ship-commit__runs {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__envs li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__env {
+  color: #e4e5e9;
+}
+.ship-commit__env-note {
+  color: #a1a4ad;
+}
+.ship-commit__image {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}

@@ -3,7 +3,8 @@
  * rows: an opened row's Commit link leads to /ship/{owner}/{name}/{sha}, which loads; every commit
  * Ship lists has its page; one kiln doesn't know says so instead of breaking (step 1). A failing
  * commit shows what failed before anything else, then its six stage cards and its trace, failures
- * first; one nothing failed in starts at its stages (step 2).
+ * first; one nothing failed in starts at its stages (step 2). It says what ships with it, where each
+ * environment stands from it with the one image they run, and its runs link to their pages (step 3).
  */
 import { expect, test } from "@playwright/test";
 
@@ -66,4 +67,39 @@ test("a commit nothing failed in starts at its stages", async ({ page }) => {
   const { commit, sections } = await pageOf(page, "deploy: a rollback holds");
   await expect(sections.first()).toHaveAttribute("aria-label", "Stages", { timeout: 15_000 });
   await expect(commit.getByRole("region", { name: "Errors" })).toHaveCount(0);
+});
+
+test("its runs link to their pages, and it says where each environment stands with the one image", async ({ page }) => {
+  const { commit } = await pageOf(page, "deploy: a rollback holds");
+  const runs = commit.getByRole("region", { name: "Runs" }).getByRole("link");
+  await expect(runs.first()).toBeVisible({ timeout: 15_000 });
+  const hrefs = await runs.evaluateAll((els) => els.map((el) => el.getAttribute("href") ?? ""));
+  expect(hrefs.length).toBeGreaterThan(0);
+  const envs = commit.getByRole("region", { name: "Environments" });
+  await expect(envs).toContainText("staging");
+  await expect(envs).toContainText("production");
+  await expect(envs).toContainText("runs it now");
+  await expect(envs).toContainText("staging and production run the same image");
+  for (const href of hrefs) {
+    expect(href).toMatch(/\/runs\/[^/]+$/);
+    await page.goto(href);
+    await expect(page.getByRole("heading", { level: 1 })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  }
+});
+
+test("what ships with it: a change's tip lists the commit it carries, which rides with the tip", async ({ page }) => {
+  const list = (await (await page.request.get("/api/ship/commits")).json()) as { commits: { repo: string; sha: string; short: string; stand: string; message: string }[] };
+  const tip = list.commits.find((x) => x.message === "pipeline: dynamic matrices" && x.stand === "needs_you");
+  const old = list.commits.find((x) => x.message === "pipeline: dynamic matrices" && x.stand === "superseded");
+  if (!tip || !old) throw new Error("no D41 and its superseded commit");
+  await page.goto(`/ship/${tip.repo}/${tip.sha}`);
+  const tipWith = page.getByRole("region", { name: "Ships with" });
+  await expect(tipWith).toContainText(old.short, { timeout: 15_000 });
+  await page.goto(`/ship/${old.repo}/${old.sha}`);
+  const oldWith = page.getByRole("region", { name: "Ships with" });
+  await expect(oldWith).toContainText("It rides with", { timeout: 15_000 });
+  await expect(oldWith).toContainText(tip.short);
+  await oldWith.getByRole("link").first().click();
+  await expect(page).toHaveURL(new RegExp(`/ship/${tip.repo}/${tip.sha}$`));
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
-import { failuresOf, fold, keyOf, order, pickCard, shipGroups, standWord, strip, traceOf } from "../src/views/ship/model.ts";
+import { environmentsOf, failuresOf, fold, keyOf, order, pickCard, ridesOf, shipGroups, standWord, strip, traceOf } from "../src/views/ship/model.ts";
 
 const c = (sha: string, stand: string, extra: Partial<ShipCommit> = {}): ShipCommit => ({
   repo: "r",
@@ -193,4 +193,35 @@ test("the commit page's trace: every lane of every group, failures first, then b
     ["Checks · test", "Review · v1 · pushed", "Checks · lint", "Checks · later"],
   );
   assert.equal(spans[0]?.id, "checks/ci/test");
+});
+
+test("what ships with a commit: what folds under it, what it rides with, or nothing", () => {
+  const commits = [c("tip", "needs_you", { change: { name: "D1" } as ShipCommit["change"] }), c("old", "superseded", { fold_under: "tip" }), c("lone", "shipped")];
+  assert.deepEqual(ridesOf(commits, "tip").as, "head");
+  assert.deepEqual(
+    ridesOf(commits, "tip").with.map((r) => r.sha),
+    ["old"],
+  );
+  const rider = ridesOf(commits, "old");
+  assert.equal(rider.as, "rider");
+  assert.equal(rider.head?.sha, "tip");
+  assert.deepEqual(rider.with, []);
+  assert.equal(ridesOf(commits, "lone").as, "alone");
+  assert.equal(ridesOf(commits, "unknown").as, "alone");
+});
+
+test("where each environment stands from a commit: its latest deploy there, and whether it runs it now", () => {
+  const envs = environmentsOf({
+    ...c("s", "shipped"),
+    environments: [{ environment: "production", production: true }],
+    deployments: [
+      { environment: "production", production: true, state: "success", description: "promoted", at: 300 },
+      { environment: "staging", production: false, state: "failure", description: "first try", at: 100 },
+      { environment: "staging", production: false, state: "success", description: "synced", at: 200 },
+    ],
+  });
+  assert.deepEqual(envs, [
+    { environment: "staging", production: false, state: "passed", description: "synced", at: 200, now: false },
+    { environment: "production", production: true, state: "passed", description: "promoted", at: 300, now: true },
+  ]);
 });

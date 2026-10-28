@@ -361,6 +361,24 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
                 },
               ]
             : [],
+          // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
+          runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
+          // A commit in production went through staging, built once: its deploys and the one image they run.
+          ...(row.environments?.some((e) => e.production)
+            ? {
+                build: {
+                  platforms: [
+                    { name: "linux/amd64", state: "passed" as const },
+                    { name: "macos/arm64", state: "passed" as const },
+                  ],
+                  image: { state: "passed" as const, digest: `sha256:${row.sha}${row.sha}`.slice(0, 71) },
+                },
+                deployments: [
+                  { environment: "staging", production: false, state: "success", description: "synced and healthy", at: row.at + 600 },
+                  { environment: "production", production: true, state: "success", description: "promoted from staging", at: row.at + 1800 },
+                ],
+              }
+            : {}),
         }
       : null;
     const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
