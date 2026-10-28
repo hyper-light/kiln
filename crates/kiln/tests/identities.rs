@@ -1006,8 +1006,9 @@ fn w27_r02_no_step_reads_the_legs_key() -> anyhow::Result<()> {
 
 /// W27-R01 (identities plan step 7): the server and CD sign as themselves. Their certificates verify
 /// to kiln's root, as the server and as CD for the server; their keys are made in the server's data,
-/// each in its own 0600 file and nowhere else there, and kept across a restart. One revoked is
-/// issued anew at once: a certificate for the same key, or for a new key when the key was revoked.
+/// each in its own 0600 file and nowhere else there, and kept across a restart. One revoked, by its
+/// certificate or by its key (a revocation takes the key with it), is replaced at once: a new key,
+/// in its own file, and a certificate for it.
 #[test]
 fn w27_r01_server_and_cd() -> anyhow::Result<()> {
     use kiln_ci::identity::chain::{Actor, Identity, verify};
@@ -1047,12 +1048,12 @@ fn w27_r01_server_and_cd() -> anyhow::Result<()> {
     s.restart()?;
     assert_eq!(identities(&s, "server")?.len(), 1);
     assert_eq!(identities(&s, "cd")?.len(), 1);
-    // The server's certificate revoked: another for the same key, at once, verifying as before.
+    // The server's certificate revoked: a new key and a certificate for it, at once, verifying as before.
     let (key, was) = (read("server-signing.key")?, kiln::pki::fingerprints(&read("server-signing.pem")?)?);
     revoke(&s, &serde_json::json!({ "serial": was.serial, "reason": "w27 step 7: a certificate revoked" }))?;
     let now = kiln::pki::fingerprints(&read("server-signing.pem")?)?;
-    assert!(now.serial != was.serial && now.key == was.key, "a new certificate for the same key: {was:?} then {now:?}");
-    assert_eq!(read("server-signing.key")?, key);
+    assert!(now.serial != was.serial && now.key != was.key && read("server-signing.key")? != key, "a new key: {was:?} then {now:?}");
+    kept("server-signing.key")?;
     assert_eq!(verified(&s, &pki, "server-signing.pem")?.identity, server_of);
     // CD's key revoked: a new key, in its own 0600 file, and a certificate for it.
     let (key, was) = (read("cd-signing.key")?, kiln::pki::fingerprints(&read("cd-signing.pem")?)?);

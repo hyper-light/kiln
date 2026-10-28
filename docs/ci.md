@@ -8786,10 +8786,11 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   `<data>/pki`, each in its own 0600 file (`server-signing.key`, `cd-signing.key`), apart from the
   TLS leaf, and certified for 90 days (`kiln://<org>/server`; CD's `kiln://<org>/server/cd`, acting
   for the server). The server looks at them as it starts, every 6 hours while it runs and after any
-  revocation: one with less than 30 days left, or revoked, is issued anew at once, and a key revoked
-  is replaced by a new one. Test: `w27_r01_server_and_cd` (each verifies to kiln's root, as the
-  server and as CD for the server; each key in its file and nowhere else in the server's data; a
-  certificate revoked, then a key, each issued anew).
+  revocation: one with less than 30 days left is renewed, and one revoked is replaced at once, a new
+  key and a certificate for it (a revocation takes the certificate's key with it). Test:
+  `w27_r01_server_and_cd` (each verifies to kiln's root, as the server and as CD for the server;
+  each key in its file and nowhere else in the server's data; the server's certificate revoked,
+  then CD's key, each replaced).
 - *People.* A person's key is made on their own device by `kiln login`, in their config
   (`~/.config/kiln/identity.key`, 0600), after they sign in there: with the sign-in link they were
   given (`--link`), their name and password (`--name`), or a personal access token (`--token`; with a

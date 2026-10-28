@@ -30,7 +30,8 @@ pub const OWN_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 36
 /// (0600, never sent), apart from the server's TLS leaf; certified by kiln's CA and recorded.
 /// Looked at as the server starts, every [`OWN_EVERY`] while it runs and after any revocation
 /// (`POST /api/identities/revoke`): a certificate missing, expiring or not for its key is issued
-/// anew, as is one revoked; a key revoked (lost) is replaced by a new one, and that certified.
+/// anew; one revoked is replaced, key and all, as a revocation takes the certificate's key with it
+/// (one revoked by its serial alone, as a superseded one is, is issued anew for the same key).
 pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Result<()> {
     let revoked = revocations(store).await?;
     for (kind, actor) in [("server", Actor::Server), ("cd", Actor::Cd)] {
