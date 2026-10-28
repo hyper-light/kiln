@@ -25,7 +25,6 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import { atOf, doingOf, findAgents } from "./broadcast";
-import { MODES, SendModes } from "./composer";
 import { useAttachments } from "./controls";
 import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
@@ -781,12 +780,6 @@ export function NewAgent({
               </button>
             </Tip>
             <MicButton field={field} setText={(t) => onText(t)} onNote={setNote} />
-            {/* The same bar as messaging agents, so nothing moves as the composer turns: a new agent takes its first message at once. */}
-            <Tip content="A new agent takes its first message at once: Queue, Steer and Now are for agents at work">
-              <fieldset className="mc-modes" disabled>
-                <SendModes modes={MODES} mode="queue" onMode={() => undefined} />
-              </fieldset>
-            </Tip>
             <span className="cp-gap" />
             <React.Suspense
               fallback={

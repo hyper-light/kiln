@@ -1341,19 +1341,6 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
     gap: 0 18px;
   }
 }
-/* Queue · Steer · Now when starting an agent: shown as messaging shows them, not in play. */
-.mc-modes {
-  display: contents;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  min-width: 0;
-}
-.mc-modes button,
-.mc-modes .cp-mode-pick {
-  opacity: 0.45;
-  cursor: default;
-}
 /* The field is the agent composer's own height from the start, so nothing moves as it's used. */
 .mc .hx-compose-input {
   min-height: 46px;

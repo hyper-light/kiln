@@ -213,8 +213,7 @@ server says, and counts every session it has, ended ones included, until it's up
   Each goes to every agent it's for at once; a line says how it went (done, skipped, failed) and
   opens to each agent's outcome and why. Those all ended leave the selection.
 - **The composer.** At the top of the page, on a desktop and a phone alike, whole and the agent
-  page's composer's size from the start, Queue · Steer · Now in its bar in both of its turns (when
-  starting an agent they're shown but not in play: its first message goes at once). There is no New agents button and no dialog: with nothing selected it starts an
+  page's composer's size from the start. There is no New agents button and no dialog: with nothing selected it starts an
   agent, its words the agent's first message. Above the box is the agent page's own line,
   permissions · model · effort, and the bolt where the model goes faster (the speeds each model
   runs at come with the machine's models, `KindInfo.models[].speeds`; a machine whose runner
