@@ -467,9 +467,10 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
               <span className="ms-to-all">{held ? `${n} of ${total} agents` : reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
             )}
             {onClear && picked.length > 0 && (
-              <button type="button" className="ms-link mc-clear" onClick={onClear}>
+              <Button size="xs" variant="secondary" className="mc-clear" onClick={onClear}>
+                <X aria-hidden="true" />
                 Clear
-              </button>
+              </Button>
             )}
           </div>
           {attachments.chips}

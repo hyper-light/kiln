@@ -770,40 +770,45 @@ a.ms-why:hover {
   font-size: 12.5px;
   cursor: pointer;
 }
-/* What to do with the agents selected (bulk.tsx): the same actions, in the same places, while
-   selecting, in the head's own voice (its links: one size, one colour, End's a warning's), at the end
-   of the head's line, or, narrow, a line of their own, edge to edge with the line above and there from
-   the moment selecting starts; what's asked, More, and how it went each take a line across the head. */
+/* What to do with the agents selected (bulk.tsx): Actions and Clear, the head's pills, at the end of
+   its one line from the moment selecting starts; what's asked and how it went each take a line under it. */
 .ms-bulk {
   display: flex;
   align-items: center;
-  gap: 22px;
+  gap: 8px;
   margin-left: auto;
 }
-.ms-bulk-act {
-  min-height: 40px;
+/* The Actions menu: a row's menu, a little wider for its words, each action with its icon. */
+.ms-bulk-menu {
+  width: 284px;
 }
-.ms-link.ms-bulk-act:disabled {
+.ms-bulk-menu .menu-item[data-disabled] {
   color: #5f626b;
   cursor: default;
 }
-.ms-bulk-more .ms-chev {
-  transition: transform 0.2s;
+.ms-bulk-menu .menu-item[data-disabled]:hover {
+  background: none;
 }
-/* How many are selected, its digits one width and its room as wide as it can get: nothing beside it moves as more are picked. */
-.ms-n {
-  display: inline-block;
-  text-align: right;
+.ms-bulk-menu .menu-item > svg,
+.ms-menu-mark {
+  flex: none;
+  width: 14px;
+  height: 14px;
 }
-.ms-n,
+.ms-menu-mark {
+  display: inline-grid;
+  place-items: center;
+}
+/* How many of those selected it's for, when not all. */
+.ms-menu-n {
+  color: #8f939e;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
 .ms-count {
   font-variant-numeric: tabular-nums;
 }
-.ms-bulk-more[aria-expanded="true"] .ms-chev {
-  transform: rotate(180deg);
-}
 .ms-bulk-ask,
-.ms-bulk-row,
 .ms-bulk-said {
   display: flex;
   flex: 1 1 100%;
@@ -812,10 +817,6 @@ a.ms-why:hover {
   gap: 8px 10px;
   min-width: 0;
   padding: 0 0 10px;
-}
-/* More: its actions the bar's own, one gap between them. */
-.ms-bulk-row {
-  gap: 0 22px;
 }
 /* How it went: a long line wraps beside its ×, from the left. */
 .ms-bulk-said {
@@ -874,25 +875,8 @@ a.ms-why:hover {
 .ms-msg-outcomes > li[data-result="done"] .ms-msg-o-result {
   color: #a8c9bc;
 }
-/* Too narrow for the head's line and the actions together: they take a line of their own, spread
-   from the head's left edge to its right, as the line above is. */
-@container (max-width: 660px) {
-  .ms-bulk {
-    flex: 1 1 100%;
-    justify-content: space-between;
-    gap: 12px;
-    margin-left: 0;
-  }
-}
-/* By touch with room for both, the actions follow Select all and Done along the one line. */
-@container (min-width: 661px) {
-  .ms-listhead[data-selecting] .ms-bulk {
-    margin-left: 28px;
-  }
-}
 @media (pointer: coarse) {
-  .ms-bulk-ask .hx-pick select,
-  .ms-bulk-row .hx-pick select {
+  .ms-bulk-ask .hx-pick select {
     font-size: 16px;
   }
 }
@@ -1006,12 +990,23 @@ a.ms-why:hover {
     user-select: none;
     -webkit-user-select: none;
   }
+  /* The head's left edge where the rows' is, and its ring as far from the count as theirs from their
+     names: the ring that picks them all sits over theirs. */
+  .ms-listhead {
+    padding-left: 6px;
+  }
+  .ms-all {
+    gap: 0;
+  }
   @container (max-width: 760px) {
     .ms-row:not(.ms-found-row) {
       grid-template-columns: minmax(0, 1fr) auto;
       grid-template-areas:
         "main main"
         "meta actions";
+      padding-left: 12px;
+    }
+    .ms-listhead {
       padding-left: 12px;
     }
   }
@@ -1034,20 +1029,8 @@ a.ms-why:hover {
 .ms-listhead[data-selecting] .ms-count {
   color: #eceef2;
 }
-.ms-picks {
-  display: inline-flex;
-  align-items: center;
-  gap: 22px;
-  min-height: 40px;
-  margin-left: auto;
-}
 .ms-select {
-  min-height: 40px;
   margin-left: auto;
-}
-.ms-done {
-  color: #eceef2;
-  font-weight: 450;
 }
 /* Picking: an open ring beside each name, filled and ticked when it's picked. It's always there, no
    wider than nothing, and slides open as picking starts, the name easing aside, and shut at Done. */
@@ -1095,12 +1078,53 @@ a.ms-why:hover {
     display: none;
   }
 }
+/* By touch, the head's ring that picks them all (or none): a real checkbox drawn as the rows' ring,
+   sliding in with theirs, ticked when all are picked and a dash when some are. */
+.ms-pick-all {
+  flex: none;
+  box-sizing: border-box;
+  width: 0;
+  height: 18px;
+  margin: 0;
+  border: 0 solid rgb(255 255 255 / 34%);
+  border-radius: 50%;
+  appearance: none;
+  opacity: 0;
+  cursor: pointer;
+  transition:
+    width 0.16s ease,
+    margin-right 0.16s ease,
+    opacity 0.16s ease,
+    background-color 0.12s ease,
+    border-color 0.12s ease;
+}
+.ms-pick-all[data-on] {
+  width: 18px;
+  margin-right: 10px;
+  border-width: 1.5px;
+  opacity: 1;
+}
+.ms-pick-all:checked,
+.ms-pick-all:indeterminate {
+  border-color: #e7e9ee;
+  background: #e7e9ee
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.4l3 3 6-6.4' fill='none' stroke='%2308090a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 12px no-repeat;
+}
+.ms-pick-all:indeterminate {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8h8' fill='none' stroke='%2308090a' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.ms-pick-all:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 80%);
+  outline-offset: 2px;
+}
 /* Swiped far enough: let go and it's picked (or put back). */
 .ms-row[data-swipe="ready"] {
   box-shadow: inset 3px 0 0 #e7e9ee;
 }
 html[data-motion="paused"] .ms-pick,
-html[data-motion="paused"] .ms-pick::before {
+html[data-motion="paused"] .ms-pick::before,
+html[data-motion="paused"] .ms-pick-all {
   transition: none;
 }
 .ms-select + .ms-msg-open {

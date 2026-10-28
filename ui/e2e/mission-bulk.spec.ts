@@ -1,12 +1,14 @@
 /**
  * What to do with the agents selected in Mission control (docs/agents.md, "Mission control"), in the
  * production build against the mock: selected (checkboxes with a mouse; Select, then a tap on each,
- * by touch), the list's head offers one agent's own actions, the same buttons in the same places from
- * the moment selecting starts, turned off where none of them takes one: Resume and Pause for goals
- * paused and running, Move to… (a machine that takes them all, or some, saying why the rest stay),
- * End… (asked in the line, with the agents they started), and under More stopping their turns. Each
- * goes to each agent, a line says how it went and opens to each one's outcome. Picking more moves
- * nothing (the list, the head, the buttons), and nothing scrolls sideways. On a desktop and a phone.
+ * by touch), the list's head is one line from the moment selecting starts: a ring (or checkbox) that
+ * picks them all, how many, the Actions menu and Clear. The menu has one agent's own actions, turned
+ * off where none of them takes one and saying how many each is for when not all: Resume and Pause for
+ * goals paused and running, Move to… (a machine that takes them all, or some, saying why the rest
+ * stay), Stop their turns, End… (asked in the line, with the agents they started). Each goes to each
+ * agent, a line says how it went and opens to each one's outcome. Clear, or putting back the last one,
+ * ends selecting. Picking more moves nothing (the list, the head, its buttons, the composer's one-line
+ * To line), and nothing scrolls sideways. On a desktop and a phone.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -15,13 +17,14 @@ const REAL = !!process.env.E2E_BASE_URL;
 
 const touchScreen = (page: Page) => page.evaluate(() => matchMedia("(pointer: coarse)").matches);
 const rowOf = (page: Page, id: string) => page.locator(`li.ms-row[data-agent="${id}"]`);
+const head = (page: Page) => page.locator(".ms-listhead");
 
 /** Selects these agents' rows as the page lets one: by touch, Select, then a tap on each; with a mouse, their checkboxes. */
 async function pick(page: Page, ...ids: string[]) {
   await expect(page.locator("li.ms-row").first()).toBeVisible();
   const touch = await touchScreen(page);
   if (touch) {
-    const select = page.locator(".ms-listhead").getByRole("button", { name: "Select", exact: true });
+    const select = head(page).getByRole("button", { name: "Select", exact: true });
     if (await select.isVisible()) await select.tap();
   }
   for (const id of ids) {
@@ -32,8 +35,27 @@ async function pick(page: Page, ...ids: string[]) {
   }
 }
 
+/** Puts one back as the page lets one: a tap by touch, its checkbox with a mouse. */
+async function putBack(page: Page, id: string) {
+  const row = rowOf(page, id);
+  if (await touchScreen(page)) await row.locator(".ms-main").tap();
+  else await row.getByRole("checkbox", { name: /^Select / }).uncheck();
+  await expect(row).not.toHaveAttribute("data-selected", "true");
+}
+
 const bulk = (page: Page, n: number) => page.getByRole("group", { name: `What to do with the ${n} selected agent${n === 1 ? "" : "s"}` });
 const said = (page: Page) => page.locator(".ms-bulk-said");
+/** An action in the Actions menu (its name ends with how many it's for, when not all). */
+const action = (page: Page, name: string) => page.getByRole("menuitem", { name: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`) });
+
+/** Opens the Actions menu, does `go` with it, and leaves it shut. */
+async function inMenu(page: Page, go: () => Promise<void>) {
+  await head(page).getByRole("button", { name: "Actions" }).click();
+  await expect(page.getByRole("menu")).toBeVisible();
+  await go();
+  if (await page.getByRole("menu").isVisible()) await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toHaveCount(0);
+}
 
 /** Nothing on the page, nor in the list's head, wider than the page. */
 async function nothingSideways(page: Page) {
@@ -47,9 +69,8 @@ async function nothingSideways(page: Page) {
 
 /**
  * Where things are: a row of the list from the page's top (scrolling doesn't count, moving does), how
- * big the list's head and the composer's To line are, and Clear selection and each button from the
- * head's top (the head is held in view by touch while selecting, so where it is on the page goes with
- * the scroll).
+ * big the list's head and the composer's To line are, and each of the head's buttons from its top (the
+ * head is held in view by touch while selecting, so where it is on the page goes with the scroll).
  */
 function places(page: Page, row: string) {
   return page.evaluate((row) => {
@@ -68,7 +89,6 @@ function places(page: Page, row: string) {
       row: r ? `${Math.round(r.x)},${Math.round(r.y + scrollY)}` : null,
       head: h ? `${Math.round(h.width)}x${Math.round(h.height)}` : null,
       to: to ? `${Math.round(to.width)}x${Math.round(to.height)}` : null,
-      clear: inHead(document.querySelector(".ms-all + .ms-link")),
       buttons: [...document.querySelectorAll(".ms-bulk > *")].map((b) => `${(b.textContent ?? "").trim()} ${inHead(b)}`),
     };
   }, row);
@@ -91,29 +111,34 @@ async function settled(page: Page, row: string) {
   return places(page, row);
 }
 
-test("picking agents moves nothing: the list stays where it is, the buttons keep their places and widths", async ({ page }, info) => {
+test("picking agents moves nothing: the list stays where it is, the head keeps its one line and its buttons their places", async ({ page }, info) => {
   test.skip(REAL, "the mock's agents");
   await page.goto("/agents");
   await expect(page.locator("li.ms-row").first()).toBeVisible();
   const touch = await touchScreen(page);
-  // By touch the buttons are there from Select on, before any agent is picked (the list makes room for them once).
-  if (touch) await page.locator(".ms-listhead").getByRole("button", { name: "Select", exact: true }).tap();
+  // By touch the line is there from Select on, before any agent is picked (and the head no taller for it).
   const watched = "fan-s3";
+  const resting = await settled(page, watched);
+  if (touch) await head(page).getByRole("button", { name: "Select", exact: true }).tap();
   const before = await settled(page, watched);
   if (touch) {
-    expect(before.buttons.map((b) => b.split(" ")[0])).toEqual(["Resume", "Pause", "Move", "End…", "More"]);
-    for (const name of ["Resume", "Pause", "Move to…", "End…", "More"]) await expect(page.locator(".ms-bulk").getByRole("button", { name, exact: true })).toBeDisabled();
+    expect(before.head, "starting to select changed the list's head").toBe(resting.head);
+    expect(before.row, "starting to select moved the list").toBe(resting.row);
+    expect(before.buttons.map((b) => b.split(" ")[0])).toEqual(["Actions", "Clear"]);
+    await expect(head(page).getByRole("button", { name: "Actions" })).toBeDisabled();
   }
 
   // "Release prep": its goals running (read a moment after it's picked), on the kiln server.
   await pick(page, "fam-orch");
   const first = await places(page, watched);
-  // The composer turned to messaging it and the buttons came: the list didn't move.
+  // The composer turned to messaging it and the line came: the list didn't move.
   expect(first.row, "picking the first agent moved the list").toBe(before.row);
   expect(first.head, "picking the first agent changed the list's head").toBe(before.head);
   if (touch) expect(first.buttons).toEqual(before.buttons);
-  await expect(page.locator(".ms-bulk").getByRole("button", { name: "Pause", exact: true })).toBeEnabled();
-  await expect(page.locator(".ms-bulk").getByRole("button", { name: "Move to…", exact: true })).toBeDisabled();
+  await inMenu(page, async () => {
+    await expect(action(page, "Pause")).toBeEnabled();
+    await expect(action(page, "Move to…")).toBeDisabled();
+  });
   expect(await settled(page, watched), "the goal stacks coming in moved something").toEqual(first);
 
   // Into two digits, agents at work and ready, on the server and on runners (none of those the last test ends).
@@ -121,19 +146,37 @@ test("picking agents moves nothing: the list stays where it is, the buttons keep
     await pick(page, id);
     expect(await places(page, watched), `picking ${id} moved something`).toEqual(first);
   }
-  await expect(page.locator(".ms-bulk").getByRole("button", { name: "Move to…", exact: true })).toBeEnabled();
+  await inMenu(page, async () => {
+    await expect(action(page, "Move to…")).toBeEnabled();
+  });
   await nothingSideways(page);
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: info.outputPath(`mission-bulk-steady-${info.project.name}.png`) });
 
   // Putting one back moves nothing either.
-  if (touch) await rowOf(page, "att-ci").locator(".ms-main").tap();
-  else
-    await rowOf(page, "att-ci")
-      .getByRole("checkbox", { name: /^Select / })
-      .uncheck();
-  await expect(rowOf(page, "att-ci")).not.toHaveAttribute("data-selected", "true");
+  await putBack(page, "att-ci");
   expect(await places(page, watched)).toEqual(first);
+});
+
+test("Clear, or putting back the last one picked, ends selecting", async ({ page }) => {
+  test.skip(REAL, "the mock's agents");
+  await page.goto("/agents");
+  const touch = await touchScreen(page);
+  await pick(page, "fam-orch", "att-ci");
+  await expect(bulk(page, 2)).toBeVisible();
+  await bulk(page, 2).getByRole("button", { name: "Clear" }).click();
+  await expect(page.getByRole("group", { name: /^What to do with the/ })).toHaveCount(0);
+  await expect(page.locator("li.ms-row[data-selected]")).toHaveCount(0);
+  if (touch) await expect(head(page).getByRole("button", { name: "Select", exact: true })).toBeVisible();
+
+  await pick(page, "att-ci");
+  await putBack(page, "att-ci");
+  await expect(page.getByRole("group", { name: /^What to do with the/ })).toHaveCount(0);
+  if (touch) {
+    await expect(head(page).getByRole("button", { name: "Select", exact: true })).toBeVisible();
+    // Selecting over, the rows' rings are put away with it.
+    await expect(page.locator(".ms-pick[data-on]")).toHaveCount(0);
+  }
 });
 
 test("selected agents are stopped and moved at once, each as its own would be, and how it went opens to each", async ({ page }, info) => {
@@ -141,27 +184,21 @@ test("selected agents are stopped and moved at once, each as its own would be, a
   await page.goto("/agents");
   // "Fix the flaky retry test" works (Codex, on metal-ryzen-01); "Update the docs" is ready (Claude Code, on metal-ryzen-02).
   await pick(page, "fam-tests", "fam-docs");
-  const bar = bulk(page, 2);
-  await expect(bar).toBeVisible();
-  await expect(bar.getByRole("button", { name: "Move to…", exact: true })).toBeEnabled();
-  await expect(bar.getByRole("button", { name: "End…", exact: true })).toBeEnabled();
-  // Neither has goals to pause or resume: those are there, turned off.
-  await expect(bar.getByRole("button", { name: "Resume", exact: true })).toBeDisabled();
-  await expect(bar.getByRole("button", { name: "Pause", exact: true })).toBeDisabled();
-
-  // Stopping their turns is under More, for the one working; neither has stopped, to restart or remove.
-  await bar.getByRole("button", { name: "More", exact: true }).click();
-  const more = page.getByRole("group", { name: "More for the selected agents" });
-  await expect(more.getByRole("button", { name: "Restart", exact: true })).toBeDisabled();
-  await expect(more.getByRole("button", { name: "Remove", exact: true })).toBeDisabled();
-  await more.getByRole("button", { name: "Stop their turns", exact: true }).click();
+  await expect(bulk(page, 2)).toBeVisible();
+  await inMenu(page, async () => {
+    await expect(action(page, "Move to…")).toBeEnabled();
+    await expect(action(page, "End…")).toBeEnabled();
+    // Neither has goals to pause or resume, nor has stopped, to restart or remove: those are there, turned off.
+    for (const name of ["Resume", "Pause", "Restart", "Remove"]) await expect(action(page, name)).toBeDisabled();
+    // Stopping their turns is for the one working.
+    await expect(action(page, "Stop their turns")).toHaveAccessibleName(/1 of 2$/);
+    await action(page, "Stop their turns").click();
+  });
   await expect(said(page)).toContainText("Stopped the turns of 1 agent");
   const broadcasts = async () => ((await (await page.request.get("/api/mock/broadcasts")).json()) as { broadcasts: unknown[] }).broadcasts;
   await expect.poll(broadcasts).toContainEqual(expect.objectContaining({ to: { ids: ["fam-tests"] }, command: { type: "interrupt" } }));
-  await bar.getByRole("button", { name: "More", exact: true }).click();
-  await expect(more).toHaveCount(0);
 
-  await bar.getByRole("button", { name: "Move to…", exact: true }).click();
+  await inMenu(page, () => action(page, "Move to…").click());
   const ask = page.getByRole("group", { name: "Move the selected agents" });
   const to = ask.getByRole("combobox", { name: "The machine they move to" });
   // A machine that takes only one says why the other stays.
@@ -190,7 +227,7 @@ test("selected agents are stopped and moved at once, each as its own would be, a
   await expect(page.locator(".ms-bulk-outcomes li[data-result='done']")).toHaveCount(2);
 
   // Ending them is asked in the line first; neither started agents of its own.
-  await bar.getByRole("button", { name: "End…", exact: true }).click();
+  await inMenu(page, () => action(page, "End…").click());
   const end = page.getByRole("group", { name: "End the selected agents" });
   await expect(end).toContainText("End 2 agents? Their processes stop and they leave the board. Their changes stay on disk.");
   await expect(end.getByRole("checkbox")).toHaveCount(0);
@@ -206,16 +243,18 @@ test("a selected agent's goals are paused and resumed, and ending it offers the 
   await page.goto("/agents");
   // "Release prep" runs its goals, and started three agents that still run.
   await pick(page, "fam-orch");
-  const bar = bulk(page, 1);
-  await bar.getByRole("button", { name: "Pause", exact: true }).click();
+  await expect(bulk(page, 1)).toBeVisible();
+  await inMenu(page, () => action(page, "Pause").click());
   await expect(said(page)).toContainText("Paused the goals of 1 agent: no next goal starts until you resume them");
-  await bar.getByRole("button", { name: "Resume", exact: true }).click();
+  await inMenu(page, () => action(page, "Resume").click());
   await expect(said(page)).toContainText("Resumed 1 agent");
-  await expect(bar.getByRole("button", { name: "Pause", exact: true })).toBeEnabled();
-  // It runs on the kiln server, where it stays.
-  await expect(bar.getByRole("button", { name: "Move to…", exact: true })).toBeDisabled();
+  await inMenu(page, async () => {
+    await expect(action(page, "Pause")).toBeEnabled();
+    // It runs on the kiln server, where it stays.
+    await expect(action(page, "Move to…")).toBeDisabled();
+  });
 
-  await bar.getByRole("button", { name: "End…", exact: true }).click();
+  await inMenu(page, () => action(page, "End…").click());
   const end = page.getByRole("group", { name: "End the selected agents" });
   const kids = end.getByRole("checkbox", { name: /^End the 3 agents it started too/ });
   await expect(kids).toBeChecked();
@@ -231,7 +270,7 @@ test("ending selected agents ends each, and they leave the list and the selectio
   await page.goto("/agents");
   // The plan run's two steps' agents: "Step 1: Freeze main" and "Step 2: Run the full bench".
   await pick(page, "run-freeze", "run-bench");
-  await bulk(page, 2).getByRole("button", { name: "End…", exact: true }).click();
+  await inMenu(page, () => action(page, "End…").click());
   await page.getByRole("group", { name: "End the selected agents" }).getByRole("button", { name: "End 2", exact: true }).click();
   await expect(said(page)).toContainText("Ended 2 agents");
   await expect(page.locator('li.ms-row[data-agent="run-freeze"], li.ms-row[data-agent="run-bench"]')).toHaveCount(0);
