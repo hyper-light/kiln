@@ -47,7 +47,7 @@ export function HostPullsPage() {
   return (
     <div className="container-console page rv-page">
       <title>{`${repo} · Pull requests · kiln`}</title>
-      <PageIntro index={4} label={`Repositories / Review / ${repo}`} title="Pull requests." lead="Open on the repository's host, reviewed from here." />
+      <PageIntro index={3} label={`Repositories / Review / ${repo}`} title="Pull requests." lead="Open on the repository's host, reviewed from here." />
       <Loadable label="Loading its pull requests" fallback={<Loading label="Loading its pull requests" block />}>
         <PullList repo={repo} />
       </Loadable>

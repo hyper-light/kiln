@@ -18,7 +18,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
+import { EmptyState, FilterBar, PageIntro, SelectField } from "@/components/ui/misc";
 import { errorMessage } from "@/lib/hooks";
 import { useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
@@ -27,6 +27,7 @@ import { environmentsHref } from "@/views/environments/shared";
 import { whatDiffers } from "./model";
 import { HEALTH_TONE, HealthPair, StatePair, SYNC_TONE, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
 import "./deployments.css";
+import { ShipViews } from "@/views/ship/views";
 
 const ROW = 68;
 const PAGE = 500;
@@ -141,7 +142,7 @@ export default function Deployments() {
     <div className="container-console page cd-page">
       <title>Deployments · kiln</title>
       <PageIntro
-        index={3}
+        index={2}
         label="Deployments"
         title="Deployments."
         lead="What git says, and what runs: every app's sync and health, live."
@@ -162,6 +163,7 @@ export default function Deployments() {
           </>
         }
       />
+      <ShipViews />
       <Loadable label="the apps" fallback={<DeploymentsHold />}>
         <DeploymentsBody />
       </Loadable>
@@ -352,19 +354,10 @@ function DeploymentsBody() {
   return (
     <>
       <Summary s={summary} />
-      <div className="cd-toolbar">
-        <FacetBox
-          label="Filter apps"
-          placeholder="Filter by name, sync, health, project, cluster…"
-          query={query}
-          onQuery={onQuery}
-          facets={groups}
-          chosen={choice}
-          onChosen={setChoice}
-          className="cd-filter"
-        />
-        <SelectField label="Sort apps" hideLabel value={sort} onChange={setSort} options={SORTS} className="cd-sort" />
-      </div>
+      <FilterBar>
+        <FacetBox label="Filter apps" placeholder="Filter by name, sync, health, project, cluster…" query={query} onQuery={onQuery} facets={groups} chosen={choice} onChosen={setChoice} />
+        <SelectField label="Sort apps" hideLabel value={sort} onChange={setSort} options={SORTS} />
+      </FilterBar>
 
       <div className="cd-list-head">
         <label className="cd-pick">
@@ -449,10 +442,10 @@ function DeploymentsHold() {
       <p className="cd-summary-line" aria-hidden="true">
         <span className="cd-count">{" "}</span>
       </p>
-      <div className="cd-toolbar">
-        <FacetBox label="Filter apps" placeholder="Filter by name, sync, health, project, cluster…" facets={[]} chosen={{}} onChosen={noop} className="cd-filter" />
-        <SelectField label="Sort apps" hideLabel value={sort} onChange={noop} options={SORTS} className="cd-sort" />
-      </div>
+      <FilterBar>
+        <FacetBox label="Filter apps" placeholder="Filter by name, sync, health, project, cluster…" facets={[]} chosen={{}} onChosen={noop} />
+        <SelectField label="Sort apps" hideLabel value={sort} onChange={noop} options={SORTS} />
+      </FilterBar>
       <div className="cd-list-head">
         <label className="cd-pick">
           <input type="checkbox" className="check" disabled aria-label="Select every app shown" />

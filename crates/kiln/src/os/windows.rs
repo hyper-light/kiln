@@ -18,6 +18,12 @@ pub fn elevated() -> bool {
     super::win32::elevated()
 }
 
+/// Whether standard error's console takes VT escapes, turned on when it can (Windows 10 and
+/// later): `kiln setup` draws in colour only where it does.
+pub fn console_takes_escapes() -> bool {
+    super::win32::console_vt()
+}
+
 /// Run `program` with `parameters` (one command line) as an administrator, its window hidden,
 /// and wait up to `timeout` for its exit code. Windows asks the person at the desktop first
 /// (UAC); an error of kind `PermissionDenied` means they said no.

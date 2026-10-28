@@ -377,7 +377,12 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
+    // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
+    r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
+    r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("DELETE", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
     r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
     r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
@@ -394,6 +399,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/review", "diffs.review", At::Diff(2)),
     r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
+    r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/reclaim", "diffs.submit", At::Diff(2)),
@@ -446,6 +454,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/legs/*/logs", "logs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs/*", "logs.read", At::Job(3)),
     r("GET", "/api/ci/logs/search", "logs.read", At::RepoQuery),
+    // A finished job (a leg, a pipeline's job) again, here or elsewhere (W05-R28).
+    r("POST", "/api/ci/legs/*/retry", "runs.rerun", At::Job(3)),
     // A terminal into a leg, and keeping or releasing a failed one (W17); on the `host` executor
     // the terminal also needs `runners.terminal` on its runner, which the handler checks.
     r("GET", "/api/ci/legs/*/terminal", "runs.debug", At::Job(3)),
@@ -493,6 +503,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/ci/environments", "environments.manage", At::RepoQuery),
     any("/api/ci/environments/**", "environments.manage", At::RepoQuery),
     r("POST", "/api/ci/routing/explain", "runs.read", At::Anywhere),
+    r("GET", "/api/ci/work/reap/policies", "runs.read", At::Anywhere),
+    // W24-R31: a scope's reaper policy, changed with caches.write there (a session's: the server's).
+    r("PUT", "/api/ci/work/reap/policies", "caches.write", At::ScopeQuery),
     any("/api/ci/routing/rules", "routing.manage", At::ScopeQuery),
     r("GET", "/api/ci/integrations/kinds", "runs.read", At::Anywhere),
     any("/api/ci/integrations", "integrations.manage", At::Server),
@@ -509,6 +522,7 @@ pub static ROUTES: &[Rule] = &[
     // Deploying by API (docs/deploy-api.md §15): releases are deploys; apps, environments and
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
+    r("GET", "/api/ship/**", "runs.read", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),
@@ -525,8 +539,18 @@ pub static ROUTES: &[Rule] = &[
     // Runners and machines. The list is of the runners the caller may read (`crate::doctor::readable`).
     r("GET", "/api/agents", "runners.read", At::Anywhere),
     r("GET", "/api/reach/runners", "runners.read", At::Server),
+    // The copies of runners' trees other runners keep (docs/reach.md §5.1): read with the runners,
+    // a runner's rules and asking it to let go now its managers'; every runner's rules and a
+    // repository's are the server's settings (unnamed).
+    r("GET", "/api/reach/keep", "runners.read", At::Server),
+    r("PUT", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
+    r("DELETE", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
+    r("POST", "/api/reach/keep/runners/*/now", "runners.manage", At::Runner(4)),
+    r("POST", "/api/reach/keep/now", "runners.manage", At::Server),
     r("GET", "/api/front-doors", "runners.read", At::Server),
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
+    // How many agent sessions it runs at once: read with the runner, set by those who manage it.
+    r("GET", "/api/runners/*/agent-limit", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
     r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
     r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),

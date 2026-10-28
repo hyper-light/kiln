@@ -28,9 +28,9 @@ restarting their processes. Other ACP agents keep steering queued.
 Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
 in a temporary configuration that keeps its native default model, with imports, MCP servers and
 automatic updates off. It sends no prompts. Each model's effort choices are read from the agent
-and kept in the existing model cache for the start dialog. Shared effort choices are offered only
+and kept in the existing model cache for Mission control's composer, which starts agents. Shared effort choices are offered only
 when every listed model
-supports them. The start dialog uses the native default model's levels before a model is chosen,
+supports them. The composer uses the native default model's levels before a model is chosen,
 then the chosen model's own levels. Resuming keeps the conversation's model and sends a selected
 effort only if that model supports it. The native permission modes are available before discovery
 finishes.
@@ -76,9 +76,21 @@ again on the same conversation. A new model, effort or mode is a flag, so it sta
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
 
+An agent goes on in any other of these harnesses, its conversation carried over: picking another
+harness's model in the head's line (`set_model` with `kind`; a harness that lists no models yet
+offers its own default) switches it once the turn under way ends. The conversation is read from
+Claude Code's transcript or Codex's rollout where it ran there, else from kiln's timeline with the
+plan as it stands, and only what the model still sees goes (`harness/handoff.rs`). Claude Code
+takes it as a transcript it resumes and Codex as its new thread's history, each call as its own
+where it has one; Devin, the other ACP agents and Antigravity take it in words, given once with the
+first message they get (a restart before that gives it then), in less room. The permission mode
+goes at the same latitude, never wider (an ACP agent that names its modes only once started gets
+kiln's Ask, or Bypass from a mode that skipped every check), and the effort as near as the model
+takes. The timeline marks the line between the two.
+
 ## Where a harness is found
 
-A machine offers a harness (`/api/harness/kinds`, the machines the new-agent dialog lists) when its
+A machine offers a harness (`/api/harness/kinds`, the machines Mission control's composer lists) when its
 program is on the runner's PATH or on the PATH a login shell of the machine's user has, asked as
 reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept ten minutes). A runner's
 service keeps the PATH of the terminal it was installed from, so a harness installed since in a
@@ -129,6 +141,39 @@ Ending the agent stops what it left running, then ends whatever else is still in
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
 
+## How many agents a machine runs
+
+A machine has at most so many agent sessions at work at once (`crate::harness::limit`). Only
+those at work count: starting, on a turn (waiting on you for an approval or an answer in the
+middle of one included), or between turns with subagents they sent off still at work, as Mission
+control shows them working, or needing you mid-turn. Finished, ready, paused, stopped and ended
+agents don't count, nor do ones whose goals wait for you. A new agent while that many are at work
+(or waiting for room) is refused, saying how many and the limit. One already there goes to work
+again only once there's room: what it's sent (a person's message, a skill, kiln's own: a goal, a
+plan step, a parent's news) waits in its queue, the longest waiting going first, and Mission
+control says it's waiting for room. A stopped one starts again (restarted, sent a message, or by
+itself after a crash) only once there's room too. Its limit is the first of these there is:
+
+1. **What's set for it on the server**: Runners, the runner's row opened, *Agent sessions*; or
+   `PUT /api/runners/:name/agent-limit` with `{"max_sessions": 128}` (`null` takes it away). It's
+   kept in the server's store, sent to the runner as it connects and whenever it changes, and kept
+   by the runner for its restarts. It wins over the config.
+2. **Its config's** `[agent] max_agent_sessions` (`kiln config set agent.max_agent_sessions 128`). A
+   runner reads it again within seconds of a change, with nothing restarting. The server's own
+   `kiln.toml` holds it for the server's own agents, read as the server starts.
+3. **kiln's default**, 64.
+
+A limit is from 1 to 4096. Lowered under what's at work, those go on, each through what waits in
+its queue, and none goes to work again until fewer are. Every session a machine ran comes back
+after a restart, however few the limit says then, and what a restart cut short goes on once there's
+room. So does each one a newer runner process of the machine takes over.
+
+The runner says what it holds and where that comes from. The Runners page shows it beside how many
+of the machine's agents are at work now, out of all it has, and how many wait for room. The
+server's own runner runs no agents: the server runs its own (the `local` machine), held to what's
+set for its runner. A runner whose kiln is older than this holds 64, whatever its config or the
+server says, and counts every session it has, ended ones included, until it's upgraded.
+
 ## Mission control
 
 - **How they stand.** Under the page's title, one rule across the page has a length for each way
@@ -157,22 +202,51 @@ counted.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
   it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
   many, with Select all and Done. With a mouse, rows keep their checkboxes.
-- **The message box.** It writes to the agents selected (each named in its To line, put back with
-  its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
-  harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say
-  into the mic, queued, steered or sent now as an agent's own box sends it. Above it, the agent
-  page's line of settings, permissions · model · effort, each opened in place with the same
-  controls: unset, each agent keeps its own; chosen, only the agents that have it are sent to, and
-  given it first (Reset unsets them all). In the field, / lists kiln's own commands for all of them
-  first (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
+- **What to do with those selected.** The list's head offers each of one agent's own actions that
+  some of the selected take, saying how many: **Resume** (those paused at a usage limit, and those
+  whose goals are paused part-way), **Pause** (their goals running), **Stop** (their turns under
+  way), **Restart** and **Remove** (those stopped or ended), **Move to…** and **End…**. Moving
+  and ending are asked in a line under the buttons: Move offers each machine that takes some of
+  them (how many, when not all, and why the rest stay), once their turns are over or now; End
+  says what goes with them and ends the agents they started that still run too, unless unticked.
+  **More** holds where their commands run, keeping them going, and muting their notifications.
+  Each goes to every agent it's for at once; a line says how it went (done, skipped, failed) and
+  opens to each agent's outcome and why. Those all ended leave the selection.
+- **The composer.** At the top of the page, on a desktop and a phone alike, whole and the agent
+  page's composer's size from the start. There is no New agents button and no dialog: with nothing selected it starts an
+  agent, its words the agent's first message. Above the box is the agent page's own line,
+  permissions · model · effort, and the bolt where the model goes faster (the speeds each model
+  runs at come with the machine's models, `KindInfo.models[].speeds`; a machine whose runner
+  lists none yet gives Claude Code's Opus models fast mode, as their agents' pages show it), each
+  opened in place with the same controls. The agent is picked as its page switches one: by a model
+  of another harness the machine runs, each listed under its name (one that hasn't listed its
+  models yet, as "Default"; a machine that hasn't listed a harness's models takes another
+  machine's list). The box is the agent page's composer, the field and its bar. Under it, More
+  options opens to one row each: the machine, the folder, how many, its name, its workspace, where
+  its commands run, a shell to run in and the machine's past sessions to continue (closed, it says
+  what isn't as it starts out). Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
+  soon as its first snapshot is in (a moment at most), one view transition carrying each part of
+  the composer to its place on the page. Several stay on Mission control: the line under the box
+  says what started, and they come into the list. Files go with the first message, sent once the
+  agent can take it. Everything else that started agents (Duplicate, a message's "Start new agent
+  on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
+  composer in and says where it came from, with Clear for your own defaults.
+- **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
+  or harness), the same composer writes to them, each named in the To line where the folder was,
+  put back with its ×, Clear for them all; what's written stays as it turns. A prompt goes with
+  files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
+  now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
+  chosen (the speed too), only the agents that have it are sent to, and given it first (Reset
+  unsets them all). In the field, / lists kiln's own commands for all of them first
+  (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
   each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
-  working. It empties as it sends, and says how it went.
+  working. It empties as it sends, and says how it went. Every agent the list shows is Select all.
 
 ## API
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured) |
+| GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
@@ -184,6 +258,7 @@ counted.
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets") |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
+| GET / PUT / DELETE | `/api/harness/sessions/:id/keep` | its copies on other runners (each with what the rules say of it) and its own rules for them (docs/reach.md §5.1); DELETE: its repository's and runner's apply |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Devin, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
@@ -410,7 +485,9 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
-Mission Control lists every agent kiln runs, in one flat list. An agent started through kiln's API
+Mission Control lists every agent kiln runs, in one flat list. The one exception is a card's helper
+(`agents.about`, below): it answers what a person tapped in a conversation, so it's no row, its
+parent isn't told of it, and kiln ends it once no card has read its answer for 90 seconds. An agent started through kiln's API
 is a top-level agent, whoever started it: a row of its own, in the counts, filters, conversation
 search and bulk actions, with no nesting under the agent that started it. A harness's own
 subagents stay subagents: they aren't rows, and their status and output stay inside their agent's
@@ -472,6 +549,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.list` | `GET /api/harness/agents` | `machine?` (a runner's name, `local` for the server), `harness?`, `state?` (a stand or a status), `parent?`, `plan_run?` → `{agents: [Agent]}` |
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
+| `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
 | `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
@@ -505,6 +583,10 @@ pause?, exit?, needs?}`. `stand` says where it is, in a word:
 | `offline` | its machine is away; it goes on when it's back |
 | `ended` | it ended, or kiln doesn't list it any more |
 
+An agent that couldn't start keeps the first message it was given until its harness takes it: a
+Restart once the harness is installed, its runner starting again, or a move to a machine that has
+it (docs/reach.md §8) gives it then.
+
 ### Where a child runs
 
 `on` is a machine's name (`local` or `server` for the server, `agent:<name>` too), or what it
@@ -513,7 +595,10 @@ the machines that suit and have the harness installed, the idlest (most idle cor
 memory) gets it; outposts and job pods never do. Without `on`, an agent's child runs on the
 agent's own machine, in its folder unless `cwd` says otherwise; a person's runs on the server
 when it runs agents, else on the best runner with the harness. A child on another machine starts
-in that machine's home unless `cwd` names a folder there.
+in that machine's home unless `cwd` names a folder there. A machine named, or the agent's own,
+that kiln knows hasn't the harness (its list of harnesses says so; the server's own asked again
+with its user's login shell) is refused, naming the machines that have it, rather than given an
+agent that can't start there.
 
 ### Sending again
 
@@ -639,8 +724,8 @@ permissions low and how to merge their work.
 
 ## Workspaces of their own
 
-An agent can work in **its own Slates volume** instead of the folder itself (New agents →
-Workspace → Its own volume; `agents.start` with `workspace: "volume"`) (docs/agentic.md, W):
+An agent can work in **its own Slates volume** instead of the folder itself (Mission control's
+composer → More options → Workspace → Own volume; `agents.start` with `workspace: "volume"`) (docs/agentic.md, W):
 
 - **What it is.** On the agent's machine, before its harness starts, kiln lays an overlay volume
   over the folder's repository and mounts it under the runner's state directory
@@ -1058,7 +1143,8 @@ turn (`harness/pause.rs`):
   harness chosen are the only ones it goes to; otherwise kiln picks one that is
   connected, takes sessions over (reach), and has the same harness signed in to another account,
   one kiln doesn't know to be as full. Failing that, another harness its conversation can be
-  carried into (Claude Code ⇄ Codex), signed in with room, with the first model it lists there.
+  carried into (any other), signed in with room, with the first model it lists there (its own
+  default, when it lists none).
   Its own harness comes first, then a machine with a copy of its repository, then the emptiest
   account; a repository not there yet is copied over and kept in step. It moves as a move you ask
   for does (`docs/reach.md` §8), and goes on there unpaused, the cut-off turn first. With nowhere
@@ -1067,7 +1153,7 @@ turn (`harness/pause.rs`):
   seconds, with the way to upgrade it; one from before a machine could be chosen offers only
   "wherever has room".
 - **Go on now.** The paused line above the composer: resume now, resume at the reset or not, or
-  go on now: here in another harness (Claude Code ⇄ Codex), or on another machine that takes
+  go on now: here in another harness (any other on its machine), or on another machine that takes
   agents over, in its own harness or one its conversation can be carried into, with the model
   chosen; the turn the limit cut off goes on there. What you do there that its runner doesn't do
   (an older kiln: it stops again at its stop point as it resumes, or leaves a command it doesn't

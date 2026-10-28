@@ -14,6 +14,7 @@
 //! | [`Placement`](placement::Placement) | where work runs, by resources | Hex (CP-T7.1) |
 //! | [`HarnessPort`](harness::HarnessPort) | kiln's agents: who they are, and commands to them | kiln's harness registry |
 //! | [`Forge`](forge::Forge) | what a git host does with changes: stacks, its queue, updates, batched reviews, merges | githost: kiln's GitHub App, GitLab, Bitbucket (W26-R20) |
+//! | [`Search`](search::Search) | a tree's files, searched by text or by code's shape | vorpal (`kiln-search`, W26-R07) |
 //! | [`Sigstore`](sigstore::Sigstore) | an outside Fulcio and Rekor: keys certified, entries logged | kiln's client of the Fulcio and Rekor it's configured with |
 //!
 //! Each module holds the trait, its simulator (`Sim*`: deterministic, in memory, bounded) and its
@@ -37,6 +38,7 @@ pub mod harness;
 pub mod placement;
 pub mod records;
 pub mod sandbox;
+pub mod search;
 pub mod secrets;
 pub mod sigstore;
 pub mod spawn;
@@ -50,6 +52,7 @@ pub use harness::HarnessPort;
 pub use placement::Placement;
 pub use records::Records;
 pub use sandbox::Sandbox;
+pub use search::Search;
 pub use secrets::Secrets;
 pub use sigstore::Sigstore;
 pub use spawn::Spawn;

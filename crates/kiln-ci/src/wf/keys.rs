@@ -292,7 +292,7 @@ pub const STEP: &[Key] = &[
     kiln("test-results", Ty::Any, "kiln: test reports this step writes (W16-R01)."),
     kiln("integrations", Ty::StrList, "kiln: integrations this step authenticates to (W11-R03)."),
     kiln_only("tty", Ty::Bool, "kiln v1: run under a pseudo-terminal."),
-    kiln("memo", Ty::StrOrMap(MEMO), "kiln: reuse the step's earlier success while its inputs are unchanged: `check` (nothing to restore), or `{ inputs, outputs, env, max-age }` (W24-R07)."),
+    kiln("memo", Ty::StrOrMap(MEMO), "kiln: reuse the step's earlier success while its inputs are unchanged: `check` (nothing to restore), or `{ inputs, outputs, env, max-age, platform, tools }` (W24-R07, W28-R70)."),
     kiln("tests", Ty::Any, "kiln: run a build's test binaries, those whose binary or what they read changed, and replay the others' recorded passes: `{ cargo: [args] }` (W24-R10)."),
 ];
 
@@ -303,6 +303,8 @@ pub const MEMO: &[Key] = &[
     kiln("env", Ty::StrList, "Variables the step depends on besides those the workflow declares."),
     kiln("max-age", Ty::Str, "How long a result stays reusable (`14d` by default)."),
     kiln("secrets", Ty::Str, "`hmac`: a step that receives secrets keyed by their HMAC (W24-R05)."),
+    kiln("platform", Ty::Any, "The platform facets the key keeps (`[os, arch]`; `any` for none): the step keys by what it declares only, so pipelines share it (W28-R70)."),
+    kiln("tools", Ty::Any, "Toolchains whose identity the key keeps, each at a precision: `{ node: major, rustc: full }` (W28-R71)."),
 ];
 
 pub const JOB: &[Key] = &[
@@ -368,6 +370,8 @@ pub const WORKFLOW: &[Key] = &[
     gha("cache-mode", Ty::Str, "Cache access for every job: `read`, `write`, `write-only` or `none` (low-trust events default to `read`)."),
     kiln_only("secrets", Ty::Any, "kiln: the secrets this workflow uses (W09-R06)."),
     kiln("supersede", Ty::Any, "kiln: cancel or deprioritize older runs (W05-R08)."),
+    kiln_only("coalesce", Ty::Any, "kiln: `{ quiet, max-wait, when }`: a burst of pushes runs its newest commit while the runners it needs are busy (W28-R61)."),
+    kiln_only("cadence", Ty::Any, "kiln: `{ on: free }` or `{ every }`: the newest commit runs when its runner frees, or once per interval (W28-R62)."),
     kiln("routing", Ty::Any, "kiln: `{ infer: true }` (W05-R19)."),
     kiln_only("run-env", Ty::Bool, "kiln: collect `$KILN_RUN_ENV` into `run.env` (W04-R21)."),
     kiln("kiln", Ty::Any, "kiln: `{ honour-skip-ci, chain-depth }` (W03-R06, R13)."),

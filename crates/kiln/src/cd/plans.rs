@@ -840,9 +840,14 @@ pub async fn plan(cd: &Arc<Cd>, ask: Ask) -> Result<Value, Fail> {
         })
         .collect();
     let ok = diffs.iter().all(|d| d.get("ok") == Some(&Value::Bool(true)));
-    cd.hub.emit(&json!({
-        "type": "cd_plan", "repo": st.urls.first(), "trunk": st.trunk, "base": st.base, "head": st.commits.last(),
-        "commits": st.commits.len(), "apps": affected.len(), "ok": ok,
+    cd.hub.emit(&crate::wire::events::ServerEvent::CdPlan(crate::wire::events::CdPlan {
+        repo: st.urls.first().cloned(),
+        trunk: st.trunk.clone(),
+        base: st.base.clone(),
+        head: st.commits.last().cloned(),
+        commits: st.commits.len(),
+        apps: affected.len(),
+        ok,
     }));
     Ok(json!({
         "repo": st.urls.first(),

@@ -20,6 +20,12 @@ use super::model::{
     Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
 };
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness"];
+/// What it turns on or off once it runs, as the agent says what it takes (steering; its model,
+/// effort and speed options): kept as they were across an in-place upgrade.
+pub(super) const LEARNED: &[&str] = &["steer", "queue_steer", "set_model", "set_effort", "set_speed"];
+
 mod catalog;
 
 #[cfg(not(test))]
@@ -135,7 +141,7 @@ pub struct Acp {
     #[serde(default)]
     mcp: Vec<Value>,
     /// The conversation so far, in words, given with the first message it sends (a session that
-    /// went on here from another machine, `super::moving`).
+    /// went on here from another machine, `super::moving`, or from another harness).
     #[serde(default)]
     context: Option<String>,
     /// Config options replace the older model and mode setters when the agent offers them.
@@ -206,6 +212,12 @@ fn kiln_bypass() -> ModeOption {
     ModeOption { id: KILN_BYPASS.into(), label: "Bypass".into(), description: "kiln approves everything the agent asks to do".into(), dangerous: true }
 }
 
+/// The modes kiln can start an agent in before the agent says its own: kiln's (it asks you, or
+/// approves everything itself), which every ACP agent takes.
+pub(super) fn kiln_modes() -> Vec<ModeOption> {
+    vec![kiln_ask(), kiln_bypass()]
+}
+
 impl Acp {
     pub fn new(resume: Option<String>) -> Self {
         let empty = resume.is_none();
@@ -267,6 +279,11 @@ impl Acp {
         self.context = text.filter(|t| !t.is_empty());
     }
 
+    /// The conversation it was offered went with a message (or it was offered none).
+    pub fn seeded(&self) -> bool {
+        self.context.is_none()
+    }
+
     /// Its session gets these MCP servers (ACP's `mcpServers`, stdio).
     pub fn offer_mcp(&mut self, servers: Vec<Value>) {
         self.mcp = servers;
@@ -319,7 +336,7 @@ impl Acp {
 
     pub fn start(&mut self, core: &mut Core) {
         self.replaying = self.resume.is_some() && core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
-        core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments"].iter().map(|s| (*s).to_owned()).collect();
+        core.meta.features = FEATURES.iter().map(|s| (*s).to_owned()).collect();
         core.touch_meta();
         // kiln's commands until the agent lists its own.
         if core.meta.commands.is_empty() {
@@ -640,7 +657,7 @@ impl Acp {
             if prominent {
                 match category {
                     "model" => {
-                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), efforts: known.iter().find(|m| m.id == o.id).map(|m| m.efforts.clone()).unwrap_or_default(), default: known.iter().find(|m| m.id == o.id).is_some_and(|m| m.default) }).collect();
+                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), efforts: known.iter().find(|m| m.id == o.id).map(|m| m.efforts.clone()).unwrap_or_default(), default: known.iter().find(|m| m.id == o.id).is_some_and(|m| m.default), speeds: known.iter().find(|m| m.id == o.id).map(|m| m.speeds.clone()).unwrap_or_default() }).collect();
                         core.state.model = current.as_str().unwrap_or_default().to_owned();
                         core.meta.features.push("set_model".into());
                     }
@@ -866,7 +883,8 @@ impl Acp {
         self.empty = false;
         self.close_streams(core);
         // Images inline where the agent takes them; everything else as a link to the file. The
-        // conversation so far comes first, once, when it went on here from another machine.
+        // conversation so far comes first, once, when it went on here from another machine or
+        // another harness.
         let mut blocks = Vec::new();
         if let Some(c) = self.context.take() {
             blocks.push(json!({"type": "text", "text": c}));
@@ -929,6 +947,16 @@ impl Acp {
             self.prompt(core, item);
             super::pause::sent_from_queue(core, &id);
         }
+    }
+
+    /// There may be room on its machine for it to go to work: what waits goes, as between turns.
+    pub fn room(&mut self, core: &mut Core) {
+        self.next(core);
+    }
+
+    /// It holds messages till its session can take them.
+    pub fn holds(&self) -> bool {
+        !self.waiting.is_empty()
     }
 
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
@@ -1835,11 +1863,14 @@ mod tests {
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
         let _ = written(&mut core);
+        // Not given yet: started again now, it would be given it then.
+        assert!(!a.seeded());
         a.command(&mut core, Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = written(&mut core);
         let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
         assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("<kiln_handoff>earlier</kiln_handoff>"));
         assert_eq!(prompt.pointer("/params/prompt/1/text").and_then(Value::as_str), Some("go on"));
+        assert!(a.seeded(), "its own session has it now");
         // The timeline shows what the person said, not the conversation it went with.
         assert!(core.events().any(|e| matches!(&e.body, Body::User { text, .. } if text == "go on")));
         let pid = prompt.get("id").cloned().unwrap_or_default();

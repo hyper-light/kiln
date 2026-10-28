@@ -346,6 +346,12 @@ export function invalidate(prefix = "") {
   for (const e of entries.values()) if (e.key.startsWith(prefix)) refresh(e);
 }
 
+/** Change the data under `key` here, at once — `useSuspenseResource`'s `setData` from outside a component. */
+export function setData<T>(key: string, fn: (prev: T) => T) {
+  const e = entries.get(key);
+  if (e?.snap.has) set(e, { data: fn(e.snap.data as T), has: true });
+}
+
 /** Lets the keys whose first load failed try again (`Loadable`'s Try again). */
 export function retryFailed() {
   for (const e of entries.values()) if (e.snap.failed) e.snap = { ...e.snap, failed: false, error: undefined };

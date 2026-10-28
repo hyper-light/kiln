@@ -35,16 +35,19 @@ export const Link = React.forwardRef<HTMLAnchorElement, LinkProps>(function Link
   return <AnyLink ref={ref} to={p.pathname} search={p.search} hash={p.hash || undefined} replace={replace} {...rest} />;
 });
 
-/** A Link that knows whether it's the current page (`end`: only exactly, not below it). */
+/** A Link that knows whether it's the current page (`end`: only exactly, not below it; `also`:
+ * other paths it's the current page for, and below them, as Ship is for runs and deployments). */
 export function NavLink({
   to,
   end,
+  also,
   className,
   children,
   ...rest
 }: AnchorProps & {
   to: string;
   end?: boolean;
+  also?: readonly string[];
   className?: string | ((s: { isActive: boolean }) => string | undefined);
   children?: React.ReactNode | ((s: { isActive: boolean }) => React.ReactNode);
 }) {
@@ -52,9 +55,18 @@ export function NavLink({
   const target = split(to).pathname;
   const exact = Boolean(end) || target === "/";
   // The same rule TanStack's Link applies to set aria-current (below the path, or exactly).
-  const isActive = exact ? pathname === target : pathname === target || pathname.startsWith(`${target.replace(/\/$/, "")}/`);
+  const under = (t: string) => pathname === t || pathname.startsWith(`${t.replace(/\/$/, "")}/`);
+  const own = exact ? pathname === target : under(target);
+  const isActive = own || (also ?? []).some(under);
   return (
-    <Link to={to} activeOptions={{ exact, includeSearch: false }} className={typeof className === "function" ? className({ isActive }) : className} {...rest}>
+    <Link
+      to={to}
+      activeOptions={{ exact, includeSearch: false }}
+      className={typeof className === "function" ? className({ isActive }) : className}
+      {...rest}
+      // Below one of `also`, TanStack counts it inactive: it's the current page all the same.
+      {...(isActive && !own ? { "aria-current": "page" as const } : {})}
+    >
       {typeof children === "function" ? children({ isActive }) : children}
     </Link>
   );
@@ -66,17 +78,19 @@ export function Navigate({ to, replace }: { to: string; replace?: boolean }) {
 }
 
 /** navigate("/runs/1?x=2", { replace }) or navigate(-1). */
-export function useNavigate(): (to: string | number, opts?: { replace?: boolean }) => void {
+export function useNavigate(): (to: string | number, opts?: { replace?: boolean; viewTransition?: boolean }) => void {
   const navigate = useTanNavigate();
   const router = useRouter();
   return React.useCallback(
-    (to: string | number, opts?: { replace?: boolean }) => {
+    (to: string | number, opts?: { replace?: boolean; viewTransition?: boolean }) => {
       if (typeof to === "number") {
         router.history.go(to);
         return;
       }
       const p = split(to);
-      void navigate({ to: p.pathname, search: p.search, hash: p.hash || undefined, replace: opts?.replace } as never);
+      // A view transition only while motion plays (kiln's own pause, or the device's reduced motion: motion.tsx).
+      const viewTransition = opts?.viewTransition && document.documentElement.dataset.motion !== "paused" ? true : undefined;
+      void navigate({ to: p.pathname, search: p.search, hash: p.hash || undefined, replace: opts?.replace, viewTransition } as never);
     },
     [navigate, router],
   );

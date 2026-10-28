@@ -214,7 +214,9 @@ pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
 /// only its user's login shell has (`crate::reach::serve::login_env`, which a runner asks as it
 /// starts and every ten minutes). A runner's service keeps the PATH of the terminal it was
 /// installed from: a harness installed since in a folder that PATH lacks (Claude Code's and
-/// Codex's installers put theirs in `~/.local/bin`) is on its user's PATH alone.
+/// Codex's installers put theirs in `~/.local/bin`) is on its user's PATH alone. CI legs' steps
+/// run with it too, and the runner's tool facts are found on it (docs/ci.md W13-R01, W13-R03): a
+/// toolchain installed since (node from nvm, cargo from rustup) is on its user's PATH alone.
 pub fn search_path() -> Option<std::ffi::OsString> {
     let users = crate::reach::serve::login_path();
     joined_path(std::env::var_os("PATH").as_deref(), users.as_deref().map(std::ffi::OsStr::new))
@@ -482,8 +484,32 @@ impl Adapter {
         self.drain_subagents(core);
     }
 
+    /// There may be room on its machine now for it to go to work (`super::limit`): what waits goes,
+    /// as it does once a turn ends, then what waits for its subagents.
+    pub fn room(&mut self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => a.room(core),
+            Self::Codex(a) => a.room(core),
+            Self::Acp(a) => a.room(core),
+            Self::Agy(a) => a.room(core),
+        }
+        self.drain_subagents(core);
+    }
+
+    /// Something waits to go to its harness: kiln's queue, what its adapter holds till its harness
+    /// is ready, or what waits for one of its subagents.
+    pub fn waits(&self, core: &Core) -> bool {
+        let held = match self {
+            Self::Codex(a) => a.holds(),
+            Self::Acp(a) => a.holds(),
+            Self::Claude(_) | Self::Agy(_) => false,
+        };
+        held || !core.state.queue.is_empty() || core.state.tasks.iter().any(|t| !t.queue.is_empty())
+    }
+
     /// Start with a conversation carried over from another harness, in the harness's own form
-    /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript).
+    /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript;
+    /// an ACP agent and Antigravity take it in words, with the first message they get).
     pub fn seed(&mut self, items: Vec<serde_json::Value>) {
         // The conversation in words (`moving::Carry::Words`), for a harness that takes it only with
         // its first message.
@@ -496,13 +522,44 @@ impl Adapter {
         }
     }
 
-    /// That conversation is in (or there was none).
+    /// That conversation is in (or there was none): an ACP agent and Antigravity have it once
+    /// they were given it with a message, so one started again before that is given it then.
     pub fn seeded(&self) -> bool {
         match self {
             Self::Codex(a) => a.seeded(),
-            Self::Claude(_) | Self::Acp(_) | Self::Agy(_) => true,
+            Self::Acp(a) => a.seeded(),
+            Self::Agy(a) => a.seeded(),
+            Self::Claude(_) => true,
         }
     }
+
+    /// A session an older image handed over runs on this one: it says what this image's harness
+    /// can do, as a start would (its adapter doesn't start again), keeping what its harness turned
+    /// on or off while it ran.
+    pub fn upgraded(&self, core: &mut Core) {
+        let (features, learned) = match self {
+            Self::Claude(_) => (super::claude::FEATURES, super::claude::LEARNED),
+            Self::Codex(_) => (super::codex::FEATURES, super::codex::LEARNED),
+            Self::Acp(_) => (super::acp::FEATURES, super::acp::LEARNED),
+            Self::Agy(_) => (super::antigravity::FEATURES, super::antigravity::LEARNED),
+        };
+        let now = upgraded_features(features, learned, &core.meta.features);
+        if now != core.meta.features {
+            core.meta.features = now;
+            core.touch_meta();
+        }
+    }
+}
+
+/// This image's `features`, those in `learned` as the session had them.
+fn upgraded_features(features: &[&str], learned: &[&str], had: &[String]) -> Vec<String> {
+    let mut now: Vec<String> = features.iter().filter(|f| !learned.contains(f)).map(|f| (*f).to_owned()).collect();
+    for f in had {
+        if learned.contains(&f.as_str()) && !now.contains(f) {
+            now.push(f.clone());
+        }
+    }
+    now
 }
 
 /// What a machine offers, for the "new agent" dialog.
@@ -574,9 +631,17 @@ impl Kind {
         }
     }
 
-    /// A conversation can be carried into it from another harness (and out of it): kiln reads
-    /// and writes its own record of one.
+    /// A conversation can be carried into it from another harness (and out of it): every harness
+    /// kiln runs as a structured session. One with its [`own_record`](Self::own_record) is read
+    /// and written as it keeps it; any other is read from kiln's timeline and given the
+    /// conversation in words, with the first message it gets.
     pub fn switchable(&self) -> bool {
+        self.structured()
+    }
+
+    /// kiln reads and writes its own record of a conversation (Claude Code's transcript, Codex's
+    /// thread), so a conversation carried into it or out of it goes as that record.
+    pub fn own_record(&self) -> bool {
         matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer)
     }
 
@@ -704,6 +769,22 @@ fn known_models(kind: &str) -> Vec<super::model::ModelOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Devin session handed over from an image before every harness could switch runs on this
+    /// image's features (switching among them), with the model and steering its agent said it takes
+    /// kept, and one it never said left off; what this image dropped is gone.
+    #[test]
+    fn a_session_handed_over_runs_on_this_images_features() {
+        let had: Vec<String> = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "steer", "queue_steer", "set_model", "gone"].iter().map(|s| (*s).to_owned()).collect();
+        let now = upgraded_features(super::super::acp::FEATURES, super::super::acp::LEARNED, &had);
+        for f in super::super::acp::FEATURES {
+            assert!(now.iter().any(|n| n == f), "{f} missing: {now:?}");
+        }
+        assert!(now.iter().any(|n| n == "switch_harness") && now.iter().any(|n| n == "set_model") && now.iter().any(|n| n == "steer"), "{now:?}");
+        assert!(!now.iter().any(|n| n == "set_effort" || n == "gone"), "{now:?}");
+        // Again: nothing changes.
+        assert_eq!(upgraded_features(super::super::acp::FEATURES, super::super::acp::LEARNED, &now), now);
+    }
 
     #[test]
     fn devin_runs_its_acp_protocol_and_keeps_its_terminal_interface() -> anyhow::Result<()> {

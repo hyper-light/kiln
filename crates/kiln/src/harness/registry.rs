@@ -132,7 +132,7 @@ impl Mirror {
             self.sent = Value::Null;
             return None;
         }
-        let text = json!({"t": "state", "state": self.state}).to_string();
+        let text = crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::State { state: self.state.clone() }).text();
         let patch = state_patch(&self.sent, &self.state);
         self.sent.clone_from(&self.state);
         Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from), rev: self.rev })
@@ -310,32 +310,34 @@ impl Parts {
     /// The frames that bring a viewer to the state the parts were taken at; `files`, what's kept of
     /// the files its messages mention (`Keeper::frame`), goes ahead of the events.
     fn frames(self, files: Option<String>) -> Vec<String> {
-        let head = if self.resumed { "resumed" } else { "open" };
-        let mut out = vec![json!({"t": head, "info": self.info, "rev": self.rev, "born": born()}).to_string()];
+        use crate::wire::ui::{SessionDown, SessionFrame};
+        let (info, born) = (self.info, Some(born()));
+        let head = if self.resumed { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born } };
+        let mut out = vec![SessionDown { frame: head, rev: Some(self.rev) }.text()];
+        let text = |f: SessionFrame| SessionDown::from(f).text();
         if !self.meta.is_null() {
-            out.push(json!({"t": "meta", "meta": self.meta}).to_string());
+            out.push(text(SessionFrame::Meta { meta: self.meta }));
         }
         if !self.state.is_null() {
-            out.push(json!({"t": "state", "state": self.state}).to_string());
+            out.push(text(SessionFrame::State { state: self.state }));
         }
         if !self.changes.is_null() {
-            out.push(json!({"t": "changes", "files": self.changes}).to_string());
+            out.push(text(SessionFrame::Changes { files: self.changes }));
         }
         out.extend(files);
-        let mut batch: Vec<&Value> = Vec::new();
+        let mut batch: Vec<Value> = Vec::new();
         let mut size = 0usize;
         for e in &self.events {
             let n = e.to_string().len();
             if size + n > 256 * 1024 && !batch.is_empty() {
-                out.push(json!({"t": "events", "events": batch}).to_string());
-                batch = Vec::new();
+                out.push(text(SessionFrame::Events { events: std::mem::take(&mut batch) }));
                 size = 0;
             }
             size += n;
-            batch.push(e);
+            batch.push(Value::clone(e));
         }
         if !batch.is_empty() {
-            out.push(json!({"t": "events", "events": batch}).to_string());
+            out.push(text(SessionFrame::Events { events: batch }));
         }
         out
     }
@@ -499,7 +501,8 @@ fn state_patch(was: &Value, now: &Value) -> Option<String> {
     let (Value::Object(was), Value::Object(now)) = (was, now) else { return None };
     let set: serde_json::Map<String, Value> = now.iter().filter(|(k, v)| was.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let gone: Vec<&String> = was.keys().filter(|k| !now.contains_key(*k)).collect();
-    Some(if gone.is_empty() { json!({"t": "state_patch", "set": set}) } else { json!({"t": "state_patch", "set": set, "gone": gone}) }.to_string())
+    let gone = gone.into_iter().cloned().collect();
+    Some(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::StatePatch { set, gone }).text())
 }
 
 /// A file uploaded for a message, kept briefly until the message is sent.
@@ -635,6 +638,26 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
         _ if kept => Naming::Keep,
         _ => Naming::Theirs,
     }
+}
+
+async fn send_package(hub: &Hub, id: &str, to: &str, bytes: &[u8]) -> Result<(), String> {
+    // In pieces that fit a command's frame, each answered before the next goes (docs/wire.md,
+    // "Commands"): a move whose machine went away mid-way says so.
+    const PIECE: usize = 768 << 10;
+    let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
+    let mut offset = 0u64;
+    for (n, piece) in pieces.iter().enumerate() {
+        use crate::wire::commands::Answer;
+        let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
+        match hub.command(to, &msg, crate::hub::COMMAND_WITHIN).await {
+            Answer::Taken | Answer::Sent => {}
+            Answer::Refused { why, .. } => return Err(format!("{to} couldn't take the session: {why}")),
+            Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{to} went away while the session was on its way")),
+            Answer::Unanswered { why } => return Err(format!("{to} didn't answer while the session was on its way: {why}")),
+        }
+        offset += piece.len() as u64;
+    }
+    Ok(())
 }
 
 impl Registry {
@@ -856,7 +879,7 @@ impl Registry {
             m.info.keep_off = !on;
             m.info.clone()
         };
-        hub.emit(&json!({"type": "harness", "info": info}));
+        hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
     }
 
     /// The plans sessions proposed (plan mode) since the last look, by session, each its latest.
@@ -879,7 +902,25 @@ impl Registry {
             }
         }
         for info in changed {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        }
+    }
+
+    /// What of session `id`'s messages couldn't be read (`crate::wire::unread`) changed: told to its
+    /// viewers.
+    pub fn set_refused(&self, hub: &Hub, id: &str, refused: Option<crate::wire::unread::Kept>) {
+        let info = {
+            let mut g = self.mirrors.lock();
+            match g.get_mut(id) {
+                Some(m) if m.info.refused != refused => {
+                    m.info.refused = refused;
+                    Some(m.info.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(info) = info {
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -908,7 +949,7 @@ impl Registry {
             }
             m.info.clone()
         };
-        hub.emit(&json!({"type": "harness", "info": info}));
+        hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
     }
 
     /// Environment for one of the server's own terminals, so `kiln spawn` there works.
@@ -976,7 +1017,7 @@ impl Registry {
             tracing::info!(sessions = infos.len(), "agent sessions on machines that are away, from the conversation store");
         }
         for info in infos {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1095,6 +1136,19 @@ impl Registry {
             }
         }
         all
+    }
+
+    pub fn lacks(&self, target: &str, kind: &str) -> bool {
+        #[cfg(test)]
+        if self.test_program.lock().is_some() {
+            return false;
+        }
+        self.kinds.lock().get(target).is_some_and(|ks| !ks.iter().any(|k| k.id == kind && k.available))
+    }
+
+    #[cfg(test)]
+    pub fn set_kinds(&self, target: &str, kinds: Vec<KindInfo>) {
+        self.kinds.lock().insert(target.to_owned(), kinds);
     }
 
     /// A session's meta as last reported (its harness's catalog: slash commands, models, modes).
@@ -1244,6 +1298,8 @@ impl Registry {
                 let mut info = (**info).clone();
                 // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
                 info.held = g.get(id).and_then(|m| m.info.held.clone());
+                // So is what of its messages couldn't be read (`crate::wire::unread`).
+                info.refused = g.get(id).and_then(|m| m.info.refused.clone());
                 // So is whether kiln started it as its parent's subagent (`Spec::subagent`): a runner
                 // from before the word doesn't say it, and it stays one.
                 info.subagent |= g.get(id).is_some_and(|m| m.info.subagent);
@@ -1424,9 +1480,9 @@ impl Registry {
             self.opened.forget(id);
             self.asked.forget(id);
             super::archive::closed(hub, id);
-            hub.emit(&json!({"type": "harness_closed", "id": id}));
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if let Some(info) = changed {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1499,7 +1555,7 @@ impl Registry {
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
-            hub.emit(&json!({"type": "harness_closed", "id": id}));
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
     }
 
@@ -1561,7 +1617,7 @@ impl Registry {
         }
         self.kinds.lock().remove(&format!("agent:{machine}"));
         for info in infos {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1584,7 +1640,7 @@ impl Registry {
             }
         }
         for info in infos {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
 
@@ -1637,7 +1693,7 @@ impl Registry {
         if let Some(m) = self.mirrors.lock().get_mut(id) {
             // A revision of its own, past what its viewers have: else they'd take it as had.
             m.rev = m.rev.saturating_add(1);
-            m.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
+            m.send(Frame::of(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Files { files: added.to_vec() }).text()));
         }
     }
 
@@ -1758,15 +1814,18 @@ impl Registry {
                         left_behind: 0,
                         reach: spec.reach.clone(),
                         pause: None,
+                        room_wait: None,
                         last_turn: None,
                         keep_off: false,
                         held: None,
+                        refused: None,
                         move_on_limit: false,
                         move_plan: Default::default(),
                         pause_at: None,
                         max_subagents: None,
                         parent: spec.parent.clone(),
                         plan_run: spec.plan_run.clone(),
+                        helper: spec.helper.clone(),
                         subagent: spec.subagent,
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
@@ -1777,7 +1836,7 @@ impl Registry {
             }
         }
         for info in &out {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
         Ok(out)
     }
@@ -2199,25 +2258,60 @@ impl Registry {
             })
         };
         if let Some(info) = info {
-            hub.emit(&json!({"type": "harness", "info": info}));
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
         tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
-        // In pieces that fit a command's frame, each answered before the next goes (docs/wire.md,
-        // "Commands"): a move whose machine went away mid-way says so.
-        const PIECE: usize = 768 << 10;
-        let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
-        let mut offset = 0u64;
-        for (n, piece) in pieces.iter().enumerate() {
-            use crate::wire::commands::Answer;
-            let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
-            match hub.command(to, &msg, crate::hub::COMMAND_WITHIN).await {
-                Answer::Taken | Answer::Sent => {}
-                Answer::Refused { why, .. } => return Err(format!("{to} couldn't take the session: {why}")),
-                Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{to} went away while the session was on its way")),
-                Answer::Unanswered { why } => return Err(format!("{to} didn't answer while the session was on its way: {why}")),
-            }
-            offset += piece.len() as u64;
+        send_package(hub, id, to, &bytes).await
+    }
+
+    pub fn never_started(&self, id: &str) -> bool {
+        let Some(s) = self.local.get(id) else { return false };
+        if s.pid.lock().is_some() {
+            return false;
         }
+        let core = s.core.lock();
+        core.state.status == Status::Exited && core.state.harness_session.is_none() && !core.events().any(|e| matches!(e.body, super::model::Body::User { .. } | super::model::Body::Assistant { .. }))
+    }
+
+    pub async fn move_local(&self, hub: &Hub, id: &str, to: &str, cwd: &str) -> Result<(), String> {
+        let s = self.local.get(id).filter(|_| self.never_started(id)).ok_or_else(|| "only an agent whose harness never started on the kiln server moves from it".to_owned())?;
+        if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
+            return Err(format!("{to} isn't connected"));
+        }
+        if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
+            return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
+        }
+        let spec = s.resume_spec();
+        let (events, mut state) = {
+            let core = s.core.lock();
+            (core.events().cloned().collect::<Vec<_>>(), core.state.clone())
+        };
+        let had = self.mirrors.lock().get(id).and_then(|m| m.state.get("epoch").and_then(Value::as_u64)).unwrap_or(0);
+        let next = had.max(state.epoch) + 1;
+        state.epoch = next - 1;
+        let from_cwd = state.cwd.clone();
+        let pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
+        let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        send_package(hub, id, to, &bytes).await?;
+        self.raise_epoch(id, next);
+        if let Some(store) = &self.convo {
+            store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes: None, epoch: Some(next), open: false, at: crate::util::now_ms() }]);
+        }
+        let info = {
+            let mut g = self.mirrors.lock();
+            g.get_mut(id).filter(|m| m.location == Location::Local).map(|m| {
+                m.location = Location::Machine(to.to_owned());
+                m.info.target = m.location.target();
+                m.info.status = Status::Starting;
+                m.opened_at = Some(std::time::Instant::now());
+                m.info.clone()
+            })
+        };
+        if let Some(info) = info {
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        }
+        self.local.let_go(id);
+        tracing::info!(session = %id, %to, bytes = bytes.len(), "an agent whose harness never started on the server goes on on a runner");
         Ok(())
     }
 
@@ -2248,7 +2342,7 @@ impl Registry {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
             super::archive::closed(hub, id);
-            hub.emit(&json!({"type": "harness_closed", "id": id}));
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ok || loc.is_some()
     }

@@ -17,6 +17,7 @@ import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
+import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
@@ -25,11 +26,14 @@ import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
+import { handleKeep } from "./keep.ts";
+import { handleReap } from "./reap.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
+import { handleShip } from "./ship.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -99,6 +103,12 @@ const repoTc = new Map<string, Toolchain>();
 const runs: Run[] = []; // newest first
 const jobsByRun = new Map<string, SimJob[]>();
 const jobsById = new Map<string, SimJob>();
+/** A job for Ship's fixed rows to stream (ship.ts): one running, else the first. */
+function liveJob() {
+  const all = [...jobsById.values()];
+  const sj = all.find((j) => j.job.status === "running") ?? all[0];
+  return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
+}
 const logs = new Map<string, LogStream>();
 const agents = new Map<string, Agent>();
 const agentState = new Map<string, HostState>();
@@ -205,8 +215,8 @@ function pushSample(name: string, s: HostSample) {
 const serverHost = newHost(16, 64, 1800);
 prefillHistory("server", serverHost, 0.25);
 
-function addAgent(a: Omit<Agent, "running" | "busy" | "sample" | "draining"> & { draining?: boolean }, host: HostState, prefill = true) {
-  const agent: Agent = { ...a, draining: a.draining ?? false, running: [], busy: 0, sample: null };
+function addAgent(a: Omit<Agent, keyof ReturnType<typeof defaultRunner>> & Partial<ReturnType<typeof defaultRunner>>, host: HostState, prefill = true) {
+  const agent: Agent = { ...defaultRunner(), ...a };
   agents.set(a.name, agent);
   agentState.set(a.name, host);
   if (prefill) {
@@ -262,7 +272,8 @@ function plannedFor(tpl: JobTpl): PlannedJob {
     artifacts: tpl.key === "bench" ? ["target/criterion/**"] : [],
     cache: tpl.toolchain === "rust" ? ["~/.cargo/registry", "target"] : [],
     condition: null,
-    steps: tpl.steps.map((s) => ({ name: s.name, run: s.run, tty: true })),
+    requires: [],
+    steps: tpl.steps.map((s) => ({ name: s.name, run: s.run, shell: null, env: {}, "working-directory": null, "timeout-minutes": null, "continue-on-error": false, tty: true })),
   };
 }
 
@@ -863,15 +874,20 @@ function sampleAll() {
 for (let i = 0; i < 3; i++) startRun(weightedRepo(rnd));
 for (let i = 0; i < 25; i++) tick();
 
-setInterval(tick, 1000);
-setInterval(() => emitQueue(), 1000);
-setInterval(() => emitQueue(true), 5000);
-setInterval(sampleAll, 5000);
+/** A browser check's quiet (`POST /api/mock/quiet`, `{ on }`): the simulated runs, queue and samples
+ * stand still while it's on, so a measurement sees only what it sends itself (ship-perf's keystrokes). */
+let quiet = false;
+setInterval(() => quiet || tick(), 1000);
+setInterval(() => quiet || emitQueue(), 1000);
+setInterval(() => quiet || emitQueue(true), 5000);
+setInterval(() => quiet || sampleAll(), 5000);
 (function scheduleNewRun() {
   setTimeout(() => {
-    const repo = weightedRepo(rnd);
-    startRun(repo);
-    repo.last_polled_at = now();
+    if (!quiet) {
+      const repo = weightedRepo(rnd);
+      startRun(repo);
+      repo.last_polled_at = now();
+    }
     scheduleNewRun();
   }, between(12_000, 35_000));
 })();
@@ -1326,6 +1342,7 @@ const MIME: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".woff2": "font/woff2",
   ".woff": "font/woff",
+  ".wasm": "application/wasm",
   ".png": "image/png",
   ".json": "application/json",
   ".webmanifest": "application/manifest+json",
@@ -1410,6 +1427,10 @@ const server = http.createServer(async (req, res) => {
       sendAway(Number(url.searchParams.get("ms") ?? 10_000));
       return json(res, 200, { ok: true });
     }
+    if (p === "/api/mock/quiet" && m === "POST") {
+      quiet = (await body<{ on?: boolean }>(req)).on ?? true;
+      return json(res, 200, { quiet });
+    }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
     // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
@@ -1435,9 +1456,14 @@ const server = http.createServer(async (req, res) => {
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
+    if (await handleShip(req, res, url, { json, liveJob, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
+    // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
+    if (await handleKeep(req, res, url, { json, body })) return;
+    // ---- the reaper's policies (W24-R31) ----
+    if (await handleReap(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 

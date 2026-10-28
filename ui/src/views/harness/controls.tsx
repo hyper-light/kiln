@@ -6,12 +6,18 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { ArrowDownToLine, MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
-import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type Meta, type State } from "@/api/harness";
+import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type JsonValue, type Meta, type State } from "@/api/harness";
 import { formatBytes } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Hold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { ReapPolicy } from "../reap";
 import { cn } from "@/lib/utils";
 import { AtLimit } from "./elsewhere";
+
+/** Its copies on other runners and its rules for them (docs/reach.md §5.1), loaded with the sheet's group. */
+const AgentKeep = React.lazy(() => import("../keep/agent").then((m) => ({ default: m.AgentKeep })));
 
 type Send = (c: Command) => void;
 
@@ -50,7 +56,7 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
   const v = valueOf(c, state);
   const [text, setText] = React.useState(typeof v === "string" ? v : "");
   const [option, setOption] = React.useState("");
-  const set = (value: unknown, dangerous?: boolean) =>
+  const set = (value: JsonValue, dangerous?: boolean) =>
     confirm(dangerous ?? c.dangerous, `${c.label}?`, c.description ?? "This can't be undone from kiln.", () => send({ type: "control", id: c.id, value }));
   return (
     <div className="hx-ctl">
@@ -101,7 +107,7 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
             onSubmit={(e) => {
               e.preventDefault();
               const chosen = c.options?.find((o) => o.id === option) ?? c.options?.[0];
-              set(c.options?.length ? { option: chosen?.id, text } : text, chosen?.dangerous);
+              set(c.options?.length ? (chosen ? { option: chosen.id, text } : { text }) : text, chosen?.dangerous);
               setText("");
             }}
           >
@@ -171,8 +177,8 @@ function LimitRows({ agent, state, send }: { agent: AgentInfo | null; state: Sta
           <div className="hx-ctl-text">
             <span className="hx-ctl-label">At a limit</span>
             <span className="hx-dim text-[12px]">
-              Wait for the reset, or go on on another of your machines with room: the one chosen or whichever has room, in its own harness signed in to another account or one its conversation can be
-              carried into (Claude Code ⇄ Codex). Its conversation and repository go along.
+              Wait for the reset, or go on on another of your machines with room: the one chosen or whichever has room, in its own harness signed in to another account or another one its conversation
+              is carried into (Claude Code, Codex, Devin, Antigravity and the other ACP agents). Its conversation and repository go along.
             </span>
           </div>
           <div className="hx-ctl-input">
@@ -256,6 +262,20 @@ export function SettingsSheet({
           <div className="hx-ctls">
             <LimitRows agent={agent} state={state} send={send} />
             <SubagentRows agent={agent} state={state} send={send} />
+            {agent && (
+              <>
+                <Loadable label="its copies on other runners" fallback={null}>
+                  <AgentKeep id={agent.id} />
+                </Loadable>
+                {/* What this session's caches keep (W24-R31): its own rules over its repository's and the system's. */}
+                <section className="hx-ctl-group" aria-label="What its caches keep">
+                  <div className="hx-eyebrow">What its caches keep</div>
+                  <Loadable label="its cache policy" fallback={<Hold height={450} />}>
+                    <ReapPolicy scope="session" target={agent.id} at={{ session: agent.id, runner: agent.target.startsWith("agent:") ? agent.target.slice(6) : undefined }} />
+                  </Loadable>
+                </section>
+              </>
+            )}
             {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">

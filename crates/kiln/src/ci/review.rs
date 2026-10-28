@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use http::StatusCode;
 use kiln_ci::land::{self, Action, Facts, OwnerRule, Policy};
-use kiln_ci::review::State;
+use kiln_ci::review::{Gate, Kind, State};
 use rusqlite::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
@@ -64,28 +64,31 @@ async fn follow(hub: &Hub, path: &str, file: &str, side: &str, (from, to): (&Ver
 }
 
 /// A diff's threads, with their comments: the published ones, and `viewer`'s drafts. Each
-/// thread's lines as the latest version has them, or `outdated`.
+/// thread's lines as the latest version has them, or `outdated`; its kind (W26-R11); who resolved
+/// it, when and why. A comment its author deleted says `deleted` (W26-R08).
 pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fail> {
     let (id, me) = (d.id.clone(), viewer.to_owned());
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, u32, Option<String>, Option<String>, Option<u32>, Option<u32>, String, String, i64)> = hub
+    let rows: Vec<((String, u32, Option<String>, Option<String>, Option<u32>, Option<u32>, String, String, i64), (String, Option<String>, Option<i64>, Option<String>))> = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT id, version, file, side, start_line, end_line, state, created_by, created_at FROM review_threads WHERE diff_id = ?1 ORDER BY created_at, id")?;
-            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?;
+            let mut st = c.prepare(
+                "SELECT id, version, file, side, start_line, end_line, state, created_by, created_at, kind, resolved_by, resolved_at, resolution FROM review_threads WHERE diff_id = ?1 ORDER BY created_at, id",
+            )?;
+            let rows = st.query_map([&id], |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?), (r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?))))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
         .map_err(fail)?;
     let (id, me2) = (d.id.clone(), me.clone());
-    let comments: Vec<(String, String, String, String, Option<String>, i64, bool)> = hub
+    let comments: Vec<(String, String, String, String, Option<String>, i64, bool, bool)> = hub
         .store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT c.id, c.thread_id, c.author, c.body, c.suggestion, c.created_at, c.published FROM review_comments c JOIN review_threads t ON t.id = c.thread_id
+                "SELECT c.id, c.thread_id, c.author, c.body, c.suggestion, c.created_at, c.published, c.deleted_at IS NOT NULL FROM review_comments c JOIN review_threads t ON t.id = c.thread_id
                  WHERE t.diff_id = ?1 AND (c.published = 1 OR c.author = ?2) ORDER BY c.created_at, c.id",
             )?;
-            let rows = st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?;
+            let rows = st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
@@ -93,13 +96,21 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
     let latest = versions.last().cloned();
     let path = super::diffs::home(hub, d).await.ok().map(|(_, p)| p);
+    let applied = applied(hub, d).await?;
     let mut by: HashMap<String, Vec<Value>> = HashMap::new();
-    for (cid, tid, author, body, suggestion, at, published) in comments {
-        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published }));
+    for (cid, tid, author, body, suggestion, at, published, deleted) in comments {
+        // Its suggestions (W26-R10): its body's blocks, then the old field, each saying which
+        // revision applied it.
+        let made = applied.get(&cid);
+        let suggests: Vec<Value> = if deleted { Vec::new() } else { kiln_ci::suggest::suggestions(&body, suggestion.as_deref()) }
+            .into_iter()
+            .map(|s| json!({ "index": s.index, "lines": s.lines, "field": s.field, "applied": made.filter(|a| a.0 == s.index).map(|(_, n, by, at)| json!({ "version": n, "by": by, "at": at })) }))
+            .collect();
+        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
     }
     let mut out = Vec::new();
-    for (tid, version, file, side, start, end, state, created_by, at) in rows {
-        let Some(list) = by.remove(&tid) else { continue };
+    for ((tid, version, file, side, start, end, state, created_by, at), (kind, resolved_by, resolved_at, resolution)) in rows {
+        let Some(mut list) = by.remove(&tid) else { continue };
         let side = side.unwrap_or_else(|| "new".into());
         // Where it is now.
         let now = match (&file, start, &latest, &path, versions.iter().find(|v| v.n == version)) {
@@ -107,12 +118,59 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
             (None, ..) => Some(Value::Null),
             _ => None,
         };
+        // A suggestion not applied whose lines changed since is outdated: it says so, and doesn't apply.
+        for s in list.iter_mut().filter_map(|c| c.get_mut("suggestions")).filter_map(Value::as_array_mut).flatten() {
+            let outdated = now.is_none() && s.get("applied").is_none_or(Value::is_null);
+            if let Some(o) = s.as_object_mut() {
+                o.insert("outdated".into(), json!(outdated));
+            }
+        }
         out.push(json!({
             "id": tid, "version": version, "file": file, "side": side, "start_line": start, "end_line": end, "state": state, "created_by": created_by, "created_at": at,
             "outdated": now.is_none(), "now": now.unwrap_or(Value::Null), "comments": list,
+            "kind": Kind::read(&kind).as_str(), "resolved_by": resolved_by, "resolved_at": resolved_at, "resolution": resolution,
         }));
     }
     Ok(out)
+}
+
+/// The suggestions applied on `d` (W26-R10), by comment: which of its suggestions, the revision
+/// that applied it, who applied it and when.
+async fn applied(hub: &Hub, d: &Diff) -> Result<HashMap<String, (u32, u32, String, i64)>, Fail> {
+    let id = d.id.clone();
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT comment, suggestion, n, pushed_by, created_at FROM diff_versions WHERE diff_id = ?1 AND comment IS NOT NULL AND suggestion IS NOT NULL ORDER BY n")?;
+            let rows = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?;
+            Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+        })
+        .await
+        .map_err(fail)
+}
+
+/// A diff's threads as the gate reads them (W26-R11): each one's kind and reviewer, where it
+/// is, whether it's resolved, and whether it's only a draft yet (none of its comments published).
+async fn gate_threads(hub: &Hub, d: &Diff) -> Result<Vec<kiln_ci::review::Thread>, Fail> {
+    let id = d.id.clone();
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT t.kind, t.created_by, t.file, t.start_line, t.state = 'resolved', NOT EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1)
+                 FROM review_threads t WHERE t.diff_id = ?1 ORDER BY t.created_at, t.id",
+            )?;
+            let rows = st.query_map([&id], |r| Ok(kiln_ci::review::Thread { kind: Kind::read(&r.get::<_, String>(0)?), by: r.get(1)?, file: r.get(2)?, line: r.get(3)?, resolved: r.get(4)?, draft: r.get(5)? }))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(fail)
+}
+
+/// The gate on `d` (W26-R11): for `asking`, whoever approves (their drafts count, since approving
+/// publishes them), or for no one, as merging and any automatic merge ask it. Each conflict of its
+/// replay onto where it lands holds it until Commit resolution makes a revision of it (W26-R12).
+pub async fn gate_of(hub: &Hub, d: &Diff, asking: Option<&str>) -> Result<Gate, Fail> {
+    let conflicts = super::conflicts::for_gate(hub, d).await;
+    Ok(kiln_ci::review::gate(&gate_threads(hub, d).await?, &conflicts, asking))
 }
 
 /// A new comment: on a thread (`thread`), or a new thread on a version's `file`, `side` and
@@ -142,6 +200,12 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
     if file.is_some() != start.is_some() {
         return Err(bad("a comment on code names its `file` and `start_line`"));
     }
+    // A new thread's kind (W26-R11): a question unless it says otherwise.
+    let kind = match body.get("kind").and_then(Value::as_str) {
+        None => Kind::Question,
+        Some(k) => Kind::parse(k).ok_or_else(|| bad("`kind` is `question`, `nit`, `issue` or `blocking`"))?,
+    }
+    .as_str();
     let (diff_id, me2, said, file_c, side_c) = (d.id.clone(), me.clone(), text.clone(), file.clone(), side.clone());
     let (tid, cid) = hub
         .store
@@ -155,8 +219,8 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
                 None => {
                     let id = crate::util::new_id();
                     c.execute(
-                        "INSERT INTO review_threads (id, diff_id, version, file, side, start_line, end_line, state, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9)",
-                        params![id, diff_id, version, file, side, start, end.or(start), me2, now],
+                        "INSERT INTO review_threads (id, diff_id, version, file, side, start_line, end_line, state, created_by, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10)",
+                        params![id, diff_id, version, file, side, start, end.or(start), me2, now, kind],
                     )?;
                     id
                 }
@@ -173,10 +237,21 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
     if publish {
         hub.store.audit(caller.name.clone(), "diffs.comment".into(), format!("{} {} thread {tid}", d.repo, d.name)).await;
         // For whoever follows a diff's conversation (an agent's queue, the inbox).
-        hub.emit(&json!({
-            "type": "comment", "repo": d.repo, "diff": d.name, "version": version, "thread": tid, "comment": cid, "author": me, "body": said,
-            "file": file_c, "side": side_c, "start_line": start, "end_line": end.or(start), "diff_author": d.author, "diff_author_for": d.author_for,
-        }));
+        hub.emit(&crate::wire::events::ServerEvent::Comment(Box::new(crate::wire::events::Comment {
+            repo: d.repo.clone(),
+            diff: d.name.clone(),
+            version,
+            thread: tid.clone(),
+            comment: cid.clone(),
+            author: me.clone(),
+            body: said.clone(),
+            file: file_c,
+            side: side_c,
+            start_line: start,
+            end_line: end.or(start),
+            diff_author: d.author.clone(),
+            diff_author_for: d.author_for.clone(),
+        })));
         tell(hub, d, &me, vec![(tid.clone(), said)]);
     }
     Ok(json!({ "id": cid, "thread": tid, "draft": !publish }))
@@ -222,49 +297,177 @@ fn tell(hub: &std::sync::Arc<Hub>, d: &Diff, me: &str, said: Vec<(String, String
     });
 }
 
-/// `PATCH /api/comments/:id`: a comment's author edits it (`body`, `suggestion`); anyone who may
-/// review resolves or reopens its thread (`state`).
+/// A comment as editing and deleting it read it: its thread, its author, whether it was deleted;
+/// its thread's author, kind, state and place; its diff's name and repository.
+struct Found {
+    thread: String,
+    author: String,
+    deleted: bool,
+    opened_by: String,
+    kind: Kind,
+    resolved: bool,
+    at: String,
+    diff: String,
+    repo: String,
+}
+
+async fn found(hub: &Hub, id: &str) -> Result<Found, Fail> {
+    let key = id.to_owned();
+    hub.store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT c.thread_id, c.author, c.deleted_at IS NOT NULL, t.created_by, t.kind, t.state = 'resolved', t.file, t.start_line, CASE d.kind WHEN 'diff' THEN 'D' ELSE 'CR' END || d.number, p.name
+                 FROM review_comments c JOIN review_threads t ON t.id = c.thread_id JOIN diffs d ON d.id = t.diff_id JOIN repos p ON p.id = d.repo_id WHERE c.id = ?1",
+                [&key],
+                |r| {
+                    let (file, line): (Option<String>, Option<u32>) = (r.get(6)?, r.get(7)?);
+                    Ok(Found {
+                        thread: r.get(0)?,
+                        author: r.get(1)?,
+                        deleted: r.get(2)?,
+                        opened_by: r.get(3)?,
+                        kind: Kind::read(&r.get::<_, String>(4)?),
+                        resolved: r.get(5)?,
+                        at: kiln_ci::review::place(file.as_deref(), line),
+                        diff: r.get(8)?,
+                        repo: r.get(9)?,
+                    })
+                },
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(fail)?
+        .ok_or((StatusCode::NOT_FOUND, "no such comment".into()))
+}
+
+/// `PATCH /api/comments/:id`: a comment's author edits it (`body`, `suggestion`); its thread's
+/// author changes the thread's kind (`kind`, W26-R11); anyone who may review resolves or reopens
+/// its thread (`state`), but a blocking thread is resolved only by its author, or by an owner who
+/// says why (`reason`, kept with the thread: a reviewer who left can't strand a change). Kinds and
+/// resolutions are audited, and who resolved a thread, when and why, is kept.
 pub async fn edit(hub: &Hub, id: &str, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let (me, _) = who(caller);
-    let key = id.to_owned();
-    let found: Option<(String, String, String, String)> = hub
-        .store
-        .call(move |c| Ok(c.query_row("SELECT c.thread_id, c.author, t.diff_id, p.name FROM review_comments c JOIN review_threads t ON t.id = c.thread_id JOIN diffs d ON d.id = t.diff_id JOIN repos p ON p.id = d.repo_id WHERE c.id = ?1", [&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?))
-        .await
-        .map_err(fail)?;
-    let Some((thread, author, _diff, repo)) = found else { return Err((StatusCode::NOT_FOUND, "no such comment".into())) };
-    if !caller.can("diffs.review", &Scope::Repo { repo: repo.clone() }) {
+    let f = found(hub, id).await?;
+    if !caller.can("diffs.review", &Scope::Repo { repo: f.repo.clone() }) {
         return Err((StatusCode::FORBIDDEN, "commenting needs `diffs.review`".into()));
     }
     let text = body.get("body").and_then(Value::as_str).map(str::to_owned);
     let suggestion = body.get("suggestion").and_then(Value::as_str).map(str::to_owned);
-    if (text.is_some() || suggestion.is_some()) && !author.eq_ignore_ascii_case(&me) && !caller.is_owner() {
-        return Err((StatusCode::FORBIDDEN, "only its author edits a comment".into()));
+    if text.is_some() || suggestion.is_some() {
+        if f.deleted {
+            return Err((StatusCode::CONFLICT, "the comment was deleted".into()));
+        }
+        if !f.author.eq_ignore_ascii_case(&me) && !caller.is_owner() {
+            return Err((StatusCode::FORBIDDEN, "only its author edits a comment".into()));
+        }
     }
     let state = match body.get("state").and_then(Value::as_str) {
         None => None,
         Some(s @ ("open" | "resolved")) => Some(s.to_owned()),
         Some(other) => return Err(bad(format!("`state` is `open` or `resolved`, not `{other}`"))),
     };
-    let (cid, tid) = (id.to_owned(), thread.clone());
-    let (text_c, sug_c, state_c) = (text.clone(), suggestion.clone(), state.clone());
+    let kind = match body.get("kind").and_then(Value::as_str) {
+        None => None,
+        Some(k) => Some(Kind::parse(k).ok_or_else(|| bad(format!("`kind` is `question`, `nit`, `issue` or `blocking`, not `{k}`")))?),
+    }
+    .filter(|k| *k != f.kind);
+    let reason = body.get("reason").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
+    let theirs = f.opened_by.eq_ignore_ascii_case(&me);
+    let whose = kiln_ci::review::named(&f.opened_by);
+    // A thread's kind is its author's to change (W26-R11).
+    if kind.is_some() && !theirs {
+        return Err((StatusCode::FORBIDDEN, format!("{}: only {whose} changes this thread's kind", f.at)));
+    }
+    // A blocking thread holds the change until its author resolves it; an owner may, saying why.
+    let resolving = state.as_deref() == Some("resolved") && !f.resolved;
+    let reopening = state.as_deref() == Some("open") && f.resolved;
+    if resolving && f.kind == Kind::Blocking && !theirs {
+        if !caller.is_owner() {
+            return Err((StatusCode::FORBIDDEN, format!("{}: only {whose} resolves this blocking comment (or an owner, saying why)", f.at)));
+        }
+        if reason.is_none() {
+            return Err(bad(format!("{}: an owner resolving {whose}'s blocking comment says why (`reason`)", f.at)));
+        }
+    }
+    let (cid, tid, me2) = (id.to_owned(), f.thread.clone(), me.clone());
+    let (text_c, sug_c, reason_c) = (text.clone(), suggestion.clone(), reason.clone());
     hub.store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             if text_c.is_some() || sug_c.is_some() {
-                c.execute("UPDATE review_comments SET body = COALESCE(?2, body), suggestion = COALESCE(?3, suggestion), updated_at = ?4 WHERE id = ?1", params![cid, text_c, sug_c, now])?;
+                tx.execute("UPDATE review_comments SET body = COALESCE(?2, body), suggestion = COALESCE(?3, suggestion), updated_at = ?4 WHERE id = ?1", params![cid, text_c, sug_c, now])?;
             }
-            if let Some(s) = state_c {
-                c.execute("UPDATE review_threads SET state = ?2 WHERE id = ?1", params![tid, s])?;
+            if let Some(k) = kind {
+                tx.execute("UPDATE review_threads SET kind = ?2 WHERE id = ?1", params![tid, k.as_str()])?;
             }
+            if resolving {
+                tx.execute("UPDATE review_threads SET state = 'resolved', resolved_by = ?2, resolved_at = ?3, resolution = ?4 WHERE id = ?1", params![tid, me2, now, reason_c])?;
+            } else if reopening {
+                tx.execute("UPDATE review_threads SET state = 'open', resolved_by = NULL, resolved_at = NULL, resolution = NULL WHERE id = ?1", [&tid])?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await
         .map_err(fail)?;
-    if let Some(s) = &state {
-        hub.store.audit(caller.name.clone(), format!("diffs.thread.{s}"), format!("{repo} thread {thread}")).await;
+    let (repo, thread) = (&f.repo, &f.thread);
+    if let Some(k) = kind {
+        hub.store.audit(caller.name.clone(), "diffs.thread.kind".into(), format!("{repo} {} thread {thread} ({}): {} to {}", f.diff, f.at, f.kind.as_str(), k.as_str())).await;
     }
-    Ok(json!({ "id": id, "thread": thread, "state": state }))
+    if let Some(s) = &state {
+        let why = reason.as_deref().filter(|_| resolving).map(|r| format!(" ({whose}'s {}): {r}", f.kind.as_str())).unwrap_or_default();
+        hub.store.audit(caller.name.clone(), format!("diffs.thread.{s}"), format!("{repo} thread {thread}{why}")).await;
+    }
+    if kind.is_some() || resolving || reopening {
+        // What waits on the gate to land asks it again: an automatic merge goes once it clears.
+        super::land::kick();
+    }
+    Ok(json!({ "id": id, "thread": thread, "state": state, "kind": kind.unwrap_or(f.kind).as_str() }))
+}
+
+/// `DELETE /api/comments/:id` (W26-R08): its author takes a comment back. A thread's first comment
+/// stays where it was, saying `deleted`, while replies remain under it; a thread left with no
+/// comment goes with it, and with it whatever it held. Audited.
+pub async fn delete(hub: &Hub, id: &str, caller: &Caller) -> Result<Value, Fail> {
+    let (me, _) = who(caller);
+    let f = found(hub, id).await?;
+    if f.deleted {
+        return Err((StatusCode::NOT_FOUND, "no such comment: it was deleted".into()));
+    }
+    if !caller.can("diffs.review", &Scope::Repo { repo: f.repo.clone() }) {
+        return Err((StatusCode::FORBIDDEN, "commenting needs `diffs.review`".into()));
+    }
+    if !f.author.eq_ignore_ascii_case(&me) {
+        return Err((StatusCode::FORBIDDEN, format!("only its author, {}, deletes a comment", kiln_ci::review::named(&f.author))));
+    }
+    let (cid, tid) = (id.to_owned(), f.thread.clone());
+    let gone = hub
+        .store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let first: Option<String> = tx.query_row("SELECT id FROM review_comments WHERE thread_id = ?1 ORDER BY created_at, rowid LIMIT 1", [&tid], |r| r.get(0)).optional()?;
+            let others: i64 = tx.query_row("SELECT COUNT(*) FROM review_comments WHERE thread_id = ?1 AND id <> ?2 AND deleted_at IS NULL", params![tid, cid], |r| r.get(0))?;
+            let gone = others == 0;
+            if gone {
+                tx.execute("DELETE FROM review_comments WHERE thread_id = ?1", [&tid])?;
+                tx.execute("DELETE FROM review_threads WHERE id = ?1", [&tid])?;
+            } else if first.as_deref() == Some(cid.as_str()) {
+                tx.execute("UPDATE review_comments SET body = 'deleted', suggestion = NULL, deleted_at = ?2, updated_at = ?2 WHERE id = ?1", params![cid, crate::util::now_unix()])?;
+            } else {
+                tx.execute("DELETE FROM review_comments WHERE id = ?1", [&cid])?;
+            }
+            tx.commit()?;
+            Ok(gone)
+        })
+        .await
+        .map_err(fail)?;
+    hub.store.audit(caller.name.clone(), "diffs.comment.delete".into(), format!("{} {} thread {} ({}) comment {id}{}", f.repo, f.diff, f.thread, f.at, if gone { ", and the thread with it" } else { "" })).await;
+    if gone {
+        super::land::kick();
+    }
+    Ok(json!({ "id": id, "thread": f.thread, "deleted": true, "thread_deleted": gone }))
 }
 
 // ------------------------------------------------------------------ reviews and policy
@@ -374,6 +577,10 @@ pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     let (_, path) = super::diffs::home(hub, d).await?;
     let (policy, owners) = policy(hub, &path, &d.trunk).await;
     let mut blockers = land::blockers(&policy.land, &owners, &f);
+    // A blocking thread holds landing, and any automatic land, until its author resolves it
+    // (W26-R11): the gate's hold, as accepting and Ship read it. The change stays out of the queue
+    // until its review clears (W26-R02).
+    blockers.extend(gate_of(hub, d, None).await?.reasons());
     match State::parse(&d.state) {
         Some(State::Draft) => blockers.insert(0, "it's a draft".into()),
         Some(State::Landed) => blockers = vec!["it landed".into()],
@@ -397,6 +604,12 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     if action == Action::Accept && d.author.eq_ignore_ascii_case(&me) {
         return Err((StatusCode::FORBIDDEN, format!("{} is yours: someone else accepts it", d.name)));
     }
+    // Accepting goes through the gate (W26-R11): a blocking thread or a conflict holds it, saying
+    // why; open issues ask to go ahead anyway (`force`); what's still open is said.
+    let note = match action {
+        Action::Accept => gate_of(hub, d, Some(&me)).await?.approve(body.get("force").and_then(Value::as_bool).unwrap_or(false)).map_err(|why| (StatusCode::CONFLICT, why))?,
+        _ => None,
+    };
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
     let latest = versions.last().map_or(1, |v| v.n);
     let (id, me2, text2) = (d.id.clone(), me.clone(), text.clone());
@@ -452,8 +665,19 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     }
     let shown = if matches!(state, State::NeedsReview | State::ChangesRequested | State::Accepted) { now } else { state };
     hub.store.audit(caller.name.clone(), format!("diffs.review.{}", action.as_str()), format!("{} {} v{latest}", d.repo, d.name)).await;
-    hub.emit(&json!({ "type": "review", "repo": d.repo, "diff": d.name, "version": latest, "reviewer": me, "action": action.as_str(), "body": text, "published": published, "state": shown.as_str(), "diff_author": d.author, "diff_author_for": d.author_for }));
-    Ok(json!({ "diff": d.name, "action": action.as_str(), "version": latest, "published": published, "state": shown.as_str() }))
+    hub.emit(&crate::wire::events::ServerEvent::Review(Box::new(crate::wire::events::Review {
+        repo: d.repo.clone(),
+        diff: d.name.clone(),
+        version: latest,
+        reviewer: me.clone(),
+        action: action.as_str().to_owned(),
+        body: text.clone(),
+        published,
+        state: shown.as_str().to_owned(),
+        diff_author: d.author.clone(),
+        diff_author_for: d.author_for.clone(),
+    })));
+    Ok(json!({ "diff": d.name, "action": action.as_str(), "version": latest, "published": published, "state": shown.as_str(), "note": note }))
 }
 
 /// `POST /api/diffs/:id/viewed`: `{ file, viewed }` for the caller, at the latest version (it
@@ -559,98 +783,170 @@ pub async fn inbox(hub: &Hub, caller: &Caller) -> Result<Value, Fail> {
     Ok(json!({ "you": me, "waiting_for_you": yours, "waiting_for_others": theirs, "review_requested": asked, "your_diffs": mine }))
 }
 
-/// `POST /api/comments/:id/apply` (W14-R05): a comment's suggestion, the lines it replaces taken
-/// to the latest version. A diff gets a new version, its commit amended (same parent, same
-/// message, same author); a change request's branch gets a commit. The thread is resolved, saying
-/// where the suggestion went.
-pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Caller) -> Result<Value, Fail> {
+/// A comment as applying its suggestions reads it (W26-R10): its body and old `suggestion` field,
+/// its author, whether it's published or deleted, and its thread's place.
+struct Suggested {
+    comment: String,
+    field: Option<String>,
+    body: String,
+    by: String,
+    published: bool,
+    deleted: bool,
+    thread: String,
+    diff: String,
+    version: u32,
+    file: Option<String>,
+    side: Option<String>,
+    start: Option<u32>,
+    end: Option<u32>,
+}
+
+/// `POST /api/comments/:id/apply` `{ suggestion? }` (W14-R05, W26-R10): one of a comment's
+/// suggestions (its body's `suggestion` blocks, then its old `suggestion` field as one more;
+/// `suggestion` says which when it has several) taken to the latest revision, where it replaces the
+/// lines its thread is on. It's a revision of whoever applies it, made through the one commit path
+/// W27-R03 signs ([`super::revision::commit`]): a diff's commit amended (its parent, message and
+/// author kept), a change request's branch given a commit of the applier's; the applier its
+/// committer and the suggester a co-author, as GitHub has it. The revision says why it exists
+/// (`suggestion applied`, its thread, the comment and which suggestion), and the thread says which
+/// revision applied it and is resolved, unless it's blocking and someone else's (W26-R11). A
+/// suggestion whose lines changed since says it's outdated and changes nothing, as does a draft's
+/// or one applied already.
+pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let key = id.to_owned();
-    #[allow(clippy::type_complexity)]
-    let found: Option<(Option<String>, String, String, String, u32, Option<String>, Option<String>, Option<u32>, Option<u32>)> = hub
+    let found: Option<Suggested> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT c.suggestion, c.author, c.thread_id, t.diff_id, t.version, t.file, t.side, t.start_line, t.end_line FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE c.id = ?1 OR CAST(c.rowid AS TEXT) = ?1",
+                "SELECT c.id, c.suggestion, c.body, c.author, c.published, c.deleted_at IS NOT NULL, c.thread_id, t.diff_id, t.version, t.file, t.side, t.start_line, t.end_line
+                 FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE c.id = ?1 OR CAST(c.rowid AS TEXT) = ?1",
                 [&key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                |r| {
+                    Ok(Suggested {
+                        comment: r.get(0)?,
+                        field: r.get(1)?,
+                        body: r.get(2)?,
+                        by: r.get(3)?,
+                        published: r.get(4)?,
+                        deleted: r.get(5)?,
+                        thread: r.get(6)?,
+                        diff: r.get(7)?,
+                        version: r.get(8)?,
+                        file: r.get(9)?,
+                        side: r.get(10)?,
+                        start: r.get(11)?,
+                        end: r.get(12)?,
+                    })
+                },
             )
             .optional()?)
         })
         .await
         .map_err(fail)?;
-    let Some((suggestion, suggested_by, thread, diff, version, file, side, start, end)) = found else { return Err((StatusCode::NOT_FOUND, "no such comment".into())) };
-    let Some(suggestion) = suggestion else { return Err(bad("the comment suggests nothing")) };
-    let (Some(file), Some(start)) = (file, start) else { return Err(bad("a suggestion is on a file's lines")) };
-    if side.as_deref() == Some("old") {
+    let c = found.filter(|c| !c.deleted).ok_or((StatusCode::NOT_FOUND, "no such comment".to_owned()))?;
+    let at = kiln_ci::review::place(c.file.as_deref(), c.start);
+    // As on GitHub, a pending review's suggestion waits for the review.
+    if !c.published {
+        return Err((StatusCode::CONFLICT, format!("{at}: a draft's suggestion applies once its review is published")));
+    }
+    let all = kiln_ci::suggest::suggestions(&c.body, c.field.as_deref());
+    let which = match body.get("suggestion") {
+        Some(v) => v.as_u64().and_then(|i| u32::try_from(i).ok()).ok_or_else(|| bad("`suggestion` is which of the comment's suggestions, from 0"))?,
+        None if all.len() > 1 => return Err(bad(format!("the comment suggests {} changes: say which (`suggestion`, 0 to {})", all.len(), all.len() - 1))),
+        None => 0,
+    };
+    let Some(suggestion) = all.into_iter().find(|s| s.index == which) else {
+        return Err(bad(if which == 0 { "the comment suggests nothing".to_owned() } else { format!("the comment has no suggestion {which}") }));
+    };
+    let (Some(file), Some(start)) = (c.file.clone(), c.start) else { return Err(bad("a suggestion is on a file's lines")) };
+    if c.side.as_deref() == Some("old") {
         return Err(bad("a suggestion replaces lines of the new side"));
     }
-    let d = super::diffs::find(hub, &diff).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, "the diff is gone".to_owned()))?;
+    let d = super::diffs::find(hub, &c.diff).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, "the diff is gone".to_owned()))?;
     if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {
         return Err((StatusCode::FORBIDDEN, "applying a suggestion needs `diffs.submit`".into()));
     }
     if !State::parse(&d.state).is_some_and(|s| s.is_open() && s != State::Landing) {
         return Err((StatusCode::CONFLICT, format!("{} is {}", d.name, d.state)));
     }
-    let versions = super::diffs::versions(hub, &d).await.map_err(fail)?;
-    let (Some(from), Some(latest)) = (versions.iter().find(|v| v.n == version).cloned(), versions.last().cloned()) else { return Err(bad("the comment's version is gone")) };
-    let (repo, path) = super::diffs::home(hub, &d).await?;
-    let (s, e) = follow(hub, &path, &file, "new", (&from, &latest), (start, end.unwrap_or(start))).await.ok_or((StatusCode::CONFLICT, "the lines it replaces changed since: it's outdated".to_owned()))?;
-    // The file with the lines replaced.
-    let old = gitops::run_git(hub, &["-C", &path, "show", &format!("{}:{file}", latest.commit)], LS_REMOTE_TIMEOUT).await.map_err(|_| bad(format!("{file} isn't in the latest version")))?;
-    let text = String::from_utf8_lossy(&old).into_owned();
-    let ends_nl = text.ends_with('\n');
-    let mut lines: Vec<&str> = text.lines().collect();
-    let (lo, hi) = (usize::try_from(s).unwrap_or(1).max(1) - 1, usize::try_from(e).unwrap_or(1));
-    if hi > lines.len() || lo >= hi {
-        return Err((StatusCode::CONFLICT, "the lines it replaces aren't there".into()));
+    if let Some((i, n, ..)) = applied(hub, &d).await?.get(&c.comment) {
+        return Err((StatusCode::CONFLICT, format!("{at}: {} applied in v{n}", if *i == which { "this suggestion was" } else { "another of this comment's suggestions was" })));
     }
-    let replacement: Vec<&str> = suggestion.lines().collect();
-    lines.splice(lo..hi, replacement);
-    let mut new_text = lines.join("\n");
-    if ends_nl {
-        new_text.push('\n');
+    let versions = super::diffs::versions(hub, &d).await.map_err(fail)?;
+    let (Some(from), Some(latest)) = (versions.iter().find(|v| v.n == c.version).cloned(), versions.last().cloned()) else { return Err(bad("the comment's version is gone")) };
+    let (repo, path) = super::diffs::home(hub, &d).await?;
+    // The thread's lines where the latest revision has them, or outdated: changed since.
+    let (s, e) = follow(hub, &path, &file, "new", (&from, &latest), (start, c.end.unwrap_or(start))).await.ok_or_else(|| (StatusCode::CONFLICT, format!("{at}: this suggestion is outdated: its lines changed since v{}", c.version)))?;
+    let old = gitops::run_git(hub, &["-C", &path, "show", &format!("{}:{file}", latest.commit)], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{file} isn't in v{}", latest.n)))?;
+    let text = String::from_utf8(old).map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, format!("{file} isn't text: a suggestion changes lines of text")))?;
+    let new_text = kiln_ci::suggest::replace(&text, (s, e), &suggestion.lines).ok_or_else(|| (StatusCode::CONFLICT, format!("{at}: the lines it replaces aren't in v{}", latest.n)))?;
+    if new_text == text {
+        return Err((StatusCode::CONFLICT, format!("{at}: v{} reads as it suggests already", latest.n)));
     }
     let listing = gitops::run_git(hub, &["-C", &path, "ls-tree", &latest.commit, "--", &file], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
     let mode = listing.split_whitespace().next().unwrap_or("100644").to_owned();
     let tree = super::diffs::tree_with(hub, &path, &latest.commit, super::diffs::Edit::Put { file: &file, mode: &mode, content: new_text.into_bytes() }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let (me, _) = who(caller);
-    let applier = me.strip_prefix("user:").unwrap_or(&me).to_owned();
-    let n = match &d.branch {
-        // A change request: a commit on its branch, a version from it.
+    let suggester = c.by.clone();
+    let lines = if s == e { format!("line {s}") } else { format!("lines {s}-{e}") };
+    let note = format!("applied a suggestion from {suggester}");
+    let (made, n) = match &d.branch {
+        // A change request: a commit of the applier's on its branch, a version from it.
         Some(branch) => {
-            let msg = format!("Apply a suggestion from {suggested_by}\n\nOn {file}, lines {s}-{e}.\n");
-            let c = super::diffs::make_commit(hub, &path, &tree, &latest.commit, (&applier, None), &applier, &msg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &c, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{branch} moved: push or pull, then try again")))?;
+            let message = format!("Apply a suggestion from {suggester}\n\nOn {file}, {lines}.\n");
+            let commit = super::revision::Commit { tree: &tree, parents: &[latest.commit.as_str()], author: (&me, None), by: &caller.name, co_authors: &[suggester.as_str()], message: &message };
+            let made = super::revision::commit(hub, &path, &commit).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &made.sha, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{branch} moved: push or pull, then try again")))?;
             let by = super::cr::By { pushed_by: caller.name.clone(), author: super::diffs::author_of(&caller.name, Some(caller.kind)), started_by: caller.started_by() };
-            super::cr::submit(hub, &repo, &path, &d.trunk, branch, &c, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version
+            let n = super::cr::submit(hub, &repo, &path, &d.trunk, branch, &made.sha, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version;
+            (made, n)
         }
-        // A diff: its commit amended.
+        // A diff: its commit amended, still its author's; a suggester who wrote it isn't named again.
         None => {
             let message = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%B", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
             let who_wrote = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%an <%ae>%x00%ad", "--date=raw", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
             let (author, date) = who_wrote.split_once('\0').unwrap_or((&who_wrote, ""));
-            let c = super::diffs::make_commit(hub, &path, &tree, &latest.parent, (author, Some(date).filter(|d| !d.is_empty())), &applier, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            let patch = super::diffs::git_run(hub, &["-C", &path, "show", "--no-color", &c], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
+            let co: Vec<&str> = if suggester.eq_ignore_ascii_case(&d.author) { Vec::new() } else { vec![suggester.as_str()] };
+            let commit = super::revision::Commit { tree: &tree, parents: &[latest.parent.as_str()], author: (author, Some(date)), by: &caller.name, co_authors: &co, message: &message };
+            let made = super::revision::commit(hub, &path, &commit).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let patch = super::diffs::git_run(hub, &["-C", &path, "show", "--no-color", &made.sha], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
             let patch_id = super::diffs::git_with_input(hub, &["-C", &path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
             let id = d.id.clone();
             let below: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT parent_diff FROM diffs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.flatten())).await.map_err(fail)?;
-            let nv = super::diffs::NewVersion { commit: c, parent: latest.parent.clone(), base: latest.base.clone(), patch_id, message, note: Some(format!("applied a suggestion from {suggested_by}")), rebase_only: false, pushed_by: caller.name.clone(), parent_diff: below };
-            super::diffs::add_version(hub, &repo, &path, &d, nv).await.map_err(fail)?
+            let nv = super::diffs::NewVersion {
+                commit: made.sha.clone(),
+                parent: latest.parent.clone(),
+                base: latest.base.clone(),
+                patch_id,
+                message: made.message.clone(),
+                note: Some(note.clone()),
+                rebase_only: false,
+                pushed_by: caller.name.clone(),
+                parent_diff: below,
+            };
+            let n = super::diffs::add_version(hub, &repo, &path, &d, nv).await.map_err(fail)?;
+            (made, n)
         }
     };
-    // The thread says where it went, and is done.
-    let (t, me2, note) = (thread.clone(), me.clone(), format!("Applied in v{n}."));
-    hub.store
+    // The revision's why (W26-R04): a suggestion applied, its thread, the comment and which.
+    let why = super::revision::Why { why: "suggestion applied", thread: Some(&c.thread), comment: Some((&c.comment, which)), note: Some(&note) };
+    if !super::revision::record(hub, &d.id, n, &made.sha, &why).await.map_err(fail)? {
+        tracing::warn!(diff = %d.name, version = n, commit = %made.sha, "a suggestion's revision isn't the version's commit: its why isn't recorded");
+    }
+    // The thread says which revision applied it, and is done; a blocking one stays open until its
+    // author resolves it (W26-R11), unless they applied it themselves.
+    let (t, me2, said) = (c.thread.clone(), me.clone(), format!("Applied in v{n}."));
+    let resolved = hub
+        .store
         .call(move |c| {
             let now = crate::util::now_unix();
-            c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)", params![crate::util::new_id(), t, me2, note, now])?;
-            c.execute("UPDATE review_threads SET state = 'resolved' WHERE id = ?1", [&t])?;
-            Ok(())
+            c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)", params![crate::util::new_id(), t, me2, said, now])?;
+            Ok(c.execute("UPDATE review_threads SET state = 'resolved', resolved_by = ?2, resolved_at = ?3 WHERE id = ?1 AND (kind <> 'blocking' OR lower(created_by) = lower(?2))", params![t, me2, now])? > 0)
         })
         .await
         .map_err(fail)?;
-    hub.store.audit(caller.name.clone(), "diffs.suggestion.apply".into(), format!("{} {} v{n}", d.repo, d.name)).await;
-    Ok(json!({ "diff": d.name, "version": n, "thread": thread, "state": "resolved" }))
+    hub.store.audit(caller.name.clone(), "diffs.suggestion.apply".into(), format!("{} {} v{n} ({at}: {suggester}'s suggestion {which}, comment {})", d.repo, d.name, c.comment)).await;
+    Ok(json!({ "diff": d.name, "version": n, "thread": c.thread, "state": if resolved { "resolved" } else { "open" }, "commit": made.sha, "suggestion": which, "signer": made.signer }))
 }
 
 /// Says when a run on a diff's or change request's version finishes (`diff_run`): which version,
@@ -710,17 +1006,17 @@ async fn diff_run(hub: &Hub, run: &str) -> anyhow::Result<()> {
         .await?;
     let Some((_, name, version, author, author_for, repo, status, conclusion, workflow)) = found else { return Ok(()) };
     let key = run.to_owned();
-    let failed: Vec<Value> = hub
+    let failed: Vec<crate::wire::events::FailedLeg> = hub
         .store
         .call(move |c| {
             let mut st = c.prepare("SELECT id, COALESCE(job_id, key), status FROM jobs WHERE run_id = ?1 AND status IN ('failed', 'timed_out')")?;
             let rows = st.query_map([&key], |r| {
                 let id: String = r.get(0)?;
-                Ok(json!({ "leg": id, "name": r.get::<_, String>(1)?, "status": r.get::<_, String>(2)?, "failure": format!("/api/ci/legs/{id}/logs/failure") }))
+                Ok(crate::wire::events::FailedLeg { name: r.get::<_, String>(1)?, status: r.get::<_, String>(2)?, failure: format!("/api/ci/legs/{id}/logs/failure"), leg: id })
             })?;
             Ok(rows.filter_map(Result::ok).collect())
         })
         .await?;
-    hub.emit(&json!({ "type": "diff_run", "repo": repo, "diff": name, "version": version, "run": run, "workflow": workflow, "status": status, "conclusion": conclusion, "failed": failed, "diff_author": author, "diff_author_for": author_for }));
+    hub.emit(&crate::wire::events::ServerEvent::DiffRun(Box::new(crate::wire::events::DiffRun { repo, diff: name, version, run: run.to_owned(), workflow, status, conclusion, failed, diff_author: author, diff_author_for: author_for })));
     Ok(())
 }

@@ -118,6 +118,7 @@ pub const MAX_EVENTS: usize = 4_000;
 
 /// A change for the UI (and for the server's mirror of a machine's session).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Update {
     /// A session appeared, or is announced again after a reconnect (a snapshot follows). `since`:
@@ -126,6 +127,7 @@ pub enum Update {
     Open {
         info: Box<super::session::Info>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         since: Option<u64>,
     },
     /// The session is gone.
@@ -149,6 +151,7 @@ pub enum Update {
     /// rewind's). None: from the start.
     Reset {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         from: Option<u64>,
     },
 }
@@ -319,6 +322,10 @@ pub struct Core {
     /// A limit another session on the account reached, asked of the harness before it holds this
     /// one too (`pause::account_hold`).
     pub limit_ask: Option<super::pause::Ask>,
+    /// Whether it may go to work now: room on its machine for one more agent at work (at work
+    /// already, it may), as its host keeps it (`super::limit`). None (a core of no machine's): it
+    /// may.
+    pub room: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Default for Core {
@@ -376,7 +383,21 @@ impl Core {
             hold: false,
             harness: None,
             limit_ask: None,
+            room: None,
         }
+    }
+
+    /// Whether it may go to work now ([`Core::room`]): its state says since when it waits for room
+    /// (`State::room_wait`), and that it no longer does once it may.
+    pub fn has_room(&mut self) -> bool {
+        let Some(room) = &self.room else { return true };
+        let ok = room();
+        let wait = if ok { None } else { Some(self.state.room_wait.unwrap_or_else(Self::now)) };
+        if self.state.room_wait != wait {
+            self.state.room_wait = wait;
+            self.touch_state();
+        }
+        ok
     }
 
     /// Everything in it, for this process's next image ([`Core::thaw`]).

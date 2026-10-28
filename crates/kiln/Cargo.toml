@@ -36,6 +36,8 @@ hyper-block = "=0.1.0"
 # The bus kiln's events ride (docs/bus.md): Quiver, vendored at vendor/quiver.
 quiver = "=0.1.0"
 quiver-api = "=0.1.0"
+# The search across a change (docs/ci.md W26-R07): kiln-seams' Search on vorpal (vendor/vorpal).
+kiln-search = { path = "../kiln-search" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"
@@ -114,6 +116,11 @@ command-group = "5.0.1"
 workspace = true
 
 [dev-dependencies]
+# The UI's wire types, rendered to ui/src/api/wire/ by `wire::ts` (test builds alone: the release
+# binary doesn't carry it).
+ts-rs = { version = "12.0.1", features = ["serde-json-impl", "no-serde-warnings"] }
+kiln-ci = { path = "../kiln-ci", features = ["ts"] }
+kiln-cd = { path = "../kiln-cd", features = ["ts"] }
 kiln-sim = { path = "../kiln-sim" }
 tempfile = "3.27.0"
 # hyper-durable's RamStore, for sync's tests alone: kiln's copy compiles it only where a test asks

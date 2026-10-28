@@ -135,11 +135,12 @@ fn glob_files(wd: &Path, pattern: &str) -> Vec<String> {
     glob::glob(&full).map(|paths| paths.flatten().filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()).unwrap_or_default()
 }
 
-/// The leg's `PATH` from `path` (the runner's own by default): with what its steps added
+/// The leg's `PATH` from `path` (by default the runner's own, then the folders only its user's
+/// login shell has: `crate::harness::kinds::search_path`, W13-R03): with what its steps added
 /// (`GITHUB_PATH`), then kiln's own binary (`kiln auth`, its credential helper).
 fn leg_path(st: &State, path: Option<&str>) -> String {
     let sep = if cfg!(windows) { ';' } else { ':' };
-    let base_path = std::env::var("PATH").unwrap_or_default();
+    let base_path = crate::harness::kinds::search_path().map(|p| p.to_string_lossy().into_owned()).or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
     let mut path = st.path.apply(path.unwrap_or(base_path.as_str()), sep);
     if let Some(d) = &st.kiln_bin {
         path = format!("{path}{sep}{}", d.to_string_lossy());
@@ -264,6 +265,55 @@ impl Layout {
             runner_workspace,
         }
     }
+}
+
+/// Where a kiln-dialect leg's `TMPDIR` is (W02-R06): in its own temp, on the work volume, emptied
+/// with it before every leg.
+fn v1_tmp(l: &Layout) -> PathBuf {
+    l.temp.join("tmp")
+}
+
+/// The event as v1 named it (W02-R06): GitHub's `workflow_dispatch` is v1's `manual`, a tag's
+/// `push` its `tag`; the rest (`push`, `schedule`, kiln's own events) are named alike.
+fn v1_event(github: &serde_json::Value) -> String {
+    let s = |k: &str| github.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    match (s("event_name"), s("ref_type")) {
+        ("workflow_dispatch", _) => "manual".into(),
+        ("push", "tag") => "tag".into(),
+        (e, _) => e.into(),
+    }
+}
+
+/// The variables v1's runner gave every step (W02-R06, docs/pipelines.md), for a kiln-dialect
+/// leg: what kiln's own workflows read (`kiln:$KILN_SHA`, `$KILN_AGENT`). Beneath the job's own
+/// `env`, as every default is. `KILN_JOB` and `KILN_ATTEMPT` keep the engine's meaning.
+fn v1_env(a: &AssignmentV2, runner: &str, l: &Layout) -> Vec<(&'static str, String)> {
+    let g = &a.contexts.github;
+    let s = |k: &str| match g.get(k) {
+        Some(serde_json::Value::String(v)) => v.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    let sha = Some(s("sha")).filter(|v| !v.is_empty()).unwrap_or_else(|| a.sha.clone());
+    let tmp = v1_tmp(l).to_string_lossy().into_owned();
+    let mut v = vec![
+        ("KILN", "true".to_owned()),
+        ("KILN_REPO", a.repo.clone()),
+        ("KILN_SHA", sha),
+        ("KILN_BRANCH", s("ref_name")),
+        ("KILN_EVENT", v1_event(g)),
+        ("KILN_RUN_ID", a.run_id.clone()),
+        ("KILN_RUN_NUMBER", s("run_number")),
+        ("KILN_JOB_ID", a.job_id.clone()),
+        ("KILN_WORKSPACE", l.workspace.to_string_lossy().into_owned()),
+        ("KILN_AGENT", runner.to_owned()),
+    ];
+    // Windows tools find their temp folder through TEMP and TMP rather than TMPDIR.
+    if cfg!(windows) {
+        v.extend([("TEMP", tmp.clone()), ("TMP", tmp.clone())]);
+    }
+    v.push(("TMPDIR", tmp));
+    v
 }
 
 /// In a microVM's leg (W13-R05): its forwarder to the host's egress proxy, and what that proxy
@@ -1032,6 +1082,15 @@ impl Leg {
         let conf = super::credential::docker_config(&a.integrations, Some(&own), base);
         let wanted = map.is_none() || a.integrations.iter().any(|i| i.kind == "oci");
         if wanted && std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
+            // A leg on the host keeps the runner's builders, contexts and plugins, as a v1 job.
+            if map.is_none()
+                && let Some(from) = super::credential::runner_config_dir()
+            {
+                let to = docker.clone();
+                if let Ok(Err(e)) = crate::rt::blocking(move || super::credential::link_runner_config(&from, &to)).await {
+                    tracing::debug!(error = %e, "the runner's Docker config folder couldn't be linked into the leg's");
+                }
+            }
             st.env.insert("DOCKER_CONFIG".into(), seen(&docker));
             st.env.insert("KILN_REGISTRY_HOST".into(), own);
         }
@@ -1176,6 +1235,11 @@ impl Leg {
         if shard_items(a).is_some() {
             set("KILN_SHARD_ITEMS", l.temp.join("_kiln").join("shard-items").to_string_lossy().into_owned());
         }
+        if st.dialect == Dialect::Kiln {
+            for (k, val) in v1_env(a, &self.runner_name, l) {
+                set(k, val);
+            }
+        }
         // The server's own certificate authority beside the machine's roots (§2.6): Node adds
         // it to its own; git, curl, Python and OpenSSL take the bundle. A job's own say wins.
         // In the machine's own store, only Node and Python's requests (which read bundles of
@@ -1260,10 +1324,14 @@ impl Leg {
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         let items = shard_items(a);
+        let tmp = (dialect == Dialect::Kiln).then(|| v1_tmp(&layout));
         crate::rt::blocking(move || -> std::io::Result<()> {
             let _ = std::fs::remove_dir_all(&temp);
             std::fs::create_dir_all(&ws)?;
             std::fs::create_dir_all(&cmds)?;
+            if let Some(t) = tmp {
+                std::fs::create_dir_all(t)?;
+            }
             std::fs::create_dir_all(temp.join("_github_workflow"))?;
             if let Some(text) = items {
                 std::fs::create_dir_all(temp.join("_kiln"))?;
@@ -1272,6 +1340,9 @@ impl Leg {
             std::fs::write(temp.join("_github_workflow").join("event.json"), event)
         })
         .await??;
+        // Its steps' PATH has the folders only the runner's user's login shell has (`leg_path`,
+        // W13-R03): that shell is asked now, unless it answered in the last ten minutes.
+        crate::reach::serve::login_env().await;
         let trust = self.server_trust(&layout).await;
         let secrets: BTreeMap<String, String> = a.secrets.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
         let mut masks: Vec<String> = secrets.iter().filter(|(k, _)| !kiln_ci::secrets::DEBUG_FLAGS.contains(&k.as_str())).map(|(_, v)| v.clone()).collect();
@@ -1688,6 +1759,10 @@ impl Leg {
                         anyhow::bail!("git {}: {said}", args.get(2).copied().unwrap_or_default());
                     }
                 }
+                let dir = ws.clone();
+                if !crate::rt::blocking(move || pack_refs(&dir)).await.unwrap_or(false) {
+                    tracing::debug!(workspace = %w, "git pack-refs failed: the checkout keeps no packed-refs");
+                }
                 let Some(x) = warm.filter(|_| in_place) else { return Ok(()) };
                 // In place: only the files that differ are written, the rest keep their mtimes, and
                 // everything but the kept folders is cleaned. A ref (not a SHA) was fetched first.
@@ -1985,7 +2060,7 @@ impl Leg {
         };
         // W24-R07: a `memo:` step is looked up before it runs, a hit replayed instead; what earlier
         // hits left is put in place before anything runs.
-        let keyed = match self.memo_prepare(st, idx, step, nested, &env, &wd, shell.as_deref(), script.as_deref(), &with).await {
+        let keyed = match self.memo_prepare(st, idx, step, nested, &env, &wd, shell.as_deref(), script.as_deref(), &with, job_deadline).await {
             memo::Prepared::Hit(hit) => {
                 let outputs = self.memo_replay(st, idx, *hit).await;
                 self.finish(st, idx, id, Conclusion::Success, Conclusion::Success, Some(0), outputs, nested).await;
@@ -4745,6 +4820,16 @@ impl Again {
     }
 }
 
+/// A leg's checkout left as a clone leaves a repository: its refs packed, so `.git/packed-refs`
+/// exists, which a fetch into a new repository never writes. A build script that watches it
+/// (`cargo:rerun-if-changed`, as kiln's own build.rs does) runs again on every cargo command
+/// while it's missing, and its crate is built again each time: W28 step 3's replay saw bench's
+/// quic-transport rebuild kiln on each of its five `cargo test` runs and time out, where v1's
+/// clone built it once. Whether it went.
+fn pack_refs(dir: &std::path::Path) -> bool {
+    std::process::Command::new("git").arg("-C").arg(dir).args(["pack-refs", "--all"]).env("GIT_TERMINAL_PROMPT", "0").output().is_ok_and(|o| o.status.success())
+}
+
 /// Whether git's `said` is of a server it couldn't reach, or one that answered it's unavailable.
 fn unreachable(said: &str) -> bool {
     [
@@ -4913,6 +4998,33 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W28 step 3's replay: a leg's checkout (a fetch of its commit into a new repository) leaves
+    /// `.git/packed-refs`, as v1's clone does, so a build script watching it stays fresh.
+    #[test]
+    fn w28_a_legs_checkout_leaves_packed_refs_as_a_clone() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let git = |dir: &std::path::Path, args: &[&str]| -> anyhow::Result<String> {
+            let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).env("GIT_CONFIG_NOSYSTEM", "1").env("HOME", tmp.path()).output()?;
+            anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        let (src, w) = (tmp.path().join("src"), tmp.path().join("w"));
+        std::fs::create_dir_all(&src)?;
+        git(&src, &["init", "-q"])?;
+        git(&src, &["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "one"])?;
+        git(&src, &["config", "uploadpack.allowReachableSHA1InWant", "true"])?;
+        let sha = git(&src, &["rev-parse", "HEAD"])?;
+        git(tmp.path(), &["init", "-q", "w"])?;
+        git(&w, &["remote", "add", "origin", &format!("file://{}", src.display())])?;
+        git(&w, &["fetch", "-q", "--no-tags", "--depth=1", "origin", &sha])?;
+        git(&w, &["checkout", "-q", "--detach", "FETCH_HEAD"])?;
+        assert!(!w.join(".git/packed-refs").exists(), "a fetch into a new repository writes none");
+        assert!(pack_refs(&w));
+        assert!(w.join(".git/packed-refs").is_file());
+        assert_eq!(git(&w, &["rev-parse", "HEAD"])?, sha, "nothing else moved");
+        Ok(())
+    }
 
     /// The server URL actions that refuse GitHub Enterprise Server get keeps the server's port, so
     /// what they fetch from it reaches kiln (docs/ci.md W08-R08).
@@ -5713,6 +5825,82 @@ jobs:
         let (r, logs, _) = run_leg("on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: test -z \"$KILN_SHARD_ITEMS\"\n", &[])?;
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
         Ok(())
+    }
+
+    /// The variables a leg's step printed (`env`), by name.
+    #[cfg(unix)]
+    fn printed_env(log: &str) -> BTreeMap<String, String> {
+        log.lines().filter_map(|l| l.trim_end_matches('\r').split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+    }
+
+    /// W02-R06 on the engine: a kiln-dialect leg's steps see v1's job variables with v1's values
+    /// (`KILN_SHA` the commit, `KILN_BRANCH` the ref's name, `KILN_AGENT` the runner, `TMPDIR` in
+    /// the leg's work directory); the job's own `env` wins over them; the engine's `KILN_JOB` keeps
+    /// its meaning; and a GitHub-dialect leg gets none of them.
+    #[cfg(unix)]
+    #[test]
+    fn w02_r06_v1_job_variables() -> anyhow::Result<()> {
+        const ADDED: [&str; 11] = ["KILN", "KILN_REPO", "KILN_SHA", "KILN_BRANCH", "KILN_EVENT", "KILN_RUN_ID", "KILN_RUN_NUMBER", "KILN_JOB_ID", "KILN_WORKSPACE", "KILN_AGENT", "TMPDIR"];
+        let sha = "4f1c0de4f1c0de4f1c0de4f1c0de4f1c0de4f1c0";
+        let tweak = move |a: &mut AssignmentV2| {
+            a.run_id = "run-7".into();
+            a.sha = sha.into();
+            a.contexts.github = serde_json::json!({"event_name": "push", "ref": "refs/heads/main", "ref_name": "main", "ref_type": "branch", "sha": sha, "run_number": "42", "repository": "acme/app", "event": {}});
+        };
+        let wf = "on: push\njobs:\n  t:\n    steps:\n      - run: env\n      - run: test -d \"$TMPDIR\" && mktemp >/dev/null && echo tag=kiln:$KILN_SHA\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Kiln, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        let got = |k: &str| env.get(k).map(String::as_str);
+        let ws = got("GITHUB_WORKSPACE").ok_or_else(|| anyhow::anyhow!("no GITHUB_WORKSPACE: {env:?}"))?;
+        let runner_ws = Path::new(ws).parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
+        for (k, want) in [
+            ("KILN", "true"),
+            ("KILN_REPO", "acme/app"),
+            ("KILN_SHA", sha),
+            ("KILN_BRANCH", "main"),
+            ("KILN_EVENT", "push"),
+            ("KILN_RUN_ID", "run-7"),
+            ("KILN_RUN_NUMBER", "42"),
+            ("KILN_JOB_ID", "leg-1"),
+            ("KILN_WORKSPACE", ws),
+            ("KILN_AGENT", "test-runner"),
+            ("KILN_JOB", "leg-1"),
+        ] {
+            assert_eq!(got(k), Some(want), "{k}: {env:?}");
+        }
+        assert_eq!(got("KILN_SHA"), got("GITHUB_SHA"), "KILN_SHA is github.sha");
+        let tmp = got("TMPDIR").ok_or_else(|| anyhow::anyhow!("no TMPDIR: {env:?}"))?;
+        assert!(Path::new(tmp).starts_with(runner_ws), "TMPDIR {tmp} is in the leg's work directory {}", runner_ws.display());
+        assert!(logs.get(&1).is_some_and(|l| l.contains(&format!("tag=kiln:{sha}"))), "image.yaml's tag is the commit: {logs:?}");
+
+        // The job's own `env` wins.
+        let wf = "on: push\njobs:\n  t:\n    env: { KILN_BRANCH: mine, TMPDIR: /var/tmp }\n    steps:\n      - run: env\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Kiln, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        assert_eq!((env.get("KILN_BRANCH").map(String::as_str), env.get("TMPDIR").map(String::as_str)), (Some("mine"), Some("/var/tmp")), "{env:?}");
+
+        // A GitHub-dialect leg: none of them, but what this process had already.
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: env\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        for k in ADDED {
+            assert_eq!(env.get(k).cloned(), std::env::var(k).ok(), "{k} isn't added in the GitHub dialect: {env:?}");
+        }
+        Ok(())
+    }
+
+    /// W02-R06: the event as v1 named it.
+    #[test]
+    fn w02_r06_v1_event_names() {
+        let ev = |j: serde_json::Value| v1_event(&j);
+        assert_eq!(ev(serde_json::json!({"event_name": "workflow_dispatch", "ref_type": "branch"})), "manual");
+        assert_eq!(ev(serde_json::json!({"event_name": "push", "ref_type": "tag"})), "tag");
+        assert_eq!(ev(serde_json::json!({"event_name": "push", "ref_type": "branch"})), "push");
+        assert_eq!(ev(serde_json::json!({"event_name": "schedule"})), "schedule");
+        assert_eq!(ev(serde_json::json!({"event_name": "diff"})), "diff");
     }
 
     /// W04-R20 to R22 on the runner: typed outputs, exported environment, `run.env`, and a secret

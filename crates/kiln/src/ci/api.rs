@@ -44,6 +44,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W24-R07: the work ledger, for steps' reuse.
         ["_kiln", "work", "v1", rest @ ..] => Some(super::services::memo::route(hub, rest, req).await),
         ["twirp", service, method] => Some(super::services::twirp::route(hub, service, method, req).await),
+        // W24-R26: the Remote Execution API's cache (its CAS and action cache), gRPC for a leg's token.
+        [service, method] if super::work::reapi::serves(service) => Some(boxed(|| super::work::reapi::route(hub, service, method, req)).await),
         // W14: GitHub's REST API (as GHES serves it, at /api/v3) and GraphQL, for a leg's token.
         ["api", "v3", rest @ ..] => Some(super::rest::route(hub, rest, req).await),
         ["api", "graphql"] => Some(super::rest::graphql(hub, req).await),
@@ -93,6 +95,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
 pub fn is_open(seg: &[&str]) -> bool {
     git_path(seg)
         || matches!(seg, ["git", rest @ ..] if git_path(rest))
+        || matches!(seg, [service, _] if super::work::reapi::serves(service))
         || super::rest::is_web(seg)
         || super::rest::is_download(seg)
         || matches!(
@@ -138,6 +141,7 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (&Method::GET, ["runs", _, "pending" | "artifacts"])
             | (&Method::GET, ["runs", _, "artifacts", _, "download"])
             | (&Method::POST, ["runs", _, "cancel" | "rerun" | "approve"])
+            | (&Method::POST, ["legs", _, "retry"])
             | (&Method::GET, ["legs", _, "logs"])
             | (&Method::GET, ["environments"])
     )
@@ -190,6 +194,8 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::POST, ["repos", repo, "providers", "sync"]) => Ok(ok(&super::providers::sync_now(hub, repo).await?)),
         (&Method::GET, ["repos", repo, "providers", "workflows"]) => Ok(ok(&super::providers::workflows(hub, repo).await?)),
         (&Method::GET, ["repos", repo, "commits", sha, "checks"]) => Ok(ok(&super::providers::checks(hub, repo, sha).await?)),
+        // W26-R07: a search across a host's pull request, at its mirrored head.
+        (&Method::GET, ["repos", repo, "pulls", n, "search"]) => Ok(ok(&super::search::pull(hub, repo, n, q, caller).await?)),
         // W23-R06: the host's pull requests (merge requests).
         (_, ["repos", repo, "pulls", tail @ ..]) => crate::githost::pulls::route(hub, method, repo, tail, body, caller).await,
         // W03-R11: dispatches (another provider's, W23-R01).
@@ -200,6 +206,8 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
         (&Method::POST, ["runs", id, "rerun"]) => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
+        // W05-R28: a finished job again, here or elsewhere (another provider's, by its provider).
+        (&Method::POST, ["legs", id, "retry"]) => super::retry::retry(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
         (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
         (&Method::GET, ["environments"]) => super::environments::route(hub, method, &[], q, body, caller).await,
         _ => Err((StatusCode::NOT_FOUND, "no such route".into())),
@@ -304,6 +312,13 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let c = boxed(|| super::services::cas::collect(hub)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "objects": c.objects, "bytes": c.bytes })))
         }
+        // W24-R31: the reaper's policies.
+        (&Method::GET, ["work", "reap", "policies"]) => boxed(|| super::reap::get(hub, q)).await,
+        (&Method::PUT, ["work", "reap", "policies"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 1 << 16)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| super::reap::put(hub, q, body, caller.as_ref())).await
+        }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => boxed(|| super::routing::get(hub)).await,
         (&Method::PUT, ["routing", "rules"]) => {
@@ -365,6 +380,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["runs", id, which @ ("annotations" | "summary")]) => boxed(|| super::runs_api::part(hub, id, which, q)).await,
         (&Method::GET, ["legs", id]) => boxed(|| super::runs_api::leg(hub, id)).await,
         (&Method::GET, ["legs", id, "routing"]) => boxed(|| super::runs_api::routing(hub, id)).await,
+        (&Method::GET, ["legs", id, "runners"]) => boxed(|| super::retry::runners(hub, id)).await,
         (&Method::POST, ["legs", id, "rerun-step"]) => {
             let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
             let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 1 << 16)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;

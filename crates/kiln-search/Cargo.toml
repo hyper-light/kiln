@@ -1,0 +1,46 @@
+[package]
+name = "kiln-search"
+description = "The search across a change (docs/ci.md W26-R07): kiln-seams' Search on vorpal, vendored at vendor/vorpal. An index per tree: its files, each one's definitions by vorpal's outline, and their trigrams in vorpal's trigram store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures = "0.3.34"
+kiln-seams = { path = "../kiln-seams" }
+memchr = "2.8.3"
+parking_lot = "0.12.5"
+postcard = { version = "1.1.3", features = ["alloc"] }
+rayon = "1.12.0"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+# vorpal, vendored at vendor/vorpal (the root manifest's [patch.crates-io] points each name there;
+# docs/vendoring.md): its pattern engine, its outline, its trigram store, and the grammars of the
+# languages kiln reads structurally. Every name is pinned exactly, as kiln's other products are.
+vorpal-core = "=0.10.2"
+vorpal-kg = "=0.10.2"
+vorpal-language = { version = "=0.10.2", default-features = false, features = [
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-css",
+  "tree-sitter-go",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-json",
+  "tree-sitter-md",
+  "tree-sitter-python",
+  "tree-sitter-rust",
+  "tree-sitter-toml",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+] }
+vorpal-outline = "=0.10.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

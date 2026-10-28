@@ -648,23 +648,9 @@ a.ms-why:hover {
 }
 
 /* ---------------------------------------------------------------- how the list is shown, and messaging it */
-/* The filter field and the sort, side by side, on a phone too: there the sort gives way. */
+/* The filter field and the sort, side by side, on a phone too (a FilterBar). */
 .ms-bar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 220px;
-  gap: 10px;
   margin-bottom: 10px;
-}
-@container (max-width: 760px) {
-  .ms-bar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 180px);
-  }
-}
-@container (max-width: 520px) {
-  .ms-bar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 150px);
-    gap: 8px;
-  }
 }
 
 /* Message the agents: an agent's composer, in the page. */
@@ -783,6 +769,105 @@ a.ms-why:hover {
   font-size: 12.5px;
   cursor: pointer;
 }
+/* What to do with the agents selected (bulk.tsx): their buttons end the head's line (or, narrow, take
+   one of their own); what's asked, More, and how it went each take a line across the head. */
+.ms-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.ms-bulk-more {
+  margin-left: 4px;
+  font-size: 12.5px;
+}
+.ms-bulk-more[aria-expanded="true"] .ms-chev {
+  transform: rotate(90deg);
+}
+.ms-bulk-ask,
+.ms-bulk-row,
+.ms-bulk-said {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+  padding: 2px 0 6px;
+}
+.ms-bulk-row {
+  gap: 8px 22px;
+}
+/* How it went: a long line wraps beside its ×, from the left. */
+.ms-bulk-said {
+  flex-wrap: nowrap;
+}
+.ms-bulk-said .ms-msg-result {
+  min-width: 0;
+  text-align: left;
+}
+.ms-bulk-said svg,
+.ms-bulk-said .hx-icon {
+  flex: none;
+}
+.ms-bulk-reach {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+}
+.ms-bulk-q {
+  min-width: 0;
+  color: #ededee;
+  font-size: 13px;
+}
+.ms-bulk-note {
+  flex: 1 1 100%;
+  margin: 0;
+  color: #8f939e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.ms-bulk-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 32px;
+  color: #c8cad0;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.ms-bulk-check .check {
+  flex: none;
+}
+.ms-bulk-names {
+  color: #8f939e;
+}
+/* Each agent's outcome, under the line: within the head, which a touch screen holds in view, so it scrolls past a few. */
+.ms-bulk-outcomes {
+  flex: 1 1 100%;
+  max-height: min(320px, 40dvh);
+  margin-top: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ms-msg-outcomes > li[data-result="done"] .ms-msg-o-result {
+  color: #a8c9bc;
+}
+@container (max-width: 760px) {
+  .ms-bulk {
+    flex: 1 1 100%;
+    margin-left: 0;
+  }
+}
+@media (pointer: coarse) {
+  .ms-bulk-ask .hx-pick select,
+  .ms-bulk-row .hx-pick select {
+    font-size: 16px;
+  }
+}
 /* A row's name, renamed in place: the field keeps the name's size. */
 .name-field.ms-name-field {
   margin-left: -9px;
@@ -797,6 +882,7 @@ a.ms-why:hover {
 
 /* A machine offline a while, with agents on it: they can go on elsewhere. */
 .ms-recover {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -808,8 +894,11 @@ a.ms-why:hover {
   background: #1b1915;
   color: #c9c3b6;
   font-size: 13px;
+  /* A sideways drag is the card's (to put it away), not the page's. */
+  touch-action: pan-y;
 }
 .ms-recover > span:first-child {
+  padding-right: 28px;
   flex: 1 1 320px;
   min-width: 0;
 }
@@ -821,6 +910,12 @@ a.ms-why:hover {
 }
 .ms-recover-none {
   color: #97999f;
+}
+/* × puts it away (a swipe does too, on a touch screen). */
+.ms-recover-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
 }
 
 /* ---------------------------------------------------------------- notifications, and a phone's page */
@@ -1032,4 +1127,247 @@ html[data-motion="paused"] .ms-pick {
 .ms-loading-meta {
   width: 120px;
   height: 10px;
+}
+
+/* ---------------------------------------------------------------- the composer, starting an agent (new-agent.tsx): no dialog, no button */
+/* Turning between starting an agent and messaging those selected: the same lines in the same places, crossfaded. */
+.mc-mode {
+  animation: mc-in 0.14s ease-out;
+}
+@keyframes mc-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+}
+.ms-to .mc-clear {
+  margin-left: auto;
+  font-size: 12px;
+}
+/* Under the box: where it starts (and the rest of the options) and past sessions, each a dropdown that opens in place below. */
+.mc-under {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 26px;
+  min-height: 34px;
+  margin-top: 6px;
+  padding: 0 4px;
+}
+.mc-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 0;
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.mc-toggle .mc-chev {
+  color: #7b7e88;
+  transition: transform 0.15s;
+}
+.mc-toggle[aria-expanded="true"] {
+  color: #ededee;
+}
+.mc-toggle[aria-expanded="true"] .mc-chev {
+  transform: rotate(180deg);
+}
+@media (hover: hover) {
+  .mc-toggle:hover {
+    color: #ededee;
+  }
+}
+.mc-sum {
+  color: #ededee;
+}
+.mc-sum::before {
+  margin: 0 8px 0 2px;
+  color: #5d6068;
+  content: "·";
+}
+.mc-from {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.mc-from .ms-link {
+  font-size: 12.5px;
+}
+/* More options, open: one quiet row each. */
+.mc-opts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 640px;
+  margin: 2px 0 14px;
+  padding: 0 4px;
+  animation: rs-fade 0.12s ease-out;
+}
+.mc-opt {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: center;
+  min-height: 44px;
+  border-top: 1px solid #17191d;
+}
+.mc-opt-key {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.mc-opt-val {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.mc-inline-input {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #ededee;
+  font-size: 13px;
+  outline: none;
+}
+.mc-inline-input::placeholder {
+  color: #6d7078;
+}
+.mc-seg {
+  display: inline-flex;
+  gap: 18px;
+}
+.mc-seg button {
+  padding: 6px 0 5px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.mc-seg button[aria-checked="true"] {
+  color: #ededee;
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2) 0 100% / 100% 1px no-repeat;
+}
+.mc-seg button:disabled {
+  color: #5d6068;
+  cursor: default;
+}
+/* What a row opens, under it across the options. */
+.mc-opt-panel {
+  grid-column: 1 / -1;
+  max-width: none;
+  padding: 2px 0 14px;
+}
+/* The folder row: the folder line itself, its own label said by the row's key. */
+.mc-opt-folder .mc-opt-val {
+  display: block;
+  padding: 10px 0;
+}
+.mc-opt-folder .ip-line > .ip-eyebrow {
+  display: none;
+}
+.mc-none {
+  color: #6d7078;
+}
+button.mc-pick {
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+button.mc-pick > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+button.mc-pick[aria-expanded="true"] .mc-chev {
+  transform: rotate(180deg);
+}
+.mc-pick {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #ededee;
+  font-size: 13px;
+}
+.mc-pick .mc-chev {
+  color: #7b7e88;
+}
+.mc-pick select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+.mc-past {
+  margin: 0 4px 12px;
+}
+.mc-note {
+  margin: 4px 4px 10px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.mc-note code {
+  color: #ededee;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.mc-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #d9b3b6;
+  font-size: 13px;
+}
+.mc-ok {
+  color: #b9d6ca;
+}
+.mc-ok svg {
+  color: #a8c9bc;
+}
+@container (max-width: 520px) {
+  .mc-under {
+    gap: 0 18px;
+  }
+}
+/* The field is the agent composer's own height from the start, so nothing moves as it's used. */
+.mc .hx-compose-input {
+  min-height: 46px;
+}
+/* Opening the agent it started: one view transition, each part landing where it goes on the agent's page (console.css names those). */
+:root[data-opening] .mc .mc-how {
+  view-transition-name: kiln-run;
+}
+:root[data-opening] .mc .hx-compose-box {
+  view-transition-name: kiln-composer;
+}
+::view-transition-group(*) {
+  animation-duration: 0.22s;
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .mc-mode,
+  .mc-opts {
+    animation: none;
+  }
+  .mc-toggle .mc-chev {
+    transition: none;
+  }
+}
+:root[data-motion="paused"] .mc-mode,
+:root[data-motion="paused"] .mc-opts {
+  animation: none;
+}
+:root[data-motion="paused"] .mc-toggle .mc-chev {
+  transition: none;
 }

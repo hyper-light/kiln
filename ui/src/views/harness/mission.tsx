@@ -7,8 +7,8 @@
 import * as React from "react";
 import "./harness.css";
 import "./mission.css";
-import { Link, useNavigate, useSearchParams } from "@/lib/router";
-import { ArrowUpRight, ChevronRight, Plus } from "lucide-react";
+import { Link, useNavigate } from "@/lib/router";
+import { ArrowUpRight, ChevronRight, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
@@ -26,6 +26,7 @@ import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
+import { BulkBar } from "./bulk";
 import { DEFAULT_VIEW, isFiltered, ListBar, sortOf, useGlide, useListHold, useShownList, type ListView } from "./list-tools";
 import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
@@ -33,18 +34,19 @@ import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
-import { SpawnDialog } from "./spawn";
+import { NewAgent } from "./new-agent";
+import { MISSION_DRAFT } from "./new-agent-draft";
+import { useDrafts } from "./state";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
+import { isMarked, markNotices, useMarks } from "./notices";
+import { swipeAway } from "./swipe-away";
 import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
-
-/** A phone: the page's head is one line, and the message box folds. */
-const PHONE = "(max-width: 640px)";
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -56,6 +58,9 @@ const WORD: Record<Stand, string> = {
   offline: "Offline",
   ended: "Ended",
 };
+
+/** An agent waiting for room on its machine to go to work (`room_wait`): what it was sent waits in its queue. */
+const ROOM = "Waiting for room: its machine has as many agents at work as its limit lets";
 
 /** The one line that matters for this agent right now. */
 function lineOf(a: AgentInfo, stand: Stand): string {
@@ -78,13 +83,14 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return [doing, plan].filter(Boolean).join(" · ");
     }
     case "finished":
+      if (a.room_wait) return ROOM;
       return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
     case "ready":
-      return a.goal || a.title || "No task yet";
+      return a.room_wait ? ROOM : a.goal || a.title || "No task yet";
     case "offline":
       return "Its machine is offline";
     case "ended":
-      return a.goal || a.title || "Ended";
+      return a.room_wait ? ROOM : a.goal || a.title || "Ended";
   }
 }
 
@@ -284,56 +290,16 @@ function StandsNow() {
 }
 
 export default function Mission() {
-  const [spawn, setSpawn] = React.useState(false);
-  const navigate = useNavigate();
-  const [params, setParams] = useSearchParams();
-  // ?new=1 (links from elsewhere) opens New agents: open, it stays so by itself, and the link's
-  // mark comes off the address.
-  const fromLink = params.get("new") === "1";
-  const phone = useMediaQuery(PHONE);
-  const opened = () => {
-    if (!fromLink) return;
-    setSpawn(true);
-    const n = new URLSearchParams(params);
-    n.delete("new");
-    setParams(n, { replace: true });
-  };
   return (
     <div className="container-console page ms-page">
       <title>Agents · kiln</title>
-      <PageIntro
-        index={6}
-        label="Agents"
-        title="Mission control."
-        compact
-        actions={
-          phone ? (
-            <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
-              <Plus />
-            </Button>
-          ) : (
-            <Button onClick={() => setSpawn(true)}>
-              New agents <Plus />
-            </Button>
-          )
-        }
-      />
+      <PageIntro index={5} label="Agents" title="Mission control." compact />
       <React.Suspense fallback={<div className="st" aria-hidden="true" />}>
         <StandsNow />
       </React.Suspense>
       <Loadable label="Loading agents" fallback={<RowsLoading />}>
-        <Agents onSpawn={() => setSpawn(true)} />
+        <Agents />
       </Loadable>
-      <SpawnDialog
-        open={spawn || fromLink}
-        onOpenChange={setSpawn}
-        onOpened={opened}
-        onStarted={(started) => {
-          setSpawn(false);
-          if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
-          else invalidate("harness/agents");
-        }}
-      />
     </div>
   );
 }
@@ -380,6 +346,11 @@ function Found({ all }: { all: { a: AgentInfo }[] }) {
 
 /** A machine offline this long, with agents on it, may be gone: they can go on elsewhere. */
 const GONE_AFTER_S = 120;
+/**
+ * The notice that machine `machine`, offline since `since` (s), may be gone: put away (× or a swipe)
+ * or acted on, it stays so for you everywhere (notices.ts) until the machine goes offline again.
+ */
+const goneKey = (machine: string, since: number) => `machine-gone:${machine}:${Math.round(since)}`;
 
 /**
  * Machines that have been offline a while with agents on them: if one is gone, its agents go on
@@ -389,6 +360,7 @@ const GONE_AFTER_S = 120;
 function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   const runners = useAgentsLive().data;
   const nowS = useNow() / 1000;
+  const marks = useMarks();
   const offline = new Map<string, number>();
   for (const { a, stand } of rows) {
     if (stand !== "offline" || a.target === "local") continue;
@@ -397,7 +369,7 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   }
   const gone = [...offline].flatMap(([machine, count]) => {
     const r = runners.find((x) => x.name === machine);
-    return r && !r.connected && nowS - r.last_seen > GONE_AFTER_S ? [{ machine, count, since: r.last_seen }] : [];
+    return r && !r.connected && nowS - r.last_seen > GONE_AFTER_S && !isMarked(marks, goneKey(machine, r.last_seen)) ? [{ machine, count, since: r.last_seen }] : [];
   });
   const others = runners.filter((r) => r.connected && !r.ephemeral && !r.outpost).map((r) => r.name);
   // A machine on battery that is low: its agents stop when it sleeps.
@@ -419,12 +391,16 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
 function RecoverMachine({ machine, count, since, others }: { machine: string; count: number; since: number; others: string[] }) {
   const [to, setTo] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const key = goneKey(machine, since);
+  const away = () => markNotices([key], "away");
   const go = async () => {
     setBusy(true);
     try {
       const { moved } = await harnessApi.recover(machine, to || undefined);
       const failed = moved.filter((m) => m.error);
       const n = moved.length - failed.length;
+      // All of them on elsewhere: done with, here and everywhere. Some left: the card stays for those.
+      if (n > 0 && failed.length === 0) markNotices([key], "done");
       if (n > 0)
         toast({
           title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`,
@@ -440,7 +416,7 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
     }
   };
   return (
-    <div className="ms-recover" role="status">
+    <div className="ms-recover" role="status" {...swipeAway<HTMLDivElement>(away)}>
       <span>
         {machine} has been offline since {relativeTime(since)}. If it&rsquo;s gone, its {count} agent{count === 1 ? "" : "s"} can go on elsewhere from kiln&rsquo;s copy of
         {count === 1 ? " its conversation" : " their conversations"}.
@@ -461,11 +437,46 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
       ) : (
         <span className="ms-recover-none">No other machine is connected to take them.</span>
       )}
+      <button type="button" className="icon-btn ms-recover-close" data-variant="bare" data-size="sm" aria-label={`Put away ${machine}'s notice`} title="Put away" onClick={away}>
+        <X size={14} />
+      </button>
     </div>
   );
 }
 
-function Agents({ onSpawn }: { onSpawn: () => void }) {
+/**
+ * The composer at the top of the page (no dialog, no New agents button): with agents selected it
+ * messages them (broadcast.tsx); with none it starts one (new-agent.tsx). What's written stays as it
+ * turns from one to the other, and the turn is a quick crossfade, the same lines in the same places.
+ */
+function MissionComposer({
+  picked,
+  all,
+  onPick,
+  onClear,
+  focusFor,
+}: {
+  picked: AgentInfo[];
+  all: AgentInfo[];
+  onPick: (ids: string[], on: boolean) => void;
+  onClear: () => void;
+  focusFor: "new" | "message" | null;
+}) {
+  const text = useDrafts((s) => s.drafts[MISSION_DRAFT] ?? "");
+  const setDraft = useDrafts((s) => s.setDraft);
+  const onText = React.useCallback((t: string | ((was: string) => string)) => setDraft(MISSION_DRAFT, typeof t === "function" ? t(useDrafts.getState().drafts[MISSION_DRAFT] ?? "") : t), [setDraft]);
+  return picked.length > 0 ? (
+    <div className="mc-mode" key="message">
+      <MessageBar agents={picked} reach="selected" onEnded={onClear} all={all} onPick={onPick} text={text} onText={onText} onClear={onClear} autoFocus={focusFor === "message"} />
+    </div>
+  ) : (
+    <div className="mc-mode" key="new">
+      <NewAgent text={text} onText={onText} all={all} onPick={onPick} autoFocus={focusFor === "new"} />
+    </div>
+  );
+}
+
+function Agents() {
   const { list, reload } = useAgents();
   const seen = useSeen();
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
@@ -478,9 +489,8 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
     setSelected(new Set());
     setPicking(false);
   };
-  // On a phone the message box stays folded until agents are selected or it's opened.
-  const phone = useMediaQuery(PHONE);
-  const [messaging, setMessaging] = React.useState(false);
+  // Where the composer's field takes the focus as it turns: to messaging, from an agent picked with @ in it; back to starting one, from Clear.
+  const [focusFor, setFocusFor] = React.useState<"new" | "message" | null>(null);
 
   const done = useAnswered();
   const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
@@ -507,7 +517,13 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
       return next;
     });
   }, []);
-  const select = React.useCallback((id: string, on: boolean) => setMany([id], on), [setMany]);
+  const select = React.useCallback(
+    (id: string, on: boolean) => {
+      setFocusFor(null);
+      setMany([id], on);
+    },
+    [setMany],
+  );
   // The rows' gestures ask what's selected now; their props are made once, with the list's hold.
   const [touch] = React.useState(() => {
     const now: { s: TouchSelect } = { s: { isSelected: () => false, set: () => undefined, selecting: false } };
@@ -537,21 +553,33 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
     },
     [some],
   );
-  const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
-  const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
   const findable = React.useMemo(() => all.map((r) => r.a), [all]);
-  const message = <MessageBar agents={targets} reach={reach} onEnded={clear} all={findable} onPick={setMany} />;
-  const folds = phone && checked.length === 0;
+  // Nothing selected, it starts an agent; agents selected, it messages those (and nothing else: "every agent shown" is Select all).
+  const composer = (
+    <MissionComposer
+      picked={checked.map((r) => r.a)}
+      all={findable}
+      onPick={(ids, on) => {
+        setMany(ids, on);
+        setFocusFor("message");
+      }}
+      onClear={() => {
+        clear();
+        setFocusFor("new");
+      }}
+      focusFor={focusFor}
+    />
+  );
   const renderRow = ({ a, stand, asking }: MissionRow) => <Row key={a.id} a={a} stand={stand} asking={asking} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />;
   // Every agent kiln runs, the subagents on their agents' rows too: none is listed again as found on its machine.
   const everyone = React.useMemo(() => list.map((a) => ({ a })), [list]);
 
   return (
     <>
+      {composer}
       {all.length > 0 && (
         <>
           <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
-          {!phone && message}
           <React.Suspense fallback={null}>
             <Recover rows={all} />
           </React.Suspense>
@@ -564,10 +592,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
       {all.length === 0 ? (
         <div className="ms-empty">
           <p className="ms-empty-title">No agents yet.</p>
-          <p>Claude Code, Codex, or any harness your machines have — one or a dozen. kiln runs them: steer them, answer them, review what they change.</p>
-          <Button onClick={onSpawn}>
-            New agents <Plus />
-          </Button>
+          <p>Claude Code, Codex, or any harness your machines have — one or a dozen: tell the box above what to do, and it starts. kiln runs them: steer them, answer them, review what they change.</p>
         </div>
       ) : (
         <>
@@ -632,14 +657,9 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                 )}
               </>
             )}
-            {folds && (
-              <button type="button" className="ms-link ms-msg-open" aria-expanded={messaging} onClick={() => setMessaging(!messaging)}>
-                <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
-                Message agents
-              </button>
-            )}
+            {/* What to do with those selected, in the head (held in view by touch while selecting); what they started, from every agent kiln runs. */}
+            <BulkBar agents={checked.map((r) => r.a)} all={list} onGone={clear} />
           </div>
-          {phone && (!folds || messaging) && message}
           {live.length > 0 ? (
             <div {...touch.props} data-held={held || undefined}>
               <ul className="ms-list" ref={glide}>

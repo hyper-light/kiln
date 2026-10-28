@@ -1,8 +1,9 @@
 # Install a kiln agent on this Windows machine, fetched from the kiln server that served this
 # script. Never asks for a password: installs into %LOCALAPPDATA%\Programs\kiln, puts that on your
-# PATH, and starts kiln at boot through a scheduled task that runs as you (`kiln install --agent`).
-# Windows asks for administrator rights once for that (an administrator PowerShell has them);
-# without them, or with nobody at the keyboard, the task starts kiln when you sign in instead.
+# PATH, and starts kiln at boot through a scheduled task that runs as you (`kiln setup`, which says
+# what it will do and asks first in this window). Windows asks for administrator rights once for
+# that (an administrator PowerShell has them); without them, or with nobody at the keyboard, the
+# task starts kiln when you sign in instead.
 #
 #   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Token <join-token> [-Labels windows] [-Name box1] [-Slots 4]
 #   $env:KILN_JOIN_TOKEN = '<join-token>'; irm @@KILN_SERVER@@/install.ps1 | iex
@@ -76,6 +77,33 @@ if ($Outpost) {
 Write-Host "kiln ($target) installed to $exe"
 # `kiln install` puts $dir on your PATH for new terminals; this one finds kiln now too.
 if (-not (($env:Path -split ';') -contains $dir)) { $env:Path = "$dir;$env:Path" }
+
+# `kiln setup` takes it from here: in this window it says what it will do and asks first; with
+# nobody here it asks nothing. Without a token (or with -Join) it asks the server to take this
+# machine. A kiln from before `kiln setup` goes on below as it always did. (Windows PowerShell stops
+# on a native command's error output while ErrorActionPreference is Stop: not for this question.)
+$hasSetup = $false
+try {
+  $ErrorActionPreference = 'Continue'
+  & $exe setup --help *> $null
+  $hasSetup = ($LASTEXITCODE -eq 0)
+} catch {
+  $hasSetup = $false
+} finally {
+  $ErrorActionPreference = 'Stop'
+}
+if ($hasSetup) {
+  $setupArgs = @('setup', '--server', $Server)
+  if ($Token -and -not $Join) { $setupArgs += @("--token=$Token") }
+  if ($Labels) { $setupArgs += @('--labels', $Labels) }
+  if ($Name) { $setupArgs += @('--name', $Name) }
+  if ($Slots) { $setupArgs += @('--slots', $Slots) }
+  if ($Quic) { $setupArgs += @('--quic', $Quic) }
+  if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) { $setupArgs += @('--unattended') }
+  & $exe @setupArgs
+  if ($LASTEXITCODE -ne 0) { throw "kiln setup failed (exit code $LASTEXITCODE)" }
+  return
+}
 
 if ($Join -or -not $Token) {
   # No token: ask to join; it waits for an admin to approve the code it prints, then installs.

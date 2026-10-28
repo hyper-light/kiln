@@ -238,6 +238,12 @@ pub enum AgentMsg {
     /// changed, and every 10 minutes, each superseding the last; only to a server announcing
     /// [`CAP_WORK`]. Appended last: postcard encodes variants by index.
     WorkState { json: String },
+    /// The most agent sessions this machine has at work at once, and where that comes from (JSON
+    /// [`crate::harness::limit::Held`]: what a person set from the server, its config's, or kiln's
+    /// default). Sent as it's welcomed and whenever it changes, each superseding the last; only to
+    /// a server announcing [`CAP_AGENT_LIMIT`]. Appended last: postcard encodes variants by index.
+    AgentLimit { json: String },
+
     /// An identity asked for (JSON [`IdentityAsk`], docs/ci.md W27-R01): a CSR for a key this
     /// runner process made and keeps (for itself, an agent session it holds at an epoch, a leg it
     /// runs); the server answers with [`ServerMsg::Identity`]. Only to a server announcing
@@ -247,6 +253,7 @@ pub enum AgentMsg {
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct NetDrop {
     pub lane: String,
     pub reason: String,
@@ -378,10 +385,16 @@ pub const CAP_HANDOVER: u64 = 1 << 35;
 /// ([`AgentMsg::WorkState`]); a server that says it takes that.
 pub const CAP_WORK: u64 = 1 << 36;
 
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: the most agent sessions a machine has at
+/// work at once, set from the server (docs/agents.md, "How many agents a machine runs"). A runner that
+/// says it takes [`ServerMsg::AgentLimit`] and says what it holds ([`AgentMsg::AgentLimit`]); a
+/// server that says it takes that.
+pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
+
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: identities (docs/ci.md W27-R01). A runner
 /// that says it asks for certificates for keys it makes and keeps ([`AgentMsg::Identity`]); a
 /// server that says it issues them ([`ServerMsg::Identity`]).
-pub const CAP_IDENTITY: u64 = 1 << 37;
+pub const CAP_IDENTITY: u64 = 1 << 38;
 
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -652,6 +665,12 @@ pub enum ServerMsg {
     /// wire's, the cluster group's and the restarts' `Kept` (CP-T3.2 landed after them): postcard
     /// encodes variants by index.
     HarnessSend { session: String, epoch: u64, json: String },
+    /// What a person set from the server for the most agent sessions this machine has at work at
+    /// once (JSON [`crate::harness::limit::Asked`]), over its config's; none set, its config's (or
+    /// kiln's default) holds. Sent as the runner says [`CAP_AGENT_LIMIT`] and whenever it changes;
+    /// the runner keeps it for its restarts. Appended last: postcard encodes variants by index.
+    AgentLimit { json: String },
+
     /// The certificate for an [`AgentMsg::Identity`], or why there's none (JSON [`IdentityGiven`],
     /// docs/ci.md W27-R01). Only to runners announcing [`CAP_IDENTITY`]. Appended last: postcard
     /// encodes variants by index.
@@ -817,6 +836,57 @@ mod tests {
         Ok(())
     }
 
+    /// W05-R22, found by W28 step 3's replay: a job pod (`kiln agent --ephemeral`, v1's `[k8s]`
+    /// jobs) never says what it can do, so it was written every job as for a runner from before the
+    /// CI work, without `requires`, and read it as this build does: `rust` refused as malformed
+    /// ("Found an Option discriminant that wasn't 0 or 1"), `ui` read with no steps and passed
+    /// without running one. A pod reads its job whole; a bare-metal runner that hasn't said keeps
+    /// the old layout (W22-AC09).
+    #[test]
+    fn w05_r22_a_job_pod_reads_its_assignment_whole() -> anyhow::Result<()> {
+        let p = crate::pipeline::parse(concat!(
+            "name: ci\njobs:\n",
+            "  rust:\n    runs-on: [k8s]\n    toolchain: rust\n    resources: { cpu: \"2\", memory: 16Gi }\n",
+            "    steps:\n      - { name: clippy, run: cargo clippy }\n      - { name: test, run: cargo test }\n",
+            "  ui:\n    runs-on: [k8s]\n    toolchain: node\n    steps: [{run: npm ci}, {run: npm run lint}]\n",
+            "  linux:\n    runs-on: [k8s]\n    requires: [\"os == linux\"]\n    steps: [{run: uname}]\n",
+        ))?;
+        let jobs = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+        assert_eq!(jobs.len(), 3);
+        let assign = |spec: PlannedJob| {
+            ServerMsg::Assign(Box::new(Assignment {
+                job_id: "j".into(),
+                run_id: "r".into(),
+                repo: "o/r".into(),
+                clone_url: String::new(),
+                sha: "0".repeat(40),
+                branch: "main".into(),
+                event: "push".into(),
+                run_number: 7,
+                attempt: 0,
+                spec,
+                secrets: vec![("K".into(), "v".into())],
+                job_token: "t".into(),
+                server_url: "http://kiln".into(),
+            }))
+        };
+        for spec in &jobs {
+            // What a pod's own decoder (this build's) reads of what the server writes it.
+            let read = decode::<ServerMsg>(&encode(&assign(spec.clone().for_assignee(0, true)))?)?;
+            let ServerMsg::Assign(a) = read else { anyhow::bail!("{} came back as another message", spec.key) };
+            assert_eq!((&a.spec.key, &a.spec.steps, &a.spec.requires), (&spec.key, &spec.steps, &spec.requires), "{} as its pod reads it", spec.key);
+            assert_eq!((a.secrets.len(), a.server_url.as_str()), (1, "http://kiln"), "{}: the fields after the job", spec.key);
+            // What the pod got before: the layout of a runner from before the CI work.
+            let before = decode::<ServerMsg>(&encode(&assign(spec.clone().for_runner(0)))?);
+            assert!(!matches!(&before, Ok(m) if m == &assign(spec.clone())), "{}: read whole without `requires`", spec.key);
+        }
+        // A bare-metal runner that hasn't said what it can do is still written the old layout.
+        let any = jobs.iter().find(|j| j.key == "ui").cloned().ok_or_else(|| anyhow::anyhow!("no ui"))?;
+        assert_eq!(encode(&assign(any.clone().for_assignee(0, false)))?, encode(&assign(any.clone().for_runner(0)))?);
+        assert_eq!(encode(&assign(any.clone().for_assignee(CAP_CI2, false)))?, encode(&assign(any.for_runner(CAP_CI2)))?);
+        Ok(())
+    }
+
     #[test]
     fn appended_variants_keep_their_indexes() -> anyhow::Result<()> {
         // Older peers decode by variant index: the new ones must come after every existing one.
@@ -902,17 +972,37 @@ mod tests {
         Ok(())
     }
 
+    /// A machine's agent limit comes after every older variant both ways (so a peer from before
+    /// reads every older frame as it did), and its bit is a new one.
+    #[test]
+    fn agent_limits_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let work = encode(&AgentMsg::WorkState { json: "{}".into() })?;
+        let held = AgentMsg::AgentLimit { json: r#"{"max_sessions":128,"from":"server","config":100}"#.into() };
+        let b = encode(&held)?;
+        assert_eq!(b.first().copied(), work.first().map(|i| i + 1), "AgentMsg::AgentLimit comes right after WorkState");
+        assert_eq!(b.first(), Some(&52));
+        assert_eq!(decode::<AgentMsg>(&b)?, held);
+        let send = encode(&ServerMsg::HarnessSend { session: "s".into(), epoch: 1, json: "{}".into() })?;
+        let asked = ServerMsg::AgentLimit { json: r#"{"max_sessions":128}"#.into() };
+        let b = encode(&asked)?;
+        assert_eq!(b.first().copied(), send.first().map(|i| i + 1), "ServerMsg::AgentLimit comes right after HarnessSend");
+        assert_eq!(b.first(), Some(&58));
+        assert_eq!(decode::<ServerMsg>(&b)?, asked);
+        assert!(CAP_AGENT_LIMIT.is_power_of_two() && CAP_AGENT_LIMIT == 1 << 37 && CAP_AGENT_LIMIT & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK) == 0);
+        Ok(())
+    }
+
     /// W27-R01: identities come after every older variant, and their bit is a new one.
     #[test]
     fn w27_r01_identities_are_appended_last() -> anyhow::Result<()> {
-        let work = encode(&AgentMsg::WorkState { json: String::new() })?;
-        let send = encode(&ServerMsg::HarnessSend { session: String::new(), epoch: 0, json: String::new() })?;
+        let limit = encode(&AgentMsg::AgentLimit { json: String::new() })?;
+        let asked = encode(&ServerMsg::AgentLimit { json: String::new() })?;
         let (a, s) = (AgentMsg::Identity { json: "{}".into() }, ServerMsg::Identity { json: "{}".into() });
         let (ab, sb) = (encode(&a)?, encode(&s)?);
-        assert_eq!(ab.first().copied(), work.first().map(|i| i + 1), "AgentMsg::Identity comes right after WorkState");
-        assert_eq!(sb.first().copied(), send.first().map(|i| i + 1), "ServerMsg::Identity comes right after HarnessSend");
+        assert_eq!(ab.first().copied(), limit.first().map(|i| i + 1), "AgentMsg::Identity comes right after AgentLimit");
+        assert_eq!(sb.first().copied(), asked.first().map(|i| i + 1), "ServerMsg::Identity comes right after AgentLimit");
         assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
-        assert!(CAP_IDENTITY.is_power_of_two() && CAP_IDENTITY == 1 << 37 && CAP_IDENTITY & (CAP_WIRE | CAP_NET_DROPS | 1 << 34 | CAP_HANDOVER | CAP_WORK) == 0);
+        assert!(CAP_IDENTITY.is_power_of_two() && CAP_IDENTITY == 1 << 38 && CAP_IDENTITY & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT) == 0);
         Ok(())
     }
 

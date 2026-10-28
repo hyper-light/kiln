@@ -24,6 +24,7 @@ use super::{Deploy, appset, kilncd, reads, store};
 
 /// An environment's move between providers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Move {
     pub environment: String,
     pub from: String,
@@ -35,6 +36,7 @@ pub struct Move {
     pub by: String,
     pub started_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub ended_at: Option<i64>,
     /// Hand over once the new provider agrees with what runs.
     #[serde(default)]
@@ -48,10 +50,13 @@ pub struct Move {
     #[serde(default)]
     pub registrations: Vec<Moved>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "MovePhase"))]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// The new provider is given each app in shadow, and compares.
@@ -66,10 +71,13 @@ pub enum Phase {
 
 /// One registration's part in a move.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "MovedRegistration"))]
 pub struct Moved {
     pub app: String,
     /// The new provider would change nothing of what runs but its own tracking marks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub agrees: Option<bool>,
     /// Where it disagrees: each object it would change, as a diff shows it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -79,8 +87,10 @@ pub struct Moved {
     pub uids: BTreeMap<String, String>,
     /// Objects whose uid changed, or that are gone, after it: made again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub remade: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub message: Option<String>,
 }
 
@@ -126,7 +136,7 @@ pub async fn get(d: &Deploy, env: &str) -> anyhow::Result<Option<Move>> {
 
 async fn save(d: &Deploy, m: &Move) -> anyhow::Result<()> {
     store::kv_set(&*d.records, &key(&m.environment), &serde_json::to_string(m)?).await?;
-    d.hub.emit(&json!({ "type": "deploy_move", "move": m }));
+    d.hub.emit(&crate::wire::events::ServerEvent::DeployMove { moving: Box::new(m.clone()) });
     Ok(())
 }
 

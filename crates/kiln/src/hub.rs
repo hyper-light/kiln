@@ -23,6 +23,7 @@ use crate::net::{Kind, NetEvent, NetHandle};
 use crate::pipeline::Context;
 use crate::proto::{self, AgentMsg, Assignment, Hello, JobResult, LANE_CONTROL, LANE_TERM, ServerMsg};
 use crate::store::{AgentRow, Job, Status, Store};
+use crate::wire::events::ServerEvent;
 
 /// How long a persistent agent may be gone before its jobs are requeued.
 pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
@@ -84,7 +85,7 @@ impl OutpostInvites {
 /// Whether a runner carries a label a job asks for (`runs-on`), in any case: one of its own, its
 /// name, or what its platform says (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
 /// `aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled so.
-fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
+pub(crate) fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
     want == name || labels.iter().any(|l| l.eq_ignore_ascii_case(want)) || platform_labels(os, arch).iter().any(|l| l.eq_ignore_ascii_case(want))
 }
 
@@ -103,6 +104,18 @@ fn facts_meet(requires: &[String], facts: Option<&kiln_ci::facts::RunnerFacts>, 
     }
     let Some(f) = facts else { return false };
     requires.iter().all(|r| kiln_ci::sched::routing::Constraint::parse(r).is_ok_and(|c| c.eval(f, labels)))
+}
+
+/// Why runner `a` can't take a job of `labels` (`runs-on`) and `requires` whatever its load, as
+/// [`Hub::pick_agent`] places it: each label it lacks, and each constraint its facts don't meet
+/// ([`meets`]). Empty: it can. Where a retry may ask the job to run (docs/ci.md W05-R28).
+pub(crate) fn cannot_take(labels: &[String], requires: &[String], a: &AgentLive) -> Vec<String> {
+    let mut why: Vec<String> = labels.iter().filter(|l| !carries(&a.labels, &a.os, &a.arch, &a.name, l)).map(|l| format!("lacks the label {l}")).collect();
+    match a.facts.as_deref() {
+        None if !requires.is_empty() => why.push("hasn't said what it has, which its `requires` needs".to_owned()),
+        facts => why.extend(requires.iter().filter(|r| !facts_meet(std::slice::from_ref(*r), facts, &a.labels)).map(|r| format!("needs {r}"))),
+    }
+    why
 }
 
 /// For a job waiting on its `requires`: each connected runner its labels fit, with the constraints
@@ -255,6 +268,7 @@ fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AgentLive {
     pub name: String,
     #[serde(skip)]
@@ -275,13 +289,21 @@ pub struct AgentLive {
     pub sample: Option<HostSample>,
     /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub battery: Option<crate::os::battery::Battery>,
     /// What its QUIC layer let go before the wire, by lane and reason, as it last said
     /// ([`AgentMsg::NetDrops`]); and what the server's let go of what it had for it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<proto::NetDrop>>", optional))]
     pub dropped: Vec<proto::NetDrop>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<proto::NetDrop>>", optional))]
     pub dropped_toward: Vec<proto::NetDrop>,
+    /// What of its messages the server couldn't read, and of the server's it couldn't
+    /// (`crate::wire::unread`): how many by wire and code, and the newest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub refused: Option<crate::wire::unread::Kept>,
     pub terminal: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. It takes no jobs and the server doesn't upgrade it.
@@ -298,13 +320,16 @@ pub struct AgentLive {
     pub lost_at: Option<Instant>,
     /// What the runner's probes found and its administrator declared (docs/ci.md W13-R01, R02).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub facts: Option<Box<kiln_ci::facts::RunnerFacts>>,
     /// The machine's runner processes, while it has more than one (a runner replaced without a
     /// restart: the old one keeps its terminals until they end). See `crate::instances`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<crate::instances::InstanceView>>", optional))]
     pub instances: Vec<crate::instances::InstanceView>,
     /// How its connection reaches the server, while connected (`GET /api/agents`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub transport: Option<crate::tunnel::Transport>,
     /// How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
     /// it takes no new work.
@@ -391,6 +416,9 @@ pub struct Hub {
     /// Time, as the goal driver and what else moves onto it take it: kiln's runtime in production,
     /// a simulated clock in tests (kiln-seams' `Clock`, docs/seams.md).
     pub clock: Arc<dyn kiln_seams::Clock>,
+    /// What the wires couldn't read (`crate::wire::unread`): counted, kept for each runner's and
+    /// agent session's page, audited.
+    pub refusals: Mutex<crate::wire::unread::Refusals>,
     /// Agents that have been sent Cancel for a job, with when (for the timeout escalation).
     cancel_sent: Mutex<HashMap<String, Instant>>,
     /// (job, agent) pairs recently declined: not offered again until DECLINE_BACKOFF passes.
@@ -411,6 +439,9 @@ pub struct Hub {
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
+    /// How many agent sessions each machine runs at once, as set here, and what each said it
+    /// holds (`crate::harness::limit`).
+    pub agent_limits: crate::harness::limit::AgentLimits,
     /// Peered clusters (`crate::peers`).
     pub peered: crate::peers::Peers,
     /// The tailnet's split DNS for the front doors' names (`crate::frontdoor::tailnet`).
@@ -419,6 +450,9 @@ pub struct Hub {
     pub sync: crate::sync::server::Sync,
     /// Reach: the links between runners this server relays, and their identities (`crate::reach`).
     pub reach: Mutex<crate::reach::relay::Relay>,
+    /// The copies of runners' trees other runners keep: the rules for them, and what each runner
+    /// said it holds and let go (`crate::reach::copies`, docs/reach.md §5.1).
+    pub copies: crate::reach::copies::Copies,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
@@ -434,6 +468,11 @@ pub struct Hub {
     pub blobs: crate::blobs::Opened,
     /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// The search across a change (docs/ci.md W26-R07): vorpal, its indexes under the server's
+    /// cache (`crate::ci::search`).
+    pub search: Arc<dyn kiln_seams::Search>,
+    /// Memo steps in flight, one execution per key and domain (docs/ci.md W28-R72).
+    pub flight: crate::ci::services::memo::Flights,
 }
 
 impl Hub {
@@ -471,11 +510,14 @@ impl Hub {
         let harness_dir = cfg.data("harness");
         // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
         let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        // The search across a change (W26-R07): an index per tree in the server's cache.
+        let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
+        let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
         Ok(Arc::new(Self {
             cfg,
@@ -520,6 +562,7 @@ impl Hub {
             gitops_wanted: Mutex::new(HashSet::new()),
             tool_fixes: Mutex::new(HashMap::new()),
             shutdown,
+            refusals: Mutex::new(crate::wire::unread::Refusals::new(Arc::clone(&clock))),
             clock,
             cancel_sent: Mutex::new(HashMap::new()),
             declined: Mutex::new(HashMap::new()),
@@ -530,10 +573,12 @@ impl Hub {
             handovers: Mutex::new(crate::handovers::Handovers::default()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
+            agent_limits: crate::harness::limit::AgentLimits::default(),
             peered: crate::peers::Peers::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
             reach: Mutex::new(crate::reach::relay::Relay::default()),
+            copies,
             places,
             tasks,
             shares: crate::sync::share::Shares::default(),
@@ -541,27 +586,48 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            search,
+            flight: Default::default(),
         }))
     }
 
-    /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
-    /// each other platform's runners upgrade to now.
+    /// A job of kiln's own release pipeline succeeded (`[updates]`), a v1 job or a leg of the CI
+    /// engine's run: the binaries it built are what each other platform's runners upgrade to now.
     pub(crate) async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
+        // The engine's run of a tag is a `push` of it.
+        let tagged;
+        let run = if run.event == "push" && run.branch != self.cfg.updates.release_branch && crate::updates::pushed_tag(self, &run.id).await {
+            tagged = crate::store::Run { event: "tag".into(), ..run.clone() };
+            &tagged
+        } else {
+            run
+        };
         // The server's commit, or the newest one a runner runs (`crate::fleet`).
         let newest = self.updates.fleet.target().map(|t| t.commit).unwrap_or_default();
         if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) && (newest.is_empty() || !crate::updates::adopts(&self.cfg.updates, run, &newest)) {
             return;
         }
-        let path = crate::api::artifact_path(self, job);
-        if !path.exists() {
-            return;
+        // v1's job keeps its artifacts as a tarball; the engine's leg uploaded them to CI's store.
+        let v1 = crate::api::artifact_path(self, job);
+        let (path, copied) = if v1.exists() {
+            (v1, false)
+        } else {
+            match crate::updates::leg_artifacts(self, job).await {
+                Ok(Some(p)) => (p, true),
+                Ok(None) => return,
+                Err(e) => return tracing::warn!(run = run.number, leg = job, error = %format!("{e:#}"), "the release pipeline's artifacts couldn't be read"),
+            }
+        };
+        let adopted = crate::updates::adopt_into(self, &path, run).await;
+        if copied {
+            let _ = std::fs::remove_file(&path);
         }
-        match crate::updates::adopt_into(self, &path, run).await {
+        match adopted {
             Ok(kept) if !kept.is_empty() => {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
                 self.updates.fleet.wake();
             }
             Ok(_) => {}
@@ -664,7 +730,7 @@ impl Hub {
         match crate::sync::wire::decode(json) {
             Some(crate::sync::wire::Msg::Repos(r)) => {
                 if self.places.heard(machine, r) {
-                    self.emit(&serde_json::json!({ "type": "places" }));
+                    self.emit(&ServerEvent::Places);
                 }
                 // Said when it connects, and when what it holds changes: what it shares.
                 self.shares.arrange(self);
@@ -707,37 +773,85 @@ impl Hub {
 
     /// Tell every UI that the session list changed.
     pub fn emit_terminals(&self) {
-        self.emit(&serde_json::json!({ "type": "terminals" }));
+        self.emit(&ServerEvent::Terminals);
     }
 
-    pub fn emit(&self, v: &serde_json::Value) {
+    /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners.
+    pub fn emit(&self, e: &ServerEvent) {
         if self.events.receiver_count() > 0 {
-            self.events.send(Arc::from(v.to_string()));
+            self.events.send(Arc::from(e.text()));
         }
     }
 
     pub async fn emit_job(&self, job_id: &str) {
         if let Ok(Some(mut j)) = self.store.job(job_id.to_owned()).await {
             j.spec = None;
-            self.emit(&serde_json::json!({"type": "job", "job": j}));
+            self.emit(&ServerEvent::Job { job: Box::new(j) });
         }
     }
 
     pub async fn emit_run(&self, run_id: &str) {
         if let Ok(Some(r)) = self.store.run(run_id.to_owned()).await {
-            self.emit(&serde_json::json!({"type": "run", "run": r}));
+            self.emit(&ServerEvent::Run { run: Box::new(r) });
         }
     }
 
     pub(crate) fn emit_agent(&self, a: &AgentLive) {
-        self.emit(&serde_json::json!({"type": "agent", "agent": a}));
+        self.emit(&ServerEvent::Agent { agent: Box::new(a.clone()) });
+    }
+
+    /// A message a wire couldn't read (`crate::wire::unread`): counted, kept for its sender's page
+    /// and `on`'s, audited, and each page it changed told. Some: tell its sender now, of how many
+    /// before it it wasn't told; None: not now.
+    pub async fn note_unread(&self, u: crate::wire::unread::Unread, on: Option<crate::wire::unread::Page>) -> Option<u64> {
+        let noted = self.refusals.lock().note(u, on);
+        self.audit_unread(noted.rows).await;
+        for page in &noted.changed {
+            self.emit_refused(page);
+        }
+        noted.tell
+    }
+
+    /// The audit log's rows a minute for what the wires couldn't read, as they come due.
+    pub(crate) async fn tick_unread(&self) {
+        let rows = self.refusals.lock().tick();
+        self.audit_unread(rows).await;
+    }
+
+    async fn audit_unread(&self, rows: Vec<crate::wire::unread::Row>) {
+        for r in rows {
+            let e = crate::audit::Entry {
+                principal: r.principal,
+                action: crate::wire::unread::ACTION.to_owned(),
+                target: Some(r.target.to_owned()),
+                result: r.result.to_owned(),
+                ip: r.address,
+                detail: r.detail,
+                ..Default::default()
+            };
+            crate::audit::write(&self.store, e).await;
+        }
+    }
+
+    /// `page`'s refusals changed: its viewers are told, a runner's in its record, an agent
+    /// session's in its info.
+    fn emit_refused(&self, page: &crate::wire::unread::Page) {
+        let kept = self.refusals.lock().kept(page).cloned();
+        match page {
+            crate::wire::unread::Page::Runner(name) => {
+                let a = self.agents.lock().get(name).cloned();
+                if let Some(mut a) = a {
+                    a.refused = kept;
+                    self.emit_agent(&a);
+                }
+            }
+            crate::wire::unread::Page::Session(id) => self.harness.set_refused(self, id, kept),
+        }
     }
 
     pub fn emit_queue(&self) {
         let m = metrics::global();
-        self.emit(&serde_json::json!({
-            "type": "queue", "queued": m.jobs_queued.get(), "running": m.jobs_running.get()
-        }));
+        self.emit(&ServerEvent::Queue(crate::wire::events::Queue::Counts { queued: m.jobs_queued.get(), running: m.jobs_running.get() }));
     }
 
     pub fn record_sample(&self, agent: &str, s: HostSample) {
@@ -752,7 +866,7 @@ impl Hub {
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
         }
-        self.emit(&serde_json::json!({"type": "sample", "agent": agent, "sample": s}));
+        self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
     }
 
     // ------------------------------------------------------------ agent view
@@ -786,6 +900,7 @@ impl Hub {
                     battery: None,
                     dropped: Vec::new(),
                     dropped_toward: Vec::new(),
+                    refused: None,
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
@@ -809,6 +924,7 @@ impl Hub {
         for a in &mut out {
             a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
             a.dropped_toward = a.peer.map(|p| metrics::net().toward(p)).unwrap_or_default();
+            a.refused = self.refusals.lock().kept(&crate::wire::unread::Page::Runner(a.name.clone())).cloned();
         }
         out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
         out
@@ -1169,6 +1285,8 @@ impl Hub {
                 self.send_waited(peer, waited).await;
             }
             self.flush_commands().await;
+            // The audit log's rows a minute for what the wires couldn't read.
+            self.tick_unread().await;
             // What the server has of each runner's streams, said again every few seconds: one lost
             // below the channel mustn't hold a runner's updates up until its next connection.
             if said.elapsed() >= HAVE_AGAIN {
@@ -1248,6 +1366,7 @@ impl Hub {
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
+        self.agent_limits.forget(&self.store, agent).await;
         self.places.forget(agent);
         self.tailnet.wake.notify();
         self.update_slot_gauges();
@@ -1390,7 +1509,7 @@ impl Hub {
             let what = format!("{agent} is on battery at {}%{left}: plug it in, or it sleeps and its runner with it", b.percent);
             tracing::warn!(machine = %agent, percent = b.percent, minutes = ?b.minutes, "a machine on battery is low");
             self.store.audit("kiln".into(), "machine.battery_low".into(), what.clone()).await;
-            self.emit(&serde_json::json!({"type": "machine.battery_low", "machine": agent, "battery": b, "text": what}));
+            self.emit(&ServerEvent::MachineBatteryLow { machine: agent.to_owned(), battery: b, text: what });
         }
     }
 
@@ -1448,7 +1567,7 @@ impl Hub {
         // Its agent sessions keep running there too; they are announced again on reconnect.
         self.harness.machine_lost(self, name);
         if self.ai_sessions.lock().remove(name).is_some() {
-            self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": name }));
+            self.emit(&ServerEvent::AiSessions { machine: name.to_owned() });
         }
         self.update_slot_gauges();
         self.emit_agent(&snapshot);
@@ -1633,7 +1752,7 @@ impl Hub {
                 Ok(sessions) => {
                     let old = self.ai_sessions.lock().insert(agent.clone(), sessions.clone());
                     if old.as_ref() != Some(&sessions) {
-                        self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": agent }));
+                        self.emit(&ServerEvent::AiSessions { machine: agent.to_owned() });
                     }
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable AI session report"),
@@ -1685,7 +1804,7 @@ impl Hub {
                 }
                 self.updates.on_build(self, &agent, &build);
                 self.updates.fleet.wake();
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
                 crate::frontdoor::control::on_build(self, &agent, caps).await;
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
@@ -1708,7 +1827,7 @@ impl Hub {
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
                 self.updates.fleet.wake();
-                self.emit(&serde_json::json!({ "type": "updates" }));
+                self.emit(&ServerEvent::Updates);
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::Cluster { json, raft } => match (self.store.group(), crate::store::learner::decode(&json)) {
@@ -1773,7 +1892,10 @@ impl Hub {
                     let waited = self.cmds.lock().not_wire(peer);
                     self.send_waited(peer, waited).await;
                 }
+                // One that takes its agent limit from here is sent what's set for its machine.
+                crate::harness::limit::on_caps(self, &agent, peer, caps).await;
             }
+            AgentMsg::AgentLimit { json } => crate::harness::limit::on_held(self, peer, &agent, &json),
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
@@ -1833,6 +1955,28 @@ impl Hub {
                 match ask.get("op").and_then(serde_json::Value::as_str) {
                     Some("directory") => {
                         let answer = serde_json::json!({ "runners": self.reach_directory() });
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    }
+                    // What the runner holds of other runners' trees and let go: kept, and answered
+                    // with the rules it weighs them with (docs/reach.md §5.1).
+                    Some("keep") => {
+                        let (hub, runner) = (Arc::clone(self), agent.clone());
+                        crate::rt::spawn(async move {
+                            let answer = hub.copies.heard(&hub, &runner, ask.get("report")).await;
+                            hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                        });
+                    }
+                    // Which runner holds which object of the runners' caches (docs/ci.md W24-R27).
+                    Some(op @ ("holds" | "holders")) => {
+                        let s = |k: &str| ask.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                        let (repo, digest) = (s("repo"), s("digest"));
+                        let answer = if op == "holds" {
+                            crate::reach::directory::holds(&agent, &repo, &digest);
+                            serde_json::json!({})
+                        } else {
+                            let up: Vec<String> = crate::reach::directory::holders(&repo, &digest, &agent).into_iter().filter(|r| self.agents.lock().get(r).is_some_and(|a| a.connected)).collect();
+                            serde_json::json!({ "runners": up })
+                        };
                         self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
@@ -2106,6 +2250,7 @@ impl Hub {
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
+            refused: None,
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
@@ -2166,7 +2311,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_IDENTITY }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2521,11 +2666,8 @@ impl Hub {
             let chosen = self.pick_agent(&job);
             match chosen {
                 Some(agent) => {
-                    let executor = if job.labels.iter().any(|l| l == "k8s") && self.agents.lock().get(&agent).is_some_and(|a| a.ephemeral) {
-                        "k8s"
-                    } else {
-                        "baremetal"
-                    };
+                    let ephemeral = self.agents.lock().get(&agent).is_some_and(|a| a.ephemeral);
+                    let executor = if job.labels.iter().any(|l| l == "k8s") && ephemeral { "k8s" } else { "baremetal" };
                     if !self.store.claim_job(job.id.clone(), agent.clone(), executor.into()).await? {
                         continue;
                     }
@@ -2559,7 +2701,7 @@ impl Hub {
                         event: run.event.clone(),
                         run_number: run.number,
                         attempt: job.attempt,
-                        spec: spec.for_runner(self.runner_caps(&agent)),
+                        spec: spec.for_assignee(self.runner_caps(&agent), ephemeral),
                         secrets: self.job_secrets(),
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
@@ -2584,6 +2726,10 @@ impl Hub {
                 None => {
                     let Some(k) = k8s else { continue };
                     if !job.labels.iter().any(|l| l == "k8s") {
+                        continue;
+                    }
+                    // A retry asked for a runner by name (W05-R28): a pod made for it isn't that one.
+                    if job.placement.as_ref().is_some_and(|p| p.runner.is_some()) {
                         continue;
                     }
                     let timeout = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
@@ -2695,6 +2841,8 @@ impl Hub {
             })
             .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
             .filter(|a| meets(job, a))
+            // Where a person's retry asked it to run (docs/ci.md W05-R28).
+            .filter(|a| job.placement.as_ref().is_none_or(|p| p.allows(&a.name)))
             .filter(|a| agent_room(a.slots, a.facts.as_deref(), &a.held, a.exclusive, a.running.len(), incoming))
             // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
             // job goes to another, or waits for one (a pod made for it is its own).
@@ -2892,6 +3040,56 @@ pub(crate) fn hold_on(a: &mut AgentLive, job: &str, incoming: kiln_ci::sched::st
 pub(crate) mod tests {
     use super::*;
 
+    fn unread(wire: crate::wire::unread::Wire, from: crate::wire::unread::Sender) -> crate::wire::unread::Unread {
+        crate::wire::unread::Unread { wire, from, what: "variant 51".into(), code: crate::wire::unread::Code::Unknown, why: "AgentMsg has 51 variants".into() }
+    }
+
+    /// A message a runner sent that couldn't be read (typed messages, step 1): its row is in the audit
+    /// log, its runner's record carries it, and the runner's page is told.
+    #[test]
+    fn a_refusal_noted_is_audited_kept_on_its_runner_and_its_page_told() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
+            hub.agents.lock().insert("fedora".into(), live_runner("fedora", "linux", "x86_64"));
+            let mut events = hub.events.subscribe();
+            let fedora = crate::wire::unread::Sender::Runner { name: "fedora".into(), instance: "main".into() };
+            anyhow::ensure!(hub.note_unread(unread(crate::wire::unread::Wire::Runner, fedora), None).await == Some(0), "its sender may be told");
+            let row: (String, Option<String>, String, String) = hub
+                .store
+                .call(|c| Ok(c.query_row("SELECT principal, target, result, detail FROM audit2 WHERE action = 'security.wire_refused'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
+                .await?;
+            anyhow::ensure!(row == ("runner:fedora".into(), Some("runner".into()), "unknown".into(), "variant 51: AgentMsg has 51 variants".into()), "{row:?}");
+            let kept = hub.agent_list().await.into_iter().find(|a| a.name == "fedora").and_then(|a| a.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "GET /api/agents carries it: {kept:?}");
+            let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
+            anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("agent")) && told.pointer("/agent/refused/counts/0/n") == Some(&serde_json::json!(1)), "{told}");
+            Ok(())
+        })
+    }
+
+    /// A runner's update of an agent session that couldn't be read shows on the session's page too:
+    /// its info carries it, its viewers are told, and the runner's next Open of it keeps it.
+    #[test]
+    fn a_refusal_about_a_session_is_kept_in_its_info() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::registry::Location;
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = || Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            hub.harness.ingest(&hub, &there, "s1", open());
+            let mut events = hub.events.subscribe();
+            let from = crate::wire::unread::Sender::Runner { name: "box".into(), instance: "main".into() };
+            let _ = hub.note_unread(unread(crate::wire::unread::Wire::RunnerPayload, from), Some(crate::wire::unread::Page::Session("s1".into()))).await;
+            let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
+            anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("harness")) && told.pointer("/info/refused/counts/0/wire") == Some(&serde_json::json!("runner_payload")), "{told}");
+            hub.harness.ingest(&hub, &there, "s1", open());
+            let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "kept across its runner's Open: {kept:?}");
+            Ok(())
+        })
+    }
+
     /// A job's `requires` route it by the runner's facts (docs/ci.md W05-R22): the release's
     /// macOS job goes to a Mac with cargo and node, never to one with no developer tools (which
     /// failed it at `npm`, 2026-10-24), nor to one that hasn't said what it has.
@@ -2910,6 +3108,30 @@ pub(crate) mod tests {
         assert!(!facts_meet(&release, None, &labels), "a runner that hasn't said what it has");
         assert!(facts_meet(&[], None, &labels), "a job with no requires goes where its labels say");
         assert!(!facts_meet(&["tools has".to_owned()], Some(&mac(&["node"])), &labels), "a requirement that doesn't parse holds nowhere");
+    }
+
+    /// W05-R28: the runners a retry may ask a pipeline's job onto are those `pick_agent` would
+    /// place it on, its labels and its `requires` both (the release's Linux build, `runs-on:
+    /// [baremetal]`, isn't for a Mac); each other says why not.
+    #[test]
+    fn w05_r28_a_retry_s_runners_are_where_v1_places_the_job() {
+        let runner = |name: &str, os: &str, labels: &[&str], tools: Option<&[&str]>| {
+            let mut a = live_runner(name, os, "x86_64");
+            a.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+            a.facts = tools.map(|t| {
+                Box::new(kiln_ci::facts::RunnerFacts { os: os.into(), arch: "x86_64".into(), tools: t.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), ..Default::default() })
+            });
+            a
+        };
+        let labels = vec!["baremetal".to_owned()];
+        let requires: Vec<String> = ["os == linux", "tools has cargo"].iter().map(|r| (*r).to_owned()).collect();
+        assert!(cannot_take(&labels, &requires, &runner("fedora", "linux", &["baremetal"], Some(&["cargo"]))).is_empty());
+        assert_eq!(cannot_take(&labels, &requires, &runner("mac", "macos", &["baremetal", "macos"], Some(&["cargo"]))), ["needs os == linux"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("bare", "linux", &["baremetal"], Some(&[]))), ["needs tools has cargo"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("quiet", "linux", &["baremetal"], None)), ["hasn't said what it has, which its `requires` needs"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("pod", "linux", &["k8s"], Some(&["cargo"]))), ["lacks the label baremetal"]);
+        // No `requires`: its labels alone, facts or none.
+        assert!(cannot_take(&labels, &[], &runner("quiet", "linux", &["baremetal"], None)).is_empty());
     }
 
     /// What a waiting job's runners lack, for an agent to install (`GET /api/jobs/:id/tools`):
@@ -2982,6 +3204,22 @@ pub(crate) mod tests {
         assert!(carries(&[], "macos", "aarch64", "mac", "arm64") && carries(&[], "macos", "aarch64", "mac", "darwin"));
     }
 
+    /// W05-R21 in v1: `[baremetal, linux]` fits a Linux runner labelled only `baremetal` (its
+    /// platform says Linux), `[Linux]` fits one labelled `linux`, and `[baremetal, linux]` doesn't
+    /// fit a Mac labelled `baremetal`.
+    #[test]
+    fn w05_r21_labels_match_in_any_case() {
+        let fits = |labels: &[&str], os: &str, arch: &str, want: &[&str]| {
+            let own: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+            want.iter().all(|w| carries(&own, os, arch, "runner", w))
+        };
+        assert!(fits(&["baremetal"], "linux", "x86_64", &["baremetal", "linux"]), "the platform's Linux");
+        assert!(fits(&["baremetal"], "linux", "x86_64", &["baremetal", "Linux"]) && fits(&["baremetal"], "linux", "x86_64", &["BAREMETAL", "LINUX"]));
+        assert!(fits(&["linux"], "linux", "x86_64", &["Linux"]), "`Linux` against `linux`");
+        assert!(fits(&["Linux"], "linux", "x86_64", &["linux"]), "`linux` against `Linux`");
+        assert!(!fits(&["baremetal"], "macos", "aarch64", &["baremetal", "linux"]), "a Mac isn't Linux");
+    }
+
     /// A connected runner on `os`/`arch` that hosts agents (its terminals on), for a test's hub.
     pub(crate) fn live_runner(name: &str, os: &str, arch: &str) -> AgentLive {
         AgentLive {
@@ -3005,6 +3243,7 @@ pub(crate) mod tests {
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
+            refused: None,
             terminal: true,
             outpost: false,
             dedicated_job: None,

@@ -910,6 +910,8 @@ pub(crate) struct NewVersion {
 pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool, by: &str) -> anyhow::Result<()> {
     // Its preview goes, and its stack's once the stack has no open diff (W15-R07).
     super::previews::closed(hub, repo, d, merged).await;
+    // Its search indexes go with it (W26-R07).
+    super::search::closed(hub, d).await;
     activity(hub, repo, d, "closed", by, |p| {
         if let Some(pr) = p.get_mut("pull_request").and_then(Value::as_object_mut) {
             pr.insert("state".into(), json!("closed"));
@@ -1007,6 +1009,10 @@ pub struct Version {
     /// Who submitted it, which its runs are held to (W10-R02's `secrets.use`); kiln's own.
     #[serde(skip)]
     pub started_by: Option<Value>,
+    /// Why it exists (W26-R04), when it isn't a push: `suggestion applied`, `conflict resolved`.
+    pub why: Option<String>,
+    /// The thread it answers (a suggestion's).
+    pub thread: Option<String>,
 }
 
 const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for, d.kiln_change,
@@ -1067,11 +1073,24 @@ pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>
     let (id, name) = (d.id.clone(), d.name.clone());
     hub.store
         .call(move |c| {
-            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at, started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at, started_by, why, thread FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
             let rows = st.query_map([&id], |r| {
                 let n: u32 = r.get(0)?;
                 let started_by = r.get::<_, Option<String>>(8)?.and_then(|t| serde_json::from_str(&t).ok());
-                Ok(Version { n, commit: r.get(1)?, parent: r.get(2)?, base: r.get(3)?, rebase_only: r.get(4)?, pushed_by: r.get(5)?, note: r.get(6)?, created_at: r.get(7)?, git_ref: format!("refs/kiln/diffs/{name}/v{n}"), started_by })
+                Ok(Version {
+                    n,
+                    commit: r.get(1)?,
+                    parent: r.get(2)?,
+                    base: r.get(3)?,
+                    rebase_only: r.get(4)?,
+                    pushed_by: r.get(5)?,
+                    note: r.get(6)?,
+                    created_at: r.get(7)?,
+                    git_ref: format!("refs/kiln/diffs/{name}/v{n}"),
+                    started_by,
+                    why: r.get(9)?,
+                    thread: r.get(10)?,
+                })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -1271,6 +1290,70 @@ async fn blob(hub: &Hub, d: &Diff, v: &Version, q: &HashMap<String, String>) -> 
     let r = srv::response(StatusCode::OK, content_type(path), srv::full(bytes));
     let r = srv::with_header(r, http::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     Ok(srv::with_header(r, http::header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; style-src 'unsafe-inline'"))
+}
+
+/// `GET /api/ship/commits/:repo/:sha/diff`: a commit with no change's diff from its parent, the
+/// same shape as a version's files (W26-R07; its Ship item's Files). The repository's own callers
+/// only (`runs.read`, as the row is).
+pub async fn ship_commit_diff(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, caller: &crate::authz::Caller) -> Result<Response, Fail> {
+    let (path, name) = commit_repo(hub, repo_key, sha, caller).await?;
+    let parent = gitops::run_git(hub, &["-C", &path, "rev-parse", "--verify", "--quiet", &format!("{sha}^")], LS_REMOTE_TIMEOUT)
+        .await
+        .map(|o| String::from_utf8_lossy(&o).trim().to_owned())
+        .unwrap_or_else(|_| "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned());
+    let stat = gitops::run_git(hub, &["-C", &path, "diff", "--numstat", "-z", "-M", &parent, sha], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let status = gitops::run_git(hub, &["-C", &path, "diff", "--name-status", "-z", "-M", &parent, sha], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let patch = gitops::run_git(hub, &["-C", &path, "diff", "--no-color", "-M", &parent, sha], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let mut list = numstat(&String::from_utf8_lossy(&stat));
+    let statuses = name_status(&String::from_utf8_lossy(&status));
+    for f in &mut list {
+        let s = f.get("path").and_then(Value::as_str).and_then(|p| statuses.get(p));
+        if let (Some(o), Some(s)) = (f.as_object_mut(), s) {
+            o.insert("status".into(), json!(s));
+            o.insert("viewed".into(), json!(false));
+        }
+    }
+    const MAX: usize = 8 << 20;
+    let truncated = patch.len() > MAX;
+    let text = String::from_utf8_lossy(patch.get(..MAX.min(patch.len())).unwrap_or_default()).into_owned();
+    Ok(srv::json(StatusCode::OK, &json!({ "repo": name, "commit": sha, "parent": parent, "files": list, "patch": text, "truncated": truncated })))
+}
+
+/// `GET /api/ship/commits/:repo/:sha/blob?path=`: a file as it is at the commit, for the same
+/// Files' whole-file view; typed by its name, sandboxed, [`MAX_BLOB`] at most.
+pub async fn ship_commit_blob(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> Result<Response, Fail> {
+    let (path, _) = commit_repo(hub, repo_key, sha, caller).await?;
+    let fpath = q
+        .get("path")
+        .map(String::as_str)
+        .filter(|p| !p.is_empty() && !p.starts_with('/') && !p.split('/').any(|x| x == ".." || x.is_empty()))
+        .ok_or((StatusCode::BAD_REQUEST, "`path`: a file of the repository".to_owned()))?;
+    let spec = format!("{sha}:{fpath}");
+    let size = gitops::run_git(hub, &["-C", &path, "cat-file", "-s", &spec], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::NOT_FOUND, format!("no {fpath} there")))?;
+    let size: u64 = String::from_utf8_lossy(&size).trim().parse().unwrap_or(u64::MAX);
+    if size > MAX_BLOB {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("{fpath} is {size} bytes; at most {MAX_BLOB} are served")));
+    }
+    let bytes = gitops::run_git(hub, &["-C", &path, "cat-file", "blob", &spec], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let r = srv::response(StatusCode::OK, content_type(fpath), srv::full(bytes));
+    let r = srv::with_header(r, http::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    Ok(srv::with_header(r, http::header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; style-src 'unsafe-inline'"))
+}
+
+/// The bare repository of `repo_key` (name or id) when `sha` exists in it and the caller may read
+/// the repository, else the API's "not found".
+async fn commit_repo(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, caller: &crate::authz::Caller) -> Result<(String, String), Fail> {
+    let repos = hub.store.repos().await.map_err(fail)?;
+    let repo = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
+    if !caller.can("runs.read", &Scope::Repo { repo: repo.name.clone() }) {
+        return Err((StatusCode::NOT_FOUND, "no such commit".to_owned()));
+    }
+    let path = super::hosting::native_path(hub, &repo).ok_or((StatusCode::NOT_FOUND, "the repository isn't hosted here".to_owned()))?;
+    let path = path.to_string_lossy().into_owned();
+    gitops::run_git(hub, &["-C", &path, "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "no such commit".to_owned()))?;
+    Ok((path, repo.name))
 }
 
 /// A file's type by its name: images (and PDFs) as themselves, the rest as bytes.
@@ -1579,7 +1662,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::GET, ["repos", repo, "change-requests"]) => ok(list(hub, repo, q, "change_request").await?),
         (&Method::POST, ["repos", repo, "change-requests"]) => ok(super::cr::create(hub, repo, caller, body).await?),
         (&Method::POST, ["repos", repo, "submit"]) => ok(submit_patches(hub, repo, caller, body).await?),
-        (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller).await?),
+        (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => {
@@ -1604,6 +1687,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         }
         (&Method::POST, ["review", "inbox", "read"]) => ok(super::inbox::read(hub, caller, body).await?),
         (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
+        (&Method::DELETE, ["comments", id]) => ok(super::review::delete(hub, id, caller).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
         (_, ["diffs" | "change-requests", key, rest @ ..]) => {
             let d = find(hub, key).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, format!("no diff {key}")))?;
@@ -1622,6 +1706,11 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 (&Method::GET, ["versions", n, "blob"]) => {
                     let vs = versions(hub, &d).await.map_err(fail)?;
                     blob(hub, &d, &version_of(&vs, n)?, q).await
+                }
+                // W26-R07: a search across the version's files, backed by vorpal.
+                (&Method::GET, ["versions", n, "search"]) => {
+                    let vs = versions(hub, &d).await.map_err(fail)?;
+                    ok(super::search::version(hub, &d, &version_of(&vs, n)?, q).await?)
                 }
                 (&Method::GET, ["interdiff"]) => {
                     let vs = versions(hub, &d).await.map_err(fail)?;
@@ -1644,8 +1733,17 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     };
                     ok(dependencies(hub, &d, &from, &to.commit, &from_label, &format!("v{}", to.n)).await?)
                 }
-                (&Method::GET, ["comments"]) => ok(json!({ "threads": super::review::threads(hub, &d, &super::review::who(caller).0).await? })),
+                // The threads, and the gate as it stands for the caller approving (W26-R11).
+                (&Method::GET, ["comments"]) => {
+                    let me = super::review::who(caller).0;
+                    ok(json!({ "threads": super::review::threads(hub, &d, &me).await?, "gate": super::review::gate_of(hub, &d, Some(&me)).await? }))
+                }
                 (&Method::POST, ["comments"]) => ok(super::review::comment(hub, &d, caller, body).await?),
+                // Its conflicts with where it lands, resolved where they fall, then committed (W26-R12).
+                (&Method::GET, ["conflicts"]) => ok(super::conflicts::list(hub, &d).await?),
+                (&Method::POST, ["conflicts", "commit"]) => ok(super::conflicts::commit(hub, &d, caller).await?),
+                (&Method::POST, ["conflicts", id, "resolution"]) => ok(super::conflicts::resolve(hub, &d, id, caller, body).await?),
+                (&Method::DELETE, ["conflicts", id, "resolution"]) => ok(super::conflicts::undo(hub, &d, id, caller).await?),
                 (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),
                 (&Method::POST, ["viewed"]) => ok(super::review::viewed(hub, &d, caller, body).await?),
                 (&Method::GET, ["land"]) => ok(super::review::readiness(hub, &d).await?),
