@@ -3876,7 +3876,7 @@ support (G-11, G-18, G-25, G-27, G-28).
   | `virt.kvm`, `virt.hvf`, `virt.nested` | `/dev/kvm` access, Hypervisor.framework entitlement check |
   | `executors` | which of `host`, `docker`, `firecracker`, `shards`, `k8s` work right now (each probed for real: a no-op run), with versions (`docker.version`, `docker.rootless`, `podman.version`, `firecracker.version`, `shards.version`, `shards.features`) |
   | `binfmt` | platforms registered for QEMU user emulation |
-  | `tools.<name>.version` | `git`, `node`, `python3`, `cargo`, `go`, `java`, `dotnet`, `docker buildx`, `shards`, … found on `PATH` |
+  | `tools.<name>.version` | `git`, `node`, `python3`, `cargo`, `go`, `java`, `dotnet`, `docker buildx`, `shards`, … found on the `PATH` a leg's steps have (W13-R03): the runner's, then the folders only its user's login shell has |
   | `net.egress` | whether the internet is reachable directly or only through a proxy |
 
 - **W13-R02 Declared facts.** Administrators add facts in the runner's configuration
@@ -3888,7 +3888,11 @@ support (G-11, G-18, G-25, G-27, G-28).
 - **W13-R03 `host`**: today's executor (a process tree killed as a group; job objects on Windows),
   now behind W06's `Exec` trait. Runs `container:` jobs and services through the host's Docker or
   Podman when `CAP_DOCKER`, GitHub-exact for self-hosted runners (steps on the host, containers
-  beside them).
+  beside them). Its steps' `PATH` is the runner's, then the folders only its user's login shell
+  has (`$SHELL -l -i`, asked as a leg starts unless it answered in the last ten minutes, as for
+  `kiln run` and harnesses): a runner's service keeps the PATH of the terminal it was installed
+  from, so a toolchain installed since (node from nvm, cargo from rustup) is found without
+  installing the runner again.
 - **W13-R04 `docker`**: the whole leg runs in a fresh container of the leg's image (the routing
   rule's `image`, W05-R21), the way a hosted runner gives each job a fresh machine. When the job
   declares `container:`, that container is the leg's container (GitHub-exact). Docker actions and
