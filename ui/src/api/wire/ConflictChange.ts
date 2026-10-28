@@ -7,4 +7,4 @@
  * edit), or taken back (no `take`), by `by` (`agent` when an agent's, kept for a person to take);
  * or their resolution was committed (`state` `resolved`, `version` the revision it made).
  */
-export type Conflict = { repo: string, diff: string, replay: string, version: number | null, state: string | null, conflict: string | null, take: string | null, by: string | null, agent: boolean | null, };
+export type ConflictChange = { repo: string, diff: string, replay: string, version: number | null, state: string | null, conflict: string | null, take: string | null, by: string | null, agent: boolean | null, };

@@ -119,7 +119,7 @@ pub enum ServerEvent {
     RunnerOffline { runner: OfflineRunner },
     /// A change's conflicts changed (W26-R12): its replay found some, one was resolved or taken
     /// back, or their resolution was committed.
-    Conflict(Box<Conflict>),
+    Conflict(Box<ConflictChange>),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -217,7 +217,7 @@ pub struct Comment {
 /// or their resolution was committed (`state` `resolved`, `version` the revision it made).
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-pub struct Conflict {
+pub struct ConflictChange {
     pub repo: String,
     pub diff: String,
     pub replay: String,
