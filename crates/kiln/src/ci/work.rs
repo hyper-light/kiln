@@ -50,6 +50,7 @@
 //! and decides alike on either.
 
 pub mod ledger;
+pub mod reapi;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -171,6 +172,10 @@ pub struct Recorded {
     /// reproduces the entry; a lookup gives the newest such run's.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub notes: BTreeMap<String, String>,
+    /// The Remote Execution API's `ActionResult` it is, as its client sent it, in base64: what the
+    /// action cache answers with (W24-R26).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_result: Option<String>,
 }
 
 impl Recorded {
