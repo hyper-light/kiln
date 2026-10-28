@@ -171,6 +171,18 @@ impl Handle {
     }
 }
 
+/// The argument that makes kiln a pacer's guard (`kiln headroom-guard <record>`).
+pub const GUARD_ARG: &str = pace::GUARD_ARG;
+
+/// `kiln headroom-guard <record>`: a pacer's guard, which starts again what its pacer stopped once
+/// the pacer ends, however it ends (docs/headroom.md, "Failing safe").
+pub fn guard_main(record: Option<std::ffi::OsString>) -> std::process::ExitCode {
+    match record {
+        Some(r) => pace::guard(Path::new(&r)),
+        None => std::process::ExitCode::FAILURE,
+    }
+}
+
 /// Starts headroom for this runner (once per process; later calls get the same).
 pub fn start(ctx: Ctx) -> Handle {
     if SHARED.running.swap(true, Ordering::AcqRel) {

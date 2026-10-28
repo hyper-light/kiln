@@ -2,22 +2,35 @@
 //! the first `d`% of every period and is stopped for the rest, so slowing is continuous rather than
 //! on or off. Everything here is the runner's own, so none of it needs privileges.
 //!
-//! Linux: each agent session's cgroup (`crate::os::contain`), and, unless the settings say not to,
-//! every transient unit the user's service manager runs (`systemd-run --user`: a build an agent
-//! started to outlive its command), stopped and started with `cgroup.freeze`. macOS and Windows:
-//! each agent session's processes as `crate::os::contain` holds them, metered process by process
-//! and stopped process by process (SIGSTOP and SIGCONT; every thread suspended and resumed).
+//! Linux: each agent session's cgroup (`crate::os::contain`), and, for the machine's installed
+//! runner unless the settings say not to, every transient unit the user's service manager runs
+//! (`systemd-run --user`: a build an agent started to outlive its command), stopped and started
+//! with `cgroup.freeze`. macOS and Windows: each agent session's processes as `crate::os::contain`
+//! holds them, metered process by process and stopped process by process (SIGSTOP and SIGCONT;
+//! every thread suspended and resumed). What someone else stopped is never touched.
 //!
-//! Every group paced is noted in a file, so a runner that dies with work stopped starts it again
-//! when it starts (and so does the next one, should this one never come back).
+//! Nothing stays stopped once its pacer is gone (docs/headroom.md, "Failing safe"). Each pacer has
+//! a guard, a small process of its own (`kiln headroom-guard`) placed to outlive it, and tells it
+//! everything it may stop before it stops any of it. The guard starts all of that again the moment
+//! the pacer's end of its input closes, which happens however the pacer ends. Each pacer's record on
+//! disk says the same, for a pacer that starts after both pacer and guard died.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+
+/// The argument that makes kiln a pacer's guard ([`guard`]).
+pub const GUARD_ARG: &str = "headroom-guard";
+/// What the guard says once it runs: nothing is stopped before.
+const GUARD_READY: &str = "ready";
+/// The pacers' records, one each, in headroom's folder.
+const RECORDS: &str = "paced";
 
 /// A group of processes headroom can see and slow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,66 +103,44 @@ impl Meter {
 pub struct Pacer {
     shares: Arc<Mutex<HashMap<PathBuf, u8>>>,
     period: Arc<Mutex<Duration>>,
-    /// The groups stopped now, each with what starts it again (`imp::release`).
-    held: Arc<Mutex<HashMap<PathBuf, Vec<String>>>>,
     stop: Arc<AtomicBool>,
-    record: PathBuf,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How a pacer's guard starts, given the record it guards: kiln's own [`kiln_guard`] (the crate's
+/// tests start one of their own).
+pub type GuardCmd = fn(&Path) -> std::io::Result<Command>;
+
+/// `kiln headroom-guard <record>`, from this very binary.
+pub fn kiln_guard(record: &Path) -> std::io::Result<Command> {
+    let mut c = Command::new(std::env::current_exe()?);
+    c.arg(GUARD_ARG).arg(record);
+    Ok(c)
 }
 
 impl Pacer {
-    /// Starts groups a previous runner left stopped (as its record says), then the thread.
+    /// Starts what pacers before this one left stopped (their records say what), then the thread,
+    /// guarded by kiln's own guard.
     pub fn start(dir: &Path) -> Self {
-        let record = dir.join("paced.json");
-        release_recorded(&record);
+        Self::start_with(dir, kiln_guard)
+    }
+
+    /// The same, its guard started by `guard`.
+    pub fn start_with(dir: &Path, guard: GuardCmd) -> Self {
+        release_left(dir);
         let shares: Arc<Mutex<HashMap<PathBuf, u8>>> = Arc::default();
-        let held: Arc<Mutex<HashMap<PathBuf, Vec<String>>>> = Arc::default();
         let period = Arc::new(Mutex::new(Duration::from_millis(1000)));
         let stop = Arc::new(AtomicBool::new(false));
-        let (sh, pe, he, st, rec) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&held), Arc::clone(&stop), record.clone());
-        let spawned = std::thread::Builder::new().name("kiln-pacer".into()).spawn(move || {
-            let base = Instant::now();
-            while !st.load(Ordering::Relaxed) {
-                let p = pe.lock().as_millis().max(1) as u64;
-                let now = base.elapsed().as_millis() as u64;
-                let want: Vec<(PathBuf, u8)> = sh.lock().iter().map(|(d, s)| (d.clone(), *s)).collect();
-                let mut held = he.lock();
-                let mut changed = false;
-                for (dir, share) in &want {
-                    // Each group's period starts at its own offset, so they don't all start at once.
-                    let offset = dir.to_string_lossy().bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))) % p;
-                    let run = (now + offset) % p < p * u64::from(*share) / 100;
-                    if run {
-                        if let Some(keys) = held.remove(dir) {
-                            keys.iter().for_each(|k| imp::release(k));
-                            changed = true;
-                        }
-                    } else if !held.contains_key(dir)
-                        && let Ok(keys) = imp::stop(dir)
-                    {
-                        held.insert(dir.clone(), keys);
-                        changed = true;
-                    }
-                }
-                // Groups no longer paced run again.
-                held.retain(|dir, keys| {
-                    let keep = want.iter().any(|(d, _)| d == dir);
-                    if !keep {
-                        keys.iter().for_each(|k| imp::release(k));
-                        changed = true;
-                    }
-                    keep
-                });
-                if changed {
-                    note(&rec, &held);
-                }
-                drop(held);
-                std::thread::sleep(Duration::from_millis(50));
+        let (sh, pe, st, dir) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stop), dir.to_owned());
+        let spawned = std::thread::Builder::new().name("kiln-pacer".into()).spawn(move || match Proc::me() {
+            Some(me) => {
+                let record = dir.join(RECORDS).join(format!("{}-{}.json", me.pid, me.start));
+                run(&sh, &pe, &st, &Paced { me, record, how: guard });
             }
+            None => tracing::warn!("headroom: this process's own start is unknown, so nothing is paced"),
         });
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, "headroom: the pacer couldn't start; work past the window still waits to start");
-        }
-        Self { shares, period, held, stop, record }
+        let thread = spawned.map_err(|e| tracing::warn!(error = %e, "headroom: the pacer couldn't start; work past the window still waits to start")).ok();
+        Self { shares, period, stop, thread }
     }
 
     /// Each paced group's share from now (percent; groups at 100 aren't listed).
@@ -159,33 +150,361 @@ impl Pacer {
     }
 }
 
-/// Notes what starts every group stopped now, for a runner that starts after this one dies.
-fn note(record: &Path, held: &HashMap<PathBuf, Vec<String>>) {
-    let keys: Vec<&String> = held.values().flatten().collect();
-    if let Err(e) = crate::util::write_secret_unsynced(record, &serde_json::to_vec(&keys).unwrap_or_default(), 0o644) {
-        tracing::warn!(error = %e, "headroom: couldn't note what is paced");
-    }
-}
-
 impl Drop for Pacer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for keys in std::mem::take(&mut *self.held.lock()).into_values() {
-            keys.iter().for_each(|k| imp::release(k));
+        // The thread starts what it stopped and lets its guard go before it ends.
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
-        let _ = std::fs::remove_file(&self.record);
     }
 }
 
-/// Starts everything a record says was stopped.
-fn release_recorded(record: &Path) {
-    let Ok(raw) = std::fs::read(record) else { return };
-    let keys: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
-    keys.iter().for_each(|k| imp::release(k));
-    if !keys.is_empty() {
-        tracing::info!(stopped = keys.len(), "headroom: work a previous runner left paced runs again");
+/// A process, by its id and when it started: an id alone may be another process's by now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct Proc {
+    pid: u32,
+    /// Seconds since the epoch, as the system has it.
+    start: u64,
+}
+
+impl Proc {
+    fn me() -> Option<Self> {
+        Self::of(std::process::id())
     }
+
+    fn of(pid: u32) -> Option<Self> {
+        started(pid).map(|start| Self { pid, start })
+    }
+
+    /// Whether it still runs (its id is still its own).
+    fn alive(&self) -> bool {
+        started(self.pid) == Some(self.start)
+    }
+}
+
+/// When process `pid` started, while it runs.
+fn started(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::nothing());
+    sys.process(pid).map(sysinfo::Process::start_time)
+}
+
+/// A pacer's record: whose it is, who guards it, and everything it may have stopped.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Record {
+    owner: Option<Proc>,
+    guard: Option<Proc>,
+    stopped: Vec<String>,
+}
+
+/// What a pacer's thread works with.
+struct Paced {
+    me: Proc,
+    record: PathBuf,
+    how: GuardCmd,
+}
+
+/// The pacer's thread: each paced group stopped for its share of every period, and only while a
+/// guard runs that will start it again.
+fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stop: &AtomicBool, p: &Paced) {
+    let base = Instant::now();
+    // The groups stopped now, each with what starts it again (`imp::release`).
+    let mut held: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    // What the guard and the record list, group by group: all a paced group has had stopped.
+    let mut listed: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
+    let mut guard: Option<Guard> = None;
+    // A scope of its own where one outlives the runner's unit; none once that fails.
+    let mut scope = imp::guard_in_scope();
+    // A guard that can't start is asked for again a period later: the pacer's own pace.
+    let mut next_try = Instant::now();
+    let mut warned = false;
+    // Records of pacers that ended with their guards while this one runs (a runner it took over
+    // from, killed with its guard): looked at once a period.
+    let mut next_look = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let per = *period.lock();
+        let p_ms = u64::try_from(per.as_millis()).unwrap_or(u64::MAX).max(1);
+        let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let want: Vec<(PathBuf, u8)> = shares.lock().iter().map(|(d, s)| (d.clone(), *s)).collect();
+        if Instant::now() >= next_look {
+            next_look = Instant::now() + per;
+            if let Some(records) = p.record.parent() {
+                release_ended(records);
+            }
+        }
+        // A guard that ended guards nothing: what it held runs again before anything stops anew.
+        if let Some((ready, false)) = guard.as_mut().map(|g| (g.ready(), g.running())) {
+            if ready {
+                tracing::warn!("headroom: the pacer's guard ended; what it held runs again");
+            } else {
+                // It never ran: started in a scope that couldn't be made, it starts without one.
+                scope = false;
+            }
+            guard = None;
+            release_all(&mut held, &mut listed, &mut guard, p);
+        }
+        if guard.is_none() && !want.is_empty() && Instant::now() >= next_try {
+            next_try = Instant::now() + per;
+            let tried = match Guard::start(p, scope) {
+                Err(_) if scope => {
+                    scope = false;
+                    Guard::start(p, false)
+                }
+                r => r,
+            };
+            match tried {
+                Ok(g) => {
+                    guard = Some(g);
+                    warned = false;
+                }
+                Err(e) if !warned => {
+                    warned = true;
+                    tracing::warn!(error = %e, "headroom: the pacer's guard couldn't start, so nothing is paced");
+                }
+                Err(_) => {}
+            }
+        }
+        let guarded = guard.as_ref().is_some_and(Guard::ready);
+        let mut unheard = false;
+        for (dir, share) in &want {
+            // Each group's period starts at its own offset, so they don't all start at once.
+            let offset = dir.to_string_lossy().bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))) % p_ms;
+            let run = (now + offset) % p_ms < p_ms * u64::from(*share) / 100;
+            if run {
+                if let Some(keys) = held.remove(dir) {
+                    keys.iter().for_each(|k| imp::release(k));
+                }
+            } else if guarded && !held.contains_key(dir) {
+                let keys = imp::keys(dir);
+                if keys.is_empty() {
+                    continue;
+                }
+                // Told first: the guard and the record list it all before any of it stops.
+                let mine = listed.entry(dir.clone()).or_default();
+                if !keys.iter().all(|k| mine.contains(k)) {
+                    mine.extend(keys.iter().cloned());
+                    if !tell(&mut guard, &listed, p) {
+                        unheard = true;
+                        break;
+                    }
+                }
+                held.insert(dir.clone(), imp::stop_keys(&keys));
+            }
+        }
+        if unheard {
+            // A guard that didn't hear is let go: what it held runs again, and nothing stops until
+            // a guard runs that hears.
+            if let Some(mut g) = guard.take() {
+                let _ = g.child.kill();
+                let _ = g.child.wait();
+            }
+            release_all(&mut held, &mut listed, &mut guard, p);
+        }
+        // Groups no longer paced run again and come off the list.
+        held.retain(|dir, keys| {
+            let keep = want.iter().any(|(d, _)| d == dir);
+            if !keep {
+                keys.iter().for_each(|k| imp::release(k));
+            }
+            keep
+        });
+        let before = listed.len();
+        listed.retain(|dir, _| want.iter().any(|(d, _)| d == dir));
+        if listed.len() != before {
+            tell(&mut guard, &listed, p);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Ending: everything runs again, the guard hears nothing is left, and it goes.
+    release_all(&mut held, &mut listed, &mut guard, p);
+    if let Some(mut g) = guard {
+        g.finish();
+    }
+}
+
+/// Everything held runs again and nothing is listed any more.
+fn release_all(held: &mut HashMap<PathBuf, Vec<String>>, listed: &mut HashMap<PathBuf, BTreeSet<String>>, guard: &mut Option<Guard>, p: &Paced) {
+    for keys in std::mem::take(held).into_values() {
+        keys.iter().for_each(|k| imp::release(k));
+    }
+    listed.clear();
+    tell(guard, listed, p);
+}
+
+/// Tells the guard, then the record, all that's listed now; whether the guard heard it.
+fn tell(guard: &mut Option<Guard>, listed: &HashMap<PathBuf, BTreeSet<String>>, p: &Paced) -> bool {
+    let all: BTreeSet<&String> = listed.values().flatten().collect();
+    let heard = guard.as_mut().is_some_and(|g| g.tell(&all));
+    if all.is_empty() {
+        let _ = std::fs::remove_file(&p.record);
+    } else {
+        let rec = Record { owner: Some(p.me), guard: guard.as_ref().and_then(|g| g.proc), stopped: all.into_iter().cloned().collect() };
+        if let Err(e) = crate::util::write_secret_unsynced(&p.record, &serde_json::to_vec(&rec).unwrap_or_default(), 0o644) {
+            tracing::warn!(error = %e, "headroom: couldn't note what is paced");
+        }
+    }
+    heard
+}
+
+/// A pacer's guard, as its pacer holds it.
+struct Guard {
+    child: std::process::Child,
+    /// Its input: this pacer's to write to and, by ending, to close.
+    input: Option<std::process::ChildStdin>,
+    ready: Arc<AtomicBool>,
+    proc: Option<Proc>,
+}
+
+impl Guard {
+    /// Starts it (in a scope of its own when `scope`) apart from this process's group.
+    fn start(p: &Paced, scope: bool) -> std::io::Result<Self> {
+        let inner = (p.how)(&p.record)?;
+        #[cfg(target_os = "linux")]
+        let mut cmd = if scope { imp::in_scope(&inner, &p.record) } else { inner };
+        #[cfg(not(target_os = "linux"))]
+        let mut cmd = {
+            let _ = scope;
+            inner
+        };
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = spawn_apart(&mut cmd)?;
+        let (input, out) = (child.stdin.take(), child.stdout.take());
+        let ready = Arc::new(AtomicBool::new(false));
+        let heard = Arc::clone(&ready);
+        // Its word that it runs, then whatever else it says, read to the end so it never blocks.
+        let read = out.ok_or_else(|| std::io::Error::other("the guard's output wasn't kept")).and_then(|out| {
+            std::thread::Builder::new().name("kiln-pacer-guard".into()).spawn(move || {
+                use std::io::BufRead as _;
+                for line in std::io::BufReader::new(out).lines() {
+                    match line {
+                        Ok(l) if l.trim() == GUARD_READY => heard.store(true, Ordering::Release),
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
+        if let Err(e) = read {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        let proc = Proc::of(child.id());
+        Ok(Self { child, input, ready, proc })
+    }
+
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// One line: all that's listed now (the guard keeps the last whole line it gets).
+    fn tell(&mut self, all: &BTreeSet<&String>) -> bool {
+        use std::io::Write as _;
+        let Some(input) = self.input.as_mut() else { return false };
+        let mut line = serde_json::to_vec(all).unwrap_or_default();
+        line.push(b'\n');
+        input.write_all(&line).and_then(|()| input.flush()).is_ok()
+    }
+
+    /// Its input closed, it ends: waited for.
+    fn finish(&mut self) {
+        drop(self.input.take());
+        let _ = self.child.wait();
+    }
+}
+
+/// Starts `cmd` apart from this process: in a process group of its own (what ends this one's,
+/// a terminal's or launchd's, doesn't end it), and on Windows out of this process's job where the
+/// job lets it.
+fn spawn_apart(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0).spawn()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        match cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW).spawn() {
+            // A job that keeps its processes' children: the guard stays in it.
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).spawn(),
+            r => r,
+        }
+    }
+}
+
+/// A pacer's guard (`kiln headroom-guard <record>`): says it runs, keeps the last whole line its
+/// pacer sends (everything the pacer may stop, sent before any of it stops), and once the pacer's
+/// end of its input closes, however the pacer ended, starts all of it again and removes the record.
+pub fn guard(record: &Path) -> std::process::ExitCode {
+    use std::io::{BufRead as _, Write as _};
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{GUARD_READY}").and_then(|()| out.flush());
+    let mut last: Vec<String> = Vec::new();
+    let mut input = std::io::stdin().lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match input.read_line(&mut line) {
+            Ok(n) if n > 0 && line.ends_with('\n') => {
+                if let Ok(l) = serde_json::from_str(line.trim_end()) {
+                    last = l;
+                }
+            }
+            // The end, or a line cut short: one the pacer ended telling, nothing on it stopped yet.
+            _ => break,
+        }
+    }
+    last.iter().for_each(|k| imp::release(k));
     let _ = std::fs::remove_file(record);
+    std::process::ExitCode::SUCCESS
+}
+
+/// Starts again what pacers before this one left stopped: the old shared record's list, and each
+/// pacer's record whose pacer and guard have both ended.
+fn release_left(dir: &Path) {
+    let old = dir.join("paced.json");
+    if let Ok(raw) = std::fs::read(&old) {
+        let keys: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
+        keys.iter().for_each(|k| imp::release(k));
+        if !keys.is_empty() {
+            tracing::info!(stopped = keys.len(), "headroom: work a previous runner left paced runs again");
+        }
+        let _ = std::fs::remove_file(&old);
+    }
+    release_ended(&dir.join(RECORDS));
+}
+
+/// Starts again what each pacer whose pacer and guard have both ended left stopped, and removes its
+/// record (a guard still running does it itself; a running pacer's is its own).
+fn release_ended(records: &Path) {
+    let Ok(rd) = std::fs::read_dir(records) else { return };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Some(rec) = std::fs::read(&path).ok().and_then(|raw| serde_json::from_slice::<Record>(&raw).ok()) else { continue };
+        if rec.owner.is_some_and(|o| o.alive()) || rec.guard.is_some_and(|g| g.alive()) {
+            continue;
+        }
+        rec.stopped.iter().for_each(|k| imp::release(k));
+        if !rec.stopped.is_empty() {
+            tracing::info!(stopped = rec.stopped.len(), "headroom: work a pacer that ended left stopped runs again");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -201,27 +520,60 @@ mod imp {
         Path::new(ROOT).join("cgroup.controllers").is_file()
     }
 
-    /// Whether this process paces the user's own units: one process a machine does, the one that
-    /// holds `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock` (taken once, held until it exits), so two
-    /// runners on a machine (or a test's runner beside the machine's) never pace the same units.
+    /// A pacer's guard's own scope (`kiln-headroom-guard-<pid>-<start>.scope`): never paced.
+    const GUARD_UNIT: &str = "kiln-headroom-guard-";
+
+    /// Whether this process paces the user's own units: the machine's installed runner (the one its
+    /// supervisor started; a test's runner or one started by hand paces only its own sessions)
+    /// holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`, so two runners on a machine never pace
+    /// the same units. Tried again each time until held, so a runner that took over from another
+    /// (blue/green) takes it once that one is gone.
     fn escapes_ours() -> bool {
-        static HELD: std::sync::OnceLock<Option<fs::File>> = std::sync::OnceLock::new();
-        HELD.get_or_init(|| {
+        static HELD: parking_lot::Mutex<Option<fs::File>> = parking_lot::Mutex::new(None);
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !crate::os::supervise::started_by_supervisor() {
+            return false;
+        }
+        let mut held = HELD.lock();
+        if held.is_none() {
             let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::getuid())), PathBuf::from);
-            let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("kiln-headroom-escapes.lock")).ok()?;
-            match f.try_lock() {
-                Ok(()) => Some(f),
-                Err(_) => {
-                    tracing::info!("headroom: another kiln on this machine paces the user's units; this one paces its own sessions");
-                    None
-                }
+            *held = take_lock(&dir.join("kiln-headroom-escapes.lock"));
+            if held.is_none() && !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("headroom: another kiln on this machine paces the user's units; this one paces its own sessions until it can");
             }
-        })
-        .is_some()
+        }
+        held.is_some()
+    }
+
+    /// The lock at `path`, when no one else holds it.
+    pub(super) fn take_lock(path: &Path) -> Option<fs::File> {
+        let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
+        f.try_lock().ok().map(|()| f)
     }
 
     fn own() -> Option<String> {
         fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_owned())
+    }
+
+    /// Whether a pacer's guard starts in a scope of its own: where the user's service manager runs
+    /// this runner as its unit, which a restart stops with every process left in it.
+    pub fn guard_in_scope() -> bool {
+        crate::os::supervise::started_by_supervisor() && own().is_some_and(|o| o.contains("/user@"))
+    }
+
+    /// `inner` run in a scope of its own by the user's service manager, still this process's child
+    /// (`systemd-run --scope` runs it itself), so its input is still this process's to close.
+    pub fn in_scope(inner: &std::process::Command, record: &Path) -> std::process::Command {
+        let name = record.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut c = std::process::Command::new("systemd-run");
+        c.args(["--user", "--scope", "--quiet", "--collect"]).arg(format!("--unit={GUARD_UNIT}{name}")).arg("--").arg(inner.get_program()).args(inner.get_args());
+        for (k, v) in inner.get_envs() {
+            match v {
+                Some(v) => c.env(k, v),
+                None => c.env_remove(k),
+            };
+        }
+        c
     }
 
     pub fn groups(escapes: bool) -> Vec<Group> {
@@ -256,7 +608,7 @@ mod imp {
                             }
                             if name.ends_with(".slice") {
                                 next.push(p);
-                            } else if (name.ends_with(".service") || name.ends_with(".scope")) && !desktop(&name) && transient.join(&name).exists() && !mine.starts_with(&p) {
+                            } else if (name.ends_with(".service") || name.ends_with(".scope")) && !desktop(&name) && !name.starts_with(GUARD_UNIT) && transient.join(&name).exists() && !mine.starts_with(&p) {
                                 out.push(Group { dir: p, label: name, session: None });
                             }
                         }
@@ -325,9 +677,18 @@ mod imp {
         fs::write(dir.join("cgroup.freeze"), if stop { "1" } else { "0" })
     }
 
-    /// Stops the whole cgroup at once; it starts again by its folder.
-    pub fn stop(dir: &Path) -> std::io::Result<Vec<String>> {
-        freeze(dir, true).map(|()| vec![dir.display().to_string()])
+    /// What stopping the group stops: the whole cgroup at once, by its folder; nothing if it's
+    /// frozen already (someone else's freeze, left as it is and never thawed here).
+    pub fn keys(dir: &Path) -> Vec<String> {
+        match fs::read_to_string(dir.join("cgroup.freeze")) {
+            Ok(v) if v.trim() == "0" => vec![dir.display().to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Stops what `keys` name; says which it stopped.
+    pub fn stop_keys(keys: &[String]) -> Vec<String> {
+        keys.iter().filter(|k| freeze(Path::new(k), true).is_ok()).cloned().collect()
     }
 
     pub fn release(key: &str) {
@@ -384,44 +745,66 @@ mod imp {
         crate::os::contain::Group::existing(session).map(|g| g.pids()).unwrap_or_default()
     }
 
-    /// Stops each of the session's processes, each starting again by its id: one started
-    /// meanwhile runs until the next stop.
-    pub fn stop(dir: &Path) -> std::io::Result<Vec<String>> {
-        stop_pids(&pids(dir))
+    /// What stopping the session stops: each of its processes now, by id and start (an id may be
+    /// another's by the time it's started again); one started meanwhile runs until the next stop.
+    pub fn keys(dir: &Path) -> Vec<String> {
+        pids(dir).into_iter().filter(|p| !stopped_already(*p)).filter_map(super::Proc::of).map(|p| key(&p)).collect()
     }
 
-    /// Stops processes `pids`: SIGSTOP on macOS, every thread suspended on Windows.
+    pub(super) fn key(p: &super::Proc) -> String {
+        format!("pid:{}:{}", p.pid, p.start)
+    }
+
+    fn parse(key: &str) -> Option<super::Proc> {
+        let (pid, start) = key.strip_prefix("pid:")?.split_once(':')?;
+        Some(super::Proc { pid: pid.parse().ok()?, start: start.parse().ok()? })
+    }
+
+    /// A process someone else stopped (macOS: SIGSTOP isn't counted, so it's left alone and never
+    /// continued here). Windows counts each suspension, so each undoes only its own.
     #[cfg(target_os = "macos")]
-    pub fn stop_pids(pids: &[u32]) -> std::io::Result<Vec<String>> {
-        use nix::sys::signal::{Signal, kill};
-        Ok(pids
-            .iter()
-            .copied()
-            .filter(|p| i32::try_from(*p).is_ok_and(|p| kill(nix::unistd::Pid::from_raw(p), Signal::SIGSTOP).is_ok()))
-            .map(|p| format!("pid:{p}"))
-            .collect())
+    fn stopped_already(pid: u32) -> bool {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+        let pid = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::nothing());
+        sys.process(pid).is_some_and(|p| p.status() == ProcessStatus::Stop)
     }
 
-    #[cfg(windows)]
-    pub fn stop_pids(pids: &[u32]) -> std::io::Result<Vec<String>> {
-        Ok(crate::os::contain::suspend_all(pids).into_iter().map(|p| format!("pid:{p}")).collect())
+    #[cfg(not(target_os = "macos"))]
+    fn stopped_already(_pid: u32) -> bool {
+        false
     }
 
-    #[cfg(not(any(target_os = "macos", windows)))]
-    pub fn stop_pids(_pids: &[u32]) -> std::io::Result<Vec<String>> {
-        Err(std::io::Error::other("no pacing on this system"))
-    }
-
-    pub fn release(key: &str) {
-        let Some(pid) = key.strip_prefix("pid:").and_then(|p| p.parse::<u32>().ok()) else { return };
+    /// Stops what `keys` name: SIGSTOP on macOS, every thread suspended on Windows; says which it
+    /// stopped.
+    pub fn stop_keys(keys: &[String]) -> Vec<String> {
+        let procs: Vec<(&String, u32)> = keys.iter().filter_map(|k| parse(k).map(|p| (k, p.pid))).collect();
         #[cfg(target_os = "macos")]
-        if let Ok(pid) = i32::try_from(pid) {
+        let stopped: Vec<u32> = procs.iter().map(|(_, p)| *p).filter(|p| i32::try_from(*p).is_ok_and(|p| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGSTOP).is_ok())).collect();
+        #[cfg(windows)]
+        let stopped = crate::os::contain::suspend_all(&procs.iter().map(|(_, p)| *p).collect::<Vec<_>>());
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let stopped: Vec<u32> = Vec::new();
+        procs.into_iter().filter(|(_, p)| stopped.contains(p)).map(|(k, _)| k.clone()).collect()
+    }
+
+    /// Starts again what a key names, while it's still the process it was.
+    pub fn release(key: &str) {
+        let Some(p) = parse(key).filter(super::Proc::alive) else { return };
+        #[cfg(target_os = "macos")]
+        if let Ok(pid) = i32::try_from(p.pid) {
             let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGCONT);
         }
         #[cfg(windows)]
-        crate::os::contain::resume_all(&[pid]);
+        crate::os::contain::resume_all(&[p.pid]);
         #[cfg(not(any(target_os = "macos", windows)))]
-        let _ = pid;
+        let _ = p;
+    }
+
+    /// No unit outside kiln's own groups is paced here, so the guard needs no scope of its own.
+    pub fn guard_in_scope() -> bool {
+        false
     }
 }
 
@@ -499,12 +882,50 @@ mod portable_tests {
         Ok(())
     }
 
+    /// Set in a child these tests start as a pacer's guard: the record it guards.
+    const GUARD: &str = "KILN_HEADROOM_TEST_GUARD";
+
+    /// A pacer's guard in tests: this test binary again, run as [`guard_child`] (`kiln
+    /// headroom-guard` is the kiln binary's own).
+    pub(super) fn test_guard(record: &std::path::Path) -> std::io::Result<std::process::Command> {
+        let mut c = std::process::Command::new(std::env::current_exe()?);
+        c.args([this("guard_child").as_str(), "--exact", "--nocapture", "--quiet", "--test-threads=1"]).env(GUARD, record);
+        Ok(c)
+    }
+
+    /// The name this module's test `test` runs by.
+    fn this(test: &str) -> String {
+        format!("{}::{test}", module_path!().split_once("::").map_or("", |(_, m)| m))
+    }
+
+    /// Whether `f` holds within `limit`, looked at every 10 ms.
+    pub(super) fn within(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let end = std::time::Instant::now() + limit;
+        loop {
+            if f() {
+                return true;
+            }
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn guard_child() {
+        if let Some(record) = std::env::var_os(GUARD) {
+            let _ = super::guard(std::path::Path::new(&record));
+        }
+    }
+
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn a_stopped_process_does_nothing_and_works_again_once_released() -> anyhow::Result<()> {
         write_if_asked()?;
         let w = Writer::start("a_stopped_process_does_nothing_and_works_again_once_released")?;
-        let keys = super::imp::stop_pids(&w.pid())?;
+        let p = super::Proc::of(w.child.id()).ok_or_else(|| anyhow::anyhow!("the writer's start is unknown"))?;
+        let keys = super::imp::stop_keys(&[super::imp::key(&p)]);
         anyhow::ensure!(keys.len() == 1, "{keys:?}");
         // What was under way when it stopped lands first.
         std::thread::sleep(Duration::from_millis(200));
@@ -514,6 +935,53 @@ mod portable_tests {
         let (cpu, written) = w.over(Duration::from_millis(700));
         anyhow::ensure!(cpu > 0 && written > 0, "released, yet {cpu} µs of CPU and {written} bytes written");
         Ok(())
+    }
+
+    /// Set in the child pacer [`a_pacer_killed_while_it_holds_a_process_stopped_leaves_it_running`]
+    /// starts: what it stops, and its record.
+    #[cfg(any(target_os = "macos", windows))]
+    const STOP: &str = "KILN_HEADROOM_TEST_STOP";
+    #[cfg(any(target_os = "macos", windows))]
+    const RECORD: &str = "KILN_HEADROOM_TEST_RECORD";
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_pacer_killed_while_it_holds_a_process_stopped_leaves_it_running() -> anyhow::Result<()> {
+        const NAME: &str = "a_pacer_killed_while_it_holds_a_process_stopped_leaves_it_running";
+        write_if_asked()?;
+        if let (Some(key), Some(record)) = (std::env::var_os(STOP), std::env::var_os(RECORD)) {
+            return hold(&key.to_string_lossy(), std::path::Path::new(&record));
+        }
+        let w = Writer::start(NAME)?;
+        let p = super::Proc::of(w.child.id()).ok_or_else(|| anyhow::anyhow!("the writer's start is unknown"))?;
+        let dir = tempfile::tempdir()?;
+        let mut pacer = std::process::Command::new(std::env::current_exe()?)
+            .args([this(NAME).as_str(), "--exact", "--nocapture", "--quiet", "--test-threads=1"])
+            .env(STOP, super::imp::key(&p))
+            .env(RECORD, dir.path().join("pacer.json"))
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let stopped = within(Duration::from_secs(20), || w.over(Duration::from_millis(200)).0 == 0);
+        let _ = pacer.kill();
+        let _ = pacer.wait();
+        anyhow::ensure!(stopped, "the child pacer never stopped the writer");
+        anyhow::ensure!(within(Duration::from_secs(1), || w.over(Duration::from_millis(50)).0 > 0), "still stopped 1 s after its pacer was killed");
+        Ok(())
+    }
+
+    /// In the child pacer: its guard told first, the process stopped, then held until killed.
+    #[cfg(any(target_os = "macos", windows))]
+    fn hold(key: &str, record: &std::path::Path) -> anyhow::Result<()> {
+        let me = super::Proc::me().ok_or_else(|| anyhow::anyhow!("this process's start is unknown"))?;
+        let paced = super::Paced { me, record: record.to_owned(), how: test_guard };
+        let mut g = super::Guard::start(&paced, false)?;
+        anyhow::ensure!(within(Duration::from_secs(20), || g.ready()), "the guard never said it runs");
+        let key = key.to_owned();
+        anyhow::ensure!(g.tell(&std::collections::BTreeSet::from([&key])), "the guard didn't hear");
+        anyhow::ensure!(super::imp::stop_keys(std::slice::from_ref(&key)).len() == 1, "nothing stopped");
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
     }
 }
 
@@ -529,16 +997,36 @@ mod tests {
         assert!(!imp::desktop("amphora-gate-order-1793058099.service"));
     }
 
+    use super::portable_tests::{test_guard, within};
+
+    /// A "group" that's only a folder: freezing and thawing write its cgroup.freeze, as on a real
+    /// cgroup.
+    fn group(dir: &Path, name: &str, frozen: bool) -> anyhow::Result<PathBuf> {
+        let g = dir.join(name);
+        std::fs::create_dir(&g)?;
+        std::fs::write(g.join("cgroup.freeze"), if frozen { "1" } else { "0" })?;
+        Ok(g)
+    }
+
+    fn frozen(g: &Path) -> bool {
+        std::fs::read_to_string(g.join("cgroup.freeze")).is_ok_and(|v| v.trim() == "1")
+    }
+
+    /// The pacers' records in `dir`.
+    fn records(dir: &Path) -> Vec<Record> {
+        std::fs::read_dir(dir.join(RECORDS))
+            .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).filter_map(|e| serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()).collect())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn a_record_left_behind_starts_its_groups_again_and_goes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        // A "group" that's only a folder: thawing writes its cgroup.freeze, as on a real cgroup.
-        let g = dir.path().join("g");
-        std::fs::create_dir(&g)?;
-        std::fs::write(g.join("cgroup.freeze"), "1")?;
+        let g = group(dir.path(), "g", true)?;
+        // The record pacers before these kept, one for all of them.
         std::fs::write(dir.path().join("paced.json"), serde_json::to_vec(&[g.display().to_string()])?)?;
-        let p = Pacer::start(dir.path());
-        anyhow::ensure!(std::fs::read_to_string(g.join("cgroup.freeze"))? == "0");
+        let p = Pacer::start_with(dir.path(), test_guard);
+        anyhow::ensure!(!frozen(&g));
         anyhow::ensure!(!dir.path().join("paced.json").exists());
         drop(p);
         Ok(())
@@ -547,17 +1035,122 @@ mod tests {
     #[test]
     fn a_paced_group_is_stopped_part_of_each_period_and_runs_once_let_go() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let g = dir.path().join("g");
-        std::fs::create_dir(&g)?;
-        std::fs::write(g.join("cgroup.freeze"), "0")?;
-        let p = Pacer::start(dir.path());
+        let g = group(dir.path(), "g", false)?;
+        let p = Pacer::start_with(dir.path(), test_guard);
         p.set(HashMap::from([(g.clone(), 0)]), Duration::from_millis(200));
-        std::thread::sleep(Duration::from_millis(300));
-        anyhow::ensure!(std::fs::read_to_string(g.join("cgroup.freeze"))? == "1", "0% is stopped");
-        anyhow::ensure!(dir.path().join("paced.json").exists(), "what is paced is noted");
+        anyhow::ensure!(within(Duration::from_secs(20), || frozen(&g)), "0% is stopped once its guard runs");
+        anyhow::ensure!(records(dir.path()).iter().any(|r| r.stopped.contains(&g.display().to_string())), "what is paced is noted");
         p.set(HashMap::new(), Duration::from_millis(200));
-        std::thread::sleep(Duration::from_millis(300));
-        anyhow::ensure!(std::fs::read_to_string(g.join("cgroup.freeze"))? == "0", "let go, it runs");
+        anyhow::ensure!(within(Duration::from_secs(5), || !frozen(&g)), "let go, it runs");
+        anyhow::ensure!(within(Duration::from_secs(5), || records(dir.path()).is_empty()), "nothing paced, nothing noted");
+        Ok(())
+    }
+
+    /// Set in the child pacer [`a_pacer_killed_while_its_group_is_frozen_leaves_it_running`]
+    /// starts: the folder its group is in.
+    const PACER: &str = "KILN_HEADROOM_TEST_PACER";
+
+    #[test]
+    fn a_pacer_killed_while_its_group_is_frozen_leaves_it_running() -> anyhow::Result<()> {
+        const NAME: &str = "a_pacer_killed_while_its_group_is_frozen_leaves_it_running";
+        if let Some(dir) = std::env::var_os(PACER) {
+            // In the child: the group paced at 0% until this process is killed.
+            let dir = PathBuf::from(dir);
+            let p = Pacer::start_with(&dir, test_guard);
+            p.set(HashMap::from([(dir.join("g"), 0)]), Duration::from_millis(200));
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let g = group(dir.path(), "g", false)?;
+        let me = format!("{}::{NAME}", module_path!().split_once("::").map_or("", |(_, m)| m));
+        let mut pacer = Command::new(std::env::current_exe()?).args([me.as_str(), "--exact", "--nocapture", "--quiet", "--test-threads=1"]).env(PACER, dir.path()).stdout(Stdio::null()).spawn()?;
+        let stopped = within(Duration::from_secs(20), || frozen(&g));
+        // SIGKILL: nothing of the pacer runs to start its group again.
+        let _ = pacer.kill();
+        let _ = pacer.wait();
+        anyhow::ensure!(stopped, "the child pacer never stopped its group");
+        anyhow::ensure!(within(Duration::from_secs(1), || !frozen(&g)), "still frozen 1 s after its pacer was killed");
+        anyhow::ensure!(within(Duration::from_secs(1), || records(dir.path()).is_empty()), "its record is left");
+        Ok(())
+    }
+
+    /// A process that has ended, by its id and start as a record has it.
+    fn ended() -> anyhow::Result<Proc> {
+        let mut c = Command::new("sleep").arg("60").spawn()?;
+        let p = Proc::of(c.id()).ok_or_else(|| anyhow::anyhow!("no start for {}", c.id()))?;
+        c.kill()?;
+        c.wait()?;
+        Ok(p)
+    }
+
+    #[test]
+    fn a_record_whose_pacer_and_guard_are_gone_is_released_and_one_still_running_is_left() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (gone_g, live_g) = (group(dir.path(), "a", true)?, group(dir.path(), "b", true)?);
+        let gone = ended()?;
+        let me = Proc::me().ok_or_else(|| anyhow::anyhow!("this process's start is unknown"))?;
+        let recs = dir.path().join(RECORDS);
+        std::fs::create_dir(&recs)?;
+        std::fs::write(recs.join("gone.json"), serde_json::to_vec(&Record { owner: Some(gone), guard: None, stopped: vec![gone_g.display().to_string()] })?)?;
+        std::fs::write(recs.join("live.json"), serde_json::to_vec(&Record { owner: Some(me), guard: None, stopped: vec![live_g.display().to_string()] })?)?;
+        let p = Pacer::start_with(dir.path(), test_guard);
+        anyhow::ensure!(!frozen(&gone_g) && !recs.join("gone.json").exists(), "what an ended pacer left runs again");
+        anyhow::ensure!(frozen(&live_g) && recs.join("live.json").exists(), "a running pacer's is its own");
+        drop(p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_left_while_a_pacer_runs_is_released_within_a_period() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let g = group(dir.path(), "g", true)?;
+        let p = Pacer::start_with(dir.path(), test_guard);
+        p.set(HashMap::new(), Duration::from_millis(200));
+        // A pacer that ended with its guard after this one started (one this runner took over
+        // from, say): its record as it left it.
+        let recs = dir.path().join(RECORDS);
+        std::fs::create_dir_all(&recs)?;
+        std::fs::write(recs.join("gone.json"), serde_json::to_vec(&Record { owner: Some(ended()?), guard: None, stopped: vec![g.display().to_string()] })?)?;
+        anyhow::ensure!(within(Duration::from_secs(5), || !frozen(&g)), "still frozen");
+        anyhow::ensure!(!recs.join("gone.json").exists(), "its record is left");
+        drop(p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_someone_else_froze_stays_frozen_through_pacing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (theirs, ours) = (group(dir.path(), "theirs", true)?, group(dir.path(), "ours", false)?);
+        let p = Pacer::start_with(dir.path(), test_guard);
+        p.set(HashMap::from([(theirs.clone(), 0), (ours.clone(), 0)]), Duration::from_millis(200));
+        anyhow::ensure!(within(Duration::from_secs(20), || frozen(&ours)), "ours is stopped once its guard runs");
+        anyhow::ensure!(records(dir.path()).iter().all(|r| !r.stopped.contains(&theirs.display().to_string())), "theirs is noted as ours");
+        p.set(HashMap::new(), Duration::from_millis(200));
+        anyhow::ensure!(within(Duration::from_secs(5), || !frozen(&ours)), "ours runs once let go");
+        drop(p);
+        anyhow::ensure!(frozen(&theirs), "theirs was thawed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_runner_its_supervisor_did_not_start_paces_only_kilns_own_groups() {
+        // This test process: started by cargo, not by kiln's supervisor.
+        assert!(!crate::os::supervise::started_by_supervisor());
+        let gs = groups(true);
+        assert!(gs.iter().all(|g| g.session.is_some()), "{gs:?}");
+    }
+
+    #[test]
+    fn the_machines_lock_goes_to_the_next_holder_once_let_go() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("escapes.lock");
+        let first = imp::take_lock(&path).ok_or_else(|| anyhow::anyhow!("not taken"))?;
+        anyhow::ensure!(imp::take_lock(&path).is_none(), "two holders");
+        drop(first);
+        // At the next try (a child another test is starting holds the lock's file until it execs).
+        anyhow::ensure!(within(Duration::from_secs(1), || imp::take_lock(&path).is_some()), "not taken once let go");
         Ok(())
     }
 }

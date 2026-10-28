@@ -56,22 +56,40 @@ person sends "now" never waits.
 **Pacing.** When running work wants more than a budget, the budget is water-filled class by class,
 max-min fair within a class, and each group runs that share of every period (`cgroup.freeze`):
 only for the resource that's short. Groups are each agent session's cgroup and, with `escapes`
-on, the user's transient units (`systemd-run --user`: agents' builds), paced by one kiln a
-machine (the one holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`) and never one that kiln
-itself runs in. Units the desktop starts
-for a person (`app-…`, `dbus-…`, `xdg-…`) are never paced.
+on, the user's transient units (`systemd-run --user`: agents' builds). Those are paced only by the
+machine's installed runner: the one its supervisor started (its parent is the process serving the
+supervisor's control socket it was given), holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`
+(tried again until held, so a runner that took over from another takes it once that one is gone).
+A runner a test or a person started paces its own sessions only. Units kiln itself runs in, units
+the desktop starts for a person (`app-…`, `dbus-…`, `xdg-…`) and kiln's guards
+(`kiln-headroom-guard-…`) are never paced, and neither is anything someone else froze: a cgroup
+already frozen when headroom would stop it is left as it is, and never thawed by headroom.
 
 On macOS and Windows a group is each agent session's processes as kiln holds them (followed fork
 by fork on macOS, its job object on Windows), metered process by process (CPU time, bytes
 written, resident memory: `sysinfo`) and stopped process by process: SIGSTOP and SIGCONT on
 macOS, every thread suspended and resumed on Windows. A process an agent starts while its group
-is stopped runs until the next stop. Neither system says what its disks write in all, so
-`delivered_bps` is unknown there: budgets are measured on kiln's own work either way.
+is stopped runs until the next stop; one someone else stopped (macOS) is left alone, and on
+Windows each suspension is undone by one resume, so only kiln's own are. Neither system says what
+its disks write in all, so `delivered_bps` is unknown there: budgets are measured on kiln's own
+work either way.
 
-**Failing safe.** What's stopped is noted in `<state>/headroom/paced.json` (a cgroup's folder; a
-process id on macOS and Windows) and started again on the next start; what was learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own
-threads, from settings it kept, with the server away. How many agent sessions a machine has at
-work at once is the agent limit's (`docs/agents.md`), not headroom's.
+**Failing safe.** Nothing stays stopped once what stopped it is gone, however it goes (killed,
+crashed, its unit restarted, replaced by a build without headroom). Every pacer has a guard, `kiln
+headroom-guard`, a small process of its own: under a user manager the installed runner's guard
+runs in a scope of its own (`kiln-headroom-guard-<pid>-<start>.scope`, which a restart of the
+runner's unit leaves running); elsewhere it runs in a process group of its own, and on Windows
+outside the runner's job where the job allows. The pacer stops nothing until its guard says it
+runs, and tells it everything it may stop (a cgroup's folder; a process by its id and start on
+macOS and Windows) before stopping any of it. The guard keeps the last list whole; once the
+pacer's end of its input closes, which the system does however the pacer ends, the guard starts
+it all again and goes. Each pacer also keeps its list in `<state>/headroom/paced/<pid>-<start>.json`:
+a pacer releases every record whose pacer and guard have both ended, as it starts and once a
+period after (and, as it starts, the single `paced.json` older builds kept). A guard that ends while its pacer runs takes nothing with it: the
+pacer starts everything again itself and stops nothing until a guard runs again. What was
+learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own threads, from
+settings it kept, with the server away. How many agent sessions a machine has at work at once is
+the agent limit's (`docs/agents.md`), not headroom's.
 
 ## Settings
 

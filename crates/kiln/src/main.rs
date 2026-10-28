@@ -455,6 +455,11 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("vmm-jail") {
         return kiln::runner::jail::main();
     }
+    // A headroom pacer's guard (docs/headroom.md, "Failing safe"): a small process of its own that
+    // starts again what its pacer stopped once the pacer ends, however it ends; it needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {
+        return kiln::headroom::guard_main(std::env::args_os().nth(2));
+    }
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
         let action = std::env::args().nth(1).unwrap_or_default();
