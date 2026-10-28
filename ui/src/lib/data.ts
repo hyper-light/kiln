@@ -78,6 +78,15 @@ export function labelOf(name: string, labels: Labels = useMachineLabels.getState
   return (Object.hasOwn(labels, name) ? labels[name] : undefined) ?? name;
 }
 
+/**
+ * Words a machine wrote naming another by the id kiln knows it by ("Moved here from <id>": a runner
+ * has only the ids): each runner's id in them, the name it's shown by now (docs/machines.md). Other
+ * ids (a session's, a plan's) have no label, and stay.
+ */
+export function withLabels(text: string, labels: Labels = useMachineLabels.getState()): string {
+  return text.replace(/\b[0-9a-f]{32}\b/g, (id) => labelOf(id, labels));
+}
+
 /** Machines' names in the order people read them: by the names they're shown by. */
 export const byLabel =
   (labels: Labels = useMachineLabels.getState()) =>

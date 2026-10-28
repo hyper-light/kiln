@@ -4,7 +4,7 @@ import { events } from "../src/api/events.ts";
 import { waitSentence } from "../src/api/ci.ts";
 import { placementWords, retryChoices, type RetryOptions } from "../src/api/retry.ts";
 import type { Agent, ServerEvent } from "../src/api/types.ts";
-import { agentsRes, byLabel, labelOf, noteLabels, shownName, useMachineLabels } from "../src/lib/data.ts";
+import { agentsRes, byLabel, labelOf, noteLabels, shownName, useMachineLabels, withLabels } from "../src/lib/data.ts";
 
 /** A machine kiln knows by its machine id (docs/machines.md): the id is its name, its key everywhere. */
 const ID = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
@@ -27,6 +27,16 @@ test("a machine known by its id is shown by its label; one known by its name, by
   // A name that is also a property every object has is no label.
   assert.equal(labelOf("constructor"), "constructor");
   assert.equal(labelOf("toString"), "toString");
+});
+
+test("a runner's words name machines by their ids: each runner's id is said by its label, other ids stay", () => {
+  useMachineLabels.setState({}, true);
+  noteLabels([{ name: ID, label: MBP }]);
+  const session = "01a157fddb8276a2996246ea931c4808";
+  assert.equal(withLabels(`Moved here from ${ID} — the conversation, its timeline and queue came along`), `Moved here from ${MBP} — the conversation, its timeline and queue came along`);
+  assert.equal(withLabels(`Moving to fedora: handing over ${session}`), `Moving to fedora: handing over ${session}`);
+  // Only a whole id: not part of a longer one.
+  assert.equal(withLabels(`${ID}0`), `${ID}0`);
 });
 
 test("the labels change only when one does: noting the same ones again leaves them be", () => {

@@ -25,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type Outgoing, type QueueItem, type SessionStore, type Task } from "@/api/harness";
-import { labelOf, useLabels } from "@/lib/data";
+import { labelOf, useLabels, withLabels } from "@/lib/data";
 import { useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -519,11 +519,13 @@ function Thought({ item, live, since }: { item: ThoughtItem; live: boolean; sinc
 
 function Notice({ e, repeats }: { e: Extract<HEvent, { kind: "notice" }>; repeats?: number }) {
   const signIn = React.useContext(SignIn);
+  // A runner's words name machines by their ids ("Moved here from …"): said by the names people see.
+  const labels = useLabels();
   const I = e.level === "error" ? CircleAlert : e.level === "warn" ? TriangleAlert : Info;
   return (
     <>
       <div className="hx-notice" data-level={e.level} data-ev={e.id}>
-        <I size={12} /> <span>{e.text}</span>
+        <I size={12} /> <span>{withLabels(e.text, labels)}</span>
         {repeats && repeats > 1 && (
           <span className="hx-notice-n" title={`Said ${repeats} times in a row`}>
             ×{repeats}
