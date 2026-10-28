@@ -1053,9 +1053,13 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
       return (ctx.json(res, 200, { id: b, thread: t.id, state: t.state, kind: t.kind }), true);
     }
     if (m === "DELETE") {
+      // As kiln deletes (crates/kiln/src/ci/review.rs): the last comment left takes its thread with it;
+      // the first, with replies still after it, stays, said deleted; a reply goes.
       if (cm) {
-        if (t.comments.length === 1) t.comments = [];
-        else cm.deleted = true;
+        const others = t.comments.filter((x) => x !== cm && !x.deleted).length;
+        if (others === 0) t.comments = [];
+        else if (t.comments[0] === cm) cm.deleted = true;
+        else t.comments = t.comments.filter((x) => x !== cm);
       }
       ctx.emit({ type: "comment", diff: t.diff });
       return (ctx.json(res, 200, { id: b, thread: t.id, deleted: true, thread_deleted: t.comments.length === 0 }), true);
