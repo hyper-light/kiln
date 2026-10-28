@@ -37,20 +37,29 @@ function putAway(keys: string[], agent: string, how: "away" | "done" = "away") {
   markNotices(keys, how, [agent]);
 }
 
-/** What a tool call would do, as an agent's page says it. */
-const VERB: Record<string, string> = {
-  shell: "run a command",
-  edit: "change files",
-  web: "go online",
-  mcp: "use a connected tool",
-  agent: "start a subagent",
-};
-
-/** What it asks, in a few words. */
-function what(ap: NonNullable<Card["ap"]>): { lead: string; line?: string } {
-  if (ap.tool === "question") return { lead: "asks you", line: ap.title };
-  if (ap.tool === "plan") return { lead: "proposes a plan", line: ap.title || undefined };
-  return { lead: `wants to ${VERB[ap.tool] ?? "go ahead"}`, line: `${ap.tool_name || ap.tool}: ${ap.title}` };
+/** What it asks, in a few words, whatever its harness calls the tool: a command as you'd type it, else what it would do to what. */
+function asks(ap: NonNullable<Card["ap"]>): React.ReactNode {
+  const code = (s: string) => <span className="rq-code">{s}</span>;
+  switch (ap.tool) {
+    case "shell":
+      return code(`$ ${ap.title}`);
+    case "edit":
+      return <>Edit {code(ap.title)}</>;
+    case "read":
+      return <>Read {code(ap.title)}</>;
+    case "web":
+      return /^https?:\/\//.test(ap.title) ? <>Open {code(ap.title)}</> : <>Search the web for {ap.title}</>;
+    case "mcp":
+      return <>Use {code(ap.title)}</>;
+    case "skill":
+      return <>Run the {code(ap.title)} skill</>;
+    case "agent":
+      return <>Start a subagent: {ap.title}</>;
+    case "plan":
+      return ap.title || "A plan to look at";
+    default:
+      return ap.title;
+  }
 }
 
 /** A finger dragging a card sideways: it follows, and past SWIPE it's put away. */
@@ -85,9 +94,9 @@ function swipe(onAway: () => void): Pick<React.HTMLAttributes<HTMLLIElement>, "o
   };
 }
 
-/** A card's frame: its agent and what it says, what to do about it, and × to put it away. */
-function Shell({ card, lead, line, busy, children }: { card: Card; lead: string; line?: string; busy?: boolean; children?: React.ReactNode }) {
-  const { a } = card;
+/** A card's frame: its agent and where it runs (and how many more it asks), what it says, what to do about it, and × to put it away. */
+function Shell({ card, line, busy, children }: { card: Card; line?: React.ReactNode; busy?: boolean; children?: React.ReactNode }) {
+  const { a, more } = card;
   const label = agentLabel(a);
   // A request puts away all its agent asks now; the rest, this one.
   const away = () => putAway(card.kind === "request" ? a.approvals.map((p) => p.id) : [card.key], a.id);
@@ -98,8 +107,11 @@ function Shell({ card, lead, line, busy, children }: { card: Card; lead: string;
         <p className="rq-head">
           <Link to={`/agents/${a.id}`} className="rq-name">
             {label}
-          </Link>{" "}
-          <span className="rq-lead">{lead}</span>
+          </Link>
+          <span className="rq-where">
+            {machineName(a.target)}
+            {more > 0 && ` · +${more} more`}
+          </span>
         </p>
         {line && <p className="rq-line">{line}</p>}
         {children && <div className="rq-acts">{children}</div>}
@@ -108,16 +120,6 @@ function Shell({ card, lead, line, busy, children }: { card: Card; lead: string;
         <X size={14} />
       </button>
     </li>
-  );
-}
-
-/** Its machine, and how many more it asks. */
-function Where({ a, more = 0 }: { a: AgentInfo; more?: number }) {
-  return (
-    <span className="rq-where">
-      {machineName(a.target)}
-      {more > 0 && ` · +${more} more`}
-    </span>
   );
 }
 
@@ -132,11 +134,12 @@ function Open({ a }: { a: AgentInfo }) {
 function RequestCard({ card }: { card: Card }) {
   const [busy, setBusy] = React.useState(false);
   const navigate = useNavigate();
-  const { a, ap, more } = card;
+  const { a, ap } = card;
   if (!ap) return null;
   const href = `/agents/${a.id}`;
-  const { lead, line } = what(ap);
   const plan = ap.tool === "plan";
+  // More to see than the card has room for: a plan to read, an edit's diff.
+  const review = plan || ap.tool === "edit";
   // Answered at once (answered.ts): the card goes now, and is back if the answer doesn't go.
   const decide = (decision: "allow" | "deny") => {
     setBusy(true);
@@ -146,7 +149,7 @@ function RequestCard({ card }: { card: Card }) {
     });
   };
   return (
-    <Shell card={card} lead={lead} line={line} busy={busy}>
+    <Shell card={card} line={asks(ap)} busy={busy}>
       {ap.tool === "question" ? (
         <Button size="xs" onClick={() => navigate(href)}>
           Answer
@@ -162,18 +165,16 @@ function RequestCard({ card }: { card: Card }) {
               Deny
             </Button>
           )}
-          <Link to={href} className="rq-open">
-            Review <ArrowUpRight size={12} aria-hidden="true" />
-          </Link>
+          {review && (
+            <Link to={href} className="rq-open">
+              Review <ArrowUpRight size={12} aria-hidden="true" />
+            </Link>
+          )}
         </>
       )}
-      <Where a={a} more={more} />
     </Shell>
   );
 }
-
-/** Its first letter a capital: a line that stands on its own. */
-const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** Goals it paused for you: the plan they wait on to look at, and Resume. */
 function HeldCard({ card }: { card: Card }) {
@@ -199,7 +200,7 @@ function HeldCard({ card }: { card: Card }) {
     );
   };
   return (
-    <Shell card={card} lead="paused its goals for you" line={capital(heldWords(held.why)) || undefined} busy={busy}>
+    <Shell card={card} line={`Paused its goals${heldWords(held.why) ? `: ${heldWords(held.why)}` : ""}`} busy={busy}>
       {held.plan ? (
         <>
           <Button size="xs" onClick={() => navigate(`/agents/plans/${held.plan}`)}>
@@ -217,7 +218,6 @@ function HeldCard({ card }: { card: Card }) {
           <Open a={a} />
         </>
       )}
-      <Where a={a} />
     </Shell>
   );
 }
@@ -238,12 +238,11 @@ function StoppedCard({ card }: { card: Card }) {
   };
   const code = a.exit?.code;
   return (
-    <Shell card={card} lead="stopped by itself" line={`${a.exit?.error ?? "Its harness ended"}${typeof code === "number" ? ` (exit ${code})` : ""}`} busy={busy}>
+    <Shell card={card} line={`Stopped by itself: ${a.exit?.error ?? "its harness ended"}${typeof code === "number" ? ` (exit ${code})` : ""}`} busy={busy}>
       <Button size="xs" disabled={busy} onClick={restart}>
         Restart
       </Button>
       <Open a={a} />
-      <Where a={a} />
     </Shell>
   );
 }
@@ -253,7 +252,7 @@ function LimitCard({ card }: { card: Card }) {
   const now = useClock(30_000);
   const { a } = card;
   if (!a.pause) return null;
-  return <Shell card={card} lead="is paused at its usage limit" line={pauseLine(a.pause, now)} />;
+  return <Shell card={card} line={pauseLine(a.pause, now)} />;
 }
 
 function CardOf({ card }: { card: Card }) {

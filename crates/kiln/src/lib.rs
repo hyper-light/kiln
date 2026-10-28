@@ -61,8 +61,10 @@ pub mod records;
 pub mod research;
 pub mod runner;
 pub mod rt;
+pub mod ship;
 pub mod secrets;
 pub mod server;
+pub mod setup;
 #[cfg(test)]
 mod sim;
 pub mod skew;

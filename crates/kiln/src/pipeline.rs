@@ -225,6 +225,16 @@ impl PlannedJob {
         self.without_requires = caps & crate::proto::CAP_CI2 == 0;
         self
     }
+
+    /// The job as the runner it's assigned to reads it: [`PlannedJob::for_runner`] with what the
+    /// runner said it can do, or for a job pod (`ephemeral`, [`crate::k8s`]) as this build writes
+    /// it. A pod never says (it sends no `Build`, so its capabilities read none) and runs the
+    /// agent image this server is set up with, which reads `requires`: written without it, every
+    /// `[k8s]` job of v1's went to its pod out of step, refused as malformed or read with no steps
+    /// and passed without running (W05-R22, W28 step 3's replay).
+    pub fn for_assignee(self, caps: u32, ephemeral: bool) -> Self {
+        self.for_runner(if ephemeral { caps | crate::proto::CAP_CI2 } else { caps })
+    }
 }
 
 // By hand for `requires`, which a runner from before the CI work reads a job without: the fields

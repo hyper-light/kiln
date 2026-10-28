@@ -463,8 +463,9 @@ What stays, and why:
 
 **Into another harness.** `move {"to": …, "kind": "codex", "model": "…"}` moves it to a runner that
 has that harness instead of its own, the conversation carried over as a switch of harness carries it
-(Claude Code ⇄ Codex: read from the harness's own record, fitted, written the way the other keeps
-its own; the permission mode never wider, the nearest effort). The timeline says it goes on in the
+(any harness into any other: read from Claude Code's or Codex's own record, else kiln's timeline,
+fitted, and written the way the other keeps its own, or in words for an ACP agent or Antigravity;
+the permission mode never wider, the nearest effort). The timeline says it goes on in the
 other harness, there too. Not from the server's copy: a machine that's away moves an agent only in its
 own harness.
 

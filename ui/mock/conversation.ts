@@ -382,7 +382,12 @@ if (COMPACT) add({ id: "compaction:mock-1", at: LIVE_AT + 900, kind: "notice", l
 // A long turn already under way: what it said and ran, step after step.
 for (let k = 1; k <= LIVE_STEPS; k++) {
   const at = LIVE_AT + 1_000 + k * 20;
-  add({ id: `L-live-n${k}`, at, kind: "assistant", text: `Step ${k}: the reconnect path in \`${FILES[k % FILES.length]}\` reads its backoff from the same clock as the deadline, so I'm checking it next.` });
+  add({
+    id: `L-live-n${k}`,
+    at,
+    kind: "assistant",
+    text: `Step ${k}: the reconnect path in \`${FILES[k % FILES.length]}\` reads its backoff from the same clock as the deadline, so I'm checking it next.`,
+  });
   add({
     id: `L-live-s${k}`,
     at: at + 5,
@@ -541,6 +546,8 @@ const meta: Meta = {
 
 let activity = "Running cargo test";
 let effort = "high";
+/** A switch to another harness, waiting for the turn under way to end. */
+let switching: State["switching"];
 // A long turn under way, as the harness reports it (`doing`, since `turn_started`): it thinks, then
 // takes a step, and thinks again. An interrupt doesn't take (so a stop can be forced), a forced stop
 // ends the turn, and a message sent to it when it's done starts the next.
@@ -582,6 +589,7 @@ const state = (): State => ({
   dropped: DROPPED,
   pause: pause(),
   limits: limits(),
+  switching,
 });
 
 const viewers = new Set<WebSocket>();
@@ -725,10 +733,13 @@ for (let i = 1; i <= CHURN; i++) {
 }
 // Its machine back: viewers hear it, as the server tells them.
 if (offline())
-  setTimeout(() => {
-    broadcast({ t: "state", state: state() });
-    emit({ type: "harness", info: longInfo() });
-  }, offlineUntil - Date.now() + 50);
+  setTimeout(
+    () => {
+      broadcast({ t: "state", state: state() });
+      emit({ type: "harness", info: longInfo() });
+    },
+    offlineUntil - Date.now() + 50,
+  );
 /** Send its machine away again for `ms` (the browser checks drive it, `POST /mock/away`). */
 export function sendAway(ms: number) {
   offlineUntil = Date.now() + ms;
@@ -827,8 +838,12 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
       moveOn = Boolean(c.on);
       movePlan = moveOn ? { ...(c.to ? { to: c.to } : {}), ...(c.kind ? { kind: c.kind } : {}), ...(c.model ? { model: c.model } : {}) } : {};
     } else if (c.type === "set_mode" && c.mode) info.mode = c.mode;
-    else if (c.type === "set_model" && c.model) info.model = c.model;
-    else if (c.type === "set_effort" && c.effort) effort = c.effort;
+    // Another harness's model (its own default: none): the switch waits for the turn under way, as a runner's does.
+    else if (c.type === "set_model" && c.kind && c.kind !== info.kind) switching = { kind: c.kind, model: c.model ?? "" };
+    else if (c.type === "set_model" && c.model) {
+      switching = undefined;
+      info.model = c.model;
+    } else if (c.type === "set_effort" && c.effort) effort = c.effort;
     else if (c.type === "force_stop") {
       running = false;
       lastTurn = { at: Date.now(), how: "stopped", kept: 0 };

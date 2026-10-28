@@ -256,6 +256,11 @@ pub fn has_cluster() -> bool {
     context_name(None).is_ok()
 }
 
+/// The kubeconfig's current context, when it names one (what `kiln setup` offers to install into).
+pub fn current_context() -> Option<String> {
+    context_name(None).ok()
+}
+
 /// An image of kiln for Linux on `arch` CPUs (`amd64`, `arm64`), built with this machine's Docker
 /// unless it's built already: from this binary when it's a Linux kiln for them, else from the
 /// static build a kiln server has ([`fetch_linux_kiln`]). Its tag, and whether it was built now.

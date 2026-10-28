@@ -10,7 +10,9 @@ both at once don't fit one machine beside its other work, and a side waiting on 
 would spend its jobs' timeouts waiting). Then it records every job's conclusion on each side and,
 for the `rust` job, each test that failed (from its `test` step's cargo output). The next commit
 waits for that, since ci.yaml and release.yaml cancel a run in progress when main moves. With one
-`--repo` for both, both sides get each commit at once.
+`--repo` for both, both sides get each commit at once. Only push runs count: a `schedule:` fires on
+each server's own clock at whatever commit its main is at then, so its runs don't line up with the
+replay's commits (W28 step 3).
 
     python3 -I ci/conformance/engine_vs_v1.py --v1-repo <bare repository> --engine-repo <another> \\
         --v1 http://127.0.0.1:17101 --v1-token-file <a>/data/admin.token \\
@@ -103,8 +105,8 @@ def failing_tests(log):
 class V1:
     side = "v1"
 
-    def rerun(self, run):
-        return self.s.post(f"/api/runs/{run['id']}/retry")
+    def rerun(self, run, failed_only=False):
+        return self.s.post(f"/api/runs/{run['id']}/retry", {"only_failed": failed_only})
 
     def __init__(self, server, name):
         self.s = server
@@ -115,7 +117,7 @@ class V1:
 
     def runs(self, sha):
         page = self.s.get(f"/api/runs?repo={self.repo}&limit=200") or []
-        return [r for r in page if r.get("sha") == sha and not r.get("workflow_id")]
+        return [r for r in page if r.get("sha") == sha and not r.get("workflow_id") and r.get("event", "push") == "push"]
 
     def done(self, run):
         return run.get("status") in FINISHED_V1
@@ -137,8 +139,8 @@ class V1:
 class Engine:
     side = "engine"
 
-    def rerun(self, run):
-        return self.s.post(f"/api/ci/runs/{run['id']}/rerun")
+    def rerun(self, run, failed_only=False):
+        return self.s.post(f"/api/ci/runs/{run['id']}/rerun", {"mode": "failed" if failed_only else "all"})
 
     def __init__(self, server, name):
         self.s = server
@@ -147,7 +149,7 @@ class Engine:
     def runs(self, sha):
         q = urllib.parse.quote(self.name, safe="")
         page = (self.s.get(f"/api/ci/runs?repo={q}&limit=100") or {}).get("runs", [])
-        return [r for r in page if r.get("sha") == sha or r.get("head_sha") == sha]
+        return [r for r in page if (r.get("sha") == sha or r.get("head_sha") == sha) and r.get("event", "push") == "push"]
 
     def done(self, run):
         # The engine's runs share v1's table and statuses (`failed`, …), with a conclusion besides.
@@ -235,6 +237,41 @@ def compare(rec, prod=None):
     return {"match": not diffs and not rec.get("timed_out"), "diffs": diffs, "set_aside": aside}
 
 
+def retry_timeouts(sides, sha, rec, prod, timeout):
+    """`--retry-timeouts`: a job whose conclusions differ runs once more on the side where it didn't
+    succeed (on a machine shared with other work a timeout, a missed bench target or a runner
+    frozen past its grace says as much about the load as the job; a real difference comes back):
+    the jobs of
+    that side's run of its workflow that didn't succeed (others keep their results: ci-bench's
+    bench-gate would compare a second measure with the first), then the commit recorded anew, the
+    first record kept in it."""
+    again = []
+    for d in compare(rec, prod)["diffs"]:
+        ok = {s.side: (d[s.side] or []) == ["success"] for s in sides}
+        for s in sides:
+            # The side that didn't succeed where the other did; else the one that timed out or was
+            # cancelled (a runner away past its grace, a lab freeze).
+            if not ok[s.side] and (any(ok.values()) or {"timed_out", "cancelled"} & set(d[s.side] or [])):
+                run = next((r for r in s.runs(sha) if (r.get("pipeline") or r.get("name")) == d["workflow"]), None)
+                if run and all(run is not r for _, r, _ in again):
+                    again.append((s, run, d))
+    if not again:
+        return rec
+    for s, run, d in again:
+        print(f"  {s.side} {d['workflow']}/{d['job']} {d[s.side]} there: its run's unfinished jobs again ({s.rerun(run, failed_only=True)})", flush=True)
+    time.sleep(60)
+    runs, late = {}, rec.get("timed_out", False)
+    for s in sides:
+        got, slow = wait_for([s], sha, timeout)
+        runs.update(got)
+        late = late or slow
+    new = record(sides, sha, runs, late)
+    new.update({k: rec[k] for k in ("subject", "before", "seconds") if k in rec})
+    new["retried"] = [f"{s.side}:{d['workflow']}/{d['job']}" for s, _, d in again]
+    new["first_record"] = {side: {wf: f.get("jobs") for wf, f in v.items()} for side, v in rec["sides"].items()}
+    return new
+
+
 def report(out_dir, order, prod=None):
     rows, matched = [], 0
     for sha in order:
@@ -288,6 +325,7 @@ def main():
     ap.add_argument("--prod", help="production's failing tests by commit: {sha: {failed: [...]}}")
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--rerun", help="run a recorded commit's runs again on both sides (a commit the lab disturbed) and record it anew")
+    ap.add_argument("--retry-timeouts", action="store_true", help="a job whose conclusions differ runs once more where it didn't succeed before the commit is recorded")
     a = ap.parse_args()
     with open(a.commits) as f:
         order = [l.split()[0] for l in f if l.strip() and not l.startswith("#")]
@@ -338,6 +376,8 @@ def main():
             timed_out = timed_out or late
         rec = record(sides, sha, runs, timed_out)
         rec.update({"subject": subject, "before": current, "seconds": round(time.time() - t0)})
+        if a.retry_timeouts:
+            rec = retry_timeouts(sides, sha, rec, prod, a.timeout)
         with open(path + ".part", "w") as f:
             json.dump(rec, f, indent=1)
         os.replace(path + ".part", path)

@@ -21,6 +21,11 @@ use super::model::{
     ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, same_account, sort_catalog,
 };
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"];
+/// It turns nothing on or off once it runs.
+pub(super) const LEARNED: &[&str] = &[];
+
 /// Environment variables a Claude Code session sets for its children; a harness kiln starts must
 /// not inherit them (it would think it runs inside another session).
 pub const SCRUB_ENV: &[&str] = &[
@@ -699,7 +704,7 @@ impl Claude {
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(claude_catalog());
         }
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
+        core.meta.features = FEATURES
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
