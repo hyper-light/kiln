@@ -106,6 +106,18 @@ fn facts_meet(requires: &[String], facts: Option<&kiln_ci::facts::RunnerFacts>, 
     requires.iter().all(|r| kiln_ci::sched::routing::Constraint::parse(r).is_ok_and(|c| c.eval(f, labels)))
 }
 
+/// Why runner `a` can't take a job of `labels` (`runs-on`) and `requires` whatever its load, as
+/// [`Hub::pick_agent`] places it: each label it lacks, and each constraint its facts don't meet
+/// ([`meets`]). Empty: it can. Where a retry may ask the job to run (docs/ci.md W05-R28).
+pub(crate) fn cannot_take(labels: &[String], requires: &[String], a: &AgentLive) -> Vec<String> {
+    let mut why: Vec<String> = labels.iter().filter(|l| !carries(&a.labels, &a.os, &a.arch, &a.name, l)).map(|l| format!("lacks the label {l}")).collect();
+    match a.facts.as_deref() {
+        None if !requires.is_empty() => why.push("hasn't said what it has, which its `requires` needs".to_owned()),
+        facts => why.extend(requires.iter().filter(|r| !facts_meet(std::slice::from_ref(*r), facts, &a.labels)).map(|r| format!("needs {r}"))),
+    }
+    why
+}
+
 /// For a job waiting on its `requires`: each connected runner its labels fit, with the constraints
 /// its facts don't meet (every one, when it hasn't reported facts) and the tools they name, those
 /// an install would fix first, then those that lack least. None when one already meets them all:
@@ -3096,6 +3108,30 @@ pub(crate) mod tests {
         assert!(!facts_meet(&release, None, &labels), "a runner that hasn't said what it has");
         assert!(facts_meet(&[], None, &labels), "a job with no requires goes where its labels say");
         assert!(!facts_meet(&["tools has".to_owned()], Some(&mac(&["node"])), &labels), "a requirement that doesn't parse holds nowhere");
+    }
+
+    /// W05-R28: the runners a retry may ask a pipeline's job onto are those `pick_agent` would
+    /// place it on, its labels and its `requires` both (the release's Linux build, `runs-on:
+    /// [baremetal]`, isn't for a Mac); each other says why not.
+    #[test]
+    fn w05_r28_a_retry_s_runners_are_where_v1_places_the_job() {
+        let runner = |name: &str, os: &str, labels: &[&str], tools: Option<&[&str]>| {
+            let mut a = live_runner(name, os, "x86_64");
+            a.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+            a.facts = tools.map(|t| {
+                Box::new(kiln_ci::facts::RunnerFacts { os: os.into(), arch: "x86_64".into(), tools: t.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), ..Default::default() })
+            });
+            a
+        };
+        let labels = vec!["baremetal".to_owned()];
+        let requires: Vec<String> = ["os == linux", "tools has cargo"].iter().map(|r| (*r).to_owned()).collect();
+        assert!(cannot_take(&labels, &requires, &runner("fedora", "linux", &["baremetal"], Some(&["cargo"]))).is_empty());
+        assert_eq!(cannot_take(&labels, &requires, &runner("mac", "macos", &["baremetal", "macos"], Some(&["cargo"]))), ["needs os == linux"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("bare", "linux", &["baremetal"], Some(&[]))), ["needs tools has cargo"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("quiet", "linux", &["baremetal"], None)), ["hasn't said what it has, which its `requires` needs"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("pod", "linux", &["k8s"], Some(&["cargo"]))), ["lacks the label baremetal"]);
+        // No `requires`: its labels alone, facts or none.
+        assert!(cannot_take(&labels, &[], &runner("quiet", "linux", &["baremetal"], None)).is_empty());
     }
 
     /// What a waiting job's runners lack, for an agent to install (`GET /api/jobs/:id/tools`):
