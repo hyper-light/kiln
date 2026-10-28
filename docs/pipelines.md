@@ -272,10 +272,10 @@ and Retry runs the job again).
 
 A job that finished (failed, say, on a machine that's the problem) runs again from its panel on
 the run page, or `POST /api/ci/legs/:id/retry` (MCP's `ci.legs.retry`): on any runner that can run
-it, on any but the one it ran on, or on one you name of those its labels allow. It runs in its
-run, as its next attempt, while the run's other jobs go on; the jobs that need it wait for it
-again. Its log keeps the attempt before, a `[kiln]` line where the next begins. A job that ran in a
-pod made for it (`[k8s]`) gets a new pod each time, so only "anywhere" applies to it
+it, on any but the one it ran on, or on one you name of those its labels and `requires` allow. It
+runs in its run, as its next attempt, while the run's other jobs go on; the jobs that need it wait
+for it again. Its log keeps the attempt before, a `[kiln]` line where the next begins. A job that
+ran in a pod made for it (`[k8s]`) gets a new pod each time, so only "anywhere" applies to it
 ([ci.md](ci.md) W05-R28).
 
 If `isolation` is absent, a job runs as it does in v1: in a pod on `[k8s]`, and on the host

@@ -44,6 +44,8 @@ struct Job {
     executor: Option<String>,
     /// A pipeline job's `runs-on`.
     labels: Vec<String>,
+    /// A pipeline job's `requires`, which v1 places it by too (W05-R22).
+    requires: Vec<String>,
     /// Its run has finished.
     run_done: bool,
     /// It's of its run's latest attempt (a pipeline's job always is).
@@ -77,22 +79,23 @@ impl Job {
 }
 
 async fn job_of(hub: &Hub, id: &str) -> Result<Job, Fail> {
-    type Row = (String, String, Option<String>, String, Option<String>, Option<String>, String, i64, String, i64, String);
+    type Row = (String, String, Option<String>, String, Option<String>, Option<String>, String, i64, String, i64, String, Option<String>);
     let key = id.to_owned();
     let row: Option<Row> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT j.run_id, j.key, j.job_id, j.status, j.agent, j.executor, j.labels, j.run_attempt, r.status, r.attempt, r.provider FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1",
+                "SELECT j.run_id, j.key, j.job_id, j.status, j.agent, j.executor, j.labels, j.run_attempt, r.status, r.attempt, r.provider, j.spec FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1",
                 [&key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?)),
             )
             .optional()?)
         })
         .await
         .map_err(internal)?;
-    let Some((run, key, job, status, agent, executor, labels, leg_attempt, run_status, run_attempt, provider)) = row else { return Err((StatusCode::NOT_FOUND, "no such job".into())) };
+    let Some((run, key, job, status, agent, executor, labels, leg_attempt, run_status, run_attempt, provider, spec)) = row else { return Err((StatusCode::NOT_FOUND, "no such job".into())) };
     let latest = job.is_none() || leg_attempt == run_attempt;
+    let requires = spec.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("requires").cloned()).and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
     Ok(Job {
         run,
         key,
@@ -102,6 +105,7 @@ async fn job_of(hub: &Hub, id: &str) -> Result<Job, Fail> {
         agent: agent.filter(|a| !a.is_empty() && a != "-"),
         executor,
         labels: serde_json::from_str(&labels).unwrap_or_default(),
+        requires,
         run_done: Status::parse(&run_status).is_terminal(),
         latest,
         provider,
@@ -133,13 +137,14 @@ struct Candidate {
 }
 
 /// The runners of their own (no pod made for one job, no outpost, which takes none) a job could
-/// run on again, each with why it can't when it can't: a pipeline's job by its labels, a leg as
-/// routing decides (its requirements, rules and capabilities, W05-R20). Those able first.
+/// run on again, each with why it can't when it can't: a pipeline's job as v1 places it (its
+/// labels and `requires`), a leg as routing decides (its requirements, rules and capabilities,
+/// W05-R20). Those able first.
 async fn candidates(hub: &Hub, id: &str, j: &Job) -> Result<Vec<Candidate>, Fail> {
     let agents: Vec<crate::hub::AgentLive> = hub.agents.lock().values().filter(|a| !a.ephemeral && !a.outpost).cloned().collect();
     let candidate = |a: &crate::hub::AgentLive, why: Vec<String>| Candidate { name: a.name.clone(), connected: a.connected, draining: a.draining, busy: a.busy, slots: a.slots, why };
     let mut out: Vec<Candidate> = match j.kind() {
-        "pipeline" => agents.iter().map(|a| candidate(a, j.labels.iter().filter(|l| !crate::hub::carries(&a.labels, &a.os, &a.arch, &a.name, l)).map(|l| format!("lacks the label {l}")).collect())).collect(),
+        "pipeline" => agents.iter().map(|a| candidate(a, crate::hub::cannot_take(&j.labels, &j.requires, a))).collect(),
         "ci" => {
             let route = super::dispatch::stored_route(hub, id).await.map_err(internal)?.ok_or_else(|| conflict("the leg's routing isn't kept"))?;
             let explained = super::routing::route_now(hub, route).await.ok_or_else(|| (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned()))?;

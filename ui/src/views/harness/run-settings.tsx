@@ -368,9 +368,19 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
   const [versions, setVersions] = React.useState(false);
   const fams = families(words);
   const chosen = words.find((w) => w.id === value);
-  // Few models, or none sharing a family: just the models.
+  // Few models, or none sharing a family: just the models, the chosen one said under them.
   if (fams.length === words.length || words.length <= 4) {
-    return <WordRow label="Model" words={words} value={value} onPick={onPick} />;
+    return (
+      <div className="rs-model">
+        <WordRow label="Model" words={words} value={value} onPick={onPick} />
+        {chosen && (
+          <p className="rs-now">
+            <span className="rs-now-name">{chosen.text}</span>
+            {chosen.hint && <span className="rs-now-hint">{chosen.hint}</span>}
+          </p>
+        )}
+      </div>
+    );
   }
   const current = fams.find((f) => f.versions.some((v) => v.id === value));
   const famWords: Word[] = fams.map((f) => ({ id: `family:${f.name}`, text: f.name, full: f.name, hint: f.pick.hint }));
@@ -389,15 +399,18 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
           }
         }}
       />
-      <p className="rs-now">
-        <span className="rs-now-name">{chosen?.text ?? value}</span>
-        {chosen?.hint && <span className="rs-now-hint">{chosen.hint}</span>}
-        {own.length > 1 && (
-          <button type="button" className="rs-more" aria-expanded={versions} onClick={() => setVersions((v) => !v)}>
-            {versions ? "fewer" : `${own.length - 1} other version${own.length === 2 ? "" : "s"}`}
-          </button>
-        )}
-      </p>
+      {/* Only where the chosen model is: another harness's models don't name it. */}
+      {chosen && (
+        <p className="rs-now">
+          <span className="rs-now-name">{chosen.text}</span>
+          {chosen.hint && <span className="rs-now-hint">{chosen.hint}</span>}
+          {own.length > 1 && (
+            <button type="button" className="rs-more" aria-expanded={versions} onClick={() => setVersions((v) => !v)}>
+              {versions ? "fewer" : `${own.length - 1} other version${own.length === 2 ? "" : "s"}`}
+            </button>
+          )}
+        </p>
+      )}
       {versions && current && own.length > 1 && <WordRow label={`${current.name} versions`} words={own.map((v) => ({ ...v, text: versionText(v, current.name) }))} value={value} onPick={onPick} />}
     </div>
   );

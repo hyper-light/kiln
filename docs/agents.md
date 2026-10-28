@@ -213,16 +213,19 @@ server says, and counts every session it has, ended ones included, until it's up
   Each goes to every agent it's for at once; a line says how it went (done, skipped, failed) and
   opens to each agent's outcome and why. Those all ended leave the selection.
 - **The composer.** At the top of the page, on a desktop and a phone alike, whole and the agent
-  page's composer's size from the start, Queue · Steer · Now in its bar in both of its turns (when
-  starting an agent they're shown but not in play: its first message goes at once). There is no New agents button and no dialog: with nothing selected it starts an
+  page's composer's size from the start. There is no New agents button and no dialog: with nothing selected it starts an
   agent, its words the agent's first message. Above the box is the agent page's own line,
   permissions · model · effort, and the bolt where the model goes faster (the speeds each model
-  runs at come with the machine's models, `KindInfo.models[].speeds`), each opened in place with
-  the same controls; choosing another harness's model starts it in that harness. In the box's top
-  slot: the agent, its machine, its folder and how many, each opened in place. Under the box, More
-  options (name, workspace, where its commands run, a shell to run in; closed, it says what isn't
-  as it starts out) and the machine's past sessions to continue, each a dropdown that opens in
-  place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
+  runs at come with the machine's models, `KindInfo.models[].speeds`; a machine whose runner
+  lists none yet gives Claude Code's Opus models fast mode, as their agents' pages show it), each
+  opened in place with the same controls. The agent is picked as its page switches one: by a model
+  of another harness the machine runs, each listed under its name (one that hasn't listed its
+  models yet, as "Default"; a machine that hasn't listed a harness's models takes another
+  machine's list). The box is the agent page's composer, the field and its bar. Under it, one line
+  says where it starts ("Claude Code on kiln-a094a12d (fedora-2) in ~/…/kiln") and opens More
+  options, one row each: the machine, the folder, how many, its name, its workspace, where its
+  commands run and a shell to run in (closed, it says what else isn't as it starts out); beside it,
+  the machine's past sessions to continue. Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
   soon as its first snapshot is in (a moment at most), one view transition carrying each part of
   the composer to its place on the page. Several stay on Mission control: the line under the box
   says what started, and they come into the list. Files go with the first message, sent once the
