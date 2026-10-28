@@ -2098,7 +2098,9 @@ W20.
     is kept with the run's saved input, so legs queued after a restart have it too, and on the
     leg's row (`jobs.placement`) for the API and the run page.
   - A pipeline's job retried in place (`Store::retry_job`, `w05_r28_a_job_retried_in_place`) and
-    placed by v1's `pick_agent`; a job asked onto a runner by name gets no pod made for it.
+    placed by v1's `pick_agent`; a job asked onto a runner by name gets no pod made for it. The
+    runners it may be asked onto are where `pick_agent` places it, by its labels and `requires`
+    (`hub::cannot_take`, `w05_r28_a_retry_s_runners_are_where_v1_places_the_job`).
   - `GET /api/ci/legs/:id/runners` and `POST /api/ci/legs/:id/retry` (`crates/kiln/src/ci/retry.rs`),
     `ci.legs.runners` and `ci.legs.retry` for MCP, and the job panel's Retry with where to run it.
   - End to end (`tests/retry_elsewhere.rs`, AC12).
