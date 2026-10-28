@@ -177,6 +177,7 @@ const diffs: MockDiff[] = [
     branch: "fair",
     versions: 1,
   },
+  // A landed change for Ship's landed row (W26-R14's e2e): its review ended approved.
   {
     id: "d44",
     name: "D44",
@@ -185,7 +186,7 @@ const diffs: MockDiff[] = [
     repo: REPO,
     change_id: "I44",
     title: "ci: a landed change",
-    summary: "The review it landed by: two versions, a question, an approval.",
+    summary: "The queue's weights, landed: two revisions, kim's approval.",
     author: "user:ada",
     author_kind: "user",
     author_for: null,
@@ -194,8 +195,8 @@ const diffs: MockDiff[] = [
     stack: null,
     parent: null,
     topic: null,
-    created_at: now() - 86400,
-    updated_at: now() - 3600,
+    created_at: now() - 172800,
+    updated_at: now() - 5400,
     branch: null,
     versions: 2,
   },
@@ -515,9 +516,13 @@ function suggestionsOf(c: MockComment) {
     const body: string[] = [];
     i++;
     while (i < lines.length && lines[i]?.trim() !== fence) body.push(lines[i++] ?? "");
-    out.push({ index: out.length, lines: body, field: false, applied: appliedOf(c.id, out.length - 1), outdated: false });
+    const index = out.length;
+    out.push({ index, lines: body, field: false, applied: appliedOf(c.id, index), outdated: false });
   }
-  if (c.suggestion != null) out.push({ index: out.length, lines: c.suggestion.split("\n"), field: true, applied: appliedOf(c.id, out.length - 1), outdated: false });
+  if (c.suggestion != null) {
+    const index = out.length;
+    out.push({ index, lines: c.suggestion.split("\n"), field: true, applied: appliedOf(c.id, index), outdated: false });
+  }
   return out;
 }
 const appliedSuggestions = new Map<string, { version: number; by: string; at: number }>();
@@ -815,7 +820,19 @@ const hostPullOf = (number: number) => ({
     ],
   },
 });
-const hostPulls = [hostPullOf(3), hostPullOf(4)];
+const hostPulls = [
+  hostPullOf(3),
+  hostPullOf(4),
+  {
+    ...hostPullOf(6),
+    title: "ci: a landed change",
+    author: "lee",
+    state: "merged",
+    head: "w26-landed",
+    url: "https://gitlab.com/lundhe/w23/-/merge_requests/6",
+    reviews: [{ author: "mei", state: "approved", body: "The queue is right now.", at: T0 + 7000 }],
+  },
+];
 
 async function handleHostPulls(req: http.IncomingMessage, res: http.ServerResponse, rest: string[], ctx: Ctx): Promise<boolean> {
   const m = req.method ?? "GET";
@@ -977,7 +994,7 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
   const m = req.method ?? "GET";
   const segs = p.split("/").filter(Boolean).slice(1);
   const [a, b, c, d2, e] = segs;
-  if (a === "ci" && b === "repos" && segs[3] === "pulls" && decodeURIComponent(c ?? "") === HOST_REPO) return handleHostPulls(req, res, segs.slice(4), ctx);
+  if (a === "ci" && b === "repos" && segs[3] === "pulls" && [HOST_REPO, "hyper-light/kiln"].includes(decodeURIComponent(c ?? ""))) return handleHostPulls(req, res, segs.slice(4), ctx);
   if (a === "review" && b === "inbox" && m === "GET") return (ctx.json(res, 200, inbox()), true);
   if (a === "stacks" && b && m === "GET") {
     const list = diffs.filter((d) => d.stack === b).map((d) => Object.fromEntries(Object.entries(d).filter(([k]) => k !== "versions")));

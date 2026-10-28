@@ -6,9 +6,8 @@
  * does.
  */
 import type http from "node:http";
-import type { ShipChange, ShipCommit, ShipDetail, ShipPage, ShipPip } from "../src/api/ship.ts";
+import type { ShipChange, ShipCommit, ShipDetail, ShipMark, ShipPage, ShipPip } from "../src/api/ship.ts";
 import { Trunk } from "./ship-sim.ts";
-import type { ReviewMark } from "../src/api/review.ts";
 
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
@@ -65,7 +64,7 @@ function commits(): ShipCommit[] {
       pips: pips("requested", "none", "passed"),
       kind: "diff",
       host: "kiln",
-      change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 2, latest: 2 },
+      change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 7, latest: 7 },
       runs: [{ id: "run-41", pipeline: "ci" }],
       actions: [
         { name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, diff: "D41" } },
@@ -238,7 +237,7 @@ const arrival = (n: number): ShipCommit => ({
  */
 /** The marks Review's step 8 tells its story with (W26-R14): D41 pushed, a blocking thread
  * resolved, fixed by Apply, its conflict resolved, approved; the landed !6; CR12 asked of kim. */
-const MARKS: Record<string, (at: number) => ReviewMark[]> = {
+const MARKS: Record<string, (at: number) => ShipMark[]> = {
   D41: (at) => [
     { id: "D41-push-5", kind: "push", at: at - 3000, end: at - 3000, by: "agent:matrix", signer: null, revision: 5, state: "passed" },
     { id: "D41-comment-1", kind: "comment", at: at - 2700, end: at - 2100, by: "user:kim", signer: null, revision: 5, state: "blocked", thread: "D41-t1", note: "blocking" },
@@ -258,14 +257,14 @@ const MARKS: Record<string, (at: number) => ReviewMark[]> = {
   ],
 };
 
-function marksOf(c: ShipCommit): ReviewMark[] {
+function marksOf(c: ShipCommit): ShipMark[] {
   const told = MARKS[c.change?.name ?? ""];
   if (told) return told(c.at);
   const base = c.at - 3600;
-  const push = (n: number | null, at: number): ReviewMark => ({ id: `${c.short}-push-${n ?? 0}`, kind: "push", at, end: at, by: c.author, signer: null, revision: n, state: "passed" });
+  const push = (n: number | null, at: number): ShipMark => ({ id: `${c.short}-push-${n ?? 0}`, kind: "push", at, end: at, by: c.author, signer: null, revision: n, state: "passed" });
   const ch = c.change;
   if (!ch) return [push(null, c.at)];
-  const marks: ReviewMark[] = [];
+  const marks: ShipMark[] = [];
   for (let n = 1; n <= ch.revision; n++) marks.push(push(n, base + n * 600));
   const after = base + ch.revision * 600;
   const open = ch.open ? ch.open.question + ch.open.nit + ch.open.issue + ch.open.blocking : 0;

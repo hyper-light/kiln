@@ -976,3 +976,135 @@
     padding-left: 34px;
   }
 }
+
+/* Ship's Lanes, f-ship drawn (W26-R14/15): a shared horizon, a group per stage — Review first —
+   each lane a label pinned left and a bar wearing its rim, Previous / Now / next walking the
+   horizon, Fit squeezing the rows and Detail giving each its who/when/seal. */
+.ship-lanesbox {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ship-lanesbox__nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #8b8e96;
+}
+.ship-lanesbox__nav .rv-ib {
+  font-size: 11px;
+}
+.ship-lanesbox__span {
+  flex: 1;
+  text-align: center;
+  white-space: nowrap;
+}
+.ship-lanegroup__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #b9bbc2;
+}
+.ship-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ship-lane {
+  display: grid;
+  grid-template-columns: 16px minmax(84px, 160px) minmax(60px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  padding: 1px 0;
+}
+.ship-lane__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-lane__track {
+  position: relative;
+  height: 12px;
+  border-left: 1px solid var(--k-line, #2a2c31);
+  border-right: 1px solid var(--k-line, #2a2c31);
+  background: linear-gradient(90deg, transparent calc(50% - 0.5px), var(--k-line-2, #1f2125) calc(50% - 0.5px) calc(50% + 0.5px), transparent calc(50% + 0.5px)), transparent;
+}
+.ship-lane__bar {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #8d869f, #aca1d5 21%, #8a7cae 42%, #8d869f);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 12%);
+}
+.ship-lane__bar--point {
+  width: 6px;
+  border-radius: 50%;
+}
+.ship-lane__bar[data-state="passed"],
+.ship-lane__bar[data-state="approved"],
+.ship-lane__bar[data-state="healthy"] {
+  background: linear-gradient(90deg, #79978a, #a8c9bc 22%, #8aafa0 49%, #79978a);
+}
+.ship-lane__bar[data-state="running"],
+.ship-lane__bar[data-state="blocked"],
+.ship-lane__bar[data-state="requested"],
+.ship-lane__bar[data-state="asked"] {
+  background: linear-gradient(90deg, #a8906a, #e2cfae 22%, #b39b74 49%, #a8906a);
+}
+.ship-lane__bar[data-state="failed"],
+.ship-lane__bar[data-state="conflicted"],
+.ship-lane__bar[data-state="changed"] {
+  background: linear-gradient(90deg, #996f77, #d1aaad 23%, #a17b83 46%, #996f77);
+}
+.ship-lane__now {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  width: 4px;
+  margin-left: -4px;
+  border-radius: 50%;
+  background: #8b8e96;
+}
+.ship-lane__who,
+.ship-lane__when {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #8b8e96;
+  white-space: nowrap;
+}
+.ship-lane__seal {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: #8b8e96;
+  white-space: nowrap;
+}
+.ship-lanesbox[data-fit] .ship-lane {
+  grid-template-columns: 16px minmax(0, 1fr) 84px auto;
+}
+.ship-lanesbox[data-fit] .ship-lane__track,
+.ship-lanesbox[data-fit] .ship-lane__who,
+.ship-lanesbox[data-fit] .ship-lane__when {
+  display: none;
+}
+.ship-lane__note {
+  font-style: normal;
+  color: #8b8e96;
+}
+@media (max-width: 700px) {
+  .ship-lane {
+    grid-template-columns: 16px minmax(0, 1fr) auto;
+  }
+  .ship-lane__track,
+  .ship-lane__who,
+  .ship-lane__when {
+    display: none;
+  }
+}

@@ -6,7 +6,6 @@
  */
 import { apiPath } from "@/lib/peer-base";
 import { request } from "./client";
-import type { ReviewMark } from "./review";
 
 export type ShipStand = "needs_you" | "failing" | "landing" | "checking" | "building" | "in_staging" | "waiting" | "shipping" | "replanting" | "shipped" | "fixed" | "rolled_back" | "superseded";
 
@@ -72,15 +71,34 @@ export interface ShipPage {
 /** A build part's state (`Part` in kiln_cd::journey). */
 export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded";
 
+/**
+ * A mark of a lane group (W26-R14): a push, replay, comment, fix, resolution or approval with its
+ * time (`end` null while under way, = `at` for a point, unix seconds), who did it, its revision and
+ * its signer — null until W27-R03 signs kiln's records, so the seal says unsigned, never a false
+ * one. `state` is a GlyphState name.
+ */
+export interface ShipMark {
+  id: string;
+  kind: "push" | "replay" | "comment" | "fix" | "resolution" | "approval";
+  at: number;
+  end: number | null;
+  by: string;
+  signer: string | null;
+  revision: number | null;
+  state: string;
+  thread?: string;
+  note?: string;
+}
+
 /** A commit with every record its stand came from: `GET /api/ship/commits/{repo}/{sha}`. */
 export interface ShipDetail extends ShipCommit {
+  /** The Review lane group's marks, oldest first; a commit with no change has the one, its push. */
+  review?: ShipMark[];
   checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string; job?: string; run?: string; start?: number; end?: number }[] }[];
   build?: { platforms: { name: string; state: ShipPart }[]; image: { state: ShipPart; digest: string | null } };
   deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
   releases?: { state: string; message: string | null; rolled_back: boolean }[];
   replant?: { name: string; state: string; why: string }[];
-  /** Review's marks, oldest first (W26-R14), for the Review lane group. */
-  review?: ReviewMark[];
 }
 
 /** What a list asks for: a repository, the facets (W26-R02), a page. */

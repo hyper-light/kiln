@@ -63,10 +63,11 @@ test("each host's pull requests and kiln's diffs are Ship items, Review first on
   await page.goto("/ship?host=bitbucket");
   await expect(rows.first()).toContainText("Landing");
   await page.goto("/ship?kind=diff");
-  await expect(rows).toHaveCount(1);
-  await expect(rows.first()).toContainText("D41");
-  await page.goto("/ship?kind=request,diff&host=kiln");
   await expect(rows).toHaveCount(2);
+  await expect(rows.first()).toContainText("D41");
+  await expect(rows.nth(1)).toContainText("D44");
+  await page.goto("/ship?kind=request,diff&host=kiln");
+  await expect(rows).toHaveCount(3);
 });
 
 test("Ship's list holds still as it loads and as a row opens", async ({ page, browserName }) => {
