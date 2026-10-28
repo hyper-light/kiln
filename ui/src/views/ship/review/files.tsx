@@ -24,8 +24,7 @@ import {
   type Thread,
 } from "@/api/review";
 import type { ShipCommit } from "@/api/ship";
-import { Loadable } from "@/components/ui/loading";
-import { useRes } from "@/lib/data";
+import { useRes, warm } from "@/lib/data";
 import { invalidate, setData } from "@/lib/resource";
 import { parsePatch, type PatchFile } from "@/views/review/patch";
 import { Conversation, ConvoBox, Description } from "./convo";
@@ -40,17 +39,34 @@ import "./review.css";
 
 export const ReviewFiles = React.memo(function ReviewFiles({ item }: { item: ShipCommit }) {
   counted("ship/reviewfiles");
-  const ch = item.change;
-  const host = ch?.host;
+  warmReview(item);
   // Files is one `<section aria-label="Files">`, focusable, once its review is drawn or has failed:
   // Ship's Diff button waits for it to appear and brings it into view, focused. While it loads there
-  // is none, so the focus never lands on a placeholder that the review then replaces.
-  return (
-    <Loadable label="Loading its review">
-      <ReviewBoundary>{ch && host === "kiln" ? <KilnFiles item={item} /> : ch && host ? <HostFiles item={item} /> : <CommitFiles item={item} />}</ReviewBoundary>
-    </Loadable>
-  );
+  // is none, so the focus never lands on a placeholder that the review then replaces. It suspends
+  // until then, under the dropdown's one boundary (Ship's Dropdown): every section waits for Files,
+  // so the dropdown grows once and nothing drawn is pushed down when the review lands (W26-R15).
+  // Once drawn, it stays: what a changed item reads anew (a new revision's files, a commit become
+  // a change) loads behind the review shown, which the dropdown's loader never replaces.
+  const shown = React.useDeferredValue(item);
+  const ch = shown.change;
+  const host = ch?.host;
+  return <ReviewBoundary>{ch && host === "kiln" ? <KilnFiles item={shown} /> : ch && host ? <HostFiles item={shown} /> : <CommitFiles item={shown} />}</ReviewBoundary>;
 });
+
+/** A host's pull request's number, from its change's name ("!6", "#12"). */
+const pullNumber = (name: string) => Number(name.replace(/\D/g, ""));
+
+/**
+ * Starts loading an item's review, every key it reads at once (lib/data.ts's `warm`): one round
+ * trip, where reading them in turn waits for each before asking for the next. Ship's rows call it
+ * as the pointer comes onto one or the focus into it, so the review is on its way before it opens.
+ */
+export function warmReview(item: ShipCommit) {
+  const ch = item.change;
+  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name));
+  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)));
+  else warm(inboxRes, commitFilesRes(item.repo, item.sha));
+}
 
 /** A change the server doesn't keep (a mock's, a pruned one): the section says so, nothing else breaks. */
 class ReviewBoundary extends React.Component<{ children: React.ReactNode }, { err: unknown }> {
@@ -300,7 +316,7 @@ function anchorHere(t: Thread, map: Map<string, { t: Thread }[]>): boolean {
 
 function HostFiles({ item }: { item: ShipCommit }) {
   const ch = item.change!;
-  const n = Number(ch.name.replace(/\D/g, ""));
+  const n = pullNumber(ch.name);
   const { me, ops } = useOps(item);
   const pull = useRes(hostPullRes(item.repo, n)).data;
   const [q, setQ] = React.useState("");

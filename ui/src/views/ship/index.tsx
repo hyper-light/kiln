@@ -29,7 +29,7 @@ import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { firstStage, JobCards } from "./jobs";
 import { ShipOutput } from "./output";
-import { ReviewFiles, ShipLanes } from "./review";
+import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { counted } from "./review/perf";
 
 const LIMIT = 100;
@@ -208,7 +208,8 @@ const Row = React.memo(
           ? `${n} more shipped`
           : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
     return (
-      <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)}>
+      // Its review starts loading as the pointer comes onto the row or the focus into it (W26-R15).
+      <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)} onPointerEnter={() => warmReview(c)} onFocus={() => warmReview(c)}>
         <div className="ship-r">
           <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
             <span className="ship-name">{c.message || c.change?.title || c.short}</span>
@@ -370,32 +371,35 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
   return (
     <div className="ship-open" ref={files}>
       {/* Dropdown boundary agreed with the Ship agent 01a1748c, 2026-10-26 20:28 PDT (NOTES.md):
-          Files (with the Conversation) first, owned by Review. */}
-      <ReviewFiles item={commit} />
-      <section aria-label="Output" className="ship-sec">
-        <h3>Output</h3>
-        <Loadable label="Loading the output" className="ship-output-slot">
-          <ShipOutput commit={commit} stage={shown} />
-        </Loadable>
-      </section>
-      <section aria-label="Jobs" className="ship-sec">
-        <h3>Jobs</h3>
-        <JobCards commit={commit} onPick={setStage} />
-        <ul>
-          {(commit.runs ?? []).map((r) => (
-            <li key={r.id}>
-              <Link to={`/runs/${r.id}`}>{r.pipeline}</Link>
-            </li>
-          ))}
-        </ul>
-      </section>
-      <section aria-label="Lanes" className="ship-sec">
-        <h3>Lanes</h3>
-        <Loadable label="Loading the lanes" className="ship-lanes-slot">
-          <ShipLanes commit={commit} />
-        </Loadable>
-        {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}
-      </section>
+          Files (with the Conversation) first, owned by Review. One loader for them all: every
+          section waits for Files' review, so none is drawn first and then pushed down (2026-10-28). */}
+      <Loadable label="Loading its review">
+        <ReviewFiles item={commit} />
+        <section aria-label="Output" className="ship-sec">
+          <h3>Output</h3>
+          <Loadable label="Loading the output" className="ship-output-slot">
+            <ShipOutput commit={commit} stage={shown} />
+          </Loadable>
+        </section>
+        <section aria-label="Jobs" className="ship-sec">
+          <h3>Jobs</h3>
+          <JobCards commit={commit} onPick={setStage} />
+          <ul>
+            {(commit.runs ?? []).map((r) => (
+              <li key={r.id}>
+                <Link to={`/runs/${r.id}`}>{r.pipeline}</Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+        <section aria-label="Lanes" className="ship-sec">
+          <h3>Lanes</h3>
+          <Loadable label="Loading the lanes" className="ship-lanes-slot">
+            <ShipLanes commit={commit} />
+          </Loadable>
+          {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}
+        </section>
+      </Loadable>
     </div>
   );
 }
