@@ -497,3 +497,29 @@
 .ship-open section[aria-label="Files"]:focus:not(:focus-visible) {
   outline: none;
 }
+
+/* A commit's own page (Commit page plan, step 1): its title, its stand and line, its journey. */
+.ship-commit {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+.ship-commit__title {
+  margin: 0;
+  font-size: 1.5rem;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.ship-commit__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  color: #a1a4ad;
+  font-size: 0.875rem;
+}
+/* An opened row's way to its commit's page, after the agreed sections. */
+.ship-open__page {
+  margin: 0;
+  font-size: 0.8125rem;
+}
