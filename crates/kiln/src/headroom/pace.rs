@@ -847,11 +847,22 @@ mod portable_tests {
         }
 
         /// What it did over `d`: CPU µs and bytes written.
+        #[cfg(any(target_os = "macos", windows))]
         fn over(&self, d: Duration) -> (u64, u64) {
             let (c0, w0, _) = super::processes(&self.pid());
             std::thread::sleep(d);
             let (c1, w1, _) = super::processes(&self.pid());
             (c1.saturating_sub(c0), w1.saturating_sub(w0))
+        }
+
+        /// Whether it uses CPU and writes, both, within `limit` (one sync can hold it a while on a
+        /// loaded disk).
+        fn works_within(&self, limit: Duration) -> bool {
+            let (c0, w0, _) = super::processes(&self.pid());
+            within(limit, || {
+                let (c, w, _) = super::processes(&self.pid());
+                c > c0 && w > w0
+            })
         }
     }
 
@@ -878,10 +889,8 @@ mod portable_tests {
         write_if_asked()?;
         let w = Writer::start("a_processs_cpu_and_writes_rise_as_it_works")?;
         let (_, _, mem) = super::processes(&w.pid());
-        let (cpu, written) = w.over(Duration::from_millis(700));
-        anyhow::ensure!(cpu > 0, "no CPU time");
-        anyhow::ensure!(written > 0, "nothing written");
         anyhow::ensure!(mem > 0, "no memory");
+        anyhow::ensure!(w.works_within(Duration::from_secs(30)), "no CPU time or nothing written");
         Ok(())
     }
 
@@ -935,8 +944,7 @@ mod portable_tests {
         let (cpu, written) = w.over(Duration::from_millis(700));
         anyhow::ensure!(cpu == 0 && written == 0, "stopped, yet {cpu} µs of CPU and {written} bytes written");
         keys.iter().for_each(|k| super::imp::release(k));
-        let (cpu, written) = w.over(Duration::from_millis(700));
-        anyhow::ensure!(cpu > 0 && written > 0, "released, yet {cpu} µs of CPU and {written} bytes written");
+        anyhow::ensure!(w.works_within(Duration::from_secs(30)), "released, yet no CPU time or nothing written");
         Ok(())
     }
 
@@ -1117,7 +1125,8 @@ mod tests {
         std::fs::create_dir_all(&recs)?;
         std::fs::write(recs.join("gone.json"), serde_json::to_vec(&Record { owner: Some(ended()?), guard: None, stopped: vec![g.display().to_string()] })?)?;
         anyhow::ensure!(within(Duration::from_secs(5), || !frozen(&g)), "still frozen");
-        anyhow::ensure!(!recs.join("gone.json").exists(), "its record is left");
+        // Removed once what it lists runs again, a moment after.
+        anyhow::ensure!(within(Duration::from_secs(5), || !recs.join("gone.json").exists()), "its record is left");
         drop(p);
         Ok(())
     }
