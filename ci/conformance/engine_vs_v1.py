@@ -25,6 +25,14 @@ stopped (a commit already recorded is moved past, not run again). `--report` wri
 `<out>/report.md` from the records: per commit, each workflow's jobs side by side, whether the
 conclusions match, and the tests set aside, each failing on one side only and failing at that
 commit elsewhere (on the v1 side there, or in production's v1 run of it, `--prod`).
+
+`--quiet CORES,MBPS` (Ada, 10-28: "Do quiet tests to determine correctness then do noisy tests to
+find the bugs. Inability to perform under noise is a bug."): before each wave and each retry the
+driver waits until other work on the machine (noise.py: its cores and disk MB/s, the lab's own
+cgroups left out) stays under these for two minutes, and each record keeps how busy the machine was
+over each wave (`conditions`). A commit that differed under noise and matched when quiet keeps the
+difference as `noise_bug`. With `--retry-timeouts`, a job about to run again has its logs kept first
+in `<out>/logs/` (a v1 job's retry overwrites its only log).
 """
 
 import argparse
@@ -135,6 +143,14 @@ class V1:
                 return self.s.get(f"/api/jobs/{job['id']}/logs?step={idx}", raw=True) or ""
         return ""
 
+    def full_log(self, job):
+        """Every step's log (v1 keeps a job's last attempt's only: its retry overwrites them)."""
+        parts = []
+        for idx, name in job["steps"]:
+            text = self.s.get(f"/api/jobs/{job['id']}/logs?step={idx}", raw=True) or ""
+            parts.append(f"===== step {idx} {name}\n{text}\n")
+        return "".join(parts)
+
 
 class Engine:
     side = "engine"
@@ -172,6 +188,74 @@ class Engine:
                 n = st.get("number") or st.get("idx", i)
                 return self.s.get(f"/api/ci/legs/{job['id']}/logs?step={n}", raw=True) or ""
         return ""
+
+    def full_log(self, job):
+        """Every step's log and the leg's annotations (a bench-gate's verdict among them)."""
+        d = self.s.get(f"/api/ci/legs/{job['id']}") or {}
+        parts = []
+        for i, st in enumerate(d.get("steps", [])):
+            n = st.get("number") or st.get("idx", i)
+            text = self.s.get(f"/api/ci/legs/{job['id']}/logs?step={n}", raw=True) or ""
+            parts.append(f"===== step {n} {st.get('name')}\n{text}\n")
+        parts.append("===== annotations\n" + "\n".join(json.dumps(a) for a in d.get("annotations") or []) + "\n")
+        return "".join(parts)
+
+
+QUIET = None   # (cores, MB/s) others may use at most for a quiet wave, with --quiet
+OUT = None     # the results folder: the logs of what a retry runs again go in its logs/
+
+
+def keep_logs(s, run, d, sha):
+    """The logs of a job a retry is about to run again, kept as they are (10-28: v1's retry
+    overwrote the only log of its release/windows failing under noise)."""
+    if not OUT:
+        return
+    try:
+        folder = os.path.join(OUT, "logs")
+        os.makedirs(folder, exist_ok=True)
+        for j in s.jobs(run)[1]:
+            if j["job"] == d["job"] and j["conclusion"] != "success":
+                path = os.path.join(folder, f"{sha[:10]}-{s.side}-{d['workflow']}-{j['job']}-{int(time.time())}.log")
+                with open(path, "w") as f:
+                    f.write(s.full_log(j))
+                print(f"  kept {os.path.basename(path)}", flush=True)
+    except Exception as e:  # noqa: BLE001 - a kept log helps; the retry doesn't wait on it
+        print(f"  logs of {s.side} {d['workflow']}/{d['job']} not kept: {e}", flush=True)
+METER = None
+
+
+def quiet_now(seconds=120):
+    """Whether other work stayed under --quiet's limits over the last `seconds`."""
+    w = METER.last(seconds) if METER else None
+    return bool(w) and w["samples"] >= 3 and w["others_cores_mean"] < QUIET[0] and w["others_mbps_mean"] < QUIET[1]
+
+
+def wait_quiet(what):
+    """With --quiet: waits until other work on the machine stays under its limits (the lab idle
+    between waves), saying so every ten minutes. The quiet runs' rule (Ada, 10-28): quiet tests
+    determine correctness, noisy ones find the bugs."""
+    if not QUIET:
+        return 0
+    t0, said = time.time(), 0.0
+    while not quiet_now():
+        if time.time() - said >= 600:
+            print(f"  {time.strftime('%H:%M:%S')} waiting for quiet before {what}: {METER.last(120)}", flush=True)
+            said = time.time()
+        time.sleep(30)
+    waited = round(time.time() - t0)
+    if waited > 60:
+        print(f"  {time.strftime('%H:%M:%S')} quiet after {waited} s: {METER.last(120)}", flush=True)
+    return waited
+
+
+def conditions(t0, t1=None):
+    """Other work on the machine over a wave, for its record (with --quiet)."""
+    return METER.window(t0, t1) if METER else None
+
+
+def was_quiet(conds):
+    """A wave was quiet when other work's mean stayed under --quiet's limits."""
+    return bool(conds) and all(c and c["others_cores_mean"] < QUIET[0] and c["others_mbps_mean"] < QUIET[1] for c in conds.values())
 
 
 def wait_for(sides, sha, timeout, settle=120):
@@ -258,6 +342,10 @@ def retry_timeouts(sides, sha, rec, prod, timeout):
     if not again:
         return rec
     for s, run, d in again:
+        keep_logs(s, run, d, sha)
+    wait_quiet(f"retrying {sha[:10]}")
+    t_retry = time.time()
+    for s, run, d in again:
         print(f"  {s.side} {d['workflow']}/{d['job']} {d[s.side]} there: its run's unfinished jobs again ({s.rerun(run, failed_only=True)})", flush=True)
     time.sleep(60)
     runs, late = {}, rec.get("timed_out", False)
@@ -269,6 +357,13 @@ def retry_timeouts(sides, sha, rec, prod, timeout):
     new.update({k: rec[k] for k in ("subject", "before", "seconds") if k in rec})
     new["retried"] = [f"{s.side}:{d['workflow']}/{d['job']}" for s, _, d in again]
     new["first_record"] = {side: {wf: f.get("jobs") for wf, f in v.items()} for side, v in rec["sides"].items()}
+    if QUIET:
+        new["first_conditions"] = rec.get("conditions")
+        new["conditions"] = {"retry": conditions(t_retry)}
+        new["quiet"] = was_quiet(new["conditions"])
+        # Differed under noise and matched when quiet: a bug under noise, not a wrong answer.
+        if not was_quiet(rec.get("conditions")) and compare(new, prod)["match"]:
+            new["noise_bug"] = {"diffs": compare(rec, prod)["diffs"], "conditions": rec.get("conditions")}
     return new
 
 
@@ -326,7 +421,15 @@ def main():
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--rerun", help="run a recorded commit's runs again on both sides (a commit the lab disturbed) and record it anew")
     ap.add_argument("--retry-timeouts", action="store_true", help="a job whose conclusions differ runs once more where it didn't succeed before the commit is recorded")
+    ap.add_argument("--quiet", help="CORES,MBPS: each wave and retry waits until other work uses less than this, and each record says how busy the machine was")
     a = ap.parse_args()
+    global QUIET, METER, OUT
+    OUT = a.out
+    if a.quiet:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import noise
+        cores, mbps = (float(x) for x in a.quiet.split(","))
+        QUIET, METER = (cores, mbps), noise.Meter(every=30)
     with open(a.commits) as f:
         order = [l.split()[0] for l in f if l.strip() and not l.startswith("#")]
     prod = json.load(open(a.prod)) if a.prod else None
@@ -343,6 +446,8 @@ def main():
         sys.exit("--repo, or --v1-repo and --engine-repo")
     if a.rerun:
         sha = a.rerun
+        wait_quiet(f"rerunning {sha[:10]}")
+        t_rerun = time.time()
         for s in sides:
             for r in s.runs(sha):
                 print(f"  {s.side} rerun {r['id']}: {s.rerun(r)}", flush=True)
@@ -350,6 +455,9 @@ def main():
         runs, timed_out = wait_for(sides, sha, a.timeout)
         rec = record(sides, sha, runs, timed_out)
         rec.update({"subject": git(waves[0][1], "log", "-1", "--format=%s", sha), "rerun": True})
+        if QUIET:
+            rec["conditions"] = {"rerun": conditions(t_rerun)}
+            rec["quiet"] = was_quiet(rec["conditions"])
         path = os.path.join(a.out, f"{sha}.json")
         with open(path + ".part", "w") as f:
             json.dump(rec, f, indent=1)
@@ -368,21 +476,26 @@ def main():
         subject = git(waves[0][1], "log", "-1", "--format=%s", sha)
         print(f"{time.strftime('%H:%M:%S')} {sha[:10]} {subject}", flush=True)
         t0 = time.time()
-        runs, timed_out = {}, False
+        runs, timed_out, conds = {}, False, {}
         for side, repo in waves:
+            wait_quiet(f"{side[0].side}'s wave of {sha[:10]}")
+            t_wave = time.time()
             git(repo, "update-ref", "refs/heads/main", sha, git(repo, "rev-parse", "refs/heads/main"))
             got, late = wait_for(side, sha, a.timeout)
             runs.update(got)
             timed_out = timed_out or late
+            conds[side[0].side] = conditions(t_wave)
         rec = record(sides, sha, runs, timed_out)
         rec.update({"subject": subject, "before": current, "seconds": round(time.time() - t0)})
+        if QUIET:
+            rec["conditions"], rec["quiet"] = conds, was_quiet(conds)
         if a.retry_timeouts:
             rec = retry_timeouts(sides, sha, rec, prod, a.timeout)
         with open(path + ".part", "w") as f:
             json.dump(rec, f, indent=1)
         os.replace(path + ".part", path)
         c = compare(rec, prod)
-        print(f"  {'match' if c['match'] else 'DIFFERS'} in {rec['seconds']} s: {c['diffs'] or ''} {c['set_aside'] or ''}", flush=True)
+        print(f"  {'match' if c['match'] else 'DIFFERS'} in {rec['seconds']} s{'' if not QUIET else (' (quiet)' if rec.get('quiet') else ' (NOT quiet)')}: {c['diffs'] or ''} {c['set_aside'] or ''}{' noise bug: ' + str(rec['noise_bug']['diffs']) if rec.get('noise_bug') else ''}", flush=True)
     report(a.out, order, prod)
 
 
