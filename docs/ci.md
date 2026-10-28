@@ -8346,10 +8346,37 @@ cold 2211 s) for the one-file change. Each run's reports say why each step ran, 
 warm (R28), which tells a miss from a slow hit; the figures go in the baseline's table above, with
 their commits, runner and date.
 
-**M5 (seams), not yet on main.** Warm `k8s` pools, the ledger behind one interface (on `Records`)
-and the Remote Execution API's cache are built on branch `ci-w24-m5-seams` against an older ledger
-and an older pod builder; they need porting onto main's (`k8s::pool_pod`, and the ledger's trust,
-signatures, verification, classes and reaper) before they land.
+**The seams, warm `k8s` pools and the Remote Execution API's cache (M5, in part).** Built (R02,
+R14, R26, on main's one path, R30):
+
+- *The ledger behind one interface.* The one path (`ci::work`: keying, records, lookups, e-classes,
+  trust, signatures, verification, test results, the reaper) is written once over
+  `ci::work::ledger::Rows`, so it runs on the `work_records` table or on `Records` (kiln's
+  `StoreRecords`, the simulator, Amphora's once CP-T1.5 lands) and decides alike on each: a scenario
+  through the whole path says the same, and audits the same, on all three, and the seam's suite
+  passes on a `Records` holding the ledger's rows. There a row's value is its 8-byte stamp, then the
+  table's value; a transaction's writes are one commit, and an entry's insert-only write is a
+  condition that its key is absent, so two writers racing for an entry leave one (R22). What Records
+  can't hold (a path set past a MiB) it refuses, typed, keeping nothing. The bytes a result names
+  (`cas/<sha256>`) are checked through `Blobs`. Production keeps the ledger in the table. AC10 on
+  `StoreRecords`, on disk (fedora, 2026-10-27, 20,000 results, 5,000 lookups through the one path,
+  each its seam's calls in turn and its hit counted): p50 1.4 ms, p99 4.7 ms, held under 10 ms by a
+  test; on the table in the same run, p50 0.17 ms and p99 1.1 ms, held under AC10's 5 ms.
+- *Warm `k8s` pools.* A pool's `warm = { root, node_label }` keeps each pod's `<work>/warm` in
+  `<root>/<pool>` on its node (`/var/lib/kiln/warm` by default, a `hostPath`), on the pod
+  `k8s::pool_pod` makes, its pods only on nodes carrying the label and drawn to the four nodes its
+  pods ran on last. Not while `ci.untrusted.executors` names `k8s`: its pods start cold, and the
+  pool's change says why. Per-lane volumes cloned through CSI snapshots aren't built yet.
+- *The Remote Execution API's cache.* `ContentAddressableStorage`, `ActionCache`, `Capabilities`
+  and `ByteStream`, as gRPC at kiln's listener (HTTP/2 in the clear or over TLS), for a leg's token,
+  as Bazel takes it: `--remote_cache=grpc://<server>` with
+  `--remote_header=authorization="Bearer $ACTIONS_RUNTIME_TOKEN"`. A leg reads and writes as its
+  cache mode lets it, untrusted legs in their own domain, reading down (R21). Blobs are the content
+  store's, a repository told of only those it put. Action results are the ledger's, on its one path:
+  each the result of a unit of kind `action` whose definition is the action's digest, successes
+  only, never overwritten (the same outputs again reproduce the entry; others are refused and have
+  it judged again, R23), and answered while every blob they name is held. `Execute` answers
+  `UNIMPLEMENTED`; people's and agents' own tokens (person scopes) aren't taken yet.
 
 ### W26 Review in Ship: changes as Ship items, each owning its review
 
