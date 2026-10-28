@@ -184,9 +184,35 @@ fn run(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What an install says, for `kiln setup` to show its way (`crate::setup`): the heading a part of
+/// it starts with, or one of its lines.
+pub enum Said<'a> {
+    Heading(&'a str),
+    Line(&'a str),
+}
+
+/// Where what installs say goes instead of standard error, while `kiln setup` shows it.
+pub type Teller = std::sync::Arc<dyn Fn(Said<'_>) + Send + Sync>;
+
+static TELLER: parking_lot::RwLock<Option<Teller>> = parking_lot::RwLock::new(None);
+
+/// From now on what installs say goes to `teller` (`None`: to standard error again).
+pub fn tell(teller: Option<Teller>) {
+    *TELLER.write() = teller;
+}
+
+pub(crate) fn teller() -> Option<Teller> {
+    TELLER.read().clone()
+}
+
 pub(crate) fn say(msg: impl AsRef<str>) {
     use std::io::Write as _;
-    let _ = writeln!(std::io::stderr(), "  {}", msg.as_ref());
+    match teller() {
+        Some(t) => t(Said::Line(msg.as_ref())),
+        None => {
+            let _ = writeln!(std::io::stderr(), "  {}", msg.as_ref());
+        }
+    }
 }
 
 /// Copy the running executable to `dest` atomically (no-op if it already is `dest`).
@@ -457,7 +483,12 @@ fn local_url(cfg: &crate::config::Config) -> String {
 
 fn eprintln_header(s: &str) {
     use std::io::Write as _;
-    let _ = writeln!(std::io::stderr(), "\n{s}\n");
+    match teller() {
+        Some(t) => t(Said::Heading(s)),
+        None => {
+            let _ = writeln!(std::io::stderr(), "\n{s}\n");
+        }
+    }
 }
 
 /// Enroll now (so the boot command carries no secret) and return the agent's run arguments.

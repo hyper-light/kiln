@@ -75,16 +75,27 @@ async fn repo_tick(hub: &Hub, repo: &Repo, minute: i64, cache: &mut Cache, live:
     let Some(sha) = refs.get(&head).cloned() else { return Ok(()) };
     live.push((repo.id.clone(), sha.clone()));
     let commit = cache.get(hub, repo, &sha).await?;
-    for l in commit.workflows.iter().filter(|l| l.runs && !l.has_errors()) {
-        let Some(w) = &l.workflow else { continue };
-        let entries: Vec<&Schedule> = w.on.iter().filter(|t| t.event == "schedule").flat_map(|t| t.schedules.iter()).collect();
-        for (i, s) in entries.into_iter().enumerate() {
-            if let Err(e) = entry(hub, repo, &refs, &head, &sha, l, i, s, minute, cache, live).await {
-                tracing::warn!(repo = %repo.name, workflow = %l.path, cron = %s.cron, error = %format!("{e:#}"), "a schedule could not run");
-            }
+    for (l, i, s) in entries(&commit, hub.cfg.ci.kiln_workflows) {
+        if let Err(e) = entry(hub, repo, &refs, &head, &sha, l, i, s, minute, cache, live).await {
+            tracing::warn!(repo = %repo.name, workflow = %l.path, cron = %s.cron, error = %format!("{e:#}"), "a schedule could not run");
         }
     }
     Ok(())
+}
+
+/// The schedule entries of a commit's workflows the engine starts, each with its index in its
+/// workflow: GitHub's, and the kiln dialect's only once `[ci] kiln_workflows` takes them off v1,
+/// as for every other event (`events::on_trigger`). v1's scheduler fires them otherwise: with the
+/// engine on and `kiln_workflows` off, both did, and each `.kiln/` schedule ran twice (W28 step 3's
+/// replay: wire-lab's and sim's every night).
+fn entries(commit: &load::Commit, kiln_workflows: bool) -> Vec<(&load::Loaded, usize, &Schedule)> {
+    commit
+        .workflows
+        .iter()
+        .filter(|l| l.runs && !l.has_errors() && (l.dialect == kiln_ci::expr::Dialect::Gha || kiln_workflows))
+        .filter_map(|l| l.workflow.as_ref().map(|w| (l, w)))
+        .flat_map(|(l, w)| w.on.iter().filter(|t| t.event == "schedule").flat_map(|t| t.schedules.iter()).enumerate().map(move |(i, s)| (l, i, s)))
+        .collect()
 }
 
 /// Whether the entry is due at `minute`: its own, or (with `catch-up`) a missed one.
@@ -214,6 +225,33 @@ mod tests {
         assert!(due(&c, &tz, &catch, "s", up, last));
         // Nothing was missed since the last fire: no catch-up.
         assert!(!due(&c, &tz, &catch, "s", up, Some(six)));
+        Ok(())
+    }
+
+    /// W03-R10, found by W28 step 3's replay: a `.kiln/` workflow's schedule is the engine's only
+    /// once `[ci] kiln_workflows` takes the kiln dialect off v1, whose scheduler fires it before
+    /// that; GitHub's schedules are the engine's either way.
+    #[test]
+    fn w03_r10_a_kiln_schedule_is_v1s_until_kiln_workflows() -> Result<(), String> {
+        use kiln_ci::expr::Dialect;
+        let read = |path: &str, text: &str, dialect: Dialect| {
+            let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, dialect);
+            load::Loaded { path: path.into(), dialect, runs: true, workflow, diagnostics: Vec::new() }
+        };
+        let commit = load::Commit {
+            workflows: vec![
+                read(".kiln/wire-lab.yaml", "name: wire-lab\non:\n  schedule: [\"17 3 * * *\"]\n  manual: true\njobs:\n  seeds:\n    runs-on: [baremetal, linux]\n    steps:\n      - run: echo seeds\n", Dialect::Kiln),
+                read(".github/workflows/nightly.yml", "on:\n  schedule:\n    - cron: '0 4 * * *'\n    - cron: '0 5 * * *'\njobs:\n  n:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo n\n", Dialect::Gha),
+            ],
+            ..load::Commit::default()
+        };
+        if let Some(l) = commit.workflows.iter().find(|l| l.has_errors()) {
+            return Err(format!("{} didn't read", l.path));
+        }
+        let fired = |kiln_workflows: bool| entries(&commit, kiln_workflows).into_iter().map(|(l, i, s)| (l.path.clone(), i, s.cron.clone())).collect::<Vec<_>>();
+        let nightly = |i: usize, cron: &str| (".github/workflows/nightly.yml".to_owned(), i, cron.to_owned());
+        assert_eq!(fired(false), vec![nightly(0, "0 4 * * *"), nightly(1, "0 5 * * *")], "the kiln dialect's stays v1's");
+        assert_eq!(fired(true), vec![(".kiln/wire-lab.yaml".to_owned(), 0, "17 3 * * *".to_owned()), nightly(0, "0 4 * * *"), nightly(1, "0 5 * * *")]);
         Ok(())
     }
 }

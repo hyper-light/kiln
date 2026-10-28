@@ -177,8 +177,8 @@ function LimitRows({ agent, state, send }: { agent: AgentInfo | null; state: Sta
           <div className="hx-ctl-text">
             <span className="hx-ctl-label">At a limit</span>
             <span className="hx-dim text-[12px]">
-              Wait for the reset, or go on on another of your machines with room: the one chosen or whichever has room, in its own harness signed in to another account or one its conversation can be
-              carried into (Claude Code ⇄ Codex). Its conversation and repository go along.
+              Wait for the reset, or go on on another of your machines with room: the one chosen or whichever has room, in its own harness signed in to another account or another one its conversation
+              is carried into (Claude Code, Codex, Devin, Antigravity and the other ACP agents). Its conversation and repository go along.
             </span>
           </div>
           <div className="hx-ctl-input">

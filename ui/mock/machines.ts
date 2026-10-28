@@ -30,7 +30,7 @@ const runner = (name: string, os: string, arch: string, harnesses: string[], ove
 });
 
 const RUNNERS: ReachRunner[] = [
-  runner("adacachy", "linux", "x86_64", ["claude", "codex"]),
+  runner("adacachy", "linux", "x86_64", ["claude", "codex", "devin", "antigravity", "gemini"]),
   runner("metal-ryzen-01", "linux", "x86_64", ["claude", "codex"]),
   runner("metal-mac-mini", "macos", "aarch64", ["claude"]),
   runner("metal-pi-04", "linux", "aarch64", ["codex"]),
@@ -60,7 +60,28 @@ const codex: KindInfo = {
     { id: "gpt-6.1-sol-mini", label: "GPT-6.1 Sol mini", description: "" },
   ],
 };
-const kindsOf = (hs: string[]) => [claude, codex].filter((k) => hs.includes(k.id));
+const devin: KindInfo = {
+  id: "devin",
+  name: "Devin",
+  verified: true,
+  available: true,
+  switch: true,
+  models: [
+    { id: "swe-2", label: "SWE 2", description: "" },
+    { id: "claude-opus-5-5", label: "Opus 5.5", description: "" },
+  ],
+};
+const antigravity: KindInfo = {
+  id: "antigravity",
+  name: "Antigravity CLI",
+  verified: true,
+  available: true,
+  switch: true,
+  models: [{ id: "gemini-3.8-pro", label: "Gemini 3.8 Pro", description: "" }],
+};
+/** A harness none of whose sessions ran here yet: it lists no models. */
+const gemini: KindInfo = { id: "gemini", name: "Gemini CLI", verified: false, available: true, switch: true };
+const kindsOf = (hs: string[]) => [claude, codex, devin, antigravity, gemini].filter((k) => hs.includes(k.id));
 
 /** The moves asked for, newest last. */
 const moves: { id: string; to: string; now: boolean; kind?: string; model?: string }[] = [];
@@ -72,7 +93,10 @@ export async function handleMachines(req: http.IncomingMessage, res: http.Server
   let mm: RegExpMatchArray | null;
   if (p === "/api/reach/runners" && m === "GET") return (ctx.json(res, 200, { runners: RUNNERS }), true);
   if (p === "/api/harness/kinds" && m === "GET") {
-    const all: Record<string, KindInfo[]> = { local: [claude, codex], ...Object.fromEntries(RUNNERS.filter((r) => r.connected).map((r) => [`agent:${r.name}`, kindsOf(r.harnesses)])) };
+    const all: Record<string, KindInfo[]> = {
+      local: [claude, codex, devin, antigravity, gemini],
+      ...Object.fromEntries(RUNNERS.filter((r) => r.connected).map((r) => [`agent:${r.name}`, kindsOf(r.harnesses)])),
+    };
     // One machine's (`?target=`), or every machine's.
     const target = url.searchParams.get("target");
     return (ctx.json(res, 200, target ? (all[target] ?? []) : all), true);
