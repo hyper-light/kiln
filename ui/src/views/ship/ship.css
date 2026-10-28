@@ -497,3 +497,146 @@
 .ship-open section[aria-label="Files"]:focus:not(:focus-visible) {
   outline: none;
 }
+
+/* A commit's own page (Commit page plan, step 1): its title, its stand and line, its journey. */
+.ship-commit {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+.ship-commit__title {
+  margin: 0;
+  font-size: 1.5rem;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.ship-commit__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  color: #a1a4ad;
+  font-size: 0.875rem;
+}
+/* An opened row's way to its commit's page, after the agreed sections. */
+.ship-open__page {
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
+/* The commit page's sections (its step 2): what failed first, the six stage cards, the trace. */
+.ship-commit .ship-sec > h2 {
+  margin: 0 0 8px;
+  color: #e4e5e9;
+  font-size: 13px;
+  font-weight: 500;
+}
+.ship-commit__errors {
+  border-color: rgb(229 115 115 / 0.45);
+}
+.ship-commit__errors ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__error-name {
+  color: #e4e5e9;
+  font-weight: 500;
+}
+.ship-commit__error-stage,
+.ship-commit__error-note {
+  color: #a1a4ad;
+  overflow-wrap: anywhere;
+}
+.ship-commit__stages {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The commit page's step 3: what ships with it, its environments and image, its runs. */
+.ship-commit__rides,
+.ship-commit__envs,
+.ship-commit__runs {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__envs li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__env {
+  color: #e4e5e9;
+}
+.ship-commit__env-note {
+  color: #a1a4ad;
+}
+.ship-commit__image {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+/* The commit page's Build (Build and replant plan, step 1): each platform, the image, runners' binaries. */
+.ship-commit__builds,
+.ship-commit__kept {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__builds li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__kept {
+  margin-top: 8px;
+  color: #a1a4ad;
+}
+
+/* The commit page's Replant (Build and replant plan, step 2): the server's build, then each runner. */
+.ship-commit__replant,
+.ship-commit__found {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__replant > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__acts {
+  display: inline-flex;
+  gap: 6px;
+}
+.ship-commit__found {
+  flex-basis: 100%;
+  padding-left: 24px;
+  color: #a1a4ad;
+}
+.ship-commit__server {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}

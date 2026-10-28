@@ -13,6 +13,8 @@ interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   /** One of the mock's own jobs, running if one is (server.ts), for a fixed row's leg to stream. */
   liveJob?: () => { run: string; job: string; name: string; state: string } | null;
+  /** CI starting on a pushed commit (server.ts's run on kiln's repository): its run and job events reach the page as a real push's do. */
+  push?: () => void;
 }
 
 /** kiln's own trunk, simulated (ship-sim.ts); `MOCK_SHIP=static` serves the fixed rows alone, for
@@ -210,6 +212,23 @@ function commits(): ShipCommit[] {
   ];
 }
 
+/**
+ * The fixed rows' runners, replanting onto "ci: a landed change", the newest in production (the
+ * commit page's Replant; Build and replant plan, step 2): one replanted, one Pi whose upgrade timed
+ * out until System's Retry starts it again, one offline.
+ */
+const PI = "pi-kitchen";
+/** Retried, by browser (its User-Agent), so the e2e projects running side by side each have their own Pi. */
+const piRetried = new Set<string>();
+const replantOf = (row: ShipCommit, ua: string) =>
+  row.short === "6666666"
+    ? [
+        { name: "metal-ryzen-01", state: "on", why: "" },
+        { name: PI, state: piRetried.has(ua) ? "waiting" : "failed", why: piRetried.has(ua) ? "" : "the upgrade timed out: it didn't come back on the new build within 10 minutes" },
+        { name: "metal-nuc-old", state: "offline", why: "offline since 3d" },
+      ]
+    : null;
+
 /** Commits a test adds on top (`POST /api/mock/ship/arrive`, `?clear=1` to take them away), newest first. */
 const arrived: ShipCommit[] = [];
 const arrival = (n: number): ShipCommit => ({
@@ -233,6 +252,65 @@ const arrival = (n: number): ShipCommit => ({
   fold_under: null,
   actions: [],
 });
+
+/**
+ * A burst of agents' commits (`POST /api/mock/ship/agents?n=14&over=10`; Agent pace and checks,
+ * step 1): first a release production waits on you to approve, then agents' commits that ride with
+ * it (waiting, so they fold under it), every fourth one an agent asking you. Each lands on top of
+ * `arrived`, spread over `over` seconds, and starts CI as a push does (`push`); `arrive?clear=1`
+ * takes them away and stops what's to come.
+ */
+const burstTimers = new Set<ReturnType<typeof setTimeout>>();
+const agentCommit = (k: number): ShipCommit => {
+  const id = sha(`a${k.toString(16)}`);
+  const base = {
+    repo: REPO,
+    sha: id,
+    short: id.slice(0, 7),
+    branch: "main",
+    at: now(),
+    environments: [],
+    tags: [],
+    runs: [],
+    cursor: 200 + k,
+    kind: "commit" as const,
+    host: null,
+    change: null,
+    fold_under: null,
+  };
+  if (k === 1)
+    return {
+      ...base,
+      message: "release: production waits on you",
+      author: "agent:release",
+      stand: "needs_you",
+      line: "In staging and healthy · production waits on your approval",
+      pips: pips("none", "passed", "passed", "passed", "healthy", "needs"),
+      actions: [
+        { name: "approve", method: "POST", path: "/api/deploy/releases/ship-rel-burst/approve", body: {} },
+        { name: "hold", method: "POST", path: "/api/deploy/releases/ship-rel-burst/reject", body: {} },
+      ],
+    };
+  if (k % 4 === 0)
+    return {
+      ...base,
+      message: `agent: asks about flake ${k}`,
+      author: `agent:fix-${k}`,
+      stand: "needs_you",
+      line: `agent:fix-${k} asks: retry the flaky leg?`,
+      pips: pips("none", "passed", "failed"),
+      actions: [{ name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, run: `ship-run-burst-${k}` } }],
+    };
+  return {
+    ...base,
+    message: `agent: rider ${k}`,
+    author: `agent:fix-${k}`,
+    stand: "waiting",
+    line: "Passed and built · rides with the release",
+    pips: pips("none", "passed", "passed", "passed", "healthy"),
+    actions: [],
+  };
+};
 
 /**
  * A fixed row's review marks, oldest first (W26-R14): a commit with no change has one, its push; a
@@ -305,6 +383,7 @@ const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...com
  * `ship-rel-…`, a trunk runner whose upgrade failed), so they answer before the routes the rest of
  * the mock keeps for those paths. True when it answered. */
 export async function handleShip(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
+  const ua = String(req.headers["user-agent"] ?? "");
   const p = url.pathname;
   const m = req.method ?? "GET";
   const q = url.searchParams;
@@ -331,6 +410,22 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
                 {
                   pipeline: "ci",
                   legs: [
+                    // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
+                    // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
+                    ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
+                      ? [
+                          {
+                            name: row.line.split(" · ")[0] ?? "checks",
+                            state: "failed",
+                            attempts: 2,
+                            note: row.line.split(" · ").slice(1).join(" · "),
+                            job: live.job,
+                            run: live.run,
+                            start: T0 - 900,
+                            end: T0 - 840,
+                          },
+                        ]
+                      : []),
                     {
                       name: live.name,
                       state: live.state === "running" ? "running" : "passed",
@@ -345,6 +440,26 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
                 },
               ]
             : [],
+          ...(replantOf(row, ua) ? { replant: replantOf(row, ua) ?? [] } : {}),
+          // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
+          runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
+          // A commit in production went through staging, built once: its deploys and the one image they run.
+          ...(row.environments?.some((e) => e.production)
+            ? {
+                build: {
+                  platforms: [
+                    { name: "linux/amd64", state: "passed" as const },
+                    // "deploy: a rollback holds" was in staging when a newer push came: its Mac build gave way to the newer one's.
+                    { name: "macos/arm64", state: row.short === "1111111" ? ("superseded" as const) : ("passed" as const) },
+                  ],
+                  image: { state: "passed" as const, digest: `sha256:${row.sha}${row.sha}`.slice(0, 71) },
+                },
+                deployments: [
+                  { environment: "staging", production: false, state: "success", description: "synced and healthy", at: row.at + 600 },
+                  { environment: "production", production: true, state: "success", description: "promoted from staging", at: row.at + 1800 },
+                ],
+              }
+            : {}),
         }
       : null;
     const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
@@ -352,9 +467,60 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     else ctx.json(res, 200, detail);
     return true;
   }
+  if (p === "/api/mock/ship/agents" && m === "POST") {
+    const n = Math.min(Math.max(Number(q.get("n") ?? 14) || 14, 1), 100);
+    const over = Math.min(Math.max(Number(q.get("over") ?? 10) || 10, 0), 60);
+    for (let k = 1; k <= n; k++) {
+      const t = setTimeout(
+        () => {
+          burstTimers.delete(t);
+          arrived.unshift(agentCommit(k));
+          ctx.push?.();
+        },
+        ((k - 1) * over * 1000) / Math.max(1, n - 1),
+      );
+      burstTimers.add(t);
+    }
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
   if (p === "/api/mock/ship/arrive" && m === "POST") {
-    if (q.get("clear")) arrived.length = 0;
-    else arrived.unshift(arrival(arrived.length + 1));
+    if (q.get("clear")) {
+      for (const t of burstTimers) clearTimeout(t);
+      burstTimers.clear();
+      arrived.length = 0;
+    } else arrived.unshift(arrival(arrived.length + 1));
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
+  // The fixed rows' Pi, through System's own actions: Retry (POST /api/updates/runners/:name) starts
+  // its upgrade again, Diagnose (GET /api/agents/:name/diagnose) finds the timeout; a test resets it.
+  if (p === `/api/updates/runners/${PI}` && m === "POST") {
+    piRetried.add(ua);
+    ctx.json(res, 200, { id: "upg-pi-kitchen", kind: "runner", target: PI, method: "download", state: "running", started_at: now(), ended_at: null, from_build: "0.1.0+0f1e2d3", to_build: null });
+    return true;
+  }
+  if (p === `/api/agents/${PI}/diagnose` && m === "GET") {
+    ctx.json(res, 200, {
+      runner: PI,
+      at: Date.now(),
+      worst: "fail",
+      findings: [
+        {
+          id: "upgrade.last",
+          level: "fail",
+          title: "Its last upgrade timed out",
+          detail: "It went down to swap in the new build and didn't answer again within 10 minutes: a Pi on an SD card can take longer.",
+          fix: { action: "retry-upgrade", label: "Upgrade it again", way: "download" },
+        },
+      ],
+      machine_checked: false,
+      why: "It hasn't answered since its upgrade.",
+    });
+    return true;
+  }
+  if (p === "/api/mock/ship/replant" && m === "POST") {
+    if (q.get("reset")) piRetried.delete(ua);
     ctx.json(res, 200, { ok: true });
     return true;
   }

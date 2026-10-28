@@ -196,6 +196,9 @@ export function standCounts(commits: readonly ShipCommit[]): Record<ShipShown, n
 const UNDER_WAY = new Set(["running", "soaking", "guard", "replanting"]);
 const FELL = new Set(["failed", "error", "rolledback", "partial"]);
 
+/** Whether a state is a failure: failed, kiln's own error, rolled back, partly. */
+export const fell = (state: string) => FELL.has(state);
+
 /**
  * The card picked first, as kiln's stepToShow picks a step: the running one, else the one that
  * failed, else the last that ran (the first when none has).
@@ -235,7 +238,7 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
         { id: "image", name: "image", state: glyph(built.image.state), start: null, end: null },
       ]
     : [];
-  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: glyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
+  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: replantGlyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
   const deploys = (production: boolean): ShipLane[] =>
     (detail.deployments ?? [])
       .filter((d) => d.production === production)
@@ -243,3 +246,114 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
   const group = (stage: Stage, lanes: ShipLane[]): ShipLaneGroup => ({ group: stage, label: STAGE_WORD[stage], state: pip(stage), note: "", lanes });
   return [group("land", []), group("checks", legs), group("build", build), group("staging", deploys(false)), group("production", deploys(true)), group("replant", replant)];
 }
+
+/** What failed in a commit, each with its stage, its words and where its log is (the commit page's Errors, its step 2). */
+export interface Failure {
+  stage: Stage;
+  name: string;
+  note: string;
+  /** Its job's page, or its run's; null where it has no log of its own. */
+  href: string | null;
+}
+
+/** Everything that failed: each Checks leg, the build's platforms and image, each deploy, each runner replanted. */
+export function failuresOf(detail: ShipDetail): Failure[] {
+  const legs = (detail.checks ?? []).flatMap((c) =>
+    c.legs.filter((l) => fell(l.state)).map((l): Failure => ({ stage: "checks", name: l.name, note: l.note, href: l.run && l.job ? `/runs/${l.run}/jobs/${l.job}` : l.run ? `/runs/${l.run}` : null })),
+  );
+  const built = detail.build;
+  const build: Failure[] = built
+    ? [...built.platforms.filter((p) => p.state === "failed").map((p) => p.name), ...(built.image.state === "failed" ? ["image"] : [])].map((name) => ({ stage: "build", name, note: "", href: null }))
+    : [];
+  const deploys = (detail.deployments ?? [])
+    .filter((d) => fell(DEPLOY_GLYPH[d.state ?? ""] ?? "none"))
+    .map((d): Failure => ({ stage: d.production ? "production" : "staging", name: d.environment, note: d.description ?? "", href: null }));
+  const runners = (detail.replant ?? []).filter((r) => fell(r.state)).map((r): Failure => ({ stage: "replant", name: r.name, note: r.why, href: null }));
+  return [...legs, ...build, ...deploys, ...runners];
+}
+
+/** One span of the commit's trace: a lane, named with its group. */
+export type Span = ShipLane & { group: string };
+
+/** Every lane of every group as one trace, failures first, then by when each started (those not yet started last). */
+export function traceOf(groups: readonly ShipLaneGroup[]): Span[] {
+  const spans = groups.flatMap((g) => g.lanes.map((l): Span => ({ ...l, id: `${g.group}/${l.id}`, name: `${g.label} · ${l.name}`, group: g.group })));
+  return spans
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => Number(fell(b.s.state)) - Number(fell(a.s.state)) || (a.s.start ?? Infinity) - (b.s.start ?? Infinity) || a.i - b.i)
+    .map((x) => x.s);
+}
+
+/** What ships with a commit (the commit page's step 3): the commits folded with it, and how. */
+export interface Rides {
+  /** It leads them (the approval they ride with, its change's tip, the newest shipped), rides with `head`, or ships alone. */
+  as: "head" | "rider" | "alone";
+  head: ShipCommit | null;
+  /** The others that ship with it. */
+  with: ShipCommit[];
+  folds: Item["folds"];
+}
+
+/** What ships with `sha`, from the list's commits as Ship folds them. */
+export function ridesOf(commits: readonly ShipCommit[], sha: string): Rides {
+  for (const it of fold(commits)) {
+    if (it.head.sha === sha) return it.riders.length ? { as: "head", head: null, with: it.riders, folds: it.folds } : { as: "alone", head: null, with: [], folds: undefined };
+    if (it.riders.some((r) => r.sha === sha)) return { as: "rider", head: it.head, with: it.riders.filter((r) => r.sha !== sha), folds: it.folds };
+  }
+  return { as: "alone", head: null, with: [], folds: undefined };
+}
+
+/** Where an environment stands from a commit: its latest deploy of it, and whether it runs it now. */
+export interface Standing {
+  environment: string;
+  production: boolean;
+  state: string;
+  description: string;
+  at: number | null;
+  /** It runs this commit now. */
+  now: boolean;
+}
+
+/** Each environment the commit was deployed to or runs in, staging before production, as it stands from it. */
+export function environmentsOf(detail: ShipDetail): Standing[] {
+  const by = new Map<string, Standing>();
+  for (const d of [...(detail.deployments ?? [])].sort((a, b) => a.at - b.at))
+    by.set(d.environment, { environment: d.environment, production: d.production, state: DEPLOY_GLYPH[d.state ?? ""] ?? "none", description: d.description ?? "", at: d.at, now: false });
+  for (const e of detail.environments ?? []) {
+    const was = by.get(e.environment);
+    by.set(e.environment, was ? { ...was, now: true } : { environment: e.environment, production: e.production, state: "passed", description: "", at: null, now: true });
+  }
+  return [...by.values()].sort((a, b) => Number(a.production) - Number(b.production) || a.environment.localeCompare(b.environment));
+}
+
+/** A platform's build of a commit, in words (the commit page's Build; Build and replant plan, step 1). */
+const BUILD_WORD: Record<string, string> = { passed: "built", running: "building", queued: "queued", failed: "failed", superseded: "superseded by a newer push" };
+export const buildWord = (state: string) => BUILD_WORD[state] ?? state;
+
+/** A binary System keeps for a platform, as far as a commit goes: runners get it, or a newer build replaced it. */
+export interface KeptBuild {
+  label: string;
+  target: string;
+  state: "current" | "replaced";
+}
+
+/**
+ * From System's builds (the binaries kiln keeps for its runners, as the Builds section reads them):
+ * for a commit of kiln's own, each platform whose binary runners get is built from it, and each
+ * whose binary from it is kept but replaced by a newer build.
+ */
+export function keptBuildsOf(platforms: readonly { label: string; target: string; binary: { sha?: string } | null; shadowed: readonly { sha?: string }[] }[], sha: string): KeptBuild[] {
+  const of = (b: { sha?: string } | null | undefined) => {
+    const a = b?.sha?.toLowerCase();
+    const c = sha.toLowerCase();
+    return !!a && (c.startsWith(a) || a.startsWith(c));
+  };
+  return platforms.flatMap((p): KeptBuild[] =>
+    of(p.binary) ? [{ label: p.label, target: p.target, state: "current" }] : p.shadowed.some(of) ? [{ label: p.label, target: p.target, state: "replaced" }] : [],
+  );
+}
+
+/** A runner's replant as the read model says it (on, waiting, failed, offline), as a glyph and in words (Build and replant plan, step 2). */
+const REPLANT: Record<string, [string, string]> = { on: ["replanted", "replanted"], waiting: ["replanting", "replanting"], failed: ["failed", "didn't replant"], offline: ["offline", "offline"] };
+export const replantGlyph = (state: string) => REPLANT[state]?.[0] ?? (state in GLYPHS ? state : "none");
+export const replantWord = (state: string) => REPLANT[state]?.[1] ?? state;

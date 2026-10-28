@@ -84,7 +84,7 @@ const GROW_BY = 10 * 60;
 /** The window the lanes draw on: from the earliest start, at least 30 minutes wide and 10 more at a
  * time as now or a mark passes its end, so the bars keep their scale as time passes but for a
  * 10-minute step (the opened commit's step 2). `now` is the caller's — no clock inside. */
-function horizonOf(groups: ShipLaneGroup[], now: number): [number, number] {
+export function horizonOf(groups: ShipLaneGroup[], now: number): [number, number] {
   let lo = now;
   for (const g of groups) for (const l of g.lanes) if (l.start != null && l.start < lo) lo = l.start;
   let hi = now;
@@ -96,7 +96,7 @@ function horizonOf(groups: ShipLaneGroup[], now: number): [number, number] {
 const pos = (t: number, [lo, hi]: [number, number]) => Math.min(1, Math.max(0, (t - lo) / (hi - lo)));
 
 /** A lane's words: name and, in Detail, who did it and when (and its place when it has one). */
-function LaneBar({ lane, window, now }: { lane: ShipLane; window: [number, number]; now: number }) {
+export function LaneBar({ lane, window, now }: { lane: ShipLane; window: [number, number]; now: number }) {
   const [lo, hi] = window;
   const a = lane.start == null ? null : pos(lane.start, [lo, hi]);
   // A bar under way runs to now, not to the window's end.

@@ -411,6 +411,9 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
           </Loadable>
           {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}
         </section>
+        <p className="ship-open__page">
+          <Link to={`/ship/${commit.repo}/${commit.sha}`}>Commit {commit.short}</Link>, its stages and trace on a page of its own
+        </p>
       </Loadable>
     </div>
   );

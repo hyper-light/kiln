@@ -58,6 +58,7 @@ import { Route as AppDeploymentsReleasesTemplatesNameRouteImport } from './route
 import { Route as AppReviewHostsRepoIndexRouteImport } from './routes/_app.review.hosts.$repo.index'
 import { Route as AppReviewHostsRepoNumberRouteImport } from './routes/_app.review.hosts.$repo.$number'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
+import { Route as AppShipOwnerNameShaRouteImport } from './routes/_app.ship_.$owner.$name.$sha'
 import { Route as AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.apps.$app_.environments.$env'
 
 const AppRoute = AppRouteImport.update({
@@ -317,6 +318,11 @@ const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
   path: '/runs/$id/jobs/$jobId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppShipOwnerNameShaRoute = AppShipOwnerNameShaRouteImport.update({
+  id: '/ship_/$owner/$name/$sha',
+  path: '/ship/$owner/$name/$sha',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute =
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport.update({
     id: '/deployments/releases/apps/$app_/environments/$env',
@@ -371,6 +377,7 @@ export interface FileRoutesByFullPath {
   '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/ship/$owner/$name/$sha': typeof AppShipOwnerNameShaRoute
   '/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/review/hosts/$repo/': typeof AppReviewHostsRepoIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -422,6 +429,7 @@ export interface FileRoutesByTo {
   '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/ship/$owner/$name/$sha': typeof AppShipOwnerNameShaRoute
   '/deployments/releases/templates': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/review/hosts/$repo': typeof AppReviewHostsRepoIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -475,6 +483,7 @@ export interface FileRoutesById {
   '/_app/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/_app/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/_app/ship_/$owner/$name/$sha': typeof AppShipOwnerNameShaRoute
   '/_app/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/_app/review/hosts/$repo/': typeof AppReviewHostsRepoIndexRoute
   '/_app/deployments/releases/apps/$app_/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -528,6 +537,7 @@ export interface FileRouteTypes {
     | '/deployments/releases/templates/$name'
     | '/review/hosts/$repo/$number'
     | '/runs/$id/jobs/$jobId'
+    | '/ship/$owner/$name/$sha'
     | '/deployments/releases/templates/'
     | '/review/hosts/$repo/'
     | '/deployments/releases/apps/$app/environments/$env'
@@ -579,6 +589,7 @@ export interface FileRouteTypes {
     | '/deployments/releases/templates/$name'
     | '/review/hosts/$repo/$number'
     | '/runs/$id/jobs/$jobId'
+    | '/ship/$owner/$name/$sha'
     | '/deployments/releases/templates'
     | '/review/hosts/$repo'
     | '/deployments/releases/apps/$app/environments/$env'
@@ -631,6 +642,7 @@ export interface FileRouteTypes {
     | '/_app/deployments/releases/templates/$name'
     | '/_app/review/hosts/$repo/$number'
     | '/_app/runs/$id/jobs/$jobId'
+    | '/_app/ship_/$owner/$name/$sha'
     | '/_app/deployments/releases/templates/'
     | '/_app/review/hosts/$repo/'
     | '/_app/deployments/releases/apps/$app_/environments/$env'
@@ -986,6 +998,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRunsIdJobsJobIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/ship_/$owner/$name/$sha': {
+      id: '/_app/ship_/$owner/$name/$sha'
+      path: '/ship/$owner/$name/$sha'
+      fullPath: '/ship/$owner/$name/$sha'
+      preLoaderRoute: typeof AppShipOwnerNameShaRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/releases/apps/$app_/environments/$env': {
       id: '/_app/deployments/releases/apps/$app_/environments/$env'
       path: '/deployments/releases/apps/$app/environments/$env'
@@ -1042,6 +1061,7 @@ interface AppRouteChildren {
   AppDeploymentsReleasesTemplatesNameRoute: typeof AppDeploymentsReleasesTemplatesNameRoute
   AppReviewHostsRepoNumberRoute: typeof AppReviewHostsRepoNumberRoute
   AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
+  AppShipOwnerNameShaRoute: typeof AppShipOwnerNameShaRoute
   AppDeploymentsReleasesTemplatesIndexRoute: typeof AppDeploymentsReleasesTemplatesIndexRoute
   AppReviewHostsRepoIndexRoute: typeof AppReviewHostsRepoIndexRoute
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute: typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -1095,6 +1115,7 @@ const AppRouteChildren: AppRouteChildren = {
     AppDeploymentsReleasesTemplatesNameRoute,
   AppReviewHostsRepoNumberRoute: AppReviewHostsRepoNumberRoute,
   AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
+  AppShipOwnerNameShaRoute: AppShipOwnerNameShaRoute,
   AppDeploymentsReleasesTemplatesIndexRoute:
     AppDeploymentsReleasesTemplatesIndexRoute,
   AppReviewHostsRepoIndexRoute: AppReviewHostsRepoIndexRoute,
