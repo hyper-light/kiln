@@ -24,7 +24,9 @@ import {
   type Thread,
 } from "@/api/review";
 import type { ShipCommit } from "@/api/ship";
+import { toast } from "@/components/ui/toast";
 import { useRes, warm } from "@/lib/data";
+import { errorMessage } from "@/lib/hooks";
 import { invalidate, setData } from "@/lib/resource";
 import { parsePatch, type PatchFile } from "@/views/review/patch";
 import { Conversation, ConvoBox, Description } from "./convo";
@@ -271,9 +273,19 @@ function KilnFiles({ item }: { item: ShipCommit }) {
     };
   }, [ops, act, key, version]);
 
+  // Viewed, kept by kiln for the change: the file folds at once, and its files are read again so it
+  // opens folded next time (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2).
+  const viewed = React.useCallback(
+    (file: string, on: boolean) =>
+      void reviewApi.viewed(key, file, on).then(
+        () => invalidate(`review/files/${key}/`),
+        (e: unknown) => toast.error("Couldn't mark it viewed", errorMessage(e)),
+      ),
+    [key],
+  );
   const ctx: FilesCtx = React.useMemo(
-    () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf }),
-    [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf],
+    () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf, viewed }),
+    [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf, viewed],
   );
   const jump = (j: Jump) => {
     if (j.whole) setWhole(j.file);
@@ -383,7 +395,7 @@ function HostFiles({ item }: { item: ShipCommit }) {
       }
     >
       {list.map((f) => (
-        <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={{ status: "M" }} />
+        <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={{ status: pull.files.find((x) => x.path === f.path)?.status }} />
       ))}
     </Frame>
   );

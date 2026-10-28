@@ -568,7 +568,9 @@
   list-style: none;
   cursor: pointer;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-columns: auto;
+  grid-auto-flow: column;
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
@@ -602,6 +604,17 @@
   background: rgb(255 255 255 / 6%);
   font-size: 10.5px;
   color: #a1a4ad;
+}
+/* A file's Viewed, as kiln's review page has it: ticked, the file folds. */
+.rv-viewed {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  white-space: nowrap;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  color: #a1a4ad;
+  cursor: pointer;
 }
 .rv-f > summary .rv-ib {
   margin: -6px -6px -6px 0;
@@ -773,11 +786,16 @@
   color: #8fb5a6;
   opacity: 0.55;
 }
+/* Its box one width as it ticks ("9m ago" to "10m ago"), as a row's age is, so pushed right it never
+   moves: nothing on screen moves while a row is open (Agent pace and checks, step 2). */
 .rv-when {
   margin-left: auto;
   display: inline-flex;
   gap: 4px;
   align-items: center;
+  justify-content: flex-end;
+  min-width: 8ch;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .rv-draft {
