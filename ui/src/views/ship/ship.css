@@ -347,7 +347,8 @@
 }
 
 /* An opened commit's job cards (opened-commit plan, step 1): as many to a view as fit, the cards and
-   their gaps together exactly the lanes card's width, snapping a card at a time. */
+   their gaps together exactly the lanes card's width, a view at a time. The view's cards alone are
+   drawn (jobs.tsx), so nothing scrolls sideways (W21-AC01). */
 .ship-jobs {
   container-type: inline-size;
 }
@@ -355,18 +356,11 @@
   --n: 1;
   --gap: 0.75rem;
   display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: calc((100% - (var(--n) - 1) * var(--gap)) / var(--n));
-  column-gap: var(--gap);
+  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
+  gap: var(--gap);
   margin: 0;
   padding: 0;
-  overflow-x: auto;
   list-style: none;
-  scroll-snap-type: x mandatory;
-  scrollbar-width: none;
-}
-.ship-jobs__track::-webkit-scrollbar {
-  display: none;
 }
 @container (min-width: 420px) {
   .ship-jobs__track {
@@ -397,7 +391,6 @@
   border: 1px solid rgb(255 255 255 / 0.1);
   border-radius: 0.75rem;
   background: rgb(255 255 255 / 0.02);
-  scroll-snap-align: start;
 }
 .ship-job__head {
   display: flex;
