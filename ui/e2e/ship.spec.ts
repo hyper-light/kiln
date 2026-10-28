@@ -62,12 +62,12 @@ test("each host's pull requests and kiln's diffs are Ship items, Review first on
   await expect(rows.filter({ hasText: "ci: cache keys by lockfile" })).toHaveCount(0);
   await page.goto("/ship?host=bitbucket");
   await expect(rows.first()).toContainText("Landing");
+  // The landed change is GitLab's !6, not a kiln diff: kiln's diff is D41, its change request CR12.
   await page.goto("/ship?kind=diff");
-  await expect(rows).toHaveCount(2);
+  await expect(rows).toHaveCount(1);
   await expect(rows.first()).toContainText("D41");
-  await expect(rows.nth(1)).toContainText("D44");
   await page.goto("/ship?kind=request,diff&host=kiln");
-  await expect(rows).toHaveCount(3);
+  await expect(rows).toHaveCount(2);
 });
 
 test("Ship's list holds still as it loads and as a row opens", async ({ page, browserName }) => {

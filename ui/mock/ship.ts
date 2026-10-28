@@ -244,7 +244,8 @@ const MARKS: Record<string, (at: number) => ShipMark[]> = {
   D41: (at) => [
     { id: "D41-push-5", kind: "push", at: at - 3000, end: at - 3000, by: "agent:matrix", signer: null, revision: 5, state: "passed" },
     { id: "D41-comment-1", kind: "comment", at: at - 2700, end: at - 2100, by: "user:kim", signer: null, revision: 5, state: "blocked", thread: "D41-t1", note: "blocking" },
-    { id: "D41-resolved-1", kind: "comment", at: at - 2100, end: at - 2100, by: "user:kim", signer: null, revision: 5, state: "passed", thread: "D41-t1", note: "resolved" },
+    // A resolution's mark is `<thread>:resolved`, as ship.rs makes it: its lane reads "kim · resolved".
+    { id: "D41-t1:resolved", kind: "comment", at: at - 2100, end: at - 2100, by: "user:kim", signer: null, revision: 5, state: "passed", thread: "D41-t1", note: "resolved" },
     { id: "D41-fix-6", kind: "fix", at: at - 1800, end: at - 1800, by: "agent:matrix for user:ada", signer: null, revision: 6, state: "passed", thread: "D41-t1", note: "suggestion applied" },
     { id: "D41-resolution-7", kind: "resolution", at: at - 900, end: at - 900, by: "agent:matrix", signer: null, revision: 7, state: "passed" },
     { id: "D41-approval", kind: "approval", at: at - 600, end: at - 300, by: "user:kim", signer: null, revision: 7, state: "approved" },

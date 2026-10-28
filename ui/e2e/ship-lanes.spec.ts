@@ -42,8 +42,10 @@ test("a diff's Review lane group shows each mark in order, its time and unsigned
   const group = row.locator('.ship-lanegroup[data-group="review"]');
   await expect(group.locator(".ship-lanegroup__head")).toContainText("Review");
   const lanes = group.locator(".ship-lane");
-  await expect(lanes).toHaveCount(9);
-  const names = ["v1 · pushed", "v2 · pushed", "v3 · pushed", "v4 · pushed", "v5 · pushed", "v6 · pushed", "v7 · pushed", "ada · comment", "approval · ada (v7)"];
+  // D41's story, as the step tells it: v5 pushed, kim's blocking comment, kim resolves it, v6 by
+  // Apply, v7 its conflict resolved, kim's approval.
+  const names = ["v5 · pushed", "kim · comment", "kim · resolved", "v6 · suggestion applied", "v7 · conflict resolved", "approval · kim (v7)"];
+  await expect(lanes).toHaveCount(names.length);
   for (const [i, name] of names.entries()) {
     const lane = lanes.nth(i);
     await expect(lane).toContainText(name);

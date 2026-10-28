@@ -24,7 +24,7 @@ import {
   type Thread,
 } from "@/api/review";
 import type { ShipCommit } from "@/api/ship";
-import { Loadable, Loading } from "@/components/ui/loading";
+import { Loadable } from "@/components/ui/loading";
 import { useRes } from "@/lib/data";
 import { invalidate, setData } from "@/lib/resource";
 import { parsePatch, type PatchFile } from "@/views/review/patch";
@@ -42,25 +42,15 @@ export const ReviewFiles = React.memo(function ReviewFiles({ item }: { item: Shi
   counted("ship/reviewfiles");
   const ch = item.change;
   const host = ch?.host;
+  // Files is one `<section aria-label="Files">`, focusable, once its review is drawn or has failed:
+  // Ship's Diff button waits for it to appear and brings it into view, focused. While it loads there
+  // is none, so the focus never lands on a placeholder that the review then replaces.
   return (
-    <Loadable label="Loading its review" fallback={<FilesHold />}>
+    <Loadable label="Loading its review">
       <ReviewBoundary>{ch && host === "kiln" ? <KilnFiles item={item} /> : ch && host ? <HostFiles item={item} /> : <CommitFiles item={item} />}</ReviewBoundary>
     </Loadable>
   );
 });
-
-/**
- * The Files section while its review loads. Loading, failed or loaded, the dropdown's first section
- * is `<section aria-label="Files">`, focusable, where Ship's Diff button brings it into view.
- */
-function FilesHold() {
-  return (
-    <section className="rv-s" aria-label="Files" tabIndex={-1}>
-      <h3 className="rv-h">Files</h3>
-      <Loading label="Loading its review" block />
-    </section>
-  );
-}
 
 /** A change the server doesn't keep (a mock's, a pruned one): the section says so, nothing else breaks. */
 class ReviewBoundary extends React.Component<{ children: React.ReactNode }, { err: unknown }> {
