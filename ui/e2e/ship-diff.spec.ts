@@ -44,11 +44,18 @@ test("opening a row by its chevron leaves the page where it is", async ({ page }
   await page.goto("/ship");
   const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
   await expect(row).toBeVisible({ timeout: 15_000 });
-  // The chevron in view first (a click would scroll to it), so what's measured is the app's own move.
+  // The chevron in view, and the pointer resting on it, so the list holds still (a commit another test
+  // adds above can't move it), then a click where it is: what's measured is the app's own move, not a
+  // click's scroll to a chevron that moved.
   const chevron = row.locator(".ship-go");
   await chevron.scrollIntoViewIfNeeded();
+  const box = await chevron.boundingBox();
+  if (!box) throw new Error("no chevron");
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   const before = await page.evaluate(() => window.scrollY);
-  await chevron.click();
+  const at = (await chevron.boundingBox()) ?? box;
+  await page.mouse.click(at.x + at.width / 2, at.y + at.height / 2);
+  await expect(row.locator(".ship-go")).toHaveAttribute("aria-expanded", "true");
   const files = row.locator('section[aria-label="Files"]');
   await expect(files).toHaveCount(1);
   await expect(files).not.toBeFocused();
