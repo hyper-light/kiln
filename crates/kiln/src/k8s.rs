@@ -8,13 +8,13 @@
 //!
 //! The pod needs no git and no GitHub access: source comes from the server's mirror as a tarball.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{
-    Affinity, Container, ContainerPort, EnvVar, ExecAction, HostAlias, NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeClaimVolumeSource, Pod, PodSpec,
-    PreferredSchedulingTerm, Probe, ResourceRequirements, SecurityContext, Volume, VolumeMount,
+    Affinity, Container, ContainerPort, EnvVar, ExecAction, HostAlias, HostPathVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeClaimVolumeSource,
+    Pod, PodSpec, PreferredSchedulingTerm, Probe, ResourceRequirements, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -54,6 +54,8 @@ pub struct ExecutorPod {
 pub struct K8s {
     api: KubeApi,
     cfg: KCfg,
+    /// The nodes each warm pool's pods ran on, newest first (W24-R14).
+    warm_nodes: parking_lot::Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl K8s {
@@ -61,7 +63,7 @@ impl K8s {
         let api = KubeApi::discover(&cfg.namespace)?;
         // Probe permissions now so a broken RBAC setup is reported at startup.
         api.list_pods(MANAGED).await?;
-        Ok(Self { api, cfg: cfg.clone() })
+        Ok(Self { api, cfg: cfg.clone(), warm_nodes: parking_lot::Mutex::default() })
     }
 
     pub async fn launch(&self, hub: &Hub, job: &Job, run: &Run) -> anyhow::Result<String> {
@@ -80,21 +82,49 @@ impl K8s {
 
     /// A `k8s` pool's executor (docs/ci.md W13-R07): [`pool_pod`], whose own runner enrolls with
     /// a one-time token bound to the executor and the pod's name.
+    ///
+    /// A pool with `warm` keeps its runners' warm workspaces on their nodes ([`warm`], W24-R14).
     pub async fn launch_executor(&self, hub: &Hub, executor: &str, pool: &kiln_ci::sched::pools::PoolSpec, pod: Option<&crate::ci::pools::LegPod>) -> anyhow::Result<String> {
+        let warm = self.warm_for(hub, pool);
         let name = executor_pod(executor);
         let token = crate::util::random_token();
         let ttl = Duration::from_secs(u64::from(self.cfg.start_timeout_seconds) + 120);
         hub.executor_tokens.lock().insert(token.clone(), (executor.to_owned(), name.clone(), Instant::now() + ttl));
         let server_url = self.cfg.server_url.clone().unwrap_or_else(|| hub.cfg.server.public_url.clone());
         let server_quic = self.cfg.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone());
-        let made = pool_pod(&self.cfg, executor, &name, &token, (&server_url, &server_quic), pool, pod);
+        let mut made = pool_pod(&self.cfg, executor, &name, &token, (&server_url, &server_quic), pool, pod);
+        if let Some(w) = &warm {
+            apply_warm(&mut made, w);
+        }
         self.api.create_pod(&made).await?;
         Ok(name)
     }
 
-    /// The `k8s` pools' executor pods there are.
+    /// What a pool's next pod gets of `warm` (W24-R14): none when the pool keeps no workspaces, or
+    /// while untrusted legs may run in its pods (`ci.untrusted.executors` naming `k8s`), which
+    /// would write where trusted legs read (W24-R21).
+    fn warm_for(&self, hub: &Hub, pool: &kiln_ci::sched::pools::PoolSpec) -> Option<Warm> {
+        let w = pool.warm.as_ref()?;
+        if hub.cfg.ci.untrusted.executors.iter().any(|e| e == "k8s") {
+            tracing::warn!(pool = %pool.name, "a k8s pool's pod starts cold: untrusted legs may run in its pods (`ci.untrusted.executors` names k8s), and they'd write warm workspaces trusted legs read");
+            return None;
+        }
+        let nodes = self.warm_nodes.lock().get(&pool.name).cloned().unwrap_or_default();
+        Some(warm(w, &pool.name, &nodes))
+    }
+
+    /// The `k8s` pools' executor pods there are. A warm pool's pods on a node are remembered, the
+    /// pool's next pods drawn there (W24-R14).
     pub async fn executor_pods(&self) -> anyhow::Result<Vec<ExecutorPod>> {
         let list = self.api.list_pods(EXECUTOR_PODS).await?;
+        {
+            let mut nodes = self.warm_nodes.lock();
+            for p in &list {
+                if let (Some(pool), Some(node)) = (p.metadata.annotations.as_ref().and_then(|a| a.get(WARM_ANNOTATION)), p.spec.as_ref().and_then(|s| s.node_name.as_deref())) {
+                    remember(&mut nodes, pool, node);
+                }
+            }
+        }
         Ok(list
             .into_iter()
             .filter_map(|p| {
@@ -528,6 +558,81 @@ fn pod_docker(d: &kiln_ci::sched::pools::PodDocker) -> [Container; 2] {
     [cli, engine]
 }
 
+/// Where a pod's runner keeps its warm workspaces (W24-R11): `<work>/warm`.
+const POD_WARM_DIR: &str = "/work/warm";
+/// A warm pool's pod's annotation: its pool, whose nodes are remembered (W24-R14).
+const WARM_ANNOTATION: &str = "kiln.dev/warm";
+/// How many of the nodes a warm pool's pods ran on its next pods are drawn to.
+const WARM_NODES: usize = 4;
+
+/// What a pod of a pool with `warm` gets (docs/ci.md W24-R14): the folder `<root>/<pool>` on its
+/// node (a `hostPath`, made when it's missing), at `/work/warm`, where its runner keeps its lanes'
+/// warm workspaces; a node carrying the pool's `node_label`, when it names one; and a pull toward
+/// the nodes the pool's pods ran on last (`nodes`, newest first), whose folders hold their lanes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Warm {
+    pub pool: String,
+    pub volume: Volume,
+    pub required: Option<NodeSelectorTerm>,
+    pub preferred: Vec<PreferredSchedulingTerm>,
+}
+
+pub fn warm(w: &kiln_ci::sched::pools::PodWarm, pool: &str, nodes: &[String]) -> Warm {
+    // A pool's name is letters, digits, `-`, `_` and `.`; one of dots alone isn't a folder's.
+    let folder = if pool.chars().all(|c| c == '.') { pool.replace('.', "_") } else { pool.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect() };
+    let path = format!("{}/{folder}", w.root().trim_end_matches('/'));
+    let volume = Volume { name: "warm".into(), host_path: Some(HostPathVolumeSource { path, type_: Some("DirectoryOrCreate".into()) }), ..Default::default() };
+    let required = w.node_label().map(|(key, value)| NodeSelectorTerm {
+        match_expressions: Some(vec![NodeSelectorRequirement { key, operator: if value.is_some() { "In" } else { "Exists" }.into(), values: value.map(|v| vec![v]) }]),
+        ..Default::default()
+    });
+    let preferred = nodes
+        .iter()
+        .take(WARM_NODES)
+        .zip([100, 80, 60, 40])
+        .map(|(node, weight)| PreferredSchedulingTerm {
+            weight,
+            preference: NodeSelectorTerm { match_fields: Some(vec![NodeSelectorRequirement { key: "metadata.name".into(), operator: "In".into(), values: Some(vec![node.clone()]) }]), ..Default::default() },
+        })
+        .collect();
+    Warm { pool: pool.to_owned(), volume, required, preferred }
+}
+
+/// Puts `w` in an executor's `pod`: its volume, mounted at `/work/warm` in the job container and in
+/// a Docker sidecar's engine (what a step bind-mounts from a warm workspace is there too); its node
+/// terms (the label's joins each required term the pod has); its annotation.
+pub fn apply_warm(pod: &mut Pod, w: &Warm) {
+    pod.metadata.annotations.get_or_insert_with(BTreeMap::new).insert(WARM_ANNOTATION.to_owned(), w.pool.clone());
+    let Some(spec) = pod.spec.as_mut() else { return };
+    spec.volumes.get_or_insert_with(Vec::new).push(w.volume.clone());
+    for c in spec.containers.iter_mut().chain(spec.init_containers.iter_mut().flatten()).filter(|c| c.name == "job" || c.name == "docker") {
+        c.volume_mounts.get_or_insert_with(Vec::new).push(mount(&w.volume.name, POD_WARM_DIR));
+    }
+    if w.required.is_none() && w.preferred.is_empty() {
+        return;
+    }
+    let nodes = spec.affinity.get_or_insert_with(Affinity::default).node_affinity.get_or_insert_with(NodeAffinity::default);
+    if let Some(term) = &w.required {
+        let selector = nodes.required_during_scheduling_ignored_during_execution.get_or_insert_with(|| NodeSelector { node_selector_terms: Vec::new() });
+        if selector.node_selector_terms.is_empty() {
+            selector.node_selector_terms.push(term.clone());
+        } else {
+            for t in &mut selector.node_selector_terms {
+                t.match_expressions.get_or_insert_with(Vec::new).extend(term.match_expressions.iter().flatten().cloned());
+            }
+        }
+    }
+    nodes.preferred_during_scheduling_ignored_during_execution.get_or_insert_with(Vec::new).extend(w.preferred.iter().cloned());
+}
+
+/// Remembers that a pod of warm pool `pool` ran on `node`: its nodes, newest first, the most kept.
+fn remember(nodes: &mut HashMap<String, Vec<String>>, pool: &str, node: &str) {
+    let list = nodes.entry(pool.to_owned()).or_default();
+    list.retain(|n| n != node);
+    list.insert(0, node.to_owned());
+    list.truncate(WARM_NODES);
+}
+
 fn env_var(k: &str, v: &str) -> EnvVar {
     EnvVar { name: k.to_owned(), value: Some(v.to_owned()), ..Default::default() }
 }
@@ -544,7 +649,8 @@ fn empty_dir(name: &str) -> Volume {
 mod tests {
     use super::*;
     use crate::ci::pools::{LegPod, kiln_pod};
-    use kiln_ci::sched::pools::PoolSpec;
+    use kiln_ci::sched::pools::{PodWarm, PoolSpec};
+    use serde_json::{Value, json};
 
     fn cfg() -> KCfg {
         KCfg { cache_pvc: Some("kiln-cache".into()), priority_class: Some("kiln-jobs".into()), ..KCfg::default() }
@@ -727,5 +833,134 @@ mod tests {
         assert_eq!(at(&shape(&made), "/image"), "postgres:17");
         assert_eq!(at(&shape(&made), "/resources/requests/memory"), "8Gi");
         assert!(env(&made).iter().any(|e| e == "KILN_POD_CONTAINERS"));
+    }
+
+    /// An executor's pod as `launch_executor` makes one with a Docker sidecar: the job container and
+    /// the engine mount the work folder.
+    fn executor() -> Pod {
+        let container = |name: &str| Container { name: name.into(), volume_mounts: Some(vec![mount("work", "/work")]), ..Default::default() };
+        Pod {
+            metadata: ObjectMeta { name: Some("kiln-x-pool-rust-1".into()), annotations: Some(BTreeMap::from([(EXECUTOR_ANNOTATION.to_owned(), "pool-rust-1".to_owned())])), ..Default::default() },
+            spec: Some(PodSpec {
+                init_containers: Some(vec![Container { name: "kiln-bin".into(), volume_mounts: Some(vec![mount("kiln-bin", "/kiln-bin")]), ..Default::default() }, container("docker")]),
+                containers: vec![container("job")],
+                volumes: Some(vec![empty_dir("kiln-bin"), empty_dir("work")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn mounts(pod: &Value, at: &str) -> Vec<(String, String)> {
+        let containers = pod.pointer("/spec/containers").and_then(Value::as_array).into_iter().flatten().chain(pod.pointer("/spec/initContainers").and_then(Value::as_array).into_iter().flatten());
+        containers
+            .filter_map(|c| {
+                let name = c.get("name").and_then(Value::as_str)?;
+                let m = c.get("volumeMounts").and_then(Value::as_array)?.iter().find(|m| m.get("mountPath").and_then(Value::as_str) == Some(at))?;
+                Some((name.to_owned(), m.get("name").and_then(Value::as_str).unwrap_or_default().to_owned()))
+            })
+            .collect()
+    }
+
+    /// W24-R14: a warm pool's pod keeps its runner's warm workspaces in a folder of the pool's on its
+    /// node, `/work/warm` in the job container and the Docker engine both; goes only to a node with
+    /// the pool's label; is drawn to the nodes the pool's pods ran on last, the newest most; and is
+    /// marked, so its node is remembered.
+    #[test]
+    fn w24_r14_a_warm_pools_pod_keeps_its_workspaces_on_its_node() -> anyhow::Result<()> {
+        let w = warm(&PodWarm { root: Some("/mnt/nvme/kiln/".into()), node_label: Some("kiln.dev/warm=true".into()) }, "rust", &["n2".into(), "n1".into()]);
+        let mut pod = executor();
+        apply_warm(&mut pod, &w);
+        let v = serde_json::to_value(&pod)?;
+        assert_eq!(v.pointer("/spec/volumes/2"), Some(&json!({ "name": "warm", "hostPath": { "path": "/mnt/nvme/kiln/rust", "type": "DirectoryOrCreate" } })), "{v}");
+        assert_eq!(mounts(&v, "/work/warm"), [("job".to_owned(), "warm".to_owned()), ("docker".to_owned(), "warm".to_owned())], "{v}");
+        assert_eq!(mounts(&v, "/kiln-bin"), [("kiln-bin".to_owned(), "kiln-bin".to_owned())], "the binary's copy keeps none: {v}");
+        let affinity = v.pointer("/spec/affinity/nodeAffinity").cloned().unwrap_or_default();
+        assert_eq!(
+            affinity.pointer("/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"),
+            Some(&json!([{ "matchExpressions": [{ "key": "kiln.dev/warm", "operator": "In", "values": ["true"] }] }])),
+            "{affinity}"
+        );
+        assert_eq!(
+            affinity.pointer("/preferredDuringSchedulingIgnoredDuringExecution"),
+            Some(&json!([
+                { "weight": 100, "preference": { "matchFields": [{ "key": "metadata.name", "operator": "In", "values": ["n2"] }] } },
+                { "weight": 80, "preference": { "matchFields": [{ "key": "metadata.name", "operator": "In", "values": ["n1"] }] } },
+            ])),
+            "{affinity}"
+        );
+        assert_eq!(v.pointer("/metadata/annotations/kiln.dev~1warm"), Some(&json!("rust")));
+        assert_eq!(v.pointer("/metadata/annotations/kiln.dev~1executor"), Some(&json!("pool-rust-1")), "its own annotations stay");
+        Ok(())
+    }
+
+    /// W24-R14: with no label and no nodes yet, a warm pool's pod gets its folder and no node terms;
+    /// a label alone is a key that must be there; a label's requirement joins a required term the
+    /// pod has; a pool's name of dots is no folder's.
+    #[test]
+    fn w24_r14_a_warm_pods_node_terms_only_as_the_pool_says() -> anyhow::Result<()> {
+        let mut pod = executor();
+        apply_warm(&mut pod, &warm(&PodWarm::default(), "pods", &[]));
+        let v = serde_json::to_value(&pod)?;
+        assert_eq!(v.pointer("/spec/volumes/2/hostPath/path"), Some(&json!("/var/lib/kiln/warm/pods")));
+        assert!(v.pointer("/spec/affinity").is_none(), "{v}");
+        let label = warm(&PodWarm { node_label: Some("nvme".into()), ..PodWarm::default() }, "pods", &[]);
+        assert_eq!(serde_json::to_value(&label.required)?, json!({ "matchExpressions": [{ "key": "nvme", "operator": "Exists" }] }));
+        let mut held = executor();
+        if let Some(spec) = held.spec.as_mut() {
+            let zone = NodeSelectorTerm { match_expressions: Some(vec![NodeSelectorRequirement { key: "zone".into(), operator: "In".into(), values: Some(vec!["a".into()]) }]), ..Default::default() };
+            spec.affinity = Some(Affinity { node_affinity: Some(NodeAffinity { required_during_scheduling_ignored_during_execution: Some(NodeSelector { node_selector_terms: vec![zone] }), ..Default::default() }), ..Default::default() });
+        }
+        apply_warm(&mut held, &label);
+        let v = serde_json::to_value(&held)?;
+        assert_eq!(
+            v.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"),
+            Some(&json!([{ "matchExpressions": [{ "key": "zone", "operator": "In", "values": ["a"] }, { "key": "nvme", "operator": "Exists" }] }])),
+            "{v}"
+        );
+        assert_eq!(warm(&PodWarm::default(), "..", &[]).volume.host_path.map(|h| h.path).as_deref(), Some("/var/lib/kiln/warm/__"));
+        Ok(())
+    }
+
+    /// W24-R14 on the pod [`pool_pod`] makes: a warm pool's pod with a Docker engine mounts its
+    /// node's folder at `/work/warm` in the job container and in the engine, beside the pool's own
+    /// volumes, and is drawn to the node its pods ran on last.
+    #[test]
+    fn w24_r14_a_warm_pools_pod_from_pool_pod() -> anyhow::Result<()> {
+        let pool = PoolSpec {
+            name: "rust".into(),
+            executor: "k8s".into(),
+            labels: vec!["rust".into()],
+            docker: Some(kiln_ci::sched::pools::PodDocker::default()),
+            warm: Some(PodWarm::default()),
+            ..PoolSpec::default()
+        };
+        let mut pod = pool_pod(&cfg(), "x1", "kiln-x-1", "t", ("http://kiln:7070", "kiln:7071"), &pool, None);
+        let preferred = |v: &Value| v.pointer("/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution").and_then(Value::as_array).cloned().unwrap_or_default();
+        let before = preferred(&serde_json::to_value(&pod)?);
+        apply_warm(&mut pod, &warm(&PodWarm::default(), &pool.name, &["n1".into()]));
+        let v = serde_json::to_value(&pod)?;
+        assert_eq!(mounts(&v, "/work/warm"), [("job".to_owned(), "warm".to_owned()), ("docker".to_owned(), "warm".to_owned())], "{v}");
+        let volumes = v.pointer("/spec/volumes").and_then(Value::as_array).cloned().unwrap_or_default();
+        let named = |n: &str| volumes.iter().find(|x| x.get("name").and_then(Value::as_str) == Some(n)).cloned();
+        assert_eq!(named("warm"), Some(json!({ "name": "warm", "hostPath": { "path": "/var/lib/kiln/warm/rust", "type": "DirectoryOrCreate" } })), "{v}");
+        assert!(named("work").is_some() && named("cache").is_some(), "the pool's own volumes stay: {v}");
+        let after = preferred(&v);
+        assert!(before.iter().all(|t| after.contains(t)), "the pod's own node preferences stay: {v}");
+        assert!(after.iter().any(|t| t.pointer("/preference/matchFields/0/values") == Some(&json!(["n1"]))), "drawn to the node it ran on last: {v}");
+        Ok(())
+    }
+
+    /// W24-R14: a warm pool remembers the nodes its pods ran on, newest first, each once, the four
+    /// newest kept.
+    #[test]
+    fn w24_r14_a_warm_pool_remembers_its_nodes_newest_first() {
+        let mut nodes = HashMap::new();
+        for n in ["a", "b", "c", "a", "d", "e"] {
+            remember(&mut nodes, "rust", n);
+        }
+        remember(&mut nodes, "go", "z");
+        assert_eq!(nodes.get("rust").cloned().unwrap_or_default(), ["e", "d", "a", "c"]);
+        assert_eq!(nodes.get("go").cloned().unwrap_or_default(), ["z"]);
     }
 }

@@ -2002,7 +2002,7 @@ impl Dispatch {
         if let Some((hash, max_age)) = &reuse {
             let (repo, trusted) = self.runs.get(run).map(|r| (r.repo.name.clone(), super::reuse::work_trusted(r.trusted, &r.event.name))).unwrap_or_default();
             match super::reuse::lookup(&self.hub, &repo, trusted, hash, *max_age).await {
-                Ok(Some((source, report))) => return Box::pin(self.take_over(run, spec, &source, hash, report_from_json(&report))).await,
+                Ok(Some((source, report, class))) => return Box::pin(self.take_over(run, spec, &source, hash, report_from_json(&report), class)).await,
                 Ok(None) => {}
                 Err(e) => tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "reuse couldn't be looked up; the leg runs"),
             }
@@ -2094,9 +2094,9 @@ impl Dispatch {
 
     /// A leg that takes `source`'s result over (W08-R10): its copy in this run, and its report to
     /// the plan.
-    async fn take_over(&mut self, run: &str, spec: LegSpec, source: &str, hash: &str, report: LegReport) -> anyhow::Result<()> {
+    async fn take_over(&mut self, run: &str, spec: LegSpec, source: &str, hash: &str, report: LegReport, class: Option<String>) -> anyhow::Result<()> {
         let id = crate::util::new_id();
-        super::reuse::take_over(&self.hub, run, source, &id, hash).await?;
+        super::reuse::take_over(&self.hub, run, source, &id, hash, class).await?;
         self.hub.emit_job(&id).await;
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id);

@@ -257,6 +257,9 @@ pub struct Metrics {
     pub work_saved_seconds: Counter,
     /// W24-R31: bytes the reaper freed, by store and reason.
     pub work_reaped_bytes: CounterVec,
+    /// The work ledger's equivalence classes (W24-R30): merges, splits and hits through a class,
+    /// by layer (`leg`, `step`, `test`, `action`).
+    pub work_classes: CounterVec,
 }
 
 pub fn global() -> &'static Metrics {
@@ -294,6 +297,7 @@ pub fn global() -> &'static Metrics {
         work_lookups: CounterVec::new(&["layer", "outcome"]),
         work_saved_seconds: Counter::default(),
         work_reaped_bytes: CounterVec::new(&["store", "reason"]),
+        work_classes: CounterVec::new(&["layer", "event"]),
     })
 }
 
@@ -1088,6 +1092,8 @@ pub fn render() -> String {
     scalar!("kiln_ci_rollup_lag_seconds", "gauge", "How far behind the CI insights rollups are.", m.ci_rollup_lag.get());
     help(&mut o, "kiln_work_lookups_total", "counter", "Lookups of recorded work (W24), by layer (leg, ...) and outcome (hit, miss, error).");
     m.work_lookups.render(&mut o, "kiln_work_lookups_total");
+    help(&mut o, "kiln_work_classes_total", "counter", "The work ledger's equivalence classes (W24-R30), by layer and event (merge, split, hit).");
+    m.work_classes.render(&mut o, "kiln_work_classes_total");
     scalar!("kiln_work_saved_seconds_total", "counter", "Seconds of work saved: what the results reuse took over had run.", m.work_saved_seconds.get());
     help(&mut o, "kiln_work_reaped_bytes_total", "counter", "Bytes the reaper freed (W24-R31), by store (warm, ...) and reason (max_age, target, floor).");
     m.work_reaped_bytes.render(&mut o, "kiln_work_reaped_bytes_total");

@@ -901,6 +901,7 @@ a.ms-why:hover {
 
 /* A machine offline a while, with agents on it: they can go on elsewhere. */
 .ms-recover {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -912,8 +913,11 @@ a.ms-why:hover {
   background: #1b1915;
   color: #c9c3b6;
   font-size: 13px;
+  /* A sideways drag is the card's (to put it away), not the page's. */
+  touch-action: pan-y;
 }
 .ms-recover > span:first-child {
+  padding-right: 28px;
   flex: 1 1 320px;
   min-width: 0;
 }
@@ -925,6 +929,12 @@ a.ms-why:hover {
 }
 .ms-recover-none {
   color: #97999f;
+}
+/* × puts it away (a swipe does too, on a touch screen). */
+.ms-recover-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
 }
 
 /* ---------------------------------------------------------------- notifications, and a phone's page */
@@ -1177,57 +1187,11 @@ html[data-motion="paused"] .ms-pick::before {
     transform: translateY(2px);
   }
 }
-/* In the box's top slot (the To line's, when messaging): the agent, its machine, its folder, how many, in the folder line's voice. */
-.mc-slot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  row-gap: 2px;
-  min-height: 34px;
-  padding: 8px 12px 0;
-}
-.mc-slot .ip-line {
-  flex: none;
-  align-items: center;
-  width: auto;
-  min-height: 26px;
-  padding: 0;
-}
-/* The folder line is one of the slot's parts; what it opens takes the slot's whole width, under it. */
-.mc-slot > .ip {
-  display: contents;
-}
-.mc-slot .ip-panel,
-.mc-slot .mc-slot-panel {
-  flex-basis: 100%;
-  order: 10;
-}
-.mc-slot .rs-panel.mc-slot-panel {
-  max-width: none;
-  padding: 2px 0 0;
-}
-.mc-slot .mc-part[aria-expanded="true"] .ip-seg[data-last] {
-  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2) 0 100% / 100% 1px no-repeat;
-}
-.mc-dot {
-  padding: 0 10px;
-  color: #5d6068;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 16px;
-}
-.mc-looking {
-  color: #6d7078;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
 .ms-to .mc-clear {
   margin-left: auto;
   font-size: 12px;
 }
-/* Under the box: More options and past sessions, each a dropdown that opens in place below. */
+/* Under the box: where it starts (and the rest of the options) and past sessions, each a dropdown that opens in place below. */
 .mc-under {
   display: flex;
   flex-wrap: wrap;
@@ -1278,12 +1242,11 @@ html[data-motion="paused"] .ms-pick::before {
 .mc-from .ms-link {
   font-size: 12.5px;
 }
-/* More options, open: one quiet row each, two to a line where there's room. */
+/* More options, open: one quiet row each. */
 .mc-opts {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: 48px;
-  max-width: 960px;
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 640px;
   margin: 2px 0 14px;
   padding: 0 4px;
   animation: rs-fade 0.12s ease-out;
@@ -1339,6 +1302,41 @@ html[data-motion="paused"] .ms-pick::before {
   color: #5d6068;
   cursor: default;
 }
+/* What a row opens, under it across the options. */
+.mc-opt-panel {
+  grid-column: 1 / -1;
+  max-width: none;
+  padding: 2px 0 14px;
+}
+/* The folder row: the folder line itself, its own label said by the row's key. */
+.mc-opt-folder .mc-opt-val {
+  display: block;
+  padding: 10px 0;
+}
+.mc-opt-folder .ip-line > .ip-eyebrow {
+  display: none;
+}
+.mc-none {
+  color: #6d7078;
+}
+button.mc-pick {
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+button.mc-pick > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+button.mc-pick[aria-expanded="true"] .mc-chev {
+  transform: rotate(180deg);
+}
 .mc-pick {
   position: relative;
   display: inline-flex;
@@ -1385,25 +1383,9 @@ html[data-motion="paused"] .ms-pick::before {
   color: #a8c9bc;
 }
 @container (max-width: 520px) {
-  .mc-opts {
-    grid-template-columns: minmax(0, 1fr);
-  }
   .mc-under {
     gap: 0 18px;
   }
-}
-/* Queue · Steer · Now when starting an agent: shown as messaging shows them, not in play. */
-.mc-modes {
-  display: contents;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  min-width: 0;
-}
-.mc-modes button,
-.mc-modes .cp-mode-pick {
-  opacity: 0.45;
-  cursor: default;
 }
 /* The field is the agent composer's own height from the start, so nothing moves as it's used. */
 .mc .hx-compose-input {
@@ -1415,9 +1397,6 @@ html[data-motion="paused"] .ms-pick::before {
 }
 :root[data-opening] .mc .hx-compose-box {
   view-transition-name: kiln-composer;
-}
-:root[data-opening] .mc-slot {
-  view-transition-name: kiln-where;
 }
 ::view-transition-group(*) {
   animation-duration: 0.22s;

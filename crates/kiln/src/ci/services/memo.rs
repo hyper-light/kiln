@@ -331,14 +331,14 @@ async fn wait(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fai
 /// What stands for a step's unit: the newest success in the scope, within `max_age`, its leg still
 /// kept (a pruned run takes its logs with it), and its files still kept: its tree's `work.object`
 /// not yet due (each file in it is kept at least as long, [`keep_object`]) and in the store.
-async fn found(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, max_age: Option<u64>) -> anyhow::Result<Option<(Key, Recorded, i64)>> {
+async fn found(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, max_age: Option<u64>) -> anyhow::Result<Option<(Key, Recorded, i64, Option<String>)>> {
     let now = crate::util::now_unix();
     let since = now.saturating_sub(i64::try_from(max_age.unwrap_or(memo::MAX_AGE)).unwrap_or(i64::MAX));
     let (scope, unit) = (leg.scope.clone(), unit.clone());
     hub.store
         .call(move |c| {
             let same = |p: &PathSet| p.clone();
-            let Some(work::Hit { key, recorded: rec, .. }) = work::lookup(c, &scope, &unit, &same)? else { return Ok(None) };
+            let Some(work::Hit { key, recorded: rec, class, .. }) = work::lookup(c, &scope, &unit, &same)? else { return Ok(None) };
             if rec.outcome != "success" || rec.provenance.finished_at < since {
                 return Ok(None);
             }
@@ -351,13 +351,19 @@ async fn found(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, max_age: Option<u64>) -
                 }
             }
             let number: Option<i64> = c.query_row("SELECT r.number FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1", [&rec.provenance.leg], |r| r.get(0)).optional()?;
-            Ok(number.map(|n| (key, rec, n)))
+            Ok(number.map(|n| (key, rec, n, class.map(|b| b.class.rep()))))
         })
         .await
 }
 
-/// A hit: the leg's step takes its source's log over, and is told what it left and where from.
-async fn hit(hub: &Arc<Hub>, leg: &LegOf, step: u32, (key, rec, number): (Key, Recorded, i64)) -> Result<Response, Fail> {
+/// A hit: the leg's step takes its source's log over, and is told what it left and where from,
+/// and through which class when equivalence found it (W24-R30, R28).
+async fn hit(hub: &Arc<Hub>, leg: &LegOf, step: u32, (key, rec, number, class): (Key, Recorded, i64, Option<String>)) -> Result<Response, Fail> {
+    // A hit through equivalence says so, and counts by layer (W24-R30, R28).
+    crate::metrics::global().work_lookups.inc(&["step", if class.is_some() { "class" } else { "hit" }]);
+    if class.is_some() {
+        crate::metrics::global().work_classes.inc(&["step", "hit"]);
+    }
     take_over(hub, leg, step, &rec).await.map_err(internal)?;
     let p = &rec.provenance;
     let workflow: Option<String> = {
@@ -369,6 +375,7 @@ async fn hit(hub: &Arc<Hub>, leg: &LegOf, step: u32, (key, rec, number): (Key, R
         &json!({
             "key": key.hex(),
             "outputs": rec.outputs,
+            "class": class,
             "source": { "run": p.run, "number": number, "workflow": workflow, "leg": p.leg, "step": p.step, "attempt": p.attempt, "runner": p.runner, "commit": p.commit, "finished_at": p.finished_at, "ms": p.ms },
         }),
     ))
