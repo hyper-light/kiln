@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct RunnerFacts {
     /// `linux`, `macos`, `windows`, … (lower case, Rust's `std::env::consts::OS` spelling).
@@ -47,6 +48,7 @@ pub struct RunnerFacts {
 /// The machine as W24's work sees it: its load now (admission, W24-R19). The work volume's free
 /// disk is [`RunnerFacts::disk`]'s.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct WorkFacts {
     /// The share of the last 10 seconds in which all the machine's non-idle tasks were stalled on
@@ -57,6 +59,7 @@ pub struct WorkFacts {
 
 /// Agents' workspaces of their own on a machine: Slates volumes over their folders.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct Workspaces {
     /// Agents here can have them.
@@ -73,6 +76,7 @@ pub struct Workspaces {
 
 /// The kiln a runner runs, and where kiln's source is on its machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct KilnFacts {
     /// The commit it was built from; empty for a local build that knows none.
@@ -87,6 +91,7 @@ pub struct KilnFacts {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct Cpu {
     pub model: Option<String>,
@@ -97,6 +102,7 @@ pub struct Cpu {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct Mem {
     pub total: u64,
@@ -104,6 +110,7 @@ pub struct Mem {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct Disk {
     pub total: u64,
@@ -111,6 +118,7 @@ pub struct Disk {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct Gpu {
     pub vendor: String,
@@ -120,6 +128,7 @@ pub struct Gpu {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct Virt {
     /// `/dev/kvm` is usable by the runner.
@@ -130,6 +139,8 @@ pub struct Virt {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(rename = "ExecutorFacts"))]
 #[serde(default)]
 pub struct Executor {
     pub version: Option<String>,
@@ -138,6 +149,7 @@ pub struct Executor {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct Net {
     /// The internet is reachable directly.

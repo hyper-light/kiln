@@ -393,6 +393,12 @@ pub struct Scheduler {
     pub mode: String,
     pub overcommit: Overcommit,
     pub default_request: kiln_ci::sched::pools::ResourceSpec,
+    /// `event` (W05-R09's defaults by event) or `intent` (W28-R64): gate 90, someone waiting 80,
+    /// trunk 60, work in progress 40, a job's own `priority:` still first.
+    pub priority: String,
+    /// What fair share is between, outermost first (W05-R10, W28-R66): `repo`, then `actor` (the
+    /// agent or person a commit is attributed to), then `lane` (a workflow on a branch).
+    pub fair_by: Vec<String>,
     /// `[ci.scheduler.admission]` (docs/ci.md W24-R19): off when unset.
     pub admission: Option<Admission>,
 }
@@ -402,12 +408,43 @@ impl Scheduler {
     pub fn resources(&self) -> bool {
         self.mode.trim().eq_ignore_ascii_case("resources")
     }
+
+    /// Priority by intent (W28-R64).
+    pub fn by_intent(&self) -> bool {
+        self.priority.trim().eq_ignore_ascii_case("intent")
+    }
+
+    /// `fair_by` as the scheduler takes it: always the repository first; unknown names left out.
+    pub fn fair_levels(&self) -> Vec<kiln_ci::sched::FairBy> {
+        use kiln_ci::sched::FairBy;
+        let mut out = vec![FairBy::Repo];
+        for l in &self.fair_by {
+            let level = match l.trim().to_ascii_lowercase().as_str() {
+                "actor" => FairBy::Actor,
+                "lane" => FairBy::Lane,
+                _ => continue,
+            };
+            if !out.contains(&level) {
+                out.push(level);
+            }
+        }
+        out
+    }
 }
 
 impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
-        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost, mode: "slots".into(), overcommit: Overcommit::default(), default_request: Default::default(), admission: None }
+        Scheduler {
+            aging_per_minute: d.aging_per_minute,
+            default_cost_seconds: d.default_cost,
+            mode: "slots".into(),
+            overcommit: Overcommit::default(),
+            default_request: Default::default(),
+            priority: "event".into(),
+            fair_by: vec!["repo".into()],
+            admission: None,
+        }
     }
 }
 
@@ -438,7 +475,7 @@ impl Default for Admission {
 
 impl Admission {
     /// As the scheduler takes it; why not when a value doesn't read.
-    pub fn admission(&self) -> Result<kiln_ci::sched::admit::Admission, String> {
+    pub fn admission(&self) -> Result<kiln_ci::sched::load::Admission, String> {
         if !self.io_full.is_finite() || !(0.0..=100.0).contains(&self.io_full) {
             return Err(format!("`[ci.scheduler.admission] io_full` is a percentage from 0 to 100, not {}", self.io_full));
         }
@@ -446,7 +483,7 @@ impl Admission {
         if let Some(h) = self.heavy_after.filter(|h| !h.is_finite() || *h < 0.0) {
             return Err(format!("`[ci.scheduler.admission] heavy_after` is seconds, not {h}"));
         }
-        Ok(kiln_ci::sched::admit::Admission { io_full: self.io_full, disk_free: disk_free as u64, heavy_after: self.heavy_after })
+        Ok(kiln_ci::sched::load::Admission { io_full: self.io_full, disk_free: disk_free as u64, heavy_after: self.heavy_after })
     }
 }
 
@@ -721,15 +758,15 @@ mod tests {
     fn w24_r19_admission_config() -> anyhow::Result<()> {
         let s: Scheduler = toml::from_str("[admission]\nio_full = 35\ndisk_free = \"50Gi\"\nheavy_after = 900\n")?;
         let a = s.admission.as_ref().map(Admission::admission).transpose().map_err(|e| anyhow::anyhow!(e))?;
-        anyhow::ensure!(a == Some(kiln_ci::sched::admit::Admission { io_full: 35.0, disk_free: 50 << 30, heavy_after: Some(900.0) }), "{a:?}");
+        anyhow::ensure!(a == Some(kiln_ci::sched::load::Admission { io_full: 35.0, disk_free: 50 << 30, heavy_after: Some(900.0) }), "{a:?}");
         anyhow::ensure!(Scheduler::default().admission.is_none(), "off until set");
         let defaults: Scheduler = toml::from_str("[admission]\n")?;
-        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::admit::Admission { io_full: 40.0, disk_free: 20 << 30, heavy_after: None })));
+        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::load::Admission { io_full: 40.0, disk_free: 20 << 30, heavy_after: None })));
         for (bad, says) in [(Admission { io_full: 140.0, ..Admission::default() }, "io_full"), (Admission { disk_free: "lots".into(), ..Admission::default() }, "disk_free"), (Admission { heavy_after: Some(-1.0), ..Admission::default() }, "heavy_after")] {
             anyhow::ensure!(bad.admission().is_err_and(|e| e.contains(says)), "{bad:?}");
         }
         anyhow::ensure!(toml::from_str::<Scheduler>("[admission]\nio = 3\n").is_err(), "an unknown key is an error");
-        use kiln_ci::sched::admit;
+        use kiln_ci::sched::load as admit;
         use kiln_seams::sandbox;
         anyhow::ensure!((admit::WEIGHT_MIN, admit::WEIGHT_MAX, admit::WEIGHT_EVEN) == (sandbox::WEIGHT_MIN, sandbox::WEIGHT_MAX, sandbox::Limits::default().io_weight));
         Ok(())

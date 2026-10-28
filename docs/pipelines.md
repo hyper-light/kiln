@@ -270,6 +270,14 @@ again, then runs the run's failed jobs again, or the waiting job goes there once
 agent for up to three hours, and only while kiln runs: a restart forgets the fix (the agent goes on,
 and Retry runs the job again).
 
+A job that finished (failed, say, on a machine that's the problem) runs again from its panel on
+the run page, or `POST /api/ci/legs/:id/retry` (MCP's `ci.legs.retry`): on any runner that can run
+it, on any but the one it ran on, or on one you name of those its labels allow. It runs in its
+run, as its next attempt, while the run's other jobs go on; the jobs that need it wait for it
+again. Its log keeps the attempt before, a `[kiln]` line where the next begins. A job that ran in a
+pod made for it (`[k8s]`) gets a new pod each time, so only "anywhere" applies to it
+([ci.md](ci.md) W05-R28).
+
 If `isolation` is absent, a job runs as it does in v1: in a pod on `[k8s]`, and on the host
 everywhere else (where `image` is ignored, as before). Containers and microVMs are always asked
 for explicitly. Runners advertise `docker` / `microvm` themselves when they can run them.

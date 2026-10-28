@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, EmptyState, Facts, Meter, PageIntro, SelectField } from "@/components/ui/misc";
+import { Confirm, EmptyState, Facts, FilterBar, Meter, PageIntro, SelectField } from "@/components/ui/misc";
 import { WatchedBy } from "@/views/attach/here";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
@@ -26,6 +26,7 @@ import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
 import { BatteryLine, LowBattery } from "./battery";
 import { lostLine } from "./runner-lost";
+import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-limit";
 import { ImagesPanel, PoolsPanel } from "./runners-pools";
 import { useAuth } from "@/lib/auth";
 
@@ -335,10 +336,9 @@ function RunnersTools({
   onView: (v: "table" | "cards") => void;
 }) {
   return (
-    <div className="runners-tools">
-      <FacetBox className="runners-filter" label="Filter runners" placeholder="Filter by name, state, label, platform…" query={q} onQuery={onQ} facets={facets} chosen={chosen} onChosen={onChosen} />
+    <FilterBar className="runners-tools">
+      <FacetBox label="Filter runners" placeholder="Filter by name, state, label, platform…" query={q} onQuery={onQ} facets={facets} chosen={chosen} onChosen={onChosen} />
       <SelectField
-        className="runners-layout"
         label="Layout"
         hideLabel
         value={view}
@@ -348,7 +348,7 @@ function RunnersTools({
           { value: "cards", label: "Cards" },
         ]}
       />
-    </div>
+    </FilterBar>
   );
 }
 
@@ -559,6 +559,12 @@ function AgentDetails({
         />
       </div>
 
+      <div className="mt-8">
+        <Loadable label={`${agent.name}'s agent sessions`} fallback={<Hold height={142} />}>
+          <AgentLimit key={agent.name} runner={agent.name} />
+        </Loadable>
+      </div>
+
       {agent.facts && (
         <div className="mt-8">
           <div className="label mb-2">Facts</div>
@@ -595,6 +601,92 @@ function AgentDetails({
         <div className="label mb-3">Last hour · 5 s resolution</div>
         {samples.length < 2 ? <p className="empty-line">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={2} />}
       </div>
+    </section>
+  );
+}
+
+/**
+ * The most agents a runner has at work at once (docs/agents.md, "How many agents a machine runs"):
+ * set here, it wins over the runner's config (`[agent] max_agent_sessions`), which wins over kiln's
+ * default. Only agents at work count. Lowered under what's at work, those go on; a new one is
+ * refused until fewer are at work.
+ */
+function AgentLimit({ runner }: { runner: string }) {
+  const view = useSuspenseResource(`agent-limit/${runner}`, (s) => api.agentLimit(runner, s), { on: ["agent_limit", "agent", "harness", "harness_closed"], apply: withEvent });
+  const v = view.data;
+  const id = React.useId();
+  const [draft, setDraft] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  const [msg, setMsg] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  // Until something is typed, the field follows what holds (another tab, another admin, its config).
+  const shown = draft ?? String(v.max_sessions ?? v.held?.max_sessions ?? v.default);
+  const save = async (max: number | null) => {
+    setSaving(true);
+    try {
+      const next = await api.setAgentLimit(runner, max);
+      view.setData(() => next);
+      setDraft(null);
+      setMsg({ tone: "ok", text: max === null ? `Nothing set here now: ${runner} holds its config's, or kiln's default.` : `Saved: at most ${max} agents at work at once on ${runner}.` });
+    } catch (e) {
+      setMsg({ tone: "error", text: errorMessage(e) });
+    } finally {
+      setSaving(false);
+    }
+  };
+  const submit = () => {
+    const n = parseLimit(shown, v.max);
+    if (typeof n === "string") setMsg({ tone: "error", text: n });
+    else void save(n);
+  };
+  return (
+    <section className="runner-limit" aria-labelledby={`${id}-head`}>
+      <div className="label mb-2" id={`${id}-head`}>
+        Agent sessions
+      </div>
+      <p className="runner-limit-line">{limitLine(v)}</p>
+      {settable(v) && (
+        <form
+          className="runner-limit-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
+          <label htmlFor={id} className="sr-only">
+            The most agents at work at once on {runner}
+          </label>
+          <div className="field runner-limit-field">
+            <input
+              id={id}
+              type="text"
+              inputMode="numeric"
+              autoComplete="off"
+              value={shown}
+              aria-invalid={msg?.tone === "error" || undefined}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                setMsg(null);
+              }}
+            />
+          </div>
+          <Button type="submit" variant="secondary" size="xs" disabled={saving || draft === null}>
+            {saving ? "Saving…" : "Save"}
+          </Button>
+          {v.max_sessions !== null && (
+            <Button type="button" variant="ghost" size="xs" disabled={saving} onClick={() => void save(null)}>
+              Use its config
+            </Button>
+          )}
+        </form>
+      )}
+      <p className="runner-limit-msg" role="status" data-tone={msg?.tone ?? "quiet"}>
+        {msg?.text ?? (standing(v) || " ")}
+      </p>
+      <p className="field-hint">
+        Only agents at work count: starting, on a turn, or waiting on you in the middle of one. Finished, ready, paused and ended agents don&rsquo;t. At the limit a new agent is refused, and
+        what&rsquo;s sent to one already there waits in its queue until there&rsquo;s room. Set here, it wins over the runner&rsquo;s config (<code>[agent] max_agent_sessions</code>), which wins over
+        kiln&rsquo;s default of {v.default}.
+      </p>
     </section>
   );
 }

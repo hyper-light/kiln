@@ -648,23 +648,9 @@ a.ms-why:hover {
 }
 
 /* ---------------------------------------------------------------- how the list is shown, and messaging it */
-/* The filter field and the sort, side by side, on a phone too: there the sort gives way. */
+/* The filter field and the sort, side by side, on a phone too (a FilterBar). */
 .ms-bar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 220px;
-  gap: 10px;
   margin-bottom: 10px;
-}
-@container (max-width: 760px) {
-  .ms-bar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 180px);
-  }
-}
-@container (max-width: 520px) {
-  .ms-bar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 150px);
-    gap: 8px;
-  }
 }
 
 /* Message the agents: an agent's composer, in the page. */
@@ -782,6 +768,105 @@ a.ms-why:hover {
   color: #a1a4ad;
   font-size: 12.5px;
   cursor: pointer;
+}
+/* What to do with the agents selected (bulk.tsx): their buttons end the head's line (or, narrow, take
+   one of their own); what's asked, More, and how it went each take a line across the head. */
+.ms-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.ms-bulk-more {
+  margin-left: 4px;
+  font-size: 12.5px;
+}
+.ms-bulk-more[aria-expanded="true"] .ms-chev {
+  transform: rotate(90deg);
+}
+.ms-bulk-ask,
+.ms-bulk-row,
+.ms-bulk-said {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+  padding: 2px 0 6px;
+}
+.ms-bulk-row {
+  gap: 8px 22px;
+}
+/* How it went: a long line wraps beside its ×, from the left. */
+.ms-bulk-said {
+  flex-wrap: nowrap;
+}
+.ms-bulk-said .ms-msg-result {
+  min-width: 0;
+  text-align: left;
+}
+.ms-bulk-said svg,
+.ms-bulk-said .hx-icon {
+  flex: none;
+}
+.ms-bulk-reach {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+}
+.ms-bulk-q {
+  min-width: 0;
+  color: #ededee;
+  font-size: 13px;
+}
+.ms-bulk-note {
+  flex: 1 1 100%;
+  margin: 0;
+  color: #8f939e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.ms-bulk-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 32px;
+  color: #c8cad0;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.ms-bulk-check .check {
+  flex: none;
+}
+.ms-bulk-names {
+  color: #8f939e;
+}
+/* Each agent's outcome, under the line: within the head, which a touch screen holds in view, so it scrolls past a few. */
+.ms-bulk-outcomes {
+  flex: 1 1 100%;
+  max-height: min(320px, 40dvh);
+  margin-top: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ms-msg-outcomes > li[data-result="done"] .ms-msg-o-result {
+  color: #a8c9bc;
+}
+@container (max-width: 760px) {
+  .ms-bulk {
+    flex: 1 1 100%;
+    margin-left: 0;
+  }
+}
+@media (pointer: coarse) {
+  .ms-bulk-ask .hx-pick select,
+  .ms-bulk-row .hx-pick select {
+    font-size: 16px;
+  }
 }
 /* A row's name, renamed in place: the field keeps the name's size. */
 .name-field.ms-name-field {

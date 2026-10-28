@@ -60,6 +60,8 @@ pub(crate) const FAIL_MARK: &str = "KILN-UPGRADE-FAIL";
 const CHECK_SELECTOR: &str = "kiln.dev/role=image-check";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "UpdateJobState"))]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Running,
@@ -69,6 +71,8 @@ pub enum JobState {
 
 /// One upgrade, as the UI follows it.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "UpdateJob"))]
 pub struct Job {
     pub id: String,
     /// "runner" or "server".
@@ -86,10 +90,12 @@ pub struct Job {
     pub to_build: Option<String>,
     /// The commit it brings the machine to, when kiln knows it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub commit: Option<String>,
     /// A build's: the machine that builds it, when another than the runner's own
     /// (`crate::fleet`); the runner downloads that build.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub on: Option<String>,
     /// The machine reported running `to_build`.
     pub reached: bool,
@@ -97,6 +103,7 @@ pub struct Job {
     pub error: Option<String>,
     /// Kiln stopped waiting for it: which of its [`Waits`] ran out ("upgrade", "jobs" or "build").
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub timed_out: Option<&'static str>,
     /// Its last log line is a progress line (a terminal's carriage return draws it over): the
     /// next line takes its place.
@@ -473,34 +480,100 @@ pub async fn adopt_into(hub: &Hub, artifacts: &Path, run: &crate::store::Run) ->
     Ok(kept)
 }
 
-/// The binaries in a release run's artifacts, by target, as [`adopt_into`] takes them.
+/// The binaries in a release run's artifacts, by target, as [`adopt_into`] takes them: v1's
+/// tarball, or the zip a leg of the CI engine uploaded ([`leg_artifacts`]).
 fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     use std::io::Read as _;
-    let mut archive = tar::Archive::new(std::fs::File::open(artifacts).with_context(|| format!("open {}", artifacts.display()))?);
+    let open = || std::fs::File::open(artifacts).with_context(|| format!("open {}", artifacts.display()));
+    let mut magic = [0u8; 4];
+    let zipped = open()?.read_exact(&mut magic).is_ok() && &magic == b"PK\x03\x04";
     let mut kept = Vec::new();
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_string_lossy().into_owned();
-        let name = path.rsplit('/').next().unwrap_or(&path);
-        let Some(target) = name.strip_prefix("kiln-").map(|t| t.strip_suffix(".exe").unwrap_or(t)) else { continue };
-        if !known_target(target) || (target == crate::api::TARGET && run.sha.eq_ignore_ascii_case(crate::api::COMMIT)) || entry.size() > MAX_BINARY as u64 {
-            continue;
+    if zipped {
+        let mut zip = zip::ZipArchive::new(std::io::BufReader::new(open()?))?;
+        for i in 0..zip.len() {
+            let entry = zip.by_index(i)?;
+            let (name, size) = (entry.name()?.into_owned(), entry.size());
+            if !entry.is_dir() && !take_binary(&name, size, entry, run, &mut kept)? {
+                break;
+            }
         }
-        let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
-        entry.read_to_end(&mut bytes)?;
-        // An archive cut short (its upload broke off) reads as a shorter file, with no error: never
-        // one runners would upgrade to. Nor what isn't its platform's program.
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != entry.size() {
-            tracing::warn!(target, run = run.number, got = bytes.len(), size = entry.size(), "a release binary cut short in its run's artifacts: not kept");
-            break;
+    } else {
+        let mut archive = tar::Archive::new(open()?);
+        for entry in archive.entries()? {
+            let entry = entry?;
+            let (path, size) = (entry.path()?.to_string_lossy().into_owned(), entry.size());
+            if !take_binary(&path, size, entry, run, &mut kept)? {
+                break;
+            }
         }
-        if !runs_on(target, &bytes) {
-            tracing::warn!(target, run = run.number, "a release binary that isn't its platform's program: not kept");
-            continue;
-        }
-        kept.push((target.to_owned(), bytes));
     }
     Ok(kept)
+}
+
+/// One file of a release run's artifacts, `size` bytes at `path`: kept in `kept` when it's a
+/// platform's binary, read whole, and that platform's program. False when it was cut short, as is
+/// everything after it.
+fn take_binary(path: &str, size: u64, mut from: impl std::io::Read, run: &crate::store::Run, kept: &mut Vec<(String, Vec<u8>)>) -> anyhow::Result<bool> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let Some(target) = name.strip_prefix("kiln-").map(|t| t.strip_suffix(".exe").unwrap_or(t)) else { return Ok(true) };
+    if !known_target(target) || (target == crate::api::TARGET && run.sha.eq_ignore_ascii_case(crate::api::COMMIT)) || size > MAX_BINARY as u64 {
+        return Ok(true);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    from.read_to_end(&mut bytes)?;
+    // An archive cut short (its upload broke off) reads as a shorter file, with no error: never
+    // one runners would upgrade to. Nor what isn't its platform's program.
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size {
+        tracing::warn!(target, run = run.number, got = bytes.len(), size, "a release binary cut short in its run's artifacts: not kept");
+        return Ok(false);
+    }
+    if !runs_on(target, &bytes) {
+        tracing::warn!(target, run = run.number, "a release binary that isn't its platform's program: not kept");
+        return Ok(true);
+    }
+    kept.push((target.to_owned(), bytes));
+    Ok(true)
+}
+
+/// What leg `leg` of a CI engine's run uploaded of its job's `artifacts:` (the artifact
+/// `artifacts-<key>`, docs/ci.md W08-R08), copied out of CI's store to a zip of its own under
+/// `<data>/artifacts` for [`adopt_into`] (the caller removes it); None when it uploaded none.
+pub async fn leg_artifacts(hub: &Hub, leg: &str) -> anyhow::Result<Option<PathBuf>> {
+    use rusqlite::OptionalExtension as _;
+    let Some(job) = hub.store.job(leg.to_owned()).await? else { return Ok(None) };
+    let (l, name) = (leg.to_owned(), kiln_ci::store::v1_artifacts_name(&job.key));
+    let object: Option<String> = hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT object FROM ci_artifacts WHERE leg_id = ?1 AND name = ?2 AND finalized = 1 AND object IS NOT NULL", rusqlite::params![l, name], |r| r.get(0)).optional()?))
+        .await?;
+    let Some(object) = object else { return Ok(None) };
+    let obj = crate::ci::services::cas::object(hub, &object).await?.ok_or_else(|| anyhow::anyhow!("leg {leg}'s artifacts are gone from CI's store"))?;
+    let safe: String = leg.chars().filter(char::is_ascii_alphanumeric).collect();
+    let path = hub.cfg.data("artifacts").join(format!("{safe}.zip"));
+    let (tx, written) = crate::rt::file_sink(&path, obj.size)?;
+    let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size);
+    while let Ok(b) = rx.recv().await {
+        if tx.send(b).await.is_err() {
+            break;
+        }
+    }
+    drop(tx);
+    match written.await {
+        // A piece that couldn't be read ends the stream early.
+        Ok(n) if n == obj.size => Ok(Some(path)),
+        r => {
+            let _ = std::fs::remove_file(&path);
+            Err(r.err().unwrap_or_else(|| anyhow::anyhow!("leg {leg}'s artifacts read short of their {} bytes", obj.size)))
+        }
+    }
+}
+
+/// Whether the CI engine's run `run` is of a pushed tag (its event `push`, as GitHub's).
+pub async fn pushed_tag(hub: &Hub, run: &str) -> bool {
+    use rusqlite::OptionalExtension as _;
+    let r = run.to_owned();
+    let trigger: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT trigger FROM runs WHERE id = ?1", [r], |x| x.get::<_, Option<String>>(0)).optional()?.flatten())).await.unwrap_or_default();
+    trigger.and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|t| t.get("ref").and_then(serde_json::Value::as_str).map(|r| r.starts_with("refs/tags/"))).unwrap_or(false)
 }
 
 /// Whether `bytes` is a program `target` runs: an ELF on Linux, a Mach-O (or a universal one) on
@@ -613,13 +686,24 @@ fn short(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)
 }
 
-/// Runs the release pipeline on `commit` of the release branch. Its binaries are what runners of
-/// every other platform upgrade to once it succeeds (`adopts`).
+/// Runs the release pipeline on `commit` of the release branch: on the CI engine when kiln's own
+/// workflows run there (`[ci] kiln_workflows`), else on v1. Its binaries are what runners of every
+/// other platform upgrade to once it succeeds (`adopts`). A run of it at that commit still under
+/// way is the build: nothing more starts.
 pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) -> anyhow::Result<crate::store::Run> {
     let u = &hub.cfg.updates;
+    let runs = hub.store.runs(Some(repo.id.clone()), 200, None).await?;
+    if let Some(run) = runs.into_iter().find(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit) && !r.status.is_terminal()) {
+        return Ok(run);
+    }
+    let missing = || anyhow::anyhow!("{} has no pipeline called {} at {}", u.release_repo, u.release_pipeline, short(commit));
     let t = crate::gitops::Trigger { event: "manual", branch: u.release_branch.clone(), sha: commit.to_owned(), before: None, pipeline: Some(u.release_pipeline.clone()), payload: None };
+    if hub.cfg.ci.kiln_workflows && hub.ci.enabled() {
+        let id = crate::ci::events::start_one(hub, repo, &t).await?.ok_or_else(missing)?;
+        return hub.store.run(id).await?.ok_or_else(missing);
+    }
     let runs = crate::gitops::trigger(hub, repo, t).await?;
-    runs.into_iter().next().ok_or_else(|| anyhow::anyhow!("{} has no pipeline called {} at {}", u.release_repo, u.release_pipeline, short(commit)))
+    runs.into_iter().next().ok_or_else(missing)
 }
 
 /// Keeps every platform in step with the server (`[updates] in_step`): whenever the binaries kept
@@ -674,7 +758,7 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
         Ok(run) => {
             tracing::info!(run = run.number, commit = short(commit), "building every platform from the server's commit");
             hub.store.audit("kiln".into(), "upgrade.build".into(), format!("{} {} #{} for the server's commit {}", u.release_repo, u.release_pipeline, run.number, short(commit))).await;
-            hub.emit(&serde_json::json!({ "type": "updates" }));
+            hub.emit(&crate::wire::events::ServerEvent::Updates);
             Ok(())
         }
         Err(e) => {
@@ -802,7 +886,7 @@ pub fn release(hub: &Arc<Hub>, force: bool) -> ReleaseInfo {
                 .unwrap_or_else(|e| ReleaseInfo { error: Some(format!("{e:#}")), checked_at: crate::util::now_unix(), ..ReleaseInfo::default() });
             *h.updates.release.lock() = Some((Instant::now(), r));
             h.updates.checking_release.store(false, Ordering::Release);
-            h.emit(&serde_json::json!({ "type": "updates" }));
+            h.emit(&crate::wire::events::ServerEvent::Updates);
         });
     }
     cached.map(|(_, r)| r).unwrap_or_default()
@@ -864,7 +948,7 @@ pub fn image(hub: &Arc<Hub>, force: bool) -> Option<ImageCheck> {
             };
             *h.updates.image.lock() = Some((Instant::now(), c));
             h.updates.checking_image.store(false, Ordering::Release);
-            h.emit(&serde_json::json!({ "type": "updates" }));
+            h.emit(&crate::wire::events::ServerEvent::Updates);
         });
     }
     Some(cached.map(|(_, c)| c).unwrap_or_default())
@@ -1017,7 +1101,7 @@ impl Updates {
             f(j);
             j.clone()
         };
-        hub.emit(&serde_json::json!({ "type": "update_job", "job": snapshot }));
+        hub.emit(&crate::wire::events::ServerEvent::UpdateJob { job: Box::new(snapshot) });
     }
 
     pub(crate) fn say(&self, hub: &Hub, id: &str, line: impl Into<String>) {
@@ -1075,7 +1159,7 @@ impl Updates {
         if let Some(j) = self.job(id) {
             crate::fleet::on_job_end(hub, &j, error.as_deref());
         }
-        hub.emit(&serde_json::json!({ "type": "updates" }));
+        hub.emit(&crate::wire::events::ServerEvent::Updates);
     }
 
     /// Kiln stops waiting for it: its `which` wait ([`Waits`]) ran out.
@@ -1149,7 +1233,7 @@ impl Updates {
         });
         if let Some(j) = through {
             crate::fleet::on_job_end(hub, &j, None);
-            hub.emit(&serde_json::json!({ "type": "updates" }));
+            hub.emit(&crate::wire::events::ServerEvent::Updates);
         }
     }
 }
@@ -2791,6 +2875,148 @@ mod tests {
             assert_eq!(targets, others, "this server's own platform keeps its own build");
         }
         Ok(())
+    }
+
+    /// The release repository, as kiln follows it.
+    async fn release_repo(hub: &Hub) -> anyhow::Result<crate::store::Repo> {
+        hub.store
+            .upsert_repo(crate::store::Repo {
+                id: crate::util::new_id(),
+                name: hub.cfg.updates.release_repo.clone(),
+                clone_url: String::new(),
+                branches: vec!["main".into()],
+                poll_seconds: 0,
+                enabled: true,
+                created_at: 0,
+                last_polled_at: None,
+                last_error: None,
+                mode: "upstream".into(),
+                default_branch: None,
+                mirror: None,
+            })
+            .await
+    }
+
+    /// W28 step 3: with kiln's own workflows on the CI engine, release.yaml's legs upload their
+    /// `artifacts:` to CI's store, each as `artifacts-<key>`: a leg's binaries are kept as
+    /// [`release_binaries_are_kept`] keeps a v1 run's, with its run's number and commit.
+    #[test]
+    fn an_engine_release_runs_binaries_are_kept_for_the_other_platforms() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo = release_repo(&hub).await?;
+            // The server's commit when it knows it (it keeps only that commit's), else any.
+            let sha = if crate::api::COMMIT.is_empty() { "0d21482abcdef".to_owned() } else { crate::api::COMMIT.to_owned() };
+            let new = |id: &str, event: &str, git_ref: &str| crate::ci::runs::NewRun {
+                id: id.into(),
+                workflow: ".kiln/release.yaml".into(),
+                name: "release".into(),
+                event: event.into(),
+                branch: git_ref.rsplit('/').next().unwrap_or_default().into(),
+                sha: sha.clone(),
+                trigger: serde_json::json!({ "event": event, "ref": git_ref }),
+                trusted: true,
+                ..crate::ci::runs::NewRun::default()
+            };
+            let (number, _) = crate::ci::runs::create(&hub, &repo, new("engine-run", "workflow_dispatch", "refs/heads/main")).await?;
+            hub.store
+                .call(|c| {
+                    Ok(c.execute(
+                        "INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, queued_at, job_id) VALUES ('leg-macos', 'engine-run', 'macos', 'macOS', 'succeeded', 'success', '[]', '[]', '{}', 0, 'macos')",
+                        [],
+                    )?)
+                })
+                .await?;
+            // What kiln/upload@v1 makes of `artifacts: ["dist/*"]`: a zip of dist's files.
+            let fake = |magic: &[u8]| -> Vec<u8> {
+                let mut b = magic.to_vec();
+                b.resize(2 << 20, 7);
+                b
+            };
+            let dir = tempfile::tempdir()?;
+            let zipped = dir.path().join("artifacts.zip");
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&zipped)?);
+            for (name, bytes) in [("kiln-x86_64-pc-windows-msvc.exe", fake(b"MZ")), ("kiln-aarch64-apple-darwin", fake(&[0xcf, 0xfa, 0xed, 0xfe])), ("SHA256SUMS", b"sums".to_vec())] {
+                z.start_file(name, zip::write::SimpleFileOptions::default())?;
+                z.write_all(&bytes)?;
+            }
+            z.finish()?;
+            let obj = crate::ci::services::cas::put_file(&hub, &zipped).await?;
+            let (object, size) = (obj.digest.clone(), i64::try_from(obj.size)?);
+            hub.store
+                .call(move |c| {
+                    Ok(c.execute(
+                        "INSERT INTO ci_artifacts (run_id, leg_id, name, object, size, digest, mime_type, created_at, finalized) VALUES ('engine-run', 'leg-macos', 'artifacts-macos', ?1, ?2, 'sha256:' || ?1, 'application/zip', 0, 1)",
+                        rusqlite::params![object, size],
+                    )?)
+                })
+                .await?;
+            let run = hub.store.run("engine-run".into()).await?.ok_or_else(|| anyhow::anyhow!("no run"))?;
+            hub.adopt_release("leg-macos", &run).await;
+            // A server of one of these platforms keeps its own build of its own commit.
+            for t in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"].into_iter().filter(|t| *t != crate::api::TARGET || crate::api::COMMIT.is_empty()) {
+                let b = stored(&hub, t).ok_or_else(|| anyhow::anyhow!("{t} wasn't kept"))?;
+                assert_eq!((b.origin.as_str(), b.run, b.sha.as_deref(), b.size), ("built", Some(number), Some(sha.as_str()), 2 << 20), "{t}");
+            }
+            assert!(!hub.cfg.data("artifacts").join("legmacos.zip").exists(), "its copy goes once read");
+            // The engine's run of a tag is a push of it.
+            crate::ci::runs::create(&hub, &repo, new("engine-tag", "push", "refs/tags/v0.3.0")).await?;
+            assert!(pushed_tag(&hub, "engine-tag").await && !pushed_tag(&hub, "engine-run").await);
+            Ok(())
+        })
+    }
+
+    /// W28 step 3: `[updates] in_step`'s build of the server's commit, with kiln's own workflows on
+    /// the CI engine, is one engine run of release at that commit; asked again while it runs, it's
+    /// that run again and nothing more starts.
+    #[test]
+    fn the_servers_commit_is_built_once_by_the_engine() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| {
+                c.ci.enabled = true;
+                c.ci.kiln_workflows = true;
+            })
+            .await?;
+            crate::ci::dispatch::spawn(Arc::clone(&hub));
+            let repo = release_repo(&hub).await?;
+            // The repository as kiln mirrors it: one commit, its release.yaml in the kiln dialect.
+            let work = tempfile::tempdir()?;
+            let w = work.path().to_owned();
+            let mirror = crate::gitops::mirror_path(&hub, &repo.name);
+            let sha = crate::rt::blocking(move || -> anyhow::Result<String> {
+                let git = |dir: &Path, args: &[&str]| -> anyhow::Result<String> {
+                    let o = std::process::Command::new("git")
+                        .current_dir(dir)
+                        .args(["-c", "user.name=kiln", "-c", "user.email=kiln@localhost", "-c", "commit.gpgsign=false"])
+                        .args(args)
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .output()?;
+                    anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+                    Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                };
+                std::fs::create_dir_all(w.join(".kiln"))?;
+                std::fs::write(
+                    w.join(".kiln/release.yaml"),
+                    "name: release\non:\n  push: { branches: [main] }\n  manual: true\njobs:\n  linux:\n    runs-on: [baremetal, local]\n    steps:\n      - name: build\n        run: ci/release/build.sh\n    artifacts: [\"dist/*\"]\n",
+                )?;
+                git(&w, &["init", "--quiet", "--initial-branch=main"])?;
+                git(&w, &["add", "."])?;
+                git(&w, &["commit", "--quiet", "-m", "release"])?;
+                git(&w, &["clone", "--quiet", "--bare", &w.to_string_lossy(), &mirror.to_string_lossy()])?;
+                git(&w, &["rev-parse", "HEAD"])
+            })
+            .await??;
+            let run = build_commit(&hub, &repo, &sha).await?;
+            assert_eq!((run.pipeline.as_str(), run.sha.as_str(), run.event.as_str(), run.branch.as_str()), ("release", sha.as_str(), "workflow_dispatch", "main"));
+            assert!(!run.status.is_terminal(), "no runner takes its legs: it waits");
+            let again = build_commit(&hub, &repo, &sha).await?;
+            assert_eq!(again.id, run.id, "the run under way is the build");
+            let releases = hub.store.runs(Some(repo.id.clone()), 50, None).await?.into_iter().filter(|r| r.pipeline == "release").count();
+            assert_eq!(releases, 1, "nothing more started");
+            Ok(())
+        })
     }
 
     /// CP-T10.1: binaries kept as files (`<data>/binaries`) are taken into the local store where

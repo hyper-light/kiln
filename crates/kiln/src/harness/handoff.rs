@@ -1,14 +1,17 @@
-//! Carrying a conversation from one harness to another (Claude Code ⇄ Codex), so a person can
-//! switch the model mid-conversation, across harnesses, and the new one picks up exactly where
-//! the old one left off.
+//! Carrying a conversation from one harness to another (any of Claude Code, Codex, the ACP agents
+//! and Antigravity to any other), so a person can switch the model mid-conversation, across
+//! harnesses, and the new one picks up exactly where the old one left off.
 //!
-//! The conversation is read from the source harness's own record (Claude Code's transcript,
-//! Codex's rollout), never from kiln's timeline, which shortens long inputs and outputs. Only what
-//! the model still sees is carried: from the last compaction on, without thinking (it is bound to
-//! the provider that wrote it). It is written the way the target keeps its own history: a Claude
-//! Code transcript to `--resume`, or Responses items for Codex's `thread/inject_items`. Tool calls
-//! become the target's own calls where it has a faithful counterpart (commands, file changes,
-//! reads); the rest become words saying what was run and what it returned.
+//! The conversation is read from the source harness's own record where kiln reads one (Claude
+//! Code's transcript, Codex's rollout), rather than kiln's timeline, which shortens long inputs
+//! and outputs; an ACP agent's and Antigravity's come from kiln's timeline ([`from_events`]).
+//! Only what the model still sees is carried: from the last compaction on, without thinking (it
+//! is bound to the provider that wrote it). It is written the way the target keeps its own
+//! history: a Claude Code transcript to `--resume`, or Responses items for Codex's
+//! `thread/inject_items`; an ACP agent and Antigravity are given it in words with the first
+//! message they get ([`as_words`]). Tool calls become the target's own calls where it has a
+//! faithful counterpart (commands, file changes, reads); the rest become words saying what was
+//! run and what it returned.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -807,9 +810,9 @@ pub const WORDS_BUDGET: usize = 200 * 1024;
 /// (ACP agents, Antigravity): what was said, and each tool call with what kiln kept of its output
 /// (kiln shortens long ones). A subagent's events and kiln's own notes to the agent (task
 /// notifications, reminders) are left out; the person's attachments go by name.
-pub fn from_events(events: &[Event]) -> Conversation {
+pub fn from_events<'a>(events: impl IntoIterator<Item = &'a Event>) -> Conversation {
     let mut c = Conversation::default();
-    for e in events.iter().filter(|e| e.parent.is_none()) {
+    for e in events.into_iter().filter(|e| e.parent.is_none()) {
         match &e.body {
             Body::User { text, origin, attachments, .. } if origin.as_deref() != Some("system") && (!text.trim().is_empty() || !attachments.is_empty()) => {
                 let mut text = text.clone();
@@ -1149,12 +1152,14 @@ pub fn to_claude(c: &Conversation, note: Option<&str>, session: &str, cwd: &str,
 // ---------------------------------------------------------------------- the note to the model
 
 /// What the target model is told about the switch: where the conversation came from, how its
-/// calls are shown, and the plan as it stands.
-pub fn note(from: &str, from_model: &str, to: &str, todos: &[Todo], dropped: usize) -> String {
+/// calls are shown (`words`: all of them in words, for a harness given it so), and the plan as it
+/// stands.
+pub fn note(from: &str, from_model: &str, to: &str, todos: &[Todo], dropped: usize, words: bool) -> String {
     let model = if from_model.is_empty() { String::new() } else { format!(" (model {from_model})") };
+    let shown = if words { "each described in words".to_owned() } else { format!("calls {to} has a counterpart for are shown as its own, the rest are described in words") };
     let mut s = format!(
-        "This conversation began in {from}{model} and now continues here in {to}, with the person's messages and the tool calls carried over as they ran: \
-         calls {to} has a counterpart for are shown as its own, the rest are described in words. Pick up exactly where it left off, as the same agent; don't start over or repeat work that is done."
+        "This conversation began in {from}{model} and now continues here in {to}, with the person's messages and the tool calls carried over as they ran: {shown}. \
+         Pick up exactly where it left off, as the same agent; don't start over or repeat work that is done."
     );
     if dropped > 0 {
         s.push_str(&format!(" {dropped} older messages were left out to fit the context window."));
@@ -1186,6 +1191,7 @@ enum Latitude {
 }
 
 fn latitude(kind: &str, mode: &str) -> Option<Latitude> {
+    use super::lineage::Level;
     Some(match (kind, mode) {
         // Never asks, refuses what isn't allowed: no more than read-only (never escalated).
         ("claude", "plan" | "dontAsk") | ("codex", "read-only") => Latitude::ReadOnly,
@@ -1193,12 +1199,23 @@ fn latitude(kind: &str, mode: &str) -> Option<Latitude> {
         ("claude", "acceptEdits") | ("codex", "auto") => Latitude::Edits,
         ("claude", "auto") => Latitude::Auto,
         ("claude", "bypassPermissions") | ("codex", "full-access") => Latitude::SkipAll,
-        _ => return None,
+        ("claude" | "codex", _) => return None,
+        // Any other harness (Devin, Antigravity, the other ACP agents): where its mode stands in
+        // every harness's one order (`lineage::level`).
+        _ => match super::lineage::level(kind, mode)? {
+            Level::Plan => Latitude::ReadOnly,
+            Level::Ask => Latitude::Ask,
+            Level::AcceptEdits => Latitude::Edits,
+            Level::Auto => Latitude::Auto,
+            Level::Bypass => Latitude::SkipAll,
+        },
     })
 }
 
-fn mode_at(kind: &str, l: Latitude) -> Option<&'static str> {
-    Some(match (kind, l) {
+/// Harness `kind`'s mode at latitude `l`, of those it offers (`offered`; for Claude Code and
+/// Codex, empty is any of theirs).
+fn mode_at(kind: &str, l: Latitude, offered: &[String]) -> Option<String> {
+    let named = match (kind, l) {
         ("claude", Latitude::ReadOnly) => "plan",
         ("claude", Latitude::Ask) => "default",
         ("claude", Latitude::Edits) => "acceptEdits",
@@ -1208,19 +1225,22 @@ fn mode_at(kind: &str, l: Latitude) -> Option<&'static str> {
         ("codex", Latitude::Ask) => "untrusted",
         ("codex", Latitude::Edits | Latitude::Auto) => "auto",
         ("codex", Latitude::SkipAll) => "full-access",
-        _ => return None,
-    })
+        // Any other harness: the first mode it offers that stands there.
+        _ => return offered.iter().find(|m| latitude(kind, m) == Some(l)).cloned(),
+    };
+    (offered.is_empty() || offered.iter().any(|o| o == named)).then(|| named.to_owned())
 }
 
 /// The target's permission mode for the source's: the same latitude (plan → read-only, ask →
 /// ask, accept edits ≈ Codex's auto), never more. Skipping every check carries over only from a
 /// mode that already did, and only if the target offers it (`offered`); else the next one down.
-/// A mode kiln doesn't know asks.
+/// A mode kiln doesn't know asks. None: the target offers none that low (an ACP agent that says
+/// its own modes only once started has nothing below ask), and starts in its own default.
 pub fn mode_for(from_kind: &str, mode: &str, to_kind: &str, offered: &[String]) -> Option<String> {
     let mut l = latitude(from_kind, mode).unwrap_or(Latitude::Ask);
     loop {
-        if let Some(m) = mode_at(to_kind, l).filter(|m| offered.is_empty() || offered.iter().any(|o| o == m)) {
-            return Some(m.to_owned());
+        if let Some(m) = mode_at(to_kind, l, offered) {
+            return Some(m);
         }
         l = match l {
             Latitude::SkipAll => Latitude::Auto,
@@ -1681,6 +1701,51 @@ mod tests {
         assert_eq!(effort_for("ultra", &levels(&["low", "medium", "high", "xhigh", "max"])).as_deref(), Some("max"));
         assert_eq!(effort_for("minimal", &levels(&["low", "high"])).as_deref(), Some("low"));
         assert_eq!(effort_for("", &levels(&["low"])), None);
+    }
+
+    /// Devin, Antigravity and the other ACP agents carry their permission mode at the same
+    /// latitude too, into and out of every harness, never more.
+    #[test]
+    fn every_harness_s_mode_carries_at_the_same_latitude_never_more() {
+        let list = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let (claude, codex) = (list(&["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"]), list(&["auto", "read-only", "untrusted", "full-access"]));
+        let devin = list(&["accept-edits", "smart", "ask", "plan", "bypass"]);
+        let agy = list(&["default", "accept-edits", "plan", "bypass"]);
+        // An ACP agent that says its own only once started: kiln's Ask and Bypass.
+        let gemini = list(&["kiln-ask", "kiln-bypass"]);
+        let carry = |from: &str, modes: &[&str], to: &str, offered: &[String]| modes.iter().map(|m| mode_for(from, m, to, offered).unwrap_or_default()).collect::<Vec<_>>();
+        assert_eq!(carry("claude", &["plan", "default", "acceptEdits", "auto", "bypassPermissions"], "devin", &devin), ["plan", "ask", "accept-edits", "smart", "bypass"]);
+        assert_eq!(carry("devin", &["plan", "ask", "accept-edits", "smart", "bypass"], "claude", &claude), ["plan", "default", "acceptEdits", "auto", "bypassPermissions"]);
+        // Its own default where it named none.
+        assert_eq!(carry("devin", &["plan", "ask", "accept-edits", "smart", "bypass", ""], "codex", &codex), ["read-only", "untrusted", "auto", "auto", "full-access", "auto"]);
+        // Antigravity has no auto: the next one down.
+        assert_eq!(carry("claude", &["plan", "default", "acceptEdits", "auto", "bypassPermissions"], "antigravity", &agy), ["plan", "default", "accept-edits", "accept-edits", "bypass"]);
+        assert_eq!(carry("antigravity", &["plan", "default", "accept-edits", "bypass"], "devin", &devin), ["plan", "ask", "accept-edits", "bypass"]);
+        // An ACP agent's own words for its modes place them too.
+        assert_eq!(carry("gemini", &["autoEdit", "yolo", "kiln-ask", "kiln-bypass"], "claude", &claude), ["acceptEdits", "bypassPermissions", "default", "bypassPermissions"]);
+        assert_eq!(carry("codex", &["untrusted", "auto", "full-access"], "gemini", &gemini), ["kiln-ask", "kiln-ask", "kiln-bypass"]);
+        // Nothing that low there: its own default.
+        assert_eq!(mode_for("claude", "plan", "gemini", &gemini), None);
+        // Skipping every check only where it's offered.
+        let safe: Vec<String> = devin.iter().filter(|m| *m != "bypass").cloned().collect();
+        assert_eq!(mode_for("claude", "bypassPermissions", "devin", &safe).as_deref(), Some("smart"));
+        assert_eq!(mode_for("codex", "full-access", "gemini", &list(&["kiln-ask"])).as_deref(), Some("kiln-ask"));
+    }
+
+    /// A harness given the conversation in words is told every call is said so, from whichever
+    /// harness it came.
+    #[test]
+    fn a_conversation_in_words_says_so_and_goes_whole_with_its_note() {
+        let c = from_claude(&lines(&claude_session()));
+        let n = note("Claude Code", "claude-opus-5-5", "Devin", &c.todos, 0, true);
+        assert!(n.contains("began in Claude Code (model claude-opus-5-5) and now continues here in Devin") && n.contains("each described in words") && !n.contains("counterpart"), "{n}");
+        assert!(n.contains("- [~] test"), "the plan as it stands: {n}");
+        assert!(note("Codex", "", "Claude Code", &[], 3, false).contains("calls Claude Code has a counterpart for are shown as its own"));
+        let words = as_words(c, &n, WORDS_BUDGET);
+        let (said, ran, edited) = (words.find("The person said:\nfix the bug in a.txt"), words.find("You ran `cat a.txt` (exit code 0); it returned:\nalpha"), words.find("You used the Edit tool"));
+        assert!(words.starts_with(&format!("<kiln_handoff>\n{n}")) && said.is_some() && ran.is_some() && edited.is_some(), "{words}");
+        assert!(said < ran && ran < edited, "oldest first");
+        assert!(words.contains("[What came before, in short]\nSummary: we set things up."));
     }
 
     #[test]

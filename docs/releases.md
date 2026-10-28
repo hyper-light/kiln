@@ -113,7 +113,8 @@ back after a rollback. No other kiln process takes one a live process serves (a 
 server`'s own agent given the runner's name and state folder, say), and a socket left with nothing
 behind it (something took its file, then ended) is served again within seconds.
 
-**On a Mac, run `kiln signing setup` once.** macOS's local network privacy judges every program
+**On a Mac, run `kiln signing setup` once** (`kiln setup` offers it, and `install.sh` hands over
+to `kiln setup` at a terminal). macOS's local network privacy judges every program
 by its code signature. kiln's builds are ad hoc signed, so to macOS each upgrade is a program it
 has never seen, cut off from the local network, and so from the kiln server, until someone allows
 it again. `kiln signing setup` makes kiln a signing identity on the Mac: a self-signed certificate
@@ -295,6 +296,12 @@ be upgraded to exactly what the server runs, so platforms don't drift apart.
   release branch, and every 10 minutes until then. A build that fails is tried again after 30
   minutes, at most 3 times.
 - An uploaded binary isn't built from any commit, so the next build replaces it.
+- A run of the release pipeline at the commit still under way is the build: the server starts no
+  other, and neither does *Build every platform* (System → Builds).
+- With kiln's own workflows on the CI engine (`[ci] kiln_workflows`), the build is the engine's run
+  of release.yaml. Each leg's `artifacts:` are an artifact of that leg (`artifacts-linux`,
+  `artifacts-macos`, docs/ci.md W08-R08). As each leg succeeds, the binaries in its artifact are
+  checked and kept, as a v1 job's are. A machine waiting on the build is told which run and leg.
 - `[updates] in_step = false` turns this off. System → Builds shows the commit, and which
   platforms are behind it.
 
@@ -322,6 +329,9 @@ Adding machines then needs nothing but the server:
 ```sh
 curl -fsSL http://server:7070/install.sh | sh -s -- --join          # Linux, macOS
 ```
+
+The script hands over to `kiln setup` once kiln is on the machine: at a terminal it asks first,
+and on a Mac gives kiln its own signature; without one it asks nothing.
 
 Windows (PowerShell): download `http://server:7070/dl/kiln/x86_64-pc-windows-msvc` to `kiln.exe`
 and run `kiln.exe join --server http://server:7070`.

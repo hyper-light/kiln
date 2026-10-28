@@ -2,8 +2,11 @@
 # Install a kiln agent on this machine (Linux or macOS), fetched from the kiln server that served
 # this script. Never asks for a password: installs into ~/.local (or /usr/local when run as root),
 # puts that on your PATH (a line in your shell's startup file, when it isn't), and starts on boot
-# via `kiln install --agent --unattended` (systemd, cron or XDG autostart on Linux; launchd on
-# macOS). Windows: use install.ps1 instead.
+# (systemd, cron or XDG autostart on Linux; launchd on macOS). Windows: use install.ps1 instead.
+#
+# `kiln setup` takes over once kiln is here. At a terminal it says what it will do and asks first,
+# and on a Mac offers kiln its own code signature, which its upgrades need; without a terminal it
+# asks nothing (`kiln setup --unattended`).
 #
 #   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --token <join-token> [--labels baremetal,bench] [--name box1] [--slots 4]
 #
@@ -82,6 +85,17 @@ if [ "$OUTPOST" = 1 ]; then
   exec "$BIN_DIR/kiln" outpost --server "$SERVER" --state-dir "$BIN_DIR" $ARGS
 fi
 echo "kiln ($TARGET) installed to $BIN_DIR/kiln"
+# `kiln setup` takes it from here, asking at this terminal (its input is this script, so answers
+# come from /dev/tty) or, with none, asking nothing. Without a token it asks the server to take
+# this machine, as --join does. A kiln from before `kiln setup` goes on as it always did.
+if "$BIN_DIR/kiln" setup --help >/dev/null 2>&1; then
+  if [ -t 2 ] && (exec </dev/tty) 2>/dev/null; then
+    # shellcheck disable=SC2086
+    exec "$BIN_DIR/kiln" setup --server "$SERVER" $ARGS </dev/tty
+  fi
+  # shellcheck disable=SC2086
+  exec "$BIN_DIR/kiln" setup --unattended --server "$SERVER" $ARGS
+fi
 if [ "$JOIN" = 1 ]; then
   # shellcheck disable=SC2086
   exec "$BIN_DIR/kiln" join --server "$SERVER" $ARGS

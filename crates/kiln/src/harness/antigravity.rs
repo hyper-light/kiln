@@ -23,6 +23,11 @@ use super::model::{
 };
 use super::session::Spec;
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments", "switch_harness"];
+/// It turns nothing on or off once it runs.
+pub(super) const LEARNED: &[&str] = &[];
+
 /// Its modes. Ask is agy's own default; in this mode nothing can ask you, so whatever needs your
 /// approval is denied.
 pub const ASK: &str = "default";
@@ -122,7 +127,7 @@ pub struct Agy {
     restarting: bool,
     seq: u64,
     /// The conversation so far, in words, given with the first message it sends (a session that
-    /// went on here from another machine, `super::moving`).
+    /// went on here from another machine, `super::moving`, or from another harness).
     #[serde(default)]
     context: Option<String>,
 }
@@ -157,7 +162,7 @@ impl Agy {
     }
 
     pub fn start(&mut self, core: &mut Core) {
-        core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments"].iter().map(|s| (*s).to_owned()).collect();
+        core.meta.features = FEATURES.iter().map(|s| (*s).to_owned()).collect();
         core.meta.modes = modes();
         core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
         // Its go-back (rewind, restore files, branch, fork) is kiln's own (`harness::goback`).
@@ -409,10 +414,16 @@ impl Agy {
         self.context = text.filter(|t| !t.is_empty());
     }
 
+    /// The conversation it was offered went with a message (or it was offered none).
+    pub fn seeded(&self) -> bool {
+        self.context.is_none()
+    }
+
     fn prompt(&mut self, core: &mut Core, m: QueueItem) {
         self.close_text(core);
         // It takes text only: files go as their paths on this machine, which it reads itself. The
-        // conversation so far comes first, once, when it went on here from another machine.
+        // conversation so far comes first, once, when it went on here from another machine or
+        // another harness.
         let mut text = match self.context.take() {
             Some(c) => format!("{c}\n\n{}", m.text),
             None => m.text.clone(),
@@ -452,6 +463,11 @@ impl Agy {
         let id = item.id.clone();
         self.prompt(core, item);
         super::pause::sent_from_queue(core, &id);
+    }
+
+    /// There may be room on its machine for it to go to work: its queue goes, as between turns.
+    pub fn room(&mut self, core: &mut Core) {
+        self.next(core);
     }
 
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
@@ -891,6 +907,24 @@ mod tests {
         feed(&mut a, &mut core, &[json!({"event": "init", "conversation_id": CID, "init": {}})]);
         assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/message/content")).and_then(Value::as_str), Some("hello"));
         assert!(core.state.queue.is_empty());
+    }
+
+    /// A conversation carried in (from another harness, or one that moved here) goes in words with
+    /// the first message, once; until then it's still to give, so a start before that (a new mode)
+    /// gives it then.
+    #[test]
+    fn a_conversation_carried_in_goes_with_its_first_message_once() {
+        let (mut a, mut core) = started(&Spec::default());
+        a.offer_context(Some("<kiln_handoff>earlier</kiln_handoff>".into()));
+        assert!(!a.seeded());
+        send(&mut a, &mut core, "m1", "go on", SendMode::Queue);
+        assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/message/content")).and_then(Value::as_str), Some("<kiln_handoff>earlier</kiln_handoff>\n\ngo on"));
+        assert!(a.seeded(), "its own conversation has it now");
+        // The timeline shows what the person said, not the conversation it went with.
+        assert!(core.events().any(|e| matches!(&e.body, Body::User { text, .. } if text == "go on")));
+        feed(&mut a, &mut core, &[json!({"event": "result", "result": {"conversation_id": CID, "status": "SUCCESS", "response": "", "num_turns": 1}})]);
+        send(&mut a, &mut core, "m2", "and then", SendMode::Queue);
+        assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/message/content")).and_then(Value::as_str), Some("and then"), "only the first message carries it");
     }
 
     #[test]

@@ -21,6 +21,11 @@ use super::model::{
     ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, same_account, sort_catalog,
 };
 
+/// What a session of it can do, said when it starts (and again after an in-place upgrade).
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"];
+/// It turns nothing on or off once it runs.
+pub(super) const LEARNED: &[&str] = &[];
+
 /// Environment variables a Claude Code session sets for its children; a harness kiln starts must
 /// not inherit them (it would think it runs inside another session).
 pub const SCRUB_ENV: &[&str] = &[
@@ -699,7 +704,7 @@ impl Claude {
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(claude_catalog());
         }
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
+        core.meta.features = FEATURES
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -1590,6 +1595,11 @@ impl Claude {
         super::pause::sent_from_queue(core, &id);
     }
 
+    /// There may be room on its machine for it to go to work: kiln's queue goes, as after a turn.
+    pub fn room(&mut self, core: &mut Core) {
+        self.drain_queue(core);
+    }
+
     // ------------------------------------------------------------------ messages to subagents
 
     /// How a person's message reaches subagent `t` now. Claude Code takes none for a subagent
@@ -1641,10 +1651,12 @@ impl Claude {
     /// What waits for its subagents goes, to each that finished, one message each: it's resumed
     /// with it (and the next waits until it finishes again).
     pub fn drain_subagents(&mut self, core: &mut Core) {
-        if !super::pause::open(core) || matches!(core.state.status, Status::Exited | Status::Starting) {
+        // Room on its machine is asked for only with something to send.
+        let waiting = super::subagent::waiting(core);
+        if waiting.is_empty() || matches!(core.state.status, Status::Exited | Status::Starting) || !super::pause::open(core) {
             return;
         }
-        for task in super::subagent::waiting(core) {
+        for task in waiting {
             let Some(t) = core.state.tasks.iter().find(|t| t.id == task).cloned() else { continue };
             if t.live() || self.waking.contains(&t.id) || self.takes(core, &t).0.is_empty() {
                 continue;

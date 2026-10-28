@@ -1,9 +1,10 @@
 /**
  * Where an agent can go on: here in another harness, or on another of your machines that takes
- * agents over, in its own harness or one its conversation can be carried into (Claude Code ⇄
- * Codex). Two selects: the machine, then the harness and model there. At a usage limit it can go on
- * so by itself (`AtLimit`; the agent keeps the choice, `State.move_plan`), or a person sends it now
- * (`GoOnNow`, above the composer while it's paused).
+ * agents over, in its own harness or one its conversation can be carried into (any other: Claude
+ * Code, Codex, Devin, Antigravity, the other ACP agents). Two selects: the machine, then the harness
+ * and model there (its own default, for a harness that lists none yet). At a usage limit it can go
+ * on so by itself (`AtLimit`; the agent keeps the choice, `State.move_plan`), or a person sends it
+ * now (`GoOnNow`, above the composer while it's paused).
  */
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
@@ -25,15 +26,12 @@ interface Place {
   kinds: KindInfo[];
 }
 
-/** A harness with models it lists (one an agent's conversation can be carried into needs one). */
-const withModels = (k: KindInfo) => (k.models?.length ?? 0) > 0;
-
 /** Where `agent` can go on: the other harnesses here, the machines that take it over, and its machine's runner being too old to hand it over. */
 function usePlaces(agent: Agent) {
   const { byTarget, runners } = useSuspenseResource("harness/move", askPlaces).data;
   // Carried into another harness only out of one that's carried too.
   const carries = (byTarget[agent.target] ?? []).find((k) => k.id === agent.kind)?.switch ?? false;
-  const goesIn = (k: KindInfo) => k.available && (k.id === agent.kind || (carries && Boolean(k.switch) && withModels(k)));
+  const goesIn = (k: KindInfo) => k.available && (k.id === agent.kind || (carries && Boolean(k.switch)));
   const here = (byTarget[agent.target] ?? []).filter((k) => k.id !== agent.kind && goesIn(k));
   const machine = agent.target.startsWith("agent:");
   const places: Place[] = machine
@@ -50,15 +48,15 @@ function usePlaces(agent: Agent) {
   return { here, places, older: Boolean(mine && !mine.fingerprint) };
 }
 
-/** `kind:model`, a choice of the second select ("" its own harness, as it is). */
-const pick = (kind?: string, model?: string) => (kind && model ? `${kind}:${model}` : "");
+/** `kind:model`, a choice of the second select ("" its own harness, as it is; `kind:` that harness's own default model). */
+const pick = (kind?: string, model?: string) => (kind ? `${kind}:${model ?? ""}` : "");
 const unpick = (v: string): { kind?: string; model?: string } => {
   const [kind, ...rest] = v.split(":");
   const model = rest.join(":");
-  return kind && model ? { kind, model } : {};
+  return kind ? { kind, ...(model ? { model } : {}) } : {};
 };
 
-/** The harnesses and their models, as options: its own first ("as it is"), then each other one's models. */
+/** The harnesses and their models, as options: its own first ("as it is"), then each other one's models (its default, for one that lists none yet). */
 function HarnessOptions({ agent, kinds, own }: { agent: Agent; kinds: KindInfo[]; own: boolean }) {
   return (
     <>
@@ -67,11 +65,15 @@ function HarnessOptions({ agent, kinds, own }: { agent: Agent; kinds: KindInfo[]
         .filter((k) => k.id !== agent.kind)
         .map((k) => (
           <optgroup key={k.id} label={k.name}>
-            {(k.models ?? []).map((m) => (
-              <option key={m.id} value={`${k.id}:${m.id}`}>
-                {k.name} · {m.label || m.id}
-              </option>
-            ))}
+            {k.models?.length ? (
+              k.models.map((m) => (
+                <option key={m.id} value={pick(k.id, m.id)}>
+                  {k.name} · {m.label || m.id}
+                </option>
+              ))
+            ) : (
+              <option value={pick(k.id)}>{k.name} · its default model</option>
+            )}
           </optgroup>
         ))}
     </>
@@ -117,11 +119,7 @@ export function AtLimit({ agent, state, send }: { agent: Agent; state: State | n
   };
   return (
     <span className="hx-atlimit">
-      <Select
-        label="At a limit"
-        value={where}
-        onChange={(v) => set(v === "" ? { on: false } : { on: true, ...(v === "*" ? {} : { to: v }) })}
-      >
+      <Select label="At a limit" value={where} onChange={(v) => set(v === "" ? { on: false } : { on: true, ...(v === "*" ? {} : { to: v }) })}>
         <option value="">Wait for the reset</option>
         <option value="*">Go on wherever has room</option>
         {plans &&
@@ -153,7 +151,7 @@ export function AtLimit({ agent, state, send }: { agent: Agent; state: State | n
  */
 export function GoOnNow({ agent, canSwitch, send }: { agent: Agent; canSwitch: boolean; send: (c: Command) => void }) {
   const { here, places } = usePlaces(agent);
-  const switches = canSwitch ? here.filter(withModels) : [];
+  const switches = canSwitch ? here : [];
   const [where, setWhere] = React.useState<string | null>(null);
   const [what, setWhat] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -163,12 +161,12 @@ export function GoOnNow({ agent, canSwitch, send }: { agent: Agent; canSwitch: b
   const there = places.find((p) => p.target === shown);
   const kinds = there ? there.kinds : switches;
   const own = Boolean(there?.kinds.some((k) => k.id === agent.kind));
-  // Here it changes harness: a model must be chosen. There it may go as it is.
+  // Here it changes harness: one must be chosen (its own default model, when it lists none). There it may go as it is.
   const chosen = what || (own ? "" : pick(kinds.find((k) => k.id !== agent.kind)?.id, kinds.find((k) => k.id !== agent.kind)?.models?.[0]?.id));
   const go = async () => {
     const { kind, model } = unpick(chosen);
     if (!there) {
-      if (kind && model) send({ type: "set_model", model, kind });
+      if (kind) send({ type: "set_model", model: model ?? "", kind });
       return;
     }
     setBusy(true);

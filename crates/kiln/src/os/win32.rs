@@ -3,7 +3,8 @@
 //! broadcast that tells the desktop it changed (`WM_SETTINGCHANGE`), and running a program as an
 //! administrator (`ShellExecuteExW` with the `runas` verb: Windows asks the person at the desktop).
 //! And one every kiln makes: how big a volume is and how much of it this user may still write
-//! (`GetDiskFreeSpaceExW`), what `statvfs` tells elsewhere.
+//! (`GetDiskFreeSpaceExW`), what `statvfs` tells elsewhere. And `kiln setup`'s: VT escapes on in
+//! its console (`SetConsoleMode`).
 //!
 //! user32 and shell32 are looked up at run time (`LoadLibraryExW` + `GetProcAddress`), so a kiln
 //! that never installs anything (an agent, a supervisor) doesn't load them.
@@ -89,6 +90,9 @@ unsafe extern "system" {
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
     fn GetDiskFreeSpaceExW(directory: *const u16, available: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    fn GetStdHandle(which: u32) -> *mut c_void;
+    fn GetConsoleMode(console: *mut c_void, mode: *mut u32) -> i32;
+    fn SetConsoleMode(console: *mut c_void, mode: u32) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -132,6 +136,31 @@ fn shell_execute_ex() -> Option<ShellExecuteExFn> {
     let p = *F.get_or_init(|| lookup("shell32.dll", c"ShellExecuteExW") as usize);
     // SAFETY: shell32's ShellExecuteExW, whose signature the type spells out.
     (p != 0).then(|| unsafe { std::mem::transmute::<usize, ShellExecuteExFn>(p) })
+}
+
+/// `STD_ERROR_HANDLE`: `(DWORD)-12`.
+const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+/// Whether the console standard error writes to takes VT escapes (colour, moving the cursor),
+/// turned on here when it's off and the console can (Windows 10 and later). `false` when
+/// standard error isn't a console, or the console can't.
+pub fn console_vt() -> bool {
+    // SAFETY: GetStdHandle takes a constant; what it returns is this process's (or none).
+    let console = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    if console.is_null() || console as isize == -1 {
+        return false;
+    }
+    let mut mode = 0u32;
+    // SAFETY: `mode` lives on this stack; `console` is this process's standard error.
+    if unsafe { GetConsoleMode(console, &mut mode) } == 0 {
+        return false;
+    }
+    if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+        return true;
+    }
+    // SAFETY: as above.
+    unsafe { SetConsoleMode(console, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 }
 }
 
 /// Whether this process runs with an administrator's full rights: elevated, or UAC is off.

@@ -1,0 +1,421 @@
+/* The glyphs (status-glyph.tsx): each state's shape moves in a way of its own, only transform and
+   opacity, all on the page's clock (phaseLock). Still under reduced motion; paused by Kiln's motion
+   toggle. */
+
+.sg {
+  display: inline-block;
+  flex: none;
+  overflow: visible;
+  vertical-align: -2px;
+}
+.sg .sg-m {
+  transform-box: view-box;
+  transform-origin: 7px 7px;
+}
+.sg .sg-turn {
+  animation: sg-turn 1.4s linear infinite;
+}
+.sg .sg-call {
+  animation: sg-call 0.8s ease-in-out infinite alternate;
+}
+.sg .sg-breathe {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sg-breathe 1.3s ease-in-out infinite alternate;
+}
+.sg .sg-swap-a {
+  animation: sg-swap-a 2.4s ease-in-out infinite;
+}
+.sg .sg-swap-b {
+  animation: sg-swap-b 2.4s ease-in-out infinite;
+}
+.sg .sg-crawl {
+  animation: sg-turn 10s linear infinite;
+}
+.sg .sg-crawl-slow {
+  animation: sg-turn 20s linear infinite reverse;
+}
+.sg .sg-glow {
+  animation: sg-glow 3.2s ease-in-out infinite alternate;
+}
+.sg .sg-wave {
+  animation: sg-wave 1.8s ease-in-out infinite alternate;
+}
+.sg .sg-throb {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sg-throb 1.6s ease-in-out infinite alternate;
+}
+.sg .sg-blink {
+  animation: sg-blink 1.2s ease-in-out infinite alternate;
+}
+.sg .sg-hand {
+  animation: sg-turn 6s linear infinite;
+}
+.sg .sg-flicker {
+  animation: sg-flicker 2.6s linear infinite;
+}
+.sg .sg-fade {
+  animation: sg-fade 3s ease-in-out infinite alternate;
+}
+.sg .sg-rewind {
+  animation: sg-rewind 2.4s ease-in-out infinite;
+}
+.sg .sg-sway {
+  transform-origin: 7px 12.6px;
+  animation: sg-sway 3s ease-in-out infinite alternate;
+}
+.sg .sg-drift {
+  animation: sg-wave 2.2s ease-in-out infinite alternate;
+}
+.sg .sg-twinkle {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sg-twinkle 2.4s ease-in-out infinite;
+}
+.sg .sg-flutter {
+  transform-origin: 3px 4.8px;
+  animation: sg-flutter 2s ease-in-out infinite alternate;
+}
+
+@keyframes sg-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes sg-call {
+  from {
+    opacity: 0.62;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes sg-breathe {
+  from {
+    transform: scale(0.82);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+@keyframes sg-swap-a {
+  0%,
+  20% {
+    opacity: 1;
+  }
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+}
+@keyframes sg-swap-b {
+  0%,
+  20% {
+    opacity: 0.25;
+  }
+  60%,
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes sg-glow {
+  from {
+    opacity: 0.72;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes sg-wave {
+  from {
+    transform: translateX(-0.7px);
+  }
+  to {
+    transform: translateX(0.7px);
+  }
+}
+@keyframes sg-throb {
+  from {
+    transform: scale(0.84);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+@keyframes sg-blink {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.5;
+  }
+}
+@keyframes sg-flicker {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  8% {
+    opacity: 0.45;
+  }
+  12% {
+    opacity: 1;
+  }
+  54% {
+    opacity: 0.8;
+  }
+  58% {
+    opacity: 0.4;
+  }
+  62% {
+    opacity: 1;
+  }
+}
+@keyframes sg-fade {
+  from {
+    opacity: 0.45;
+  }
+  to {
+    opacity: 0.95;
+  }
+}
+@keyframes sg-rewind {
+  0%,
+  60%,
+  100% {
+    transform: rotate(0deg);
+  }
+  30% {
+    transform: rotate(-32deg);
+  }
+}
+@keyframes sg-sway {
+  from {
+    transform: rotate(-7deg);
+  }
+  to {
+    transform: rotate(7deg);
+  }
+}
+@keyframes sg-twinkle {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(0.8);
+    opacity: 0.7;
+  }
+}
+@keyframes sg-flutter {
+  from {
+    transform: skewY(-6deg);
+  }
+  to {
+    transform: skewY(4deg);
+  }
+}
+
+/* The journey strip: six pips joined by a line, lit once the stage before is done, light flowing
+   into a stage with work under way. */
+.js {
+  display: inline-flex;
+  align-items: flex-start;
+}
+.js-p {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 22px;
+}
+.js-l {
+  color: #5c6470;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.js-p[data-on] .js-l {
+  color: #8c8f98;
+}
+.js-c {
+  position: relative;
+  flex: none;
+  width: 18px;
+  height: 1px;
+  margin-top: 7px;
+  overflow: hidden;
+  background: rgb(255 255 255 / 10%);
+}
+.js-c[data-lit] {
+  background: rgb(191 220 207 / 45%);
+}
+.js-c[data-flow]::after {
+  position: absolute;
+  inset: 0;
+  width: 60%;
+  background: linear-gradient(90deg, transparent, #a6c4ed, #b8a6d5, transparent);
+  content: "";
+  animation: sg-beam 1.6s linear infinite;
+}
+@keyframes sg-beam {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(200%);
+  }
+}
+@media (max-width: 720px) {
+  .js-l {
+    display: none;
+  }
+  .js-c {
+    width: 9px;
+  }
+  .js-p {
+    min-width: 16px;
+  }
+}
+
+/* A timeline's bars wear the pause button's rim (console.css), laid flat: each state's palette
+   sliding under the bar, uneven glints passing over it at their own pace. */
+.sg-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 4px;
+  overflow: hidden;
+  isolation: isolate;
+  border-radius: 5px;
+  --rim: linear-gradient(90deg, #8d869f, #aca1d5 21%, #d3c6ee 29%, #8a7cae 42%, #b5a7db 68%, #8d869f);
+  --glint: rgb(225 215 245 / 35%);
+  --current: 24s;
+  --spark: 19s;
+}
+.sg-bar::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: -1;
+  width: 300%;
+  background: var(--rim);
+  background-size: 33.34% 100%;
+  content: "";
+  animation: sg-current var(--current) linear infinite;
+}
+.sg-bar::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -100%;
+  width: 300%;
+  background: linear-gradient(100deg, transparent 4%, var(--glint) 7%, transparent 10% 33%, var(--glint) 35%, transparent 38% 69%, var(--glint) 73%, transparent 77%);
+  content: "";
+  animation: sg-spark var(--spark) linear infinite reverse;
+}
+.sg-bar:is([data-s="running"], [data-s="guard"], [data-s="replanting"]) {
+  --rim: linear-gradient(
+    90deg,
+    #b8d9d2,
+    #7194c9 8%,
+    #c8e0ef 13%,
+    #a6c4ed 23%,
+    #8677ad 32%,
+    #d7c1ee 37%,
+    #b8a6d5 46%,
+    #d6a2aa 55%,
+    #eed6bc 59%,
+    #a2bfae 66%,
+    #d8cbb0 77%,
+    #a6c4ed 85%,
+    #d6a2aa 91%,
+    #b8d9d2
+  );
+  --glint: rgb(245 234 255 / 90%);
+  --current: 5.3s;
+  --spark: 3.7s;
+}
+.sg-bar:is([data-s="failed"], [data-s="rolledback"]) {
+  --rim: linear-gradient(90deg, #996f77, #d1aaad 23%, #e1bdc0 30%, #a17b83 46%, #c29ba1 73%, #996f77);
+  --glint: rgb(233 197 200 / 20%);
+  --current: 52s;
+  --spark: 43s;
+}
+.sg-bar:is([data-s="passed"], [data-s="replanted"], [data-s="soaking"], [data-s="reused"], [data-s="healthy"]) {
+  --rim: linear-gradient(90deg, #79978a, #a8c9bc 22%, #d2e6d8 32%, #8aafa0 49%, #b4d0bd 76%, #79978a);
+  --glint: rgb(225 240 229 / 30%);
+  --current: 32s;
+  --spark: 27s;
+}
+.sg-bar[data-s="needs"] {
+  --rim: linear-gradient(90deg, #a8906a, #e2cfae 22%, #f0e2c6 32%, #b39b74 49%, #d8c39d 76%, #a8906a);
+  --glint: rgb(245 232 205 / 55%);
+  --current: 11s;
+  --spark: 8s;
+}
+.sg-bar:is([data-s="flaky"], [data-s="partial"]) {
+  --rim: linear-gradient(90deg, #8f7a5c, #d0b591 22%, #e3cfae 32%, #9c8566 49%, #c4a982 76%, #8f7a5c);
+  --glint: rgb(240 225 200 / 35%);
+  --current: 32s;
+  --spark: 27s;
+}
+.sg-bar:is([data-s="superseded"], [data-s="offline"], [data-s="none"]) {
+  --rim: linear-gradient(90deg, #555962, #797c84 24%, #898c94 34%, #656872 53%, #777a82 80%, #555962);
+  --glint: rgb(163 166 173 / 10%);
+  --current: 100s;
+  --spark: 83s;
+}
+.sg-bar:is([data-s="queued"], [data-s="waiting"]) {
+  opacity: 0.55;
+}
+@keyframes sg-current {
+  to {
+    transform: translateX(-33.34%);
+  }
+}
+@keyframes sg-spark {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: translateX(0);
+  }
+  17% {
+    opacity: 1;
+  }
+  21% {
+    transform: translateX(6%);
+  }
+  43% {
+    opacity: 0.3;
+  }
+  47% {
+    transform: translateX(22%);
+  }
+  71% {
+    opacity: 0.8;
+  }
+  76% {
+    transform: translateX(28%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sg *,
+  .js-c::after,
+  .sg-bar::before,
+  .sg-bar::after {
+    animation: none !important;
+  }
+}
+html[data-motion="paused"] .sg *,
+html[data-motion="paused"] .js-c::after,
+html[data-motion="paused"] .sg-bar::before,
+html[data-motion="paused"] .sg-bar::after {
+  animation-play-state: paused !important;
+}

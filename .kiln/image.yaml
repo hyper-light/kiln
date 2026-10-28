@@ -17,11 +17,30 @@ jobs:
     runs-on: [baremetal, local]
     # Linux, as that Docker is. Saying so also gets the job to its runner whole from a server that
     # left an empty `requires` out of an assignment (a084bb776's): runners refused it as malformed.
-    requires: ["os == linux"]
-    timeout-minutes: 60
+    # It builds kiln as release's linux job does when it gets there first (W28-R78).
+    requires: ["os == linux", "tools has cargo", "tools has python3", "tools has node"]
+    timeout-minutes: 90
     steps:
+      # The UI and x86_64 musl steps leave their `memo:` out until the kiln deployed reads it: that
+      # kiln builds its successor from this file, and one from before 159234cd51 refuses the key, so
+      # no image could be built (run 1364). v1 ignores a memo anyway.
+      # One UI build per ui/ tree for ci, release and image (docs/ci.md W28-R77): this step's text,
+      # memo and place among memo steps are the same in every job that builds the UI, so is its key
+      # (W28-R70), and the first job to reach it builds it while the others wait and take it
+      # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
+      - name: ui
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+      # One x86_64-unknown-linux-musl build per commit for release and the image (W28-R78): the
+      # same text and memo in both, after the shared UI step; its commit named, as the binary
+      # embeds it (KILN_COMMIT).
+      - name: x86_64 musl
+        run: KILN_COMMIT=$KILN_SHA nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
+      # The image takes that binary (the Dockerfile's `prebuilt` target) until W24-R29's
+      # operations replace BuildKit; static, as job pods copy it into any image.
       - name: build
-        run: docker build -q --build-arg KILN_COMMIT=$KILN_SHA --label kiln.published=kiln -t kiln:$KILN_SHA .
+        run: |
+          if readelf -l dist/kiln-x86_64-unknown-linux-musl | grep -q INTERP; then echo "dist/kiln-x86_64-unknown-linux-musl is not static" >&2; exit 1; fi
+          docker build -q --target prebuilt --build-arg KILN_BINARY=dist/kiln-x86_64-unknown-linux-musl --label kiln.published=kiln -t kiln:$KILN_SHA .
       - name: publish
         run: |
           if [ -n "${KILN_IMAGE_KILN:-}" ]; then

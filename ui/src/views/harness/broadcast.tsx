@@ -128,9 +128,9 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
   const [tune, setTune] = React.useState<Tune>(ANY);
   // Who gets what's sent from here: those the selectors leave (all of them while each is Any).
   const agents = tuned(everyone, tune, preview);
-  const [own, setOwn] = React.useState("");
-  const text = given ?? own;
-  const setText = onText ?? setOwn;
+  const [typed, setTyped] = React.useState("");
+  const text = given ?? typed;
+  const setText = onText ?? setTyped;
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [found, setFound] = React.useState(0);
   const field = React.useRef<HTMLTextAreaElement | null>(null);
@@ -198,13 +198,15 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
     if (!(await send({ approvals: decision }))) unmark(asked);
   };
 
-  // kiln's own, for all of them at once: asked in the line under the field, as any command.
+  // kiln's own, for all of them at once: asked in the line under the field, as any command. They
+  // take no words, and their route is a command's default (they're run here, never routed).
+  const own = (name: string, description: string): SlashCommand => ({ name, group: "Kiln", args: "none", description, hint: "", route: { kind: "prompt" } });
   const kiln: SlashCommand[] = [
-    { name: "interrupt", group: "Kiln", args: "none", description: working > 0 ? `Stop the turn of ${count(working, "working agent")}` : "Stop their turns (none is working)" },
-    { name: "restart", group: "Kiln", args: "none", description: `Restart ${count(n, "agent")}` },
-    { name: "allow", group: "Kiln", args: "none", description: waiting > 0 ? `Allow ${count(waiting, "tool call")} waiting on you` : "Allow what waits on you (nothing does)" },
-    { name: "deny", group: "Kiln", args: "none", description: waiting > 0 ? `Deny ${count(waiting, "tool call")} waiting on you` : "Deny what waits on you (nothing does)" },
-    ...(reach === "selected" ? [{ name: "end", group: "Kiln", args: "none" as const, description: `End ${count(n, "agent")}: their processes stop` }] : []),
+    own("interrupt", working > 0 ? `Stop the turn of ${count(working, "working agent")}` : "Stop their turns (none is working)"),
+    own("restart", `Restart ${count(n, "agent")}`),
+    own("allow", waiting > 0 ? `Allow ${count(waiting, "tool call")} waiting on you` : "Allow what waits on you (nothing does)"),
+    own("deny", waiting > 0 ? `Deny ${count(waiting, "tool call")} waiting on you` : "Deny what waits on you (nothing does)"),
+    ...(reach === "selected" ? [own("end", `End ${count(n, "agent")}: their processes stop`)] : []),
   ];
   const kilns = (name: string) => kiln.some((c) => c.name === name);
   // The slash palette: kiln's own first, then what the agents understand, marked where only some do.

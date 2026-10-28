@@ -15,7 +15,7 @@ import { RoundButton } from "./figure/figure";
 import { AtLimit } from "./elsewhere";
 import { LimitBadge, topLimit, UsagePanel } from "./limits";
 import { machineName } from "./parts";
-import { RunSettings, type RunSettingsProps } from "./run-settings";
+import { modelIn, RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
 import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
@@ -151,8 +151,12 @@ export function AgentHeader({
     onMode: !switching && features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined,
     modeCanReapply: permissionsLive && running,
     models: meta?.models ?? [],
-    model: switching?.model ?? state?.model ?? info?.model ?? "",
-    onModel: features.includes("set_model") ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m }) : undefined,
+    // A switch waiting shows as that harness's model (its own default, for none).
+    model: switching ? modelIn(switching.kind, switching.model) : (state?.model ?? info?.model ?? ""),
+    onModel:
+      features.includes("set_model") || features.includes("switch_harness")
+        ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m })
+        : undefined,
     harness: switching?.kind ?? info?.kind,
     modelLabel,
     efforts: switching ? (switching.efforts ?? []) : (meta?.efforts ?? []),
@@ -257,7 +261,7 @@ export function AgentHeader({
       </div>
       {switchTarget ? (
         <React.Suspense fallback={<RunSettings {...line} />}>
-          <RunSettingsElsewhere {...line} target={switchTarget} />
+          <RunSettingsElsewhere {...line} target={switchTarget} own={info?.kind} />
         </React.Suspense>
       ) : (
         <RunSettings {...line} />
@@ -283,9 +287,9 @@ export function AgentHeader({
   );
 }
 
-/** The line with the models of the other harnesses on the agent's machine it can go on in (its conversation carried over). */
-function RunSettingsElsewhere({ target, ...line }: RunSettingsProps & { target: string }) {
+/** The line with the models of the other harnesses on the agent's machine it can go on in (its conversation carried over), the one a switch waits for among them; `own`: the harness it runs in. */
+function RunSettingsElsewhere({ target, own, ...line }: RunSettingsProps & { target: string; own?: string }) {
   const kinds = useSuspenseResource(`harness-kinds/${target}`, () => harnessApi.kinds(target).catch((): KindInfo[] => []), { pollMs: 120_000 });
-  const elsewhere = kinds.data.filter((k) => k.switch && k.available && k.id !== line.harness).map((k) => ({ kind: k.id, name: k.name, models: k.models ?? [] }));
+  const elsewhere = kinds.data.filter((k) => k.switch && k.available && k.id !== own).map((k) => ({ kind: k.id, name: k.name, models: k.models ?? [] }));
   return <RunSettings {...line} elsewhere={elsewhere} />;
 }

@@ -13,8 +13,15 @@
 //!   source step's log, summary, annotations and test reports over, as a reused leg takes its
 //!   source's (W08-R10). Only a success stands: one within `max_age`, whose leg is still kept and
 //!   whose files are still kept.
-//! - `POST record` `{ unit, step, ms, max_age, outputs }`: a step's success, kept on the same path
-//!   (`work::record`): 201 `{ key }`.
+//!   With `flight: true` (W28-R72 to R75), a miss is a turn in the table of steps in flight
+//!   (`kiln_ci::work::flight`, [`Flights`]): 201 `{ lease }` (execute it, renewing the lease) or
+//!   202 `{ in_flight }` (another leg's step executes it: wait).
+//! - `POST wait` `{ unit, step, max_age }`: a waiter asks again, held up to 20 s until the ledger
+//!   has the result (200, as `lookup`), its turn comes (201) or still 202.
+//! - `POST renew` `{ lease }` → `{ held }`; `POST release` `{ lease }`: a lease let go without a
+//!   success (a failure, a cancel), so the next waiter takes it.
+//! - `POST record` `{ unit, step, ms, max_age, outputs, lease? }`: a step's success, kept on the
+//!   same path (`work::record`): 201 `{ key }`; its lease, if it held one, let go after.
 //!   Its files' tree (`outputs.files`) and every file in it must be in the store already; they're
 //!   kept while a lookup could reuse it (`work.object`, until its `max_age` is up), then
 //!   [`sweep`] lets them go and the store collects them.
@@ -38,6 +45,7 @@ use std::sync::Arc;
 use http::{Method, StatusCode, header};
 use kiln_ci::work::key::{Key, PathSet, Read, Unit};
 use kiln_ci::work::tests::{self as test_results, Choice};
+use kiln_ci::work::flight;
 use kiln_ci::work::memo::{self, Digest, Replay};
 use rusqlite::{OptionalExtension as _, params};
 use serde::Deserialize;
@@ -85,6 +93,9 @@ struct LegOf {
     key: String,
     branch: String,
     run_attempt: i64,
+    /// The run's number and workflow, as a waiter is told of the step it waits on (W28-R75).
+    number: i64,
+    workflow: String,
 }
 
 impl LegOf {
@@ -97,22 +108,23 @@ impl LegOf {
 
 async fn leg_of(hub: &Hub, claims: &token::Claims) -> anyhow::Result<Option<LegOf>> {
     let (leg, run) = (claims.sub.clone(), claims.run.clone());
-    let row: Option<(String, String, String, String, i64, String, String, String, String, i64, String)> = hub
+    let row: Option<(String, String, String, String, i64, String, String, String, String, i64, String, i64, String)> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT j.id, j.run_id, p.name, r.trust, j.attempt, COALESCE(j.agent, ''), r.sha, COALESCE(j.key, j.id), r.branch, COALESCE(j.run_attempt, 1), COALESCE(r.event, '')
+                "SELECT j.id, j.run_id, p.name, r.trust, j.attempt, COALESCE(j.agent, ''), r.sha, COALESCE(j.key, j.id), r.branch, COALESCE(j.run_attempt, 1), COALESCE(r.event, ''),
+                        COALESCE(r.number, 0), COALESCE(r.workflow_id, '')
                  FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1 AND j.run_id = ?2",
                 params![leg, run],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?)),
             )
             .optional()?)
         })
         .await?;
-    Ok(row.map(|(id, run, repo, trust, attempt, runner, sha, key, branch, run_attempt, event)| {
+    Ok(row.map(|(id, run, repo, trust, attempt, runner, sha, key, branch, run_attempt, event, number, workflow)| {
         // A diff's own work, as it's reviewed, is untrusted: the land queue never takes it (W24-R20).
         let domain = crate::ci::reuse::domain(crate::ci::reuse::work_trusted(trust == "trusted", &event));
-        LegOf { scope: work::scope(&repo, domain), id, run, repo, domain, attempt: u32::try_from(attempt).unwrap_or(0), runner, sha, key, branch, run_attempt }
+        LegOf { scope: work::scope(&repo, domain), id, run, repo, domain, attempt: u32::try_from(attempt).unwrap_or(0), runner, sha, key, branch, run_attempt, number, workflow }
     }))
 }
 
@@ -126,6 +138,9 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
     match (method, rest) {
         (Method::POST, ["lookup"]) => lookup(hub, &leg, req).await,
         (Method::POST, ["record"]) => record(hub, &leg, req).await,
+        (Method::POST, ["wait"]) => wait(hub, &leg, req).await,
+        (Method::POST, ["renew"]) => renew(hub, req).await,
+        (Method::POST, ["release"]) => release(hub, req).await,
         (Method::POST, ["missing"]) => missing(hub, &leg, req).await,
         (Method::POST, ["tests", "select"]) => tests_select(hub, &leg, req).await,
         (Method::POST, ["tests", "record"]) => tests_record(hub, &leg, req).await,
@@ -275,6 +290,9 @@ struct LookupIn {
     step: u32,
     #[serde(default)]
     max_age: Option<u64>,
+    /// A miss is a turn in the table of steps in flight (W28-R72): 201 or 202 rather than 204.
+    #[serde(default)]
+    flight: bool,
 }
 
 /// What stands for a step's unit: the newest success in the scope, within `max_age`, its leg still
@@ -283,11 +301,41 @@ struct LookupIn {
 async fn lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
     let l: LookupIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
     let unit = leg.unit(l.unit);
+    if let Some(found) = found(hub, leg, &unit, l.max_age).await.map_err(internal)? {
+        return hit(hub, leg, l.step, found).await;
+    }
+    if !l.flight {
+        return Ok(srv::status(StatusCode::NO_CONTENT));
+    }
+    turn(hub, leg, &unit, l.step).await
+}
+
+/// A waiter asks again (W28-R75): held until the ledger has the result, its turn comes, or 20 s
+/// pass (the runner asks again, renewing its place).
+async fn wait(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
+    let l: LookupIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
+    let unit = leg.unit(l.unit);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(found) = found(hub, leg, &unit, l.max_age).await.map_err(internal)? {
+            return hit(hub, leg, l.step, found).await;
+        }
+        let answer = turn(hub, leg, &unit, l.step).await?;
+        if answer.status() != StatusCode::ACCEPTED || std::time::Instant::now() >= until {
+            return Ok(answer);
+        }
+        crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// What stands for a step's unit: the newest success in the scope, within `max_age`, its leg still
+/// kept (a pruned run takes its logs with it), and its files still kept: its tree's `work.object`
+/// not yet due (each file in it is kept at least as long, [`keep_object`]) and in the store.
+async fn found(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, max_age: Option<u64>) -> anyhow::Result<Option<(Key, Recorded, i64)>> {
     let now = crate::util::now_unix();
-    let since = now.saturating_sub(i64::try_from(l.max_age.unwrap_or(memo::MAX_AGE)).unwrap_or(i64::MAX));
-    let scope = leg.scope.clone();
-    let found: Option<(Key, Recorded, i64)> = hub
-        .store
+    let since = now.saturating_sub(i64::try_from(max_age.unwrap_or(memo::MAX_AGE)).unwrap_or(i64::MAX));
+    let (scope, unit) = (leg.scope.clone(), unit.clone());
+    hub.store
         .call(move |c| {
             let same = |p: &PathSet| p.clone();
             let Some(work::Hit { key, recorded: rec, .. }) = work::lookup(c, &scope, &unit, &same)? else { return Ok(None) };
@@ -306,18 +354,116 @@ async fn lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, F
             Ok(number.map(|n| (key, rec, n)))
         })
         .await
-        .map_err(internal)?;
-    let Some((key, rec, number)) = found else { return Ok(srv::status(StatusCode::NO_CONTENT)) };
-    take_over(hub, leg, l.step, &rec).await.map_err(internal)?;
+}
+
+/// A hit: the leg's step takes its source's log over, and is told what it left and where from.
+async fn hit(hub: &Arc<Hub>, leg: &LegOf, step: u32, (key, rec, number): (Key, Recorded, i64)) -> Result<Response, Fail> {
+    take_over(hub, leg, step, &rec).await.map_err(internal)?;
     let p = &rec.provenance;
+    let workflow: Option<String> = {
+        let run = p.run.clone();
+        hub.store.call(move |c| Ok(c.query_row("SELECT workflow_id FROM runs WHERE id = ?1", [&run], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await.map_err(internal)?
+    };
     Ok(srv::json(
         StatusCode::OK,
         &json!({
             "key": key.hex(),
             "outputs": rec.outputs,
-            "source": { "run": p.run, "number": number, "leg": p.leg, "step": p.step, "attempt": p.attempt, "runner": p.runner, "commit": p.commit, "finished_at": p.finished_at, "ms": p.ms },
+            "source": { "run": p.run, "number": number, "workflow": workflow, "leg": p.leg, "step": p.step, "attempt": p.attempt, "runner": p.runner, "commit": p.commit, "finished_at": p.finished_at, "ms": p.ms },
         }),
     ))
+}
+
+/// The unit's key in the table of steps in flight: its weak key whatever its domain, so a leg may
+/// wait on an execution of a domain it reads, within its repository.
+fn flight_key(leg: &LegOf, unit: &Unit) -> String {
+    format!("{}|{}", leg.repo, kiln_ci::work::key::weak(&Unit { trust: String::new(), ..unit.clone() }).hex())
+}
+
+fn holder(leg: &LegOf, step: u32) -> flight::Holder {
+    flight::Holder { run: leg.run.clone(), number: leg.number, workflow: leg.workflow.clone(), leg: leg.id.clone(), step, attempt: leg.attempt, runner: leg.runner.clone() }
+}
+
+/// A miss, as a turn in the table of steps in flight (W28-R72 to R74).
+async fn turn(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, step: u32) -> Result<Response, Fail> {
+    let domain = kiln_ci::work::trust::Domain::parse(leg.domain).map_err(bad)?;
+    let (key, who) = (flight_key(leg, unit), holder(leg, step));
+    let answer = hub.flight.with(hub, move |f, now| f.ask(&key, &domain, &who, now)).await.map_err(internal)?;
+    Ok(match answer {
+        flight::Answer::Execute { lease } => srv::json(StatusCode::CREATED, &json!({ "lease": lease })),
+        flight::Answer::Alone => srv::status(StatusCode::NO_CONTENT),
+        flight::Answer::Wait { holder, domain, since, ahead, turn } => srv::json(
+            StatusCode::ACCEPTED,
+            &json!({ "in_flight": { "holder": holder, "said": holder.said(), "domain": domain, "since": since, "ahead": ahead, "turn": turn } }),
+        ),
+    })
+}
+
+#[derive(Deserialize)]
+struct LeaseIn {
+    lease: String,
+}
+
+/// The holder of a lease is still at it.
+async fn renew(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
+    let l: LeaseIn = srv::body_json(req.into_body(), 1 << 16).await.map_err(bad)?;
+    let held = hub.flight.with(hub, move |f, now| f.renew(&l.lease, now)).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &json!({ "held": held })))
+}
+
+/// A lease let go without a success: the next waiter's turn (W28-R73).
+async fn release(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
+    let l: LeaseIn = srv::body_json(req.into_body(), 1 << 16).await.map_err(bad)?;
+    let gone = hub.flight.with(hub, move |f, now| f.end(&l.lease, now).is_some()).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &json!({ "released": gone })))
+}
+
+/// The table of steps in flight (W28-R72 to R74), kept in memory and its leases in SQLite
+/// (`work_flight`), so a restart rebuilds it: their holders renew them or they lapse.
+#[derive(Default)]
+pub struct Flights {
+    table: async_lock::Mutex<Option<flight::Flight>>,
+}
+
+impl Flights {
+    /// Runs `op` on the table (loaded once from SQLite), then keeps its leases as they stand.
+    async fn with<T>(&self, hub: &Hub, op: impl FnOnce(&mut flight::Flight, i64) -> T) -> anyhow::Result<T> {
+        let mut table = self.table.lock().await;
+        if table.is_none() {
+            let rows: Vec<String> = hub.store.call(|c| Ok(c.prepare("SELECT lease FROM work_flight")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)).await?;
+            let mut f = flight::Flight::new();
+            for json in rows {
+                match serde_json::from_str::<flight::Lease>(&json) {
+                    Ok(l) => f.restore(l),
+                    Err(e) => tracing::warn!(error = %e, "a kept lease of a step in flight doesn't read; it's let go"),
+                }
+            }
+            *table = Some(f);
+        }
+        let Some(f) = table.as_mut() else { anyhow::bail!("the table of steps in flight isn't loaded") };
+        let now = crate::util::now_ms();
+        let before: BTreeMap<String, flight::Lease> = f.leases().map(|l| (l.id.clone(), l.clone())).collect();
+        let out = op(f, now);
+        let after: BTreeMap<String, flight::Lease> = f.leases().filter(|l| now.saturating_sub(l.renewed) <= flight::LEASE_TTL_MS).map(|l| (l.id.clone(), l.clone())).collect();
+        if before != after {
+            let gone: Vec<String> = before.keys().filter(|k| !after.contains_key(*k)).cloned().collect();
+            let put: Vec<(String, String)> = after.iter().filter(|(k, l)| before.get(*k) != Some(*l)).map(|(k, l)| (k.clone(), serde_json::to_string(l).unwrap_or_default())).collect();
+            hub.store
+                .call(move |c| {
+                    let tx = crate::store::tx(c)?;
+                    for id in &gone {
+                        tx.execute("DELETE FROM work_flight WHERE id = ?1", [id])?;
+                    }
+                    for (id, json) in &put {
+                        tx.execute("INSERT INTO work_flight (id, lease) VALUES (?1, ?2) ON CONFLICT (id) DO UPDATE SET lease = excluded.lease", params![id, json])?;
+                    }
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
+        }
+        Ok(out)
+    }
 }
 
 /// The leg's step `idx` takes its source's over: its log, summary, annotations and test reports.
@@ -377,6 +523,9 @@ struct RecordIn {
     max_age: Option<u64>,
     #[serde(default)]
     outputs: BTreeMap<String, String>,
+    /// The lease it executed under (W28-R72), let go once its result is kept.
+    #[serde(default)]
+    lease: Option<String>,
 }
 
 /// An object an entry refers to, kept in the scope until `until` at least: of every result that
@@ -473,6 +622,10 @@ async fn record(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, F
         Ok(k) => k,
         Err(e) => return Ok(msg(StatusCode::BAD_REQUEST, &e)),
     };
+    // Kept first, then the lease goes: its waiters' next lookup is a hit (W28-R72).
+    if let Some(lease) = r.lease {
+        hub.flight.with(hub, move |f, now| f.end(&lease, now)).await.map_err(internal)?;
+    }
     tracing::debug!(leg = %leg.id, step = r.step, key = %key, "a step's result kept for reuse");
     Ok(srv::json(StatusCode::CREATED, &json!({ "key": key.hex() })))
 }
