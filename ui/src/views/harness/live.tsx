@@ -24,6 +24,7 @@ import { duration } from "./derive";
 import { Beam, PrismLabel } from "./signals";
 import { chunkOf, fieldAt, liveOf, modifiers, pagePoint, secret, shapeOf, typedUrl, type FieldPlace, type LiveStream, type PageField } from "./live-of";
 import { SourcePlayer, sourcePlays } from "./live-source";
+import { shownTitle } from "./page-of";
 import "./page.css";
 import "./live.css";
 
@@ -1155,7 +1156,7 @@ export function LiveView({ call }: { call: ToolCall & { id: string } }) {
       <div className="pg-head">
         <Beam status={running ? "running" : "error"} className="pg-beam" />
         <PrismLabel live={running} className="pg-title">
-          {call.title || "A live page"}
+          {shownTitle(call, "A live page")}
         </PrismLabel>
         <span className="pg-said">{running ? "Opening it on the agent's machine" : ""}</span>
       </div>
