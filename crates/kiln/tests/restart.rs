@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Options, Server, http, start};
+use common::{Options, Server, http, machine, start};
 use serde_json::{Value, json};
 
 fn git(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -100,7 +100,7 @@ fn w05_ac09_a_restart_rebuilds_the_queue() -> anyhow::Result<()> {
         let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
         let agents: Value = serde_json::from_str(&body).unwrap_or_default();
         let list = agents.as_array().cloned().or_else(|| agents.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        let up = list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("keeper") && a.get("connected").and_then(Value::as_bool).unwrap_or(true));
+        let up = list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(machine("keeper").as_str()) && a.get("connected").and_then(Value::as_bool).unwrap_or(true));
         Ok((!up).then(|| format!("{body}\n{}", runner_log())))
     })?;
     let (git_home, work) = (dir.path().join("githome"), dir.path().join("tree"));

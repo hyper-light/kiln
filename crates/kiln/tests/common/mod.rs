@@ -54,6 +54,14 @@ pub fn kiln() -> Command {
     cmd
 }
 
+/// The key kiln knows a runner a test started as `name` by: its machine id (docs/machines.md),
+/// made from the `KILN_MACHINE_ID` the test gives it (`name`) as `os::machine_id` makes one. It's
+/// shown by `name`, its label.
+pub fn machine(name: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(format!("kiln machine id\n{}", name.trim().to_ascii_lowercase()))).chars().take(32).collect()
+}
+
 /// A port free now.
 pub fn free_port() -> anyhow::Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())

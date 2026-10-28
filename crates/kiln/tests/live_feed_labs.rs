@@ -417,14 +417,16 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
         None => ("local".to_owned(), None),
         Some(name) => {
             let r = Runner::join(dir.path(), &s, name)?;
+            // Known by its machine id (docs/machines.md).
+            let key = common::machine(name);
             wait_for("the lab's runner, connected", Duration::from_secs(90), || {
                 let (_, body) = common::http(port, "GET", "/api/agents", &admin, None)?;
                 let v: Value = serde_json::from_str(&body).unwrap_or_default();
                 let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-                Ok(list.iter().any(|x| x.get("name").and_then(Value::as_str) == Some(name) && x.get("connected").and_then(Value::as_bool) == Some(true)))
+                Ok(list.iter().any(|x| x.get("name").and_then(Value::as_str) == Some(key.as_str()) && x.get("connected").and_then(Value::as_bool) == Some(true)))
             })
             .map_err(|e| anyhow::anyhow!("{e:#}\nthe runner's log:\n{}", std::fs::read_to_string(dir.path().join("runner.log")).unwrap_or_default()))?;
-            (format!("agent:{name}"), Some(r))
+            (format!("agent:{key}"), Some(r))
         }
     };
     // Viewers attach once the session runs where it was started.

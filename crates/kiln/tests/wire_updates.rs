@@ -18,7 +18,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk, frame, just_connected, socket};
-use common::{Options, http, start};
+use common::{Options, http, machine, start};
 use serde_json::{Value, json};
 
 /// A runner of the server at `port` whose link is cut for `down` every `every`, the stand-in
@@ -67,7 +67,7 @@ fn a_sessions_updates_survive_a_cut_link() -> anyhow::Result<()> {
 
     // A session there, streaming through the cuts. It's opened just after the runner connects
     // again: opening isn't on the channel yet (plan step 3), so a cut as it goes would lose it.
-    let open = json!({"target": "agent:wire-runner", "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
+    let open = json!({"target": format!("agent:{}", machine("wire-runner")), "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
     let deadline = Instant::now() + Duration::from_secs(90);
     let id = loop {
         just_connected(&log_path, deadline);
@@ -148,7 +148,7 @@ fn a_terminal_reaches_its_viewer_whole_through_cut_links() -> anyhow::Result<()>
     just_connected(&log_path, deadline);
     let cmd = format!("for i in $(seq 1 {LINES}); do echo t$i.; sleep 0.1; done");
     let q: String = cmd.bytes().map(|b| if b.is_ascii_alphanumeric() { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
-    let mut ws = socket(s.port, &s.admin, &format!("/api/terminal/ws?target=agent:term-runner&cols=120&rows=40&cmd={q}"))?;
+    let mut ws = socket(s.port, &s.admin, &format!("/api/terminal/ws?target=agent:{}&cols=120&rows=40&cmd={q}", machine("term-runner")))?;
     let mut screen = Vec::new();
     let mut said = Vec::new();
     let until = Instant::now() + Duration::from_secs(420);
@@ -218,7 +218,7 @@ fn frames_lost_below_the_channel_are_made_up_for() -> anyhow::Result<()> {
     std::fs::create_dir_all(&work)?;
     let (_runner, log_path) = runner_with(dir.path(), s.port, "shed-runner", "shed=term/46:7", LINES)?;
     let runner_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
-    let open = json!({"target": "agent:shed-runner", "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
+    let open = json!({"target": format!("agent:{}", machine("shed-runner")), "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
     let deadline = Instant::now() + Duration::from_secs(90);
     let id = loop {
         let (code, body) = http(s.port, "POST", "/api/harness/sessions", &s.admin, Some(&open))?;
@@ -267,12 +267,14 @@ fn frames_lost_below_the_channel_are_made_up_for() -> anyhow::Result<()> {
         let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
         let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        let me = list.iter().find(|a| a.get("name").and_then(Value::as_str) == Some("shed-runner")).cloned().unwrap_or_default();
+        let me = list.iter().find(|a| a.get("name").and_then(Value::as_str) == Some(machine("shed-runner").as_str())).cloned().unwrap_or_default();
         let count = |field: &str, lane: &str| {
             me.get(field).and_then(Value::as_array).into_iter().flatten().filter(|d| d.get("lane").and_then(Value::as_str) == Some(lane) && d.get("reason").and_then(Value::as_str) == Some("chaos")).filter_map(|d| d.get("frames").and_then(Value::as_u64)).sum::<u64>()
         };
         let (theirs, toward) = (count("dropped", "term"), count("dropped_toward", "control"));
-        let gauge = metric(s.port, &s.admin, r#"kiln_runner_net_frames_dropped{runner="shed-runner",lane="term",reason="chaos"}"#);
+        // Its series carries its machine's id and the name people see (docs/machines.md).
+        let key = machine("shed-runner");
+        let gauge = metric(s.port, &s.admin, &format!(r#"kiln_runner_net_frames_dropped{{runner="{key}",lane="term",reason="chaos",machine_id="{key}",machine_name="shed-runner"}}"#));
         if theirs > 0 && toward > 0 && gauge > 0 {
             break;
         }

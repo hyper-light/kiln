@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, Server, http, start, start_env};
+use common::{Options, Server, http, machine, start, start_env};
 use serde_json::{Value, json};
 
 fn login_shell(dir: &Path, path: &str) -> anyhow::Result<String> {
@@ -62,7 +62,7 @@ fn answered(s: &Server, id: &str, target: &str, logs: &[&Path]) -> anyhow::Resul
 fn offers_claude(s: &Server, runner: &str, log: &Path) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let (_, body) = http(s.port, "GET", &format!("/api/harness/kinds?target=agent:{runner}"), &s.admin, None)?;
+        let (_, body) = http(s.port, "GET", &format!("/api/harness/kinds?target=agent:{}", machine(runner)), &s.admin, None)?;
         let kinds: Value = serde_json::from_str(&body).unwrap_or_default();
         let claude = kinds.as_array().into_iter().flatten().find(|k| k.get("id").and_then(Value::as_str) == Some("claude"));
         if claude.and_then(|k| k.get("available")).and_then(Value::as_bool) == Some(true) {
@@ -98,13 +98,14 @@ fn an_agent_that_couldnt_start_on_the_server_moves_to_a_runner_that_has_its_harn
     let (code, body) = http(s.port, "POST", "/api/harness/agents", &s.admin, Some(&json!({"kind": "claude", "on": "local", "cwd": work.display().to_string()})))?;
     anyhow::ensure!(code == 409 && body.contains("Claude Code isn't installed on the kiln server") && body.contains("with `on`: box"), "{code} {body}");
 
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/move"), &s.admin, Some(&json!({"to": "agent:box"})))?;
+    let on_box = format!("agent:{}", machine("box"));
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/move"), &s.admin, Some(&json!({"to": on_box})))?;
     anyhow::ensure!(code == 202, "the move was refused: {code} {body}");
     let moved: Value = serde_json::from_str(&body)?;
-    anyhow::ensure!(moved.get("moving").and_then(Value::as_str) == Some("box") && moved.get("from_server") == Some(&json!(true)), "{moved}");
-    answered(&s, &id, "agent:box", &[&log])?;
+    anyhow::ensure!(moved.get("moving").and_then(Value::as_str) == Some(machine("box").as_str()) && moved.get("from_server") == Some(&json!(true)), "{moved}");
+    answered(&s, &id, &on_box, &[&log])?;
 
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/move"), &s.admin, Some(&json!({"to": "agent:box"})))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/move"), &s.admin, Some(&json!({"to": on_box})))?;
     anyhow::ensure!(code == 409 && body.contains("it runs on box already"), "{code} {body}");
     Ok(())
 }
@@ -127,28 +128,29 @@ fn a_runner_agent_that_couldnt_start_keeps_its_first_message_moved_or_started_ag
     agents::connected(s.port, &s.admin, "box", &box_log, Duration::from_secs(120))?;
     offers_claude(&s, "box", &box_log)?;
     let logs = [bare_log.as_path(), box_log.as_path()];
+    let (on_bare, on_box) = (format!("agent:{}", machine("bare")), format!("agent:{}", machine("box")));
 
-    let moved = open(&s, "agent:bare", &work)?;
+    let moved = open(&s, &on_bare, &work)?;
     stopped(&s, &moved)?;
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{moved}/move"), &s.admin, Some(&json!({"to": "agent:box"})))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{moved}/move"), &s.admin, Some(&json!({"to": on_box})))?;
     anyhow::ensure!(code == 202, "the move was refused: {code} {body}");
-    answered(&s, &moved, "agent:box", &logs)?;
+    answered(&s, &moved, &on_box, &logs)?;
 
-    let kept = open(&s, "agent:bare", &work)?;
+    let kept = open(&s, &on_bare, &work)?;
     stopped(&s, &kept)?;
     std::thread::sleep(Duration::from_secs(3));
     drop(bare);
     install_claude(&bare_bin)?;
     let (_bare, bare_log) = agents::runner_env(dir.path(), s.port, "bare", None, talk, &bare_env)?;
     agents::connected(s.port, &s.admin, "bare", &bare_log, Duration::from_secs(120))?;
-    answered(&s, &kept, "agent:bare", &logs)?;
+    answered(&s, &kept, &on_bare, &logs)?;
 
     std::fs::remove_file(bare_bin.join("claude"))?;
-    let restarted = open(&s, "agent:bare", &work)?;
+    let restarted = open(&s, &on_bare, &work)?;
     stopped(&s, &restarted)?;
     install_claude(&bare_bin)?;
     let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{restarted}/command"), &s.admin, Some(&json!({"type": "restart"})))?;
     anyhow::ensure!((200..300).contains(&code), "the restart was refused: {code} {body}");
-    answered(&s, &restarted, "agent:bare", &logs)?;
+    answered(&s, &restarted, &on_bare, &logs)?;
     Ok(())
 }

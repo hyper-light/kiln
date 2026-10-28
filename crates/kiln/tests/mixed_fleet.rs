@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Options, start};
+use common::{Options, machine, start};
 use serde_json::Value;
 
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
@@ -82,7 +82,7 @@ fn w22_ac09_mixed_fleet() -> anyhow::Result<()> {
     loop {
         let agents = get(port, &admin, "/api/agents")?;
         let list = agents.as_array().cloned().or_else(|| agents.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        if list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("old-runner") && a.get("connected").and_then(Value::as_bool).unwrap_or(true)) {
+        if list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(machine("old-runner").as_str()) && a.get("connected").and_then(Value::as_bool).unwrap_or(true)) {
             break;
         }
         anyhow::ensure!(Instant::now() < deadline, "the old runner never connected: {agents}\n{}\n{}", old_log(), s.log());
@@ -121,7 +121,7 @@ fn w22_ac09_mixed_fleet() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(500));
     };
     assert_eq!(v1.get("status").and_then(Value::as_str), Some("succeeded"), "{v1}\n{}", old_log());
-    assert_eq!(v1.get("agent").and_then(Value::as_str), Some("old-runner"), "{v1}");
+    assert_eq!(v1.get("agent").and_then(Value::as_str), Some(machine("old-runner").as_str()), "{v1}");
     // The engine: on-new ran on the new runner; old-only waits for a newer kiln on the old one.
     let deadline = Instant::now() + Duration::from_secs(300);
     let (on_new, old_only) = loop {
@@ -141,10 +141,10 @@ fn w22_ac09_mixed_fleet() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(500));
     };
     assert_eq!(on_new.get("conclusion").and_then(Value::as_str), Some("success"), "{on_new}");
-    assert_ne!(on_new.get("runner").and_then(Value::as_str), Some("old-runner"), "{on_new}");
+    assert_ne!(on_new.get("runner").and_then(Value::as_str), Some(machine("old-runner").as_str()), "{on_new}");
     let why = old_only.get("wait_reason").cloned().unwrap_or_default();
     assert_eq!(why.get("reason").and_then(Value::as_str), Some("capability"), "{old_only}");
-    assert!(why.get("runners").and_then(Value::as_array).is_some_and(|r| r.iter().any(|n| n.as_str() == Some("old-runner"))), "it names the old runner: {why}");
+    assert!(why.get("runners").and_then(Value::as_array).is_some_and(|r| r.iter().any(|n| n.as_str() == Some(machine("old-runner").as_str()))), "it names the old runner: {why}");
     assert!(old_only.get("conclusion").is_none_or(Value::is_null), "it waits, never fails: {old_only}");
     Ok(())
 }

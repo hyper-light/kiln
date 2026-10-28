@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Options, Server, http, start_env};
+use common::{Options, Server, http, machine, start_env};
 use serde_json::{Value, json};
 
 struct Keeper(Child);
@@ -53,7 +53,8 @@ fn connected(s: &Server, name: &str) -> anyhow::Result<bool> {
     let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
     let v: Value = serde_json::from_str(&body).unwrap_or_default();
     let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name) && a.get("connected").and_then(Value::as_bool) == Some(true)))
+    let key = machine(name);
+    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(key.as_str()) && a.get("connected").and_then(Value::as_bool) == Some(true)))
 }
 
 /// A series' value in the server's metrics (0 when it has none).

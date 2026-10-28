@@ -29,7 +29,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, http};
+use common::{Options, http, machine};
 use serde_json::{Value, json};
 
 /// Whether runner `name` is connected now.
@@ -37,7 +37,8 @@ fn connected(port: u16, admin: &str, name: &str) -> anyhow::Result<bool> {
     let (_, body) = http(port, "GET", "/api/agents", admin, None)?;
     let v: Value = serde_json::from_str(&body).unwrap_or_default();
     let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name) && a.get("connected").and_then(Value::as_bool) == Some(true)))
+    let key = machine(name);
+    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(key.as_str()) && a.get("connected").and_then(Value::as_bool) == Some(true)))
 }
 
 /// How many times the runner has cut its link so far.

@@ -99,7 +99,7 @@ fn a_message_sent_twice_under_one_key_through_a_runner_reaches_its_agent_once() 
     };
     wait("the runner connected", &mut || {
         let (_, runners) = api("GET", "/api/agents", None)?;
-        Ok(runners.as_array().into_iter().flatten().any(|r| r.get("name") == Some(&json!("t3-runner")) && r.get("connected") == Some(&json!(true))))
+        Ok(runners.as_array().into_iter().flatten().any(|r| r.get("name") == Some(&json!(common::machine("t3-runner"))) && r.get("connected") == Some(&json!(true))))
     })?;
     // An agent on it, its harness running there.
     let cwd = dir.path().join("agent");
