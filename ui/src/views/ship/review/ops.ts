@@ -8,8 +8,10 @@ import type { Thread, ThreadComment, ThreadKind } from "@/api/review";
 import type { Side } from "./fold";
 import type { Lines } from "./suggestion";
 
-/** Where a comment is being written (its draft kept by draft.ts's key, however this goes away). */
-export type DraftPlace = { kind: "line"; file: string; line: number; side: Side } | { kind: "reply"; thread: string } | { kind: "convo"; thread?: string };
+/** Where a comment is being written (its draft kept by draft.ts's key, however this goes away). A
+ * line's: `line` where its composer sits, the last of the lines it's on; `start` the first, when a
+ * shift-click took a range (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 3). */
+export type DraftPlace = { kind: "line"; file: string; line: number; side: Side; start?: number } | { kind: "reply"; thread: string } | { kind: "convo"; thread?: string };
 
 export interface Ops {
   /** The caller's principal (`user:ada`), for whose menu rows are theirs. */
@@ -24,8 +26,8 @@ export interface Ops {
   kiln: boolean;
   /** A host's pull request: its number and repository, for the forge seam's calls. */
   pull?: { repo: string; n: number };
-  /** A new thread on a line (kiln: with the kind picked). */
-  commentAt: (file: string, line: number, side: Side, body: string, kind: ThreadKind) => Promise<void>;
+  /** A new thread on a line, or on lines `start` to `line` (kiln: with the kind picked). */
+  commentAt: (file: string, line: number, side: Side, body: string, kind: ThreadKind, start?: number) => Promise<void>;
   /** A reply under a thread (a host's: `reply_to` the comment). */
   reply: (thread: Thread, body: string) => Promise<void>;
   /** A comment on the change itself (the Conversation's box). */
@@ -98,13 +100,13 @@ export function pendingComment(me: string, body: string): ThreadComment {
 }
 
 /** A thread that's still going out: `at` names its file and line, or the diff as a whole. */
-export function pendingThread(me: string, version: number, at: { file: string | null; side: "old" | "new"; line: number | null }, kind: ThreadKind, c: ThreadComment): Thread {
+export function pendingThread(me: string, version: number, at: { file: string | null; side: "old" | "new"; line: number | null; start?: number }, kind: ThreadKind, c: ThreadComment): Thread {
   return {
     id: optId("t"),
     version,
     file: at.file,
     side: at.side,
-    start_line: at.line,
+    start_line: at.start ?? at.line,
     end_line: at.line,
     state: "open",
     created_by: me,

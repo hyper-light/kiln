@@ -188,25 +188,47 @@ function lineOf(r: Row, side: Side): number | null {
   return side === "old" ? r.o : r.n;
 }
 
+/** A line's number clicked, as on kiln's review page: a comment starts there; shift-click another on
+ * the same side of the file takes the lines between; the same line again closes it. */
+export function pickLine(draft: DraftPlace | null, file: string, side: Side, line: number, extend: boolean): DraftPlace | null {
+  if (draft?.kind === "line" && draft.file === file && draft.side === side) {
+    const start = draft.start ?? draft.line;
+    if (extend) {
+      const [a, b] = [Math.min(start, line), Math.max(draft.line, line)];
+      return a === b ? { kind: "line", file, side, line: b } : { kind: "line", file, side, start: a, line: b };
+    }
+    if (start === line && draft.line === line) return null;
+  }
+  return { kind: "line", file, side, line };
+}
+
 /** One diff line, its threads and conflicts under it, and its draft's composer. */
 function Line({ file, row, ctx, map, q }: { file: PatchFile; row: Row; ctx: FilesCtx; map: Map<string, { t: Thread; a: Anchor }[]>; q: string }) {
   const side: Side = row.kind === "del" ? "old" : "new";
   const n = lineOf(row, side);
   const here = n == null ? [] : (map.get(`${file.path}|${side}:${n}`) ?? []);
   const cfs = n == null ? [] : ctx.conflicts.filter((c) => c.file === file.path && c.line === n);
-  const drafting = ctx.draft?.kind === "line" && ctx.draft.file === file.path && ctx.draft.side === side && ctx.draft.line === n;
+  const d = ctx.draft?.kind === "line" && ctx.draft.file === file.path && ctx.draft.side === side ? ctx.draft : null;
+  const drafting = d != null && d.line === n;
+  const from = d?.start ?? d?.line ?? 0;
+  const picked = d != null && n != null && n >= from && n <= d.line;
   const hit = q !== "" && row.text.toLowerCase().includes(q);
   const dim = q !== "" && !hit;
   const sign = row.kind === "add" ? "+" : row.kind === "del" ? "−" : " ";
   return (
     <>
-      <div className={`rv-l${row.kind === "add" ? " a" : row.kind === "del" ? " d" : ""}${hit ? " hit" : ""}`} data-dim={dim || undefined} data-rvl={`${file.path}|${side}:${n}`}>
+      <div
+        className={`rv-l${row.kind === "add" ? " a" : row.kind === "del" ? " d" : ""}${hit ? " hit" : ""}`}
+        data-dim={dim || undefined}
+        data-picked={picked || undefined}
+        data-rvl={`${file.path}|${side}:${n}`}
+      >
         <button
           type="button"
           className="rv-ln"
           aria-label={`Comment on line ${n}`}
           disabled={n == null || !ctx.ops.kiln}
-          onClick={() => ctx.setDraft(drafting ? null : { kind: "line", file: file.path, line: n!, side })}
+          onClick={(e) => ctx.setDraft(pickLine(ctx.draft, file.path, side, n!, e.shiftKey))}
         >
           {n ?? ""}
         </button>
@@ -224,9 +246,9 @@ function Line({ file, row, ctx, map, q }: { file: PatchFile; row: Row; ctx: File
         <div className="rv-thread">
           <ReviewComposer
             at={{ item: ctx.ops.item, file: file.path, line: n, side }}
-            lines={linesIn(ctx.rowsByFile.get(file.path) ?? [], side, n!, n!)}
-            placeholder={`Comment on line ${n}`}
-            onSend={(body, kind) => ctx.ops.commentAt(file.path, n!, side, body, kind ?? "question").then(() => ctx.setDraft(null))}
+            lines={linesIn(ctx.rowsByFile.get(file.path) ?? [], side, from, n!)}
+            placeholder={from < n! ? `Comment on lines ${from}–${n}` : `Comment on line ${n}`}
+            onSend={(body, kind) => ctx.ops.commentAt(file.path, n!, side, body, kind ?? "question", from < n! ? from : undefined).then(() => ctx.setDraft(null))}
             onCancel={() => ctx.setDraft(null)}
             autoFocus
           />

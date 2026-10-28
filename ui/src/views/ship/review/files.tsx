@@ -196,12 +196,12 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       // What goes out new (a comment, a thread) is written optimistically into the resource at
       // once and swapped for the server's ids when they land, or taken back out when refused;
       // what changes in place (resolve, kind, edit, delete) goes through useOptimistic's patch.
-      commentAt: (file, line, side, body, kind) =>
+      commentAt: (file, line, side, body, kind, start) =>
         act(async () => {
-          const t = pendingThread(ops.me, version, { file, side, line }, kind, pendingComment(ops.me, body));
+          const t = pendingThread(ops.me, version, { file, side, line, start }, kind, pendingComment(ops.me, body));
           merge({ type: "thread", t });
           try {
-            const r = await reviewApi.comment(key, { body, version, file, side, start_line: line, end_line: line, kind, publish: true });
+            const r = await reviewApi.comment(key, { body, version, file, side, start_line: start ?? line, end_line: line, kind, publish: true });
             merge({ type: "retagThread", id: t.id, t: { ...t, id: r.thread, comments: t.comments.map((c) => ({ ...c, id: r.id })) } });
           } catch (e) {
             merge({ type: "unthread", id: t.id });
