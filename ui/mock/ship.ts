@@ -7,6 +7,7 @@
  */
 import type http from "node:http";
 import type { ShipChange, ShipCommit, ShipDetail, ShipMark, ShipPage, ShipPip } from "../src/api/ship.ts";
+import { STATES } from "../src/components/ui/status-glyph-spec.ts";
 import { Trunk } from "./ship-sim.ts";
 
 interface Ctx {
@@ -313,6 +314,38 @@ const agentCommit = (k: number): ShipCommit => {
 };
 
 /**
+ * Every state a glyph has, on Ship's own journey strips (`POST /api/mock/ship/glyphs`; Agent pace and
+ * checks, step 3, its grayscale test): commits whose seven pips run through them all, each landing,
+ * so none folds; `arrive?clear=1` takes them away.
+ */
+const sampler = (): ShipCommit[] =>
+  Array.from({ length: Math.ceil(STATES.length / 7) }, (_, i) => {
+    const s = (j: number) => STATES[(i * 7 + j) % STATES.length] ?? "none";
+    const id = sha(`f${i}`);
+    return {
+      repo: REPO,
+      sha: id,
+      short: id.slice(0, 7),
+      message: `glyphs ${i + 1}`,
+      author: "agent:glyphs",
+      branch: "main",
+      at: now(),
+      stand: "landing" as const,
+      line: `${s(0)}, ${s(1)}, ${s(2)}, ${s(3)}, ${s(4)}, ${s(5)}, ${s(6)}`,
+      pips: pips(s(0), s(1), s(2), s(3), s(4), s(5), s(6)),
+      environments: [],
+      tags: [],
+      runs: [],
+      cursor: 300 + i,
+      kind: "commit" as const,
+      host: null,
+      change: null,
+      fold_under: null,
+      actions: [],
+    };
+  });
+
+/**
  * A fixed row's review marks, oldest first (W26-R14): a commit with no change has one, its push; a
  * change has a push per revision, a comment per open thread, and its approval, asked or given.
  */
@@ -482,6 +515,11 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       burstTimers.add(t);
     }
     ctx.json(res, 200, { ok: true });
+    return true;
+  }
+  if (p === "/api/mock/ship/glyphs" && m === "POST") {
+    arrived.unshift(...sampler());
+    ctx.json(res, 200, { ok: true, states: STATES.length });
     return true;
   }
   if (p === "/api/mock/ship/arrive" && m === "POST") {
