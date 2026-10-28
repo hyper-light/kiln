@@ -751,8 +751,8 @@ a.ms-why:hover {
   font-size: 12px;
 }
 
-/* Over the list: check them all, how many there are, and the list's own refresh. Each of its lines
-   a finger's height (40 px), its controls all links of one size. */
+/* Over the list: check them all, how many there are, and what to do with those picked, on one line a
+   finger's height (40 px); its hairline, held in view by touch, fading in and out with selecting. */
 .ms-listhead {
   display: flex;
   flex-wrap: wrap;
@@ -760,6 +760,7 @@ a.ms-why:hover {
   gap: 0 22px;
   min-height: 40px;
   padding: 0 8px 0 9px;
+  transition: box-shadow 0.2s ease;
 }
 .ms-all {
   display: inline-flex;
@@ -776,11 +777,88 @@ a.ms-why:hover {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+/* The head's end: Select (by touch) and Actions with Clear, one over the other in one cell, so turning
+   from one to the other is a crossfade in place, nothing beside it moving; the one leaving is out of
+   reach at once and hidden once it has faded. */
+.ms-head-end {
+  display: grid;
   margin-left: auto;
 }
-/* The Actions menu: a row's menu, a little wider for its words, each action with its icon. */
+.ms-head-end > * {
+  grid-area: 1 / 1;
+  align-self: center;
+  justify-self: end;
+}
+/* Leaving, it fades quickly; coming, it starts a beat later, so the two are never both half there. */
+.ms-head-idle,
+.ms-head-end > .ms-bulk {
+  transition:
+    opacity 0.12s ease,
+    transform 0.16s cubic-bezier(0.2, 0, 0, 1),
+    visibility 0s linear 0.16s;
+}
+.ms-head-idle:not([data-shown]),
+.ms-head-end > .ms-bulk:not([data-shown]) {
+  opacity: 0;
+  transform: translateX(6px);
+  visibility: hidden;
+}
+.ms-head-idle[data-shown],
+.ms-head-end > .ms-bulk[data-shown] {
+  transition:
+    opacity 0.16s ease 0.08s,
+    transform 0.22s cubic-bezier(0.2, 0, 0, 1) 0.08s,
+    visibility 0s;
+}
+/* A line under the head that slides open and shut: a one-row grid whose row goes from nothing to its
+   content's height and back (the About card's slide), so the list under it moves smoothly. */
+.ms-slide {
+  display: grid;
+  flex: 1 1 100%;
+  grid-template-rows: 1fr;
+  min-width: 0;
+  transition:
+    grid-template-rows 0.24s cubic-bezier(0.2, 0, 0, 1),
+    opacity 0.2s ease;
+}
+.ms-slide[data-closing] {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+@starting-style {
+  .ms-slide {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+}
+.ms-slide-clip {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+/* The count's words, as they turn (all of them, or how many are picked): fading in, not as the count goes up. */
+.ms-swap {
+  transition: opacity 0.18s ease;
+}
+@starting-style {
+  .ms-swap {
+    opacity: 0;
+  }
+}
+/* The Actions menu: a row's menu, a little wider for its words, each action with its icon; it fades
+   out as it closes, as it came in. */
 .ms-bulk-menu {
   width: 284px;
+}
+.ms-bulk-menu[data-state="closed"] {
+  animation: ms-menu-out 0.14s ease-in forwards;
+}
+@keyframes ms-menu-out {
+  to {
+    opacity: 0;
+    transform: translateY(3px);
+  }
 }
 .ms-bulk-menu .menu-item[data-disabled] {
   color: #5f626b;
@@ -1029,9 +1107,6 @@ a.ms-why:hover {
 .ms-listhead[data-selecting] .ms-count {
   color: #eceef2;
 }
-.ms-select {
-  margin-left: auto;
-}
 /* Picking: an open ring beside each name, filled and ticked when it's picked. It's always there, no
    wider than nothing, and slides open as picking starts, the name easing aside, and shut at Done. */
 .ms-pick {
@@ -1122,9 +1197,8 @@ a.ms-why:hover {
 .ms-row[data-swipe="ready"] {
   box-shadow: inset 3px 0 0 #e7e9ee;
 }
-html[data-motion="paused"] .ms-pick,
-html[data-motion="paused"] .ms-pick::before,
-html[data-motion="paused"] .ms-pick-all {
+html[data-motion="paused"] :is(.ms-pick, .ms-pick-all, .ms-head-idle, .ms-head-end > .ms-bulk, .ms-slide, .ms-swap, .ms-listhead, .ms-to-chips > .ms-to-chip),
+html[data-motion="paused"] .ms-pick::before {
   transition: none;
 }
 .ms-select + .ms-msg-open {
@@ -1155,6 +1229,17 @@ html[data-motion="paused"] .ms-pick-all {
 }
 .ms-to-chips > * {
   flex: none;
+}
+.ms-to-chips > .ms-to-chip {
+  transition:
+    opacity 0.16s ease,
+    transform 0.2s cubic-bezier(0.2, 0, 0, 1);
+}
+@starting-style {
+  .ms-to-chips > .ms-to-chip {
+    opacity: 0;
+    transform: scale(0.96);
+  }
 }
 /* Unseen, out of the line: each chip at its own width, what the fold is measured from (clipped to the
    line, so the copy never makes the page wider than it is). */

@@ -78,14 +78,53 @@ function Act({ icon: Icon, label, k, n, danger, disabled, onSelect }: { icon: Lu
 }
 
 /**
- * `open`: agents are being selected (by touch, from Select or a row held, even before the first is
- * picked): the line is there, so the first one picked moves nothing. `onClear` ends selecting.
+ * A line under the head that slides open and shut (its height from nothing and back, as the About
+ * card's does), so the list under it moves smoothly rather than jumps; shut, it's out of reach, and
+ * `onGone` says it's done sliding (a moment later where motion is paused and nothing slides).
  */
-export function BulkBar({ agents, all, open, onGone, onClear }: { agents: AgentInfo[]; all: AgentInfo[]; open: boolean; onGone: () => void; onClear: () => void }) {
+function Slide({ open, onGone, children }: { open: boolean; onGone?: () => void; children: React.ReactNode }) {
+  const gone = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el || !onGone) return;
+      const t = window.setTimeout(onGone, 400);
+      return () => window.clearTimeout(t);
+    },
+    [onGone],
+  );
+  return (
+    <div
+      className="ms-slide"
+      data-closing={!open || undefined}
+      inert={!open}
+      ref={!open ? gone : undefined}
+      onTransitionEnd={(e) => {
+        if (!open && e.target === e.currentTarget && e.propertyName === "grid-template-rows") onGone?.();
+      }}
+    >
+      <div className="ms-slide-clip">{children}</div>
+    </div>
+  );
+}
+
+/**
+ * `open`: agents are being selected (by touch, from Select or a row held, even before the first is
+ * picked): the line is there, so the first one picked moves nothing. `onClear` ends selecting. `idle`:
+ * what the head's end shows while not selecting (by touch, Select), crossfading with Actions and Clear.
+ */
+export function BulkBar({ agents, all, open, idle, onGone, onClear }: { agents: AgentInfo[]; all: AgentInfo[]; open: boolean; idle?: React.ReactNode; onGone: () => void; onClear: () => void }) {
   const [ask, setAsk] = React.useState<"move" | "end" | "reach" | null>(null);
+  // The ask on show: the one asked, or the last, while it slides shut.
+  const [shownAsk, setShownAsk] = React.useState<"move" | "end" | "reach" | null>(null);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [said, setSaid] = React.useState<Result | null>(null);
+  // How it went, put away: it slides shut, then goes.
+  const [saidGoing, setSaidGoing] = React.useState(false);
   const [outcomes, setOutcomes] = React.useState(false);
+  const askGone = React.useCallback(() => setShownAsk(null), []);
+  const saidGone = React.useCallback(() => {
+    setSaid(null);
+    setSaidGoing(false);
+  }, []);
   const [keepSet, setKeepSet] = React.useState<{ key: string; on: boolean } | null>(null);
   // Goals resumed or paused again after a try that didn't come back: under the same keys (CP-T3.2).
   const [tries] = React.useState(() => new Tries(clientId));
@@ -98,6 +137,8 @@ export function BulkBar({ agents, all, open, onGone, onClear }: { agents: AgentI
   // soon as they're picked: the menu has them when it opens.
   const stacksOf = React.useDeferredValue(key);
   if (stacksOf) preload(stacksKey(stacksOf), () => readStacks(stacksOf.split(",")), STACKS);
+  // The machines they could move to, read as selecting starts: Move's line opens with them, at its own height.
+  if (open) preload("harness/move", askPlaces);
   const n = agents.length;
   const acts = actsOf(agents);
   const disabled = busy !== null;
@@ -106,9 +147,11 @@ export function BulkBar({ agents, all, open, onGone, onClear }: { agents: AgentI
   // until it's put away or another one goes.
   const asking = ask === "move" && acts.movable.length > 0 ? "move" : ask === "end" && acts.live.length > 0 ? "end" : ask === "reach" && acts.onRunner.length > 0 ? "reach" : null;
   if (ask !== asking) setAsk(asking);
+  if (asking !== null && asking !== shownAsk) setShownAsk(asking);
 
   const run: Acting = (doing, go) => {
     setBusy(doing);
+    setSaidGoing(false);
     setAsk(null);
     setOutcomes(false);
     void go()
@@ -208,10 +251,43 @@ export function BulkBar({ agents, all, open, onGone, onClear }: { agents: AgentI
     );
   };
 
+  /** The ask on show, while asked and as it slides shut. */
+  const askLine = (k: "move" | "end" | "reach") =>
+    k === "move" ? (
+      <div className="ms-bulk-ask" role="group" aria-label="Move the selected agents">
+        <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
+          <MoveAsk agents={acts.movable} disabled={disabled} onMove={move} onCancel={() => setAsk(null)} />
+        </Loadable>
+      </div>
+    ) : k === "end" ? (
+      <div className="ms-bulk-ask" role="group" aria-label="End the selected agents">
+        <EndAsk agents={acts.live} all={all} disabled={disabled} onEnd={end} onCancel={() => setAsk(null)} />
+      </div>
+    ) : (
+      <div className="ms-bulk-ask" role="group" aria-label="Where the selected agents' commands run">
+        <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
+          <ReachPick agents={acts.onRunner} disabled={disabled} onChange={reach} onCancel={() => setAsk(null)} />
+        </Loadable>
+      </div>
+    );
+
   return (
     <>
-      {open && (
-        <div className="ms-bulk" role="group" aria-label={n > 0 ? `What to do with the ${count(n, "selected agent")}` : "What to do with the agents you select"}>
+      {/* The head's end: Select (by touch) and, selecting, Actions and Clear, one over the other, crossfading in place. */}
+      <span className="ms-head-end">
+        {idle && (
+          <span className="ms-head-idle" data-shown={!open || undefined} inert={open} aria-hidden={open || undefined}>
+            {idle}
+          </span>
+        )}
+        <div
+          className="ms-bulk"
+          data-shown={open || undefined}
+          inert={!open}
+          aria-hidden={!open || undefined}
+          role="group"
+          aria-label={n > 0 ? `What to do with the ${count(n, "selected agent")}` : "What to do with the agents you select"}
+        >
           <DropdownMenu.Root>
             <DropdownMenu.Trigger asChild>
               <Button size="xs" variant="secondary" disabled={disabled || n === 0}>
@@ -259,61 +335,51 @@ export function BulkBar({ agents, all, open, onGone, onClear }: { agents: AgentI
             Clear
           </Button>
         </div>
-      )}
-      {asking === "move" && (
-        <div className="ms-bulk-ask" role="group" aria-label="Move the selected agents">
-          <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
-            <MoveAsk agents={acts.movable} disabled={disabled} onMove={move} onCancel={() => setAsk(null)} />
-          </Loadable>
-        </div>
-      )}
-      {asking === "end" && (
-        <div className="ms-bulk-ask" role="group" aria-label="End the selected agents">
-          <EndAsk agents={acts.live} all={all} disabled={disabled} onEnd={end} onCancel={() => setAsk(null)} />
-        </div>
-      )}
-      {asking === "reach" && (
-        <div className="ms-bulk-ask" role="group" aria-label="Where the selected agents' commands run">
-          <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
-            <ReachPick agents={acts.onRunner} disabled={disabled} onChange={reach} onCancel={() => setAsk(null)} />
-          </Loadable>
-        </div>
+      </span>
+      {shownAsk && (
+        <Slide open={asking === shownAsk} onGone={askGone}>
+          {askLine(shownAsk)}
+        </Slide>
       )}
       {/* One line, at it and then how it went, so what it says is read out as it changes. */}
       {(busy ?? said) && (
-        <div className="ms-bulk-said" role="status">
-          {busy ? (
-            <span className="ms-msg-result">{busy}</span>
-          ) : (
-            said && (
-              <>
-                {said.outcomes.length > 0 ? (
-                  <button type="button" className="ms-msg-result" aria-expanded={outcomes} onClick={() => setOutcomes(!outcomes)}>
-                    <ChevronRight size={12} className={cn("ms-chev", outcomes && "rotate-90")} aria-hidden="true" />
-                    {said.line}
+        <Slide open={busy !== null || !saidGoing} onGone={saidGone}>
+          <div className="ms-bulk-said" role="status">
+            {busy ? (
+              <span className="ms-msg-result">{busy}</span>
+            ) : (
+              said && (
+                <>
+                  {said.outcomes.length > 0 ? (
+                    <button type="button" className="ms-msg-result" aria-expanded={outcomes} onClick={() => setOutcomes(!outcomes)}>
+                      <ChevronRight size={12} className={cn("ms-chev", outcomes && "rotate-90")} aria-hidden="true" />
+                      {said.line}
+                    </button>
+                  ) : (
+                    <span className="ms-msg-result">{said.line}</span>
+                  )}
+                  <button type="button" className="hx-icon" aria-label="Dismiss" onClick={() => setSaidGoing(true)}>
+                    <X size={12} />
                   </button>
-                ) : (
-                  <span className="ms-msg-result">{said.line}</span>
-                )}
-                <button type="button" className="hx-icon" aria-label="Dismiss" onClick={() => setSaid(null)}>
-                  <X size={12} />
-                </button>
-              </>
-            )
-          )}
-        </div>
+                </>
+              )
+            )}
+          </div>
+        </Slide>
       )}
-      {!busy && said && outcomes && (
-        <ul className="ms-msg-outcomes ms-bulk-outcomes">
-          {said.outcomes.map((o) => (
-            <li key={o.id} data-result={o.result}>
-              <span className="ms-msg-o-name">{o.name}</span>
-              <span className="ms-msg-o-where">{o.machine}</span>
-              <span className="ms-msg-o-result">{o.result}</span>
-              {o.reason && <span className="ms-msg-o-why">{o.reason}</span>}
-            </li>
-          ))}
-        </ul>
+      {said && said.outcomes.length > 0 && (
+        <Slide open={!busy && !saidGoing && outcomes}>
+          <ul className="ms-msg-outcomes ms-bulk-outcomes">
+            {said.outcomes.map((o) => (
+              <li key={o.id} data-result={o.result}>
+                <span className="ms-msg-o-name">{o.name}</span>
+                <span className="ms-msg-o-where">{o.machine}</span>
+                <span className="ms-msg-o-result">{o.result}</span>
+                {o.reason && <span className="ms-msg-o-why">{o.reason}</span>}
+              </li>
+            ))}
+          </ul>
+        </Slide>
       )}
     </>
   );

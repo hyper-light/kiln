@@ -644,7 +644,9 @@ function Agents() {
                   aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
                 />
                 <span className="ms-count" aria-live="polite">
-                  {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${all.length} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                  <span key={selecting ? "picked" : "all"} className="ms-swap">
+                    {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${all.length} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                  </span>
                 </span>
               </span>
             ) : (
@@ -658,7 +660,7 @@ function Agents() {
                   onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
                   aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
                 />
-                <span>
+                <span key={checked.length > 0 ? "picked" : "all"} className="ms-swap">
                   {checked.length > 0
                     ? `${checked.length} of ${selectable.length} selected`
                     : filtered
@@ -667,14 +669,22 @@ function Agents() {
                 </span>
               </label>
             )}
-            {touchScreen && !selecting && live.length > 0 && (
-              <Button size="xs" variant="secondary" className="ms-select" onClick={() => setPicking(true)}>
-                <ListChecks aria-hidden="true" />
-                Select
-              </Button>
-            )}
-            {/* What to do with those selected, on the head's one line (held in view by touch while selecting, there from the start); what they started, from every agent kiln runs. */}
-            <BulkBar agents={picked} all={list} open={selecting} onGone={clear} onClear={clear} />
+            {/* What to do with those selected, on the head's one line (held in view by touch while selecting, there from the start; by touch Select in its place before); what they started, from every agent kiln runs. */}
+            <BulkBar
+              agents={picked}
+              all={list}
+              open={selecting}
+              idle={
+                touchScreen && live.length > 0 ? (
+                  <Button size="xs" variant="secondary" onClick={() => setPicking(true)}>
+                    <ListChecks aria-hidden="true" />
+                    Select
+                  </Button>
+                ) : undefined
+              }
+              onGone={clear}
+              onClear={clear}
+            />
           </div>
           {live.length > 0 ? (
             <div {...touch.props} data-held={held || undefined}>

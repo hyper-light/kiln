@@ -130,10 +130,13 @@ test("picking agents moves nothing: the list stays where it is, the head keeps i
 
   // "Release prep": its goals running (read a moment after it's picked), on the kiln server.
   await pick(page, "fam-orch");
-  const first = await places(page, watched);
-  // The composer turned to messaging it and the line came: the list didn't move.
-  expect(first.row, "picking the first agent moved the list").toBe(before.row);
-  expect(first.head, "picking the first agent changed the list's head").toBe(before.head);
+  // The composer turned to messaging it and the line came: the list didn't move, not even for a moment.
+  const now = await places(page, watched);
+  expect(now.row, "picking the first agent moved the list").toBe(before.row);
+  expect(now.head, "picking the first agent changed the list's head").toBe(before.head);
+  // Where its end comes to rest once it has faded in (by touch it was there already).
+  const first = await settled(page, watched);
+  expect(first.row).toBe(before.row);
   if (touch) expect(first.buttons).toEqual(before.buttons);
   await inMenu(page, async () => {
     await expect(action(page, "Pause")).toBeEnabled();

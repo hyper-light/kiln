@@ -219,7 +219,9 @@ server says, and counts every session it has, ended ones included, until it's up
   now; End says what goes with them and ends the agents they started that still run too, unless
   unticked. Each goes to every agent it's for at once; a line says how it went (done, skipped,
   failed), opens to each agent's outcome and why, and stays until it's put away or the next one
-  goes. Those all ended leave the selection.
+  goes. Those all ended leave the selection. Turning to selecting and back crossfades in place
+  (Select for Actions and Clear, the count's words), and each line under the head slides open and
+  shut, the list under it moving smoothly; where motion is paused, each change is at once.
 - **The composer.** At the top of the page, on a desktop and a phone alike, whole and the agent
   page's composer's size from the start. There is no New agents button and no dialog: with nothing selected it starts an
   agent, its words the agent's first message. Above the box is the agent page's own line,
