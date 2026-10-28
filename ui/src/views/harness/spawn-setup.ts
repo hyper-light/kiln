@@ -6,17 +6,21 @@
 import type { ControlOption, KindInfo, ModeOption, Spec } from "@/api/harness";
 import type { Agent, ReachRunner } from "@/api/types";
 
-/** Each harness's own permission modes, for runners that don't report them (what the machine reports wins). */
+/** Each harness's own permission modes, as its agents' pages name them (claude.rs and codex.rs `modes`), for runners that don't report them (what the machine reports wins). */
 const MODES: Record<string, ModeOption[]> = {
   claude: [
-    { id: "default", label: "Ask first", description: "Asks before commands and edits" },
-    { id: "acceptEdits", label: "Edits OK", description: "Edits files freely, asks before commands" },
-    { id: "plan", label: "Plan first", description: "Researches and proposes a plan; changes nothing until you approve" },
+    { id: "default", label: "Ask", description: "Ask before edits and commands" },
+    { id: "acceptEdits", label: "Accept edits", description: "Edit files without asking; ask before commands" },
+    { id: "plan", label: "Plan", description: "Read and plan only; change nothing" },
+    { id: "auto", label: "Auto", description: "A classifier approves safe actions; risky ones still ask" },
+    { id: "dontAsk", label: "Allowed only", description: "Never asks: refuses anything not already allowed" },
+    { id: "bypassPermissions", label: "Bypass", description: "Skips every permission check", dangerous: true },
   ],
   codex: [
-    { id: "untrusted", label: "Ask first", description: "Asks before anything beyond reading" },
-    { id: "auto", label: "Auto", description: "Works in its folder; asks to go outside it or online" },
-    { id: "read-only", label: "Read only", description: "Reads and answers; changes nothing" },
+    { id: "auto", label: "Auto", description: "Works in its folder; asks before going beyond it" },
+    { id: "read-only", label: "Read only", description: "Reads and plans; asks before any change" },
+    { id: "untrusted", label: "Ask", description: "Asks before running anything it does not trust" },
+    { id: "full-access", label: "Full access", description: "No sandbox, never asks", dangerous: true },
   ],
 };
 export const modesFor = (k: KindInfo | undefined): ModeOption[] => k?.modes ?? MODES[k?.id ?? ""] ?? [];
@@ -67,6 +71,15 @@ export const machinesWith = (byTarget: Record<string, KindInfo[]>, kind: string)
 export const targetOf = (where: string[], wanted: (string | null | undefined)[]): string => wanted.find((t): t is string => Boolean(t) && where.includes(t ?? "")) ?? where[0] ?? "";
 
 /** A machine as people know it: the kiln server, or its name (with its hostname when that differs). */
+/** A folder, short: its last folder under "…" when it's deeper than two ("~/…/kiln"). */
+export function shortPath(cwd: string): string {
+  const t = cwd.trim() || "~";
+  const parts = t.split("/").filter(Boolean);
+  if (parts.length <= 2) return t;
+  const root = t.startsWith("~") ? "~" : "";
+  return `${root}/…/${parts[parts.length - 1]}`;
+}
+
 /** A machine as the composer's slot says it, short: its name without its domain, and its host's when that's another ("kiln-a094a12d (fedora-2)"). */
 export function shortMachineLabel(target: string, machines: Agent[]): string {
   if (target === "local") return "kiln server";
@@ -103,11 +116,21 @@ export function modelOf(k: KindInfo | undefined, chosen: string): { chosen: stri
   return { chosen: ok, shown: ok || models.find((m) => m.default)?.id || models[0]?.id || "" };
 }
 
-/** The speeds past standard the model runs at; with none chosen, its default model's. */
+/** Claude Code's fast mode (claude.rs `fast_speed`). */
+const CLAUDE_FAST: ControlOption = { id: "fast", label: "Fast", description: "Up to 2.5x faster, at a higher price per token" };
+
+/**
+ * The speeds past standard the model runs at; with none chosen, its default model's (as the line
+ * shows it). A machine whose runner lists no model's speeds (before they came with its models) is
+ * taken to give Claude Code's Opus models fast mode, as their agents' pages show it.
+ */
 export function speedsFor(k: KindInfo | undefined, model: string): ControlOption[] {
   const models = k?.models ?? [];
-  const m = model ? models.find((x) => x.id === model) : models.find((x) => x.default);
-  return m?.speeds ?? [];
+  const m = model ? models.find((x) => x.id === model) : (models.find((x) => x.default) ?? models[0]);
+  if (m?.speeds?.length) return m.speeds;
+  const said = models.some((x) => x.speeds !== undefined);
+  const opus = Boolean(m) && [m?.id, m?.label, m?.id === "default" ? m.description : ""].some((t) => /(^|[-\s])opus\b/i.test(t ?? ""));
+  return !said && k?.id === "claude" && opus ? [CLAUDE_FAST] : [];
 }
 
 /** A remembered choice, if it's still one of these; else none. */

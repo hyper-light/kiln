@@ -484,12 +484,6 @@ span.rs-bolt,
     color: #ededee;
   }
 }
-/* Shown, not to be chosen here (its tooltip says why). */
-.rs-word:disabled,
-.rs-word:disabled:hover {
-  color: #4f525a;
-  cursor: default;
-}
 .rs-word:focus-visible,
 .rs-undo:focus-visible {
   border-radius: 6px;

@@ -40,8 +40,6 @@ export interface Word {
   dangerous?: boolean;
   /** A model of another harness than the agent's (its id): choosing it switches there. */
   kind?: string;
-  /** Shown but not to be chosen here (its `hint` says why). */
-  off?: boolean;
 }
 
 const KEY: Record<Kind, string> = { mode: "Permissions", model: "Model", effort: "Effort" };
@@ -112,7 +110,7 @@ function modelWord(m: { id: string; label?: string; description?: string }, pret
   return { id: m.id, text: p !== m.id ? p : m.label || m.id, full: m.label || p, hint: m.description?.trim() || undefined };
 }
 
-export function modelWords(models: ModelOption[], current: string, pretty: (id: string) => string): Word[] {
+function modelWords(models: ModelOption[], current: string, pretty: (id: string) => string): Word[] {
   const list = models.map((m) => modelWord(m, pretty));
   // The agent's own model, when the harness doesn't list it, goes last: the families keep the harness's order. Another
   // harness's (a switch waiting) reads as its model, or "Default".
@@ -227,7 +225,7 @@ export function WordRow({ label, words, value, onPick }: { label: string; words:
   const stop = [focus, value, words[0]?.id].find((id) => id != null && words.some((w) => w.id === id));
 
   const rove = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const radios = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]:not(:disabled)'));
+    const radios = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'));
     const i = radios.findIndex((r) => r === document.activeElement);
     const n = radios.length;
     if (i < 0 || n === 0) return;
@@ -258,7 +256,6 @@ export function WordRow({ label, words, value, onPick }: { label: string; words:
             title={w.hint ? `${w.full}: ${w.hint}` : w.full}
             tabIndex={w.id === stop ? 0 : -1}
             className="rs-word"
-            disabled={w.off}
             onFocus={() => setFocus(w.id)}
             onClick={() => onPick(w)}
           >
@@ -367,7 +364,7 @@ export function Scale({ label, words, value, armed, onPick }: { label: string; w
 /* ------------------------------------------------------------------ the model */
 
 /** The model as its family, with the family's versions one tap further. */
-export function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; onPick: (w: Word) => void }) {
+function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; onPick: (w: Word) => void }) {
   const [versions, setVersions] = React.useState(false);
   const fams = families(words);
   const chosen = words.find((w) => w.id === value);

@@ -31,9 +31,26 @@ import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
 import { usePrefill, type Prefill } from "./new-agent-draft";
 import { machineName } from "./parts";
-import { ModelChoice, modelWords, RunSettings, Scale, WordRow, type Word } from "./run-settings";
+import { RunSettings, WordRow } from "./run-settings";
 import { effortsFor, resumeEffort } from "./spawn-efforts";
-import { harnessesOf, kindOf, machineLabel, machinesWithAny, shortMachineLabel, modeOf, modelOf, modesFor, onMachine, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "./spawn-setup";
+import {
+  harnessesOf,
+  kindOf,
+  machineLabel,
+  machinesWithAny,
+  shortMachineLabel,
+  shortPath,
+  modeOf,
+  modelOf,
+  modesFor,
+  onMachine,
+  oneOf,
+  reachChoices,
+  specOf,
+  speedsFor,
+  targetOf,
+  withDir,
+} from "./spawn-setup";
 import { useHeld } from "./state";
 import { MicButton } from "./voice";
 
@@ -65,7 +82,7 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
 const MACHINES = { pollMs: 60_000 } as const;
 
 const COUNTS = [1, 2, 3, 4, 6, 8, 12];
-type Part = "kind" | "machine" | "count" | null;
+type Part = "machine" | null;
 
 /** Enter starts with a keyboard and pointer; on a touch screen it's a new line (as in the composer). */
 const fine = () => window.matchMedia?.("(pointer: fine)").matches;
@@ -165,8 +182,6 @@ function resolve(c: Choices, m: Machines) {
   const target = targetOf(where, [c.picked, c.seed?.target, c.lastTarget]);
   const here = m.byTarget[target] ?? [];
   const kind = kindOf(here.length > 0 ? here : all, c.seed?.kind ?? c.kind);
-  // Every harness any machine has, those this machine doesn't run shown off.
-  const kinds = all.map((k) => ({ ...k, here: here.some((x) => x.id === k.id && x.available) }));
   const recent = c.dirs[target] ?? [];
   // The folder: typed or browsed to on this machine, else the one handed over, else the last one used here.
   const cwd = (c.folder?.target === target ? c.folder.cwd : undefined) ?? (c.seed?.target === target ? c.seed.cwd : undefined) ?? recent[0] ?? "~";
@@ -180,10 +195,11 @@ function resolve(c: Choices, m: Machines) {
   const speed = oneOf(speeds, c.speedByKind[kind]);
   const canVolume = m.workspaces[target]?.available === true;
   // The other harnesses on that machine, by their models: choosing one starts the agent there.
-  const others = (m.byTarget[target] ?? []).filter((x) => x.available && x.id !== kind && (x.models?.length ?? 0) > 0).map((x) => ({ kind: x.id, name: x.name, models: x.models ?? [] }));
+  // The other harnesses the machine runs, by their models (another machine's list where it has none yet; "Default" where none
+  // has one): choosing one starts the agent there, as the agent page's model select switches it.
+  const others = here.filter((x) => x.available && x.id !== kind).map((x) => ({ kind: x.id, name: x.name, models: onMachine(m.byTarget, target, x.id)?.models ?? [] }));
   return {
     all,
-    kinds,
     kind,
     where,
     target,
@@ -265,118 +281,6 @@ function HowLine({ c }: { c: Choices }) {
   );
 }
 
-/** In the box's top slot: the agent, its machine, its folder (or a shell), how many, each opened in place. */
-function Slot({ c }: { c: Choices }) {
-  const s = useSetup(c);
-  const toggle = (p: Exclude<Part, null>) => c.setOpen(c.open === p ? null : p);
-  // Each part after the first carries its dot, so a line never ends on one.
-  const part = (p: Exclude<Part, null>, text: string, eyebrow?: string, title?: string) => (
-    <button type="button" className="ip-line mc-part" data-part={p} aria-expanded={c.open === p} title={title} onClick={() => toggle(p)}>
-      {p !== "kind" && (
-        <span className="mc-dot" aria-hidden="true">
-          ·
-        </span>
-      )}
-      {eyebrow && <span className="ip-eyebrow">{eyebrow}</span>}
-      <span className="ip-path">
-        <span className="ip-seg" data-last="">
-          {text}
-        </span>
-      </span>
-    </button>
-  );
-  const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
-  const models = modelWords(s.info?.models ?? [], s.model.shown, modelLabel);
-  const kinds: Word[] = s.kinds.map((k) => ({ id: k.id, text: k.name, full: k.name, off: !k.here, hint: k.here ? (k.verified ? undefined : "Untested") : `Not on ${s.machine}` }));
-  return (
-    <div className="mc-slot">
-      {part("kind", s.kindName)}
-      {part("machine", s.machine || "no machine runs agents", "On", s.machineFull)}
-      {/* On a phone: the agent and its machine, then where and how many. */}
-      <i className="mc-break" aria-hidden="true" />
-      {c.shell ? (
-        <button type="button" className="ip-line mc-part" title="It starts where the shell is: tap for a folder instead" onClick={() => c.setShell("")}>
-          <span className="mc-dot" aria-hidden="true">
-            ·
-          </span>
-          <span className="ip-eyebrow">In shell</span>
-          <span className="ip-path">
-            <span className="ip-seg" data-last="">
-              {shell?.title || "this shell"}
-            </span>
-          </span>
-        </button>
-      ) : s.target ? (
-        <InlinePath target={s.target} value={s.cwd} onChange={(v) => c.setFolder({ target: s.target, cwd: v })} recent={s.recent} label="In" className="mc-where" />
-      ) : null}
-      {part("count", `×${c.count}`)}
-      {c.open === "kind" && (
-        <div className="rs-panel mc-slot-panel" role="group" aria-label="Agent">
-          <WordRow
-            label="Agent"
-            words={kinds}
-            value={s.kind}
-            onPick={(w) => {
-              c.setKind(w.id);
-              c.drop("kind");
-            }}
-          />
-          {s.kinds.some((k) => !k.here) && <p className="rs-desc">Greyed out: not on {s.machine}</p>}
-          {/* Its models, as the agent page's model select shows them: choosing one picks it and folds this away. */}
-          {models.length > 0 ? (
-            <div className="rs-elsewhere" role="group" aria-label={`${s.kindName} models`}>
-              <p className="rs-elsewhere-name">{s.kindName}</p>
-              <ModelChoice
-                words={models}
-                value={s.model.shown}
-                onPick={(w) => {
-                  c.setModelByKind({ ...c.modelByKind, [s.kind]: w.id });
-                  c.drop("model");
-                  c.setOpen(null);
-                }}
-              />
-            </div>
-          ) : (
-            <p className="rs-desc">
-              It starts on {s.kindName}'s own default model: its models show here once it has run on {s.machine}.
-            </p>
-          )}
-        </div>
-      )}
-      {c.open === "machine" && (
-        <div className="rs-panel mc-slot-panel" role="group" aria-label="Machine">
-          <WordRow
-            label="Machine"
-            words={s.where.map((t) => ({ id: t, text: shortMachineLabel(t, s.machines), full: machineLabel(t, s.machines) }))}
-            value={s.target}
-            onPick={(w) => {
-              c.setPicked(w.id);
-              c.drop("target");
-              c.setShell("");
-              c.setOpen(null);
-            }}
-          />
-        </div>
-      )}
-      {c.open === "count" && (
-        <div className="rs-panel mc-slot-panel" role="group" aria-label="How many">
-          <Scale
-            label="How many"
-            words={COUNTS.map((n) => ({
-              id: String(n),
-              text: String(n),
-              full: n === 1 ? "1 agent" : `${n} agents`,
-              hint: n === 1 ? "One agent" : `Each gets this message, named ${s.kindName} 1–${n}`,
-            }))}
-            value={String(c.count)}
-            onPick={(w) => c.setCount(Number(w.id))}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
 function StartButton({ c, busy, blocked, run }: { c: Choices; busy: boolean; blocked: boolean; run: (s: Setup) => void }) {
   const s = useSetup(c);
   const label = busy ? "Starting…" : c.count > 1 ? `Start ${c.count}` : "Start";
@@ -412,10 +316,79 @@ function Pick({ label, value, onChange, options }: { label: string; value: strin
   );
 }
 
-/** More options, open: one quiet row each, two to a line where there's room. */
+/** A row's value that opens in place under it (the machine). */
+function Opens({ c, part, text, title }: { c: Choices; part: Exclude<Part, null>; text: string; title?: string }) {
+  return (
+    <button type="button" className="mc-pick" aria-expanded={c.open === part} title={title} onClick={() => c.setOpen(c.open === part ? null : part)}>
+      <span>{text}</span>
+      <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
+    </button>
+  );
+}
+
+/**
+ * The options, open: one quiet row each. Where it starts first
+ * (the machine, the folder, how many), then the rest. The agent is picked as the agent page switches
+ * one: by a model of its in the model select above the box.
+ */
 function Options({ c, s }: { c: Choices; s: Setup }) {
+  const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
   return (
     <div className="mc-opts">
+      <div className="mc-opt">
+        <span className="mc-opt-key">Machine</span>
+        <div className="mc-opt-val">
+          <Opens c={c} part="machine" text={s.machine || "None runs agents"} title={s.machineFull} />
+        </div>
+      </div>
+      {c.open === "machine" && (
+        <div className="rs-panel mc-opt-panel" role="group" aria-label="Machine">
+          <WordRow
+            label="Machine"
+            words={s.where.map((t) => ({ id: t, text: shortMachineLabel(t, s.machines), full: machineLabel(t, s.machines) }))}
+            value={s.target}
+            onPick={(w) => {
+              c.setPicked(w.id);
+              c.drop("target");
+              c.setShell("");
+              c.setOpen(null);
+            }}
+          />
+        </div>
+      )}
+      <div className="mc-opt mc-opt-folder">
+        <span className="mc-opt-key">Folder</span>
+        <div className="mc-opt-val">
+          {c.shell ? (
+            <button type="button" className="mc-pick" title="It starts where the shell is: tap for a folder instead" onClick={() => c.setShell("")}>
+              <span>Shell: {shell?.title || "this shell"}</span>
+            </button>
+          ) : s.target ? (
+            <InlinePath target={s.target} value={s.cwd} onChange={(v) => c.setFolder({ target: s.target, cwd: v })} recent={s.recent} label="Folder" className="mc-where" />
+          ) : (
+            <span className="mc-none">—</span>
+          )}
+        </div>
+      </div>
+      <div className="mc-opt">
+        <span className="mc-opt-key">How many</span>
+        <div className="mc-opt-val">
+          <div className="mc-seg" role="radiogroup" aria-label="How many">
+            {COUNTS.map((n) => (
+              <button
+                key={n}
+                type="button"
+                role="radio"
+                aria-checked={c.count === n}
+                title={n === 1 ? "One agent" : `Each gets this message, named ${s.kindName} 1–${n}`}
+                onClick={() => c.setCount(n)}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
       <div className="mc-opt">
         <span className="mc-opt-key">Name</span>
         <div className="mc-opt-val">
@@ -518,9 +491,8 @@ function Under({
 }) {
   const s = useSetup(c);
   // What More options holds that isn't as it starts out, said while it's closed.
-  const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${c.reach}`), c.shell && "In a shell"]
-    .filter(Boolean)
-    .join(" · ");
+  const where = `${s.kindName}${c.count > 1 ? ` ×${c.count}` : ""} on ${s.machine || "no machine"} ${c.shell ? "in a shell" : `in ${shortPath(tildify(s.cwd))}`}`;
+  const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${c.reach}`)].filter(Boolean).join(" · ");
   return (
     <>
       <div className="mc-under">
@@ -532,8 +504,15 @@ function Under({
             </button>
           </span>
         )}
-        <button type="button" className="mc-toggle" aria-expanded={more} onClick={() => setMore(!more)}>
-          More options
+        <button
+          type="button"
+          className="mc-toggle mc-where-sum"
+          aria-expanded={more}
+          aria-label={`${where}${summary ? `, ${summary}` : ""}: change where it starts and more`}
+          title={s.machineFull}
+          onClick={() => setMore(!more)}
+        >
+          <span className="mc-where-text">{where}</span>
           {!more && summary && <span className="mc-sum">{summary}</span>}
           <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
         </button>
@@ -570,11 +549,6 @@ const LineLoading = () => (
     <div className="rs-top">
       <p className="rs-line" />
     </div>
-  </div>
-);
-const SlotLoading = () => (
-  <div className="mc-slot">
-    <span className="mc-looking">Looking at your machines…</span>
   </div>
 );
 
@@ -749,9 +723,6 @@ export function NewAgent({
         }}
       >
         <div className={cn("hx-compose-box", busy && "hx-compose-live")}>
-          <React.Suspense fallback={<SlotLoading />}>
-            <Slot c={c} />
-          </React.Suspense>
           {attachments.chips}
           <textarea
             ref={attach}
