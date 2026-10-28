@@ -1791,6 +1791,3 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 :root[data-opening] .hx-dock .hx-compose-box {
   view-transition-name: kiln-composer;
 }
-:root[data-opening] .ag-eyebrow {
-  view-transition-name: kiln-where;
-}

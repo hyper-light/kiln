@@ -178,7 +178,11 @@ pub async fn put(hub: &Hub, name: &str, body: &Value) -> Result<Response, Fail> 
         .await
         .map_err(internal)?;
     hub.ci.send(super::dispatch::Msg::PoolsChanged);
-    let (diagnostics, preview) = effect(hub, &pool).await;
+    let (mut diagnostics, preview) = effect(hub, &pool).await;
+    // W24-R14: a pool's warm workspaces aren't kept where untrusted legs may write them.
+    if spec.warm.is_some() && hub.cfg.ci.untrusted.executors.iter().any(|e| e == "k8s") {
+        diagnostics.push(json!({ "level": "warning", "message": format!("{}'s pods start cold: untrusted legs may run in k8s pods (`ci.untrusted.executors` names k8s), and they'd write the warm workspaces trusted legs read", pool.name) }));
+    }
     Ok(srv::json(StatusCode::OK, &json!({ "name": pool.name, "executor": pool.executor, "labels": pool.labels, "min_idle": pool.min_idle, "max": pool.max, "diagnostics": diagnostics, "preview": preview })))
 }
 

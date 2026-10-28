@@ -158,9 +158,9 @@ fn stands(c: &rusqlite::Connection, leg: &str, now: i64) -> rusqlite::Result<boo
 }
 
 /// The newest succeeded leg for `hash` within `max_age` whose artifacts are all still there, with
-/// its report: from the work ledger first (W24-R06), then from W08-R10's own table, which holds
-/// the results kept before the ledger.
-pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String)>> {
+/// its report: from the work ledger alone, on its one path (W24-R06, R30). The newest run that
+/// reproduced the entry is the one taken, so a rerun past `max_age` makes it fresh again.
+pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u64) -> anyhow::Result<Option<(String, String, Option<String>)>> {
     let (hash, since) = (hash.to_owned(), crate::util::now_unix().saturating_sub(i64::try_from(max_age).unwrap_or(i64::MAX)));
     let (scope, unit) = (crate::ci::work::scope(repo, domain(trusted)), work_unit(&hash, trusted));
     let found = hub
@@ -173,19 +173,14 @@ pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u
                 && stands(c, &hit.recorded.provenance.leg, now)?
             {
                 if let Some(by) = &hit.class {
+                    crate::metrics::global().work_classes.inc(&["leg", "hit"]);
                     tracing::info!(leg = %hit.recorded.provenance.leg, class = ?by.class, why = ?by.why, "a leg's result is reused by its class (W24-R30)");
                 }
-                return Ok(Some((hit.recorded.provenance.leg.clone(), hit.recorded.outputs.get("report").cloned().unwrap_or_default())));
+                // Its report is among its notes; an entry kept before them has it among its outputs.
+                let report = hit.recorded.notes.get("report").or_else(|| hit.recorded.outputs.get("report")).cloned().unwrap_or_default();
+                return Ok(Some((hit.recorded.provenance.leg.clone(), report, hit.class.as_ref().map(|by| by.class.rep()))));
             }
-            Ok(c.query_row(
-                "SELECT r.leg_id, r.report FROM ci_reuse r JOIN jobs j ON j.id = r.leg_id
-                 WHERE r.input_hash = ?1 AND r.created_at >= ?2 AND j.status = 'succeeded'
-                   AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.leg_id = r.leg_id AND (a.finalized = 0 OR (a.expires_at IS NOT NULL AND a.expires_at <= ?3)))
-                 ORDER BY r.created_at DESC LIMIT 1",
-                params![hash, since, crate::util::now_unix()],
-                |x| Ok((x.get(0)?, x.get(1)?)),
-            )
-            .optional()?)
+            Ok(None)
         })
         .await;
     // Every lookup counted, by layer and outcome (W24-R28).
@@ -199,16 +194,19 @@ pub async fn lookup(hub: &Hub, repo: &str, trusted: bool, hash: &str, max_age: u
 }
 
 /// A leg that succeeded under `hash`: kept for those that come after, in the work ledger as its
-/// work unit's (W24-R06) and in W08-R10's own table.
+/// work unit's (W24-R06). Its report is a note, not an output: every succeeded run of the unit
+/// reproduces the entry, and the newest is the one a lookup takes (W24-R30).
 pub async fn remember(hub: &Hub, repo: &str, trusted: bool, leg: &str, run: &str, hash: &str, report: &str) -> anyhow::Result<()> {
     let (repo, leg, run, hash, report) = (repo.to_owned(), leg.to_owned(), run.to_owned(), hash.to_owned(), report.to_owned());
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
-            c.execute("INSERT OR REPLACE INTO ci_reuse (input_hash, leg_id, run_id, report, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![hash, leg, run, report, now])?;
             let result = crate::ci::work::Recorded {
                 outcome: "success".into(),
-                outputs: BTreeMap::from([("report".to_owned(), report)]),
+                // What it produced, as its class knows it: its inputs' hash, so no two jobs' legs
+                // share a class (W24-R30), and every rerun of one reproduces it.
+                outputs: BTreeMap::from([("inputs".to_owned(), hash.clone())]),
+                notes: BTreeMap::from([("report".to_owned(), report)]),
                 provenance: crate::ci::work::Provenance { repo: repo.clone(), run, leg, finished_at: now, ..Default::default() },
                 domain: domain(trusted).to_owned(),
                 ..Default::default()
@@ -221,7 +219,7 @@ pub async fn remember(hub: &Hub, repo: &str, trusted: bool, leg: &str, run: &str
 
 /// A leg of `run` that takes `source`'s result over: a copy of it, its steps and its artifacts,
 /// `reused_from` naming it, `input_hash` its hash.
-pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str) -> anyhow::Result<()> {
+pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str, class: Option<String>) -> anyhow::Result<()> {
     let (run, source, id, hash) = (run.to_owned(), source.to_owned(), id.to_owned(), hash.to_owned());
     hub.store
         .call(move |c| {
@@ -235,6 +233,10 @@ pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str)
                  FROM jobs WHERE id = ?2",
                 params![id, source, run, hash],
             )?;
+            // Found through its class, it says which (W24-R30, R28).
+            if let Some(c) = &class {
+                tx.execute("UPDATE jobs SET reused_class = ?2 WHERE id = ?1", params![id, c])?;
+            }
             tx.execute(
                 "INSERT INTO steps (job_id, idx, name, status, started_at, finished_at, exit_code, kind, step_id, action, outcome, conclusion, outputs, attempt)
                  SELECT ?1, idx, name, status, started_at, finished_at, exit_code, kind, step_id, action, outcome, conclusion, outputs, attempt FROM steps WHERE job_id = ?2",
@@ -358,7 +360,7 @@ mod tests {
             runs::create(&hub, &repo, new("run2", "s2")).await?;
             runs::insert_leg(&hub, "run1", "leg1", &spec, Status::Queued, None).await?;
             runs::finish_leg(&hub, "leg1", Status::Succeeded, "success", None, None).await?;
-            take_over(&hub, "run2", "leg1", "leg2", "h1").await?;
+            take_over(&hub, "run2", "leg1", "leg2", "h1", None).await?;
             let checks = crate::ci::review::checks_on(&hub, "acme/app", "s2").await?;
             anyhow::ensure!(checks.get("ci/a") == Some(&Some("success".to_owned())), "{checks:?}");
             let land = kiln_ci::land::Land { checks: vec!["ci/a".into()], approvals: 0, owners: false, resolve_threads: false, ..Default::default() };
