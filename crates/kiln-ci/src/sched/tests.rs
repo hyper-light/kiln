@@ -510,13 +510,46 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
-    // With no other runner, it waits for one, and says so.
+    // With no other runner that could take it, it's asked again in a while, on the same attempt,
+    // and says so (W05-R16).
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
     s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
-    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true, asked: false }));
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "not at once: {c:?}");
+    let again = 1 + super::state::REFUSED_AGAIN_MS;
+    assert!(c.contains(&Command::Timer { at: again }), "{c:?}");
+    assert_eq!(s.reason("x"), Some(&WaitReason::Retry { at: again }));
+    let c = s.handle(Input::Tick, again);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "x" && runner == "a")), "{c:?}");
+}
+
+/// W05-R16, found by W28 step 3's replay: the only runner that could take a leg refused it (an
+/// assignment that couldn't reach it, away for a moment, comes back refused too). It's offered to
+/// that runner again in a while, as v1 offers a declined job again, as often as it refuses,
+/// instead of waiting for a runner that never comes: production's adacachy is the only runner
+/// with `local`, which image.yaml, release.yaml's builds and ci.yaml's release-binary ask for.
+#[test]
+fn w05_r16_the_only_runner_that_refused_a_leg_is_asked_again() {
+    let mut s = Scheduler::new(Config::default());
+    let mut local = linux("adacachy", 2);
+    local.view.labels = vec!["baremetal".into(), "local".into()];
+    s.handle(Input::RunnerUp(Box::new(local)), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("other", 2))), 0);
+    let image = LegIn { route: LegRoute { labels: vec!["baremetal".into(), "local".into()], ..LegRoute::default() }, ..leg("image", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(image)), 0);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "image" && runner == "adacachy")), "{c:?}");
+    let mut t = 0;
+    for _ in 0..2 {
+        t += 1;
+        let c = s.handle(Input::Rejected { leg: "image".into() }, t);
+        assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "image")), "not to the runner without `local`: {c:?}");
+        let again = t + super::state::REFUSED_AGAIN_MS;
+        assert_eq!(s.reason("image"), Some(&WaitReason::Retry { at: again }));
+        let c = s.handle(Input::Tick, again);
+        assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "image" && runner == "adacachy")), "{c:?}");
+        t = again;
+    }
 }
 
 /// W05-R16: the default retry after `runner-lost` goes to another runner when one could take it,

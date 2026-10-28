@@ -1743,7 +1743,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R16 Defaults.** Without a policy: `runner-lost` is retried once on a different runner
   when one can take it, else on the same one (today's requeue, kept, and shown as "retried:
   runner X was lost"); nothing else is retried. A policy's `runner: different` waits for another
-  runner, and says so (`other-runner`).
+  runner, and says so (`other-runner`). A leg its runner refuses (an assignment that couldn't
+  reach it counts as refused) goes to another runner that can take it, on the same attempt; with
+  none, it's offered to the one that refused it again 15 s later, as v1 offers a declined job
+  again, and says so (`retry`).
 - **W05-R17 Reruns**, GitHub-exact: re-run all jobs, re-run failed jobs (and the jobs that need
   them), re-run one job (and its dependents), optionally with debug logging. A rerun is a new run
   attempt (`github.run_attempt`); automatic leg retries are attempts of the leg
