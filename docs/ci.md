@@ -200,7 +200,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
-| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | ready | specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
+| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | ready | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa` |
 
 ---
@@ -8565,6 +8565,97 @@ repository):
 - **W26-AC11 Both kinds.** A branch pull request and a stack of three diffs each go from first
   push to landed: the stack's commits land in stack order, each reviewed on its own; the branch's
   commits land together under its review. *Integration test on real git.*
+
+**Progress.** In progress. R06 to R15, each Ship item's dropdown owning its review, are built
+(Review plan step 3, kiln plan `01a17856b1aa77df93c0ef014cda0a71`, with the CI/CD Integration
+agent, whose Ship it is). An item's diff is in one place, Files (the person's decision,
+2026-10-27): Ship's Diff button opens the row and brings Files into view, focused. AC02 and AC05
+hold; AC03 and AC04 hold but for their signatures; AC06 holds in Chromium, not yet in WebKit (below).
+
+Not yet: signatures. Nothing R06 to R15 records is signed: the revision an Apply or a conflict's
+resolution makes, a comment, a resolution, an approval and each mark of the Review lanes carry
+`signer: null`, and their seal reads "unsigned", until W27-R03 signs them (the Review plan's step 7).
+
+- *R06* (`ui/src/views/ship/index.tsx`'s Dropdown, `ui/src/views/ship/review/`): Files and the
+  Conversation, then Ship's terminal output, Jobs and Lanes, for a commit with no change, a kiln
+  diff, a change request, a host's pull request and a landed change.
+- *R07* (`review/files.tsx`, `review/diffs.tsx`, `review/search.tsx`):
+  - **The gate's row.** The open threads by kind, with counts, and Approve, in the gate's words (R11).
+  - **Search.** `GET /api/diffs/:id/versions/:n/search?q=` for a kiln change, and `GET
+    /api/repos/:repo/pulls/:n/search?q=` for a host's pull request at its mirrored head
+    (`crates/kiln/src/ci/search.rs`), through the Search seam (docs/seams.md) on vorpal
+    (`crates/kiln-search`, vendored at `vendor/vorpal`): words, a regex or a code pattern, each hit
+    with the definition it's in, changed lines first. It filters the files and jumps to a hit.
+  - **Diffs.** Each file folds; one over 100 lines shows its first lines and the lines carrying a
+    comment, a conflict or a draft. The whole file opens in place, full-screen, never a popup
+    (`GET /api/diffs/:id/versions/:n/blob`; a commit with no change, `GET
+    /api/ship/commits/:repo/:sha/diff` and `/blob`).
+- *R08* (`review/threads.tsx`): threads flat on their lines. Each comment's line says who, its
+  seal, its kind and when, and its ⋯ copies, quotes, edits, deletes and changes the kind; a long
+  press copies; Reply and Resolve sit under it. Edits go through `PATCH /api/comments/:id` (body,
+  kind, state), deletions through `DELETE /api/comments/:id` (a thread's first comment stays,
+  `deleted`, while replies remain).
+- *R09* (`ui/src/lib/markdown.tsx`'s `CommentBody`): GitHub-flavoured markdown, mentions, task
+  lists, tables, and fenced code numbered, with its language and a copy icon; raw HTML stays text
+  and script URLs are dropped.
+- *R10* (`crates/kiln-ci/src/suggest.rs`, `crates/kiln/src/ci/revision.rs`): a `suggestion` block
+  shows against the file's own line numbers. Apply (`POST /api/comments/:id/apply`) commits it as a
+  revision of whoever applies it, its suggesters co-authors, through `revision::commit`, the one
+  commit path W27-R03 will sign. The block then says "applied in vN", or "outdated" once its lines
+  have moved.
+- *R11* (`kiln_ci::review::gate`, pure): hold (a blocking thread open; a conflict unresolved, or
+  resolved and not committed), warn (an issue open), inform (a nit), clear. While it holds,
+  accepting (`POST /api/diffs/:id/review`) is refused 409 with the reasons; `force` goes past a
+  warning only; an accepted review carries its note. Landing (`GET` and `POST
+  /api/diffs/:id/land`) and automatic merges wait the same. A blocking thread is resolved by its
+  author, or by an owner who says why, the reason kept. The threads come with the caller's gate
+  (`GET /api/diffs/:id/comments`).
+- *R12* (`crates/kiln-ci/src/conflicts.rs`, `crates/kiln/src/ci/conflicts.rs`, migration
+  `20261026-2200`): each revision is replayed onto where it lands with `git merge-tree
+  --write-tree` (`review_replays`, `review_conflicts`). `GET /api/diffs/:id/conflicts` gives each
+  conflict at the change's own lines, with main's side, this side and the base; a binary file, a
+  modify/delete and the like are named and resolved by taking a side. `POST` and `DELETE
+  /api/diffs/:id/conflicts/:cid/resolution` take main, this, both, the agent's (kept as the
+  agent's for a person to take) or an edit; `POST /api/diffs/:id/conflicts/commit` makes the
+  revision, its why and note "conflict resolved". Files draws each where it falls, Commit
+  resolution in Approve's place.
+- *R13* (`review/convo.tsx`): the change's list in markdown, line comments in it too, with its
+  comment box. A host's pull request reads and writes its threads through its host
+  (`/api/repos/:repo/pulls/:n`, W23's git-host interface); the kinds are kiln's.
+- *R14*, the Review lane records (`crates/kiln/src/ship.rs`'s `load_change`, `review/lanes.tsx`):
+  Ship's detail (`GET /api/ship/commits/:repo/:sha`) carries `review`, its marks oldest first. Each
+  has a `kind` (push, replay, comment, fix, resolution, approval), `at`, `end`, `by`, `revision`,
+  `state`, `thread`, `note` and `signer` (null until W27-R03), read from what R10 to R12 keep:
+  versions and their why, threads and their resolutions (`<thread>:resolved`), replays, reviewers
+  and reviews. A host's pull request has its pushes, asks and verdicts; a commit with no change,
+  its push. Lanes draws them as the Review group, a lane a mark.
+- *R15* (`review/perf.ts`, `review/files.tsx`, the row's memo in `index.tsx`): an item renders
+  only when it changes, memoized by item and version, and a refetch that reads the same keeps its
+  references. Drafts live in the browser's drafts store, which live updates never touch;
+  mutations are React Actions with optimistic state; there are no effects; an open item holds
+  still and is patched in place.
+- *Tests.*
+  - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
+    `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
+    (`kiln-seams`) and on vorpal (`kiln-search`, `w26_r07_*`).
+  - kiln: `tests/hosting.rs` (`w26_r02_a_blocking_thread_holds_a_diff_out_of_the_queue`,
+    `w26_r11_the_gate_holds_warns_and_informs`, `w26_r11_a_blocking_thread_holds_the_automatic_merge`,
+    `w26_r14_the_review_lanes_marks`), `tests/suggestions.rs` (`w26_ac03_*`), `tests/conflicts.rs`
+    (`w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision`,
+    `w26_r12_a_change_requests_resolution_is_a_merge_commit`, on real git), `tests/search.rs`
+    (`w26_r07_a_search_across_the_change`, a 1,000-file change), `ship.rs`
+    (`w26_r14_a_commit_with_no_change_carries_its_push`).
+  - UI, in Chromium and WebKit at desktop and phone widths: `e2e/ship-review.spec.ts` (open, reply,
+    resolve, change a kind, delete, apply a suggestion, the whole file, search, every way to resolve
+    a conflict and commit it), `ship-lanes.spec.ts` (the sections' order on four kinds of item, and
+    D41's Review lanes), `ship-diff.spec.ts` (the Diff button), `ship-perf.spec.ts` (AC06: no
+    layout shift through 30 s of live updates; a keystroke renders its composer alone); unit tests
+    `comment-markdown.test.ts` and `review-composer.test.ts`.
+  - AC06 against a real server (`ci/ui/ship_ac06.mjs` on `ci/ui/review_setup.py`'s 10,000-line
+    change, 2026-10-27): Chromium's median frame scrolling the whole file in an open item is 16.7
+    ms at 1280 and at 390, and a keystroke takes 1 ms. WebKit's is 46 ms and 49 ms: every line of
+    the whole file is in the page, and WebKit lays them out more slowly. AC06 isn't met in WebKit
+    until the whole file draws only the lines in view.
 
 **Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; research `01a174af7d0476b896d3b236098ddded`;
 the mock `~/.cache/kiln-review-design/ship/review-ship.html` (Ship's prototype, from the CI/CD

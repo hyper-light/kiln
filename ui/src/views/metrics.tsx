@@ -29,7 +29,7 @@ export default function Metrics() {
     <div className="container-console page">
       <title>Live · Observe · kiln</title>
       <PageIntro
-        index={8}
+        index={7}
         label="Observe"
         title="Live"
         lead={

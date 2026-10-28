@@ -1,0 +1,79 @@
+id: julia-module
+language: Julia
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: module_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: julia-function
+language: Julia
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_definition
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+---
+id: julia-macro
+language: Julia
+role: item
+symbolType: macro
+rule:
+  all:
+    - kind: macro_definition
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+isExported: true
+---
+id: julia-const
+language: Julia
+role: item
+symbolType: constant
+rule:
+  all:
+    - kind: const_statement
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+---
+id: julia-primitive
+language: Julia
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: primitive_definition
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+---
+id: julia-struct
+language: Julia
+role: item
+symbolType: struct
+rule:
+  all:
+    - any:
+        - kind: struct_definition
+        - kind: abstract_definition
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'

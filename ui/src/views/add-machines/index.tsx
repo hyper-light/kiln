@@ -21,7 +21,7 @@ export default function AddMachines() {
       <title>Add machines · kiln</title>
       <header className="page-intro">
         <div className="min-w-0">
-          <Crumbs index={5} items={[{ label: "Runners", to: "/runners" }, { label: "Add" }]} />
+          <Crumbs index={4} items={[{ label: "Runners", to: "/runners" }, { label: "Add" }]} />
           <h1>Add machines</h1>
           <p className="lead">Run one command on a new machine, or pick one kiln already hears on your network.</p>
         </div>

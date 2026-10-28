@@ -582,7 +582,7 @@ function EnvView({ name }: { name: string }) {
   return (
     <>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: e.name }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: e.name }]} />
         <div className="rel-head-row">
           <h1 className="cd-title">{e.name}</h1>
           <div className="rel-head-actions">

@@ -293,7 +293,7 @@ export default function Mission() {
   return (
     <div className="container-console page ms-page">
       <title>Agents · kiln</title>
-      <PageIntro index={6} label="Agents" title="Mission control." compact />
+      <PageIntro index={5} label="Agents" title="Mission control." compact />
       <React.Suspense fallback={<div className="st" aria-hidden="true" />}>
         <StandsNow />
       </React.Suspense>

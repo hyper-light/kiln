@@ -17,6 +17,7 @@ import { Route as AppInsightsRouteImport } from './routes/_app.insights'
 import { Route as AppLogsRouteImport } from './routes/_app.logs'
 import { Route as AppReposRouteImport } from './routes/_app.repos'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
+import { Route as AppShipRouteImport } from './routes/_app.ship'
 import { Route as AppSyncRouteImport } from './routes/_app.sync'
 import { Route as AppSystemRouteImport } from './routes/_app.system'
 import { Route as AppTelemetryRouteImport } from './routes/_app.telemetry'
@@ -100,6 +101,7 @@ import { Route as AppObserveLlmTracesIdRouteImport } from './routes/_app.observe
 import { Route as AppReviewHostsRepoIndexRouteImport } from './routes/_app.review.hosts.$repo.index'
 import { Route as AppReviewHostsRepoNumberRouteImport } from './routes/_app.review.hosts.$repo.$number'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
+import { Route as AppShipOwnerNameShaRouteImport } from './routes/_app.ship_.$owner.$name.$sha'
 import { Route as AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.apps.$app_.environments.$env'
 
 const AppRoute = AppRouteImport.update({
@@ -139,6 +141,11 @@ const AppReposRoute = AppReposRouteImport.update({
 const AppSettingsRoute = AppSettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppShipRoute = AppShipRouteImport.update({
+  id: '/ship',
+  path: '/ship',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSyncRoute = AppSyncRouteImport.update({
@@ -576,6 +583,11 @@ const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
   path: '/runs/$id/jobs/$jobId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppShipOwnerNameShaRoute = AppShipOwnerNameShaRouteImport.update({
+  id: '/ship_/$owner/$name/$sha',
+  path: '/ship/$owner/$name/$sha',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute =
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport.update({
     id: '/deployments/releases/apps/$app_/environments/$env',
@@ -591,6 +603,7 @@ export interface FileRoutesByFullPath {
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
+  '/ship': typeof AppShipRoute
   '/sync': typeof AppSyncRoute
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
@@ -672,6 +685,7 @@ export interface FileRoutesByFullPath {
   '/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/ship/$owner/$name/$sha': typeof AppShipOwnerNameShaRoute
   '/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/review/hosts/$repo/': typeof AppReviewHostsRepoIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -683,6 +697,7 @@ export interface FileRoutesByTo {
   '/logs': typeof AppLogsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
+  '/ship': typeof AppShipRoute
   '/sync': typeof AppSyncRoute
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
@@ -765,6 +780,7 @@ export interface FileRoutesByTo {
   '/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/ship/$owner/$name/$sha': typeof AppShipOwnerNameShaRoute
   '/deployments/releases/templates': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/review/hosts/$repo': typeof AppReviewHostsRepoIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -778,6 +794,7 @@ export interface FileRoutesById {
   '/_app/logs': typeof AppLogsRoute
   '/_app/repos': typeof AppReposRoute
   '/_app/settings': typeof AppSettingsRoute
+  '/_app/ship': typeof AppShipRoute
   '/_app/sync': typeof AppSyncRoute
   '/_app/system': typeof AppSystemRoute
   '/_app/telemetry': typeof AppTelemetryRoute
@@ -860,6 +877,7 @@ export interface FileRoutesById {
   '/_app/observe/llm/traces/$id': typeof AppObserveLlmTracesIdRoute
   '/_app/review/hosts/$repo/$number': typeof AppReviewHostsRepoNumberRoute
   '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/_app/ship_/$owner/$name/$sha': typeof AppShipOwnerNameShaRoute
   '/_app/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/_app/review/hosts/$repo/': typeof AppReviewHostsRepoIndexRoute
   '/_app/deployments/releases/apps/$app_/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -874,6 +892,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/repos'
     | '/settings'
+    | '/ship'
     | '/sync'
     | '/system'
     | '/telemetry'
@@ -955,6 +974,7 @@ export interface FileRouteTypes {
     | '/observe/llm/traces/$id'
     | '/review/hosts/$repo/$number'
     | '/runs/$id/jobs/$jobId'
+    | '/ship/$owner/$name/$sha'
     | '/deployments/releases/templates/'
     | '/review/hosts/$repo/'
     | '/deployments/releases/apps/$app/environments/$env'
@@ -966,6 +986,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/repos'
     | '/settings'
+    | '/ship'
     | '/sync'
     | '/system'
     | '/telemetry'
@@ -1048,6 +1069,7 @@ export interface FileRouteTypes {
     | '/observe/llm/traces/$id'
     | '/review/hosts/$repo/$number'
     | '/runs/$id/jobs/$jobId'
+    | '/ship/$owner/$name/$sha'
     | '/deployments/releases/templates'
     | '/review/hosts/$repo'
     | '/deployments/releases/apps/$app/environments/$env'
@@ -1060,6 +1082,7 @@ export interface FileRouteTypes {
     | '/_app/logs'
     | '/_app/repos'
     | '/_app/settings'
+    | '/_app/ship'
     | '/_app/sync'
     | '/_app/system'
     | '/_app/telemetry'
@@ -1142,6 +1165,7 @@ export interface FileRouteTypes {
     | '/_app/observe/llm/traces/$id'
     | '/_app/review/hosts/$repo/$number'
     | '/_app/runs/$id/jobs/$jobId'
+    | '/_app/ship_/$owner/$name/$sha'
     | '/_app/deployments/releases/templates/'
     | '/_app/review/hosts/$repo/'
     | '/_app/deployments/releases/apps/$app_/environments/$env'
@@ -1208,6 +1232,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof AppSettingsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/ship': {
+      id: '/_app/ship'
+      path: '/ship'
+      fullPath: '/ship'
+      preLoaderRoute: typeof AppShipRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/sync': {
@@ -1791,6 +1822,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRunsIdJobsJobIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/ship_/$owner/$name/$sha': {
+      id: '/_app/ship_/$owner/$name/$sha'
+      path: '/ship/$owner/$name/$sha'
+      fullPath: '/ship/$owner/$name/$sha'
+      preLoaderRoute: typeof AppShipOwnerNameShaRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/releases/apps/$app_/environments/$env': {
       id: '/_app/deployments/releases/apps/$app_/environments/$env'
       path: '/deployments/releases/apps/$app/environments/$env'
@@ -1808,6 +1846,7 @@ interface AppRouteChildren {
   AppLogsRoute: typeof AppLogsRoute
   AppReposRoute: typeof AppReposRoute
   AppSettingsRoute: typeof AppSettingsRoute
+  AppShipRoute: typeof AppShipRoute
   AppSyncRoute: typeof AppSyncRoute
   AppSystemRoute: typeof AppSystemRoute
   AppTelemetryRoute: typeof AppTelemetryRoute
@@ -1889,6 +1928,7 @@ interface AppRouteChildren {
   AppObserveLlmTracesIdRoute: typeof AppObserveLlmTracesIdRoute
   AppReviewHostsRepoNumberRoute: typeof AppReviewHostsRepoNumberRoute
   AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
+  AppShipOwnerNameShaRoute: typeof AppShipOwnerNameShaRoute
   AppDeploymentsReleasesTemplatesIndexRoute: typeof AppDeploymentsReleasesTemplatesIndexRoute
   AppReviewHostsRepoIndexRoute: typeof AppReviewHostsRepoIndexRoute
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute: typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
@@ -1901,6 +1941,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppLogsRoute: AppLogsRoute,
   AppReposRoute: AppReposRoute,
   AppSettingsRoute: AppSettingsRoute,
+  AppShipRoute: AppShipRoute,
   AppSyncRoute: AppSyncRoute,
   AppSystemRoute: AppSystemRoute,
   AppTelemetryRoute: AppTelemetryRoute,
@@ -1984,6 +2025,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveLlmTracesIdRoute: AppObserveLlmTracesIdRoute,
   AppReviewHostsRepoNumberRoute: AppReviewHostsRepoNumberRoute,
   AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
+  AppShipOwnerNameShaRoute: AppShipOwnerNameShaRoute,
   AppDeploymentsReleasesTemplatesIndexRoute:
     AppDeploymentsReleasesTemplatesIndexRoute,
   AppReviewHostsRepoIndexRoute: AppReviewHostsRepoIndexRoute,

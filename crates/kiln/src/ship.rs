@@ -5,13 +5,25 @@
 //! each runner's replant. Where it stands is `kiln_cd::journey`'s to say: this reads the records
 //! into a journey and shapes the JSON. Every field is new, and a client must take any as missing.
 //!
-//! - `GET /api/ship/commits?repo=&limit=&cursor=`: a repository's commits, newest first, cursor-paged.
+//! Changes are Ship items by commit (docs/ci.md W26-R01): a commit is an item when it has runs or
+//! is a change's (a diff's version, a change request's commits, where a change landed; a host's
+//! pull request as `githost::mirror` keeps it: its heads, its commits, where it merged). A change's
+//! tip (its latest version's head, or the commit it landed as) carries its review; its other
+//! commits fold under the tip (`fold_under`), an older version's head standing superseded. Each row
+//! is rendered for those whose turn it is ('yours') and for everyone else, and a request picks by
+//! the caller's principals (an agent counts as its person).
+//!
+//! - `GET /api/ship/commits?repo=&limit=&cursor=&host=&kind=&lens=`: a repository's commits, newest
+//!   first, cursor-paged; `host` (kiln, github, gitlab, bitbucket) and `kind` (diff, request, commit)
+//!   filter, and `lens=review` keeps the changes' commits (W26-R02).
 //! - `GET /api/ship/commits/:repo/:sha`: one commit, its records and where it stands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use http::StatusCode;
-use kiln_cd::journey::{self, Attempt, Author, Build, Check, Journey, Land, Leg, Part, Platform, Production, Replant, Runner, RunnerReplant, Staging};
+use kiln_cd::journey::{self, Attempt, Author, Build, Check, Journey, Kinds, Land, Leg, Part, Platform, Production, Replant, Review, ReviewState, Runner, RunnerReplant, Staging};
+use kiln_ci::review::{Facts, Kind, Standing};
+use kiln_ci::turn;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
@@ -56,7 +68,12 @@ struct AttemptRec {
 
 #[derive(Debug, Clone, Default)]
 struct LegRec {
+    /// The job's id (`jobs.id`), the one its log streams under.
+    job: String,
     run_id: String,
+    /// When its job started and finished (unix seconds), as far as it has.
+    started: Option<i64>,
+    finished: Option<i64>,
     name: String,
     status: String,
     conclusion: Option<String>,
@@ -102,6 +119,494 @@ struct Records {
     waiting: Option<(String, i64)>,
     riders: u32,
     tags: Vec<String>,
+    /// The change this commit is of, and what its review is read from (W26-R01).
+    change: Option<ChangeRec>,
+}
+
+/// An open thread on a change: its kind, where it is, who opened it and its first words.
+#[derive(Debug, Clone, Default)]
+struct ThreadRec {
+    kind: String,
+    file: Option<String>,
+    line: Option<i64>,
+    by: String,
+    said: String,
+}
+
+/// A mark of the Review lane group (W26-R14), as agreed with the Ship agent (2026-10-26, NOTES.md):
+/// a push, replay, comment, fix, resolution or approval, each with its time (`end` null while under
+/// way, = `at` for a point), who did it (the principal as kiln writes it), its revision and its
+/// signer — null until W27-R03 signs kiln's records, so the seal says unsigned, never a false one.
+/// `state` is a GlyphState name (ui status-glyph-spec.ts).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct MarkRec {
+    id: String,
+    kind: &'static str,
+    at: i64,
+    end: Option<i64>,
+    by: String,
+    revision: Option<u32>,
+    state: &'static str,
+    thread: Option<String>,
+    note: Option<String>,
+}
+
+/// The change a commit is of: a kiln diff or change request (W26-R01), and the records its review
+/// stands on (W26-R02, R05). Times are unix seconds.
+#[derive(Debug, Clone, Default)]
+struct ChangeRec {
+    name: String,
+    /// `diff` or `request`.
+    kind: &'static str,
+    host: String,
+    title: String,
+    author: String,
+    author_for: Option<String>,
+    state: String,
+    landed: Option<String>,
+    /// This commit's version, and whether it is that version's head (else one of the commits a
+    /// change request's version brings).
+    n: u32,
+    head: bool,
+    latest: u32,
+    latest_sha: String,
+    message: String,
+    at: i64,
+    reviewers: Vec<(String, i64)>,
+    /// (reviewer, action, at, body, version reviewed)
+    reviews: Vec<(String, String, i64, String, Option<u32>)>,
+    /// (version, rebase only, at)
+    pushes: Vec<(u32, bool, i64)>,
+    threads: Vec<ThreadRec>,
+    replies: Vec<(String, i64)>,
+    /// The land queue's latest entry landing this change: its state and why.
+    queue: Option<(String, Option<String>)>,
+    /// The conflicts its latest revision's replay onto where it lands left, each holding its gate
+    /// until Commit resolution makes a revision of them (W26-R12).
+    conflicts: Vec<kiln_ci::review::Conflict>,
+    /// The Review lane group's marks, oldest first (W26-R14).
+    marks: Vec<MarkRec>,
+}
+
+impl ChangeRec {
+    /// The commit that carries the change's review: where it landed, else its latest head.
+    fn tip(&self) -> &str {
+        self.landed.as_deref().filter(|s| !s.is_empty()).unwrap_or(&self.latest_sha)
+    }
+
+    fn is_landed(&self) -> bool {
+        self.state == "landed" || self.landed.as_deref().is_some_and(|s| !s.is_empty())
+    }
+}
+
+/// Which change a commit (`o.repo_id`, `o.item`) is of: the newest change naming it, its head
+/// before its other commits. The facets' SQL picks the same way ([`facet_sql`]).
+const CHANGE_OF: &str = "FROM ship_commit_changes x WHERE x.repo_id = o.repo_id AND x.sha = o.item ORDER BY x.created_at DESC, x.number DESC, x.diff_id DESC, x.head DESC, x.n DESC LIMIT 1";
+/// A commit (`o`) is an item when it has runs or is a change's (W26-R01).
+const IS_ITEM: &str = "(EXISTS (SELECT 1 FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item) OR EXISTS (SELECT 1 FROM ship_commit_changes x WHERE x.repo_id = o.repo_id AND x.sha = o.item))";
+
+/// A commit's kind (`diff`, `request`, `commit`) and its change's host, as SQL over `o`.
+fn facet_sql() -> (String, String) {
+    (format!("COALESCE((SELECT CASE x.kind WHEN 'change_request' THEN 'request' ELSE 'diff' END {CHANGE_OF}), 'commit')"), format!("(SELECT x.host {CHANGE_OF})"))
+}
+
+fn first_words(s: &str) -> String {
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+    if line.chars().count() <= 40 { line.to_string() } else { format!("{}…", line.chars().take(39).collect::<String>().trim_end()) }
+}
+
+/// A principal's name as a line shows it (`user:kim` is kim).
+fn shown(p: &str) -> &str {
+    p.split(" for ").next().unwrap_or(p).rsplit(':').next().unwrap_or(p)
+}
+
+/// Marks of one second read in the order a revision's story takes (W26-R14): the push, the talk,
+/// the fix, the replay, the resolution, the verdict.
+fn mark_rank(kind: &str) -> u8 {
+    match kind {
+        "push" => 0,
+        "comment" => 1,
+        "fix" => 2,
+        "replay" => 3,
+        "resolution" => 4,
+        _ => 5,
+    }
+}
+
+/// Approval marks (W26-R14): each reviewer asked who has answered nothing yet (state `requested`,
+/// no end), and each verdict given (`accept` approves, `request_changes` asks changes, `resign`
+/// steps back). A review posted as comments alone is no verdict; its comments mark themselves.
+fn approval_marks(marks: &mut Vec<MarkRec>, key: &str, reviewers: &[(String, i64)], reviews: &[(String, String, i64, String, Option<u32>)]) {
+    for (reviewer, at) in reviewers {
+        if !reviews.iter().any(|(w, a, _, _, _)| w == reviewer && a != "comment") {
+            marks.push(MarkRec { id: format!("ask:{key}:{reviewer}"), kind: "approval", at: *at, end: None, by: reviewer.clone(), revision: None, state: "requested", thread: None, note: Some("asked".to_string()) });
+        }
+    }
+    for (i, (by, action, at, body, version)) in reviews.iter().enumerate() {
+        let (state, note) = match action.as_str() {
+            "accept" => ("approved", None),
+            "request_changes" => ("changes", None),
+            "resign" => ("superseded", Some("resigned".to_string())),
+            _ => continue,
+        };
+        let words = first_words(body);
+        marks.push(MarkRec {
+            id: format!("{key}:review:{i}"),
+            kind: "approval",
+            at: *at,
+            end: Some(*at),
+            by: by.clone(),
+            revision: *version,
+            state,
+            thread: None,
+            note: note.or_else(|| (!words.is_empty()).then_some(words)),
+        });
+    }
+}
+
+/// A mark as the detail serves it (W26-R14); `signer` is null until W27-R03 signs kiln's records.
+fn mark_json(m: &MarkRec) -> Value {
+    let mut v = json!({ "id": m.id, "kind": m.kind, "at": m.at, "end": m.end, "by": m.by, "signer": Value::Null, "revision": m.revision, "state": m.state });
+    if let Some(o) = v.as_object_mut() {
+        if let Some(t) = &m.thread {
+            o.insert("thread".into(), json!(t));
+        }
+        if let Some(n) = &m.note {
+            o.insert("note".into(), json!(n));
+        }
+    }
+    v
+}
+
+/// One commit's change, if it is a change's.
+fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Result<Option<ChangeRec>> {
+    let found: Option<(String, Option<u32>, bool, String)> = c
+        .query_row(&format!("SELECT x.diff_id, x.n, x.head, x.host {}", CHANGE_OF.replace("o.repo_id", "?1").replace("o.item", "?2")), params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .optional()?;
+    let Some((id, n, head, host)) = found else { return Ok(None) };
+    if let Some(number) = id.strip_prefix(&format!("pull:{host}:")).and_then(|n| n.parse::<i64>().ok()) {
+        return load_pull(c, repo_id, &host, number, n.unwrap_or(0), head).map(Some);
+    }
+    let mut ch = c.query_row("SELECT number, kind, title, author, author_for, state, landed_commit FROM diffs WHERE id = ?1", [&id], |r| {
+        let (number, kind): (i64, String) = (r.get(0)?, r.get(1)?);
+        let request = kind == "change_request";
+        Ok(ChangeRec {
+            name: format!("{}{number}", if request { "CR" } else { "D" }),
+            kind: if request { "request" } else { "diff" },
+            host: host.clone(),
+            title: r.get(2)?,
+            author: r.get(3)?,
+            author_for: r.get(4)?,
+            state: r.get(5)?,
+            landed: r.get(6)?,
+            n: n.unwrap_or(0),
+            head,
+            ..ChangeRec::default()
+        })
+    })?;
+    let mut marks: Vec<MarkRec> = Vec::new();
+    let mut st = c.prepare("SELECT n, commit_sha, rebase_only, created_at, message, pushed_by, why, thread FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+    for row in st.query_map([&id], |r| {
+        Ok((
+            r.get::<_, u32>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+        ))
+    })? {
+        let (v, commit, rebase_only, at, message, pushed_by, why, thread) = row?;
+        if v == ch.n {
+            (ch.message, ch.at) = (message, at);
+        }
+        ch.pushes.push((v, rebase_only, at));
+        (ch.latest, ch.latest_sha) = (v, commit);
+        // A revision is the lane's push, the fix answering a thread (an agent's fix, a suggestion
+        // applied) or the resolution of a replay's conflicts, by which `why` it was made (W26-R14).
+        let kind = match why.as_deref() {
+            Some("conflict resolved") => "resolution",
+            Some(_) => "fix",
+            None if thread.is_some() => "fix",
+            None => "push",
+        };
+        marks.push(MarkRec {
+            id: format!("{id}:v{v}"),
+            kind,
+            at,
+            end: Some(at),
+            by: pushed_by,
+            revision: Some(v),
+            state: "passed",
+            thread,
+            note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
+        });
+    }
+    let mut st = c.prepare("SELECT reviewer, added_at FROM diff_reviewers WHERE diff_id = ?1 ORDER BY added_at, reviewer")?;
+    ch.reviewers = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut st = c.prepare("SELECT reviewer, action, created_at, body, version FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
+    ch.reviews = st
+        .query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, Some(r.get::<_, u32>(4)?))))?
+        .collect::<Result<_, _>>()?;
+    approval_marks(&mut marks, &id, &ch.reviewers, &ch.reviews);
+    let mut st = c.prepare(
+        "SELECT t.kind, t.file, t.start_line, t.created_by, (SELECT c.body FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1 ORDER BY c.created_at, c.rowid LIMIT 1)
+         FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1) ORDER BY t.created_at, t.id",
+    )?;
+    ch.threads = st.query_map([&id], |r| Ok(ThreadRec { kind: r.get(0)?, file: r.get(1)?, line: r.get(2)?, by: r.get(3)?, said: r.get::<_, Option<String>>(4)?.unwrap_or_default() }))?.collect::<Result<_, _>>()?;
+    // Each thread's published comments, oldest first (the first is its opening one).
+    let mut by_thread: HashMap<String, Vec<(String, String, i64)>> = HashMap::new();
+    let mut st = c.prepare("SELECT c.thread_id, c.id, c.author, c.created_at FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 ORDER BY c.created_at, c.rowid")?;
+    for row in st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))? {
+        let (tid, cid, author, at) = row?;
+        ch.replies.push((author.clone(), at));
+        by_thread.entry(tid).or_default().push((cid, author, at));
+    }
+    // Each published thread is a comment mark as it opens (a blocking one holds, any other waits),
+    // each published comment after its thread's first is its answer, each resolution its point.
+    let mut st = c.prepare(
+        "SELECT t.id, t.kind, t.file, t.start_line, t.state, t.created_by, t.created_at, t.resolved_by, t.resolved_at, t.resolution
+         FROM review_threads t WHERE t.diff_id = ?1 AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1) ORDER BY t.created_at, t.id",
+    )?;
+    for row in st.query_map([&id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+        ))
+    })? {
+        let (tid, kind, file, line, state, by, at, resolved_by, resolved_at, resolution) = row?;
+        let open = state != "resolved";
+        let place = kiln_ci::review::place(file.as_deref(), line.and_then(|l| u32::try_from(l).ok()));
+        marks.push(MarkRec {
+            id: format!("{tid}:open"),
+            kind: "comment",
+            at,
+            end: resolved_at,
+            by,
+            revision: None,
+            state: if !open { "passed" } else if kind == "blocking" { "blocked" } else { "needs" },
+            thread: Some(tid.clone()),
+            note: Some(if kind == "question" { place } else { format!("{kind} · {place}") }),
+        });
+        for (cid, author, at) in by_thread.get(&tid).into_iter().flatten().skip(1) {
+            marks.push(MarkRec { id: format!("comment:{cid}"), kind: "comment", at: *at, end: Some(*at), by: author.clone(), revision: None, state: "passed", thread: Some(tid.clone()), note: Some("answered".to_string()) });
+        }
+        if let (Some(by), Some(at)) = (resolved_by, resolved_at) {
+            marks.push(MarkRec {
+                id: format!("{tid}:resolved"),
+                kind: "comment",
+                at,
+                end: Some(at),
+                by,
+                revision: None,
+                state: "passed",
+                thread: Some(tid),
+                note: resolution.filter(|r| !r.is_empty()).or_else(|| Some("resolved".to_string())),
+            });
+        }
+    }
+    // Each replay of a revision onto where it lands: a conflicted one is under way until resolved.
+    let mut st = c.prepare("SELECT id, version, onto_name, state, created_by, created_at, resolved_at FROM review_replays WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
+    for row in st.query_map([&id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, Option<i64>>(6)?))
+    })? {
+        let (rid, version, onto, state, by, at, resolved_at) = row?;
+        let conflicted = state == "conflicted";
+        marks.push(MarkRec {
+            id: format!("replay:{rid}"),
+            kind: "replay",
+            at,
+            end: if conflicted { resolved_at } else { Some(at) },
+            by,
+            revision: Some(version),
+            state: if conflicted && resolved_at.is_none() { "conflict" } else { "passed" },
+            thread: None,
+            note: Some(format!("onto {onto}")),
+        });
+    }
+    // Stable: marks of one second keep the order they were written here.
+    marks.sort_by_key(|m| (m.at, mark_rank(m.kind)));
+    ch.marks = marks;
+    let mut st = c.prepare(
+        "SELECT k.file, k.line, k.take IS NOT NULL FROM review_conflicts k JOIN review_replays r ON r.id = k.replay_id
+         WHERE r.id = (SELECT p.id FROM review_replays p WHERE p.diff_id = ?1 ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+           AND r.state = 'conflicted' AND r.version = (SELECT MAX(v.n) FROM diff_versions v WHERE v.diff_id = ?1)
+         ORDER BY k.position",
+    )?;
+    ch.conflicts = st.query_map([&id], |r| Ok(kiln_ci::review::Conflict { file: r.get(0)?, line: r.get(1)?, taken: r.get(2)? }))?.collect::<Result<_, _>>()?;
+    ch.queue = c
+        .query_row(
+            "SELECT l.state, l.reason FROM land_queue l WHERE l.repo_id = ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.diffs) THEN l.diffs ELSE '[]' END) j WHERE j.value = ?2) ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
+            params![repo_id, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(Some(ch))
+}
+
+/// A host's pull request as a change (W26-R01, R20): from the mirror (`githost::mirror`). Its
+/// review state reads its reviews as kiln's would (changes asked by anyone's latest review, else
+/// approved by one), its asked reviewers join its turn when it's first seen.
+fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n: u32, head: bool) -> anyhow::Result<ChangeRec> {
+    let (title, author, state, reviews, threads, said_by, said, merged, first_seen, requested): (String, String, String, String, i64, String, String, String, i64, String) = c.query_row(
+        "SELECT title, author, state, reviews, threads, said_by, said, merged_sha, first_seen, requested FROM host_pulls WHERE repo_id = ?1 AND host = ?2 AND number = ?3",
+        params![repo_id, host, number],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
+    )?;
+    let reviews: Vec<(String, String, i64, String, Option<u32>)> = serde_json::from_str::<Vec<Value>>(&reviews)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let action = match s("verdict").as_str() {
+                "approve" => "accept".to_string(),
+                v => v.to_string(),
+            };
+            (s("by"), action, r.get("at").and_then(Value::as_i64).unwrap_or(first_seen), String::new(), None)
+        })
+        .collect();
+    // Each reviewer's latest word decides, as hosts read them.
+    let mut latest: HashMap<&str, &str> = HashMap::new();
+    for (by, action, _, _, _) in &reviews {
+        if action != "comment" {
+            latest.insert(by.as_str(), action.as_str());
+        }
+    }
+    let review_state = match state.as_str() {
+        "draft" => "draft",
+        "merged" => "landed",
+        "closed" => "abandoned",
+        _ if latest.values().any(|a| *a == "request_changes") => "changes-requested",
+        _ if latest.values().any(|a| *a == "accept") => "accepted",
+        _ => "needs-review",
+    };
+    let mut st = c.prepare("SELECT n, sha, seen_at FROM host_pull_heads WHERE repo_id = ?1 AND host = ?2 AND number = ?3 ORDER BY n")?;
+    let heads: Vec<(u32, String, i64)> = st.query_map(params![repo_id, host, number], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let (latest_n, latest_sha) = heads.last().map(|(k, s, _)| (*k, s.clone())).unwrap_or_default();
+    let at = heads.iter().find(|(k, _, _)| *k == n).map_or(first_seen, |(_, _, t)| *t);
+    let count = usize::try_from(threads).unwrap_or(0);
+    let threads: Vec<ThreadRec> = (0..count).map(|i| ThreadRec { kind: "question".into(), by: if i + 1 == count { said_by.clone() } else { String::new() }, said: if i + 1 == count { said.clone() } else { String::new() }, ..ThreadRec::default() }).collect();
+    // A host's pull request's lane marks: a push per head, the asks and the verdicts (the mirror
+    // keeps no per-comment times, so no comment marks).
+    let mut marks: Vec<MarkRec> = Vec::new();
+    let key = format!("pull:{host}:{number}");
+    for (k, _, t) in &heads {
+        marks.push(MarkRec { id: format!("{key}:v{k}"), kind: "push", at: *t, end: Some(*t), by: author.clone(), revision: Some(*k), state: "passed", thread: None, note: None });
+    }
+    let asked: Vec<(String, i64)> = serde_json::from_str::<Vec<String>>(&requested).unwrap_or_default().into_iter().map(|r| (r, first_seen)).collect();
+    approval_marks(&mut marks, &key, &asked, &reviews);
+    marks.sort_by_key(|m| (m.at, mark_rank(m.kind)));
+    Ok(ChangeRec {
+        name: format!("{}{number}", if host == "gitlab" { "!" } else { "#" }),
+        kind: "request",
+        host: host.to_string(),
+        message: title.clone(),
+        title,
+        author,
+        author_for: None,
+        state: review_state.to_string(),
+        landed: Some(merged).filter(|m| !m.is_empty()),
+        n,
+        head,
+        latest: latest_n,
+        latest_sha,
+        at,
+        reviewers: asked,
+        reviews,
+        pushes: heads.iter().map(|(k, _, t)| (*k, false, *t)).collect(),
+        threads,
+        replies: Vec::new(),
+        queue: None,
+        // A host's pull request is replayed on its host, not here.
+        conflicts: Vec::new(),
+        marks,
+    })
+}
+
+/// A change's review as its tip carries it (W26-R02): whose turn it is folded from its records
+/// (`kiln_ci::turn`, W26-R05), its state read from its facts (`kiln_ci::review::state`). An older
+/// version's head stands superseded; a change request's other commits, and an abandoned change's,
+/// carry none.
+fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
+    if !ch.head || ch.state == "abandoned" {
+        return None;
+    }
+    let mut ev: Vec<(i64, u8, turn::Event)> = Vec::new();
+    ev.extend(ch.reviewers.iter().map(|(w, at)| (*at, 0, turn::Event::Asked(w.clone()))));
+    ev.extend(ch.pushes.iter().filter(|(v, _, _)| *v > 1).map(|(_, rebase_only, at)| (*at, 1, turn::Event::Pushed { rebase_only: *rebase_only })));
+    ev.extend(ch.replies.iter().map(|(w, at)| (*at, 2, turn::Event::Replied(w.clone()))));
+    ev.extend(ch.reviews.iter().map(|(w, action, at, _, _)| {
+        let e = match action.as_str() {
+            "accept" => turn::Event::Approved(w.clone()),
+            "resign" => turn::Event::Removed(w.clone()),
+            _ => turn::Event::Replied(w.clone()),
+        };
+        (*at, 3, e)
+    }));
+    ev.sort_by_key(|(at, order, _)| (*at, *order));
+    let mut events: Vec<turn::Event> = ev.into_iter().map(|(_, _, e)| e).collect();
+    match ch.state.as_str() {
+        "draft" => events.push(turn::Event::Draft),
+        "landed" => events.push(turn::Event::Closed),
+        _ => {}
+    }
+    // An agent's change is its person's to answer.
+    let author = ch.author_for.clone().unwrap_or_else(|| ch.author.clone());
+    let mut whose: Vec<String> = turn::fold(&ch.author, &events).turn.into_iter().map(|p| if p == ch.author { author.clone() } else { p }).collect();
+    whose.sort();
+    whose.dedup();
+    // The gate (W26-R11), as merging asks it: what's open by kind, and what holds the change, read
+    // as accepting and the land queue read them.
+    let threads: Vec<kiln_ci::review::Thread> = ch
+        .threads
+        .iter()
+        .map(|t| kiln_ci::review::Thread { kind: Kind::read(&t.kind), by: t.by.clone(), file: t.file.clone(), line: t.line.and_then(|l| u32::try_from(l).ok()), ..kiln_ci::review::Thread::default() })
+        .collect();
+    let gate = kiln_ci::review::gate(&threads, &ch.conflicts, None);
+    let open = Kinds { question: gate.open.question, nit: gate.open.nit, issue: gate.open.issue, blocking: gate.open.blocking };
+    let facts = Facts {
+        draft: ch.state == "draft",
+        changes_asked: ch.state == "changes-requested",
+        open: gate.open,
+        conflicts: gate.conflicts,
+        fixing: false,
+        policy_met: matches!(ch.state.as_str(), "accepted" | "landing" | "landed"),
+    };
+    let state = match kiln_ci::review::state(&facts) {
+        Standing::Draft => ReviewState::Draft,
+        Standing::Requested => ReviewState::Requested,
+        Standing::Changes => ReviewState::Changes,
+        Standing::Blocked => ReviewState::Blocked,
+        Standing::Fixing => ReviewState::Fixing,
+        Standing::Conflict => ReviewState::Conflict,
+        Standing::Approved => ReviewState::Approved,
+    };
+    let said = |t: &ThreadRec| format!("{}: {}", shown(&t.by), first_words(&t.said));
+    let about = match state {
+        ReviewState::Blocked => ch.threads.iter().rev().find(|t| Kind::read(&t.kind) == Kind::Blocking).map(|t| match (&t.file, t.line) {
+            (Some(f), Some(l)) => format!("{}:{l}", f.rsplit('/').next().unwrap_or(f)),
+            (Some(f), None) => f.rsplit('/').next().unwrap_or(f).to_string(),
+            _ => said(t),
+        }),
+        ReviewState::Changes => ch.reviews.iter().rev().find(|r| r.1 == "request_changes").map(|r| first_words(&r.3)),
+        ReviewState::Conflict => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)),
+        ReviewState::Requested => ch.threads.last().map(said),
+        _ => None,
+    }
+    .unwrap_or_default();
+    let tip = ch.tip();
+    let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: None, about, superseded_by })
 }
 
 fn short(sha: &str) -> String {
@@ -186,7 +691,9 @@ fn repo_ctx(c: &rusqlite::Connection, repo: &str) -> anyhow::Result<Option<RepoC
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let mut st = c.prepare("SELECT r.sha, o.seq, MIN(r.branch) FROM runs r JOIN ship_order o ON o.repo_id = r.repo_id AND o.item = r.sha WHERE r.repo_id = ?1 GROUP BY r.sha, o.seq ORDER BY o.seq DESC")?;
+    let mut st = c.prepare(&format!(
+        "SELECT o.item, o.seq, COALESCE((SELECT MIN(r.branch) FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item), '') FROM ship_order o WHERE o.repo_id = ?1 AND {IS_ITEM} ORDER BY o.seq DESC"
+    ))?;
     let commits = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
     Ok(Some(RepoCtx { id, name, current, waiting, commits }))
 }
@@ -211,12 +718,12 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
         .collect::<Result<_, _>>()?;
 
     let mut st = c.prepare(
-        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error
+        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at
          FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND j.job_id IS NOT NULL AND j.run_attempt = r.attempt ORDER BY j.rowid",
     )?;
     let legs: Vec<(String, LegRec)> = st
         .query_map(params![repo_id, sha], |r| {
-            Ok((r.get::<_, String>(0)?, LegRec { run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, attempts: Vec::new() }))
+            Ok((r.get::<_, String>(0)?, LegRec { job: r.get(0)?, run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, started: r.get(7)?, finished: r.get(8)?, attempts: Vec::new() }))
         })?
         .collect::<Result<_, _>>()?;
     let mut at = c.prepare("SELECT status, conclusion, failure_class FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
@@ -249,17 +756,28 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     rec.riders = u32::try_from(ctx.commits.iter().filter(|(_, f, b)| *b == branch && *f > prod_row && *f <= first_row).count()).unwrap_or(u32::MAX);
     let mut st = c.prepare("SELECT tag_name FROM ci_releases WHERE repo_id = ?1 AND target_commitish = ?2 ORDER BY id")?;
     rec.tags = st.query_map(params![repo_id, sha], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    rec.change = load_change(c, &repo_id, &sha)?;
     Ok(rec)
 }
 
 /// A commit's records as `kiln_cd::journey` reads them, `now` in ms.
 fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
     let first = rec.runs.first();
-    let author = Author::Person(first.map(|r| r.actor.clone()).unwrap_or_default());
-    let land = match rec.land.as_ref().map(|(s, why)| (s.as_str(), why)) {
+    let change = rec.change.as_ref();
+    let author = match (first, change) {
+        (None, Some(ch)) => match &ch.author_for {
+            Some(person) => Author::Agent { name: ch.author.clone(), for_person: person.clone() },
+            None => Author::Person(ch.author.clone()),
+        },
+        _ => Author::Person(first.map(|r| r.actor.clone()).unwrap_or_default()),
+    };
+    // A change's commit is in the queue when an entry lands its change, and not landed until the change is.
+    let queue = rec.land.as_ref().or(change.and_then(|ch| ch.queue.as_ref()));
+    let land = match queue.map(|(s, why)| (s.as_str(), why)) {
         Some(("testing", _)) => Land::Testing,
         Some(("queued", _)) => Land::Queued { ahead: 0 },
         Some(("ejected", why)) => Land::Ejected { why: why.clone().unwrap_or_default() },
+        _ if change.is_some_and(|ch| !ch.is_landed()) => Land::NotYet,
         _ => Land::Landed,
     };
     let run_pipeline: HashMap<&str, &str> = rec.runs.iter().map(|r| (r.id.as_str(), r.pipeline.as_str())).collect();
@@ -278,7 +796,9 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
         } else {
             leg.attempts.iter().map(|a| attempt_of(&a.status, a.conclusion.as_deref(), a.class.as_deref())).collect()
         };
-        let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default() };
+        // A leg names its job and run once it has run (Output streams that job's log).
+        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked");
+        let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()), start: leg.started, end: leg.finished };
         match checks.iter_mut().find(|c| c.pipeline == pipeline) {
             Some(c) => c.legs.push(l),
             None => checks.push(Check { pipeline: pipeline.to_string(), legs: vec![l] }),
@@ -288,7 +808,7 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
     let image = if !rec.images.is_empty() || !release_running { Part::Passed } else { Part::Running };
     let build = Build { platforms, image };
 
-    let checks_ok = !matches!(journey::pips(&Journey { checks: checks.clone(), ..empty() }, now).get(1).map(|p| p.state), Some(journey::Glyph::Failed));
+    let checks_ok = !matches!(journey::pips(&Journey { checks: checks.clone(), ..empty() }, now).into_iter().find(|p| p.stage == journey::Stage::Checks).map(|p| p.state), Some(journey::Glyph::Failed));
     let newer = |d: &DeployRec| d.first_row > rec.first_row;
     let own = |prod: bool| rec.own.iter().find(|d| d.production == prod && (prod || lower_is(&d.environment, "staging") || !rec.own.iter().any(|x| !x.production && lower_is(&x.environment, "staging"))));
     let current = |prod: bool| rec.current.iter().find(|d| d.production == prod && (prod || lower_is(&d.environment, "staging") || !rec.current.iter().any(|x| !x.production && lower_is(&x.environment, "staging"))));
@@ -351,7 +871,8 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
             .collect(),
     });
 
-    Journey { author, land, checks, build, staging, production, replant, in_production, handled_by: None, fixed_by: None }
+    let review = change.and_then(|ch| review_of(ch, &rec.sha));
+    Journey { author, land, checks, build, staging, production, replant, in_production, handled_by: None, fixed_by: None, review }
 }
 
 fn lower_is(s: &str, want: &str) -> bool {
@@ -370,6 +891,7 @@ fn empty() -> Journey {
         in_production: false,
         handled_by: None,
         fixed_by: None,
+        review: None,
     }
 }
 
@@ -378,7 +900,7 @@ fn empty() -> Journey {
 /// API's approval); retry a failed check (the run's rerun, its failed legs only) or hand it to an
 /// agent (an attachment: an agent looking after the run); retry a runner that didn't replant (its
 /// upgrade, again).
-fn actions(rec: &Records, j: &Journey) -> Vec<Value> {
+fn actions(rec: &Records, j: &Journey, yours: bool) -> Vec<Value> {
     let act = |name: &str, method: &str, path: String, body: Value| json!({ "name": name, "method": method, "path": path, "body": body });
     let mut out = Vec::new();
     if let Some(r) = rec.releases.iter().find(|r| r.state == "waiting") {
@@ -395,37 +917,151 @@ fn actions(rec: &Records, j: &Journey) -> Vec<Value> {
             out.push(act("retry_runner", "POST", format!("/api/updates/runners/{}", x.name), Value::Null));
         }
     }
+    // A change whose turn is yours: hand it to an agent, or review it (W26-R02's Hand off and Review pair).
+    if let (true, Some(ch), Some(r)) = (yours, rec.change.as_ref(), j.review.as_ref())
+        && r.superseded_by.is_none()
+    {
+        if !out.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("hand_off")) {
+            out.push(act("hand_off", "POST", "/api/attachments".to_string(), json!({ "repo": rec.repo, "diff": ch.name })));
+        }
+        out.push(act("review", "GET", format!("/api/diffs/{}", ch.name), Value::Null));
+    }
     out
 }
 
-/// A commit as the list shows it.
-fn summary(rec: &Records, runners: &[RunnerSeen], now: i64) -> Value {
-    let j = journey_of(rec, runners, now);
-    let s = journey::standing(&j, now);
+/// A commit's kind for the facets: its change's (`diff`, `request`), else `commit`.
+fn kind_of(rec: &Records) -> &'static str {
+    rec.change.as_ref().map_or("commit", |ch| ch.kind)
+}
+
+/// Who a commit under review is theirs to act on (`journey::in_turn_of`): its turn, and its author
+/// when it's theirs to answer (changes asked, a blocking thread, a conflict, its checks failed).
+fn whose(j: &Journey) -> Vec<String> {
+    let Some(r) = j.review.as_ref().filter(|r| r.superseded_by.is_none()) else { return Vec::new() };
+    let mut out: Vec<String> = r.turn.iter().chain(std::iter::once(&r.author)).filter(|p| journey::in_turn_of(j, p)).cloned().collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The facets a list is filtered by (W26-R02): the change's host, the kind, the Review lens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Facets {
+    pub host: Option<String>,
+    pub kind: Option<String>,
+    pub review: bool,
+}
+
+impl Facets {
+    pub fn from_query(q: &HashMap<String, String>) -> Self {
+        let word = |k: &str| q.get(k).map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
+        Self { host: word("host"), kind: word("kind"), review: word("lens").as_deref() == Some("review") }
+    }
+
+    fn matches(&self, kind: &str, host: Option<&str>) -> bool {
+        self.kind.as_deref().is_none_or(|k| k == kind) && self.host.as_deref().is_none_or(|h| host == Some(h)) && (!self.review || kind != "commit")
+    }
+}
+
+/// Whether a viewer (their principals) holds a row's turn.
+fn holds(whose: &[String], viewer: Option<&HashSet<String>>) -> bool {
+    viewer.is_some_and(|v| whose.iter().any(|p| v.contains(p)))
+}
+
+/// A commit as the list shows it, for whoever holds its turn (`yours`) or anyone else.
+fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
+    let s = journey::standing_as(j, now, yours);
     let first = rec.runs.first();
+    let ch = rec.change.as_ref();
     let envs: Vec<Value> = rec.current.iter().filter(|d| d.sha == rec.sha).map(|d| json!({ "environment": d.environment, "production": d.production })).collect();
-    json!({
+    let message = match (first, ch) {
+        (Some(r), _) => r.message.lines().next().unwrap_or_default().to_string(),
+        (None, Some(ch)) if ch.head && ch.kind == "request" => ch.title.clone(),
+        (None, Some(ch)) => ch.message.lines().next().filter(|l| !l.is_empty()).map_or_else(|| ch.title.clone(), str::to_string),
+        (None, None) => String::new(),
+    };
+    let change = match (ch, j.review.as_ref()) {
+        (Some(ch), r) => json!({
+            "name": ch.name, "kind": ch.kind, "host": ch.host, "title": ch.title, "revision": ch.n, "latest": ch.latest,
+            "state": r.map(|r| r.state), "turn": r.map(|r| r.turn.clone()).unwrap_or_default(),
+            "open": r.map(|r| json!({ "question": r.open.question, "nit": r.open.nit, "issue": r.open.issue, "blocking": r.open.blocking })),
+            "superseded_by": r.and_then(|r| r.superseded_by.clone()),
+        }),
+        (None, _) => Value::Null,
+    };
+    let row = json!({
         "repo": rec.repo, "sha": rec.sha, "short": short(&rec.sha),
-        "message": first.map(|r| r.message.lines().next().unwrap_or_default().to_string()).unwrap_or_default(),
-        "author": first.map(|r| r.actor.clone()).unwrap_or_default(),
+        "message": message,
+        "author": first.map(|r| r.actor.clone()).or_else(|| ch.map(|c| c.author.clone())).unwrap_or_default(),
         "branch": first.map(|r| r.branch.clone()).unwrap_or_default(),
-        "at": first.map(|r| r.created_at).unwrap_or_default(),
+        "at": first.map(|r| r.created_at).or_else(|| ch.map(|c| c.at)).unwrap_or_default(),
         "stand": s.stand, "line": s.line, "pips": s.pips,
         "environments": envs, "tags": rec.tags,
         "runs": rec.runs.iter().map(|r| json!({ "id": r.id, "pipeline": r.pipeline })).collect::<Vec<_>>(),
         "cursor": rec.first_row,
-        "actions": actions(rec, &j),
-    })
+        "kind": kind_of(rec), "host": ch.map(|c| c.host.clone()), "change": change,
+        "fold_under": ch.map(ChangeRec::tip).filter(|tip| *tip != rec.sha),
+        "actions": actions(rec, j, yours),
+    });
+    with_version(row)
 }
 
-/// A commit with every record its stand came from.
-fn detail(rec: &Records, runners: &[RunnerSeen], now: i64) -> Value {
-    let mut v = summary(rec, runners, now);
+/// The row with `v`: a hash of the JSON it shows (FNV-1a, 64 bits, in hex), the same from memory
+/// and from the store, so the page can keep a row that hasn't changed as it is (W26-R06).
+fn with_version(mut row: Value) -> Value {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in row.to_string().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    if let Some(o) = row.as_object_mut() {
+        o.insert("v".into(), json!(format!("{h:016x}")));
+    }
+    row
+}
+
+/// A commit rendered once for everyone and once for those whose turn it is (when anyone's).
+struct Rendered {
+    others: Value,
+    yours: Option<Value>,
+    whose: Vec<String>,
+}
+
+fn render(rec: &Records, runners: &[RunnerSeen], now: i64) -> Rendered {
     let j = journey_of(rec, runners, now);
+    let whose = whose(&j);
+    let yours = (!whose.is_empty()).then(|| summary_of(rec, &j, now, true));
+    Rendered { others: summary_of(rec, &j, now, false), yours, whose }
+}
+
+/// A leg as the detail shows it; `job` and `run` only once it has run (optional new fields).
+fn leg_json(l: &journey::Leg) -> Value {
+    let mut v = json!({ "name": l.name, "state": journey::leg_glyph(l), "attempts": l.attempts.len(), "note": l.note });
+    if let Some(o) = v.as_object_mut() {
+        if let Some(job) = &l.job {
+            o.insert("job".into(), json!(job));
+        }
+        if let Some(run) = &l.run {
+            o.insert("run".into(), json!(run));
+        }
+        if let Some(start) = l.start {
+            o.insert("start".into(), json!(start));
+        }
+        if let Some(end) = l.end {
+            o.insert("end".into(), json!(end));
+        }
+    }
+    v
+}
+
+/// A commit with every record its stand came from, as `viewer` sees it.
+fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Value {
+    let j = journey_of(rec, runners, now);
+    let mut v = summary_of(rec, &j, now, holds(&whose(&j), viewer));
     let checks: Vec<Value> = j
         .checks
         .iter()
-        .map(|c| json!({ "pipeline": c.pipeline, "legs": c.legs.iter().map(|l| json!({ "name": l.name, "state": journey::leg_glyph(l), "attempts": l.attempts.len(), "note": l.note })).collect::<Vec<_>>() }))
+        .map(|c| json!({ "pipeline": c.pipeline, "legs": c.legs.iter().map(leg_json).collect::<Vec<_>>() }))
         .collect();
     let part = |p: Part| match p {
         Part::Queued => "queued",
@@ -440,7 +1076,15 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64) -> Value {
     });
     let deployments: Vec<Value> = rec.own.iter().map(|d| json!({ "environment": d.environment, "production": d.production, "state": d.state, "description": d.description, "at": d.at })).collect();
     let replant: Vec<Value> = j.replant.as_ref().map(|r| r.runners.iter().map(|x| json!({ "name": x.name, "state": format!("{:?}", x.state).to_lowercase(), "why": x.why })).collect()).unwrap_or_default();
+    // The Review lane group's marks (W26-R14), oldest first; a commit with no change has the one:
+    // its push.
+    let mut marks = rec.change.as_ref().map(|c| c.marks.clone()).unwrap_or_default();
+    if rec.change.is_none() {
+        let at = rec.runs.first().map(|r| r.created_at).unwrap_or_default();
+        marks.push(MarkRec { id: format!("push:{}", rec.sha), kind: "push", at, end: Some(at), by: rec.runs.first().map(|r| r.actor.clone()).unwrap_or_default(), revision: None, state: "passed", thread: None, note: None });
+    }
     if let Some(o) = v.as_object_mut() {
+        o.insert("review".into(), json!(marks.iter().map(mark_json).collect::<Vec<_>>()));
         o.insert("checks".into(), json!(checks));
         o.insert("build".into(), build);
         o.insert("deployments".into(), json!(deployments));
@@ -452,19 +1096,22 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64) -> Value {
 
 /// A repository's commits, newest first, a page at a time (`cursor`: the last page's last
 /// `cursor`), of the repositories named in `only` (JSON, those the caller may read), or all.
-pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
+pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
     let limit = q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(30).clamp(1, 100);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
     let repo = q.get("repo").filter(|v| !v.is_empty()).cloned();
+    let f = Facets::from_query(q);
     let recs = store
         .call(move |c| {
-            let mut st = c.prepare(
+            let (kind, host) = facet_sql();
+            let mut st = c.prepare(&format!(
                 "SELECT p.name, o.item, o.seq FROM ship_order o JOIN repos p ON p.id = o.repo_id
                  WHERE (?1 IS NULL OR p.name = ?1 OR p.id = ?1) AND (?4 IS NULL OR p.name IN (SELECT value FROM json_each(?4)))
-                   AND o.seq < ?2 AND EXISTS (SELECT 1 FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item)
+                   AND o.seq < ?2 AND {IS_ITEM}
+                   AND (?5 IS NULL OR {kind} = ?5) AND (?6 IS NULL OR {host} = ?6) AND (?7 = 0 OR {kind} <> 'commit')
                  ORDER BY o.seq DESC LIMIT ?3",
-            )?;
-            let keys: Vec<(String, String)> = st.query_map(params![repo, cursor, limit + 1, only], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            ))?;
+            let keys: Vec<(String, String)> = st.query_map(params![repo, cursor, limit + 1, only, f.kind, f.host, f.review], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let mut out = Vec::new();
             for (repo, sha) in keys {
                 if let Some(rec) = load(c, &repo, &sha)? {
@@ -476,16 +1123,23 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
         .await
         .map_err(internal)?;
     let more = recs.len() > usize::try_from(limit).unwrap_or(usize::MAX);
-    let page: Vec<Value> = recs.iter().take(usize::try_from(limit).unwrap_or(30)).map(|r| summary(r, &runners, now)).collect();
+    let page: Vec<Value> = recs
+        .iter()
+        .take(usize::try_from(limit).unwrap_or(30))
+        .map(|r| {
+            let x = render(r, &runners, now);
+            if holds(&x.whose, viewer) { x.yours.unwrap_or(x.others) } else { x.others }
+        })
+        .collect();
     let next = if more { page.last().and_then(|c| c.get("cursor")).cloned() } else { None };
     Ok(json!({ "commits": page, "next_cursor": next }))
 }
 
 /// One commit of a repository, with the records its stand came from.
-pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
+pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
     let (repo, sha) = (repo.to_owned(), sha.to_owned());
     let rec = store.call(move |c| load(c, &repo, &sha)).await.map_err(internal)?;
-    rec.map(|r| detail(&r, &runners, now)).ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))
+    rec.map(|r| detail(&r, &runners, now, viewer)).ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))
 }
 
 
@@ -505,8 +1159,37 @@ pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, runners:
 struct HeldRepo {
     ctx: RepoCtx,
     order: Vec<(i64, String)>,
-    rows: HashMap<String, (Records, String)>,
+    rows: HashMap<String, Row>,
     total: usize,
+}
+
+/// A commit held: its records, its list JSON for everyone and for those whose turn it is, who
+/// they are, and its facets.
+#[derive(Debug)]
+struct Row {
+    rec: Records,
+    others: String,
+    yours: Option<String>,
+    whose: Vec<String>,
+    kind: &'static str,
+    host: Option<String>,
+}
+
+impl Row {
+    fn of(rec: Records, runners: &[RunnerSeen], now: i64) -> Result<Self, Fail> {
+        let x = render(&rec, runners, now);
+        let text = |v: &Value| serde_json::to_string(v).map_err(|e| internal(e.into()));
+        let (others, yours) = (text(&x.others)?, x.yours.as_ref().map(text).transpose()?);
+        let (kind, host) = (kind_of(&rec), rec.change.as_ref().map(|c| c.host.clone()));
+        Ok(Self { rec, others, yours, whose: x.whose, kind, host })
+    }
+
+    fn json(&self, viewer: Option<&HashSet<String>>) -> &str {
+        match &self.yours {
+            Some(y) if holds(&self.whose, viewer) => y,
+            _ => &self.others,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -596,7 +1279,7 @@ impl ShipCache {
         let cap = self.cap;
         let waiting: HashMap<String, Vec<String>> = {
             let h = self.held.read().map_err(|_| poisoned())?;
-            h.repos.values().map(|r| (r.ctx.id.clone(), r.rows.iter().filter(|(_, (rec, _))| rec.releases.iter().any(|x| x.state == "waiting")).map(|(s, _)| s.clone()).collect())).collect()
+            h.repos.values().map(|r| (r.ctx.id.clone(), r.rows.iter().filter(|(_, row)| row.rec.releases.iter().any(|x| x.state == "waiting")).map(|(s, _)| s.clone()).collect())).collect()
         };
         let read = store
             .call(move |c| -> anyhow::Result<Read> {
@@ -667,8 +1350,7 @@ impl ShipCache {
                 held.rows.remove(&sha);
             }
             for rec in recs {
-                let json = serde_json::to_string(&summary(&rec, runners, now)).map_err(|e| internal(e.into()))?;
-                held.rows.insert(rec.sha.clone(), (rec, json));
+                held.rows.insert(rec.sha.clone(), Row::of(rec, runners, now)?);
             }
             let newest: Vec<(i64, String)> = ctx.commits.iter().take(cap).map(|(s, f, _)| (*f, s.clone())).collect();
             held.rows.retain(|sha, _| newest.iter().any(|(_, s)| s == sha));
@@ -680,9 +1362,9 @@ impl ShipCache {
         // down, and the commit production runs replants. Those few are drawn again.
         for held in h.repos.values_mut() {
             let prod = held.ctx.current.iter().find(|d| d.production).map(|d| d.sha.clone());
-            for (sha, (rec, json)) in held.rows.iter_mut() {
-                if prod.as_deref() == Some(sha.as_str()) || json.contains("\"guard\"") || json.contains("\"soaking\"") {
-                    *json = serde_json::to_string(&summary(rec, runners, now)).map_err(|e| internal(e.into()))?;
+            for (sha, row) in held.rows.iter_mut() {
+                if prod.as_deref() == Some(sha.as_str()) || row.others.contains("\"guard\"") || row.others.contains("\"soaking\"") {
+                    *row = Row::of(std::mem::take(&mut row.rec), runners, now)?;
                 }
             }
         }
@@ -693,9 +1375,10 @@ impl ShipCache {
     }
 
     /// A page of commits, newest first, from memory: of `repo` (name or id) or every repository,
-    /// of those named in `only`, before `cursor`, at most `limit`. None when memory can't answer
-    /// it whole (not built, or the page reaches past the commits held): the store answers then.
-    pub fn page(&self, repo: Option<&str>, only: Option<&[String]>, cursor: i64, limit: usize) -> Result<Option<String>, Fail> {
+    /// of those named in `only`, matching `facets`, before `cursor`, at most `limit`, each as
+    /// `viewer` sees it. None when memory can't answer it whole (not built, or the page reaches
+    /// past the commits held): the store answers then.
+    pub fn page(&self, repo: Option<&str>, only: Option<&[String]>, facets: &Facets, viewer: Option<&HashSet<String>>, cursor: i64, limit: usize) -> Result<Option<String>, Fail> {
         let h = self.held.read().map_err(|_| poisoned())?;
         if !h.built {
             return Ok(None);
@@ -706,9 +1389,12 @@ impl ShipCache {
             // Newest first already: skip to the cursor, take what a page needs.
             let from = r.order.partition_point(|(f, _)| *f >= cursor);
             let before = picked.len();
-            for (f, sha) in r.order.iter().skip(from).take(limit + 1) {
-                if let Some((_, json)) = r.rows.get(sha) {
-                    picked.push((*f, json.as_str()));
+            for (f, sha) in r.order.iter().skip(from) {
+                if picked.len() - before > limit {
+                    break;
+                }
+                if let Some(row) = r.rows.get(sha).filter(|row| facets.matches(row.kind, row.host.as_deref())) {
+                    picked.push((*f, row.json(viewer)));
                 }
             }
             // Fewer than a page held past the cursor, and the repository has more: the store's.
@@ -739,14 +1425,14 @@ impl ShipCache {
     }
 
     /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more), if held.
-    pub fn detail(&self, repo: &str, sha: &str, runners: &[RunnerSeen], now: i64) -> Option<Value> {
+    pub fn detail(&self, repo: &str, sha: &str, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Option<Value> {
         let h = self.held.read().ok()?;
         if !h.built {
             return None;
         }
         let r = h.repos.iter().find(|(name, r)| name.as_str() == repo || r.ctx.id == repo).map(|(_, r)| r)?;
-        let rec = r.rows.get(sha).map(|(rec, _)| rec).or_else(|| if sha.len() >= 7 { r.rows.iter().find(|(s, _)| s.starts_with(sha)).map(|(_, (rec, _))| rec) } else { None })?;
-        Some(detail(rec, runners, now))
+        let rec = r.rows.get(sha).map(|row| &row.rec).or_else(|| if sha.len() >= 7 { r.rows.iter().find(|(s, _)| s.starts_with(sha)).map(|(_, row)| &row.rec) } else { None })?;
+        Some(detail(rec, runners, now, viewer))
     }
 }
 
@@ -791,13 +1477,37 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     }
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(30).clamp(1, 1000);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
-    match c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), cursor, limit)? {
+    let viewer = match caller {
+        Some(c) => Some(principals(hub, c).await),
+        None => None,
+    };
+    match c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
         Some(body) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(body))),
         None => {
             let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
-            Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, runners, now).await?))
+            Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, viewer.as_ref(), runners, now).await?))
         }
     }
+}
+
+/// Who a caller is, as a change's turn names principals: itself, the person an agent acts for (an
+/// agent counts as its person), and the hosts' accounts its person linked (`github:<login>`).
+async fn principals(hub: &Hub, c: &crate::authz::Caller) -> HashSet<String> {
+    let (name, _) = crate::ci::diffs::author_of(&c.name, Some(c.kind));
+    let mut out: HashSet<String> = [Some(c.name.clone()), Some(name), crate::ci::diffs::acting_for(&c.name)].into_iter().flatten().filter(|p| !p.is_empty()).collect();
+    if let Some(user) = c.user.clone() {
+        let linked: Vec<String> = hub
+            .store
+            .call(move |db| {
+                let mut q = db.prepare("SELECT provider, login FROM user_identities WHERE user_id = ?1")?;
+                let rows = q.query_map([&user], |r| Ok(format!("{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap_or_default();
+        out.extend(linked);
+    }
+    out
 }
 
 /// Whether a commit's JSON is of a repository the caller may read (`only`: the names it may, or
@@ -821,9 +1531,13 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     {
         tracing::warn!("ship: the read model kept its last good state: {e}");
     }
-    let v = match c.detail(repo, sha, &runners, now) {
+    let viewer = match caller {
+        Some(c) => Some(principals(hub, c).await),
+        None => None,
+    };
+    let v = match c.detail(repo, sha, &runners, now, viewer.as_ref()) {
         Some(v) => v,
-        None => get_in(&hub.store, repo, sha, runners, now).await?,
+        None => get_in(&hub.store, repo, sha, viewer.as_ref(), runners, now).await?,
     };
     if !visible(&v, only.as_deref()) {
         return Err((StatusCode::NOT_FOUND, "no such commit".to_string()));
@@ -845,7 +1559,10 @@ mod tests {
     /// for it; the newest a person's, failing its checks.
     fn fixture() -> String {
         let leg = |id: &str, run: &str, name: &str, status: &str, conclusion: &str| {
-            format!("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES ('{id}', '{run}', '{name}', '{name}', '{status}', '{conclusion}', '[]', '[]', '{{}}', '{name}', 1);")
+            // A leg that ran has its start, and its finish once completed (W26-R14's lanes).
+            let started = if status == "queued" { "NULL" } else { "1700000000" };
+            let finished = if status == "completed" { "1700000300" } else { "NULL" };
+            format!("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt, started_at, finished_at) VALUES ('{id}', '{run}', '{name}', '{name}', '{status}', '{conclusion}', '[]', '[]', '{{}}', '{name}', 1, {started}, {finished});")
         };
         let run = |id: &str, n: i64, pipeline: &str, sha: &str, author: &str, msg: &str| {
             format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES ('{id}', 'kiln', {n}, '{pipeline}', 'push', 'main', '{sha}', '{msg}', '{author}', 'completed', {NOW_S}, 1);")
@@ -896,7 +1613,7 @@ mod tests {
             let sql = fixture();
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let now = NOW_S * 1000;
-            let list = list_in(&store, &HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string())]), None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let list = list_in(&store, &HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string())]), None, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let commits = list.get("commits").and_then(Value::as_array).cloned().unwrap_or_default();
             let got: Vec<(String, String, String)> = commits
                 .iter()
@@ -911,22 +1628,29 @@ mod tests {
                 ]
             );
 
-            let one = get_in(&store, "hyper-light/kiln", "2222222", runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let pip = |stage: &str| one.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).and_then(|p| p.get("state")).and_then(Value::as_str).map(str::to_string);
             assert_eq!(pip("checks").as_deref(), Some("flaky"));
             assert_eq!(pip("staging").as_deref(), Some("healthy"));
             assert_eq!(pip("production").as_deref(), Some("needs"));
             assert_eq!(field(&one, &["build", "image", "digest"]).and_then(Value::as_str), Some("sha256:abc"));
             assert_eq!(field(&one, &["checks"]).and_then(Value::as_array).map(Vec::len), Some(1));
+            // A leg that ran names its job and its run, for Output to stream.
+            let leg = field(&one, &["checks"]).and_then(Value::as_array).and_then(|c| c.first()).and_then(|c| c.get("legs")).and_then(Value::as_array).and_then(|l| l.first()).cloned().unwrap_or_default();
+            assert!(leg.get("job").and_then(Value::as_str).is_some_and(|j| !j.is_empty()), "a leg that ran names its job: {leg}");
+            assert!(leg.get("run").and_then(Value::as_str).is_some_and(|r| !r.is_empty()), "a leg that ran names its run: {leg}");
+            // It says when it started (W26-R14), and the row carries its version `v` (W26-R06).
+            assert!(leg.get("start").and_then(Value::as_i64).is_some(), "a leg that ran says when it started: {leg}");
+            assert!(one.get("v").and_then(Value::as_str).is_some_and(|v| v.len() == 16), "a row carries its version: {one}");
 
-            let shipped = get_in(&store, "hyper-light/kiln", C1, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let shipped = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(field(&shipped, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));
             // Every action names an endpoint kiln has: a route in its table, not the unnamed default.
             let mut failed = runners();
             if let Some(r) = failed.get_mut(1) {
                 r.failed = Some("upgrade timed out: no report within 15 minutes".into());
             }
-            let with_failed = list_in(&store, &HashMap::new(), None, failed, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let with_failed = list_in(&store, &HashMap::new(), None, None, failed, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let acts: Vec<(String, String, String)> = with_failed
                 .get("commits")
                 .and_then(Value::as_array)
@@ -946,8 +1670,113 @@ mod tests {
             for (name, method, path) in &acts {
                 assert!(named(method, path)?, "{name}: {method} {path} is no route kiln has");
             }
-            let missing = get_in(&store, "hyper-light/kiln", "deadbee", runners(), now).await;
+            let missing = get_in(&store, "hyper-light/kiln", "deadbee", None, runners(), now).await;
             assert!(matches!(missing, Err((StatusCode::NOT_FOUND, _))));
+            Ok(())
+        })
+    }
+
+    /// W26-AC01 (kiln's part): a diff and a change request are Ship items by commit, ordered as
+    /// Ship orders, the tip carrying the review for each viewer, the rest folded under it; they
+    /// carry on as the same item once landed; host and kind filter, and the Review lens keeps them.
+    #[test]
+    fn w26_ac01_a_kiln_diff_and_a_change_request_are_ship_items() -> anyhow::Result<()> {
+        const D41: &str = "4141414aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const D41V2: &str = "4242424aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const LANDED: &str = "4343434aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CR1: &str = "1212121ccccccccccccccccccccccccccccccccc";
+        const CR2: &str = "1313131ccccccccccccccccccccccccccccccccc";
+        const CRH: &str = "1414141ccccccccccccccccccccccccccccccccc";
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let t = NOW_S - 600;
+            let sql = fixture()
+                + &format!(
+                    "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, created_at, updated_at) VALUES ('d41', 'kiln', 41, 'diff', 'pipeline: dynamic matrices', 'agent:matrix', 'agent', 'user:sam', 'needs-review', 'main', {t}, {t});
+                     INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('d41', 1, '{D41}', 'p', 'b', 'pipeline: dynamic matrices', 'agent:matrix', {t});
+                     INSERT INTO diff_reviewers (diff_id, reviewer, state, added_at) VALUES ('d41', 'user:kim', 'not-looked', {t});
+                     INSERT INTO review_threads (id, diff_id, version, file, start_line, state, created_by, created_at, kind) VALUES ('th1', 'd41', 1, 'crates/kiln-ci/src/plan/matrix.rs', 42, 'open', 'user:kim', {}, 'question');
+                     INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES ('c1', 'th1', 'user:kim', 'empty matrix meant?\n\nGitHub skips the job when `matrix` is empty.', {}, {}, 1);
+                     INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, state, trunk, branch, created_at, updated_at) VALUES ('cr12', 'kiln', 12, 'change_request', 'sched: fair shares', 'user:lee', 'human', 'needs-review', 'main', 'fair', {}, {});
+                     INSERT INTO diff_version_commits (diff_id, n, sha, position) VALUES ('cr12', 1, '{CR1}', 0), ('cr12', 1, '{CR2}', 1);
+                     INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, pushed_by, created_at) VALUES ('cr12', 1, '{CRH}', 'b', 'b', 'user:lee', {});",
+                    t + 60, t + 60, t + 60, t + 120, t + 120, t + 120
+                );
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let now = NOW_S * 1000;
+            let (kim, sam): (HashSet<String>, HashSet<String>) = (["user:kim".to_string()].into(), ["user:sam".to_string()].into());
+            let list = |q: &[(&str, &str)], viewer: Option<HashSet<String>>| {
+                let (store, q) = (store.clone(), q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>());
+                async move { list_in(&store, &q, None, viewer.as_ref(), runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            let rows = |v: &Value| -> Vec<(String, String, String, String)> {
+                let s = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+                v.get("commits").and_then(Value::as_array).into_iter().flatten().map(|c| (s(c, "short"), s(c, "stand"), s(c, "line"), s(c, "fold_under").get(..7).unwrap_or_default().to_string())).collect()
+            };
+            let row = |r: (&str, &str, &str, &str)| (r.0.to_string(), r.1.to_string(), r.2.to_string(), r.3.to_string());
+
+            // Newest first on Ship's one scale: the request's head over its commits, then D41, then
+            // the fixture's commits. kim asked a question, so it's sam's (the agent's person) to answer.
+            let as_sam = list(&[], Some(sam.clone())).await?;
+            assert_eq!(
+                rows(&as_sam),
+                vec![
+                    row(("1414141", "waiting", "Waiting on review", "")),
+                    row(("1313131", "waiting", "Not landed", "1414141")),
+                    row(("1212121", "waiting", "Not landed", "1414141")),
+                    row(("4141414", "needs_you", "kim: empty matrix meant? · 1 thread", "")),
+                    row(("3333333", "needs_you", "rust lint + test · assertion failed in sync::reconnect", "")),
+                    row(("2222222", "needs_you", "Approve for production · 1 commit", "")),
+                    row(("1111111", "shipped", "In production · runners 2/2", "")),
+                ]
+            );
+            let d41 = as_sam.get("commits").and_then(Value::as_array).and_then(|c| c.get(3)).cloned().unwrap_or_default();
+            assert_eq!((field(&d41, &["kind"]), field(&d41, &["host"]), field(&d41, &["change", "name"])), (Some(&json!("diff")), Some(&json!("kiln")), Some(&json!("D41"))));
+            let pip = |c: &Value, stage: &str| c.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).and_then(|p| p.get("state")).and_then(Value::as_str).map(str::to_string);
+            assert_eq!((pip(&d41, "review").as_deref(), pip(&d41, "land").as_deref()), (Some("requested"), Some("none")), "its strip lit at Review");
+            let names: Vec<&str> = d41.get("actions").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("name").and_then(Value::as_str)).collect();
+            assert_eq!(names, vec!["hand_off", "review"], "Ship's Hand off and Review pair, for the one whose turn it is");
+            // Everyone else: waiting, and no pair.
+            let as_kim = list(&[], Some(kim.clone())).await?;
+            let d41k = as_kim.get("commits").and_then(Value::as_array).and_then(|c| c.get(3)).cloned().unwrap_or_default();
+            assert_eq!((field(&d41k, &["stand"]), field(&d41k, &["actions"])), (Some(&json!("waiting")), Some(&json!([]))));
+            assert_eq!(list(&[], None).await?, as_kim, "no viewer sees what everyone else does");
+
+            // The facets.
+            let shorts = |v: &Value| rows(v).into_iter().map(|r| r.0).collect::<Vec<_>>();
+            assert_eq!(shorts(&list(&[("kind", "diff")], None).await?), vec!["4141414"]);
+            assert_eq!(shorts(&list(&[("kind", "request")], None).await?), vec!["1414141", "1313131", "1212121"]);
+            assert_eq!(shorts(&list(&[("kind", "commit")], None).await?), vec!["3333333", "2222222", "1111111"]);
+            assert_eq!(shorts(&list(&[("lens", "review"), ("host", "kiln")], None).await?), vec!["1414141", "1313131", "1212121", "4141414"]);
+            assert!(shorts(&list(&[("host", "github")], None).await?).is_empty());
+
+            // v2 supersedes v1, which folds under it; then D41 lands and carries on as the commit it
+            // landed as.
+            let sql = format!(
+                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('d41', 2, '{D41V2}', 'p', 'b', 'pipeline: dynamic matrices', 'agent:matrix', {});
+                 INSERT INTO reviews (id, diff_id, version, reviewer, reviewer_kind, action, body, created_at) VALUES ('rv1', 'd41', 2, 'user:kim', 'human', 'accept', '', {});
+                 UPDATE review_threads SET state = 'resolved' WHERE id = 'th1';
+                 UPDATE diffs SET state = 'accepted' WHERE id = 'd41';",
+                t + 200,
+                t + 300
+            );
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let after = rows(&list(&[("kind", "diff")], Some(sam.clone())).await?);
+            assert_eq!(after, vec![row(("4242424", "landing", "Approved · joining the queue", "")), row(("4141414", "superseded", "Replaced by v2", "4242424"))]);
+            let sql = format!(
+                "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES ('r41', 'kiln', 41, 'ci', 'push', 'main', '{LANDED}', 'pipeline: dynamic matrices', 'user:sam', 'completed', {NOW_S}, 1);
+                 INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES ('l41', 'r41', 'rust lint + test', 'rust lint + test', 'completed', 'success', '[]', '[]', '{{}}', 'rust lint + test', 1);
+                 UPDATE diffs SET state = 'landed', landed_commit = '{LANDED}', landed_at = {NOW_S} WHERE id = 'd41';"
+            );
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let landed = list(&[("kind", "diff")], Some(sam.clone())).await?;
+            let r = rows(&landed);
+            assert_eq!(r.iter().map(|x| (x.0.as_str(), x.3.as_str())).collect::<Vec<_>>(), vec![("4343434", ""), ("4242424", "4343434"), ("4141414", "4343434")]);
+            let tip = landed.get("commits").and_then(Value::as_array).and_then(|c| c.first()).cloned().unwrap_or_default();
+            assert_eq!((pip(&tip, "review").as_deref(), pip(&tip, "land").as_deref()), (Some("approved"), Some("passed")), "landed, its review still lit");
+            assert_eq!(field(&tip, &["change", "name"]), Some(&json!("D41")));
+            assert_eq!(r.get(1).map(|x| x.2.as_str()), Some("Replaced by 4343434"));
             Ok(())
         })
     }
@@ -971,26 +1800,122 @@ mod tests {
             11 => format!("INSERT OR IGNORE INTO ci_releases (repo_id, tag_name, target_commitish, author, created_at) VALUES ('kiln', 'v0.{n}', '{sha}', 'ada', 1);"),
             12 => format!("DELETE FROM ci_releases WHERE id = (SELECT MIN(id) FROM ci_releases WHERE target_commitish = '{sha}');"),
             13 => format!("UPDATE ci_deployment_statuses SET state = '{state}' WHERE id = (SELECT MAX(id) FROM ci_deployment_statuses);"),
-            _ => format!("DELETE FROM ci_deployments WHERE id = (SELECT MIN(id) FROM ci_deployments WHERE sha = '{sha}');"),
+            14 => format!("DELETE FROM ci_deployments WHERE id = (SELECT MIN(id) FROM ci_deployments WHERE sha = '{sha}');"),
+            _ => review_op(n, op, sha, t),
         }
     }
 
-    /// Memory against the store: how many answers memory gave, each equal to the store's.
+    /// A random change to review's records (W26-R01): a diff and its versions, reviewers, reviews,
+    /// threads of each kind and replies, a land, a change request with its commits, the land queue,
+    /// drafts.
+    fn review_op(n: u64, op: u64, sha: &str, t: i64) -> String {
+        // One of the diffs there are, by turns.
+        let d = format!("(SELECT id FROM diffs ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM diffs))))");
+        let th = format!("(SELECT id FROM review_threads ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM review_threads))))");
+        let pick = |xs: &[&'static str]| xs.get(usize::try_from(n).unwrap_or(0) % xs.len().max(1)).copied().unwrap_or_default();
+        match op {
+            15 => format!(
+                "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, state, trunk, created_at, updated_at) VALUES ('d{n}', 'kiln', {n}, 'diff', 'change {n}', 'user:sam', 'human', 'needs-review', 'main', {t}, {t});
+                 INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('d{n}', 1, '{sha}', 'p', 'b', 'change {n}', 'user:sam', {t});"
+            ),
+            16 => format!("INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, rebase_only, pushed_by, created_at) SELECT d.id, (SELECT MAX(v.n) + 1 FROM diff_versions v WHERE v.diff_id = d.id), '{sha}', 'p', 'b', {}, 'user:sam', {t} FROM diffs d WHERE d.id = {d};", n % 2),
+            17 => format!("INSERT OR IGNORE INTO diff_reviewers (diff_id, reviewer, state, added_at) SELECT {d}, '{}', 'not-looked', {t} WHERE {d} IS NOT NULL;", pick(&["user:kim", "user:lee"])),
+            18 => {
+                let (action, state) = [("accept", "accepted"), ("request_changes", "changes-requested"), ("comment", "needs-review")].get(usize::try_from(n % 3).unwrap_or(0)).copied().unwrap_or(("comment", "needs-review"));
+                format!(
+                    "INSERT INTO reviews (id, diff_id, version, reviewer, reviewer_kind, action, body, created_at) SELECT 'rv{n}', {d}, 1, 'user:kim', 'human', '{action}', 'outputs stay JSON', {t} WHERE {d} IS NOT NULL;
+                     UPDATE diffs SET state = '{state}' WHERE id = {d} AND state NOT IN ('landed', 'draft');"
+                )
+            }
+            19 => format!(
+                "INSERT INTO review_threads (id, diff_id, version, file, start_line, state, created_by, created_at, kind) SELECT 'th{n}', {d}, 1, 'src/expand.rs', 22, 'open', 'user:kim', {t}, '{}' WHERE {d} IS NOT NULL;
+                 INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) SELECT 'c{n}', 'th{n}', 'user:kim', 'empty matrix meant?', {t}, {t}, {} WHERE EXISTS (SELECT 1 FROM review_threads WHERE id = 'th{n}');",
+                pick(&["question", "nit", "issue", "blocking"]),
+                u8::from(!n.is_multiple_of(5))
+            ),
+            20 => format!("UPDATE review_threads SET state = CASE state WHEN 'open' THEN 'resolved' ELSE 'open' END WHERE id = {th};"),
+            21 => format!("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) SELECT 'c{n}', {th}, 'user:sam', 'it is', {t}, {t}, 1 WHERE {th} IS NOT NULL;"),
+            22 => format!("UPDATE diffs SET state = 'landed', landed_commit = '{sha}' WHERE id = {d};"),
+            23 => format!(
+                "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, state, trunk, branch, created_at, updated_at) VALUES ('cr{n}', 'kiln', {n}, 'change_request', 'request {n}', 'agent:matrix', 'agent', 'needs-review', 'main', 'b{n}', {t}, {t});
+                 UPDATE diffs SET author_for = 'user:sam' WHERE id = 'cr{n}';
+                 INSERT INTO diff_version_commits (diff_id, n, sha, position) VALUES ('cr{n}', 1, '7777777{n:033}', 0);
+                 INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, pushed_by, created_at) VALUES ('cr{n}', 1, '{sha}', 'b', 'b', 'agent:matrix', {t});"
+            ),
+            24 => format!(
+                "INSERT INTO land_queue (id, repo_id, trunk, diffs, strategy, state, enqueued_by, created_at, updated_at) SELECT 'lq{n}', 'kiln', 'main', json_array({d}), 'rebase', '{}', 'user:sam', {t}, {t} WHERE {d} IS NOT NULL;",
+                pick(&["queued", "testing", "ejected"])
+            ),
+            25 => format!("UPDATE diffs SET state = CASE state WHEN 'draft' THEN 'needs-review' ELSE 'draft' END WHERE id = {d} AND state <> 'landed';"),
+            26 => format!("DELETE FROM land_queue WHERE id = (SELECT MIN(id) FROM land_queue); DELETE FROM reviews WHERE id = (SELECT MIN(id) FROM reviews WHERE diff_id = {d});"),
+            // A host's pull request, mirrored (W26-R20): opened with a commit besides its head.
+            27 => format!(
+                "INSERT INTO host_pulls (repo_id, host, number, title, author, state, requested, first_seen) VALUES ('kiln', '{}', {n}, 'pull {n}', 'github:ada', 'open', '[\"github:kim\"]', {t});
+                 INSERT INTO host_pull_commits (repo_id, host, number, sha, position) VALUES ('kiln', '{}', {n}, '9999999{n:033}', 0);
+                 INSERT INTO host_pull_heads (repo_id, host, number, n, sha, seen_at) VALUES ('kiln', '{}', {n}, 1, '{sha}', {t});",
+                pick(&["github", "gitlab", "bitbucket"]),
+                pick(&["github", "gitlab", "bitbucket"]),
+                pick(&["github", "gitlab", "bitbucket"])
+            ),
+            28 => format!(
+                "INSERT INTO host_pull_heads (repo_id, host, number, n, sha, seen_at) SELECT p.repo_id, p.host, p.number, (SELECT MAX(h.n) + 1 FROM host_pull_heads h WHERE h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number), '{sha}', {t}
+                 FROM host_pulls p WHERE p.rowid = (SELECT rowid FROM host_pulls ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM host_pulls)))) AND EXISTS (SELECT 1 FROM host_pull_heads h WHERE h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number);"
+            ),
+            29 => format!(
+                "UPDATE host_pulls SET reviews = '[{{\"by\": \"github:kim\", \"verdict\": \"{}\", \"at\": {t}}}]', threads = {}, said_by = 'github:kim', said = 'empty matrix meant?', state = '{}', merged_sha = '{}'
+                 WHERE rowid = (SELECT rowid FROM host_pulls ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM host_pulls))));",
+                pick(&["approve", "request_changes", "comment"]),
+                n % 3,
+                pick(&["open", "open", "draft", "merged"]),
+                if n % 4 == 3 { sha } else { "" }
+            ),
+            // A change's latest revision replayed onto main (W26-R12): conflicted (a text conflict and
+            // a binary file, one of them resolved), or clean.
+            30 => format!(
+                "INSERT INTO review_replays (id, diff_id, version, commit_sha, onto, onto_name, tree, state, created_by, created_at)
+                 SELECT 'rp{n}', d.id, (SELECT MAX(v.n) FROM diff_versions v WHERE v.diff_id = d.id), '{sha}', 'onto{n}', 'main', 'tree{n}', '{}', 'kiln', {t} FROM diffs d WHERE d.id = {d} AND EXISTS (SELECT 1 FROM diff_versions v WHERE v.diff_id = d.id);
+                 INSERT INTO review_conflicts (id, replay_id, diff_id, position, file, kind, hunk, line, end_line, fingerprint) SELECT 'ka{n}', id, diff_id, 0, 'src/expand.rs', 'text', 0, 18, 24, 'fa{n}' FROM review_replays WHERE id = 'rp{n}' AND state = 'conflicted';
+                 INSERT INTO review_conflicts (id, replay_id, diff_id, position, file, kind, fingerprint, take) SELECT 'kb{n}', id, diff_id, 1, 'assets/logo.png', 'binary', 'fb{n}', '{}' FROM review_replays WHERE id = 'rp{n}' AND state = 'conflicted';",
+                pick(&["conflicted", "conflicted", "clean"]),
+                pick(&["main", "this"])
+            ),
+            // A conflict resolved or taken back, and a replay's resolution committed.
+            31 => format!(
+                "UPDATE review_conflicts SET take = CASE WHEN take IS NULL THEN 'both' ELSE NULL END WHERE id = (SELECT id FROM review_conflicts ORDER BY rowid LIMIT 1 OFFSET ({n} % MAX(1, (SELECT COUNT(*) FROM review_conflicts))));
+                 UPDATE review_replays SET state = 'resolved', resolved_version = version + 1 WHERE {} AND id = (SELECT id FROM review_replays WHERE state = 'conflicted' ORDER BY rowid LIMIT 1);",
+                u8::from(n.is_multiple_of(3))
+            ),
+            _ => "DELETE FROM host_pulls WHERE rowid = (SELECT MIN(rowid) FROM host_pulls);".to_string(),
+        }
+    }
+
+    /// Memory against the store: how many answers memory gave, each equal to the store's, for a
+    /// viewer in a change's turn, one out of it and none, and through each facet (W26-R02).
     async fn same(store: &crate::store::Store, cache: &ShipCache, now: i64, round: usize) -> anyhow::Result<usize> {
         let mut compared = 0;
+        let (kim, sam): (HashSet<String>, HashSet<String>) = (["user:kim".to_string(), "github:kim".to_string()].into(), ["user:sam".to_string()].into());
+        let facets: [&[(&str, &str)]; 6] = [&[], &[("kind", "diff")], &[("kind", "request")], &[("kind", "commit")], &[("lens", "review"), ("host", "kiln")], &[("host", "github")]];
         for limit in [2usize, 1000] {
-            let q = HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string()), ("limit".to_string(), limit.to_string())]);
-            let want = list_in(store, &q, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
-            if let Some(got) = cache.page(Some("hyper-light/kiln"), None, i64::MAX, limit).map_err(|(_, m)| anyhow::anyhow!(m))? {
-                assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the list of {limit} from memory isn't the store's");
-                compared += 1;
-            }
-            for c in want.get("commits").and_then(Value::as_array).into_iter().flatten() {
-                let sha = c.get("sha").and_then(Value::as_str).unwrap_or_default();
-                if let Some(got) = cache.detail("hyper-light/kiln", sha, &runners(), now) {
-                    let want = get_in(store, "hyper-light/kiln", sha, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
-                    assert_eq!(got, want, "round {round}: {sha}'s detail from memory isn't the store's");
-                    compared += 1;
+            for viewer in [None, Some(&kim), Some(&sam)] {
+                for fq in facets {
+                    let mut q = HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string()), ("limit".to_string(), limit.to_string())]);
+                    q.extend(fq.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+                    let want = list_in(store, &q, None, viewer, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                    if let Some(got) = cache.page(Some("hyper-light/kiln"), None, &Facets::from_query(&q), viewer, i64::MAX, limit).map_err(|(_, m)| anyhow::anyhow!(m))? {
+                        assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the list of {limit} {fq:?} for {viewer:?} from memory isn't the store's");
+                        compared += 1;
+                    }
+                    if !fq.is_empty() {
+                        continue;
+                    }
+                    for c in want.get("commits").and_then(Value::as_array).into_iter().flatten() {
+                        let sha = c.get("sha").and_then(Value::as_str).unwrap_or_default();
+                        if let Some(got) = cache.detail("hyper-light/kiln", sha, &runners(), now, viewer) {
+                            let want = get_in(store, "hyper-light/kiln", sha, viewer, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                            assert_eq!(got, want, "round {round}: {sha}'s detail for {viewer:?} from memory isn't the store's");
+                            compared += 1;
+                        }
+                    }
                 }
             }
         }
@@ -999,8 +1924,11 @@ mod tests {
 
     /// What memory serves is what the store says: random inserts, updates and deletes across every
     /// table the model reads (runs, legs, attempts, images, deployments and their statuses, Deploy
-    /// API releases, tags), the list and every commit's detail compared after each refresh; a cap
-    /// of 3 so pages past memory come from the store.
+    /// API releases, tags; and review's: diffs, versions, a change request's commits, reviewers,
+    /// reviews, threads, comments, the land queue, the hosts' mirrored pull requests, replays and
+    /// their conflicts), the list (as three viewers, through each facet)
+    /// and every commit's detail compared after each refresh; a cap of 3 so pages past memory come
+    /// from the store.
     #[test]
     fn ship_memory_is_what_the_store_says_through_random_changes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1009,7 +1937,8 @@ mod tests {
             let sql = fixture();
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::with_cap(3);
-            let shas = [C1, C2, C3, "4444444ddddddddddddddddddddddddddddddddd", "5555555eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"];
+            // The last two have no runs: they are items only as a change's commits.
+            let shas = [C1, C2, C3, "4444444ddddddddddddddddddddddddddddddddd", "5555555eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "6666666fffffffffffffffffffffffffffffffff", "8888888999999999999999999999999999999999"];
             let mut seed: u64 = 0x5eed_cafe;
             let mut next = move |n: u64| {
                 seed ^= seed << 13;
@@ -1023,8 +1952,8 @@ mod tests {
             for round in 0..80 {
                 for _ in 0..4 {
                     n += 1;
-                    let sha = shas.get(usize::try_from(next(5)).unwrap_or(0)).copied().unwrap_or(C1);
-                    let sql = ops(n, next(15), sha);
+                    let sha = shas.get(usize::try_from(next(7)).unwrap_or(0)).copied().unwrap_or(C1);
+                    let sql = ops(n, next(33), sha);
                     store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
                 }
                 now += FRESH_MS;
@@ -1054,7 +1983,7 @@ mod tests {
             let mut now = NOW_S * 1000;
             cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             for n in 0..40u64 {
-                let sql = ops(500 + n, n % 15, if n.is_multiple_of(2) { C2 } else { C3 });
+                let sql = ops(500 + n, n % 31, if n.is_multiple_of(2) { C2 } else { C3 });
                 let write = store.call(move |c| Ok(c.execute_batch(&sql)?));
                 now += FRESH_MS;
                 let before = cache.applied();
@@ -1092,13 +2021,13 @@ mod tests {
             let rows: i64 = store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ship_changes", [], |r| r.get(0))?)).await?;
             assert_eq!(rows, 1, "a commit changed a hundred times is one row");
             // Two held of three: a page of one comes from memory, a page of ten from the store.
-            assert!(cache.page(None, None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?.is_some());
-            assert!(cache.page(None, None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?.is_none());
-            let held = cache.page(None, None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert!(cache.page(None, None, &Facets::default(), None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?.is_some());
+            assert!(cache.page(None, None, &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?.is_none());
+            let held = cache.page(None, None, &Facets::default(), None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?;
             // The store failing: the refresh says so, memory keeps what it had, and stays stale.
             store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes RENAME TO ship_changes_away")?)).await?;
             assert!(cache.refresh(&store, &runners(), now + FRESH_MS).await.is_err());
-            assert_eq!(cache.page(None, None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?, held);
+            assert_eq!(cache.page(None, None, &Facets::default(), None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?, held);
             assert!(cache.stale(now + FRESH_MS));
             // Back: the next read brings everything in.
             store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes_away RENAME TO ship_changes")?)).await?;
@@ -1123,10 +2052,10 @@ mod tests {
             let count = |page: Option<String>| -> usize { page.and_then(|p| serde_json::from_str::<Value>(&p).ok()).and_then(|v| v.get("commits").and_then(Value::as_array).map(Vec::len)).unwrap_or(usize::MAX) };
             let other = ["someone/else".to_string()];
             let mine = ["hyper-light/kiln".to_string()];
-            assert_eq!(count(cache.page(None, Some(&other), i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
-            assert_eq!(count(cache.page(Some("hyper-light/kiln"), Some(&other), i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
-            assert_eq!(count(cache.page(None, Some(&mine), i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 3);
-            let one = get_in(&store, "hyper-light/kiln", C1, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(count(cache.page(None, Some(&other), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
+            assert_eq!(count(cache.page(Some("hyper-light/kiln"), Some(&other), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
+            assert_eq!(count(cache.page(None, Some(&mine), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 3);
+            let one = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert!(visible(&one, None));
             assert!(visible(&one, Some(&mine)));
             assert!(!visible(&one, Some(&other)));
@@ -1148,7 +2077,7 @@ mod tests {
             let now = NOW_S * 1000;
             cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let stand = |cache: &ShipCache| -> Option<String> {
-                let page: Value = serde_json::from_str(&cache.page(None, None, i64::MAX, 10).ok()??).ok()?;
+                let page: Value = serde_json::from_str(&cache.page(None, None, &Facets::default(), None, i64::MAX, 10).ok()??).ok()?;
                 page.get("commits")?.as_array()?.iter().find(|c| c.get("short").and_then(Value::as_str) == Some("2222222"))?.get("stand")?.as_str().map(str::to_string)
             };
             assert_eq!(stand(&cache).as_deref(), Some("needs_you"));
@@ -1215,9 +2144,9 @@ mod tests {
                 let at = |q: f64| us.get(((us.len() as f64 * q) as usize).min(us.len().saturating_sub(1))).copied().unwrap_or(f64::MAX);
                 (at(0.5), at(0.95), at(0.99), bytes)
             };
-            let p1000 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 1000).ok().flatten().map(|s| s.len()).unwrap_or(0));
-            let p100 = time(&|| cache.page(Some("hyper-light/kiln"), None, i64::MAX, 100).ok().flatten().map(|s| s.len()).unwrap_or(0));
-            let one = time(&|| cache.detail("hyper-light/kiln", "00004d2", &runners(), now).map(|v| v.to_string().len()).unwrap_or(0));
+            let p1000 = time(&|| cache.page(Some("hyper-light/kiln"), None, &Facets::default(), None, i64::MAX, 1000).ok().flatten().map(|s| s.len()).unwrap_or(0));
+            let p100 = time(&|| cache.page(Some("hyper-light/kiln"), None, &Facets::default(), None, i64::MAX, 100).ok().flatten().map(|s| s.len()).unwrap_or(0));
+            let one = time(&|| cache.detail("hyper-light/kiln", "00004d2", &runners(), now, None).map(|v| v.to_string().len()).unwrap_or(0));
             println!("ship bench: built 2,500 commits from 10,000 runs in {build:?}");
             for (name, (p50, p95, p99, bytes)) in [("limit=1000", p1000), ("limit=100", p100), ("detail", one)] {
                 println!("ship bench: {name}: p50 {p50:.1} µs, p95 {p95:.1} µs, p99 {p99:.1} µs, {bytes} bytes");
@@ -1228,6 +2157,25 @@ mod tests {
                 assert!(p100.2 < 200.0, "limit=100 p99 {:.1} µs is 0.2 ms or more", p100.2);
                 assert!(one.2 < 200.0, "detail p99 {:.1} µs is 0.2 ms or more", one.2);
             }
+            Ok(())
+        })
+    }
+
+    /// W26-R14: a commit with no change carries the Review lane group's one mark — its push,
+    /// revision null, signer null until W27-R03.
+    #[test]
+    fn w26_r14_a_commit_with_no_change_carries_its_push() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let marks = field(&one, &["review"]).and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(marks.len(), 1, "a commit with no change has the one mark: {marks:?}");
+            let m = marks.first().cloned().unwrap_or_default();
+            assert_eq!((m.get("kind"), m.get("state"), m.get("revision"), m.get("signer")), (Some(&json!("push")), Some(&json!("passed")), Some(&Value::Null), Some(&Value::Null)), "{m}");
+            assert!(m.get("end") == m.get("at"), "its push is a point: {m}");
             Ok(())
         })
     }

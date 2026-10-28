@@ -371,7 +371,7 @@ export default function EnvironmentPage() {
     <div className="container-console page cd-page">
       <title>{`${name} · Environments · kiln`}</title>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Environments", to: environmentsHref }, { label: name }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Environments", to: environmentsHref }, { label: name }]} />
         <h1 className="cd-title">{name}</h1>
         <p className="cd-note">
           {repo ? (
