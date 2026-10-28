@@ -37,12 +37,15 @@ for (const width of [1280, 390])
       await row.locator(".ship-go").click();
       const files = row.locator('section[aria-label="Files"]');
       await expect(files.locator(".rv-sum")).toBeVisible({ timeout: 15_000 });
-      // Two lines next to each other on the new side of one file, with no thread under either.
+      // Two lines next to each other on the new side of an open file (a generated one starts folded), with no thread under either: the last
+      // such pair, after every thread D41 has. The mock keeps a thread with a reply once its comments are
+      // deleted (they're marked deleted), so this one stays after the test: placed last, the threads other
+      // tests take first (kim's) are still first.
       const pick = await files.evaluate((sec) => {
         const free = [...sec.querySelectorAll<HTMLElement>(".rv-l[data-rvl*='|new:']")].filter(
-          (r) => !(r.querySelector<HTMLButtonElement>(".rv-ln")?.disabled ?? true) && !r.nextElementSibling?.classList.contains("rv-thread"),
+          (r) => (r.closest("details")?.open ?? true) && !(r.querySelector<HTMLButtonElement>(".rv-ln")?.disabled ?? true) && !r.nextElementSibling?.classList.contains("rv-thread"),
         );
-        for (let i = 0; i + 1 < free.length; i++) {
+        for (let i = free.length - 2; i >= 0; i--) {
           const [fa, la] = (free[i]?.dataset.rvl ?? "").split("|new:");
           const [fb, lb] = (free[i + 1]?.dataset.rvl ?? "").split("|new:");
           if (fa && fa === fb && Number(lb) === Number(la) + 1) return { file: fa, a: Number(la), b: Number(lb) };
@@ -62,11 +65,13 @@ for (const width of [1280, 390])
       await expect(field).toBeVisible();
       await field.fill(said);
       await writing.getByRole("button", { name: "Comment", exact: true }).click({ timeout: 15_000 });
-      // Posted: the thread under the last line, kept by kiln on both lines.
-      const thread = files.locator(".rv-thread").filter({ hasText: said });
+      // Posted: the thread under the last line, kept by kiln on both lines. (A posted thread has its
+      // kind, data-k; the composer, which stays open with the same words until kiln answers, has none.)
+      const thread = files.locator(".rv-thread[data-k]").filter({ hasText: said });
       await expect(thread).toBeVisible({ timeout: 15_000 });
-      expect(await thread.evaluate((el) => (el.previousElementSibling as HTMLElement | null)?.dataset.rvl)).toBe(`${pick.file}|new:${pick.b}`);
       await expect.poll(async () => (await threadsOf(page)).find((t) => t.comments[0]?.body === said)?.id ?? "").not.toBe("");
+      // Once kiln has it (the thread shown at once is swapped for kiln's), it sits right under the last line.
+      await expect.poll(() => thread.evaluate((el) => (el.previousElementSibling as HTMLElement | null)?.dataset.rvl)).toBe(`${pick.file}|new:${pick.b}`);
       const kept = (await threadsOf(page)).find((t) => t.comments[0]?.body === said);
       expect({ file: kept?.file, side: kept?.side, start: kept?.start_line, end: kept?.end_line }).toEqual({ file: pick.file, side: "new", start: pick.a, end: pick.b });
       // A reply joins it.
@@ -89,8 +94,13 @@ for (const width of [1280, 390])
       await expect(there.locator(".rv-thread-folded")).toContainText("2 comments");
       const under = await there.evaluate((el) => [...(el.closest(".rv-under")?.previousElementSibling?.querySelectorAll('.rv-num[data-side="new"]') ?? [])].map((b) => b.textContent));
       expect(under).toContain(String(pick.b));
-      await there.locator(".rv-thread-folded").click({ timeout: 15_000 });
-      await expect(there).toContainText(said);
+      // Opened, it holds the comment and the reply. (A click as the page is still settling can miss
+      // the folded line, in WebKit at 390 px: it's clicked again until the thread opens.)
+      await expect(async () => {
+        const fold = there.locator(".rv-thread-folded");
+        if (await fold.count()) await fold.click({ timeout: 2_000 });
+        await expect(there).toContainText(said, { timeout: 1_000 });
+      }).toPass({ timeout: 15_000 });
       await expect(there).toContainText(answer);
     } finally {
       for (const t of (await threadsOf(page)).filter((x) => x.comments[0]?.body === said)) for (const c of [...t.comments].reverse()) await page.request.delete(`/api/comments/${c.id}`);

@@ -1,8 +1,8 @@
 /**
  * The opened commit's Output (plan 01a17ba155a17737a39348c6c5362210, step 3), against the mock: the
  * first row's picked job (Checks, streaming one of the mock's own jobs) shows in a card exactly the
- * lanes card's width at 1280, 1000, 800, 600 and 390; as the job prints, nothing moves; scrolled up,
- * the log stays where it was.
+ * lanes card's width from 320 to 1440 (the Opened commit plan's Output step) at 1440, 1280, 1000, 800,
+ * 600, 390 and 320; as the job prints, nothing moves; scrolled up, the log stays where it was.
  */
 import { expect, test, type Locator } from "@playwright/test";
 
@@ -21,7 +21,7 @@ const measure = (row: Locator) =>
     return { width: r.width, lanes: inner, top: Math.round(r.top), height: Math.round(r.height) };
   });
 
-for (const width of [1280, 1000, 800, 600, 390]) {
+for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
   test(`at ${width}, the output is the lanes card's width and holds still as the job prints`, async ({ page, isMobile, browserName }) => {
     test.skip(isMobile, "each width is set here; the desktop projects run them all");
     await page.setViewportSize({ width, height: 900 });
