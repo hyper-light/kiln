@@ -29,9 +29,9 @@ interface Result {
   outcomes: Outcome[];
 }
 /** The last action's result, and the agents it was for. */
-type Said = Result & { ids: ReadonlySet<string> };
+type LastResult = Result & { ids: ReadonlySet<string> };
 /** Does an action, saying what it's at meanwhile (`doing`), then how it went. */
-type Run = (doing: string, go: () => Promise<Result>) => void;
+type Act = (doing: string, go: () => Promise<Result>) => void;
 
 const outcome = (a: AgentInfo, result: Outcome["result"], reason?: string): Outcome => ({ id: a.id, name: agentLabel(a), machine: machineName(a.target), result, reason });
 /** The outcomes, with their line: `done` says what was done to how many. */
@@ -68,7 +68,7 @@ export function BulkBar({ agents, all, onGone }: { agents: AgentInfo[]; all: Age
   const [ask, setAsk] = React.useState<"move" | "end" | null>(null);
   const [more, setMore] = React.useState(false);
   const [busy, setBusy] = React.useState<string | null>(null);
-  const [said, setSaid] = React.useState<Said | null>(null);
+  const [said, setSaid] = React.useState<LastResult | null>(null);
   const [open, setOpen] = React.useState(false);
   const [keepSet, setKeepSet] = React.useState<{ key: string; on: boolean } | null>(null);
   // Goals resumed or paused again after a try that didn't come back: under the same keys (CP-T3.2).
@@ -88,7 +88,7 @@ export function BulkBar({ agents, all, onGone }: { agents: AgentInfo[]; all: Age
   const acts = actsOf(agents);
   const disabled = busy !== null;
 
-  const run: Run = (doing, go) => {
+  const run: Act = (doing, go) => {
     const ids = new Set(agents.map((a) => a.id));
     setBusy(doing);
     setAsk(null);
@@ -491,7 +491,7 @@ function ReachPick({ agents, disabled, onChange }: { agents: AgentInfo[]; disabl
 }
 
 /** Their notifications muted for you on every device, or unmuted when they all are: where push is on here. */
-function Mute({ agents, disabled, run }: { agents: AgentInfo[]; disabled: boolean; run: Run }) {
+function Mute({ agents, disabled, run }: { agents: AgentInfo[]; disabled: boolean; run: Act }) {
   const push = useRes(pushStateRes);
   const muted = new Set(push.data.muted);
   const on = agents.filter((a) => muted.has(a.id));
