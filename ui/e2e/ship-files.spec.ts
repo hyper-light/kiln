@@ -2,7 +2,9 @@
  * An item's diff in its one place (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2; Ada,
  * 2026-10-27: "One place", Review's Files first in the dropdown), against the mock's D41: each file
  * shows its status, its +/- and Viewed; marking one Viewed folds it, and it stays marked and folded
- * on reload; the Files section is the lanes card's width within 1 px at 1280 and 390.
+ * on reload; the Files section is the lanes card's width within 1 px at 1280 and 390, and from 320 to
+ * 1440 px for a commit, a change and a host's pull request (Opened commit plan
+ * 01a175b7f21b7455bcdcd71e94ecdce0, step 1, Files).
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -65,3 +67,23 @@ for (const width of [1280, 390])
       if (marked) await page.request.post("/api/diffs/D41/viewed", { data: { file: marked, viewed: false } });
     }
   });
+
+test("from 320 to 1440 px, every item's Files is the lanes card's width within 1 px", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the widths are set here; the desktop projects run them");
+  test.setTimeout(120_000);
+  // A kiln change (D41), a host's pull request (!6, GitLab) and a commit with no change (sync).
+  for (const name of ["D41", "ci: a landed change", "sync: a move carries its homes"])
+    for (const width of [320, 390, 600, 800, 1000, 1280, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto("/ship");
+      const row = page.locator(".ship-row").filter({ hasText: name }).first();
+      await expect(row).toBeVisible({ timeout: 15_000 });
+      await row.locator(".ship-go").click();
+      const files = row.locator('section[aria-label="Files"]');
+      const card = row.locator('section[aria-label="Lanes"]');
+      await expect(files.locator(".rv-sum")).toBeVisible({ timeout: 15_000 });
+      await expect(card.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });
+      const w = { files: (await files.boundingBox())?.width ?? 0, lanes: (await card.boundingBox())?.width ?? 0 };
+      expect(Math.abs(w.files - w.lanes), `${name} at ${width}: Files ${w.files} px, the lanes card ${w.lanes} px`).toBeLessThanOrEqual(1);
+    }
+});
