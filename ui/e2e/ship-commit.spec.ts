@@ -103,3 +103,21 @@ test("what ships with it: a change's tip lists the commit it carries, which ride
   await oldWith.getByRole("link").first().click();
   await expect(page).toHaveURL(new RegExp(`/ship/${tip.repo}/${tip.sha}$`));
 });
+
+for (const width of [1280, 390]) {
+  test(`at ${width}, a commit's page draws every section and is never wider than its window`, async ({ page, isMobile }) => {
+    test.skip(isMobile, "the width is set here; the desktop projects run it");
+    await page.setViewportSize({ width, height: 900 });
+    for (const [message, first] of [
+      ["sync: a move carries its homes", "Errors"],
+      ["deploy: a rollback holds", "Stages"],
+    ] as const) {
+      const { sections } = await pageOf(page, message);
+      await expect(sections.first(), `${message}'s first section`).toHaveAttribute("aria-label", first, { timeout: 15_000 });
+      const labels = await sections.evaluateAll((els) => els.map((el) => el.getAttribute("aria-label")));
+      expect(labels.slice(labels.indexOf("Stages"))).toEqual(["Stages", "Trace", "Ships with", "Environments", "Runs"]);
+      const w = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+      expect(w.scroll, `${message} at ${width}`).toBe(w.client);
+    }
+  });
+}
