@@ -22,7 +22,7 @@ import { Crumbs } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
 import { clockTime } from "@/lib/format";
-import { updatesRes, useRes } from "@/lib/data";
+import { labelOf, updatesRes, useLabels, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
@@ -292,8 +292,9 @@ function Runners({ detail }: { detail: ShipDetail }) {
   );
 }
 
-/** One runner: replanted, replanting, didn't replant (with why), or offline; one that didn't is retried, and either looked at, through System's own actions. */
+/** One runner: replanted, replanting, didn't replant (with why), or offline; one that didn't is retried, and either looked at, through System's own actions. Shown by its label (docs/machines.md), asked for by its name. */
 function Runner({ runner }: { runner: { name: string; state: string; why: string } }) {
+  const shown = labelOf(runner.name, useLabels());
   const [busy, setBusy] = React.useState<"retry" | "diagnose" | null>(null);
   const [said, setSaid] = React.useState<string | null>(null);
   const [found, setFound] = React.useState<RunnerFinding[] | null>(null);
@@ -305,7 +306,7 @@ function Runner({ runner }: { runner: { name: string; state: string; why: string
       invalidate("ship/");
       invalidate("updates");
     } catch (e) {
-      toast({ title: `Couldn't retry ${runner.name}`, description: errorMessage(e), tone: "failed" });
+      toast({ title: `Couldn't retry ${shown}`, description: errorMessage(e), tone: "failed" });
     } finally {
       setBusy(null);
     }
@@ -315,7 +316,7 @@ function Runner({ runner }: { runner: { name: string; state: string; why: string
     try {
       setFound((await api.diagnoseRunner(runner.name)).findings);
     } catch (e) {
-      toast({ title: `Couldn't diagnose ${runner.name}`, description: errorMessage(e), tone: "failed" });
+      toast({ title: `Couldn't diagnose ${shown}`, description: errorMessage(e), tone: "failed" });
     } finally {
       setBusy(null);
     }
@@ -324,7 +325,7 @@ function Runner({ runner }: { runner: { name: string; state: string; why: string
   return (
     <li data-state={state}>
       <StatusGlyph state={state as keyof typeof GLYPHS} size={14} />
-      <span className="ship-commit__env">{runner.name}</span>
+      <span className="ship-commit__env">{shown}</span>
       <span>{replantWord(runner.state)}</span>
       {runner.why ? <span className="ship-commit__env-note">{runner.why}</span> : null}
       {runner.state === "failed" || runner.state === "offline" ? (
@@ -341,7 +342,7 @@ function Runner({ runner }: { runner: { name: string; state: string; why: string
       ) : null}
       {said ? <span role="status">{said}</span> : null}
       {found ? (
-        <ul className="ship-commit__found" aria-label={`What kiln found on ${runner.name}`}>
+        <ul className="ship-commit__found" aria-label={`What kiln found on ${shown}`}>
           {found.map((f) => (
             <li key={f.id} data-level={f.level}>
               {f.title}

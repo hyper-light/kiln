@@ -4,6 +4,7 @@
  */
 import type { ShipCommit, ShipDetail, ShipPip } from "@/api/ship";
 import { GLYPHS, STAGE_WORD, type GlyphState, type Pip, type Stage } from "@/components/ui/status-glyph-spec";
+import { labelOf } from "@/lib/data";
 import type { ShipLane, ShipLaneGroup } from "./review/lanes";
 
 /** Each stand's place in the needs-you-first order, and its word. */
@@ -241,7 +242,15 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
         { id: "image", name: "image", state: glyph(built.image.state), start: null, end: null },
       ]
     : [];
-  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: replantGlyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
+  // Each runner by the name people see (its label, docs/machines.md); its lane by its name.
+  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({
+    id: `runner/${r.name}`,
+    name: labelOf(r.name),
+    state: replantGlyph(r.state),
+    start: null,
+    end: null,
+    ...(r.why ? { note: r.why } : {}),
+  }));
   const deploys = (production: boolean): ShipLane[] =>
     (detail.deployments ?? [])
       .filter((d) => d.production === production)

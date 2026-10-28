@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
+import { noteLabels } from "../src/lib/data.ts";
 import {
   buildWord,
   environmentsOf,
@@ -131,6 +132,11 @@ test("w26_r14: Ship's stages as the Lanes' groups, every job its lane from the s
     { id: "image", name: "image", state: "queued", start: null, end: null },
   ]);
   assert.deepEqual(later[5]?.lanes, [{ id: "runner/adacachy", name: "adacachy", state: "replanting", start: null, end: null, note: "a newer kiln" }]);
+  // A runner kiln knows by its machine id: its lane by its id, named by its label (docs/machines.md).
+  const id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+  noteLabels([{ name: id, label: "studio" }]);
+  const labelled = shipGroups({ ...detail, replant: [{ name: id, state: "replanted", why: "" }] });
+  assert.deepEqual(labelled[5]?.lanes, [{ id: `runner/${id}`, name: "studio", state: replantGlyph("replanted"), start: null, end: null }]);
 });
 
 test("an open row never folds: not under the approval it rides with, nor into a run of shipped commits", () => {
