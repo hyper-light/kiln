@@ -1,28 +1,58 @@
 /* About this code (components/code/about.tsx): the card that opens under a tapped line, in the
-   page's flow (no floating panel), and what was tapped marked. */
+   page's flow (no floating panel): a band across the code, ruled above and below, a step lighter
+   than the code; and what was tapped marked. It slides open and shut (its height from nothing
+   and back, so what's under it moves, never jumps), and so does each step inside it. */
 
+/* The tapped lines: lit and barred, fading in and out (one inset shadow for each, as shadows fade). */
+.hx-row,
+.rv-row,
+.rv-half {
+  transition: box-shadow 0.2s ease;
+}
 [data-asked] {
-  box-shadow: inset 2px 0 #bab0e3;
-  background-image: linear-gradient(rgb(186 176 227 / 7%), rgb(186 176 227 / 7%));
+  box-shadow:
+    inset 2px 0 #8c8f98,
+    inset 0 0 0 100vmax rgb(255 255 255 / 5%);
+}
+
+/* A slide: a one-row grid whose row goes from nothing to its content's height and back. */
+.hx-about-card,
+.hx-about .hx-about-fold {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition:
+    grid-template-rows 0.24s cubic-bezier(0.2, 0, 0, 1),
+    opacity 0.2s ease;
+}
+.hx-about-card {
+  grid-column: 1 / -1;
+}
+.hx-about-card[data-closing],
+.hx-about .hx-about-fold:not([data-open]) {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+@starting-style {
+  .hx-about-card,
+  .hx-about .hx-about-fold[data-open] {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+}
+.hx-about-clip {
+  min-height: 0;
+  overflow: hidden;
 }
 
 .hx-about {
-  margin: 4px 10px 8px;
-  border: 1px solid #34324a;
-  border-radius: 7px;
-  background: #111018;
+  margin: 8px 0;
+  border-top: 1px solid #4a4f5c;
+  border-bottom: 1px solid #4a4f5c;
+  background: #17191f;
   color: #d7d9de;
   font: 13px/1.6 var(--font-sans, Geist, system-ui, sans-serif);
   white-space: normal;
   cursor: auto;
-  grid-column: 1 / -1;
-  animation: hx-about-open 0.2s ease-out;
-}
-@keyframes hx-about-open {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
 }
 .hx-about .hx-about-head {
   display: flex;
@@ -37,9 +67,9 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 1px 7px;
-  border: 1px solid #2a2d38;
+  border: 1px solid #343844;
   border-radius: 5px;
-  background: #1a1c23;
+  background: #1f2128;
   color: #ededee;
   font: 12px var(--font-mono, monospace);
 }
@@ -63,7 +93,7 @@
   line-height: 1;
 }
 .hx-about .hx-about-x:hover {
-  background: #1b1d24;
+  background: #22242b;
   color: #ededee;
 }
 .hx-about .hx-about-acts {
@@ -77,7 +107,7 @@
   align-items: center;
   height: 30px;
   padding: 0 13px;
-  border: 1px solid #343844;
+  border: 1px solid #3a3e49;
   border-radius: 999px;
   background: transparent;
   color: #d3d6dc;
@@ -85,7 +115,7 @@
   white-space: nowrap;
 }
 .hx-about .hx-about-btn:hover {
-  border-color: #55596a;
+  border-color: #5a5f6d;
   color: #fff;
 }
 .hx-about .hx-about-btn[data-primary] {
@@ -100,21 +130,26 @@
   color: #797c84;
   font-size: 11.5px;
 }
+.hx-about .hx-about-answer .hx-about-note {
+  padding: 0 0 8px;
+}
 .hx-about .hx-about-said {
-  padding-top: 10px;
+  margin: 0;
+  padding: 0 0 8px;
   color: #c9ccd3;
 }
 .hx-about .hx-about-ask {
   display: flex;
   gap: 8px;
-  padding: 0 12px 12px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid #262931;
 }
 .hx-about .hx-about-ask input {
   flex: 1;
   min-width: 0;
   height: 32px;
   padding: 0 10px;
-  border: 1px solid #343844;
+  border: 1px solid #3a3e49;
   border-radius: 7px;
   background: #0d0e12;
   color: #ededee;
@@ -123,7 +158,7 @@
 .hx-about .hx-about-choose {
   padding: 10px 0 0;
   margin-top: 10px;
-  border-top: 1px solid #23252e;
+  border-top: 1px solid #262931;
 }
 .hx-about .hx-about-choose > p:first-child {
   margin: 0 12px;
@@ -134,9 +169,15 @@
   gap: 8px;
   margin-top: 10px;
   padding: 10px 12px 8px;
-  border-top: 1px solid #23252e;
+  border-top: 1px solid #262931;
   color: #97999f;
   font-size: 12px;
+}
+.hx-about .hx-about-who span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .hx-about .hx-about-who b {
   color: #e2e3e7;
@@ -147,11 +188,15 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #bab0e3;
+  background: #97999f;
   animation: hx-about-breathe 1.4s ease-in-out infinite;
 }
 .hx-about .hx-about-dot[data-done] {
   background: rgb(168 201 188);
+  animation: none;
+}
+.hx-about .hx-about-dot[data-failed] {
+  background: rgb(213 164 173);
   animation: none;
 }
 @keyframes hx-about-breathe {
@@ -160,13 +205,13 @@
   }
 }
 .hx-about .hx-about-q {
-  margin: 0 12px 6px;
+  margin: 0 0 8px;
   color: #e4e5e7;
   font-size: 12.5px;
 }
 .hx-about .hx-about-trail {
-  margin: 0;
-  padding: 0 12px 6px;
+  margin: 0 0 8px;
+  padding: 0;
   list-style: none;
   color: #797c84;
   font: 11px/1.8 var(--font-mono, monospace);
@@ -181,14 +226,21 @@
   content: "› ";
   color: #565a64;
 }
+/* The answer's room, kept from the moment it's asked for: the parts come into it, a longer one scrolls. */
 .hx-about .hx-about-answer {
-  max-height: min(60vh, 520px);
+  height: min(46vh, 400px);
   overflow: auto;
   overscroll-behavior: contain;
   padding: 2px 12px 4px;
 }
 .hx-about .hx-about-part {
   margin: 0 0 12px;
+  animation: hx-about-come 0.24s ease-out;
+}
+@keyframes hx-about-come {
+  from {
+    opacity: 0;
+  }
 }
 .hx-about .hx-about-part h4 {
   margin: 0 0 3px;
@@ -207,8 +259,8 @@
 .hx-about .hx-about-part code {
   padding: 0 4px;
   border-radius: 4px;
-  background: #1a1c23;
-  color: #e3e0f0;
+  background: #22242b;
+  color: #e3e4ea;
   font: 11.5px var(--font-mono, monospace);
   overflow-wrap: anywhere;
   -webkit-box-decoration-break: clone;
@@ -221,7 +273,7 @@
   display: block;
   height: 9px;
   border-radius: 4px;
-  background: linear-gradient(90deg, #191b21 0%, #262931 45%, #191b21 90%) 0 0 / 300% 100%;
+  background: linear-gradient(90deg, #1f2128 0%, #2c2f37 45%, #1f2128 90%) 0 0 / 300% 100%;
   animation: hx-about-sheen 1.5s ease-in-out infinite;
 }
 .hx-about .hx-about-sk i + i {
@@ -252,30 +304,60 @@
     background-position: 0 0;
   }
 }
+/* Its height kept whether it holds a button or not, so the answer's end moves nothing. */
 .hx-about .hx-about-foot {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 30px;
   padding: 8px 12px 12px;
-  border-top: 1px solid #23252e;
+  border-top: 1px solid #262931;
 }
 .hx-about .hx-about-meta {
   flex: 1;
+  min-width: 0;
   color: #797c84;
   font: 11px var(--font-mono, monospace);
 }
+
+/* A code block opened by a card: its pieces meet the card flat, as if cut, adding no room of their own. */
+.hx-codeblock .hx-about {
+  margin: 0;
+}
+.hx-codeblock > .hx-pre[data-cut~="end"] {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.hx-codeblock > .hx-pre[data-cut~="start"] {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .hx-about,
+  .hx-row,
+  .rv-row,
+  .rv-half,
+  .hx-about-card,
+  .hx-about .hx-about-fold {
+    transition: none;
+  }
   .hx-about .hx-about-dot,
-  .hx-about .hx-about-sk i {
+  .hx-about .hx-about-sk i,
+  .hx-about .hx-about-part {
     animation: none;
   }
 }
 @media (max-width: 639px) {
-  .hx-about {
-    margin: 4px 6px 8px;
-  }
   .hx-about .hx-about-btn {
     height: 36px;
+  }
+  .hx-about .hx-about-foot {
+    min-height: 36px;
   }
 }

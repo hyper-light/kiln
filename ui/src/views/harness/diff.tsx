@@ -11,7 +11,7 @@ import * as React from "react";
 import { flushSync } from "react-dom";
 import { ChevronRight, ChevronsUpDown, FileDiff as FileDiffIcon, FilePlus2 } from "lucide-react";
 import type { FileDiff, Hunk } from "@/api/harness";
-import { AboutCard, AboutContext, linesLabel, offsetAt, selecting, wordAt, type Asked } from "@/components/code/about";
+import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { cn } from "@/lib/utils";
 import { diffStats } from "./derive";
@@ -493,8 +493,7 @@ function HunkRows({
   onUnfold,
   onAsk,
   asking,
-  cardAfter,
-  card,
+  cards,
 }: {
   h: HunkModel;
   hi: number;
@@ -503,10 +502,9 @@ function HunkRows({
   unfolded: ReadonlySet<string>;
   onUnfold: (id: string) => void;
   onAsk?: OnAsk;
-  /** The line a card is open under, and the card. */
+  /** The lines the open card asks about, and the cards (open or sliding shut), each under its last line. */
   asking: ReadonlySet<Line>;
-  cardAfter: Line | null;
-  card: React.ReactNode;
+  cards: ReadonlyMap<Line, React.ReactNode[]>;
 }) {
   const out: React.ReactNode[] = [];
   let sr = 1;
@@ -534,7 +532,7 @@ function HunkRows({
         out.push(
           <Row key={`${si}.${k}`} line={l} toks={toks?.get(l)} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} onAsk={onAsk} asked={asking.has(l)} />,
         );
-        if (l === cardAfter && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
+        if (!split) out.push(...(cards.get(l) ?? []));
       });
       return;
     }
@@ -555,18 +553,22 @@ function HunkRows({
     ] as const)
       list.forEach((l, k) => {
         out.push(<Row key={`${si}${tag}${k}`} line={l} toks={toks?.get(l)} sr={rows[k] ?? top} split={split} onAsk={onAsk} asked={asking.has(l)} />);
-        if (l === cardAfter && !split) out.push(<React.Fragment key="about">{card}</React.Fragment>);
+        if (!split) out.push(...(cards.get(l) ?? []));
       });
     out.push(...fills);
     sr += seg.pairs.length;
   });
-  // Side by side, rows hold their places in the grid: the card goes under the hunk's last row.
-  if (split && cardAfter && h.segs.some((sg) => (sg.t === "ctx" ? sg.lines.includes(cardAfter) : sg.dels.includes(cardAfter) || sg.adds.includes(cardAfter))) && card)
-    out.push(
-      <div key="about" style={{ gridRow: sr, gridColumn: "1 / -1" }}>
-        {card}
-      </div>,
+  // Side by side, rows hold their places in the grid: a card goes under the hunk's last row.
+  if (split) {
+    const mine = h.segs.flatMap((sg) => (sg.t === "ctx" ? sg.lines : [...sg.dels, ...sg.adds])).flatMap((l) => cards.get(l) ?? []);
+    mine.forEach((c, i) =>
+      out.push(
+        <div key={`about${i}`} style={{ gridRow: sr + i, gridColumn: "1 / -1" }}>
+          {c}
+        </div>,
+      ),
     );
+  }
   return <div className="hx-hunk">{out}</div>;
 }
 
@@ -624,10 +626,11 @@ export function FileDiffView({
   const toks = React.useMemo(() => (hl && model.hunks.length ? tokensOf(model.hunks, hl) : null), [hl, model.hunks]);
   // In an agent's conversation, a tapped line opens a card under it (components/code/about.tsx).
   const about = React.useContext(AboutContext);
-  const [asked, setAsked] = React.useState<{ lines: Line[]; ask: Asked } | null>(null);
+  const cards = useCards<{ key: string; lines: Line[]; ask: Asked }>();
+  const { update, gone } = cards;
   const onAsk = React.useCallback<OnAsk>(
     (line, word, change) =>
-      setAsked((prev) => {
+      update((prev) => {
         const hunk = model.hunks.find((x) => x.segs.some((sg) => (sg.t === "ctx" ? sg.lines.includes(line) : sg.dels.includes(line) || sg.adds.includes(line))));
         const flat = (hunk?.segs ?? []).flatMap((sg) => (sg.t === "ctx" ? sg.lines : [...sg.dels, ...sg.adds]));
         const selection = word ? line.text.slice(word.start, word.end) : undefined;
@@ -651,13 +654,17 @@ export function FileDiffView({
         const file = diff.path.split("/").pop() ?? diff.path;
         const label = selection ?? (changed && !many ? "this change" : linesLabel(a, b));
         const ask: Asked = { path: diff.path, line: a, end: many ? b : undefined, selection, change: changed || undefined, code, label, where: a ? `${file} · ${linesLabel(a, many ? b : a)}` : file };
-        return { lines, ask };
+        return { key: cardKey(label), lines, ask };
       }),
-    [model.hunks, diff.path],
+    [model.hunks, diff.path, update],
   );
-  const card = asked ? <AboutCard key={`${asked.ask.label}@${asked.ask.line ?? ""}`} ask={asked.ask} onClose={() => setAsked(null)} /> : null;
-  const asking = React.useMemo(() => new Set(asked?.lines ?? []), [asked]);
-  const cardAfter = asked?.lines[asked.lines.length - 1] ?? null;
+  // The open card and those sliding shut, each under the last of its lines.
+  const asking = React.useMemo(() => new Set(cards.open?.lines ?? []), [cards.open]);
+  const cardsAfter = new Map<Line, React.ReactNode[]>();
+  for (const [c, closing] of [...cards.closing.map((c) => [c, true] as const), ...(cards.open ? [[cards.open, false] as const] : [])]) {
+    const last = c.lines[c.lines.length - 1];
+    if (last) cardsAfter.set(last, [...(cardsAfter.get(last) ?? []), <AboutCard key={c.key} ask={c.ask} closing={closing} onClose={() => update(() => null)} onGone={() => gone(c.key)} />]);
+  }
   // Side by side only helps when lines changed on both sides (not in a new file or a pure deletion,
   // whose other column of numbers goes, too).
   const split = layout !== "unified" && !model.only ? (layout === "split" ? "on" : "auto") : undefined;
@@ -698,18 +705,7 @@ export function FileDiffView({
                     <span className="hx-sep-label">{h.where}</span>
                   </div>
                 )}
-                <HunkRows
-                  h={h}
-                  hi={hi}
-                  toks={toks}
-                  split={split !== undefined}
-                  unfolded={unfolded}
-                  onUnfold={unfold}
-                  onAsk={about ? onAsk : undefined}
-                  asking={asking}
-                  cardAfter={cardAfter}
-                  card={card}
-                />
+                <HunkRows h={h} hi={hi} toks={toks} split={split !== undefined} unfolded={unfolded} onUnfold={unfold} onAsk={about ? onAsk : undefined} asking={asking} cards={cardsAfter} />
               </React.Fragment>
             ))
           )}
