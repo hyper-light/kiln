@@ -7,13 +7,7 @@ use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::{Notice, SLOTS, SLOTS_MAX, WEIGHT, WEIGHT_MAX};
-use crate::ops::{Cx, Fail, Op, Out, path, text};
-
-fn schema(props: Value, required: &[&str]) -> Value {
-    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
-}
-
-const PROGRAM: &str = "The program's id: its master plan's (as plans_list gives it).";
+use crate::ops::{Cx, Fail, Input, Op, Out, path, text};
 
 fn json_of<T: serde::Serialize>(v: &T) -> Out {
     serde_json::to_value(v).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -226,7 +220,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Every multi-stack program kiln runs (a master plan and its track plans, run as goals on a coordinator), the critical path first: per track its worker and how it stands (a pause, its window and reset, its threshold), goal under way (and on which agent), goals met, change requests, pass, slot and usage; the program's slots, usage and the rule it brings.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({}), &[]),
+            input: Input::of::<input::ProgramsList>(),
             route: |_| Ok((Method::GET, path(&["api", "programs"]))),
             run: |cx, v| Box::pin(list(cx, v)),
         },
@@ -235,7 +229,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "One program, as programs.list gives each: its coordinator reads its slots and each track's slot (running, next, waiting, held, paused, done) from it at each goal boundary.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"program": {"type": "string", "description": PROGRAM}}), &["program"]),
+            input: Input::of::<input::ProgramsGet>(),
             route: |v| Ok((Method::GET, path(&["api", "programs", &text(v, "program")?]))),
             run: |cx, v| Box::pin(get(cx, v)),
         },
@@ -244,16 +238,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "A person changes a program's slots (1 to 32) and its tracks' weights (1 to 100): kept in kiln; its coordinator is told (the message kept until it's delivered) and follows them at its next goal boundary. Agents can't.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "program": {"type": "string", "description": PROGRAM},
-                        "slots": {"type": "integer", "minimum": 1, "maximum": SLOTS_MAX},
-                        "weights": {"type": "object", "description": "By track: {\"T7\": 4}", "additionalProperties": {"type": "integer", "minimum": 1, "maximum": WEIGHT_MAX}}
-                    }),
-                    &["program"],
-                )
-            },
+            input: Input::of::<input::ProgramsSet>(),
             route: |v| Ok((Method::PUT, path(&["api", "programs", &text(v, "program")?, "settings"]))),
             run: |cx, v| Box::pin(set(cx, v)),
         },
@@ -262,20 +247,57 @@ pub fn list_ops() -> Vec<Op> {
             summary: "The program's coordinator (or the person) assigns a track's worker (`agent`: any agent of the same person; null to unassign) and puts a goal of the coordinator's stack under way on it (`goal`: its id; null: none), or marks that goal met (`met`). Above 80% of a weekly window no new goal is put under way.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "program": {"type": "string", "description": PROGRAM},
-                        "track": {"type": "string", "description": "The track: T7."},
-                        "agent": {"type": ["string", "null"], "description": "Its worker's agent id; null to unassign."},
-                        "goal": {"type": ["string", "null"], "description": "A goal's id in the coordinator's stack, of this track, under way on the worker; null: none."},
-                        "met": {"type": "boolean", "description": "The goal (`goal`, or the one under way) is met."}
-                    }),
-                    &["program", "track"],
-                )
-            },
+            input: Input::of::<input::ProgramsAssign>(),
             route: |v| Ok((Method::PUT, path(&["api", "programs", &text(v, "program")?, "tracks", &text(v, "track")?]))),
             run: |cx, v| Box::pin(assign(cx, v)),
         },
     ]
+}
+
+/// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
+/// its type, each field's description from its doc comment.
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProgramsList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProgramsGet {
+        /// The program's id: its master plan's (as plans_list gives it).
+        pub program: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProgramsSet {
+        /// The program's id: its master plan's (as plans_list gives it).
+        pub program: String,
+        #[schemars(range(min = 1, max = super::SLOTS_MAX))]
+        pub slots: Option<i64>,
+        /// By track: {"T7": 4}
+        #[schemars(extend("additionalProperties" = {"type": "integer", "minimum": 1, "maximum": super::WEIGHT_MAX}))]
+        pub weights: Option<std::collections::BTreeMap<String, i64>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProgramsAssign {
+        /// The program's id: its master plan's (as plans_list gives it).
+        pub program: String,
+        /// The track: T7.
+        pub track: String,
+        /// Its worker's agent id; null to unassign.
+        #[schemars(extend("x-kiln-nullable" = true))]
+        pub agent: Option<String>,
+        /// A goal's id in the coordinator's stack, of this track, under way on the worker; null:
+        /// none.
+        #[schemars(extend("x-kiln-nullable" = true))]
+        pub goal: Option<String>,
+        /// The goal (`goal`, or the one under way) is met.
+        pub met: Option<bool>,
+    }
 }

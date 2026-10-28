@@ -80,6 +80,16 @@ pub enum Question {
         #[serde(default)]
         digest: String,
     },
+    /// A message an agent session's MCP server (`crate::reach::mcp`) couldn't read of what its
+    /// agent sent: noted against the session (`crate::wire::unread`, wire `mcp_reach`).
+    Unread {
+        #[serde(default)]
+        session: String,
+        what: String,
+        code: crate::wire::unread::Code,
+        #[serde(default)]
+        why: String,
+    },
 }
 
 /// The MCP servers whose tools are reach's: a runner's own kiln server (`kiln`, `crate::reach::mcp`),

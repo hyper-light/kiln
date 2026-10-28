@@ -23,7 +23,7 @@
 //! that's who it is.
 
 use std::collections::HashMap;
-use std::io::{BufRead as _, Write as _};
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,8 @@ const CODE_WALL_DEFAULT: Duration = Duration::from_secs(600);
 const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
 /// kiln's operations, as the server lists them, are asked for again after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(60);
+/// Word of what it couldn't read on its way to the server at once, at most.
+const NOTING_MOST: usize = 4;
 
 fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
     let mut s = "This is kiln's own MCP server: the machines of this kiln (its runners), and kiln itself (CI, deployments). \
@@ -162,7 +164,7 @@ fn command_schema(waits: bool) -> Value {
 /// `goals_plan`, `plans_run`, …), as this binary knows them: what's offered when the server can't
 /// say (one from before it said, or out of reach).
 fn agent_tools() -> Vec<Value> {
-    crate::mcp::agent_ops().iter().map(|o| tool_of(o.name, &json!(o.summary), &(o.input)(), o.read_only, o.destructive)).collect()
+    crate::mcp::agent_ops().iter().map(|o| tool_of(o.name, &json!(o.summary), &o.input.schema(), o.read_only, o.destructive)).collect()
 }
 
 /// One operation as an agent's tool, asked of the server for this session like the rest of kiln's
@@ -500,6 +502,8 @@ struct Server {
     /// What the agent was last given as the tools (`fingerprint`): when the server's change, it's
     /// told to ask again (`notifications/tools/list_changed`).
     listed: Mutex<Option<u64>>,
+    /// Word of what it couldn't read on its way to the server (`Server::note`).
+    noting: std::sync::atomic::AtomicUsize,
 }
 
 impl Server {
@@ -605,6 +609,26 @@ impl Server {
             None => anyhow::bail!("the kiln runner closed the connection (a runner older than kiln's operations for agents doesn't answer them: upgrade it)"),
             other => anyhow::bail!("unexpected answer {other:?}"),
         }
+    }
+
+    /// `r`, a message its agent sent that it couldn't read, told the server for this session
+    /// (`crate::reach::Question::Unread`), on a thread of its own so the agent waits for nothing:
+    /// at most [`NOTING_MOST`] on their way at once, and past that one isn't told (it's answered
+    /// all the same).
+    fn note(self: &Arc<Self>, r: &crate::mcp::rpc::Refused) {
+        use std::sync::atomic::Ordering;
+        if !r.unreadable() || self.session.is_empty() {
+            return;
+        }
+        if self.noting.fetch_add(1, Ordering::SeqCst) >= NOTING_MOST {
+            self.noting.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        let (server, q) = (Arc::clone(self), json!({"op": "unread", "what": r.what, "code": r.code(), "why": r.noted()}));
+        std::thread::spawn(move || {
+            let _ = server.ask(q);
+            server.noting.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     /// Ask the machine's preview browser, through the runner (`crate::browser::ask`).
@@ -739,6 +763,11 @@ impl Server {
             list.extend(agent);
         }
         t
+    }
+
+    /// Whether it offers a tool `name` (`tools`).
+    fn has(&self, name: &str) -> bool {
+        self.tools().as_array().is_some_and(|t| t.iter().any(|t| t.get("name").and_then(Value::as_str) == Some(name)))
     }
 
     fn call(self: &Arc<Self>, name: &str, args: &Value) -> Value {
@@ -905,10 +934,6 @@ fn rpc_ok(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-}
-
 /// `kiln reach mcp`: serve MCP on stdin/stdout until stdin closes. Tool calls run side by side.
 pub fn serve() -> anyhow::Result<()> {
     let sock = super::local::find_socket()?;
@@ -916,7 +941,7 @@ pub fn serve() -> anyhow::Result<()> {
     let session = std::env::var("KILN_SESSION").unwrap_or_default();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let machines = machines(&sock);
-    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None) });
+    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = |out: &Arc<Mutex<std::io::Stdout>>, v: &Value| {
         if let Ok(mut o) = out.lock() {
@@ -942,72 +967,112 @@ pub fn serve() -> anyhow::Result<()> {
             }
         });
     }
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                say(&out, &rpc_error(Value::Null, -32700, &format!("parse error: {e}")));
-                continue;
-            }
-        };
-        let Some(id) = msg.get("id").cloned().filter(|i| !i.is_null()) else { continue };
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_owned();
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        match method.as_str() {
-            "initialize" => {
-                let version = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18").to_owned();
-                say(
-                    &out,
-                    &rpc_ok(
-                        id,
-                        json!({
-                            "protocolVersion": version,
-                            "capabilities": {"tools": {"listChanged": true}, "resources": {"listChanged": false}},
-                            "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
-                            "instructions": instructions(server.prefer.as_deref(), &machines, &server.session),
-                        }),
-                    ),
-                );
-            }
-            "ping" => say(&out, &rpc_ok(id, json!({}))),
-            "tools/list" => {
-                let t = server.tools();
-                if let Ok(mut g) = server.listed.lock() {
-                    *g = Some(fingerprint(&t));
-                }
-                say(&out, &rpc_ok(id, json!({"tools": t})));
-            }
-            "tools/call" => {
-                let (server, out) = (Arc::clone(&server), Arc::clone(&out));
-                std::thread::spawn(move || {
-                    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                    let v = server.call(name, &args);
-                    if let Ok(mut o) = out.lock() {
-                        let _ = writeln!(o, "{}", rpc_ok(id, v));
-                        let _ = o.flush();
-                    }
-                });
-            }
-            // kiln's skills (deploying, diagnosing): resources, as the server offers them.
-            "resources/list" => say(&out, &rpc_ok(id, json!({"resources": crate::mcp::skills::resources()}))),
-            "resources/read" => {
-                let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
-                match crate::mcp::skills::read(uri) {
-                    Some(c) => say(&out, &rpc_ok(id, json!({"contents": [c]}))),
-                    None => say(&out, &rpc_error(id, -32002, &format!("no resource {uri}"))),
-                }
-            }
-            "resources/templates/list" => say(&out, &rpc_ok(id, json!({"resourceTemplates": []}))),
-            "prompts/list" => say(&out, &rpc_ok(id, json!({"prompts": []}))),
-            other => say(&out, &rpc_error(id, -32601, &format!("method not found: {other}"))),
+    for line in crate::mcp::rpc::lines(std::io::stdin().lock()) {
+        // Each message read into a request, or refused as JSON-RPC 2.0 says and noted (`rpc`). A
+        // batch (MCP before 2025-06-18) is answered whole, each message in turn; a message alone is
+        // answered as it's done, a tool's call on a thread of its own.
+        let body = crate::mcp::rpc::body(&line);
+        let lone = (!body.batch).then_some(&out);
+        let answers: Vec<Value> = body.messages.into_iter().filter_map(|m| answer(&server, &machines, m, lone)).collect();
+        if let Some(a) = crate::mcp::rpc::reply(body.batch, answers) {
+            say(&out, &a);
         }
     }
     Ok(())
+}
+
+/// One message's answer: none for a notification, nor for a tool's call when `out` is given (its
+/// answer goes there once it's done).
+fn answer(server: &Arc<Server>, machines: &str, m: Result<crate::mcp::rpc::Request, Box<crate::mcp::rpc::Refused>>, out: Option<&Arc<Mutex<std::io::Stdout>>>) -> Option<Value> {
+    use crate::mcp::rpc;
+    let refused = |r: Box<rpc::Refused>| {
+        server.note(&r);
+        Some(r.answer())
+    };
+    let req = match m {
+        Ok(req) => req,
+        Err(r) => return refused(r),
+    };
+    // A notification is never answered; one no client sends is noted all the same.
+    let Some(id) = req.id.clone() else {
+        if let Some(r) = req.unknown_notification() {
+            server.note(&r);
+        }
+        return None;
+    };
+    // A list's cursor is a string (its lists come whole).
+    if matches!(req.method.as_str(), "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list")
+        && let Err(r) = req.params::<rpc::Paginated>()
+    {
+        return refused(r);
+    }
+    Some(match req.method.as_str() {
+        "initialize" => {
+            let p: rpc::Initialize = match req.params() {
+                Ok(p) => p,
+                Err(r) => return refused(r),
+            };
+            let version = p.protocol_version.unwrap_or_else(|| "2025-06-18".to_owned());
+            rpc_ok(
+                id,
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {"listChanged": true}, "resources": {"listChanged": false}},
+                    "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": instructions(server.prefer.as_deref(), machines, &server.session),
+                }),
+            )
+        }
+        "ping" => rpc_ok(id, json!({})),
+        "tools/list" => {
+            let t = server.tools();
+            if let Ok(mut g) = server.listed.lock() {
+                *g = Some(fingerprint(&t));
+            }
+            rpc_ok(id, json!({"tools": t}))
+        }
+        "tools/call" => {
+            let p: rpc::ToolsCall = match req.params() {
+                Ok(p) => p,
+                Err(r) => return refused(r),
+            };
+            // A tool it doesn't have is a protocol error (MCP 2025-11-25), not the tool's: looked
+            // for where the call runs, as listing the tools may ask the server.
+            let unknown = req.unknown_tool(&p.name);
+            let call = move |server: &Arc<Server>| {
+                if !server.has(&p.name) {
+                    server.note(&unknown);
+                    return unknown.answer();
+                }
+                rpc_ok(id, server.call(&p.name, &Value::Object(p.arguments.unwrap_or_default())))
+            };
+            let Some(out) = out else { return Some(call(server)) };
+            let (server, out) = (Arc::clone(server), Arc::clone(out));
+            std::thread::spawn(move || {
+                let v = call(&server);
+                if let Ok(mut o) = out.lock() {
+                    let _ = writeln!(o, "{v}");
+                    let _ = o.flush();
+                }
+            });
+            return None;
+        }
+        // kiln's skills (deploying, diagnosing): resources, as the server offers them.
+        "resources/list" => rpc_ok(id, json!({"resources": crate::mcp::skills::resources()})),
+        "resources/read" => {
+            let p: rpc::ResourcesRead = match req.params() {
+                Ok(p) => p,
+                Err(r) => return refused(r),
+            };
+            match crate::mcp::skills::read(&p.uri) {
+                Some(c) => rpc_ok(id, json!({"contents": [c]})),
+                None => rpc::Refused::new(id, -32002, format!("no resource {}", p.uri)).answer(),
+            }
+        }
+        "resources/templates/list" => rpc_ok(id, json!({"resourceTemplates": []})),
+        "prompts/list" => rpc_ok(id, json!({"prompts": []})),
+        _ => return refused(Box::new(req.unknown_method())),
+    })
 }
 
 /// The server's environment: the runner's reach socket, the session's preferred runner, and the
@@ -1140,6 +1205,33 @@ mod tests {
         // Settings not as agy writes them are left alone.
         assert_eq!(agy_allow(&json!(["x"])), None);
         assert_eq!(agy_allow(&json!({"permissions": {"allow": "mcp(*)"}})), None);
+    }
+
+    /// What the agent sends its runner's MCP server is read as JSON-RPC 2.0 and MCP say: what
+    /// isn't JSON or a request is refused (each message of a batch on its own, under a null id when
+    /// its id can't be read), a method or a tool the server doesn't have too, and a valid
+    /// notification isn't answered.
+    #[test]
+    fn what_the_agent_sends_is_read_as_json_rpc_says() {
+        let server = Arc::new(Server { sock: "/nonexistent/kiln-reach.sock".into(), prefer: None, cwd: String::new(), session: String::new(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+        let ask = |line: &str| {
+            let body = crate::mcp::rpc::body(line.as_bytes());
+            let answers = body.messages.into_iter().filter_map(|m| answer(&server, "", m, None)).collect();
+            crate::mcp::rpc::reply(body.batch, answers)
+        };
+        let code = |v: Option<Value>| v.and_then(|v| v.pointer("/error/code").and_then(Value::as_i64));
+        assert_eq!(code(ask("{")), Some(-32700));
+        assert_eq!(code(ask("{}")), Some(-32600));
+        let three = ask("[1,2,3]");
+        let each: Option<Vec<(Option<Value>, Option<Value>)>> = three.as_ref().and_then(Value::as_array).map(|a| a.iter().map(|e| (e.pointer("/error/code").cloned(), e.get("id").cloned())).collect());
+        assert_eq!(each, Some(vec![(Some(json!(-32600)), Some(Value::Null)); 3]), "{three:?}");
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":1}"#)), Some(-32600));
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":2,"method":"teleport"}"#)), Some(-32601));
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"teleport","arguments":{}}}"#)), Some(-32602));
+        assert_eq!(ask(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), None);
+        assert_eq!(ask(r#"{"jsonrpc":"2.0","method":"notifications/teleport"}"#), None, "no notification is answered, one no client sends neither");
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{"cursor":5}}"#)), Some(-32602), "a cursor is a string");
+        assert_eq!(ask(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#), Some(json!({"jsonrpc": "2.0", "id": 4, "result": {}})));
     }
 
     /// The agent tools are the server's: those it names (each as its registry has it, one it

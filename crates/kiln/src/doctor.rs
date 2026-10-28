@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use crate::authz::{Caller, Scope};
 use crate::hub::Hub;
-use crate::ops::{Cx, Fail, Op, Out, path, schema, text};
+use crate::ops::{Cx, Fail, Input, Op, Out, path, text};
 use crate::proto::{self, ServerMsg};
 
 /// How much a finding matters.
@@ -613,8 +613,6 @@ pub fn answer_repair(here: &Here, action: &str) -> String {
 
 // ------------------------------------------------------------------------------- operations
 
-const RUNNER: &str = "The runner (machine) by name, as Runners lists it.";
-
 fn runner_of(v: &Value) -> Result<String, Fail> {
     text(v, "runner")
 }
@@ -649,7 +647,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Every runner (machine) of this kiln you may read: connected or not, its OS and architecture, labels, slots, what it runs now, its kiln version, battery, and when it was last heard.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({}), &[]),
+            input: Input::of::<input::RunnersList>(),
             route: |_| Ok((Method::GET, path(&["api", "agents"]))),
             run: |cx, _| Box::pin(async move { serde_json::to_value(runners_for(&cx.hub, &cx.caller).await).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())) }),
         },
@@ -658,7 +656,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Diagnose a runner: what the server knows (connected, its kiln against the newest, its last upgrade with its error and log, memory, the Rust a self-build needs) and what the machine finds about itself (room on its disks, the self-build cache and newest log, its clock, macOS signing). Findings come worst first; one kiln can fix carries `fix` ({action, label, way?}) to pass to runners.repair.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"runner": {"type": "string", "description": RUNNER}}), &["runner"]),
+            input: Input::of::<input::RunnersDiagnose>(),
             route: |v| Ok((Method::GET, path(&["api", "agents", &runner_of(v)?, "diagnose"]))),
             run: |cx, v| Box::pin(async move { diagnose(&cx.hub, &runner_of(&v)?).await }),
         },
@@ -667,16 +665,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Repair a runner, as a diagnosis's `fix` says: `retry-upgrade` (with `way` download or build: upgrade it now, nothing it runs stops), `clear-self-build-cache` (frees what self-builds compiled; refused while an upgrade runs), `prune-versions` (older kiln builds the runner keeps), `re-sign` (macOS: sign kiln again). None restarts the runner or stops what it runs.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "runner": {"type": "string", "description": RUNNER},
-                        "action": {"type": "string", "enum": ["retry-upgrade", "clear-self-build-cache", "prune-versions", "re-sign"]},
-                        "way": {"type": "string", "enum": ["download", "build"], "description": "For retry-upgrade: how; by default the way kiln can."}
-                    }),
-                    &["runner", "action"],
-                )
-            },
+            input: Input::of::<input::RunnersRepair>(),
             route: |v| Ok((Method::POST, path(&["api", "agents", &runner_of(v)?, "repair"]))),
             run: |cx, v| {
                 Box::pin(async move {
@@ -690,7 +679,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "The kiln of every runner you may read against the newest: its build, whether it's up to date, what it does next, the ways it can be upgraded now (or why not), its policy; and their latest upgrades with their state, error and log.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({}), &[]),
+            input: Input::of::<input::UpdatesList>(),
             route: |_| Ok((Method::GET, path(&["api", "updates", "runners"]))),
             run: |cx, _| Box::pin(async move { Ok(updates_for(&cx.hub, &cx.caller).await) }),
         },
@@ -699,7 +688,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Upgrade a runner to the newest kiln now (a failed upgrade tried again), optionally `way` download or build. Nothing it runs stops: its agents and jobs carry on in the new build.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"runner": {"type": "string", "description": RUNNER}, "way": {"type": "string", "enum": ["download", "build"]}}), &["runner"]),
+            input: Input::of::<input::UpdatesRetry>(),
             route: |v| Ok((Method::POST, path(&["api", "updates", "runners", &runner_of(v)?]))),
             run: |cx, v| {
                 Box::pin(async move {
@@ -713,11 +702,86 @@ pub fn list_ops() -> Vec<Op> {
             summary: "What a runner does with a newer kiln: `auto` (upgraded as soon as there's a build for it), `notify` (told, upgraded when someone chooses), or `off` (left alone).",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"runner": {"type": "string", "description": RUNNER}, "policy": {"type": "string", "enum": ["auto", "notify", "off"]}}), &["runner", "policy"]),
+            input: Input::of::<input::UpdatesPolicy>(),
             route: |v| Ok((Method::PUT, path(&["api", "updates", "runners", &runner_of(v)?]))),
             run: |cx, v| Box::pin(set_policy(cx, v)),
         },
     ]
+}
+
+/// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
+/// its type, each field's description from its doc comment.
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunnersList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunnersDiagnose {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub enum RunnersRepairAction {
+        #[serde(rename = "retry-upgrade")]
+        RetryUpgrade,
+        #[serde(rename = "clear-self-build-cache")]
+        ClearSelfBuildCache,
+        #[serde(rename = "prune-versions")]
+        PruneVersions,
+        #[serde(rename = "re-sign")]
+        ReSign,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RunnersRepairWay {
+        Download,
+        Build,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunnersRepair {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
+        pub action: RunnersRepairAction,
+        /// For retry-upgrade: how; by default the way kiln can.
+        pub way: Option<RunnersRepairWay>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct UpdatesList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct UpdatesRetry {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
+        pub way: Option<RunnersRepairWay>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum UpdatePolicy {
+        Auto,
+        Notify,
+        Off,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct UpdatesPolicy {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
+        pub policy: UpdatePolicy,
+    }
 }
 
 async fn set_policy(cx: Cx, v: Value) -> Out {

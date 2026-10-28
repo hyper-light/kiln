@@ -159,7 +159,7 @@ fn unknown_tag(said: &str) -> Option<String> {
 
 /// serde's words without the value it found: `invalid type: string "hunter2", expected u32` is
 /// `invalid type: string, expected u32`.
-fn without_values(said: &str) -> String {
+pub(crate) fn without_values(said: &str) -> String {
     for kind in ["invalid type: ", "invalid value: "] {
         if let Some(rest) = said.strip_prefix(kind)
             && let Some((found, expected)) = rest.split_once(", expected ")

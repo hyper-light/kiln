@@ -11,6 +11,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::authz::Caller;
@@ -47,10 +49,210 @@ pub struct Op {
     pub summary: &'static str,
     pub read_only: bool,
     pub destructive: bool,
-    pub input: fn() -> Value,
+    pub input: Input,
     /// Its route, from the input: method and path segments (`["api", "harness", "agents"]`).
     pub route: fn(&Value) -> Result<(Method, Vec<String>), Fail>,
     pub run: fn(Cx, Value) -> Fut,
+}
+
+/// What an operation takes: a Rust type, which reads each input it's given before it runs
+/// ([`call`]) and from which its JSON Schema is generated (MCP's `inputSchema`, `GET /api/ops`'
+/// `input`), so the two can't drift apart. Made only by [`Input::of`].
+#[derive(Clone, Copy)]
+pub struct Input {
+    schema: fn() -> Value,
+    fits: fn(&Value) -> Result<(), Misfit>,
+}
+
+impl Input {
+    /// `T`'s: an input is read as a `T` (a field `T` doesn't have is refused where `T` says
+    /// `deny_unknown_fields`, its schema's `additionalProperties: false`).
+    pub fn of<T: DeserializeOwned + JsonSchema>() -> Input {
+        Input { schema: schema_of::<T>, fits: fits::<T> }
+    }
+
+    /// Its JSON Schema.
+    pub fn schema(&self) -> Value {
+        (self.schema)()
+    }
+
+    /// What makes its JSON Schema, for a list of operations ([`Info`]).
+    pub fn schema_fn(&self) -> fn() -> Value {
+        self.schema
+    }
+
+    /// Whether `input` fits it: where and why not.
+    pub fn fits(&self, input: &Value) -> Result<(), Misfit> {
+        (self.fits)(input)
+    }
+}
+
+/// `T`'s JSON Schema as an operation publishes it: whole (no `$ref`), without `$schema` or a
+/// title, each description one line (a doc comment's lines joined), `properties` even when it
+/// takes none, and a field that may be left out said so only by not being `required`
+/// ([`optional_not_null`]).
+pub fn schema_of<T: JsonSchema>() -> Value {
+    fn one_line(v: &mut Value) {
+        match v {
+            Value::Object(o) => {
+                if let Some(Value::String(d)) = o.get_mut("description") {
+                    *d = d.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+                }
+                o.values_mut().for_each(one_line);
+            }
+            Value::Array(a) => a.iter_mut().for_each(one_line),
+            _ => {}
+        }
+    }
+    let settings = schemars::generate::SchemaSettings::draft2020_12().with(|s| {
+        s.meta_schema = None;
+        s.inline_subschemas = true;
+    });
+    let mut v = settings.into_generator().into_root_schema_for::<T>().to_value();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("title");
+        o.remove("description");
+        // An input that takes nothing says so: some clients want `properties` on every object.
+        o.entry("properties").or_insert_with(|| json!({}));
+    }
+    optional_not_null(&mut v);
+    one_line(&mut v);
+    v
+}
+
+/// The null serde takes for a field that may be left out (an `Option`), taken out of its schema:
+/// such a field says so by not being `required`, as the hand-written schemas had it and as
+/// clients that take a narrow JSON Schema (Gemini's) want it. A field marked `x-kiln-nullable`,
+/// where null means something (`programs.assign`'s unassign), keeps it.
+fn optional_not_null(v: &mut Value) {
+    fn without_null(p: &mut Value) {
+        let Some(o) = p.as_object_mut() else { return };
+        if o.remove("x-kiln-nullable").is_some() {
+            return;
+        }
+        let single = match o.get_mut("type") {
+            Some(Value::Array(ts)) => {
+                ts.retain(|t| t.as_str() != Some("null"));
+                if ts.len() == 1 { ts.first().cloned() } else { None }
+            }
+            _ => None,
+        };
+        if let Some(t) = single {
+            o.insert("type".into(), t);
+        }
+        if let Some(Value::Array(e)) = o.get_mut("enum") {
+            e.retain(|x| !x.is_null());
+        }
+        let only = match o.get_mut("anyOf") {
+            Some(Value::Array(any)) => {
+                any.retain(|x| x.get("type").and_then(Value::as_str) != Some("null"));
+                if any.len() == 1 { any.pop() } else { None }
+            }
+            _ => None,
+        };
+        if let Some(Value::Object(only)) = only {
+            o.remove("anyOf");
+            for (k, x) in only {
+                o.entry(k).or_insert(x);
+            }
+        }
+    }
+    match v {
+        Value::Object(o) => {
+            let required: Vec<String> = o.get("required").and_then(Value::as_array).map(|r| r.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+            if let Some(Value::Object(props)) = o.get_mut("properties") {
+                for (_, p) in props.iter_mut().filter(|(k, _)| !required.contains(k)) {
+                    without_null(p);
+                }
+            }
+            o.values_mut().for_each(optional_not_null);
+        }
+        Value::Array(a) => a.iter_mut().for_each(optional_not_null),
+        _ => {}
+    }
+}
+
+/// `input` read as a `T`: where and why it doesn't fit.
+fn fits<T: DeserializeOwned>(input: &Value) -> Result<(), Misfit> {
+    serde_path_to_error::deserialize::<_, T>(input).map(|_| ()).map_err(|e| Misfit::of(e.path(), &e.inner().to_string()))
+}
+
+// A number or a string: a goal by its place (from 1) or its id; a time as unix ms or RFC 3339.
+// (Not a doc comment: it would be the description of each field of this type.)
+#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum NumberOrText {
+    Number(i64),
+    Text(String),
+}
+
+/// An input that doesn't fit its operation's type: where (a JSON Pointer, `/goals/0/needs`; empty
+/// for the whole) and why, as serde says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Misfit {
+    pub path: String,
+    pub why: String,
+}
+
+impl Misfit {
+    fn of(path: &serde_path_to_error::Path, why: &str) -> Misfit {
+        use serde_path_to_error::Segment;
+        let mut at = String::new();
+        for s in path.iter() {
+            let part = match s {
+                Segment::Seq { index } => index.to_string(),
+                Segment::Map { key } => key.replace('~', "~0").replace('/', "~1"),
+                Segment::Enum { variant } => variant.clone(),
+                Segment::Unknown => continue,
+            };
+            at.push('/');
+            at.push_str(&part);
+        }
+        Misfit { path: at, why: why.to_owned() }
+    }
+
+    /// What kind of misfit it is, for the model to correct it: `unknown_field`, `missing_field`,
+    /// `invalid_type`, `invalid_value` or `invalid_input`.
+    pub fn code(&self) -> &'static str {
+        let w = self.why.as_str();
+        if w.starts_with("unknown field") {
+            "unknown_field"
+        } else if w.starts_with("missing field") {
+            "missing_field"
+        } else if w.starts_with("invalid type") {
+            "invalid_type"
+        } else if w.starts_with("invalid value") || w.starts_with("unknown variant") || w.starts_with("invalid length") {
+            "invalid_value"
+        } else {
+            "invalid_input"
+        }
+    }
+
+    /// It in words, for operation `name`: `goals.add doesn't take this input: unknown field
+    /// `golas`, expected … (at /golas)`.
+    pub fn said(&self, name: &str) -> String {
+        if self.path.is_empty() { format!("{name} doesn't take this input: {}", self.why) } else { format!("{name} doesn't take this input: {} (at {})", self.why, self.path) }
+    }
+
+    /// Its why as the refusal is noted (`crate::wire::unread`): without the values that came.
+    pub fn noted(&self) -> String {
+        let why = crate::wire::payload::without_values(&self.why);
+        if self.path.is_empty() { why } else { format!("{why} (at {})", self.path) }
+    }
+
+    /// A tool's structured answer for it: what went wrong, its code, where and why.
+    pub fn answer(&self, name: &str) -> Value {
+        json!({"error": self.said(name), "code": self.code(), "path": self.path, "why": self.why})
+    }
+}
+
+/// Why `input` doesn't fit operation `name` as `caller` gives it (an agent's own id where it left
+/// `agent` out, [`YOURS`]): kiln's own operations' inputs are read as their types; none for
+/// another's (CI's, deployments').
+pub fn misfit(caller: &Caller, name: &str, input: &Value) -> Option<Misfit> {
+    let op = own().iter().find(|o| o.name == name)?;
+    let input = yours(caller, name, if input.is_null() { json!({}) } else { input.clone() });
+    op.input.fits(&input).err()
 }
 
 /// A string field of an input, required.
@@ -106,7 +308,7 @@ pub fn listed(cd: bool) -> Vec<Info> {
         out.extend(crate::deploy::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
     }
     out.extend(crate::ci::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
-    out.extend(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
+    out.extend(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input.schema_fn() }));
     out
 }
 
@@ -142,6 +344,9 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
         let run = async {
             let s: Vec<&str> = segs.iter().map(String::as_str).collect();
             crate::authz::gate::check(&cx.hub, &cx.caller, &method, &s, &Default::default()).await?;
+            // Read as its type, once its caller may run it: what doesn't fit is refused, saying
+            // where and why.
+            op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
             (op.run)(cx.clone(), input).await
         };
         if op.read_only {
@@ -217,7 +422,7 @@ mod tests {
             };
             assert_eq!(rule.capability, needs, "{}", op.name);
             assert_eq!(op.read_only, method == Method::GET, "{}: read-only exactly when its route reads", op.name);
-            assert!((op.input)().get("type").is_some(), "{}", op.name);
+            assert!(op.input.schema().get("type").is_some(), "{}", op.name);
         }
         // Listed whether deployments are on or not.
         assert!(listed(false).iter().any(|o| o.name == "agents.wait"));
@@ -232,7 +437,7 @@ mod tests {
     fn a_keyed_operation_tells_its_caller_to_pass_its_key() {
         let mut keyed = Vec::new();
         for op in own() {
-            let input = (op.input)();
+            let input = op.input.schema();
             for field in ["key", "try"] {
                 let Some(said) = input.pointer(&format!("/properties/{field}/description")).and_then(Value::as_str) else { continue };
                 keyed.push(op.name);

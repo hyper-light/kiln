@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use crate::authz::{Caller, Rights, Scope};
 use crate::hub::Hub;
-use crate::ops::{Cx, Fail, Op, Out, path, schema};
+use crate::ops::{Cx, Fail, Input, Op, Out, path};
 use crate::store::Repo;
 
 /// What wakes an attachment.
@@ -1529,8 +1529,6 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
 
 // ------------------------------------------------------------------ operations
 
-const ATTACHMENT: &str = "An attachment's id or name.";
-
 fn bad(m: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, m.into())
 }
@@ -1746,24 +1744,6 @@ fn key_of(v: &Value, k: &str) -> Result<String, Fail> {
     crate::ops::text(v, k)
 }
 
-/// An attachment's fields, as operations take them.
-fn attachment_schema() -> Value {
-    json!({
-            "name": {"type": "string", "description": "What people and @mentions call it: letters, digits and -."},
-            "on": {"type": "string", "description": "What it looks after: repo:<owner>/<repo>, workflow:<owner>/<repo>:<path>, environment:<owner>/<repo>:<env>, pool:<name>, runner:<name>, or runners."},
-            "branches": {"type": "array", "items": {"type": "string"}, "description": "Only runs on these branches wake it (none: any)."},
-            "harness": {"type": "object", "description": "The agent kiln starts for each incident: {kind, on?, cwd?, model?, effort?, mode?} (on and cwd: the machine and the checkout it works in).", "properties": {"kind": {"type": "string"}, "on": {"type": "string"}, "cwd": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}, "mode": {"type": "string"}}},
-            "session": {"type": "string", "description": "Or a live agent's id, told of each incident instead."},
-            "wake": {"type": "array", "items": {"type": "string", "enum": WAKES}, "description": "What wakes it: failure, ejected, flaky, stuck, slow, unroutable, degraded, schedule, mention; on runners: offline, upgrade, check."},
-            "schedule": {"type": "string", "description": "Five-field cron (UTC), for wake: schedule."},
-            "can": {"type": "array", "items": {"type": "string", "enum": CAN}, "description": "What its agent may do (W20-R09); kiln refuses it the rest."},
-            "limits": {"type": "object", "properties": {"sessions_per_day": {"type": "integer"}, "reruns_per_failure": {"type": "integer"}, "stuck_minutes": {"type": "integer"}, "slow_percent": {"type": "integer"}, "tokens_per_day": {"type": "integer"}, "runner_minutes_per_day": {"type": "integer"}}},
-            "playbook": {"type": "string", "description": "What its agent does when it wakes."},
-            "reviewers": {"type": "array", "items": {"type": "string"}},
-            "paused": {"type": "boolean"}
-    })
-}
-
 /// Attachments' and incidents' operations (kiln's own: `attachments.*`, `incidents.*`).
 pub fn list_ops() -> Vec<Op> {
     vec![
@@ -1772,7 +1752,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Agents attached to what they look after (repositories, workflows, environments, runner pools, runners): what wakes each, what it may do, its open incidents and today's count against its limit. `on` keeps those on one thing (a repository's include its workflows' and environments').",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"on": {"type": "string"}}), &[]),
+            input: Input::of::<input::AttachmentsList>(),
             route: |_| Ok((Method::GET, path(&["api", "attachments"]))),
             run: |cx, v| Box::pin(list(cx, v)),
         },
@@ -1781,7 +1761,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "One attachment: everything it says, the grants its agents get, and its incidents.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"attachment": {"type": "string", "description": ATTACHMENT}}), &["attachment"]),
+            input: Input::of::<input::AttachmentsGet>(),
             route: |v| Ok((Method::GET, path(&["api", "attachments", &key_of(v, "attachment")?]))),
             run: |cx, v| Box::pin(get_one(cx, v)),
         },
@@ -1790,13 +1770,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Attach an agent to what it looks after, or change an attachment (`attachment`: its id or name). Its agents act for you, with no more than `can` gives them on what it looks after; needs `agents.attach` there.",
             read_only: false,
             destructive: false,
-            input: || {
-                let mut props = attachment_schema();
-                if let Some(o) = props.as_object_mut() {
-                    o.insert("attachment".into(), json!({"type": "string", "description": "To change one: its id or name."}));
-                }
-                schema(props, &["name", "on"])
-            },
+            input: Input::of::<input::AttachmentsSave>(),
             route: |v| {
                 Ok(match v.get("attachment").and_then(Value::as_str) {
                     Some(k) => (Method::PUT, path(&["api", "attachments", k])),
@@ -1810,7 +1784,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Detach an agent: nothing wakes it any more (its incidents stay).",
             read_only: false,
             destructive: true,
-            input: || schema(json!({"attachment": {"type": "string", "description": ATTACHMENT}}), &["attachment"]),
+            input: Input::of::<input::AttachmentsRemove>(),
             route: |v| Ok((Method::DELETE, path(&["api", "attachments", &key_of(v, "attachment")?]))),
             run: |cx, v| Box::pin(remove(cx, v)),
         },
@@ -1819,7 +1793,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Pause (or with `paused: false`, resume) one attachment, or everything attached to `on`: a repository's switch pauses its workflows' and environments' too. While paused, what would wake it waits as an incident for a person.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"attachment": {"type": "string", "description": ATTACHMENT}, "on": {"type": "string"}, "paused": {"type": "boolean"}}), &[]),
+            input: Input::of::<input::AttachmentsPause>(),
             route: |_| Ok((Method::POST, path(&["api", "attachments", "pause"]))),
             run: |cx, v| Box::pin(pause(cx, v)),
         },
@@ -1828,7 +1802,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "What woke attached agents, newest first: each incident's title, state (open, reported, resolved, waiting, dismissed), its agent, its class and report. `state` and `attachment` filter.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"state": {"type": "string"}, "attachment": {"type": "string"}, "run": {"type": "string", "description": "A run's incidents: those it happened in."}, "limit": {"type": "integer"}}), &[]),
+            input: Input::of::<input::IncidentsList>(),
             route: |_| Ok((Method::GET, path(&["api", "incidents"]))),
             run: |cx, v| Box::pin(incidents_list(cx, v)),
         },
@@ -1837,7 +1811,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "One incident, with the bundle its agent was given and each time it happened.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"incident": {"type": "string"}}), &["incident"]),
+            input: Input::of::<input::IncidentsGet>(),
             route: |v| Ok((Method::GET, path(&["api", "incidents", &key_of(v, "incident")?]))),
             run: |cx, v| Box::pin(incident_get(cx, v)),
         },
@@ -1846,16 +1820,136 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Say what an incident was and what was done (its agent, or a person): `class` (flaky, infrastructure, regression, pipeline, dependency, other), `summary`, `links` (diffs opened, runs), `state` (reported, the default; resolved; dismissed, a person's only).",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({"incident": {"type": "string"}, "class": {"type": "string", "enum": CLASSES}, "summary": {"type": "string"}, "links": {"type": "array", "items": {"type": "string"}}, "state": {"type": "string", "enum": ["reported", "resolved", "dismissed", "open"]}}),
-                    &["incident"],
-                )
-            },
+            input: Input::of::<input::IncidentsReport>(),
             route: |v| Ok((Method::POST, path(&["api", "incidents", &key_of(v, "incident")?, "report"]))),
             run: |cx, v| Box::pin(report(cx, v)),
         },
     ]
+}
+
+/// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
+/// its type, each field's description from its doc comment.
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AttachmentsList {
+        pub on: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AttachmentsGet {
+        /// An attachment's id or name.
+        pub attachment: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct AttachmentsSaveHarness {
+        pub kind: Option<String>,
+        pub on: Option<String>,
+        pub cwd: Option<String>,
+        pub model: Option<String>,
+        pub effort: Option<String>,
+        pub mode: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct AttachmentsSaveLimits {
+        pub sessions_per_day: Option<i64>,
+        pub reruns_per_failure: Option<i64>,
+        pub stuck_minutes: Option<i64>,
+        pub slow_percent: Option<i64>,
+        pub tokens_per_day: Option<i64>,
+        pub runner_minutes_per_day: Option<i64>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AttachmentsSave {
+        /// What people and @mentions call it: letters, digits and -.
+        pub name: String,
+        /// What it looks after: repo:<owner>/<repo>, workflow:<owner>/<repo>:<path>,
+        /// environment:<owner>/<repo>:<env>, pool:<name>, runner:<name>, or runners.
+        pub on: String,
+        /// Only runs on these branches wake it (none: any).
+        pub branches: Option<Vec<String>>,
+        /// The agent kiln starts for each incident: {kind, on?, cwd?, model?, effort?, mode?} (on
+        /// and cwd: the machine and the checkout it works in).
+        pub harness: Option<AttachmentsSaveHarness>,
+        /// Or a live agent's id, told of each incident instead.
+        pub session: Option<String>,
+        /// What wakes it: failure, ejected, flaky, stuck, slow, unroutable, degraded, schedule,
+        /// mention; on runners: offline, upgrade, check.
+        #[schemars(extend("items" = {"type": "string", "enum": super::WAKES}))]
+        pub wake: Option<Vec<String>>,
+        /// Five-field cron (UTC), for wake: schedule.
+        pub schedule: Option<String>,
+        /// What its agent may do (W20-R09); kiln refuses it the rest.
+        #[schemars(extend("items" = {"type": "string", "enum": super::CAN}))]
+        pub can: Option<Vec<String>>,
+        pub limits: Option<AttachmentsSaveLimits>,
+        /// What its agent does when it wakes.
+        pub playbook: Option<String>,
+        pub reviewers: Option<Vec<String>>,
+        pub paused: Option<bool>,
+        /// To change one: its id or name.
+        pub attachment: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AttachmentsRemove {
+        /// An attachment's id or name.
+        pub attachment: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AttachmentsPause {
+        /// An attachment's id or name.
+        pub attachment: Option<String>,
+        pub on: Option<String>,
+        pub paused: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct IncidentsList {
+        pub state: Option<String>,
+        pub attachment: Option<String>,
+        /// A run's incidents: those it happened in.
+        pub run: Option<String>,
+        pub limit: Option<i64>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct IncidentsGet {
+        pub incident: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum IncidentsReportState {
+        Reported,
+        Resolved,
+        Dismissed,
+        Open,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct IncidentsReport {
+        pub incident: String,
+        #[schemars(extend("enum" = super::CLASSES))]
+        pub class: Option<String>,
+        pub summary: Option<String>,
+        pub links: Option<Vec<String>>,
+        pub state: Option<IncidentsReportState>,
+    }
 }
 
 #[cfg(test)]

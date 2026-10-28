@@ -101,7 +101,8 @@ pub enum Wire {
     TunnelDown,
     /// kiln's MCP endpoint, over HTTP.
     McpHttp,
-    /// kiln's MCP calls a runner makes through reach.
+    /// What an agent sends its runner's own MCP server (`kiln reach mcp`), which calls kiln's
+    /// operations through reach.
     McpReach,
 }
 
