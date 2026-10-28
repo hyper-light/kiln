@@ -94,7 +94,7 @@ test("w26_r14: Ship's stages as the Lanes' groups, a lane for each Checks leg th
     groups.map((g) => g.group),
     ["land", "checks", "build", "staging", "production", "replant"],
   );
-  assert.deepEqual(groups[1]?.lanes, [{ id: "j1", name: "lint", state: "passed", start: 100, end: 160 }]);
+  assert.deepEqual(groups[1]?.lanes, [{ id: "ci/lint", name: "lint", state: "passed", start: 100, end: 160 }]);
   assert.equal(groups[1]?.state, "passed");
   assert.deepEqual(groups[3]?.lanes, [{ id: "staging@200", name: "staging", state: "passed", start: 200, end: 200, note: "synced" }]);
   assert.equal(groups[3]?.state, "soaking");

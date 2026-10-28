@@ -223,7 +223,8 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
   const pip = (stage: Stage) => detail.pips.find((p) => p.stage === stage)?.state ?? "none";
   const legs: ShipLane[] = (detail.checks ?? []).flatMap((c) =>
     c.legs.flatMap((l) =>
-      l.start === undefined ? [] : [{ id: l.job ?? `${c.pipeline}/${l.name}`, name: l.name, state: l.state, start: l.start, end: l.end ?? null, ...(l.note ? { note: l.note } : {}) }],
+      // Keyed by the leg, not its job: a leg tried again keeps its lane (opened commit's step 3).
+      l.start === undefined ? [] : [{ id: `${c.pipeline}/${l.name}`, name: l.name, state: l.state, start: l.start, end: l.end ?? null, ...(l.note ? { note: l.note } : {}) }],
     ),
   );
   const deploys = (production: boolean): ShipLane[] =>
