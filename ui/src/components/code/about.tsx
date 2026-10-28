@@ -7,9 +7,11 @@
  * what's worth knowing, and its answer streams into the card. Closing the card ends the helper:
  * an answer isn't kept (and kiln ends a helper no card reads: `crates/kiln/src/harness/about.rs`).
  * With subagents off the agent answers itself, and its answer streams into the card from its
- * conversation.
+ * conversation. The card is a band across the code, ruled above and below; it slides open and
+ * shut, and nothing under it jumps while it works (its answer's room is kept from the start).
  */
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { harnessApi, useSession, type AgentResult, type HEvent, type SessionStore } from "@/api/harness";
 import "./about.css";
 
@@ -146,12 +148,51 @@ function Text({ text }: { text: string }) {
   });
 }
 
-/** An answer's parts as they come; while it's `waiting`, each one not come yet holds its shape (the card's loading view). */
-function Parts({ text, waiting }: { text: string; waiting: boolean }) {
+/**
+ * The cards a surface holds: the one open, and those closing, each sliding shut before it goes.
+ * `update` changes the open card (to none: closes it), and the card it replaces slides shut; a
+ * card's `key` is its own (`cardKey`), so a card opened again where one is closing is a new one.
+ */
+export function useCards<T extends { key: string }>() {
+  const [s, setS] = React.useState<{ open: T | null; closing: T[] }>({ open: null, closing: [] });
+  const update = React.useCallback(
+    (f: (open: T | null) => T | null) =>
+      setS((s) => {
+        const open = f(s.open);
+        if (open === s.open) return s;
+        const closing = s.open && s.open.key !== open?.key ? [...s.closing, s.open] : s.closing;
+        return { open, closing: closing.filter((c) => c.key !== open?.key) };
+      }),
+    [],
+  );
+  const gone = React.useCallback((key: string) => setS((s) => ({ ...s, closing: s.closing.filter((c) => c.key !== key) })), []);
+  return { open: s.open, closing: s.closing, update, gone };
+}
+
+let cards = 0;
+/** A new card's key: `base` says where it is, the count makes it this card alone. */
+export const cardKey = (base: string) => `${base}#${++cards}`;
+
+/** A part of the card that slides open and shut (its height from nothing and back), so what's under it moves smoothly. Shut, it's out of reach. */
+function Fold({ open, children }: { open: boolean; children: React.ReactNode }) {
+  return (
+    <div className="hx-about-fold" data-open={open || undefined} inert={!open}>
+      <div className="hx-about-clip">{children}</div>
+    </div>
+  );
+}
+
+/**
+ * Where an answer goes, its height kept from the moment it's asked for (its loading view: what's
+ * reading, then each part's shape until the part comes), so nothing under the card moves while it
+ * comes: a longer answer scrolls in it. `lead` comes first in it (the question, what it's reading).
+ */
+function Parts({ text, waiting, lead }: { text: string; waiting: boolean; lead?: React.ReactNode }) {
   const parts = partsOf(text);
   const headed = parts.some((x, j) => j > 0 && x);
   return (
     <div className="hx-about-answer" aria-live="polite" aria-busy={waiting}>
+      {lead}
       {parts.map((p, i) =>
         p ? (
           <section key={i} className="hx-about-part">
@@ -170,10 +211,22 @@ function Parts({ text, waiting }: { text: string; waiting: boolean }) {
   );
 }
 
+/** Under the answer: how it stands, and what can be done (stop it, ask a follow-up), in a row that keeps its height. */
+function Foot({ meta, children }: { meta: React.ReactNode; children?: React.ReactNode }) {
+  return (
+    <div className="hx-about-foot">
+      <span className="hx-about-meta">{meta}</span>
+      {children}
+    </div>
+  );
+}
+
+const Question = ({ q }: { q?: string }) => (q ? <p className="hx-about-q">“{q}”</p> : null);
+
 const errorOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** The helper's answer, read as it comes: what it's reading, then each part in its place. */
-function Answer({ child, onDone }: { child: string; onDone: () => void }) {
+function Answer({ child, question, onDone, onFollowUp }: { child: string; question?: string; onDone: () => void; onFollowUp: () => void }) {
   const [r, setR] = React.useState<AgentResult | null>(null);
   const [trail, setTrail] = React.useState<string[]>([]);
   const [failed, setFailed] = React.useState<string | null>(null);
@@ -216,18 +269,26 @@ function Answer({ child, onDone }: { child: string; onDone: () => void }) {
   const secs = Math.max(0, Math.round((Date.now() - started.current) / 1000));
   return (
     <div ref={follow}>
-      {waiting && trail.length > 0 && (
-        <ul className="hx-about-trail">
-          {trail.map((t, i) => (
-            <li key={i}>{t}</li>
-          ))}
-        </ul>
-      )}
-      <Parts text={r?.reply?.text ?? ""} waiting={waiting} />
-      {failed && <p className="hx-about-note">Couldn&apos;t read its answer: {failed}</p>}
-      <div className="hx-about-foot">
-        <span className="hx-about-meta">
-          {failed
+      <Parts
+        text={r?.reply?.text ?? ""}
+        waiting={waiting}
+        lead={
+          <>
+            <Question q={question} />
+            {waiting && trail.length > 0 && (
+              <ul className="hx-about-trail">
+                {trail.map((t, i) => (
+                  <li key={i}>{t}</li>
+                ))}
+              </ul>
+            )}
+            {failed && <p className="hx-about-note">Couldn&apos;t read its answer: {failed}</p>}
+          </>
+        }
+      />
+      <Foot
+        meta={
+          failed
             ? ""
             : stopped
               ? "Stopped. What it found so far stays."
@@ -235,20 +296,25 @@ function Answer({ child, onDone }: { child: string; onDone: () => void }) {
                 ? `Answered in ${secs}s${r?.agent.model ? ` · ${r.agent.model}` : ""}${r?.cost_usd ? ` · $${r.cost_usd.toFixed(2)}` : ""}`
                 : r?.reply?.text
                   ? "Answering…"
-                  : "Reading…"}
-        </span>
-        {waiting && (
+                  : "Reading…"
+        }
+      >
+        {waiting ? (
           <button type="button" className="hx-about-btn" onClick={stop}>
             Stop
           </button>
+        ) : (
+          <button type="button" className="hx-about-btn" onClick={onFollowUp}>
+            Ask a follow-up
+          </button>
         )}
-      </div>
+      </Foot>
     </div>
   );
 }
 
 /** The agent's own answer, read from its conversation as it says it: after its turn, or between its steps. */
-function ItselfAnswer({ store, message, now, onDone }: { store: SessionStore; message: string; now: boolean; onDone: () => void }) {
+function ItselfAnswer({ store, message, now, question, onDone, onFollowUp }: { store: SessionStore; message: string; now: boolean; question?: string; onDone: () => void; onFollowUp: () => void }) {
   const text = useSession(store, (s) => replyTo(s.events, message));
   const idle = useSession(store, (s) => s.state?.turn_started == null);
   const done = !!text && idle;
@@ -256,35 +322,63 @@ function ItselfAnswer({ store, message, now, onDone }: { store: SessionStore; me
   const told = React.useCallback((el: HTMLSpanElement | null) => void (el && onDone()), [onDone]);
   return (
     <div>
-      {text === null && <p className="hx-about-note">{now ? "It answers between its next steps." : "It answers when this turn ends."}</p>}
-      <Parts text={text ?? ""} waiting={!done} />
-      <div className="hx-about-foot">
-        <span className="hx-about-meta">{done ? <span ref={told}>Answered in its conversation</span> : text ? "Answering…" : "Waiting for it…"}</span>
-      </div>
+      <Parts
+        text={text ?? ""}
+        waiting={!done}
+        lead={
+          <>
+            <Question q={question} />
+            {text === null && <p className="hx-about-note">{now ? "It answers between its next steps." : "It answers when this turn ends."}</p>}
+          </>
+        }
+      />
+      <Foot meta={done ? <span ref={told}>Answered in its conversation</span> : text ? "Answering…" : "Waiting for it…"}>
+        {done && (
+          <button type="button" className="hx-about-btn" onClick={onFollowUp}>
+            Ask a follow-up
+          </button>
+        )}
+      </Foot>
     </div>
   );
 }
 
 type Step =
   | { at: "menu" }
-  | { at: "choose"; question?: string }
-  | { at: "starting" }
+  | { at: "choose" }
+  | { at: "starting"; question?: string }
   | { at: "answer"; child: string; name: string; question?: string; done?: boolean }
   | { at: "itself"; now: boolean; message?: string; question?: string; done?: boolean }
-  | { at: "error"; why: string };
+  | { at: "error"; why: string; question?: string };
 
-/** The card under a tapped line: what was tapped, and asking about it. */
-export function AboutCard({ ask, onClose }: { ask: Asked; onClose: () => void }) {
+/**
+ * The card under a tapped line: what was tapped, and asking about it. It slides open as it comes
+ * and, `closing`, slides shut, then says it's `onGone`; each step of it (asking, choosing when,
+ * the answer) slides in as the one before slides out, and the answer's room is kept from the
+ * moment it's asked for, so nothing under the card jumps.
+ */
+export function AboutCard({ ask, onClose, closing = false, onGone }: { ask: Asked; onClose: () => void; closing?: boolean; onGone?: () => void }) {
   const agent = React.useContext(AboutContext);
   const [step, setStep] = React.useState<Step>({ at: "menu" });
   const [question, setQuestion] = React.useState<string | null>(null);
+  const [pending, setPending] = React.useState<string | undefined>(undefined);
   const [copied, setCopied] = React.useState(false);
+  const input = React.useRef<HTMLInputElement | null>(null);
   const onDone = React.useCallback(() => setStep((s) => (s.at === "answer" || s.at === "itself" ? { ...s, done: true } : s)), []);
+  // Shut, it goes when its slide ends; or soon after, when nothing slides (motion reduced, or out of sight).
+  const gone = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el || !onGone) return;
+      const t = window.setTimeout(onGone, 450);
+      return () => window.clearTimeout(t);
+    },
+    [onGone],
+  );
   if (!agent) return null;
   const name = agent.name || "The agent";
   const go = async (o: { question?: string; now?: boolean }) => {
     setQuestion(null);
-    setStep({ at: "starting" });
+    setStep({ at: "starting", question: o.question });
     try {
       const r = await harnessApi.about(agent.id, { path: ask.path, code: ask.code, line: ask.line, end_line: ask.end, selection: ask.selection, change: ask.change, question: o.question, now: o.now });
       const child = r.agents[0];
@@ -293,135 +387,160 @@ export function AboutCard({ ask, onClose }: { ask: Asked; onClose: () => void })
           ? { at: "itself", now: !!o.now, message: r.sent?.message, question: o.question }
           : child
             ? { at: "answer", child: child.id, name: child.name, question: o.question }
-            : { at: "error", why: "No helper started." },
+            : { at: "error", why: "No helper started.", question: o.question },
       );
     } catch (e) {
-      setStep({ at: "error", why: errorOf(e) });
+      setStep({ at: "error", why: errorOf(e), question: o.question });
     }
   };
-  const about = (q?: string) => (!agent.subagents && agent.busy ? setStep({ at: "choose", question: q }) : void go({ question: q }));
-  const asking = (
-    <form
-      className="hx-about-ask"
-      onSubmit={(e) => {
-        e.preventDefault();
-        const q = String(new FormData(e.currentTarget).get("q") ?? "").trim();
-        if (q) about(q);
-      }}
-    >
-      <input name="q" autoFocus aria-label="Your question" placeholder={step.at === "menu" ? `Ask about ${ask.label}` : "Ask a follow-up"} />
-      <button type="submit" className="hx-about-btn" data-primary>
-        Ask
-      </button>
-    </form>
-  );
-  const followUp =
-    question !== null ? (
-      asking
-    ) : (
-      <div className="hx-about-acts">
-        <button type="button" className="hx-about-btn" onClick={() => setQuestion("")}>
-          Ask a follow-up
-        </button>
-      </div>
-    );
+  const about = (q?: string) => {
+    if (!agent.subagents && agent.busy) {
+      setPending(q);
+      setQuestion(null);
+      setStep({ at: "choose" });
+    } else void go({ question: q });
+  };
+  // The question field slides open under the card and takes the keys at once.
+  const askOpen = () => {
+    flushSync(() => setQuestion(""));
+    input.current?.focus({ preventScroll: true });
+  };
+  const answering = step.at === "starting" || step.at === "answer" || step.at === "itself" || step.at === "error";
+  const done = (step.at === "answer" || step.at === "itself") && !!step.done;
   const lines = !ask.selection && !ask.change;
   return (
-    <div className="hx-about" role="region" aria-label={`About ${ask.label}`} onKeyDown={(e) => e.key === "Escape" && onClose()} onClick={(e) => e.stopPropagation()}>
-      <div className="hx-about-head">
-        <code className="hx-about-subject">{ask.label}</code>
-        <span className="hx-about-where">{ask.where}</span>
-        <button type="button" className="hx-about-x" aria-label="Close" onClick={onClose}>
-          ×
-        </button>
-      </div>
-      {step.at === "menu" && (
-        <>
-          <div className="hx-about-acts">
-            <button type="button" className="hx-about-btn" data-primary autoFocus onClick={() => about()}>
-              About
+    <div
+      className="hx-about-card"
+      data-closing={closing || undefined}
+      inert={closing}
+      ref={closing ? gone : undefined}
+      onTransitionEnd={(e) => {
+        if (closing && e.target === e.currentTarget && e.propertyName === "grid-template-rows") onGone?.();
+      }}
+    >
+      <div className="hx-about-clip">
+        <div className="hx-about" role="region" aria-label={`About ${ask.label}`} onKeyDown={(e) => e.key === "Escape" && onClose()} onClick={(e) => e.stopPropagation()}>
+          <div className="hx-about-head">
+            <code className="hx-about-subject">{ask.label}</code>
+            <span className="hx-about-where">{ask.where}</span>
+            <button type="button" className="hx-about-x" aria-label="Close" onClick={onClose}>
+              ×
             </button>
-            <button type="button" className="hx-about-btn" onClick={() => setQuestion("")}>
-              Ask…
-            </button>
-            <button
-              type="button"
-              className="hx-about-btn"
-              onClick={() => {
-                void navigator.clipboard?.writeText(ask.selection ?? ask.code).then(() => setCopied(true));
+          </div>
+          <Fold open={step.at === "menu"}>
+            <div className="hx-about-acts">
+              <button type="button" className="hx-about-btn" data-primary autoFocus onClick={() => about()}>
+                About
+              </button>
+              <button type="button" className="hx-about-btn" onClick={askOpen}>
+                Ask…
+              </button>
+              <button
+                type="button"
+                className="hx-about-btn"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(ask.selection ?? ask.code).then(() => setCopied(true));
+                }}
+              >
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <p className="hx-about-note">
+              {agent.subagents ? `A helper of ${name}'s reads the repository to answer, changing nothing.` : `Subagents are off for ${name}: it answers itself.`}
+              {lines && " Tap another line to take in the lines between."}
+            </p>
+          </Fold>
+          <Fold open={step.at === "choose"}>
+            <div className="hx-about-choose">
+              <p>
+                <b>{name}</b> is in the middle of a turn.
+              </p>
+              <div className="hx-about-acts">
+                <button type="button" className="hx-about-btn" data-primary onClick={() => void go({ question: pending, now: true })}>
+                  Ask now
+                </button>
+                <button type="button" className="hx-about-btn" onClick={() => void go({ question: pending })}>
+                  After this turn
+                </button>
+              </div>
+              <p className="hx-about-note">Now: it answers between its next steps, then carries on. After: when this turn ends.</p>
+            </div>
+          </Fold>
+          <Fold open={answering}>
+            {answering && (
+              <>
+                <div className="hx-about-who">
+                  <i className="hx-about-dot" data-done={done || undefined} data-failed={step.at === "error" || undefined} />
+                  <span>
+                    {step.at === "answer" ? (
+                      <>
+                        <b>{step.name}</b> · a helper of {name}&apos;s
+                      </>
+                    ) : step.at === "itself" ? (
+                      <>
+                        <b>{name}</b> · answering itself
+                      </>
+                    ) : step.at === "error" ? (
+                      "Couldn't ask"
+                    ) : (
+                      "Asking…"
+                    )}
+                  </span>
+                </div>
+                {step.at === "answer" ? (
+                  <Answer key={step.child} child={step.child} question={step.question} onDone={onDone} onFollowUp={askOpen} />
+                ) : step.at === "itself" && step.message && agent.store ? (
+                  <ItselfAnswer key={step.message} store={agent.store} message={step.message} now={step.now} question={step.question} onDone={onDone} onFollowUp={askOpen} />
+                ) : step.at === "itself" ? (
+                  <>
+                    <Parts
+                      text=""
+                      waiting={false}
+                      lead={
+                        <p className="hx-about-said">
+                          Asked {name} itself: its answer comes in its conversation, {step.now ? "between its next steps" : "when this turn ends"}.
+                        </p>
+                      }
+                    />
+                    <Foot meta="" />
+                  </>
+                ) : step.at === "error" ? (
+                  <>
+                    <Parts text="" waiting={false} lead={<p className="hx-about-note">Couldn&apos;t ask: {step.why}</p>} />
+                    <Foot meta="">
+                      <button type="button" className="hx-about-btn" onClick={() => about(step.question)}>
+                        Try again
+                      </button>
+                    </Foot>
+                  </>
+                ) : (
+                  <>
+                    <Parts text="" waiting lead={<Question q={step.question} />} />
+                    <Foot meta="Asking…" />
+                  </>
+                )}
+              </>
+            )}
+          </Fold>
+          <Fold open={question !== null && (step.at === "menu" || step.at === "answer" || step.at === "itself")}>
+            <form
+              className="hx-about-ask"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const q = String(new FormData(e.currentTarget).get("q") ?? "").trim();
+                if (!q) return;
+                e.currentTarget.reset();
+                about(q);
               }}
             >
-              {copied ? "Copied" : "Copy"}
-            </button>
-          </div>
-          {question !== null && asking}
-          <p className="hx-about-note">
-            {agent.subagents ? `A helper of ${name}'s reads the repository to answer, changing nothing.` : `Subagents are off for ${name}: it answers itself.`}
-            {lines && " Tap another line to take in the lines between."}
-          </p>
-        </>
-      )}
-      {step.at === "choose" && (
-        <div className="hx-about-choose">
-          <p>
-            <b>{name}</b> is in the middle of a turn.
-          </p>
-          <div className="hx-about-acts">
-            <button type="button" className="hx-about-btn" data-primary onClick={() => void go({ question: step.question, now: true })}>
-              Ask now
-            </button>
-            <button type="button" className="hx-about-btn" onClick={() => void go({ question: step.question })}>
-              After this turn
-            </button>
-          </div>
-          <p className="hx-about-note">Now: it answers between its next steps, then carries on. After: when this turn ends.</p>
+              <input ref={input} name="q" aria-label="Your question" placeholder={step.at === "menu" ? `Ask about ${ask.label}` : "Ask a follow-up"} />
+              <button type="submit" className="hx-about-btn" data-primary>
+                Ask
+              </button>
+            </form>
+          </Fold>
         </div>
-      )}
-      {(step.at === "starting" || step.at === "answer" || step.at === "itself") && (
-        <>
-          <div className="hx-about-who">
-            <i className="hx-about-dot" data-done={((step.at === "answer" || step.at === "itself") && step.done) || undefined} />
-            <span>
-              {step.at === "answer" ? (
-                <>
-                  <b>{step.name}</b> · a helper of {name}&apos;s
-                </>
-              ) : step.at === "itself" ? (
-                <>
-                  <b>{name}</b> · answering itself
-                </>
-              ) : (
-                "Asking…"
-              )}
-            </span>
-          </div>
-          {(step.at === "answer" || step.at === "itself") && step.question && <p className="hx-about-q">“{step.question}”</p>}
-          {step.at === "answer" ? (
-            <Answer key={step.child} child={step.child} onDone={onDone} />
-          ) : step.at === "itself" ? (
-            step.message && agent.store ? (
-              <ItselfAnswer key={step.message} store={agent.store} message={step.message} now={step.now} onDone={onDone} />
-            ) : (
-              <p className="hx-about-note hx-about-said">
-                Asked {name} itself: its answer comes in its conversation, {step.now ? "between its next steps" : "when this turn ends"}.
-              </p>
-            )
-          ) : (
-            <Parts text="" waiting />
-          )}
-          {(step.at === "answer" || step.at === "itself") && step.done && followUp}
-        </>
-      )}
-      {step.at === "error" && (
-        <div className="hx-about-choose">
-          <p className="hx-about-note">Couldn&apos;t ask: {step.why}</p>
-          <div className="hx-about-acts">
-            <button type="button" className="hx-about-btn" onClick={() => about()}>
-              Try again
-            </button>
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
