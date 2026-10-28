@@ -6,7 +6,7 @@
  */
 import * as React from "react";
 import { resolveLanguage, useHighlighter, type Tok } from "@/lib/syntax/browser";
-import { AboutCard, AboutContext, linesLabel, offsetAt, selecting, wordAt, type Asked } from "./about";
+import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "./about";
 import "./syntax.css";
 
 /** One line in its tokens' colours. */
@@ -45,11 +45,13 @@ export function Highlighted({ text, lang, path }: { text: string; lang?: string 
 
 /**
  * A fenced block's code in its language's colours. In an agent's conversation a name or a line in
- * it can be asked about (./about.tsx): the block opens at that line for the card.
+ * it can be asked about (./about.tsx): the block opens at that line for the card, its pieces cut
+ * flat where the card meets them, so opening adds only the card (sliding in), and closing only
+ * takes it away.
  */
 export function CodeBlock({ text, lang, className }: { text: string; lang?: string | null; className?: string }) {
   const about = React.useContext(AboutContext);
-  const [asked, setAsked] = React.useState<{ from: number; to: number; ask: Asked } | null>(null);
+  const cards = useCards<{ key: string; from: number; to: number; ask: Asked }>();
   const hl = useHighlighter(resolveLanguage(lang, null, text));
   const toks = React.useMemo(() => hl?.(text) ?? null, [hl, text]);
   const lines = text.split("\n");
@@ -70,7 +72,7 @@ export function CodeBlock({ text, lang, className }: { text: string; lang?: stri
           const n = from + before.split("\n").length - 1;
           const word = wordAt(lines[n] ?? "", off - (before.lastIndexOf("\n") + 1));
           const selection = word ? (lines[n] ?? "").slice(word.start, word.end) : undefined;
-          setAsked((prev) => {
+          cards.update((prev) => {
             let [lo, hi] = [n, n];
             // Another line, while lines are asked about: the lines between are taken in.
             if (!selection && prev && !prev.ask.selection && (n < prev.from || n > prev.to)) [lo, hi] = [Math.min(prev.from, n), Math.max(prev.to, n)];
@@ -86,21 +88,25 @@ export function CodeBlock({ text, lang, className }: { text: string; lang?: stri
               label,
               where: `the code block · ${linesLabel(lo + 1, hi + 1)}`,
             };
-            return { from: lo, to: hi, ask };
+            return { key: cardKey(`${lo}-${hi}`), from: lo, to: hi, ask };
           });
         }
       : undefined;
-  const pre = (from: number, to: number, key: string) => (
-    <pre key={key} className="hx-pre" data-lang={lang ?? undefined} onClick={tap(from)}>
+  const pre = (from: number, to: number, cut: string | undefined) => (
+    <pre key={`${from}-${to}`} className="hx-pre" data-lang={lang ?? undefined} data-cut={cut} onClick={tap(from)}>
       <code className={className}>{part(from, to)}</code>
     </pre>
   );
-  if (!asked) return pre(0, lines.length, "all");
-  return (
-    <>
-      {pre(0, asked.to + 1, "top")}
-      <AboutCard key={`${asked.ask.label}@${asked.from}`} ask={asked.ask} onClose={() => setAsked(null)} />
-      {asked.to + 1 < lines.length && pre(asked.to + 1, lines.length, "rest")}
-    </>
-  );
+  // The open card and those sliding shut, each after its last line.
+  const shown = [...cards.closing.map((c) => ({ c, closing: true })), ...(cards.open ? [{ c: cards.open, closing: false }] : [])].sort((a, b) => a.c.to - b.c.to);
+  const out: React.ReactNode[] = [];
+  let at = 0;
+  for (const { c, closing } of shown) {
+    const end = Math.min(lines.length, c.to + 1);
+    if (end > at) out.push(pre(at, end, at > 0 ? "start end" : "end"));
+    at = Math.max(at, end);
+    out.push(<AboutCard key={c.key} ask={c.ask} closing={closing} onClose={() => cards.update(() => null)} onGone={() => cards.gone(c.key)} />);
+  }
+  if (at < lines.length) out.push(pre(at, lines.length, at > 0 ? "start" : undefined));
+  return <div className="hx-codeblock">{out}</div>;
 }

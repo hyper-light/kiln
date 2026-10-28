@@ -20,11 +20,12 @@ import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
 import { relativeTime } from "@/lib/format";
-import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
+import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import { atOf, doingOf, findAgents } from "./broadcast";
+import { MODES, SendModes } from "./composer";
 import { useAttachments } from "./controls";
 import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
@@ -594,8 +595,6 @@ export function NewAgent({
   const [past, setPast] = React.useState(false);
   const [focused, setFocused] = React.useState(false);
   const [found, setFound] = React.useState(0);
-  const [inside, setInside] = React.useState(false);
-  const phone = useMediaQuery("(max-width: 640px)");
 
   /** Opens it as soon as its first snapshot is in (a moment at most), as one view transition. */
   const open = async (id: string) => {
@@ -715,19 +714,8 @@ export function NewAgent({
     setParams(n, { replace: true });
   };
 
-  // On a phone it's one line until it's used.
-  const quiet = phone && !inside && !text && files.length === 0 && !more && !past && !busy && !error && !result && !c.seed && c.open === null;
   return (
-    <section
-      ref={root}
-      className="ms-msg cp mc"
-      data-quiet={quiet || undefined}
-      aria-label="New agent"
-      onFocus={() => setInside(true)}
-      onBlur={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setInside(false);
-      }}
-    >
+    <section ref={root} className="ms-msg cp mc" aria-label="New agent">
       <React.Suspense fallback={<LineLoading />}>
         <HowLine c={c} />
       </React.Suspense>
@@ -754,7 +742,7 @@ export function NewAgent({
             value={text}
             disabled={busy}
             autoFocus={autoFocus}
-            placeholder={quiet ? "New agent: what should it do?" : c.count > 1 ? `What should these ${c.count} agents do? Each gets this message` : "What should it do?"}
+            placeholder={c.count > 1 ? `What should these ${c.count} agents do? Each gets this message` : "What should it do?"}
             aria-label="Its first message"
             enterKeyHint="send"
             autoCapitalize="sentences"
@@ -804,6 +792,12 @@ export function NewAgent({
               </button>
             </Tip>
             <MicButton field={field} setText={(t) => onText(t)} onNote={setNote} />
+            {/* The same bar as messaging agents, so nothing moves as the composer turns: a new agent takes its first message at once. */}
+            <Tip content="A new agent takes its first message at once: Queue, Steer and Now are for agents at work">
+              <fieldset className="mc-modes" disabled>
+                <SendModes modes={MODES} mode="queue" onMode={() => undefined} />
+              </fieldset>
+            </Tip>
             <span className="cp-gap" />
             <React.Suspense
               fallback={

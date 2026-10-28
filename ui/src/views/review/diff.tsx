@@ -15,7 +15,7 @@ import { reviewApi, whoSaid, type ChangedFile, type Thread } from "@/api/review"
 import { Button } from "@/components/ui/button";
 import { relativeTime } from "@/lib/format";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
-import { AboutCard, AboutContext, linesLabel, offsetAt, selecting, wordAt, type Asked } from "@/components/code/about";
+import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { hunkOf, type Line, type Seg, type Span } from "@/views/harness/diff";
 import { ignoringWhitespace, isImage, placeOf, type MovedTo, type PatchFile, type Place } from "./patch";
 import "@/components/code/syntax.css";
@@ -283,25 +283,42 @@ function Hunks({ p }: { p: FileProps }) {
   };
   // An agent's diff: a name or a line asked about opens a card under it (components/code/about.tsx).
   const about = React.useContext(AboutContext);
-  const [asked, setAsked] = React.useState<AskedLines | null>(null);
+  const cards = useCards<AskedLines>();
   const ask = about
     ? (side: Side, line: number | null, text: string, e: React.MouseEvent<HTMLElement>) => {
         if (line == null || selecting()) return;
         const off = offsetAt(e.currentTarget, e.clientX, e.clientY);
         const word = off === null ? null : wordAt(text, off);
         const selection = word ? text.slice(word.start, word.end) : undefined;
-        setAsked((prev) => {
+        cards.update((prev) => {
           let [from, to] = [line, line];
           // Another line, while lines of the same side are asked about: the lines between are taken in.
           if (!selection && prev && !prev.ask.selection && prev.side === side && (line < prev.from || line > prev.to)) [from, to] = [Math.min(prev.from, line), Math.max(prev.to, line)];
           else if (prev && prev.side === side && prev.from === line && prev.to === line && prev.ask.selection === selection) return null;
           const label = selection ?? linesLabel(from, to);
           const where = `${p.file.path.split("/").pop() ?? p.file.path} · ${side === "old" ? "old " : ""}${linesLabel(from, to)}`;
-          return { side, from, to, ask: { path: p.file.path, line: from, end: to > from ? to : undefined, selection, code: around(hunks, side, from, to), label, where } };
+          return {
+            key: cardKey(`${side}${from}-${to}`),
+            side,
+            from,
+            to,
+            ask: { path: p.file.path, line: from, end: to > from ? to : undefined, selection, code: around(hunks, side, from, to), label, where },
+          };
         });
       }
     : undefined;
-  const ctx: RowCtx = { p, pick, choose, byEnd, close: () => setPick(null), ask, asked, closeAsk: () => setAsked(null) };
+  const ctx: RowCtx = {
+    p,
+    pick,
+    choose,
+    byEnd,
+    close: () => setPick(null),
+    ask,
+    asked: cards.open,
+    cards: [...cards.closing.map((c) => ({ c, closing: true })), ...(cards.open ? [{ c: cards.open, closing: false }] : [])],
+    closeAsk: () => cards.update(() => null),
+    goneAsk: cards.gone,
+  };
   return (
     <div className="rv-hunks" data-split={p.split || undefined}>
       {models.map(({ m, tok }, hi) => {
@@ -413,11 +430,15 @@ interface RowCtx {
   /** Asking about a name or lines (an agent's diff only: components/code/about.tsx), what's asked about, and closing its card. */
   ask?: (side: Side, line: number | null, text: string, e: React.MouseEvent<HTMLElement>) => void;
   asked: AskedLines | null;
+  /** The open card and those sliding shut. */
+  cards: { c: AskedLines; closing: boolean }[];
   closeAsk: () => void;
+  goneAsk: (key: string) => void;
 }
 
 /** What a card under a line asks about: lines `from` to `to` of one side. */
 interface AskedLines {
+  key: string;
   side: Side;
   from: number;
   to: number;
@@ -466,21 +487,30 @@ function Num({ side, line, c }: { side: Side; line: number | null; c: RowCtx }) 
   );
 }
 
-/** What comes under a line: the composer of a comment picked to end there, and the threads that end there. */
+/**
+ * What comes under a line: a card asking about the lines ending there (a band of its own, sliding
+ * open and shut), the composer of a comment picked to end there, and the threads that end there.
+ */
 function Under({ side, line, c }: { side: Side; line: number | null; c: RowCtx }) {
   if (line == null) return null;
   const threads = c.byEnd.get(`${side}:${line}`) ?? [];
   const composing = c.pick != null && c.pick.side === side && c.pick.end === line;
-  const card = c.asked != null && c.asked.side === side && c.asked.to === line ? c.asked : null;
-  if (!composing && threads.length === 0 && !card) return null;
+  const cards = c.cards.filter(({ c: k }) => k.side === side && k.to === line);
+  if (!composing && threads.length === 0 && cards.length === 0) return null;
   return (
-    <div className="rv-under">
-      {card && <AboutCard key={`${card.ask.label}@${card.side}${card.from}`} ask={card.ask} onClose={c.closeAsk} />}
-      {threads.map((t) => (
-        <ThreadView key={t.id} t={t} onReply={c.p.onReply} onResolve={c.p.onResolve} now={c.p.now} />
+    <>
+      {cards.map(({ c: k, closing }) => (
+        <AboutCard key={k.key} ask={k.ask} closing={closing} onClose={c.closeAsk} onGone={() => c.goneAsk(k.key)} />
       ))}
-      {composing && c.pick && <NewComment pick={c.pick} onDone={c.close} onSend={c.p.onComment} now={c.p.now} />}
-    </div>
+      {(composing || threads.length > 0) && (
+        <div className="rv-under">
+          {threads.map((t) => (
+            <ThreadView key={t.id} t={t} onReply={c.p.onReply} onResolve={c.p.onResolve} now={c.p.now} />
+          ))}
+          {composing && c.pick && <NewComment pick={c.pick} onDone={c.close} onSend={c.p.onComment} now={c.p.now} />}
+        </div>
+      )}
+    </>
   );
 }
 

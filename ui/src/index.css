@@ -493,7 +493,8 @@ html.fills-window body {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .page-intro[data-compact] > div:last-child {
+  /* The actions, when there are any (without them the title's block is the last, and stays left). */
+  .page-intro[data-compact] > div:last-child:not(:first-child) {
     flex: none;
     flex-wrap: nowrap;
     gap: 4px;

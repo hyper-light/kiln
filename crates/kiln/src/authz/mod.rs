@@ -571,6 +571,7 @@ pub static ROUTES: &[Rule] = &[
     // Deploying by API (docs/deploy-api.md §15): releases are deploys; apps, environments and
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
+    r("GET", "/api/ship/**", "runs.read", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),

@@ -77,8 +77,8 @@ them too, with W19's `where` and `throttle`.
 
 - Agents that need you are first, whatever the sort; the sort orders the rest.
 - On a phone the page's head is one line (its title and how the agents stand), the filter and the
-  sort share a row, and the composer is at the top as on a desktop: one line until it's used, then
-  open in the page's flow: no sheets or overlays.
+  sort share a row, and the composer is at the top, whole, as on a desktop and as the agent page's
+  composer: in the page's flow, no sheets or overlays.
 - When this device has notifications off, one quiet line offers to turn them on.
 
 **Acceptance.** N-AC1: an approval on an agent reaches a subscribed phone as one notification
@@ -86,7 +86,7 @@ within 2 s of the harness asking, and tapping it opens the agent, verified with 
 push subscription in a test (and by the user on an iPhone). N-AC2: a second state of the same agent
 replaces the first, and none shows while a focused window is on that agent. N-AC3: a dead
 subscription (410) is dropped. N-AC4: on a 390×844 screen the composer and the first agent row are both
-in view without scrolling (the composer, one line until used, sits above the list).
+in view without scrolling (the composer sits above the list).
 
 ## O: Agents that run agents
 
