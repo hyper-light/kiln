@@ -81,26 +81,26 @@ export function reviewGroup(detail: { change?: { state?: string | null } | null;
 const MIN_HORIZON = 30 * 60;
 const GROW_BY = 10 * 60;
 
-/** The window the lanes draw on: from the earliest start to now, at least 30 minutes, growing by
- * 10 more whenever a mark passes it. `now` is the caller's — no clock inside. */
+/** The window the lanes draw on: from the earliest start, at least 30 minutes wide and 10 more at a
+ * time as now or a mark passes its end, so the bars keep their scale as time passes but for a
+ * 10-minute step (the opened commit's step 2). `now` is the caller's — no clock inside. */
 function horizonOf(groups: ShipLaneGroup[], now: number): [number, number] {
   let lo = now;
   for (const g of groups) for (const l of g.lanes) if (l.start != null && l.start < lo) lo = l.start;
   let hi = now;
   for (const g of groups) for (const l of g.lanes) if (l.end != null && l.end > hi) hi = l.end;
-  if (hi <= lo) hi = lo + MIN_HORIZON;
-  while (hi - lo < MIN_HORIZON) hi += GROW_BY;
-  return [lo, hi];
+  return [lo, lo + Math.max(MIN_HORIZON, Math.ceil((hi - lo) / GROW_BY) * GROW_BY)];
 }
 
 /** One lane's bar: its span on the horizon, or a tick for a point. `pos` is 0..1. */
 const pos = (t: number, [lo, hi]: [number, number]) => Math.min(1, Math.max(0, (t - lo) / (hi - lo)));
 
 /** A lane's words: name and, in Detail, who did it and when (and its place when it has one). */
-function LaneBar({ lane, window }: { lane: ShipLane; window: [number, number] }) {
+function LaneBar({ lane, window, now }: { lane: ShipLane; window: [number, number]; now: number }) {
   const [lo, hi] = window;
   const a = lane.start == null ? null : pos(lane.start, [lo, hi]);
-  const b = lane.end == null ? 1 : pos(lane.end, [lo, hi]);
+  // A bar under way runs to now, not to the window's end.
+  const b = pos(lane.end ?? now, [lo, hi]);
   return (
     <li className="ship-lane" data-kind={lane.kind}>
       <StatusGlyph state={lane.state as GlyphState} size={12} />
@@ -110,7 +110,7 @@ function LaneBar({ lane, window }: { lane: ShipLane; window: [number, number] })
       </span>
       <span className="ship-lane__track">
         {a == null ? (
-          <i className="ship-lane__now" style={{ left: "100%" }} />
+          <i className="ship-lane__now" style={{ left: `${pos(now, [lo, hi]) * 100}%` }} />
         ) : b - a < 0.004 ? (
           <i className="ship-lane__bar ship-lane__bar--point" data-state={lane.state} style={{ left: `${a * 100}%` }} />
         ) : (
@@ -128,7 +128,7 @@ function LaneBar({ lane, window }: { lane: ShipLane; window: [number, number] })
 }
 
 /** One group's lanes on the shared horizon: its head glyph and label pinned, lanes sorted as given. */
-function LaneGroup({ group, window }: { group: ShipLaneGroup; window: [number, number] }) {
+function LaneGroup({ group, window, now }: { group: ShipLaneGroup; window: [number, number]; now: number }) {
   return (
     <div className="ship-lanegroup" data-group={group.group}>
       <p className="ship-lanegroup__head">
@@ -138,7 +138,7 @@ function LaneGroup({ group, window }: { group: ShipLaneGroup; window: [number, n
       </p>
       <ul className="ship-lanes">
         {group.lanes.map((l) => (
-          <LaneBar key={l.id} lane={l} window={window} />
+          <LaneBar key={l.id} lane={l} window={window} now={now} />
         ))}
       </ul>
     </div>
@@ -152,7 +152,8 @@ export function ShipLanes({ commit }: { commit: ShipCommit }) {
   const [walk, setWalk] = React.useState(0);
   const [fit, setFit] = React.useState(true);
   const groups = React.useMemo(() => [reviewGroup(detail.data), ...shipGroups(detail.data)].filter((g): g is ShipLaneGroup => g != null && g.lanes.length > 0), [detail.data]);
-  const base = horizonOf(groups, Math.floor(Date.now() / 1000));
+  const now = Math.floor(Date.now() / 1000);
+  const base = horizonOf(groups, now);
   // A step walks a third of the horizon; Now is always the freshest end.
   const step = Math.max(1, Math.round((base[1] - base[0]) / 3));
   const window: [number, number] = walk === 0 ? base : [base[0] + walk * step, base[1] + walk * step];
@@ -177,7 +178,7 @@ export function ShipLanes({ commit }: { commit: ShipCommit }) {
         </button>
       </div>
       {groups.map((g) => (
-        <LaneGroup key={g.group} group={g} window={window} />
+        <LaneGroup key={g.group} group={g} window={window} now={now} />
       ))}
     </div>
   );

@@ -217,19 +217,29 @@ const DEPLOY_GLYPH: Record<string, string> = { success: "passed", failure: "fail
 
 /**
  * Ship's stages as the Lanes' groups (W26-R14), in the journey's order after Review: each its pip's
- * state, and a lane for what the detail times (each Checks leg that ran, each deploy).
+ * state, and every job its lane from the start (opened commit's step 2): each Checks leg, each
+ * platform the build makes and its image, each runner replanted, a bar once it has times; and each
+ * deploy at its time.
  */
 export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
   const pip = (stage: Stage) => detail.pips.find((p) => p.stage === stage)?.state ?? "none";
+  const glyph = (state: string) => (state in GLYPHS ? state : "none");
+  // Keyed by the leg, not its job: a leg tried again keeps its lane (opened commit's step 3).
   const legs: ShipLane[] = (detail.checks ?? []).flatMap((c) =>
-    c.legs.flatMap((l) =>
-      l.start === undefined ? [] : [{ id: l.job ?? `${c.pipeline}/${l.name}`, name: l.name, state: l.state, start: l.start, end: l.end ?? null, ...(l.note ? { note: l.note } : {}) }],
-    ),
+    c.legs.map((l) => ({ id: `${c.pipeline}/${l.name}`, name: l.name, state: l.state, start: l.start ?? null, end: l.end ?? null, ...(l.note ? { note: l.note } : {}) })),
   );
+  const built = detail.build;
+  const build: ShipLane[] = built
+    ? [
+        ...built.platforms.map((p) => ({ id: `platform/${p.name}`, name: p.name, state: glyph(p.state), start: null, end: null })),
+        { id: "image", name: "image", state: glyph(built.image.state), start: null, end: null },
+      ]
+    : [];
+  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: glyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
   const deploys = (production: boolean): ShipLane[] =>
     (detail.deployments ?? [])
       .filter((d) => d.production === production)
       .map((d) => ({ id: `${d.environment}@${d.at}`, name: d.environment, state: DEPLOY_GLYPH[d.state ?? ""] ?? "none", start: d.at, end: d.at, ...(d.description ? { note: d.description } : {}) }));
   const group = (stage: Stage, lanes: ShipLane[]): ShipLaneGroup => ({ group: stage, label: STAGE_WORD[stage], state: pip(stage), note: "", lanes });
-  return [group("land", []), group("checks", legs), group("build", []), group("staging", deploys(false)), group("production", deploys(true)), group("replant", [])];
+  return [group("land", []), group("checks", legs), group("build", build), group("staging", deploys(false)), group("production", deploys(true)), group("replant", replant)];
 }

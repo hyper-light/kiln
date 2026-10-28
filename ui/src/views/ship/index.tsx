@@ -56,11 +56,11 @@ function ShipList() {
   const one = (k: string) => (chosen[k]?.length === 1 ? chosen[k][0] : undefined);
   const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), lens: lens === "review" ? "review" : undefined, limit: LIMIT };
   const key = `ship/commits/${JSON.stringify(q)}`;
-  // Every stage it shows moves on its own event: a run or a leg (checks, build), review and comments,
-  // an app's sync and a rollout (staging, production), a runner's update (replant).
+  // Every stage it shows moves on its own event: a run or a leg (checks, build), review, comments and
+  // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant).
   const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), {
     pollMs: 15_000,
-    on: ["run", "job", "review", "comment", "cd_apps", "cd_rollout", "updates", "update_job"],
+    on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout", "updates", "update_job"],
   });
   const all = page.data.commits;
   // What each facet reads of a commit; every facet chosen must hold.
@@ -336,29 +336,41 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
 
 /**
  * Brings the dropdown's Files into view and focuses it (the Diff button, Changes plan
- * 01a17bd748ff73d98f09996ecdc6873d step 4): at once if Review has drawn it, else as soon as it
- * does, past its loading. The item's diff lives in one place, Review's Files (Ada, 2026-10-27).
+ * 01a17bd748ff73d98f09996ecdc6873d step 4). The item's diff lives in one place, Review's Files
+ * (Ada, 2026-10-27). While its review loads, Files is a placeholder that the loaded section then
+ * replaces: it's scrolled to once, and each Files that comes takes the focus, until the loaded one
+ * has it (Review marks it with its summary, `.rv-sum`), the reader moves the focus elsewhere, or
+ * 15 s pass.
  */
 function showFiles(open: HTMLElement): (() => void) | undefined {
+  let shown: HTMLElement | null = null;
+  /** Whether there's nothing more to do. */
   const show = () => {
+    const now = document.activeElement;
+    // The reader has moved on (the focus is somewhere, and not in what was shown): leave it there.
+    if (shown && now && now !== document.body && !shown.contains(now)) return true;
     const files = open.querySelector<HTMLElement>('section[aria-label="Files"]');
     if (!files) return false;
-    if (!files.hasAttribute("tabindex")) files.tabIndex = -1;
-    files.scrollIntoView({ block: "start", behavior: document.documentElement.dataset.motion === "paused" ? "auto" : "smooth" });
-    files.focus({ preventScroll: true });
-    return true;
+    if (files !== shown) {
+      // Review's Files is focusable (tabIndex -1) since e538638e56; one that isn't is made so.
+      if (!files.hasAttribute("tabindex")) files.tabIndex = -1;
+      if (!shown) files.scrollIntoView({ block: "start", behavior: document.documentElement.dataset.motion === "paused" ? "auto" : "smooth" });
+      files.focus({ preventScroll: true });
+      shown = files;
+    }
+    return files.querySelector(".rv-sum") !== null;
   };
   if (show()) return undefined;
   const watch = new MutationObserver(() => {
-    if (show()) watch.disconnect();
+    if (show()) stop();
   });
-  watch.observe(open, { childList: true, subtree: true });
-  // Not drawn within 15 s: stop waiting (its section says why when it comes).
-  const timer = window.setTimeout(() => watch.disconnect(), 15_000);
-  return () => {
+  const timer = window.setTimeout(() => stop(), 15_000);
+  const stop = () => {
     watch.disconnect();
     window.clearTimeout(timer);
   };
+  watch.observe(open, { childList: true, subtree: true });
+  return stop;
 }
 
 /** An item's dropdown, in its order: Files (with the Conversation), Output, Jobs, Lanes. */

@@ -71,7 +71,7 @@ test("the job card picked first: the running one, else the one that failed, else
   assert.equal(pickCard(cards("queued", "none", "none", "none", "none", "none")), 0);
 });
 
-test("w26_r14: Ship's stages as the Lanes' groups, a lane for each Checks leg that ran and each deploy", () => {
+test("w26_r14: Ship's stages as the Lanes' groups, every job its lane from the start, and each deploy", () => {
   const detail = {
     ...c("a1", "in_staging"),
     pips: [
@@ -94,11 +94,26 @@ test("w26_r14: Ship's stages as the Lanes' groups, a lane for each Checks leg th
     groups.map((g) => g.group),
     ["land", "checks", "build", "staging", "production", "replant"],
   );
-  assert.deepEqual(groups[1]?.lanes, [{ id: "j1", name: "lint", state: "passed", start: 100, end: 160 }]);
+  // Every leg its lane from the start: the queued one too, with no bar until it has times.
+  assert.deepEqual(groups[1]?.lanes, [
+    { id: "ci/lint", name: "lint", state: "passed", start: 100, end: 160 },
+    { id: "ci/test", name: "test", state: "queued", start: null, end: null },
+  ]);
   assert.equal(groups[1]?.state, "passed");
   assert.deepEqual(groups[3]?.lanes, [{ id: "staging@200", name: "staging", state: "passed", start: 200, end: 200, note: "synced" }]);
   assert.equal(groups[3]?.state, "soaking");
   assert.deepEqual(groups[4]?.lanes, []);
+  // Each platform and the image, and each runner, its lane from the start.
+  const later = shipGroups({
+    ...detail,
+    build: { platforms: [{ name: "linux/amd64", state: "running" }], image: { state: "queued", digest: null } },
+    replant: [{ name: "adacachy", state: "replanting", why: "a newer kiln" }],
+  });
+  assert.deepEqual(later[2]?.lanes, [
+    { id: "platform/linux/amd64", name: "linux/amd64", state: "running", start: null, end: null },
+    { id: "image", name: "image", state: "queued", start: null, end: null },
+  ]);
+  assert.deepEqual(later[5]?.lanes, [{ id: "runner/adacachy", name: "adacachy", state: "replanting", start: null, end: null, note: "a newer kiln" }]);
 });
 
 test("an open row never folds: not under the approval it rides with, nor into a run of shipped commits", () => {
