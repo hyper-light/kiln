@@ -557,8 +557,8 @@ fn reachable(hub: &Hub, target: &str) -> anyhow::Result<()> {
         let machine = target.strip_prefix("agent:").unwrap_or(target);
         let g = hub.agents.lock();
         let a = g.get(machine).ok_or_else(|| anyhow::anyhow!("there is no machine called {machine}"))?;
-        anyhow::ensure!(a.connected, "{machine} is not connected");
-        anyhow::ensure!(a.terminal && !a.ephemeral, "{machine} has terminals (and so agents) turned off");
+        anyhow::ensure!(a.connected, "{} is not connected", a.shown());
+        anyhow::ensure!(a.terminal && !a.ephemeral, "{} has terminals (and so agents) turned off", a.shown());
         a.os == "windows"
     };
     anyhow::ensure!(!windows, "signing in from kiln isn't available on Windows yet: run `claude auth login`, `codex login` or `devin auth login` on that machine");

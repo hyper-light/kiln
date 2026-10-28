@@ -1520,7 +1520,7 @@ async fn ai_takeover(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pi
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): taking it over ends it there, so ask with {{\"stop\": true}}")));
         }
         (TakeOver::Upgrade, _) => {
-            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in System → Updates first")));
+            return Err(err(StatusCode::CONFLICT, format!("{}'s runner is older than this take-over: upgrade it in System → Updates first", hub.shown(machine))));
         }
         (TakeOver::Outside, _) => {
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}), as a harness kiln might not resume: quit it there first, then continue it")));
@@ -1568,7 +1568,7 @@ async fn ai_fork(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pid: &
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
     if !forks_on(hub, machine) {
-        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in System → Updates first")));
+        return Err(err(StatusCode::CONFLICT, format!("{}'s runner is older than branching found sessions: upgrade it in System → Updates first", hub.shown(machine))));
     }
     let Some(spec) = found.fork_spec() else {
         return Err(if !found.started() {
@@ -3002,7 +3002,7 @@ pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::F
         return Err((StatusCode::NOT_FOUND, format!("no runner `{name}`")));
     };
     if !hub.send_to_agent(name, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::ProbeFacts).await {
-        return Err((StatusCode::CONFLICT, format!("{name} isn't connected")));
+        return Err((StatusCode::CONFLICT, format!("{} isn't connected", hub.shown(name))));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -4233,7 +4233,7 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
     let session = match t.target.strip_prefix("agent:") {
         Some(machine) => {
             if !hub.agents.lock().get(machine).is_some_and(|a| a.connected) {
-                return Err(err(StatusCode::CONFLICT, format!("{machine} is not connected")));
+                return Err(err(StatusCode::CONFLICT, format!("{} is not connected", hub.shown(machine))));
             }
             // Its kiln is to be upgraded: no new terminal (`crate::skew`).
             if let Some(why) = hub.skew_holds(machine) {
@@ -4295,7 +4295,7 @@ async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, ca
     };
     // On the host executor a terminal is a shell on the runner itself.
     if executor.as_deref() == Some("host") && !caller.can("runners.terminal", &crate::authz::Scope::Runner { runner: agent.clone() }) {
-        return Err(err(StatusCode::FORBIDDEN, format!("{} may not open a shell on runner {agent}: a host leg's terminal needs runners.terminal there", caller.name)));
+        return Err(err(StatusCode::FORBIDDEN, format!("{} may not open a shell on runner {}: a host leg's terminal needs runners.terminal there", caller.name, hub.shown(&agent))));
     }
     let existing = q.get("session").cloned();
     if let Some(s) = &existing
@@ -4989,7 +4989,7 @@ async fn open_on_device(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     };
     let caps = hub.routed_caps(&machine, &crate::proto::ServerMsg::PortOpen { conn: 0, session: id.to_owned(), port }).await;
     if caps & crate::proto::CAP_PORTS == 0 {
-        return Err(err(StatusCode::CONFLICT, format!("{machine} runs a kiln too old to open its ports: upgrade its runner")));
+        return Err(err(StatusCode::CONFLICT, format!("{} runs a kiln too old to open its ports: upgrade its runner", hub.shown(&machine))));
     }
     let (o, code) = hub.harness.opened.create(id, port, path, &by, me);
     hub.store.audit("admin".into(), "agent.opened.create".into(), format!("{id}: port {port}")).await;
@@ -5566,18 +5566,18 @@ async fn machine_dirs(hub: &Hub, target: &str, q: &HashMap<String, String>) -> R
     let machine = target.strip_prefix("agent:").unwrap_or(target);
     let (connected, agents) = hub.agents.lock().get(machine).map_or((false, false), |a| (a.connected, a.terminal && !a.ephemeral));
     if !connected {
-        return Err(err(StatusCode::CONFLICT, format!("{machine} is not connected")));
+        return Err(err(StatusCode::CONFLICT, format!("{} is not connected", hub.shown(machine))));
     }
     if !agents {
-        return Err(err(StatusCode::FORBIDDEN, format!("{machine} has terminals (and so agents) turned off")));
+        return Err(err(StatusCode::FORBIDDEN, format!("{} has terminals (and so agents) turned off", hub.shown(machine))));
     }
     let json = match hub.dir_list(machine, &path).await {
         Ok(Some(json)) => json,
-        Ok(None) => return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is too old to list folders: upgrade it"))),
+        Ok(None) => return Err(err(StatusCode::CONFLICT, format!("{}'s runner is too old to list folders: upgrade it", hub.shown(machine)))),
         Err(e) => return Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     };
     let listing: crate::dirs::Listing =
-        serde_json::from_str(&json).map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{machine} sent an unreadable folder list: {e}")))?;
+        serde_json::from_str(&json).map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{} sent an unreadable folder list: {e}", hub.shown(machine))))?;
     Ok(srv::json(StatusCode::OK, &listing))
 }
 

@@ -212,8 +212,9 @@ pub struct Sync {
 
 impl Sync {
     /// Starts the owner of the groups kept in `dir`, the contents their steps name in `contents`.
-    /// Blob tokens are signed with `key`.
-    pub fn start(dir: PathBuf, key: String, contents: Arc<Contents>) -> Self {
+    /// Blob tokens are signed with `key`; what its activity says names machines by `labels` (the
+    /// hub's).
+    pub fn start(dir: PathBuf, key: String, contents: Arc<Contents>, labels: crate::hub::Labels) -> Self {
         // Contents half-sent when the server stopped (`<data>/sync/incoming`): none is under way
         // before it listens.
         let incoming = dir.join("incoming");
@@ -234,7 +235,7 @@ impl Sync {
             if !c.wait_loaded(super::contents::LOAD_WAIT) {
                 tracing::warn!(target: "kiln.blobs", event = "list", "sync's contents weren't listed in time: what's held is known as it comes");
             }
-            match Owner::open(&dir, c, out_tx, v.clone(), a, wake_tx, k) {
+            match Owner::open(&dir, c, out_tx, v.clone(), a, wake_tx, k, labels) {
                 Ok(owner) => owner.run(&rx),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "repo sync is off");
@@ -402,10 +403,14 @@ pub struct Owner {
     recorded: HashMap<String, u64>,
     stats: HashMap<String, RepoStats>,
     started: i64,
+    /// The names people see of the machines kiln knows by their machine ids (the hub's), for what
+    /// its activity says of them.
+    labels: crate::hub::Labels,
 }
 
 impl Owner {
-    fn open(dir: &Path, contents: Arc<Contents>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    fn open(dir: &Path, contents: Arc<Contents>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String, labels: crate::hub::Labels) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let repos: Vec<Repo> = match std::fs::read(dir.join("repos.json")) {
             Ok(b) => serde_json::from_slice(&b)?,
@@ -449,6 +454,7 @@ impl Owner {
             recorded,
             stats: HashMap::new(),
             started: now_ms(),
+            labels,
         };
         for repo in repos {
             if let Err(e) = owner.open_group(&repo) {
@@ -540,17 +546,17 @@ impl Owner {
             Msg::Raft { repo, id, part, parts } => {
                 let Some(bytes) = self.joiner.add(machine, id, part, parts, raft) else { return };
                 let Ok(m) = Message::decode(&bytes) else {
-                    self.dropped(&repo, machine, "message", "undecodable", format!("a message from {machine} didn't decode: let go"));
+                    self.dropped(&repo, machine, "message", "undecodable", format!("a message from {} didn't decode: let go", self.shown(machine)));
                     return;
                 };
                 let mine = self.members_on(&repo, machine);
                 if m.to != SERVER || !mine.contains(&m.from) {
-                    self.dropped(&repo, machine, "message", "not_member", format!("a message from {machine} for a member that isn't its: let go"));
+                    self.dropped(&repo, machine, "message", "not_member", format!("a message from {} for a member that isn't its: let go", self.shown(machine)));
                     return;
                 }
                 let refused = self.groups.get_mut(&repo).and_then(|g| g.r.step(m).err());
                 if let Some(e) = refused {
-                    self.dropped(&repo, machine, "message", why(&e), format!("the log didn't take a message from {machine} ({e}): it comes again"));
+                    self.dropped(&repo, machine, "message", why(&e), format!("the log didn't take a message from {} ({e}): it comes again", self.shown(machine)));
                 }
             }
             Msg::Steps { repo, steps } => self.steps(machine, &repo, steps),
@@ -596,10 +602,11 @@ impl Owner {
         }
         let waited = secs_text(news.waited_ms);
         let session = if news.session.is_empty() { "an agent session".to_owned() } else { format!("agent session {}", short(&news.session)) };
+        let (from, to) = (self.shown(&news.from), self.shown(&news.to));
         let (tone, text) = match news.phase.as_str() {
-            "left" => (Tone::Info, format!("{session} is leaving {} for {}: its folder's last changes are in the log through #{} (that took {waited})", news.from, news.to, news.index)),
-            "arrived" => (Tone::Ok, format!("{session} went on on {} once its folder there had #{} (it waited {waited})", news.to, news.index)),
-            _ => (Tone::Warn, format!("{session} couldn't move from {} to {}, and stays: {}", news.from, news.to, news.error.as_deref().unwrap_or("it didn't say why"))),
+            "left" => (Tone::Info, format!("{session} is leaving {from} for {to}: its folder's last changes are in the log through #{} (that took {waited})", news.index)),
+            "arrived" => (Tone::Ok, format!("{session} went on on {to} once its folder there had #{} (it waited {waited})", news.index)),
+            _ => (Tone::Warn, format!("{session} couldn't move from {from} to {to}, and stays: {}", news.error.as_deref().unwrap_or("it didn't say why"))),
         };
         let name = self.name_of(&news.repo);
         tracing::info!(target: "kiln.sync", event = "sync.move", repo = %name, machine = %machine, phase = %news.phase, from = %news.from, to = %news.to, index = news.index, waited_ms = news.waited_ms, "{text}");
@@ -615,7 +622,12 @@ impl Owner {
         if let Err(e) = self.save() {
             tracing::warn!(error = %format!("{e:#}"), "the synced repos could not be saved");
         }
-        self.note(repo, Kind::Copy, &machine, Tone::Ok, format!("the new copy on {machine} has the repo's files: it syncs like the others now"));
+        self.note(repo, Kind::Copy, &machine, Tone::Ok, format!("the new copy on {} has the repo's files: it syncs like the others now", self.shown(&machine)));
+    }
+
+    /// The name people see of `machine`: its label, else its name.
+    fn shown(&self, machine: &str) -> String {
+        self.labels.lock().get(machine).cloned().unwrap_or_else(|| machine.to_owned())
     }
 
     /// The members of `repo` whose copies are on `machine`.
@@ -627,9 +639,10 @@ impl Owner {
     /// missing is asked for, and the steps come again.
     fn steps(&mut self, machine: &str, repo: &str, steps: Vec<Step>) {
         let mine = self.members_on(repo, machine);
+        let shown = self.shown(machine);
         let Some(g) = self.groups.get_mut(repo) else { return };
         let contents = &self.contents;
-        let Taking { again, dropped, mut want, proposed } = take_steps(&mut g.r, &mut g.next, |h| contents.has(h), machine, &mine, steps);
+        let Taking { again, dropped, mut want, proposed } = take_steps(&mut g.r, &mut g.next, |h| contents.has(h), machine, &shown, &mine, steps);
         for at in proposed {
             if g.arrived.len() >= ARRIVED {
                 g.arrived.clear();
@@ -650,7 +663,7 @@ impl Owner {
             let n = want.len();
             metrics::sync().retries.add(&[&name, "contents_asked"], u64::try_from(n).unwrap_or(u64::MAX));
             self.stats_of(repo).retries += 1;
-            self.note_quietly(repo, Kind::Retry, machine, "contents_asked", Tone::Info, format!("asked {machine} again for the contents of {n} file{} its steps name", if n == 1 { "" } else { "s" }));
+            self.note_quietly(repo, Kind::Retry, machine, "contents_asked", Tone::Info, format!("asked {shown} again for the contents of {n} file{} its steps name", if n == 1 { "" } else { "s" }));
             self.send(machine, Msg::Want { repo: repo.to_owned(), hashes: want }, Vec::new());
         }
     }
@@ -851,7 +864,7 @@ impl Owner {
                 let gone = (r.id.clone(), c.machine.clone());
                 // Out of offline: news only for a copy noted going away, not one merely connecting.
                 let before = before.filter(|b| *b != "offline" || self.away.contains(&gone));
-                if let Some(text) = state_change(before, c.state, &c.machine, s.and_then(|s| s.error.as_deref())) {
+                if let Some(text) = state_change(before, c.state, &self.shown(&c.machine), s.and_then(|s| s.error.as_deref())) {
                     let tone = match c.state {
                         "error" => Tone::Fail,
                         "offline" => Tone::Warn,
@@ -976,7 +989,7 @@ impl Owner {
                 let id = repo.id.clone();
                 self.repos.push(repo);
                 self.save()?;
-                let on = if machines.is_empty() { "no copies yet".to_owned() } else { format!("copies on {}", machines.join(", ")) };
+                let on = if machines.is_empty() { "no copies yet".to_owned() } else { format!("copies on {}", machines.iter().map(|m| self.shown(m)).collect::<Vec<_>>().join(", ")) };
                 self.note(&id, Kind::Copy, "kiln", Tone::Info, format!("syncing started: {on}"));
                 for m in machines {
                     self.tell_copies(&m);
@@ -994,7 +1007,7 @@ impl Owner {
                 }
                 self.save()?;
                 let first = if adopting { ": it takes the repo's files first" } else { "" };
-                self.note(&repo, Kind::Copy, &machine, Tone::Info, format!("a copy added on {machine}, in {path}{first}"));
+                self.note(&repo, Kind::Copy, &machine, Tone::Info, format!("a copy added on {}, in {path}{first}", self.shown(&machine)));
                 self.tell_copies(&machine);
                 Ok(member.to_string())
             }
@@ -1004,7 +1017,7 @@ impl Owner {
                 let copy = r.copies.remove(at);
                 self.statuses.remove(&(repo.clone(), member));
                 self.save()?;
-                self.note(&repo, Kind::Copy, &copy.machine, Tone::Info, format!("the copy on {} was removed: its files stay in {}", copy.machine, copy.path));
+                self.note(&repo, Kind::Copy, &copy.machine, Tone::Info, format!("the copy on {} was removed: its files stay in {}", self.shown(&copy.machine), copy.path));
                 self.tell_copies(&copy.machine);
                 Ok(String::new())
             }
@@ -1149,17 +1162,18 @@ pub struct Taking {
 /// `r`, each member's in order, each once, and each only once the server holds the contents it
 /// names (`has`): one sent again is passed over; one out of order stops the rest (they all come
 /// again); one whose contents aren't here yet stops them too (they're asked for). `next` is the
-/// number of the next step taken from each member, kept from one call to the next. The server's
-/// sync thread does this with every `steps` message; kiln-sim's sync model does the same.
-pub fn take_steps<L: LogStore>(r: &mut Replica<L, Index>, next: &mut HashMap<u64, u64>, has: impl Fn(&str) -> bool, machine: &str, mine: &[u64], steps: Vec<Step>) -> Taking {
+/// number of the next step taken from each member, kept from one call to the next; `shown`, the
+/// name people see of `machine`, for what's said of what was let go. The server's sync thread
+/// does this with every `steps` message; kiln-sim's sync model does the same.
+pub fn take_steps<L: LogStore>(r: &mut Replica<L, Index>, next: &mut HashMap<u64, u64>, has: impl Fn(&str) -> bool, machine: &str, shown: &str, mine: &[u64], steps: Vec<Step>) -> Taking {
     let mut out = Taking::default();
     for mut step in steps {
         if !mine.contains(&step.member) {
-            out.dropped.push(("not_member", format!("a step from {machine} for a copy that isn't on it: let go")));
+            out.dropped.push(("not_member", format!("a step from {shown} for a copy that isn't on it: let go")));
             continue;
         }
         if step.changes.len() > STEP_CHANGES {
-            out.dropped.push(("too_many_changes", format!("a step from {machine} of {} changes, more than {STEP_CHANGES}: let go", step.changes.len())));
+            out.dropped.push(("too_many_changes", format!("a step from {shown} of {} changes, more than {STEP_CHANGES}: let go", step.changes.len())));
             continue;
         }
         step.by = machine.to_owned();
@@ -1171,7 +1185,7 @@ pub fn take_steps<L: LogStore>(r: &mut Replica<L, Index>, next: &mut HashMap<u64
         }
         if step.seq > want_next {
             // One before it went missing: they all come again.
-            out.dropped.push(("out_of_order", format!("steps from {machine} came out of order (#{} before #{want_next}): they come again", step.seq)));
+            out.dropped.push(("out_of_order", format!("steps from {shown} came out of order (#{} before #{want_next}): they come again", step.seq)));
             break;
         }
         // Its contents, and a ref's bundle.
@@ -1194,12 +1208,12 @@ pub fn take_steps<L: LogStore>(r: &mut Replica<L, Index>, next: &mut HashMap<u64
         }
         let entry = group::entry(&step);
         if entry.len() > ENTRY {
-            out.dropped.push(("too_big", format!("a step from {machine} too big for the log ({} KiB, {} changes): left out", entry.len() >> 10, step.changes.len())));
+            out.dropped.push(("too_big", format!("a step from {shown} too big for the log ({} KiB, {} changes): left out", entry.len() >> 10, step.changes.len())));
             next.insert(step.member, step.seq.saturating_add(1));
             continue;
         }
         if let Err(e) = r.propose(Vec::new(), entry) {
-            out.dropped.push((why(&e), format!("the log didn't take a step from {machine} ({e}): it comes again")));
+            out.dropped.push((why(&e), format!("the log didn't take a step from {shown} ({e}): it comes again")));
             break;
         }
         out.proposed.push((step.member, step.seq));
@@ -1287,7 +1301,7 @@ mod tests {
     fn a_committed_step_shows_with_its_files_and_a_stray_one_as_let_go() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
-        let sync = Sync::start(dir.path().join("sync"), "key".into(), contents);
+        let sync = Sync::start(dir.path().join("sync"), "key".into(), contents, crate::hub::Labels::default());
         let name = "activity-test";
         let create = Ask::Create {
             name: name.into(),
@@ -1326,10 +1340,15 @@ mod tests {
         assert!(text.contains(&format!("kiln_sync_changes_total{{repo=\"{name}\",kind=\"added\"}} 1")), "its change");
         assert!(text.contains(&format!("kiln_sync_dropped_total{{repo=\"{name}\",what=\"step\",reason=\"not_member\"}} 1")), "the stray step");
         assert!(text.contains(&format!("kiln_sync_commit_seconds_count{{repo=\"{name}\"}} 1")), "its commit timed");
-        // No runner is connected: each copy is offline, and every other state reads 0.
+        // No runner is connected: each copy is offline, and every other state reads 0. Its series
+        // carries its machine's id and name too (docs/machines.md).
+        let state = |t: &str, which: &str, v: u8| {
+            let series = format!("kiln_sync_copy_state{{repo=\"{name}\",machine=\"mac\",state=\"{which}\",machine_id=");
+            t.lines().any(|l| l.starts_with(&series) && l.ends_with(&format!("}} {v}")))
+        };
         let states = eventually(|| {
             let t = crate::metrics::render();
-            t.contains(&format!("kiln_sync_copy_state{{repo=\"{name}\",machine=\"mac\",state=\"offline\"}} 1")) && t.contains(&format!("kiln_sync_copy_state{{repo=\"{name}\",machine=\"mac\",state=\"in_step\"}} 0"))
+            state(&t, "offline", 1) && state(&t, "in_step", 0)
         });
         anyhow::ensure!(states, "every state of each copy, 1 for the one it's in");
         Ok(())

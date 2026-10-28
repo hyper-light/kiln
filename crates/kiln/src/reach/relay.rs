@@ -66,9 +66,10 @@ impl Relay {
     }
 
     /// A frame from runner `from` on connection `from_peer`. `peer_of` gives a runner's connection
-    /// to reach it on (its newest process that takes reach), when it is connected. Returns what to
-    /// send where: the frame to the other end, or a close back to the sender.
-    pub fn forward(&mut self, from: &str, from_peer: PeerId, f: Frame, peer_of: impl Fn(&str) -> Option<PeerId>) -> Vec<(PeerId, ServerMsg)> {
+    /// to reach it on (its newest process that takes reach), when it is connected; `shown` the name
+    /// people see of a runner, for what a refusal says of it. Returns what to send where: the frame
+    /// to the other end, or a close back to the sender.
+    pub fn forward(&mut self, from: &str, from_peer: PeerId, f: Frame, peer_of: impl Fn(&str) -> Option<PeerId>, shown: impl Fn(&str) -> String) -> Vec<(PeerId, ServerMsg)> {
         let refuse = |why: String| vec![(from_peer, ServerMsg::Reach { from: f.to.clone(), link: f.link.clone(), open: false, data: Vec::new(), close: Some(why) })];
         if f.open {
             if self.links.contains_key(&f.link) {
@@ -78,14 +79,14 @@ impl Relay {
                 return refuse("a runner does not open a link to itself".into());
             }
             if self.links.values().filter(|e| e.a == from || e.b == from).count() >= LINKS_PER_RUNNER {
-                return refuse(format!("{from} has {LINKS_PER_RUNNER} links open already"));
+                return refuse(format!("{} has {LINKS_PER_RUNNER} links open already", shown(from)));
             }
             match self.announced.get(&f.to) {
-                None => return refuse(format!("{} does not take reach links (an older runner?)", f.to)),
-                Some(a) if !a.accept => return refuse(format!("{} does not accept commands from other runners", f.to)),
+                None => return refuse(format!("{} does not take reach links (an older runner?)", shown(&f.to))),
+                Some(a) if !a.accept => return refuse(format!("{} does not accept commands from other runners", shown(&f.to))),
                 Some(_) => {}
             }
-            let Some(to_peer) = peer_of(&f.to) else { return refuse(format!("{} is not connected", f.to)) };
+            let Some(to_peer) = peer_of(&f.to) else { return refuse(format!("{} is not connected", shown(&f.to))) };
             self.links.insert(f.link.clone(), Ends { a: from.to_owned(), a_peer: from_peer, b: f.to.clone(), b_peer: to_peer, since: Instant::now() });
             let closing = f.close.is_some();
             let out = vec![(to_peer, ServerMsg::Reach { from: from.to_owned(), link: f.link.clone(), open: true, data: f.data, close: f.close })];
@@ -159,19 +160,19 @@ mod tests {
             _ => None,
         };
         // mac (peer 10) opens a link to linux (peer 20).
-        let (to, msg) = sole(r.forward("mac", 10, frame("linux", "L1", true, b"hello"), peers))?;
+        let (to, msg) = sole(r.forward("mac", 10, frame("linux", "L1", true, b"hello"), peers, str::to_owned))?;
         assert_eq!(to, 20);
         assert_eq!(msg, ServerMsg::Reach { from: "mac".into(), link: "L1".into(), open: true, data: b"hello".to_vec(), close: None });
         // Back from linux, stamped with linux's name, to mac's connection.
-        let (to, msg) = sole(r.forward("linux", 20, frame("mac", "L1", false, b"hi"), peers))?;
+        let (to, msg) = sole(r.forward("linux", 20, frame("mac", "L1", false, b"hi"), peers, str::to_owned))?;
         assert_eq!(to, 10);
         assert!(matches!(msg, ServerMsg::Reach { ref from, .. } if from == "linux"));
         // A third runner can't write into it, and learns nothing.
-        assert!(r.forward("intruder", 30, frame("linux", "L1", false, b"rm -rf"), peers).is_empty());
+        assert!(r.forward("intruder", 30, frame("linux", "L1", false, b"rm -rf"), peers, str::to_owned).is_empty());
         // Nor can mac from another connection.
-        assert!(r.forward("mac", 11, frame("linux", "L1", false, b"x"), peers).is_empty());
+        assert!(r.forward("mac", 11, frame("linux", "L1", false, b"x"), peers, str::to_owned).is_empty());
         // Opening it again is refused.
-        let (to, msg) = sole(r.forward("mac", 10, frame("linux", "L1", true, b""), peers))?;
+        let (to, msg) = sole(r.forward("mac", 10, frame("linux", "L1", true, b""), peers, str::to_owned))?;
         assert_eq!(to, 10);
         assert!(matches!(msg, ServerMsg::Reach { close: Some(_), .. }));
         Ok(())
@@ -185,12 +186,14 @@ mod tests {
             Some((_, ServerMsg::Reach { close: Some(w), .. })) => w,
             _ => String::new(),
         };
-        assert!(why(r.forward("mac", 1, frame("linux", "a", true, b""), none)).contains("does not take reach"));
+        assert!(why(r.forward("mac", 1, frame("linux", "a", true, b""), none, str::to_owned)).contains("does not take reach"));
         r.announce("linux", Announce { fingerprint: "f".into(), accept: false, version: 1 });
-        assert!(why(r.forward("mac", 1, frame("linux", "b", true, b""), none)).contains("does not accept"));
+        assert!(why(r.forward("mac", 1, frame("linux", "b", true, b""), none, str::to_owned)).contains("does not accept"));
         r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
-        assert!(why(r.forward("mac", 1, frame("linux", "c", true, b""), none)).contains("not connected"));
-        assert!(why(r.forward("linux", 2, frame("linux", "d", true, b""), |_| Some(2))).contains("itself"));
+        assert!(why(r.forward("mac", 1, frame("linux", "c", true, b""), none, str::to_owned)).contains("not connected"));
+        // A runner kiln knows by its machine id is said by the name people see (docs/machines.md).
+        assert_eq!(why(r.forward("mac", 1, frame("linux", "e", true, b""), none, |n: &str| if n == "linux" { "studio".to_owned() } else { n.to_owned() })), "studio is not connected");
+        assert!(why(r.forward("linux", 2, frame("linux", "d", true, b""), |_| Some(2), str::to_owned)).contains("itself"));
         assert_eq!(r.links(), 0);
         Ok(())
     }
@@ -201,17 +204,17 @@ mod tests {
         r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
         r.announce("mac", Announce { fingerprint: "g".into(), accept: true, version: 1 });
         let peers = |n: &str| (n == "linux").then_some(20).or((n == "mac").then_some(10));
-        r.forward("mac", 10, frame("linux", "L1", true, b""), peers);
-        r.forward("linux", 20, frame("mac", "L2", true, b""), peers);
+        r.forward("mac", 10, frame("linux", "L1", true, b""), peers, str::to_owned);
+        r.forward("linux", 20, frame("mac", "L2", true, b""), peers, str::to_owned);
         let out = r.lost(20, "disconnected");
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|(p, m)| *p == 10 && matches!(m, ServerMsg::Reach { close: Some(w), .. } if w == "linux disconnected")));
         assert_eq!(r.links(), 0);
         // A goodbye removes the link; frames after it are refused.
-        r.forward("mac", 10, frame("linux", "L3", true, b""), peers);
+        r.forward("mac", 10, frame("linux", "L3", true, b""), peers, str::to_owned);
         let mut bye = frame("linux", "L3", false, b"");
         bye.close = Some("done".into());
-        assert_eq!(sole(r.forward("mac", 10, bye, peers))?.0, 20);
+        assert_eq!(sole(r.forward("mac", 10, bye, peers, str::to_owned))?.0, 20);
         assert_eq!(r.links(), 0);
         Ok(())
     }

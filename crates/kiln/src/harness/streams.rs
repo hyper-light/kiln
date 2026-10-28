@@ -171,10 +171,10 @@ impl Relay {
         let msg = ServerMsg::StreamOpen { stream: id.clone(), session: session.to_owned(), json: spec.to_string() };
         // The runner process holding the session streams it: it must know how.
         let caps = hub.routed_caps(&machine, &msg).await;
-        anyhow::ensure!(caps & CAP_STREAM != 0, "{machine} runs a kiln too old to stream pages: upgrade its runner");
+        anyhow::ensure!(caps & CAP_STREAM != 0, "{} runs a kiln too old to stream pages: upgrade its runner", hub.shown(&machine));
         // Another engine, or a device: a runner from before would stream Chromium as its viewer is.
         let other = spec.get("engine").and_then(Value::as_str).is_some_and(|e| !e.is_empty() && e != "chromium") || spec.get("device").and_then(Value::as_str).is_some_and(|d| !d.is_empty());
-        anyhow::ensure!(!other || caps & crate::proto::CAP_ENGINES != 0, "{machine} runs a kiln too old for other engines and devices: upgrade its runner");
+        anyhow::ensure!(!other || caps & crate::proto::CAP_ENGINES != 0, "{} runs a kiln too old for other engines and devices: upgrade its runner", hub.shown(&machine));
         let live = Arc::new(Live {
             id: id.clone(),
             session: session.to_owned(),
@@ -195,7 +195,7 @@ impl Relay {
         let answer = hub.command_start(&machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await;
         if let a @ (crate::wire::commands::Answer::Refused { .. } | crate::wire::commands::Answer::Unreachable { .. }) = answer {
             self.live.lock().remove(&id);
-            anyhow::bail!("{machine}: {}", a.words());
+            anyhow::bail!("{}: {}", hub.shown(&machine), a.words());
         }
         crate::rt::spawn(close_when_unwatched(hub.clone(), id));
         Ok(live)
@@ -389,8 +389,9 @@ impl Relay {
         });
     }
 
-    /// A machine gone: its streams end (their viewers are told).
-    pub fn machine_lost(&self, machine: &str) {
+    /// A machine gone: its streams end (their viewers are told, of it as `shown`, the name people
+    /// see).
+    pub fn machine_lost(&self, machine: &str, shown: &str) {
         let gone: Vec<Arc<Live>> = {
             let mut g = self.live.lock();
             let ids: Vec<String> = g.values().filter(|l| l.machine == machine).map(|l| l.id.clone()).collect();
@@ -400,7 +401,7 @@ impl Relay {
             self.ended(l);
         }
         for l in gone {
-            l.send(&ToViewer::Event(json!({"closed": {"why": format!("{machine} went away")}}).to_string()));
+            l.send(&ToViewer::Event(json!({"closed": {"why": format!("{shown} went away")}}).to_string()));
         }
     }
 }
@@ -547,8 +548,8 @@ pub async fn preview(hub: &Arc<Hub>, session: &str, op: &str) -> anyhow::Result<
     let answer = hub
         .ask_routed(&machine, crate::proto::CAP_PREVIEW, wait, |req| ServerMsg::Preview { req, session: session.to_owned(), json })
         .await?
-        .ok_or_else(|| anyhow::anyhow!("{machine} runs a kiln too old for this: upgrade its runner"))?
-        .ok_or_else(|| anyhow::anyhow!("{machine} said nothing"))?;
+        .ok_or_else(|| anyhow::anyhow!("{} runs a kiln too old for this: upgrade its runner", hub.shown(&machine)))?
+        .ok_or_else(|| anyhow::anyhow!("{} said nothing", hub.shown(&machine)))?;
     let v: Value = serde_json::from_str(&answer)?;
     if let Some(e) = v.get("error").and_then(Value::as_str) {
         anyhow::bail!("{e}");
@@ -730,7 +731,7 @@ mod tests {
         let r = Relay::default();
         r.live.lock().insert("a".into(), live("a", "m1"));
         r.live.lock().insert("b".into(), live("b", "m2"));
-        r.machine_lost("m1");
+        r.machine_lost("m1", "m1");
         assert!(r.get("a").is_none() && r.get("b").is_some());
     }
 

@@ -182,6 +182,8 @@ fn is_outpost(labels: &[String], slots: u32) -> bool {
 /// it.
 pub struct Pending {
     agent: String,
+    /// The name people see of its runner ([`Hub::shown`]), for what's said of its answer.
+    shown: String,
     what: &'static str,
     waits: Vec<futures::channel::oneshot::Receiver<crate::wire::commands::Answer>>,
     /// What it is already: sent to processes that can't answer, or reaching none.
@@ -212,7 +214,7 @@ impl Pending {
             let a = match crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
                 Ok(Ok(a)) => a,
                 Ok(Err(_)) => Answer::Unanswered { why: "the server let go of it".into() },
-                Err(_) => Answer::Unanswered { why: format!("no answer from {} in {} s", self.agent, within.as_secs()) },
+                Err(_) => Answer::Unanswered { why: format!("no answer from {} in {} s", self.shown, within.as_secs()) },
             };
             if answer.taken() && !a.taken() {
                 answer = a;
@@ -341,6 +343,18 @@ pub struct AgentLive {
     pub skew: crate::skew::Skew,
 }
 
+impl AgentLive {
+    /// The name people see (docs/machines.md): its label, else its name. What the sentences kiln
+    /// writes for people say of it; what's looked up by, its name.
+    pub fn shown(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// The names people see of the runners kiln knows by their machine ids, by name (docs/machines.md):
+/// [`Hub`]'s, shared with what names machines away from it (repo sync's activity).
+pub type Labels = Arc<Mutex<HashMap<String, String>>>;
+
 /// Output from a remote (agent) terminal session, routed to its websocket.
 #[derive(Debug)]
 pub enum TermOut {
@@ -362,6 +376,11 @@ pub struct Hub {
     pub net: NetHandle,
     pub pki: Arc<crate::pki::Pki>,
     pub agents: Mutex<HashMap<String, AgentLive>>,
+    /// The labels of the runners kiln knows by their machine id, by name, as the store keeps them
+    /// (docs/machines.md): what [`Hub::shown`] says of one that hasn't connected since this server
+    /// started, and repo sync of the machines its activity names. Loaded as it starts
+    /// ([`Hub::load_labels`]), kept as runners are renamed or move.
+    labels: Labels,
     /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
     pub ci: crate::ci::dispatch::Handle,
     peers: Mutex<HashMap<PeerId, String>>,
@@ -519,7 +538,8 @@ impl Hub {
         let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
-        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
+        let labels = Labels::default();
+        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents, Arc::clone(&labels));
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
         let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
@@ -532,6 +552,7 @@ impl Hub {
             net,
             pki,
             agents: Mutex::new(HashMap::new()),
+            labels,
             ci: crate::ci::dispatch::Handle::default(),
             peers: Mutex::new(HashMap::new()),
             pending_peers: Mutex::new(HashMap::new()),
@@ -809,6 +830,7 @@ impl Hub {
     /// with `hostname`, until its runner connects), and its pages told.
     pub async fn set_label(&self, name: &str, label: &str, hostname: &str) -> anyhow::Result<()> {
         self.store.set_agent_label(name.to_owned(), label.to_owned(), hostname.to_owned()).await?;
+        self.labels.lock().insert(name.to_owned(), label.to_owned());
         let live = self.agents.lock().get_mut(name).map(|a| {
             a.label = Some(label.to_owned());
             a.clone()
@@ -828,6 +850,23 @@ impl Hub {
             return Some(typed.to_owned());
         }
         g.values().find(|a| a.label.as_deref() == Some(typed)).map(|a| a.name.clone())
+    }
+
+    /// The name people see for runner `name` (docs/machines.md): its label, for one kiln knows by
+    /// its machine id, else `name` (one known by its name, or not known here). What the sentences
+    /// kiln writes for people say; what's looked up by (routes, rows, JSON keys, logs' fields,
+    /// links), `name` itself.
+    pub fn shown(&self, name: &str) -> String {
+        let live = self.agents.lock().get(name).and_then(|a| a.label.clone());
+        live.or_else(|| self.labels.lock().get(name).cloned()).unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The runners' labels as the store keeps them, for [`Hub::shown`]: as this server starts.
+    pub async fn load_labels(&self) {
+        match self.store.agent_labels().await {
+            Ok(labels) => *self.labels.lock() = labels,
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "the runners' labels couldn't be read: sentences name them by their ids"),
+        }
     }
 
     /// The labels the metrics give runner `name`'s series ([`crate::metrics::set_machine`]): its
@@ -1012,7 +1051,7 @@ impl Hub {
         let peer = {
             let inst = self.instances.lock();
             if inst.newest(machine).is_none() {
-                anyhow::bail!("{machine} is not connected");
+                anyhow::bail!("{} is not connected", self.shown(machine));
             }
             inst.newest_with(machine, proto::CAP_DIRS)
         };
@@ -1026,9 +1065,9 @@ impl Hub {
         self.ai_requests.lock().remove(&req);
         match answer {
             Some(Ok(Some(json))) => Ok(Some(json)),
-            Some(_) => anyhow::bail!("{machine} did not answer"),
-            None if !sent => anyhow::bail!("{machine} is not connected"),
-            None => anyhow::bail!("{machine} did not answer in time"),
+            Some(_) => anyhow::bail!("{} did not answer", self.shown(machine)),
+            None if !sent => anyhow::bail!("{} is not connected", self.shown(machine)),
+            None => anyhow::bail!("{} did not answer in time", self.shown(machine)),
         }
     }
 
@@ -1043,7 +1082,7 @@ impl Hub {
         let peer = {
             let mut inst = self.instances.lock();
             if inst.newest(machine).is_none() {
-                anyhow::bail!("{machine} is not connected");
+                anyhow::bail!("{} is not connected", self.shown(machine));
             }
             let to = inst.route(machine, &msg);
             to.filter(|p| inst.get(*p).is_some_and(|i| i.caps & proto::CAP_FILES != 0))
@@ -1057,9 +1096,9 @@ impl Hub {
         self.file_requests.lock().remove(&req);
         match answer {
             Some(Ok(a)) => Ok(Some(a)),
-            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
-            None if !sent => anyhow::bail!("{machine} is not connected"),
-            None => anyhow::bail!("{machine} did not answer in time"),
+            Some(Err(_)) => anyhow::bail!("{} did not answer", self.shown(machine)),
+            None if !sent => anyhow::bail!("{} is not connected", self.shown(machine)),
+            None => anyhow::bail!("{} did not answer in time", self.shown(machine)),
         }
     }
 
@@ -1088,7 +1127,7 @@ impl Hub {
         let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
         let msg = msg(req);
         if self.instances.lock().newest(machine).is_none() {
-            anyhow::bail!("{machine} is not connected");
+            anyhow::bail!("{} is not connected", self.shown(machine));
         }
         if self.routed_caps(machine, &msg).await & cap != cap {
             return Ok(None);
@@ -1102,9 +1141,9 @@ impl Hub {
         self.ai_requests.lock().remove(&req);
         match answer {
             Some(Ok(json)) => Ok(Some(json)),
-            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
-            None if !sent => anyhow::bail!("{machine} is not connected"),
-            None => anyhow::bail!("{machine} did not answer in time"),
+            Some(Err(_)) => anyhow::bail!("{} did not answer", self.shown(machine)),
+            None if !sent => anyhow::bail!("{} is not connected", self.shown(machine)),
+            None => anyhow::bail!("{} did not answer in time", self.shown(machine)),
         }
     }
 
@@ -1115,7 +1154,7 @@ impl Hub {
         let peer = {
             let inst = self.instances.lock();
             if inst.newest(machine).is_none() {
-                anyhow::bail!("{machine} is not connected");
+                anyhow::bail!("{} is not connected", self.shown(machine));
             }
             inst.newest_with(machine, cap)
         };
@@ -1129,9 +1168,9 @@ impl Hub {
         self.ai_requests.lock().remove(&req);
         match answer {
             Some(Ok(json)) => Ok(Some(json)),
-            Some(Err(_)) => anyhow::bail!("{machine} did not answer"),
-            None if !sent => anyhow::bail!("{machine} is not connected"),
-            None => anyhow::bail!("{machine} did not answer in time"),
+            Some(Err(_)) => anyhow::bail!("{} did not answer", self.shown(machine)),
+            None if !sent => anyhow::bail!("{} is not connected", self.shown(machine)),
+            None => anyhow::bail!("{} did not answer in time", self.shown(machine)),
         }
     }
 
@@ -1146,14 +1185,14 @@ impl Hub {
         self.ai_requests.lock().insert(req, tx);
         if !self.send_to_agent(machine, LANE_TERM, &msg(req)).await {
             self.ai_requests.lock().remove(&req);
-            anyhow::bail!("machine {machine} is not connected");
+            anyhow::bail!("machine {} is not connected", self.shown(machine));
         }
         let answer = crate::rt::timeout(Duration::from_secs(10), rx).await;
         self.ai_requests.lock().remove(&req);
         match answer {
             Ok(Ok(json)) => Ok(json),
-            Ok(Err(_)) => anyhow::bail!("{machine} did not answer"),
-            Err(_) => anyhow::bail!("{machine} did not answer in time"),
+            Ok(Err(_)) => anyhow::bail!("{} did not answer", self.shown(machine)),
+            Err(_) => anyhow::bail!("{} did not answer in time", self.shown(machine)),
         }
     }
 
@@ -1227,7 +1266,7 @@ impl Hub {
             }
             if !sent {
                 use crate::wire::commands::Answer;
-                pending.at_once = if pending.waits.is_empty() { Answer::Unreachable { why: format!("{agent} is not connected") } } else { Answer::Taken };
+                pending.at_once = if pending.waits.is_empty() { Answer::Unreachable { why: format!("{} is not connected", pending.shown) } } else { Answer::Taken };
             }
         }
         self.flush_commands().await;
@@ -1239,9 +1278,10 @@ impl Hub {
     fn queue_command(&self, agent: &str, peers: Vec<PeerId>, msg: &ServerMsg, mut legacy: impl FnMut(PeerId, Vec<u8>) -> bool) -> Pending {
         use crate::wire::commands::{Answer, Kind as Stream};
         let what = crate::wire::server_name(msg);
-        let at_once = |a: Answer| Pending { agent: agent.to_owned(), what, waits: Vec::new(), at_once: a, away: false };
+        let shown = self.shown(agent);
+        let at_once = |a: Answer| Pending { agent: agent.to_owned(), shown: shown.clone(), what, waits: Vec::new(), at_once: a, away: false };
         if peers.is_empty() {
-            return at_once(Answer::Unreachable { why: format!("{agent} is not connected") });
+            return at_once(Answer::Unreachable { why: format!("{shown} is not connected") });
         }
         let stream = stream_of(msg);
         let body = match proto::encode(msg) {
@@ -1277,7 +1317,7 @@ impl Hub {
         } else if !waits.is_empty() {
             Answer::Taken
         } else {
-            given.first().cloned().unwrap_or_else(|| Answer::Unreachable { why: format!("{agent} is not connected") })
+            given.first().cloned().unwrap_or_else(|| Answer::Unreachable { why: format!("{shown} is not connected") })
         };
         // Beside processes still to answer, those that answered at once count with them.
         if !waits.is_empty() {
@@ -1287,7 +1327,7 @@ impl Hub {
                 waits.push(rx);
             }
         }
-        Pending { agent: agent.to_owned(), what, away: away && !waits.is_empty(), waits, at_once: first }
+        Pending { agent: agent.to_owned(), shown, what, away: away && !waits.is_empty(), waits, at_once: first }
     }
 
     /// The commands that waited for runner process `peer` to say whether it keeps the channel, and
@@ -1427,6 +1467,11 @@ impl Hub {
         anyhow::ensure!(!connected, "{from} has a runner process connected: it moves to its machine id once none is");
         let prefixes = vec![crate::frontdoor::control::KEY_PREFIX, crate::harness::limit::KEY_PREFIX, crate::updates::POLICY_PREFIX];
         self.store.move_runner(from.to_owned(), to.to_owned(), label.to_owned(), hostname.to_owned(), prefixes).await?;
+        {
+            let mut labels = self.labels.lock();
+            labels.remove(from);
+            labels.insert(to.to_owned(), label.to_owned());
+        }
         self.agents.lock().remove(from);
         self.away_peers.lock().remove(from);
         self.reach.lock().forget(from);
@@ -1577,7 +1622,7 @@ impl Hub {
         }
         if b.low() && !was_low {
             let left = b.minutes.map(|m| format!(", about {m} min left")).unwrap_or_default();
-            let what = format!("{agent} is on battery at {}%{left}: plug it in, or it sleeps and its runner with it", b.percent);
+            let what = format!("{} is on battery at {}%{left}: plug it in, or it sleeps and its runner with it", snapshot.shown(), b.percent);
             tracing::warn!(machine = %agent, percent = b.percent, minutes = ?b.minutes, "a machine on battery is low");
             self.store.audit("kiln".into(), "machine.battery_low".into(), what.clone()).await;
             self.emit(&ServerEvent::MachineBatteryLow { machine: agent.to_owned(), battery: b, text: what });
@@ -1674,7 +1719,7 @@ impl Hub {
             self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() });
         }
         for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
-            match self.store.requeue_job(j.clone(), format!("{reason} ({name})")).await {
+            match self.store.requeue_job(j.clone(), format!("{reason} ({})", self.shown(name))).await {
                 Ok(true) => tracing::info!(job = %j, agent = name, "job requeued"),
                 Ok(false) => tracing::warn!(job = %j, agent = name, "job failed: out of retries"),
                 Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
@@ -1794,7 +1839,7 @@ impl Hub {
                 if self.owns_job(peer, &job) {
                     self.release_slot(&agent, &job);
                     self.declined.lock().insert((job.clone(), agent.clone()), Instant::now());
-                    self.store.unclaim_job(job.clone(), format!("declined by {agent}: {reason}")).await?;
+                    self.store.unclaim_job(job.clone(), format!("declined by {}: {reason}", self.shown(&agent))).await?;
                     self.emit_job(&job).await;
                     self.wake.notify();
                 }
@@ -2024,7 +2069,7 @@ impl Hub {
                             return None;
                         }
                         instances.lock().newest_with(n, proto::CAP_REACH)
-                    })
+                    }, |n| self.shown(n))
                 };
                 for (p, m) in out {
                     if let Ok(b) = proto::encode(&m) {
@@ -2272,7 +2317,7 @@ impl Hub {
                 // Another runner process of this machine runs it.
             } else {
                 self.store
-                    .requeue_job(j.id.clone(), format!("agent {name} restarted without the job"))
+                    .requeue_job(j.id.clone(), format!("agent {} restarted without the job", self.shown(&name)))
                     .await?;
                 self.emit_job(&j.id).await;
             }
@@ -2997,7 +3042,7 @@ impl Hub {
                     continue;
                 }
                 self.release_slot(&name, &j);
-                match self.store.requeue_job(j.clone(), format!("runner process did not reconnect ({name})")).await {
+                match self.store.requeue_job(j.clone(), format!("runner process did not reconnect ({})", self.shown(&name))).await {
                     Ok(_) => self.emit_job(&j).await,
                     Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
                 }
@@ -3452,5 +3497,34 @@ pub(crate) mod tests {
         assert!(!invites.take(&token), "an invite works once");
         invites.add("old".into(), Instant::now() - Duration::from_secs(1));
         assert!(!invites.take("old"), "an expired invite doesn't work");
+    }
+
+    /// docs/machines.md: what kiln says of a runner it knows by its machine id names it by its
+    /// label, connected or not seen since the server started; its id stays what's looked up by. One
+    /// known by its name is named by it, as before.
+    #[test]
+    fn a_runner_known_by_its_machine_id_is_named_by_its_label_in_what_kiln_says() -> anyhow::Result<()> {
+        use crate::wire::commands::Answer;
+        const STUDIO: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        const ATTIC: &str = "0b1d4e6f8a7c9b0d1e2f3a4b5f2a9c3e";
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.agents.lock().insert(STUDIO.into(), AgentLive { label: Some("studio".into()), connected: false, ..live_runner(STUDIO, "macos", "aarch64") });
+            hub.agents.lock().insert("fedora".into(), live_runner("fedora", "linux", "x86_64"));
+            // Named while it hasn't connected since the server started.
+            hub.set_label(ATTIC, "attic", "attic.local").await?;
+            let shown = [STUDIO, ATTIC, "fedora", "nowhere"].map(|n| hub.shown(n));
+            anyhow::ensure!(shown == ["studio", "attic", "fedora", "nowhere"], "{shown:?}");
+            // A command to it while it's away, and an agent asked of it by the name people type.
+            let away = hub.command_start(STUDIO, &ServerMsg::ProbeFacts).await;
+            anyhow::ensure!(away.at_once() == Some(&Answer::Unreachable { why: "studio is not connected".into() }), "{:?}", away.at_once());
+            let refused = crate::harness::lineage::pick(&hub, Some("studio"), "claude", None).err().map(|(_, why)| why);
+            anyhow::ensure!(refused.as_deref() == Some("studio isn't connected (or doesn't run agents): pick another machine"), "{refused:?}");
+            // Its target by the name people type is its id's; one by its id stays so.
+            let by_id = format!("agent:{STUDIO}");
+            let targets = ["agent:studio", by_id.as_str(), "agent:fedora"].map(|on| crate::harness::lineage::pick(&hub, Some(on), "claude", None).ok());
+            anyhow::ensure!(targets == [Some(by_id.clone()), Some(by_id.clone()), Some("agent:fedora".to_owned())], "{targets:?}");
+            Ok(())
+        })
     }
 }

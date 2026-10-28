@@ -1379,8 +1379,8 @@ impl Scheduler {
     }
 
     /// When not one of the runners that could take `l` (`eligible`) could hold it even idle, in
-    /// resource mode: what each has of what it's short of ("small has 16 GiB of memory"), by name.
-    /// `None` when one could, or one counts slots.
+    /// resource mode: what each has of what it's short of ("small has 16 GiB of memory"), by the
+    /// name people see. `None` when one could, or one counts slots.
     fn oversized(&self, eligible: &[&Runner], l: &Leg) -> Option<Vec<String>> {
         let c = self.config();
         if !c.resources {
@@ -1406,7 +1406,7 @@ impl Scheduler {
             if has.is_empty() {
                 return None;
             }
-            short.push(format!("{} has {}", r.input.view.name, has.join(", ")));
+            short.push(format!("{} has {}", r.input.view.shown(), has.join(", ")));
         }
         short.sort();
         Some(short)
@@ -2603,7 +2603,7 @@ impl Scheduler {
             .enumerate()
             .map(|(i, r)| {
                 let mut checks = routing::checks(&l.req, &r.input.view);
-                checks.extend(placement_check(&l.input.placement, r));
+                checks.extend(placement_check(&l.input.placement, r, |id| self.runners.get(id).map_or_else(|| id.to_owned(), |x| x.input.view.shown().to_owned())));
                 Explained {
                     runner: r.input.id.clone(),
                     name: r.input.view.name.clone(),
@@ -2707,14 +2707,15 @@ fn ms(s: f64) -> i64 {
     (s * 1000.0).round() as i64
 }
 
-/// A person's retry's placement as one more check of a runner, for explanations (W05-R28).
-fn placement_check(p: &Placement, r: &Runner) -> Option<Check> {
+/// A person's retry's placement as one more check of a runner, for explanations (W05-R28): the
+/// runners in it by the names people see (`shown`, of a runner's id).
+fn placement_check(p: &Placement, r: &Runner, shown: impl Fn(&str) -> String) -> Option<Check> {
     let (requirement, pass) = match (&p.runner, &p.avoid) {
-        (Some(x), _) => (format!("runner == {x} (asked by its retry)"), r.input.id == *x),
-        (None, Some(x)) => (format!("runner != {x} (asked by its retry)"), r.input.id != *x),
+        (Some(x), _) => (format!("runner == {} (asked by its retry)", shown(x)), r.input.id == *x),
+        (None, Some(x)) => (format!("runner != {} (asked by its retry)", shown(x)), r.input.id != *x),
         (None, None) => return None,
     };
-    Some(Check { requirement, value: format!("runner = {}", r.input.view.name), pass })
+    Some(Check { requirement, value: format!("runner = {}", r.input.view.shown()), pass })
 }
 
 fn add(a: &mut Resources, b: &Resources) {

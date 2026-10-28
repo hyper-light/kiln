@@ -414,7 +414,7 @@ pub async fn upload(hub: &Hub, name: &str, req: Request) -> Answer {
     if peers(hub, name).0.is_none() {
         return Err(fail(
             StatusCode::CONFLICT,
-            format!("{name} is not connected (or too old for a front door): the key is only ever kept on the runner, so it has to be online to take it"),
+            format!("{} is not connected (or too old for a front door): the key is only ever kept on the runner, so it has to be online to take it", hub.shown(name)),
         ));
     }
     let mut settings = hub.front_doors.settings(name);
@@ -424,7 +424,7 @@ pub async fn upload(hub: &Hub, name: &str, req: Request) -> Answer {
     hub.front_doors.inner.lock().entry(name.to_owned()).or_default().settings = settings;
     let sent = push(hub, name, None, Some(CustomCert { cert_pem: up.cert_pem, key_pem: up.key_pem })).await;
     if !sent {
-        return Err(fail(StatusCode::BAD_GATEWAY, format!("{name} could not be reached; try again")));
+        return Err(fail(StatusCode::BAD_GATEWAY, format!("{} could not be reached; try again", hub.shown(name))));
     }
     let short: String = info.sha256.chars().take(16).collect();
     hub.store
@@ -434,7 +434,8 @@ pub async fn upload(hub: &Hub, name: &str, req: Request) -> Answer {
     Ok(srv::json(StatusCode::OK, &json!({ "cert": info, "front_door": view(hub, name).await })))
 }
 
-/// Why a runner's front door cannot renew its certificate now, if it cannot.
+/// Why a runner's front door cannot renew its certificate now, if it cannot: the runner said as
+/// `name`, the name people see.
 fn renewable(settings: &Settings, name: &str) -> Result<(), String> {
     if !settings.https.enabled {
         return Err(format!("HTTPS is off on {name}: turn it on and save first"));
@@ -451,9 +452,9 @@ pub async fn renew(hub: &Hub, name: &str) -> Answer {
     if !known(hub, name).await {
         return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
     }
-    renewable(&hub.front_doors.settings(name), name).map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    renewable(&hub.front_doors.settings(name), &hub.shown(name)).map_err(|e| fail(StatusCode::CONFLICT, e))?;
     let Some(peer) = peers(hub, name).0 else {
-        return Err(fail(StatusCode::CONFLICT, format!("{name} is not connected (or too old for a front door): its key is made there, so it has to be online")));
+        return Err(fail(StatusCode::CONFLICT, format!("{} is not connected (or too old for a front door): its key is made there, so it has to be online", hub.shown(name))));
     };
     // The new key's CSR is signed as soon as it arrives, even within a minute of the last one.
     if let Some(e) = hub.front_doors.inner.lock().get_mut(name) {
@@ -461,7 +462,7 @@ pub async fn renew(hub: &Hub, name: &str) -> Answer {
     }
     let settings = hub.front_doors.settings(name);
     if !send(hub, name, peer, &Push { settings, renew: true, ..Push::default() }).await {
-        return Err(fail(StatusCode::BAD_GATEWAY, format!("{name} could not be reached; try again")));
+        return Err(fail(StatusCode::BAD_GATEWAY, format!("{} could not be reached; try again", hub.shown(name))));
     }
     hub.store.audit("admin".into(), "front_door.renew".into(), format!("{name}: asked for a new key and self-signed certificate")).await;
     hub.emit(&crate::wire::events::ServerEvent::FrontDoor { runner: name.to_string() });
@@ -486,7 +487,7 @@ pub async fn download(hub: &Hub, name: &str) -> Answer {
     let (status, _) = hub.front_doors.status(name);
     let cert = status.map(|s| s.cert).unwrap_or_default();
     let Some(pem) = cert.pem.and_then(|p| crate::pki::public_chain_pem(&p).ok()) else {
-        return Err(fail(StatusCode::NOT_FOUND, format!("{name} serves no certificate (yet)")));
+        return Err(fail(StatusCode::NOT_FOUND, format!("{} serves no certificate (yet)", hub.shown(name))));
     };
     let r = srv::response(StatusCode::OK, "application/x-pem-file", srv::full(pem.into_bytes()));
     let r = srv::with_header(r, header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", pem_filename(cert.info.as_ref(), name)));

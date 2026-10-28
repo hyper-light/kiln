@@ -121,7 +121,7 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
             match msg {
                 AgentMsg::Reach { to, link, open, data, close } => {
                     let p = Arc::clone(&peers);
-                    let out = relay.forward(from, from_peer, Frame { to, link, open, data, close }, move |n| p.lock().get(n).copied());
+                    let out = relay.forward(from, from_peer, Frame { to, link, open, data, close }, move |n| p.lock().get(n).copied(), str::to_owned);
                     for (to, sm) in out {
                         deliver(&peers, &handle_of, to, sm).await;
                     }

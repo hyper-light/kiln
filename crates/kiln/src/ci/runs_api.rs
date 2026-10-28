@@ -635,7 +635,7 @@ pub async fn release(hub: &Hub, id: &str, by: &str) -> Result<Response, Fail> {
     let agent = kept_on(hub, id).await?;
     // Parked: a runner that's away lets it go once it's back. Refused, it says why.
     let answer = hub.command(&agent, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }, crate::hub::COMMAND_WITHIN).await;
-    if let Some(f) = answer.failure(&agent) {
+    if let Some(f) = answer.failure(&hub.shown(&agent)) {
         return Err(f);
     }
     super::runs::kept(hub, id, None).await.map_err(internal)?;
@@ -652,7 +652,7 @@ pub async fn extend(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respo
     let minutes = body.get("minutes").and_then(Value::as_u64).unwrap_or(30).clamp(1, u64::from(crate::runner::kept::MAX_KEEP_MINUTES));
     let minutes = u32::try_from(minutes).unwrap_or(30);
     let answer = hub.command(&agent, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }, crate::hub::COMMAND_WITHIN).await;
-    if let Some(f) = answer.failure(&agent) {
+    if let Some(f) = answer.failure(&hub.shown(&agent)) {
         return Err(f);
     }
     let until = crate::util::now_unix() + i64::from(minutes) * 60;
@@ -691,7 +691,7 @@ pub async fn rerun_step(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<R
         return Err((StatusCode::CONFLICT, "a step of this leg is running again already; rerun once it ends".into()));
     }
     // Live: refused at once while its runner is away, rather than run later.
-    if let Some(f) = hub.command(&agent, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }, crate::hub::COMMAND_WITHIN).await.failure(&agent) {
+    if let Some(f) = hub.command(&agent, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }, crate::hub::COMMAND_WITHIN).await.failure(&hub.shown(&agent)) {
         return Err(f);
     }
     hub.store.audit(by.to_owned(), "ci.legs.rerun_step".into(), format!("{id} step {}", step + 1)).await;
@@ -723,7 +723,7 @@ pub async fn exec(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Opt
     let by = caller.map_or_else(|| "admin".to_owned(), |c| c.name.clone());
     // On the host executor the leg's shell is a shell on the runner itself.
     if executor.as_deref() == Some("host") && caller.is_some_and(|c| !c.can("runners.terminal", &crate::authz::Scope::Runner { runner: agent.clone() })) {
-        return Err((StatusCode::FORBIDDEN, format!("{by} may not run commands on runner {agent}: a host leg's shell needs runners.terminal there")));
+        return Err((StatusCode::FORBIDDEN, format!("{by} may not run commands on runner {}: a host leg's shell needs runners.terminal there", hub.shown(&agent))));
     }
     hub.store.audit(by, "ci.legs.exec".into(), format!("{id}: {command}")).await;
     let (session, mut seen) = crate::termsess::exec_leg(hub, agent, id, &command);

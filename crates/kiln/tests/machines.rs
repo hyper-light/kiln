@@ -131,6 +131,11 @@ fn a_runner_from_before_moves_to_its_machine_id_with_what_was_kept_under_its_nam
     let list = until(s.port, &s.admin, "the other machine connected", &other_log, |l| l.iter().any(|a| text(a, "name") == other && connected(a)))?;
     let shown = |k: &str| list.iter().find(|a| text(a, "name") == k).map(|a| text(a, "label").to_owned()).unwrap_or_default();
     assert_eq!((shown(&id), shown(&other)), ("build-box".to_owned(), "build-box-2".to_owned()), "{list:?}");
+    // A grant on it by the name people see is on the runner kiln knows by its id.
+    let (st, body) = http(s.port, "POST", "/api/grants", &s.admin, Some(&json!({ "user": "dan", "grant": "runners.read@runner:build-box" })))?;
+    anyhow::ensure!((200..300).contains(&st), "granting by its name: {st} {body}");
+    let (_, body) = http(s.port, "GET", "/api/users", &s.admin, None)?;
+    assert!(body.contains(&format!("runners.read@runner:{id}")) && !body.contains("runners.read@runner:build-box"), "{body}");
     Ok(())
 }
 

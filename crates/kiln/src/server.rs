@@ -116,6 +116,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
     }
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
+    // The names people see of the runners kiln knows by their machine ids, for the sentences that
+    // name them (docs/machines.md).
+    hub.load_labels().await;
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.

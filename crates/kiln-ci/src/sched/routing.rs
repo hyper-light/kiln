@@ -825,6 +825,12 @@ pub struct RunnerView {
 }
 
 impl RunnerView {
+    /// The name people see: its label, else its name. What the sentences people read say of it;
+    /// what's looked up by, its name.
+    pub fn shown(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
     /// Its labels and the ones GitHub gives every self-hosted runner.
     pub fn all_labels(&self) -> Vec<String> {
         let mut l = self.labels.clone();

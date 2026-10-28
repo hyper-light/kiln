@@ -99,6 +99,12 @@ pub fn room(s: Strain, busy: u32, slots: u32) -> f32 {
 }
 
 impl RunnerInfo {
+    /// The name people see: its label, else its name. What sentences say of it; what's looked up
+    /// by, its name.
+    pub fn shown(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
     /// How hard it is pressed, by its last sample.
     pub fn strain(&self) -> Strain {
         strain(self.cpus, self.cpu_pct, self.load1, self.mem_total, self.mem_used)
@@ -389,7 +395,8 @@ pub fn pick(runners: &[RunnerInfo], want: &Want, me: &str) -> anyhow::Result<Cho
     if passed.is_empty() {
         anyhow::bail!("no runners are known yet");
     }
-    let detail: Vec<String> = passed.iter().map(|(n, w)| format!("{n}: {w}")).collect();
+    let shown = |n: &str| runners.iter().find(|r| r.name == n).map_or_else(|| n.to_owned(), |r| r.shown().to_owned());
+    let detail: Vec<String> = passed.iter().map(|(n, w)| format!("{}: {w}", shown(n))).collect();
     anyhow::bail!("no runner suits {}: {}", want.describe(), detail.join("; "))
 }
 

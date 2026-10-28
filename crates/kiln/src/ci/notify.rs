@@ -451,10 +451,11 @@ impl Msg {
         }
     }
 
-    /// An agent's event, as `crate::push` sends it: `{type, agent: {id, name, machine, …}, title, text, url}`.
-    fn of_agent(event: &str, ev: &Value) -> Msg {
+    /// An agent's event, as `crate::push` sends it: `{type, agent: {id, name, machine, …}, title, text, url}`;
+    /// its machine said as `machine`, the name people see of it.
+    fn of_agent(event: &str, ev: &Value, machine: &str) -> Msg {
         let get = |p: &str| ev.pointer(p).and_then(Value::as_str).unwrap_or_default().to_owned();
-        let (id, name, machine, text, url) = (get("/agent/id"), get("/agent/name"), get("/agent/machine"), get("/text"), get("/url"));
+        let (id, name, text, url) = (get("/agent/id"), get("/agent/name"), get("/text"), get("/url"));
         let title = match event {
             "agent.needs_you" => format!("⏸ {name} needs you"),
             "agent.finished" => format!("✓ {name} finished"),
@@ -839,7 +840,8 @@ fn takes_agent(rule: &Rule, event: &str, ev: &Value) -> bool {
 pub async fn agent_event(hub: Arc<Hub>, ev: Value) {
     let Some(event) = ev.get("type").and_then(Value::as_str).filter(|e| AGENT_EVENTS.contains(e)).map(str::to_owned) else { return };
     let id = ev.pointer("/agent/id").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let m = Msg::of_agent(&event, &ev);
+    let machine = hub.shown(ev.pointer("/agent/machine").and_then(Value::as_str).unwrap_or_default());
+    let m = Msg::of_agent(&event, &ev, &machine);
     for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
         if rule.check(true).is_err() || !takes_agent(rule, &event, &ev) {
             continue;
@@ -1314,7 +1316,7 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
     let runner = serde_json::to_value(&offline).unwrap_or(Value::Null);
     hub.emit(&crate::wire::events::ServerEvent::RunnerOffline { runner: offline });
     let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
-    let title = format!("⚠ runner {name} is offline");
+    let title = format!("⚠ runner {} is offline", hub.shown(&name));
     let line = format!("gone {} min · {} · {url}", gone_for / 60, if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") });
     let m = Msg {
         title: title.clone(),
@@ -1659,12 +1661,17 @@ mod tests {
         assert!(rule("agent.paused", None).check(true).is_ok());
         assert!(rule("agent.paused", None).check(false).is_err());
         assert!(parse_rules("- on: agent.finished\n  to: slack:#x\n").is_err());
-        let m = Msg::of_agent("agent.needs_you", &ev);
+        let m = Msg::of_agent("agent.needs_you", &ev, "metal-1");
         assert_eq!(m.title, "⏸ Mantle needs you");
         assert_eq!(m.line, "Asks: which database? · metal-1 · https://kiln.example/agents/ag1");
         assert_eq!(m.dedup, "kiln:agent:ag1");
-        assert!(!m.resolve && Msg::of_agent("agent.finished", &ev).resolve);
+        assert!(!m.resolve && Msg::of_agent("agent.finished", &ev, "metal-1").resolve);
         assert_eq!(m.webhook.pointer("/agent/opener").and_then(Value::as_str), Some("owner"));
+        // A machine kiln knows by its machine id is said by its label; the webhook's agent keeps the
+        // key rules and links go by (docs/machines.md).
+        let labelled = Msg::of_agent("agent.needs_you", &ev, "studio");
+        assert_eq!(labelled.line, "Asks: which database? · studio · https://kiln.example/agents/ag1");
+        assert_eq!(labelled.webhook.pointer("/agent/machine").and_then(Value::as_str), Some("metal-1"));
         // A run's message is as it was.
         let r = Msg::of_run("run.failed", &subject());
         assert_eq!((r.title.as_str(), r.dedup.as_str(), r.resolve), ("✗ CI #7 failed on main", "kiln:acme/app:.github/workflows/ci.yml:main", false));

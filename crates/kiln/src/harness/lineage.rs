@@ -503,7 +503,7 @@ fn candidates(hub: &Hub, want: &crate::reach::directory::Want) -> (Vec<String>, 
         }
         let why_not = w.mismatch(r).or_else(|| (!r.connected).then(|| "offline".to_owned()));
         if let Some(why) = why_not {
-            passed.push(format!("{}: {why}", r.name));
+            passed.push(format!("{}: {why}", r.shown()));
             continue;
         }
         // Its room as reach measures it (an overloaded machine only when none other suits); CI
@@ -524,8 +524,9 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
         (None, Some(d)) => return Ok(d.to_owned()),
         (None, None) => String::new(),
     };
+    // A runner kiln knows by its machine id is named by its label too (docs/machines.md).
     if let Some(m) = on.strip_prefix("agent:") {
-        return Ok(format!("agent:{m}"));
+        return Ok(format!("agent:{}", hub.machine_named(m).unwrap_or_else(|| m.to_owned())));
     }
     let mut want = crate::reach::directory::Want::parse(&on).map_err(|e| bad(format!("`on`: {e:#}")))?;
     // A machine named, and nothing else asked of it: that one (it says itself if it can't start
@@ -538,7 +539,7 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
         let name = hub.machine_named(&name).unwrap_or(name);
         return match hub.agents.lock().get(&name) {
             Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
-            Some(_) => Err((StatusCode::CONFLICT, format!("{name} isn't connected (or doesn't run agents): pick another machine"))),
+            Some(a) => Err((StatusCode::CONFLICT, format!("{} isn't connected (or doesn't run agents): pick another machine", a.shown()))),
             None => Err((StatusCode::CONFLICT, format!("kiln has no machine named {name}"))),
         };
     }
@@ -584,8 +585,10 @@ pub async fn placed(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &s
 }
 
 fn not_installed(hub: &Hub, target: &str, kind: &Kind) -> Refused {
-    let machine = target.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), str::to_owned);
+    let machine = target.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), |m| hub.shown(m));
     let (with, _) = candidates(hub, &crate::reach::directory::Want { harness: Some(kind.id.to_owned()), ..Default::default() });
+    // As people know them, as `on` takes them.
+    let with: Vec<String> = with.iter().map(|m| hub.shown(m)).collect();
     let why = if with.is_empty() {
         format!("{} isn't installed on {machine}, nor on any other connected machine", kind.name)
     } else {
@@ -602,11 +605,12 @@ pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
         Some(machine) => {
             let caps = hub.instances.lock().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
             if !caps {
-                return Err(format!("{machine}'s kiln is older than workspaces: upgrade it (System → Updates)"));
+                return Err(format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)));
             }
-            match hub.agents.lock().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone())) {
+            let said = hub.agents.lock().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone()));
+            match said {
                 Some(f) => f,
-                None => return Err(format!("{machine} hasn't said yet whether it has Slates: try again in a minute")),
+                None => return Err(format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine))),
             }
         }
     };

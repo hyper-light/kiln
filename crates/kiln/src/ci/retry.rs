@@ -170,7 +170,8 @@ async fn candidates(hub: &Hub, id: &str, j: &Job) -> Result<Vec<Candidate>, Fail
 /// Where the retry asks it to run, checked: a runner able to run it, or any but the one its
 /// last attempt ran on. `None`: anywhere it can.
 async fn placement_of(hub: &Hub, id: &str, j: &Job, body: &Value) -> Result<Option<Placement>, Fail> {
-    let runner = body.get("runner").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
+    // A runner kiln knows by its machine id is named by its label too (docs/machines.md).
+    let runner = body.get("runner").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty()).map(|r| hub.machine_named(r).unwrap_or_else(|| r.to_owned()));
     let elsewhere = body.get("elsewhere").and_then(Value::as_bool).unwrap_or(false);
     match (runner, elsewhere) {
         (None, false) => Ok(None),
@@ -183,18 +184,19 @@ async fn placement_of(hub: &Hub, id: &str, j: &Job, body: &Value) -> Result<Opti
         }
         (Some(name), false) => match candidates(hub, id, j).await?.into_iter().find(|c| c.name == name) {
             Some(c) if c.why.is_empty() => Ok(Some(Placement { runner: Some(name), avoid: None })),
-            Some(c) => Err(conflict(format!("{name} can't run it: {}", c.why.join("; ")))),
-            None if hub.agents.lock().get(&name).is_some_and(|a| a.ephemeral || a.outpost) => Err(bad(format!("{name} takes no job asked of it: a pod made for another job, or an outpost"))),
+            Some(c) => Err(conflict(format!("{} can't run it: {}", hub.shown(&name), c.why.join("; ")))),
+            None if hub.agents.lock().get(&name).is_some_and(|a| a.ephemeral || a.outpost) => Err(bad(format!("{} takes no job asked of it: a pod made for another job, or an outpost", hub.shown(&name)))),
             None => Err(bad(format!("no runner `{name}`"))),
         },
     }
 }
 
-/// What a placement says, for logs and the audit: ` on X`, ` anywhere but X`.
-fn said(p: Option<&Placement>) -> String {
+/// What a placement says, for logs and the audit: ` on X`, ` anywhere but X`, each runner as `name`
+/// says it (by its name for the audit, the name people see for a log).
+fn said(p: Option<&Placement>, name: impl Fn(&str) -> String) -> String {
     match p.map(|p| (&p.runner, &p.avoid)) {
-        Some((Some(r), _)) => format!(" on {r}"),
-        Some((None, Some(a))) => format!(" anywhere but {a}"),
+        Some((Some(r), _)) => format!(" on {}", name(r)),
+        Some((None, Some(a))) => format!(" anywhere but {}", name(a)),
         _ => String::new(),
     }
 }
@@ -239,13 +241,13 @@ pub async fn retry(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
         return Err(conflict(why));
     }
     let placement = placement_of(hub, id, &j, body).await?;
-    let said = said(placement.as_ref());
+    let (said, shown) = (said(placement.as_ref(), str::to_owned), said(placement.as_ref(), |r| hub.shown(r)));
     match j.kind() {
         "pipeline" => match hub.store.retry_job(id.to_owned(), placement.clone()).await.map_err(internal)? {
             JobRetry::NoSuchJob => Err((StatusCode::NOT_FOUND, "no such job".into())),
             JobRetry::Refused(why) => Err(conflict(why)),
             JobRetry::Again { run, attempt, waiting } => {
-                mark(hub, id, &format!("retried by {by}{said}: its next attempt follows")).await;
+                mark(hub, id, &format!("retried by {by}{shown}: its next attempt follows")).await;
                 for w in &waiting {
                     mark(hub, w, &format!("run again with {}'s retry: its next attempt follows", j.key)).await;
                 }

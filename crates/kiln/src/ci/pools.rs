@@ -204,7 +204,7 @@ async fn effect(hub: &Hub, pool: &Pool) -> (Vec<Value>, Value) {
         diagnostics.push(json!({ "level": "warning", "message": format!("no runner connected now announces the {} executor: none of {}'s executors can start", pool.executor, pool.name) }));
     }
     for r in carriers {
-        diagnostics.push(json!({ "level": "warning", "message": format!("runner {r} carries all of {} itself: a leg asking for them may run there instead of in the pool", pool.labels.join(", ")) }));
+        diagnostics.push(json!({ "level": "warning", "message": format!("runner {} carries all of {} itself: a leg asking for them may run there instead of in the pool", hub.shown(&r), pool.labels.join(", ")) }));
     }
     let (tx, rx) = async_channel::bounded(1);
     hub.ci.send(super::dispatch::Msg::Pools { reply: tx });

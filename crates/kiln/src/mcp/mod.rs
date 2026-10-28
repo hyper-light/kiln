@@ -238,7 +238,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
     let caller = if session.is_empty() && !terminal.is_empty() && ask.get("op").and_then(Value::as_str) == Some("call") {
         terminal_caller(hub, terminal, Some(runner)).await
     } else if session.is_empty() || !hub.harness.located_on(session, runner) {
-        return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
+        return json!({"error": format!("kiln knows no agent session {session:?} on {}: its operations are for the agents it runs", hub.shown(runner))});
     } else {
         session_caller(hub, session, Some(runner)).await
     };
