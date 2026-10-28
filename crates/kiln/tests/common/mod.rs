@@ -982,6 +982,21 @@ fn sweep(work: &Path) {
     }
 }
 
+/// One look of a loop that waits until its own deadline: a request that failed (`http`'s 30 s read
+/// timeout, the server slow on a loaded machine: a pool's burst, a runner's probes) is "not yet"
+/// until then, not the test's end.
+#[allow(dead_code)]
+pub fn polled<T>(look: anyhow::Result<T>, deadline: Instant, what: &str) -> anyhow::Result<Option<T>> {
+    match look {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if Instant::now() < deadline => {
+            eprintln!("{what}: {e:#}; again");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// What a test server has besides the defaults.
 #[derive(Default)]
 pub struct Options<'a> {
