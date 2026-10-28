@@ -321,6 +321,10 @@ on its own machine, with its own tools. Its tools:
 | `research_*`, `conversations_search` | research it records, each finding graded by kiln from its sources (docs/research.md), and every agent's conversations kiln keeps |
 | `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
 
+Each of its own tools (and each `kiln.machines.*` operation below) reads its arguments as a type
+(`reach::mcp::input`), its `inputSchema` made from it. A call that doesn't fit is a tool error
+saying where and why, and the server hears of it (docs/wire.md, `mcp_reach`).
+
 The `agents_*`, `goals_*`, `research_*` and `plans_*` tools are the ones the kiln server says agents
 have (its answer for the operations names them), each as the server describes it, so a server
 deployed with new ones offers them to agents on runners not yet upgraded. Every minute the MCP

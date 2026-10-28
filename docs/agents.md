@@ -584,6 +584,11 @@ says (`additionalProperties: false`), and so is one of the wrong type. Over MCP 
 correct the call; it's noted as a message kiln couldn't read (docs/wire.md, "What can't be read"),
 on the agent's page.
 
+The tools that aren't operations are typed too: code mode's `code_search` and `code_run`, and on a
+runner its own MCP server's tools (`run`, `runners`, `output`, `stop` and the page tools) and a
+program's `kiln.machines.*` (docs/reach.md §7). Their arguments are read as their types before
+they run, and refused and noted the same way.
+
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
 as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.

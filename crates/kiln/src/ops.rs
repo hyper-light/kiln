@@ -167,6 +167,32 @@ fn optional_not_null(v: &mut Value) {
     }
 }
 
+/// A schema as kiln's hand-written schemas spelled it, to hold a generated one ([`schema_of`]) to
+/// the one it replaces: without a number's `format` (schemars says `f64` is a `double`), and
+/// without `additionalProperties` as a boolean (`true` on a free-form object; `false`, which is
+/// what reading an input as its type adds, `deny_unknown_fields`).
+#[cfg(test)]
+pub(crate) fn as_written_by_hand(schema: &Value) -> Value {
+    fn walk(v: &mut Value) {
+        let Some(o) = v.as_object_mut() else { return };
+        o.remove("format");
+        if o.get("additionalProperties").is_some_and(Value::is_boolean) {
+            o.remove("additionalProperties");
+        }
+        for (k, sub) in o.iter_mut() {
+            match k.as_str() {
+                "properties" => sub.as_object_mut().into_iter().flat_map(|p| p.values_mut()).for_each(walk),
+                "items" | "additionalProperties" => walk(sub),
+                "anyOf" | "oneOf" | "allOf" => sub.as_array_mut().into_iter().flatten().for_each(walk),
+                _ => {}
+            }
+        }
+    }
+    let mut v = schema.clone();
+    walk(&mut v);
+    v
+}
+
 /// `input` read as a `T`: where and why it doesn't fit.
 fn fits<T: DeserializeOwned>(input: &Value) -> Result<(), Misfit> {
     serde_path_to_error::deserialize::<_, T>(input).map(|_| ()).map_err(|e| Misfit::of(e.path(), &e.inner().to_string()))

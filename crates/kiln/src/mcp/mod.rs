@@ -679,6 +679,11 @@ impl Server {
         let cx = self.cx();
         match name {
             "code_search" | "code_run" => {
+                // Arguments that don't fit the tool's type: a tool error saying where and why, noted,
+                // as an operation's are. A program left out is refused, not run empty.
+                if let Some(m) = code_input(name).and_then(|i| i.fits(&args).err()) {
+                    return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), name, &m, None).await);
+                }
                 let program = args.get("program").and_then(Value::as_str).unwrap_or("").to_owned();
                 let mode = if name == "code_search" { code::Mode::Search } else { code::Mode::Run { input: args.get("input").cloned().unwrap_or(Value::Null) } };
                 let result = crate::rt::blocking(move || code::run(cx, mode, &program, code::Limits::default())).await;
@@ -726,20 +731,18 @@ pub fn tools(hub: &Hub) -> Vec<Value> {
 }
 
 fn tools_of(ops: Vec<crate::ops::Info>) -> Vec<Value> {
+    let schema = |tool: &str| code_input(tool).map_or(Value::Null, |i| i.schema());
     let mut out = vec![
         json!({
             "name": "code_search",
             "description": "Run a JavaScript program over kiln's operation registry and return what it returns. The program sees `registry` (every operation: {name, call, summary, read_only, destructive, input}) and `skills` ({name, description}). Example: `return registry.filter(o => o.name.startsWith(\"cd.apps\")).map(o => ({call: o.call, input: o.input}))`.",
-            "inputSchema": {"type": "object", "properties": {"program": {"type": "string", "description": "The body of an async function; `return` its answer."}}, "required": ["program"]},
+            "inputSchema": schema("code_search"),
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         }),
         json!({
             "name": "code_run",
             "description": "Run a JavaScript program that calls kiln and return what it returns: only that enters your context. Operations are async functions on `kiln` (`await kiln.cd.apps.list({health: \"Degraded\"})`, `kiln.call(\"cd.apps.get\", {app})`); a refused call throws an Error with `result`. `input` is given as `input`. Bounded: 64 MiB, 60 s, 2,000 calls, a 4 MiB answer.",
-            "inputSchema": {"type": "object", "properties": {
-                "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
-                "input": {"description": "Any JSON, available as `input`."}
-            }, "required": ["program"]},
+            "inputSchema": schema("code_run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
         }),
     ];
@@ -753,6 +756,39 @@ fn tools_of(ops: Vec<crate::ops::Info>) -> Vec<Value> {
         }));
     }
     out
+}
+
+/// What code mode's tool `tool` takes, as an operation takes its input: its schema is the tool's
+/// `inputSchema`, and each call's arguments are read as it before the program runs.
+fn code_input(tool: &str) -> Option<crate::ops::Input> {
+    match tool {
+        "code_search" => Some(crate::ops::Input::of::<input::CodeSearch>()),
+        "code_run" => Some(crate::ops::Input::of::<input::CodeRun>()),
+        _ => None,
+    }
+}
+
+/// Code mode's tools' inputs (a runner's own server takes [`input::CodeSearch`] too,
+/// `crate::reach::mcp`).
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CodeSearch {
+        /// The body of an async function; `return` its answer.
+        pub program: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CodeRun {
+        /// The body of an async function; `return` its answer.
+        pub program: String,
+        /// Any JSON, available as `input`.
+        pub input: Option<serde_json::Value>,
+    }
 }
 
 /// `kiln mcp`: MCP over stdio for local clients, each message forwarded to the server's
@@ -985,6 +1021,65 @@ mod tests {
                 }
             }
             anyhow::ensure!(differ.is_empty(), "published schemas that aren't their input type's: {differ:?}");
+            Ok(())
+        })
+    }
+
+    /// Code mode's tools are typed as the operations are: each publishes its input type's schema,
+    /// which says what the hand-written one did (but for spelling, `ops::as_written_by_hand`, and
+    /// `additionalProperties: false`), and a call's arguments are read as it before the program
+    /// runs. An argument it doesn't take, one of the wrong type, and a program left out or
+    /// misspelled (it ran empty before) are tool errors saying which and where, each noted against
+    /// the agent, on its page. `code_run`'s `input` is any JSON.
+    #[test]
+    fn code_mode_s_tools_are_typed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
+            agent.agent = Some("s1".into());
+            let call = |tool: &str, arguments: Value| {
+                let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}).to_string();
+                let (hub, caller) = (&hub, agent.clone());
+                async move { answer(hub, caller, body.as_bytes()).await }
+            };
+            // A tool error saying `code` at `path`.
+            let refused = |a: &Option<Value>, code: &str, path: &str| {
+                let at = |p: &str| a.as_ref().and_then(|a| a.pointer(p)).cloned();
+                at("/result/isError") == Some(json!(true)) && at("/result/structuredContent/code") == Some(json!(code)) && at("/result/structuredContent/path") == Some(json!(path))
+            };
+            // What each published before it was typed, as it was written by hand.
+            let before = [
+                ("code_search", json!({"type": "object", "properties": {"program": {"type": "string", "description": "The body of an async function; `return` its answer."}}, "required": ["program"]})),
+                (
+                    "code_run",
+                    json!({"type": "object", "properties": {
+                        "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
+                        "input": {"description": "Any JSON, available as `input`."}
+                    }, "required": ["program"]}),
+                ),
+            ];
+            let tools = tools_of(Vec::new());
+            for (name, was) in before {
+                let schema = tools.iter().find(|t| t.get("name") == Some(&json!(name))).and_then(|t| t.get("inputSchema")).cloned().unwrap_or_default();
+                anyhow::ensure!(Some(&schema) == code_input(name).map(|i| i.schema()).as_ref(), "{name} publishes its type's schema: {schema}");
+                anyhow::ensure!(schema.get("additionalProperties") == Some(&json!(false)) && crate::ops::as_written_by_hand(&schema) == was, "{name}: {schema}");
+                let a = call(name, json!({"zz_not_a_field": 1})).await;
+                anyhow::ensure!(refused(&a, "unknown_field", "/zz_not_a_field"), "{name}: {a:?}");
+                let a = call(name, json!({"program": 1})).await;
+                anyhow::ensure!(refused(&a, "invalid_type", "/program"), "{name}: {a:?}");
+                let a = call(name, json!({"programm": "return 1"})).await;
+                anyhow::ensure!(refused(&a, "unknown_field", "/programm"), "{name}: {a:?}");
+                let a = call(name, json!({})).await;
+                anyhow::ensure!(refused(&a, "missing_field", ""), "{name}: {a:?}");
+            }
+            let a = call("code_search", json!({"program": "return 1", "input": 2})).await;
+            anyhow::ensure!(refused(&a, "unknown_field", "/input"), "code_search takes no input: {a:?}");
+            let a = call("code_run", json!({"program": "return input", "input": [1, {"a": null}]})).await;
+            anyhow::ensure!(a.as_ref().and_then(|a| a.pointer("/result/structuredContent/result")) == Some(&json!([1, {"a": null}])), "{a:?}");
+            // Each refusal noted against the agent, on its page.
+            let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(9), "{kept:?}");
             Ok(())
         })
     }
