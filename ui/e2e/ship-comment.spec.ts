@@ -62,11 +62,13 @@ for (const width of [1280, 390])
       await expect(field).toBeVisible();
       await field.fill(said);
       await writing.getByRole("button", { name: "Comment", exact: true }).click({ timeout: 15_000 });
-      // Posted: the thread under the last line, kept by kiln on both lines.
-      const thread = files.locator(".rv-thread").filter({ hasText: said });
+      // Posted: the thread under the last line, kept by kiln on both lines. (A posted thread has its
+      // kind, data-k; the composer, which stays open with the same words until kiln answers, has none.)
+      const thread = files.locator(".rv-thread[data-k]").filter({ hasText: said });
       await expect(thread).toBeVisible({ timeout: 15_000 });
-      expect(await thread.evaluate((el) => (el.previousElementSibling as HTMLElement | null)?.dataset.rvl)).toBe(`${pick.file}|new:${pick.b}`);
       await expect.poll(async () => (await threadsOf(page)).find((t) => t.comments[0]?.body === said)?.id ?? "").not.toBe("");
+      // Once kiln has it (the thread shown at once is swapped for kiln's), it sits right under the last line.
+      await expect.poll(() => thread.evaluate((el) => (el.previousElementSibling as HTMLElement | null)?.dataset.rvl)).toBe(`${pick.file}|new:${pick.b}`);
       const kept = (await threadsOf(page)).find((t) => t.comments[0]?.body === said);
       expect({ file: kept?.file, side: kept?.side, start: kept?.start_line, end: kept?.end_line }).toEqual({ file: pick.file, side: "new", start: pick.a, end: pick.b });
       // A reply joins it.
@@ -89,8 +91,13 @@ for (const width of [1280, 390])
       await expect(there.locator(".rv-thread-folded")).toContainText("2 comments");
       const under = await there.evaluate((el) => [...(el.closest(".rv-under")?.previousElementSibling?.querySelectorAll('.rv-num[data-side="new"]') ?? [])].map((b) => b.textContent));
       expect(under).toContain(String(pick.b));
-      await there.locator(".rv-thread-folded").click({ timeout: 15_000 });
-      await expect(there).toContainText(said);
+      // Opened, it holds the comment and the reply. (A click as the page is still settling can miss
+      // the folded line, in WebKit at 390 px: it's clicked again until the thread opens.)
+      await expect(async () => {
+        const fold = there.locator(".rv-thread-folded");
+        if (await fold.count()) await fold.click({ timeout: 2_000 });
+        await expect(there).toContainText(said, { timeout: 1_000 });
+      }).toPass({ timeout: 15_000 });
       await expect(there).toContainText(answer);
     } finally {
       for (const t of (await threadsOf(page)).filter((x) => x.comments[0]?.body === said)) for (const c of [...t.comments].reverse()) await page.request.delete(`/api/comments/${c.id}`);
