@@ -78,6 +78,9 @@ pub enum Part {
     Failed,
     /// A newer push replaced it before it finished (binaries only).
     Superseded,
+    /// Nothing has built it: no run of the commit makes it (plan 01a1856fe81375b1bd1d1d86f270a45b,
+    /// step 3: a commit no build ran for isn't built).
+    NotYet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +355,10 @@ fn checks_glyph(checks: &[Check]) -> Glyph {
 }
 
 fn build_glyph(build: &Build) -> Glyph {
+    // No image and no platform: nothing built it, so there's nothing to say yet.
+    if build.image == Part::NotYet && build.platforms.is_empty() {
+        return Glyph::None;
+    }
     let parts = build.platforms.iter().map(|p| p.state).chain(std::iter::once(build.image));
     let parts: Vec<Part> = parts.collect();
     if build.image == Part::Failed {
@@ -620,6 +627,10 @@ fn stand_and_line(j: &Journey) -> (Stand, String) {
         let left: Vec<&str> = j.build.platforms.iter().filter(|p| matches!(p.state, Part::Queued | Part::Running)).map(|p| p.name.as_str()).collect();
         return (Stand::Building, if left.is_empty() { "Building the image".to_string() } else { format!("Building {}", left.join(", ")) });
     }
+    // Nothing built it: it stands where its checks left it.
+    if build_glyph(&j.build) == Glyph::None && j.staging == Staging::NotYet {
+        return (Stand::Waiting, if checks == Glyph::None { "Landed".to_string() } else { "Checks passed".to_string() });
+    }
     (Stand::InStaging, if j.staging == Staging::Moved { "Passed".to_string() } else { "Built".to_string() })
 }
 
@@ -821,6 +832,23 @@ mod tests {
         assert_eq!((pip(&s, Stage::Review), pip(&s, Stage::Land), pip(&s, Stage::Build)), (Some(Glyph::Blocked), Some(Glyph::None), Some(Glyph::None)));
         let pushed = landed(agent());
         assert_eq!(pip(&standing(&pushed, 0), Stage::Review), Some(Glyph::None), "a commit with no review has none");
+    }
+
+    /// Plan 01a1856fe81375b1bd1d1d86f270a45b, step 3: production read every commit as built, its
+    /// runs or none. A commit no build ran for isn't built; it stands where its checks left it.
+    #[test]
+    fn ship_a_commit_no_build_ran_for_isnt_built() {
+        let mut j = landed(agent());
+        j.build = Build { platforms: Vec::new(), image: Part::NotYet };
+        let s = standing(&j, 0);
+        assert_eq!(pip(&s, Stage::Build), Some(Glyph::None));
+        assert_eq!((s.stand, s.line.as_str()), (Stand::Waiting, "Checks passed"));
+        j.checks = Vec::new();
+        assert_eq!(standing(&j, 0).line, "Landed");
+        // Its platforms built and no image: built, by its platforms.
+        j.build.platforms = vec![Platform { name: "Linux".into(), state: Part::Passed }];
+        let s = standing(&j, 0);
+        assert_eq!((pip(&s, Stage::Build), s.line.as_str()), (Some(Glyph::Passed), "Built"));
     }
 
     #[test]

@@ -617,6 +617,11 @@ fn is_release(pipeline: &str) -> bool {
     pipeline.to_ascii_lowercase().contains("release")
 }
 
+/// A pipeline that builds the commit's image (kiln's own `image`): Build's image, not a check.
+fn is_image(pipeline: &str) -> bool {
+    pipeline.to_ascii_lowercase().contains("image")
+}
+
 /// kiln's own failures (a runner lost, the infrastructure, an image pull, a full disk): not the code's.
 fn kilns_own(class: Option<&str>) -> bool {
     matches!(class, Some("runner-lost" | "infra" | "image-pull" | "disk-full"))
@@ -630,6 +635,11 @@ fn attempt_of(status: &str, conclusion: Option<&str>, class: Option<&str>) -> At
         (_, Some("cancelled")) => Attempt::Cancelled,
         (_, Some(_)) if kilns_own(class) => Attempt::KilnError,
         (_, Some(_)) => Attempt::Failed,
+        // v1 says how a job ended in its status, with no conclusion. A job it skipped didn't run
+        // (a dependency failed): it's no pass.
+        ("succeeded", None) => Attempt::Passed,
+        ("failed" | "timed_out", None) => Attempt::Failed,
+        ("cancelled" | "skipped", None) => Attempt::Cancelled,
         _ => Attempt::Queued,
     }
 }
@@ -717,9 +727,11 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
         .query_map(params![repo_id, sha], |r| Ok(RunRec { id: r.get(0)?, pipeline: r.get(1)?, branch: r.get(2)?, message: r.get(3)?, actor: r.get(4)?, created_at: r.get(5)? }))?
         .collect::<Result<_, _>>()?;
 
+    // The engine's legs are its run's latest attempt's; v1's jobs (no `job_id`, no `run_attempt`:
+    // production's runs, 2026-10-28) are their run's, retried in place.
     let mut st = c.prepare(
         "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at
-         FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND j.job_id IS NOT NULL AND j.run_attempt = r.attempt ORDER BY j.rowid",
+         FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND (j.job_id IS NULL OR j.run_attempt = r.attempt) ORDER BY j.rowid",
     )?;
     let legs: Vec<(String, LegRec)> = st
         .query_map(params![repo_id, sha], |r| {
@@ -783,10 +795,15 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
     let run_pipeline: HashMap<&str, &str> = rec.runs.iter().map(|r| (r.id.as_str(), r.pipeline.as_str())).collect();
     let mut checks: Vec<Check> = Vec::new();
     let mut platforms: Vec<Platform> = Vec::new();
+    let mut image_parts: Vec<Part> = Vec::new();
     for leg in &rec.legs {
         let pipeline = run_pipeline.get(leg.run_id.as_str()).copied().unwrap_or_default();
         if is_release(pipeline) {
             platforms.push(Platform { name: leg.name.clone(), state: part_of(&leg.status, leg.conclusion.as_deref()) });
+            continue;
+        }
+        if is_image(pipeline) {
+            image_parts.push(part_of(&leg.status, leg.conclusion.as_deref()));
             continue;
         }
         let attempts: Vec<Attempt> = if leg.reused {
@@ -797,15 +814,27 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
             leg.attempts.iter().map(|a| attempt_of(&a.status, a.conclusion.as_deref(), a.class.as_deref())).collect()
         };
         // A leg names its job and run once it has run (Output streams that job's log).
-        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked");
+        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked" | "skipped");
         let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()), start: leg.started, end: leg.finished };
         match checks.iter_mut().find(|c| c.pipeline == pipeline) {
             Some(c) => c.legs.push(l),
             None => checks.push(Check { pipeline: pipeline.to_string(), legs: vec![l] }),
         }
     }
+    // The image: an image the commit's runs pushed; else what its image pipeline's job says; else
+    // under way while a release (the engine's, which pushes it) builds; else nothing built it.
     let release_running = platforms.iter().any(|p| matches!(p.state, Part::Queued | Part::Running));
-    let image = if !rec.images.is_empty() || !release_running { Part::Passed } else { Part::Running };
+    let image = if !rec.images.is_empty() {
+        Part::Passed
+    } else if let Some(p) = [Part::Failed, Part::Running, Part::Queued, Part::Superseded].into_iter().find(|p| image_parts.contains(p)) {
+        p
+    } else if !image_parts.is_empty() {
+        Part::Passed
+    } else if release_running {
+        Part::Running
+    } else {
+        Part::NotYet
+    };
     let build = Build { platforms, image };
 
     let checks_ok = !matches!(journey::pips(&Journey { checks: checks.clone(), ..empty() }, now).into_iter().find(|p| p.stage == journey::Stage::Checks).map(|p| p.state), Some(journey::Glyph::Failed));
@@ -1069,6 +1098,7 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
         Part::Passed => "passed",
         Part::Failed => "failed",
         Part::Superseded => "superseded",
+        Part::NotYet => "none",
     };
     let build = json!({
         "platforms": j.build.platforms.iter().map(|p| json!({ "name": p.name, "state": part(p.state) })).collect::<Vec<_>>(),
@@ -1603,6 +1633,86 @@ mod tests {
 
     fn field<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| v.get(k))
+    }
+
+    /// a946ea5 as production keeps it (2026-10-28): v1's runs, whose jobs have no `job_id` and no
+    /// `run_attempt` and say how they ended in their status alone; and C2, its checks passed and
+    /// nothing built.
+    fn production_fixture() -> String {
+        let run = |id: &str, n: i64, pipeline: &str, sha: &str, status: &str| {
+            format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at) VALUES ('{id}', 'kiln', {n}, '{pipeline}', 'push', 'main', '{sha}', 'Mission control: an offline machine', 'user.email', '{status}', {NOW_S});")
+        };
+        let job = |id: &str, run: &str, key: &str, display: &str, status: &str, error: &str, started: Option<i64>, finished: i64| {
+            let started = started.map_or_else(|| "NULL".to_string(), |s| (NOW_S + s).to_string());
+            let display = display.replace('\'', "''");
+            format!("INSERT INTO jobs (id, run_id, key, display, status, error, labels, needs, spec, started_at, finished_at) VALUES ('{id}', '{run}', '{key}', '{display}', '{status}', NULLIF('{error}', ''), '[]', '[]', '{{}}', {started}, {});", NOW_S + finished)
+        };
+        let mut s = String::from("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1);");
+        s += &run("ci", 1426, "ci", C1, "failed");
+        s += &job("j1", "ci", "release-binary", "release build (bare metal)", "skipped", "dependency failed", None, 1660);
+        s += &job("j2", "ci", "rust", "rust lint + test", "failed", "step 4 exited with Some(101)", Some(1583), 3719);
+        s += &job("j3", "ci", "ui", "ui typecheck + lint + build", "failed", "step 2 exited with Some(1)", Some(1598), 1660);
+        s += &job("j4", "ci", "ui-checks", "ui checks (Chromium and WebKit, desktop and phone)", "skipped", "dependency failed", None, 1660);
+        s += &job("j5", "ci", "vendor", "vendored projects (upstream plus kiln's recorded changes)", "failed", "step 3 exited with Some(1)", Some(1586), 1601);
+        s += &run("image", 1427, "image", C1, "succeeded");
+        s += &job("j6", "image", "image", "build and publish kiln's image", "succeeded", "", Some(358), 822);
+        s += &run("release", 1428, "release", C1, "succeeded");
+        s += &job("j7", "release", "linux", "Linux (x86-64, ARM64)", "succeeded", "", Some(292), 1361);
+        s += &job("j8", "release", "macos", "macOS (ARM64), on a Mac", "succeeded", "", Some(292), 949);
+        s += &job("j9", "release", "windows", "Windows (x86-64, cross-built)", "succeeded", "", Some(292), 855);
+        s += &run("ci2", 1429, "ci", C2, "succeeded");
+        s += &job("k1", "ci2", "rust", "rust lint + test", "succeeded", "", Some(10), 900);
+        s
+    }
+
+    /// Plan 01a1856fe81375b1bd1d1d86f270a45b, steps 2 and 3: production's own runs report. Each of
+    /// a946ea5's v1 jobs is a leg as it ended, with its times; its Build is its image pipeline's
+    /// job and its release's platforms. A commit no build ran for isn't built.
+    #[test]
+    fn ship_reports_productions_v1_runs_as_they_ended() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = production_fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let now = (NOW_S + 4000) * 1000;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, Vec::new(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let pip = |v: &Value, stage: &str| v.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).map(|p| text(p, "state")).unwrap_or_default();
+            let checks = field(&one, &["checks"]).and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(checks.iter().map(|c| text(c, "pipeline")).collect::<Vec<_>>(), vec!["ci"], "the image and release pipelines aren't checks");
+            let legs: Vec<(String, String, String, Option<i64>, Option<i64>, bool)> = checks
+                .iter()
+                .flat_map(|c| c.get("legs").and_then(Value::as_array).cloned().unwrap_or_default())
+                .map(|l| (text(&l, "name"), text(&l, "state"), text(&l, "note"), l.get("start").and_then(Value::as_i64), l.get("end").and_then(Value::as_i64), l.get("job").is_some()))
+                .collect();
+            let at = |s: i64| Some(NOW_S + s);
+            assert_eq!(
+                legs,
+                vec![
+                    ("release build (bare metal)".into(), "superseded".into(), "dependency failed".into(), None, at(1660), false),
+                    ("rust lint + test".into(), "failed".into(), "step 4 exited with Some(101)".into(), at(1583), at(3719), true),
+                    ("ui typecheck + lint + build".into(), "failed".into(), "step 2 exited with Some(1)".into(), at(1598), at(1660), true),
+                    ("ui checks (Chromium and WebKit, desktop and phone)".into(), "superseded".into(), "dependency failed".into(), None, at(1660), false),
+                    ("vendored projects (upstream plus kiln's recorded changes)".into(), "failed".into(), "step 3 exited with Some(1)".into(), at(1586), at(1601), true),
+                ]
+            );
+            assert_eq!((pip(&one, "checks"), text(&one, "stand"), text(&one, "line")), ("failed".into(), "needs_you".into(), "rust lint + test · step 4 exited with Some(101)".into()));
+            // Build: the image its image pipeline built, the platforms its release built.
+            assert_eq!(field(&one, &["build", "image", "state"]).and_then(Value::as_str), Some("passed"));
+            let platforms: Vec<(String, String)> =
+                field(&one, &["build", "platforms"]).and_then(Value::as_array).into_iter().flatten().map(|p| (text(p, "name"), text(p, "state"))).collect();
+            assert_eq!(
+                platforms,
+                vec![("Linux (x86-64, ARM64)".into(), "passed".into()), ("macOS (ARM64), on a Mac".into(), "passed".into()), ("Windows (x86-64, cross-built)".into(), "passed".into())]
+            );
+            assert_eq!(pip(&one, "build"), "passed");
+            // A commit no build ran for: not built, its checks passed.
+            let two = get_in(&store, "hyper-light/kiln", C2, None, Vec::new(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&two, "checks"), pip(&two, "build"), field(&two, &["build", "image", "state"]).and_then(Value::as_str)), ("passed".into(), "none".into(), Some("none")));
+            assert_eq!((text(&two, "stand"), text(&two, "line")), ("waiting".into(), "Checks passed".into()));
+            Ok(())
+        })
     }
 
     #[test]

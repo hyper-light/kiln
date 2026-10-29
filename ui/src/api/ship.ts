@@ -68,8 +68,8 @@ export interface ShipPage {
   next_cursor: number | null;
 }
 
-/** A build part's state (`Part` in kiln_cd::journey). */
-export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded";
+/** A build part's state (`Part` in kiln_cd::journey): `none` when nothing built it. */
+export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded" | "none";
 
 /**
  * A mark of a lane group (W26-R14): a push, replay, comment, fix, resolution or approval with its
