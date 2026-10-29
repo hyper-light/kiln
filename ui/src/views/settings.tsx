@@ -75,7 +75,7 @@ export default function Settings() {
   return (
     <div ref={arrived} className="container-console page st max-w-[880px]">
       <title>Settings · kiln</title>
-      <PageIntro index={10} label="Settings" title="Settings" />
+      <PageIntro index={9} label="Settings" title="Settings" />
       <SettingsSearch value={query} onChange={setQuery} />
       <SettingsSections query={query} onQueryChange={setQuery}>
         <SettingsSection id="device" index={next()} title="This device" about="How kiln behaves in this browser" words="browser phone">
@@ -262,7 +262,7 @@ function GrafanaGroup() {
         <SettingRow
           label="Dashboard link"
           htmlFor="st-grafana"
-          help="Open your dashboard from Metrics. Saved in this browser."
+          help="Open your dashboard from Observe › Live, beside kiln's own. Saved in this browser."
         >
           <div className="st-control-stack">
             <div className="st-control-line">

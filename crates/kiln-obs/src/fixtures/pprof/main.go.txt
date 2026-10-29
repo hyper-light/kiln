@@ -1,0 +1,54 @@
+// Profiles for kiln's pprof fixtures: a CPU profile of a hashing loop (work calling hash) and a
+// heap profile of a known allocation pattern.
+package main
+
+import (
+	"crypto/sha256"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+//go:noinline
+func hash(b []byte) [32]byte { return sha256.Sum256(b) }
+
+//go:noinline
+func work(n int) byte {
+	var acc byte
+	buf := make([]byte, 4096)
+	for i := 0; i < n; i++ {
+		buf[i%4096] = byte(i)
+		h := hash(buf)
+		acc ^= h[0]
+	}
+	return acc
+}
+
+var sink [][]byte
+
+//go:noinline
+func alloc() {
+	for i := 0; i < 10000; i++ {
+		sink = append(sink, make([]byte, 1024))
+	}
+}
+
+func main() {
+	runtime.MemProfileRate = 4096
+	f, _ := os.Create(os.Args[1] + "/cpu.pprof")
+	pprof.StartCPUProfile(f)
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	var acc byte
+	for time.Now().Before(deadline) {
+		acc ^= work(1000)
+	}
+	pprof.StopCPUProfile()
+	f.Close()
+	alloc()
+	runtime.GC()
+	h, _ := os.Create(os.Args[1] + "/heap.pprof")
+	pprof.WriteHeapProfile(h)
+	h.Close()
+	os.Exit(int(acc) & 0)
+}

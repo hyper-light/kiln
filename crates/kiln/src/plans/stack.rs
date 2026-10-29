@@ -4,7 +4,7 @@
 //! own order; steps run side by side go up as each is met, which a step that waits for others
 //! always is after them).
 //!
-//! - **A repository kiln hosts:** each step's commit, with a Change-Id of its own, is pushed to
+//! - **A repository kiln hosts:** each step's commit, with a `Kiln-Change` of its own (W26-R03), is pushed to
 //!   `refs/for/<trunk>` with its own agent's token: kiln makes it a diff whose author is that
 //!   step's agent, on the diff of the step met before it (W14-R03). Comments, reviews, CI and the land
 //!   queue then find their way back to the agent that did the step (`crate::workspace::follow`).
@@ -267,7 +267,7 @@ async fn make(hub: &Arc<Hub>, st: &mut Stack, m: &Met<'_>) -> Entry {
         title: m.title.to_owned(),
         agent: m.agent.unwrap_or_default().to_owned(),
         state: "failed".to_owned(),
-        change_id: earlier.map(|e| e.change_id.clone()).filter(|c| !c.is_empty()).unwrap_or_else(crate::ci::diffs::new_change_id),
+        change_id: earlier.map(|e| e.change_id.clone()).filter(|c| !c.is_empty()).unwrap_or_else(crate::ci::diffs::new_kiln_change),
         ..Entry::default()
     };
     let Some(info) = m.agent.and_then(|a| hub.harness.info(a)) else {
@@ -317,7 +317,9 @@ async fn make(hub: &Arc<Hub>, st: &mut Stack, m: &Met<'_>) -> Entry {
     }
     let title = if m.title.trim().is_empty() { format!("Step {} of {}", m.n, m.plan.trim()) } else { m.title.trim().to_owned() };
     let body = format!("{title}\n\n{}\n\nKiln-Agent: {} ({}, {})\nKiln-Plan-Run: {}, step {} of {}", m.goal.trim(), info.name, info.kind, info.id, m.run, m.n, m.total);
-    e.message = kiln_ci::review::with_change_id(&body, &e.change_id);
+    // Its change's `Kiln-Change` (W26-R03); a step made before W26 keeps its Change-Id, so the
+    // two never name different changes.
+    e.message = if kiln_ci::review::is_change_id(&e.change_id) { kiln_ci::review::with_change_id(&body, &e.change_id) } else { kiln_ci::identity::with_kiln_change(&body, &e.change_id) };
     if st.provider != "kiln" && st.provider != "local" {
         e.branch = Some(format!("agents/{}-{}-{}", change::slug(m.plan), change::id_end(m.run), m.n).replace("agents/-", "agents/"));
     }
@@ -498,15 +500,15 @@ async fn opened(hub: &Arc<Hub>, st: &mut Stack) {
     }
 }
 
-/// The diff with Change-Id `id` in repository `repo_id` into `trunk`: its number, latest version
-/// and review state.
+/// The diff of change `id` (its `Kiln-Change` identity, or the Change-Id a step made before W26
+/// carries) in repository `repo_id` into `trunk`: its number, latest version and review state.
 async fn diff_of(hub: &Hub, repo_id: &str, trunk: &str, id: &str) -> Option<(u32, u32, String)> {
     let (repo_id, trunk, id) = (repo_id.to_owned(), trunk.to_owned(), id.to_owned());
     hub.store
         .call(move |c| {
             use rusqlite::OptionalExtension as _;
             Ok(c.query_row(
-                "SELECT d.number, (SELECT MAX(n) FROM diff_versions v WHERE v.diff_id = d.id), d.state FROM diffs d WHERE d.repo_id = ?1 AND d.trunk = ?2 AND d.change_id = ?3 ORDER BY d.number DESC LIMIT 1",
+                "SELECT d.number, (SELECT MAX(n) FROM diff_versions v WHERE v.diff_id = d.id), d.state FROM diffs d WHERE d.repo_id = ?1 AND d.trunk = ?2 AND (d.kiln_change = ?3 OR d.change_id = ?3) ORDER BY d.number DESC LIMIT 1",
                 rusqlite::params![repo_id, trunk, id],
                 |r| Ok((r.get::<_, u32>(0)?, r.get::<_, Option<u32>>(1)?.unwrap_or(1), r.get::<_, String>(2)?)),
             )
@@ -577,7 +579,7 @@ pub async fn amend(hub: &Arc<Hub>, actor: &str, info: &Info, want: &Want, run: &
     let from: Vec<usize> = st.steps.iter().enumerate().filter(|(i, e)| *i >= at && e.state == "made").map(|(i, _)| i).collect();
     let commits: Vec<String> = from.iter().filter_map(|&i| st.steps.get(i).and_then(|e| e.sha.clone())).collect();
     let Some(first) = from.first().and_then(|&i| st.steps.get(i)).cloned() else { return Ok(None) };
-    // A new title or body for its step: the same trailers (its Change-Id) under them.
+    // A new title or body for its step: the same trailers (its Kiln-Change) under them.
     let message = (want.title.is_some() || want.body.is_some()).then(|| {
         let trailers: String = first.message.trim_end().rsplit("\n\n").next().unwrap_or_default().to_owned();
         let title = want.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(&first.title);
@@ -799,6 +801,12 @@ mod end_to_end {
             let [one, two, three] = shas.as_slice() else { anyhow::bail!("{shas:?}") };
             anyhow::ensure!(sh_off(work.path(), &format!("git show {one}:engine.rs")).await? == "fn run_engine() {}" && sh_off(work.path(), &format!("git rev-parse {three}^ {two}^")).await? == format!("{two}\n{one}"), "restacked");
             anyhow::ensure!(sh_off(work.path(), "git rev-parse HEAD").await? == head, "the folder's branch didn't move");
+            // W26-R03: each step's commit carries its diff's change, as `Kiln-Change`.
+            let changes: Vec<String> = hub.store.call(|c| Ok(c.prepare("SELECT kiln_change FROM diffs ORDER BY number")?.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)).await?;
+            for (sha, kc) in shas.iter().zip(&changes) {
+                let m = sh_off(work.path(), &format!("git log -1 --format=%B {sha}")).await?;
+                anyhow::ensure!(kiln_ci::identity::kiln_changes(&m) == [kc.clone()], "{sha}: {m} vs {kc}");
+            }
             Ok(())
         })
     }

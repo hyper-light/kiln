@@ -31,6 +31,8 @@ pub struct Config {
     pub cd: Cd,
     /// CI (docs/ci.md).
     pub ci: ci::Ci,
+    /// kiln's own metrics, logs and events (docs/observe.md).
+    pub observe: Observe,
     /// Signing in with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
     pub sso: sso::Sso,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
@@ -483,6 +485,51 @@ impl Default for Discovery {
 impl Default for Terminal {
     fn default() -> Self {
         Self { enabled: true, shell: None, max_sessions: 32, idle_minutes: 720 }
+    }
+}
+
+/// Observe (docs/observe.md): the group the server leads and runners replicate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Observe {
+    pub enabled: bool,
+    /// How long samples are kept: Datadog's, 15 months at full resolution ("Data retention
+    /// periods", docs.datadoghq.com), as days.
+    pub metrics_retention_days: u32,
+    /// How long log records are kept: Datadog's default index retention, 15 days.
+    pub logs_retention_days: u32,
+    /// How long spans are kept: Datadog's for indexed spans, 15 days ("Trace Retention",
+    /// docs.datadoghq.com).
+    pub spans_retention_days: u32,
+    /// How long profilers' uploads are kept: Datadog's for profiles, 8 days ("Continuous Profiler",
+    /// docs.datadoghq.com).
+    pub profiles_retention_days: u32,
+    /// The most GiB profiles take on the server's disk; unset, a quarter of that disk.
+    pub profiles_max_gb: Option<u32>,
+    /// The most series the group holds (0: no bound); past it, new series are refused and counted.
+    pub max_series: u64,
+    /// How often the server looks at its own host, container and process (`crate::observe::host`;
+    /// 0: never). Runners look as often as `KILN_OBSERVE_HOST_SECONDS` says, 15 unless it does.
+    pub host_seconds: u32,
+    /// Threads queries may read series on beside their own, shared by every query at once (0: each
+    /// reads on its own thread alone), at a lower priority than the server's other work. Unset: a
+    /// quarter of the cores the server may run on, less one (docs/observe.md §12.19).
+    pub query_helpers: Option<u32>,
+}
+
+impl Default for Observe {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            metrics_retention_days: 455,
+            logs_retention_days: 15,
+            spans_retention_days: 15,
+            profiles_retention_days: 8,
+            profiles_max_gb: None,
+            max_series: 0,
+            host_seconds: 15,
+            query_helpers: None,
+        }
     }
 }
 

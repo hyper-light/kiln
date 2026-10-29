@@ -26,9 +26,23 @@ kiln clone hyper-light/kiln     # remote + commit-msg hook + `kiln` helpers
 
 ## Diffs, versions and stacks
 
-- **Diff**: a commit under review, numbered per kiln (`D123`). Its identity survives amends and
-  rebases through a `Change-Id: I<40 hex>` trailer (the Gerrit format, so existing hooks and
-  tools work). The commit-msg hook adds it; `kiln submit` adds it to commits that lack it.
+- **Diff**: a commit under review, numbered per kiln (`D123`). It is a **change** whose
+  identity is kiln's own (`kc-` and 16 hex digits, docs/ci.md W26-R03), kept with its history:
+  its versions, its numbers on each host, what it was split from or absorbed. A commit carries
+  it in a `Kiln-Change: kc-…` trailer, which survives every client's amend and rebase. No hook
+  is needed: a commit pushed without one is matched to the change it rewrites (the same
+  patch-id, else the open change of the same author and trunk its patch is clearly most like,
+  as `git range-diff` pairs commits), and kiln asks when it can't tell. Gerrit's `Change-Id`
+  trailer (which kiln wrote before) and the `change-id` header jj and GitButler write (and
+  GitButler's older `gitbutler-change-id`) find their change too, as aliases; a trailer and an
+  alias naming different changes are refused, saying why. Every commit kiln makes for a change
+  (submissions without git, lands, restacks, agents' stacks) carries its trailer, and kiln's
+  optional commit-msg hook adds one to new commits.
+- **Splits and squashes**: two commits that are one change (both keeping its trailer, or both
+  like it) are a split: the one most like the change keeps it, the other is a new diff, split
+  from it (`D43 v1 (new, split from D41)`). One commit holding two open changes side by side is
+  a squash: it keeps the one it's most like and absorbs the other, which is closed
+  (`D41 v3 (updated; absorbed D42)`).
 - **Version**: each push of a changed commit adds a version (`D123 v3`). A version records the
   commit, its parent and the trunk commit it was based on. A version whose patch is unchanged and
   only sits on a new base is marked **rebase-only**, so reviewers know nothing new is in it.
@@ -48,11 +62,12 @@ git commit -m "pipeline: dynamic matrices"   # D2, on top of D1
 kiln submit                                  # or: git push kiln HEAD:refs/for/main
 ```
 
-kiln takes the commits between trunk and `HEAD`, bottom to top. For each one it creates a diff,
-or adds a version to the diff with the same `Change-Id`. It links the stack, starts `diff`
-pipelines for every new version, and prints each diff's number and link. Push options:
-`-o draft`, `-o reviewer=ada,agent:review`, `-o message="addressed comments"` (a note on the new
-versions), `-o topic=<name>`.
+kiln takes the commits between trunk and `HEAD`, bottom to top. For each one it finds its
+change (its trailer, an alias, or the change it rewrites) and creates a diff, or adds a version
+to the change's diff. It links the stack, starts `diff` pipelines for every new version, and
+prints each diff's number and link. Push options: `-o draft`, `-o reviewer=ada,agent:review`,
+`-o message="addressed comments"` (a note on the new versions), `-o topic=<name>`, and
+`-o change=<commit>:<D41|new>`, the answer when kiln asked which change a commit is.
 
 To change something in the middle of a stack, amend that commit (`git rebase -i`, or
 `kiln absorb` to route working-copy edits to the commits that last touched those lines) and
@@ -80,6 +95,35 @@ submit again. Only the diffs that changed get new versions.
 - **Actions**: reviewers accept, request changes, comment or resign. Authors mark ready,
   abandon or reclaim. Anyone allowed can **commandeer** a diff and take over authorship.
 - Reviews and comments are drafted privately and published together, like a review in other tools.
+
+### Conflicts in the diff (W26-R12)
+
+kiln replays a change's latest revision onto where it lands (its trunk's tip; a diff above another
+open one, that one's latest revision) with `git merge-tree --write-tree` in its own copy: no branch
+moves. The replay is kept by revision and by what it went onto, and runs again when either moves
+(asked for by the conflicts, by approving and by landing). Where it conflicts, each conflict comes
+back where it falls:
+
+- **Text**: between git's markers (zdiff3, so they carry the base), at this change's own lines
+  (`line`, `end_line`), with main's side (at main's lines), this side and the base. It's resolved
+  there by taking main's lines, this change's, both (main's then this change's), an agent's
+  resolution, or an edit (which may hold no conflict markers).
+- **Binary**, **modify/delete** (main changed a file this change deletes), **delete/modify**, and
+  anything else git can't merge by lines (a symbolic link, a submodule, a rename against a
+  delete): named, never shown as markers, and resolved by taking a side: main's file or this
+  change's (gone where that side deleted it).
+
+An agent's own resolution is kept as the agent's, beside the conflict, for a person to take (a
+repository's automatic resolution is the conflict ladder's, W26-R17). The same conflict in a later
+replay of the revision (main moved on other files) keeps what was resolved.
+
+**Commit resolution** makes one revision of whoever commits it, its why `conflict resolved`: a
+diff's commit onto where it lands (its author and message kept, the committer the person who
+committed the resolution), or a change request's merge commit of where it lands into its branch
+(GitHub's Resolve conflicts). Agents whose resolutions were taken are its co-authors. It goes
+through the same commit path as Apply, which W27-R03 signs; until then it's unsigned. Until it's
+made, every conflict holds the gate (W26-R11): approving, landing and any automatic merge wait,
+each saying `expand.rs:18: resolve this conflict first`, or `… commit its resolution first`.
 
 ## Landing
 
@@ -178,6 +222,9 @@ production:
 | GET/POST | `/api/diffs/:id/comments` | threads; `PATCH /api/comments/:id` resolves or edits |
 | POST | `/api/diffs/:id/review` | `{ action: accept \| request_changes \| comment \| resign, body, comments }` |
 | POST | `/api/diffs/:id/{ready,abandon,reclaim,commandeer}` | |
+| GET | `/api/diffs/:id/conflicts` | its latest revision replayed onto where it lands: each conflict where it falls, what's left to resolve, whether Commit resolution may go (`ready`) |
+| POST/DELETE | `/api/diffs/:id/conflicts/:conflict/resolution` | `{ take: main \| this \| both \| agent \| edit, lines? \| text? }` (an agent's is kept as the agent's); DELETE takes it back |
+| POST | `/api/diffs/:id/conflicts/commit` | Commit resolution: one revision, its why `conflict resolved` (`diffs.submit`, a person) |
 | POST | `/api/diffs/:id/land` | land it and everything below |
 | GET | `/api/repos/:repo/queue` | the land queue; `DELETE /api/queue/:entry` takes one out |
 | GET | `/api/stacks/:id` | a stack as a tree |

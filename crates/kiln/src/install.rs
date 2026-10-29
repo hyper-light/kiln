@@ -515,6 +515,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         instance: None,
         config: None,
         reach: Some(true),
+        observe: true,
         outpost: false,
         declared: crate::runner::probe::Declared::default(),
     };

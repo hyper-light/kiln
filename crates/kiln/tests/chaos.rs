@@ -1,7 +1,8 @@
 //! Fault injection (docs/ci.md W22-AC04), with a server built with the `chaos` feature: its own
 //! runner drops its connection and sends late, kills steps as the OOM killer does, fills a job
-//! container's disk and corrupts uploads. W05's retries and classes, W08's integrity checks and
-//! W06's cleanup do what they say under each.
+//! container's disk, corrupts uploads and has its first ask for a Node build fail. W05's retries
+//! and classes, W08's integrity checks, W06's cleanup and a step's download tries do what they say
+//! under each.
 //!
 //! `cargo test -p kiln --features chaos --test chaos`
 
@@ -26,9 +27,19 @@ fn docker_works() -> bool {
     Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]).output().is_ok_and(|o| o.status.success())
 }
 
+/// Whether nodejs.org answers here (a runner's Node builds come from it).
+fn nodejs() -> bool {
+    Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "20", "https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt"]).output().is_ok_and(|o| o.stdout == b"200")
+}
+
 /// A server whose runner injects `chaos`, the run of `workflow` on it once finished: its id and
 /// legs.
 fn run(dir: &Path, chaos: &str, workflow: &str) -> anyhow::Result<(Server, String, Vec<Value>)> {
+    run_with(dir, chaos, workflow, &[])
+}
+
+/// [`run`], `files` (path, content) committed with the workflow.
+fn run_with(dir: &Path, chaos: &str, workflow: &str, files: &[(&str, &str)]) -> anyhow::Result<(Server, String, Vec<Value>)> {
     let repo = dir.join("repo");
     std::fs::create_dir_all(&repo)?;
     std::fs::write(repo.join("README.md"), "chaos\n")?;
@@ -48,6 +59,13 @@ fn run(dir: &Path, chaos: &str, workflow: &str) -> anyhow::Result<(Server, Strin
     }
     std::fs::create_dir_all(repo.join(".kiln"))?;
     std::fs::write(repo.join(".kiln/chaos.yaml"), workflow)?;
+    for (path, content) in files {
+        let at = repo.join(path);
+        if let Some(parent) = at.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(at, content)?;
+    }
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "chaos"])?;
     let deadline = Instant::now() + Duration::from_secs(600);
@@ -126,6 +144,26 @@ jobs:
     assert!(missing.is_empty(), "lines lost: {missing:?}\n{said}\n{}", s.log());
     assert_eq!(state(&legs, "after"), ("success".to_owned(), 1), "the output arrived\n{}\n{}", log(&s, &legs, "after")?, s.log());
     assert!(s.log().contains("chaos: dropping the connection"), "the connection was dropped\n{}", s.log());
+    Ok(())
+}
+
+/// nodejs.org not answering a first ask (`fetch`: it fails as a request that timed out does), the
+/// step asks again, as GitHub's runner asks for an action's archive: its Node action runs on the
+/// leg's first attempt, the ask again said in its log.
+#[test]
+fn w22_ac04_a_node_build_asked_for_again() -> anyhow::Result<()> {
+    if !nodejs() {
+        eprintln!("skipped: nodejs.org doesn't answer here, and a runner's Node comes from it");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let workflow = "on: push\njobs:\n  node:\n    runs-on: local\n    steps:\n      - uses: kiln/checkout@v1\n      - uses: ./act\n";
+    let files = [("act/action.yml", "name: act\nruns:\n  using: node20\n  main: index.js\n"), ("act/index.js", "console.log(`node ran: ${process.version}`);\n")];
+    let (s, _, legs) = run_with(dir.path(), "fetch", workflow, &files)?;
+    let said = log(&s, &legs, "node")?;
+    assert_eq!(state(&legs, "node"), ("success".to_owned(), 1), "asked again, the step ran on the leg's first attempt\n{said}\n{}", s.log());
+    assert!(said.contains("chaos `fetch`") && said.contains("try 2 of 3"), "the ask again is said\n{said}");
+    assert!(said.contains("node ran: v20."), "{said}");
     Ok(())
 }
 

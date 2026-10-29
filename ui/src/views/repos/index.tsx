@@ -87,7 +87,7 @@ export default function Repos() {
     <div className="container-console page">
       <title>Repositories · kiln</title>
       <PageIntro
-        index={4}
+        index={3}
         label="Repositories"
         title="Repositories"
         lead="The code kiln works with, on every machine: repositories it builds (polled with conditional requests, so idle ones cost nothing against GitHub's rate limit; pipelines live in .kiln/*.yaml), folders it keeps the same on several machines, and the repositories your machines hold. Clone or sync any of them to more machines, or move one, over kiln's own links."

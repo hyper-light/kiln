@@ -96,6 +96,9 @@ const RAFT: Class = Class::Carried("repo sync's Raft");
 /// acknowledges and resends; a runner's learner is told to join on every connect, and a read that
 /// can't learn where the server is in time goes to the server.
 const CLUSTER: Class = Class::Carried("the cluster group");
+/// Observe's group (`crate::observe`, docs/observe.md §5): its Raft is hyper-raft's, which
+/// acknowledges and resends, and a write a runner takes is offered to the leader until it commits.
+const OBSERVE: Class = Class::Carried("observe's group");
 /// Reach's links (`crate::reach`): a link's two runners frame it end to end; the server relays.
 const REACH: Class = Class::Carried("reach link");
 /// Ports opened through the server (`crate::browser::ports`): a byte stream with its own window.
@@ -195,6 +198,8 @@ classes! {
         AgentMsg::HarnessAdopted { .. } => Class::Answer,
         AgentMsg::WorkState { .. } => Class::State,
         AgentMsg::AgentLimit { .. } => Class::State,
+        AgentMsg::Identity { .. } => Class::Ask,
+        AgentMsg::Observe { .. } => OBSERVE,
     }
 }
 
@@ -260,6 +265,8 @@ classes! {
         ServerMsg::Kept { .. } => Class::State,
         ServerMsg::HarnessSend { .. } => PARKED,
         ServerMsg::AgentLimit { .. } => Class::State,
+        ServerMsg::Identity { .. } => Class::Answer,
+        ServerMsg::Observe { .. } => OBSERVE,
     }
 }
 

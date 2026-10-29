@@ -468,6 +468,9 @@ pub struct Hub {
     pub blobs: crate::blobs::Opened,
     /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// The search across a change (docs/ci.md W26-R07): vorpal, its indexes under the server's
+    /// cache (`crate::ci::search`).
+    pub search: Arc<dyn kiln_seams::Search>,
     /// Memo steps in flight, one execution per key and domain (docs/ci.md W28-R72).
     pub flight: crate::ci::services::memo::Flights,
 }
@@ -507,6 +510,8 @@ impl Hub {
         let harness_dir = cfg.data("harness");
         // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
         let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        // The search across a change (W26-R07): an index per tree in the server's cache.
+        let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
@@ -581,6 +586,7 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            search,
             flight: Default::default(),
         }))
     }
@@ -859,6 +865,11 @@ impl Hub {
         }
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
+            // A runner too old to report its own figures (`crate::observe::host`): its samples, as
+            // metrics. The server's own machine reports itself.
+            if self.instances.lock().newest_with(agent, proto::CAP_OBSERVE).is_none() {
+                crate::observe::hub::host_sample(agent, &s);
+            }
         }
         self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
     }
@@ -1337,7 +1348,14 @@ impl Hub {
         true
     }
 
-    pub async fn forget_agent(&self, agent: &str) -> anyhow::Result<()> {
+    pub async fn forget_agent(&self, agent: &str, by: &str) -> anyhow::Result<()> {
+        // Its certificates are revoked for good, recorded so a restart keeps it, and refused at
+        // once (W27-R01); enrolling again under the name brings a new key.
+        let at = crate::util::now_unix();
+        let keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, at).await?;
+        if !keys.is_empty() {
+            self.net.command(crate::net::Out::RevokeKeys { keys, why: crate::identities::refusal(at, "runner forgotten", by) }).await;
+        }
         let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
         peers.extend(self.instances.lock().of(agent));
         peers.sort_unstable();
@@ -1444,9 +1462,17 @@ impl Hub {
                     // Sync moves to another runner process of the machine that syncs, if any.
                     let syncing = self.instances.lock().newest_with(&name, proto::CAP_SYNC).is_some();
                     self.sync.machine(&name, syncing);
+                    crate::observe::hub::lost(self, &name);
                     if self.instances.lock().of(&name).is_empty() {
                         self.agent_lost(&name, &reason).await;
                     } else {
+                        // Gone while another of its machine's processes goes on: retired, and its
+                        // identity with it (docs/ci.md W27-R01).
+                        if let Some(label) = lost.as_ref().map(|(i, _)| i.label())
+                            && let Err(e) = crate::identities::runner_retired(self, &name, &label).await
+                        {
+                            tracing::warn!(agent = %name, error = %format!("{e:#}"), "a retired runner process's identity wasn't revoked");
+                        }
                         self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason).await;
                     }
                 }
@@ -1789,6 +1815,9 @@ impl Hub {
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
                 }
+                if caps & proto::CAP_OBSERVE != 0 {
+                    crate::observe::hub::announced(self, &agent).await;
+                }
                 if caps & proto::CAP_CLUSTER != 0 {
                     self.cluster_announced(&agent).await;
                 }
@@ -1810,6 +1839,7 @@ impl Hub {
                 self.emit(&ServerEvent::Updates);
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
+            AgentMsg::Observe { json, bytes } => crate::observe::hub::heard(&agent, json, bytes),
             AgentMsg::Cluster { json, raft } => match (self.store.group(), crate::store::learner::decode(&json)) {
                 // Where kiln.db stands, for a read the runner answers once its replica holds it.
                 (Some(g), Some(crate::store::learner::Msg::Ask { id })) => {
@@ -1991,6 +2021,8 @@ impl Hub {
                 Ok(_) => {}
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "an unreadable report of warm workspaces"),
             },
+            // An identity it asks for, for a key it made and keeps (docs/ci.md W27-R01).
+            AgentMsg::Identity { json } => crate::identities::on_ask(self, peer, &agent, &json).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -2289,7 +2321,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2390,6 +2422,10 @@ impl Hub {
         // (ranked oldest), and nothing else tells it to hold it now (until 2026-10-25 a machine
         // upgraded so held no replica until its runner next connected).
         self.cluster_announced(name).await;
+        // And observe's: the newest replicates it (the group's messages go to it), and the build it
+        // took over from lets its own go. Until then that one held it, hearing nothing, until it
+        // ended (its jobs finished), and the new build waited for its folder.
+        crate::observe::hub::announced(self, name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.
@@ -2504,6 +2540,13 @@ impl Hub {
             #[allow(clippy::cast_precision_loss)]
             m.job_duration.observe((crate::util::now_unix() - started) as f64);
         }
+        if let Some(j) = &job {
+            let mut j = j.clone();
+            j.peak_rss = r.peak_rss.or(j.peak_rss);
+            j.cpu_seconds = r.cpu_seconds.or(j.cpu_seconds);
+            j.error = r.error.clone().or(j.error);
+            crate::observe::kiln::job_finished(&j, run.as_ref(), r.status, crate::util::now_unix());
+        }
         tracing::info!(job = %r.job, agent, status = r.status.as_str(), "job finished");
         let snapshot = self.agents.lock().get(agent).cloned();
         if let Some(a) = snapshot {
@@ -2520,6 +2563,7 @@ impl Hub {
             self.adopt_release(&r.job, run).await;
         }
         if let (Some(status), Some(run)) = (settled, run) {
+            crate::observe::kiln::run_finished(&run, status, crate::util::now_unix());
             crate::gitops::report_status(self, &run, status).await;
         }
         self.update_slot_gauges();
@@ -3267,7 +3311,7 @@ pub(crate) mod tests {
         );
         let (store, (pki, leaf)) = (store??, keys??);
         let pki = Arc::new(pki);
-        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
+        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }

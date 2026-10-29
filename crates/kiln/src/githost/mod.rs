@@ -12,6 +12,7 @@ mod forge_fake;
 pub mod github;
 pub mod gitlab;
 pub mod hooks;
+pub mod mirror;
 pub mod pulls;
 pub mod statuses;
 pub mod web;

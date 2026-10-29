@@ -340,6 +340,61 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let batch = (*batch).to_owned();
             return boxed(|| sync_bundle_put(&hub, &batch, req)).await;
         }
+        // OTLP/HTTP (`crate::observe::otlp`), with the ingest token or the admin's.
+        (&Method::POST, ["v1", "metrics"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Metrics, req, ok).await);
+        }
+        (&Method::POST, ["v1", "logs"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
+        }
+        (&Method::POST, ["v1", "traces"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Traces, req, ok).await);
+        }
+        // Prometheus's remote write (`crate::observe::remote`): the same token, as a bearer token
+        // or basic auth's password.
+        (&Method::POST, ["api", "v1", "write"]) => {
+            let ok = crate::observe::remote::token(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(&t, &hub.admin_token));
+            if !ok {
+                return Ok(srv::text(StatusCode::UNAUTHORIZED, "a remote write sends the ingest token: `authorization: credentials`, `bearer_token`, or basic auth's password"));
+            }
+            return Ok(match crate::observe::api::get() {
+                Some(o) => crate::observe::remote::answer(o, req).await,
+                None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
+            });
+        }
+        // Datadog's Agent (`crate::observe::ddagent`) at Datadog's own paths, its API key the same
+        // token: what Datadog answers a key that is not one.
+        (_, segs) if crate::observe::ddagent::is_datadog(segs) => {
+            let ok = crate::observe::ddagent::api_key(&req).is_some_and(|k| crate::observe::api::ingest_allowed(&k, &hub.admin_token));
+            if !ok {
+                return Ok(srv::json(StatusCode::FORBIDDEN, &serde_json::json!({ "errors": ["Forbidden", "API key is missing or invalid"] })));
+            }
+            return Ok(match crate::observe::api::get() {
+                Some(o) => crate::observe::ddagent::answer(o, segs, req).await,
+                None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
+            });
+        }
+        // OTLP/gRPC (`crate::observe::otlp::grpc`): the same token, as gRPC's metadata.
+        (&Method::POST, [service, "Export"]) if crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).is_some() => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            let signal = crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).unwrap_or(crate::observe::otlp::Signal::Metrics);
+            return Ok(crate::observe::api::otlp_grpc(signal, req, ok).await);
+        }
+        // The clouds' pushes (`crate::observe::cloud::push`), with the ingest token or the admin's:
+        // Firehose sends it as its access key, a Pub/Sub push subscription in its endpoint's query.
+        (&Method::POST, ["v1", "firehose"]) => {
+            let ok = req.headers().get("x-amz-firehose-access-key").and_then(|v| v.to_str().ok()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::cloud::push::firehose(req, ok).await);
+        }
+        (&Method::POST, ["v1", "pubsub"]) => {
+            let ok = srv::query(&req).get("token").is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::cloud::push::pubsub(req, ok).await);
+        }
+        // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
+        (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
@@ -456,9 +511,19 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Ship's read model: a repository's commits and where each stands (plan 01a175b3a21174bc8769f5e784b90ecb).
         (&Method::GET, ["api", "ship", "commits"]) => boxed(|| crate::ship::list(&hub, &q, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", repo, sha]) => boxed(|| crate::ship::get(&hub, repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", repo, sha, "diff"]) => boxed(|| crate::ci::diffs::ship_commit_diff(&hub, repo, sha, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", repo, sha, "blob"]) => boxed(|| crate::ci::diffs::ship_commit_blob(&hub, repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", owner, name, sha]) => {
             let repo = format!("{owner}/{name}");
             boxed(|| crate::ship::get(&hub, &repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m))
+        }
+        (&Method::GET, ["api", "ship", "commits", owner, name, sha, "diff"]) => {
+            let repo = format!("{owner}/{name}");
+            boxed(|| crate::ci::diffs::ship_commit_diff(&hub, &repo, sha, &caller)).await.map_err(|(c, m)| err(c, m))
+        }
+        (&Method::GET, ["api", "ship", "commits", owner, name, sha, "blob"]) => {
+            let repo = format!("{owner}/{name}");
+            boxed(|| crate::ci::diffs::ship_commit_blob(&hub, &repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m))
         }
         (_, ["api", "cd", rest @ ..]) => boxed(|| crate::cd::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => boxed(|| crate::deploy::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
@@ -473,6 +538,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let rest: Vec<&str> = rest.to_vec();
             let body: serde_json::Value = if method == Method::POST { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::experiments::route(&hub, &caller, &method, &rest, &q, body)).await.map_err(|(c, m)| err(c, m))
+        }
+        // Observe's routes as a task of their own: its handlers reach out (a cloud's pull, a
+        // synthetic test) and nest deep, and in a debug build the routers' frames under them
+        // (each arm's temporaries a slot of its own) took a shard's 2 MiB stack whole.
+        (_, ["api", "observe", "v1", rest @ ..]) => {
+            let rest: Vec<String> = rest.iter().map(|s| (*s).to_owned()).collect();
+            let q = q.clone();
+            crate::rt::spawn(async move {
+                let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+                crate::observe::api::route(&rest, &q, req).await
+            })
+            .await
+            .unwrap_or_else(|_| Err((StatusCode::INTERNAL_SERVER_ERROR, "the request's task ended before it answered".to_owned())))
+            .map_err(|(c, m)| err(c, m))
         }
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
@@ -587,10 +666,33 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "join-requests"]) => Ok(srv::json(StatusCode::OK, &hub.joins.list(Instant::now(), &hub.pki.ca_der))),
         (&Method::POST, ["api", "join-requests", id, "approve"]) => {
             let id = (*id).to_owned();
-            boxed(|| approve_join(&hub, &id, req)).await
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| approve_join(&hub, &id, req, &by)).await
         }
         (&Method::POST, ["api", "join-requests", id, "deny"]) => boxed(|| deny_join(&hub, id)).await,
-        (&Method::DELETE, ["api", "agents", name]) => boxed(|| forget_agent(&hub, name)).await,
+        (&Method::DELETE, ["api", "agents", name]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| forget_agent(&hub, name, &by)).await
+        }
+        // Identities kiln's CA issued: their revocations, and revoking one (W27-R01).
+        (&Method::GET, ["api", "identities", "revocations"]) => boxed(|| identity_revocations(&hub)).await,
+        // A person's short-lived certificate for a key made on their device (W27-R02).
+        (&Method::POST, ["api", "me", "identity"]) => {
+            let caller = caller_of(&hub, req.headers()).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "sign in first"))?;
+            boxed(|| me_identity(&hub, caller, req)).await
+        }
+        (&Method::GET, ["api", "identities"]) => {
+            let kind = srv::query(&req).remove("kind");
+            boxed(|| async {
+                let list = crate::identities::list(&hub, kind.as_deref()).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                Ok(srv::json(StatusCode::OK, &json!({ "identities": list })))
+            })
+            .await
+        }
+        (&Method::POST, ["api", "identities", "revoke"]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| identity_revoke(&hub, req, &by)).await
+        }
         // What's wrong with a runner, and repairs to it (`crate::doctor`, docs/releases.md).
         (&Method::GET, ["api", "agents", name, "diagnose"]) => boxed(|| crate::doctor::diagnose(&hub, name)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
         (&Method::POST, ["api", "agents", name, "repair"]) => {
@@ -2852,10 +2954,68 @@ async fn get_artifacts(hub: &Hub, id: &str) -> R {
 
 // ------------------------------------------------------------------ agents
 
-async fn forget_agent(hub: &Hub, name: &str) -> R {
-    hub.forget_agent(name).await?;
-    hub.store.audit("admin".into(), "agent.forget".into(), name.to_owned()).await;
+async fn forget_agent(hub: &Hub, name: &str, by: &str) -> R {
+    hub.forget_agent(name, by).await?;
+    hub.store.audit(by.to_owned(), "agent.forget".into(), name.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/me/identity` `{csr}`: the caller's certificate as a person, for the CSR's key, made
+/// on their device (docs/ci.md W27-R02); asked again to renew it while they stay signed in. A
+/// refusal says why, with a `code` the CLI acts on.
+async fn me_identity(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R {
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let csr = b.get("csr").and_then(serde_json::Value::as_str).ok_or_else(|| err(StatusCode::BAD_REQUEST, "send a csr"))?;
+    match crate::identities::issue_person(hub, &caller, csr).await {
+        Ok(i) => {
+            hub.store.audit(caller.name.clone(), "identity.person".into(), i.uri.clone()).await;
+            Ok(srv::json(StatusCode::OK, &json!({ "uri": i.uri, "identity": i.identity, "cert_pem": i.cert_pem, "not_before": i.not_before, "not_after": i.not_after })))
+        }
+        Err(crate::identities::PersonRefused::Failed(e)) => Err(e.into()),
+        Err(r) => Ok(srv::json(r.status(), &json!({ "error": r.to_string(), "code": r.code() }))),
+    }
+}
+
+/// `GET /api/identities/revocations`: every revocation, oldest first (W27-R01).
+async fn identity_revocations(hub: &Hub) -> R {
+    let revs = crate::identities::revocations(&hub.store).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows: Vec<serde_json::Value> = revs.iter().map(|r| json!({ "serial": r.serial, "key": r.key, "at": r.at, "reason": r.reason, "by": r.by })).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "revocations": rows })))
+}
+
+#[derive(Deserialize)]
+struct RevokeReq {
+    serial: Option<String>,
+    key: Option<String>,
+    subject: Option<String>,
+    reason: String,
+}
+
+/// `POST /api/identities/revoke` `{serial | key | subject, reason}`: revoked from now on, refused
+/// at once by the TLS directory (W27-R01).
+async fn identity_revoke(hub: &Hub, req: Request, by: &str) -> R {
+    use crate::identities::Target;
+    let r: RevokeReq = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let target = match (r.serial, r.key, r.subject) {
+        (Some(s), None, None) => Target::Serial(s),
+        (None, Some(k), None) => Target::Key(k),
+        (None, None, Some(s)) => Target::Subject(s),
+        _ => return Err(err(StatusCode::BAD_REQUEST, "name exactly one of serial, key or subject")),
+    };
+    if r.reason.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "say why it's revoked (reason)"));
+    }
+    let at = crate::util::now_unix();
+    let keys = crate::identities::revoke(&hub.store, target.clone(), r.reason.trim(), by, at).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if !keys.is_empty() {
+        hub.net.command(crate::net::Out::RevokeKeys { keys: keys.clone(), why: crate::identities::refusal(at, r.reason.trim(), by) }).await;
+    }
+    hub.store.audit(by.to_owned(), "identity.revoke".into(), format!("{target:?}: {}", r.reason.trim())).await;
+    // The server's or CD's own, revoked, is issued anew at once (a revoked key replaced).
+    if let Err(e) = crate::identities::own_identities(&hub.store, &hub.pki).await {
+        tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued anew");
+    }
+    Ok(srv::json(StatusCode::OK, &json!({ "at": at, "keys": keys })))
 }
 
 #[derive(Deserialize)]
@@ -2982,6 +3142,14 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         365
     };
     let cert = hub.pki.sign_csr(&r.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Who enrolled it (W27-R01): the owner, whose join token or invite it brought; kiln for its
+    // own pods.
+    let by = if ephemeral { "kiln" } else { "admin" };
+    crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // A name forgotten earlier in this server's life is welcome again, as an approved join makes
+    // it: its new key works, and its revoked keys stay refused (W27-R01).
+    hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
     let quic = if ephemeral {
         hub.cfg.kubernetes.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone())
     } else {
@@ -3026,6 +3194,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
     if !known {
         return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
     }
+    crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     hub.store.audit(name.clone(), "agent.instance".into(), String::new()).await;
     tracing::info!(agent = %name, "issued a certificate for a second runner process");
     Ok(srv::json(
@@ -3359,7 +3528,7 @@ async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> String {
 }
 
 /// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
-async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
+async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
     let decision: crate::join::Decision = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
     let c = match hub.joins.candidate(id, Instant::now()) {
         Ok(c) => c,
@@ -3377,6 +3546,8 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
     let days = if outpost { crate::pki::OUTPOST_DAYS } else { 365 };
     let cert = hub.pki.sign_csr(&c.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let quic = hub.cfg.server.quic_advertise.clone();
     let quic_port = hub.discovery.advert.lock().quic;
     let approval = crate::join::Approval {
@@ -3804,6 +3975,8 @@ async fn github_hook(hub: &Arc<Hub>, req: Request) -> R {
             return Err(err(StatusCode::UNAUTHORIZED, "bad signature"));
         }
     }
+    // What GitHub said, as events and metrics (`crate::observe::github`).
+    crate::observe::github::webhook(&event, &body);
     // Without the CI engine a webhook only hints; the poll decides what changed (GitOps: state
     // comes from git). With it, GitHub's payload reaches the workflows (docs/ci.md W03-R07).
     let hub = Arc::clone(hub);

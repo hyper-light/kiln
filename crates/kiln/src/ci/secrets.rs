@@ -95,8 +95,11 @@ fn random<const N: usize>() -> anyhow::Result<[u8; N]> {
 
 /// The master key, made at first use.
 fn master(hub: &Hub) -> anyhow::Result<[u8; 32]> {
-    let p = master_path(hub);
-    match std::fs::read(&p) {
+    master_at(&master_path(hub))
+}
+
+fn master_at(p: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    match std::fs::read(p) {
         Ok(b) if b.len() == 32 => {
             let mut k = [0u8; 32];
             k.copy_from_slice(&b);
@@ -105,7 +108,7 @@ fn master(hub: &Hub) -> anyhow::Result<[u8; 32]> {
         Ok(_) => anyhow::bail!("{} is not a 32-byte key", p.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let k: [u8; 32] = random()?;
-            crate::util::write_secret(&p, &k, 0o600)?;
+            crate::util::write_secret(p, &k, 0o600)?;
             Ok(k)
         }
         Err(e) => Err(e.into()),
@@ -144,6 +147,16 @@ pub(crate) fn seal_master(hub: &Hub, plain: &[u8], aad: &[u8]) -> anyhow::Result
 
 pub(crate) fn open_master(hub: &Hub, sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
     open(&master(hub)?, sealed, nonce, aad)
+}
+
+/// Seals `plain` under the master key at `master` (`<data>/secrets/master.key`), bound to `aad`:
+/// for subsystems without the hub (observe's cloud credentials).
+pub(crate) fn seal_with(master: &std::path::Path, plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    seal(&master_at(master)?, plain, aad)
+}
+
+pub(crate) fn open_with(master: &std::path::Path, sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
+    open(&master_at(master)?, sealed, nonce, aad)
 }
 
 /// The current data key: `(id, key)`, made (and wrapped) when there is none.
