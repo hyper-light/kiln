@@ -348,10 +348,13 @@ jobs:
     let run = made.get("external_id").and_then(Value::as_str).unwrap_or_default().to_owned();
     assert!(!run.is_empty());
     // Installation tokens: one repository each, the permissions a call needs (the job's: its own).
+    // W26-R20's mirror reads each repository's pull requests with a token of its own, acme/gha's
+    // too once it gets to it, so app's are the ones its run asked for.
     let tokens: Vec<Value> = calls.lock().map(|v| v.iter().filter(|(_, p, _, _)| p.ends_with("/access_tokens")).map(|(_, _, _, b)| b.clone()).collect()).unwrap_or_default();
-    assert!(tokens.iter().all(|t| t.get("repositories") == Some(&json!(["app"]))), "{tokens:?}");
-    assert!(tokens.iter().any(|t| t.pointer("/permissions/checks") == Some(&json!("write"))), "{tokens:?}");
-    assert!(tokens.iter().any(|t| t.pointer("/permissions/issues") == Some(&json!("read")) && t.pointer("/permissions/checks").is_none()), "the job's: {tokens:?}");
+    let app = |t: &Value| t.get("repositories") == Some(&json!(["app"]));
+    assert!(tokens.iter().all(|t| t.get("repositories").and_then(Value::as_array).is_some_and(|r| r.len() == 1)), "{tokens:?}");
+    assert!(tokens.iter().any(|t| app(t) && t.pointer("/permissions/checks") == Some(&json!("write"))), "{tokens:?}");
+    assert!(tokens.iter().any(|t| app(t) && t.pointer("/permissions/issues") == Some(&json!("read")) && t.pointer("/permissions/checks").is_none()), "the job's: {tokens:?}");
     assert!(calls.lock().map(|v| v.iter().any(|(m, p, a, _)| m == "GET" && p == "/repos/acme/app/issues" && a.starts_with("Bearer ghs_fake_"))).unwrap_or(false), "the job called GitHub's API");
 
     // GitHub's Re-run: a new attempt, and a check run of its own.
