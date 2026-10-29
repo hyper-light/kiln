@@ -69,11 +69,11 @@ fn ms(d: &mut Draw, below: i64) -> i64 {
 }
 
 /// A runner: on one of three platforms, with one to four slots, and half of them sized (resource
-/// mode, W05-R03).
+/// mode, W05-R03), a quarter of those with GPUs (fair share's dimensions, docs/needs.md E2.1).
 fn runner(d: &mut Draw, id: &str) -> RunnerIn {
     let (os, arch) = PLATFORMS.get(usize::try_from(d.below(3)).unwrap_or(0)).copied().unwrap_or(("linux", "x86_64"));
     let slots = 1 + u32::try_from(d.below(4)).unwrap_or(0);
-    let capacity = (d.below(2) == 0).then(|| Resources { cpu: Cpus::whole(2 + d.below(15)), mem: (4 + d.below(61)) * GIB, ..Resources::default() });
+    let capacity = (d.below(2) == 0).then(|| Resources { cpu: Cpus::whole(2 + d.below(15)), mem: (4 + d.below(61)) * GIB, gpu: if d.below(4) == 0 { 1 + u32::try_from(d.below(4)).unwrap_or(0) } else { 0 }, ..Resources::default() });
     let facts = RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() };
     RunnerIn { id: id.into(), view: RunnerView { name: id.into(), labels: vec!["kiln".into()], facts, caps: 0, pool: None }, slots, capacity, executor: None }
 }
@@ -88,11 +88,14 @@ fn leg(d: &mut Draw, n: u64) -> (LegIn, i64, Vec<FailureClass>) {
         8 => LegRoute { labels: labels("self-hosted"), requires: vec!["arch == aarch64".into()], ..LegRoute::default() },
         _ => LegRoute { labels: labels("self-hosted"), requires: vec!["os == linux".into()], ..LegRoute::default() },
     };
-    let request = match d.below(3) {
+    let mut request = match d.below(3) {
         0 => Resources::default(),
         1 => Resources { cpu: Cpus::milli(250 * (1 + d.below(16))), mem: (1 + d.below(8)) * GIB / 2, ..Resources::default() },
         _ => Resources { cpu: Cpus::whole(1 + d.below(8)), mem: (1 + d.below(32)) * GIB, ..Resources::default() },
     };
+    if !request.cpu.is_zero() && d.below(6) == 0 {
+        request.gpu = 1;
+    }
     let retry = (d.below(5) == 0).then(|| RetryPolicy {
         max: 2,
         on: vec![RetryOn::Class(FailureClass::Infra), RetryOn::Class(FailureClass::Oom)],
@@ -165,7 +168,9 @@ fn replay(cfg: &Config) -> (Vec<String>, String) {
     let mut lines = Vec::new();
     let mut h = Sha256::new();
     for seed in 0..SEEDS {
-        for (at, l) in scenario(seed, cfg) {
+        // Odd seeds in resource mode, where fair share counts CPUs, memory and GPUs beside slots.
+        let cfg = Config { resources: seed % 2 == 1, ..cfg.clone() };
+        for (at, l) in scenario(seed, &cfg) {
             let l = format!("{seed} {at} {l}");
             h.update(l.as_bytes());
             h.update(b"\n");

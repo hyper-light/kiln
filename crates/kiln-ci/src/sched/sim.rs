@@ -9,7 +9,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use super::retry::{Failed, FailureClass};
-use super::state::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler, WaitReason};
+use super::state::{Command, Config, DIMS, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, WaitReason, offers};
 
 /// Something the simulation does at a time.
 #[derive(Debug, Clone)]
@@ -54,6 +54,13 @@ pub struct Sim {
     pub busy: Vec<(String, i64, i64)>,
     /// Slot-time by leg: (leg, start, end).
     pub busy_legs: Vec<(String, i64, i64)>,
+    /// The same, with the runner: (leg, runner, start, end).
+    pub busy_on: Vec<(String, String, i64, i64)>,
+    /// What each leg asks (its request, exclusive or not) and each runner offers, and whether the
+    /// fleet is in resource mode: what [`Self::dominant_by`] measures by.
+    asks: BTreeMap<String, (Resources, bool)>,
+    offered: BTreeMap<String, RunnerIn>,
+    resources: bool,
     /// How long a host takes to start a pool's executor (W13-R09).
     pub executor_start_ms: i64,
     /// Hosts whose executors fail to start.
@@ -68,6 +75,7 @@ pub struct Sim {
 
 impl Sim {
     pub fn new(cfg: Config) -> Sim {
+        let resources = cfg.resources;
         Sim {
             sched: Scheduler::new(cfg),
             now: 0,
@@ -87,6 +95,10 @@ impl Sim {
             decisions: Vec::new(),
             busy: Vec::new(),
             busy_legs: Vec::new(),
+            busy_on: Vec::new(),
+            asks: BTreeMap::new(),
+            offered: BTreeMap::new(),
+            resources,
             executor_start_ms: 500,
             failing_hosts: BTreeSet::new(),
             trace: None,
@@ -107,6 +119,7 @@ impl Sim {
     }
 
     pub fn runner(&mut self, t: i64, r: RunnerIn) {
+        self.offered.insert(r.id.clone(), r.clone());
         self.input(t, Input::RunnerUp(Box::new(r)));
     }
 
@@ -114,6 +127,7 @@ impl Sim {
     pub fn leg(&mut self, t: i64, leg: LegIn, duration: i64) {
         self.durations.insert(leg.id.clone(), duration);
         self.repos.insert(leg.id.clone(), leg.repo.clone());
+        self.asks.insert(leg.id.clone(), (leg.request, leg.exclusive));
         self.input(t, Input::LegQueued(Box::new(leg)));
     }
 
@@ -139,11 +153,12 @@ impl Sim {
                     if self.running.get(&leg).is_none_or(|r| r.2 != attempt) {
                         continue;
                     }
-                    let Some((_, start, _)) = self.running.remove(&leg) else { continue };
+                    let Some((runner, start, _)) = self.running.remove(&leg) else { continue };
                     if let Some(repo) = self.repos.get(&leg) {
                         self.busy.push((repo.clone(), start, t));
                     }
                     self.busy_legs.push((leg.clone(), start, t));
+                    self.busy_on.push((leg.clone(), runner, start, t));
                     let outcome = match self.failures.get_mut(&leg).filter(|f| !f.is_empty()) {
                         Some(f) => Outcome::Failed(Failed { class: f.remove(0), exit_code: None, log_hits: Vec::new() }),
                         None => Outcome::Success,
@@ -173,10 +188,11 @@ impl Sim {
                     if self.running.get(&leg).is_some_and(|r| r.2 == attempt) {
                         self.failures.remove(&leg);
                         let now = self.now;
-                        if let Some((_, start, _)) = self.running.remove(&leg)
-                            && let Some(repo) = self.repos.get(&leg)
-                        {
-                            self.busy.push((repo.clone(), start, now));
+                        if let Some((runner, start, _)) = self.running.remove(&leg) {
+                            if let Some(repo) = self.repos.get(&leg) {
+                                self.busy.push((repo.clone(), start, now));
+                            }
+                            self.busy_on.push((leg.clone(), runner, start, now));
                         }
                         let more = self.sched.handle(Input::AttemptFinished { leg, attempt, outcome: Outcome::Cancelled }, now);
                         self.apply(more);
@@ -249,6 +265,40 @@ impl Sim {
     }
 
     /// When a leg was first assigned.
+    /// Each group's share of the dominant-resource time in `[from, to)` (docs/needs.md G7, E2.1):
+    /// each leg's time there weighted by its dominant share of the fleet (the largest of what it
+    /// holds over what the runners offer, in slots, CPUs, memory and GPUs, as the engine counts
+    /// them), legs grouped by `key`, and only legs on runners `on` keeps. A measurement, as
+    /// [`Self::shares`] is.
+    #[allow(clippy::float_arithmetic, clippy::cast_precision_loss)]
+    pub fn dominant_by(&self, from: i64, to: i64, key: impl Fn(&str) -> String, on: impl Fn(&str) -> bool) -> BTreeMap<String, f64> {
+        let mut fleet = [0u64; DIMS];
+        for r in self.offered.values() {
+            for (f, o) in fleet.iter_mut().zip(offers(r, self.resources)) {
+                *f += o;
+            }
+        }
+        let mut by: BTreeMap<String, f64> = BTreeMap::new();
+        for (leg, runner, s, e) in &self.busy_on {
+            let overlap = (e.min(&to) - s.max(&from)).max(0);
+            let (Some((q, exclusive)), Some(r)) = (self.asks.get(leg), self.offered.get(runner)) else { continue };
+            if overlap == 0 || !on(runner) {
+                continue;
+            }
+            let has = offers(r, self.resources);
+            let holds = if *exclusive && q.cpu.is_zero() { has } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
+            let dominant = holds.iter().zip(has).zip(fleet).filter(|((_, h), f)| *h > 0 && *f > 0).map(|((a, _), f)| *a as f64 / f as f64).fold(0.0, f64::max);
+            *by.entry(key(leg)).or_default() += overlap as f64 * dominant;
+        }
+        let total: f64 = by.values().sum();
+        if total > 0.0 {
+            for v in by.values_mut() {
+                *v /= total;
+            }
+        }
+        by
+    }
+
     pub fn started(&self, leg: &str) -> Option<i64> {
         self.assigned.iter().find(|a| a.leg == leg).map(|a| a.at)
     }

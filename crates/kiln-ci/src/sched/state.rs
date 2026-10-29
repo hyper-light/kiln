@@ -158,13 +158,46 @@ fn within(used: u64, cap: u64, factor: PerMille) -> bool {
     u128::from(used).saturating_mul(1000) <= u128::from(cap).saturating_mul(u128::from(factor))
 }
 
-/// A queued leg's place in its signature's queue: its priority, its fair-share virtual start
-/// ([`VIRTUAL`]), and when it arrived. Aging is applied between priorities as legs are picked.
-type Key = (u8, u128, u64);
+/// A queued leg's place in its signature's queue: its priority and when it arrived. Its flow's
+/// fair-share standing is taken as legs are picked, for the runner picking (docs/needs.md E2.1),
+/// and aging is applied between priorities then.
+type Key = (u8, u64);
 
-/// Fair share's virtual time, per millisecond of cost at a weight of one (thousandths): costs over
-/// weights in microseconds, so a weight of three rounds nothing that matters away.
-const VIRTUAL: u128 = 1_000_000;
+/// The dimensions fair share counts (docs/needs.md E2.1): slots, milli-CPUs, memory bytes and
+/// GPUs, in that order.
+pub const DIMS: usize = 4;
+
+/// A share of the fleet, in millionths.
+const MILLION: u128 = 1_000_000;
+
+/// What a runner offers in each dimension fair share counts (docs/needs.md E2.1): its slots, and in
+/// resource mode (`resources`, W05-R03) its CPUs, memory and GPUs; nothing in the rest.
+pub fn offers(r: &RunnerIn, resources: bool) -> [u64; DIMS] {
+    match r.capacity.filter(|c| resources && !c.cpu.is_zero()) {
+        Some(c) => [u64::from(r.slots), c.cpu.get(), c.mem, u64::from(c.gpu)],
+        None => [u64::from(r.slots), 0, 0, 0],
+    }
+}
+
+/// An item's share of each dimension of the fleet, in millionths, rounded up (docs/needs.md E2.1,
+/// DRF's shares): what it asks of each over what the fleet has; nothing where it asks nothing or
+/// the fleet has none. Its dominant share is the largest.
+pub fn shares(asks: &[u64; DIMS], fleet: &[u64; DIMS]) -> [u128; DIMS] {
+    let mut s = [0u128; DIMS];
+    for ((s, a), f) in s.iter_mut().zip(asks).zip(fleet) {
+        if *a > 0 && *f > 0 {
+            *s = (u128::from(*a) * MILLION).div_ceil(u128::from(*f));
+        }
+    }
+    s
+}
+
+/// What running costs a flow in each dimension (docs/needs.md E2.1, as DRFQ charges): its share
+/// of it times its expected milliseconds, over the flow's weight (thousandths) split `split` ways
+/// (W28-R66), in fair share's virtual time.
+pub fn charges(shares: &[u128; DIMS], ms: Ms, weight: PerMille, split: u128) -> [u128; DIMS] {
+    shares.map(|s| s.saturating_mul(u128::from(ms)).saturating_mul(split).saturating_mul(1000) / u128::from(weight.max(1)))
+}
 
 /// `ms` after `now` (unix ms), as far as an `i64` goes.
 fn later(now: i64, ms: Ms) -> i64 {
@@ -582,8 +615,10 @@ struct Leg {
     queued_at: i64,
     /// When it arrived: a leg admission held counts its wait from then.
     arrived: i64,
-    /// Its place: priority, fair-share start, arrival.
+    /// Its place: priority, arrival.
     key: Option<Key>,
+    /// Its fair-share flow while it's queued: the queue keeps its legs by it.
+    flow: String,
     /// Counted among its fair-share levels' active members (W28-R66).
     counted: bool,
     reason: Option<WaitReason>,
@@ -651,6 +686,21 @@ fn size(r: &Runner) -> Option<Resources> {
     let f = &r.input.view.facts;
     let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
     (cpus > 0 && f.mem.total > 0).then(|| Resources { cpu: Cpus::whole(u64::from(cpus)), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
+}
+
+/// What a leg holds of a runner in each dimension fair share counts while it runs there (W05-R03,
+/// docs/needs.md E2.1): one slot and its request, or, exclusive and asking for no CPUs, all of the
+/// runner; nothing in a dimension the runner doesn't offer.
+fn asks(l: &Leg, r: &Runner, resources: bool) -> [u64; DIMS] {
+    let offers = offers(&r.input, resources);
+    let q = l.input.request;
+    let mut asks = if claim(&l.input, size(r)) == Some(Claim::Whole) { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
+    for (a, o) in asks.iter_mut().zip(offers) {
+        if o == 0 {
+            *a = 0;
+        }
+    }
+    asks
 }
 
 /// What a leg coming to a runner holds of it (W05-R03): nothing of its own, the whole runner, or
@@ -722,14 +772,47 @@ pub fn slots_left(slots: u32, size: Option<Resources>, held: &Resources) -> usiz
 struct Sig {
     req: Requirement,
     eligible: BTreeSet<String>,
-    /// Its legs queued, by priority, each ordered by fair-share start and arrival.
-    queue: BTreeMap<u8, BTreeSet<(u128, u64, String)>>,
+    /// Its legs queued, by priority, then by fair-share flow, each flow's in arrival order: which
+    /// flow goes first depends on the runner picking (docs/needs.md E2.1).
+    queue: BTreeMap<u8, BTreeMap<String, BTreeSet<(u64, String)>>>,
 }
 
 impl Sig {
     fn len(&self) -> usize {
-        self.queue.values().map(BTreeSet::len).sum()
+        self.queue.values().flat_map(BTreeMap::values).map(BTreeSet::len).sum()
     }
+
+    /// Its queued legs, in no order that decides anything.
+    fn ids(&self) -> impl Iterator<Item = &String> {
+        self.queue.values().flat_map(BTreeMap::values).flat_map(|legs| legs.iter().map(|(_, id)| id))
+    }
+}
+
+/// One priority level's legs, as a runner takes them ([`Scheduler::walk`]): each flow's next leg
+/// by (its flow's standing, its arrival), the least first; a flow's legs in arrival order.
+struct Walk<'a> {
+    level: &'a BTreeMap<String, BTreeSet<(u64, String)>>,
+    heads: BTreeSet<(u128, u64, &'a str)>,
+}
+
+impl<'a> Iterator for Walk<'a> {
+    /// A leg: its flow's standing, its arrival, its id.
+    type Item = (u128, u64, &'a String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (standing, q, flow) = self.heads.pop_first()?;
+        let mut from = self.level.get(flow)?.range((q, String::new())..);
+        let (_, id) = from.next()?;
+        if let Some((after, _)) = from.next() {
+            self.heads.insert((standing, *after, flow));
+        }
+        Some((standing, q, id))
+    }
+}
+
+/// The dimensions a runner offers (docs/needs.md E2.1), in resource mode or not (`resources`).
+pub fn dims(r: &RunnerIn, resources: bool) -> [bool; DIMS] {
+    offers(r, resources).map(|o| o > 0)
 }
 
 /// The scheduler. Whatever it walks while deciding, it walks in one order on every machine and in
@@ -747,9 +830,12 @@ pub struct Scheduler {
     /// Runs by supersede key, oldest first.
     superseding: BTreeMap<String, Vec<String>>,
     run_groups: BTreeMap<String, String>,
-    /// Fair share's virtual finish by repository, and the virtual time now ([`VIRTUAL`]).
-    finish: BTreeMap<String, u128>,
-    vtime: u128,
+    /// Fair share's virtual finish by flow, and its virtual time now, each in every dimension
+    /// (docs/needs.md E2.1): start-time fair queuing's tags, per dimension as DRFQ keeps them.
+    finish: BTreeMap<String, [u128; DIMS]>,
+    vtime: [u128; DIMS],
+    /// What the fleet's connected runners that aren't draining offer in each dimension.
+    fleet: [u64; DIMS],
     seq: u64,
     timers: BTreeMap<i64, Vec<String>>,
     in_progress: BTreeMap<String, usize>,
@@ -865,6 +951,7 @@ impl Scheduler {
                 if let Some(r) = self.runners.get_mut(&runner) {
                     r.draining = true;
                 }
+                self.refresh_fleet();
                 self.release_holds(now, &mut out);
                 self.try_avoided(now, &mut out);
             }
@@ -924,13 +1011,7 @@ impl Scheduler {
     fn deprioritize(&mut self, run: &str) {
         let ids: Vec<String> = self.legs.iter().filter(|(_, l)| l.input.run == run && l.state == State::Queued).map(|(k, _)| k.clone()).collect();
         for id in ids {
-            self.unqueue(&id);
-            let fair = self.legs.get_mut(&id).map_or(0, |l| {
-                l.input.priority = 0;
-                l.key.map_or(0, |k| k.1)
-            });
-            self.set_key(&id, fair);
-            self.insert_queue(&id);
+            self.reprioritize(&id, 0);
         }
     }
 
@@ -1016,7 +1097,7 @@ impl Scheduler {
         let group = input.group.clone();
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
+            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, flow: String::new(), counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1159,6 +1240,7 @@ impl Scheduler {
                 queued_at: 0,
                 arrived: 0,
                 key: None,
+                flow: String::new(),
                 counted: false,
                 reason: None,
                 avoid: None,
@@ -1240,20 +1322,17 @@ impl Scheduler {
 
     fn queue(&mut self, id: &str, now: i64, since: i64, out: &mut Vec<Command>) {
         let Some(leg) = self.legs.get(id) else { return };
-        let cost = leg.input.cost.unwrap_or(self.config().default_cost);
         let cadenced = leg.input.exclusive && leg.input.admission.as_ref().is_some_and(|a| a.cadence.is_some());
         self.count(id);
         // Start-time fair queuing across repositories (W05-R10), and inside each by actor and lane
-        // as `fair_by` says (W28-R66): its cost over its flow's weight, in virtual time's fixed
-        // point.
-        let (flow, weight, split) = self.flow(id);
-        let start = self.vtime.max(self.finish.get(&flow).copied().unwrap_or(0));
-        let length = u128::from(cost).saturating_mul(VIRTUAL).saturating_mul(split) / u128::from(weight.max(1));
-        self.finish.insert(flow, start.saturating_add(length));
+        // as `fair_by` says (W28-R66): it waits in its flow, whose tags are taken as it's dispatched,
+        // in the dimensions its runner offers (docs/needs.md E2.1).
+        let flow = self.flow(id).0;
         if let Some(l) = self.legs.get_mut(id) {
             l.queued_at = since;
+            l.flow = flow;
         }
-        self.set_key(id, start);
+        self.set_key(id);
         self.insert_queue(id);
         if cadenced {
             self.cadenced.insert(id.to_owned());
@@ -1292,45 +1371,70 @@ impl Scheduler {
         }
     }
 
-    /// The queue key: its priority, fair-share start, arrival. Aging is applied between
-    /// priorities as legs are picked ([`Self::try_runner`]).
-    fn set_key(&mut self, id: &str, fair: u128) {
+    /// The queue key: its priority and arrival. Fair share's standing and aging are applied as
+    /// legs are picked ([`Self::try_runner`]).
+    fn set_key(&mut self, id: &str) {
         self.seq += 1;
         let seq = self.seq;
         if let Some(l) = self.legs.get_mut(id) {
-            l.key = Some((l.input.priority, fair, seq));
+            l.key = Some((l.input.priority, seq));
             l.state = State::Queued;
         }
     }
 
-    /// A queued leg's place as legs are picked ([`Self::try_runner`]): its level's effective
-    /// priority (from the wait of its signature's next leg at its priority), its fair-share start,
-    /// its arrival; the highest first, then the earliest.
+    /// A queued leg's place in queue order, as legs whose places changed together go in turn
+    /// ([`Self::runner_lost`]): its level's effective priority (from the wait of the level's next
+    /// leg), its flow's standing in every dimension, its arrival; the highest first, then the
+    /// earliest. A runner picking goes by the dimensions it offers ([`Self::try_runner`]).
     fn pick_key(&self, l: &Leg, now: i64) -> Option<(i128, u128, u64)> {
-        let (p, f, q) = l.key?;
-        let (_, _, head) = self.sigs.get(&l.sig)?.queue.get(&p)?.iter().next()?;
+        let (p, q) = l.key?;
+        let level = self.sigs.get(&l.sig)?.queue.get(&p)?;
+        let every = [true; DIMS];
+        let (_, _, head) = self.walk(level, &every).next()?;
         let waited = self.legs.get(head).map_or(0, |h| now.saturating_sub(h.queued_at).max(0));
-        Some((effective(p, self.config().aging_per_minute, waited), f, q))
+        Some((effective(p, self.config().aging_per_minute, waited), self.flow_standing(&l.flow, &every), q))
+    }
+
+    /// A flow's standing for a runner offering `dims` (docs/needs.md E2.1): the latest of where it
+    /// would start in each of them, as start-time fair queuing has it (the virtual time, or the
+    /// flow's own finish when that's later). With every dimension offered, it's DRF over time; a
+    /// dimension a runner doesn't offer (GPUs on a runner without them) doesn't count there.
+    fn flow_standing(&self, flow: &str, dims: &[bool; DIMS]) -> u128 {
+        let none = [0; DIMS];
+        let finish = self.finish.get(flow).unwrap_or(&none);
+        self.vtime.iter().zip(finish).zip(dims).filter(|(_, on)| **on).map(|((v, f), _)| (*v).max(*f)).max().unwrap_or(0)
+    }
+
+    /// One priority level's legs in the order a runner offering `dims` takes them: by their flow's
+    /// standing, then by arrival (docs/needs.md E2.1).
+    fn walk<'a>(&self, level: &'a BTreeMap<String, BTreeSet<(u64, String)>>, dims: &[bool; DIMS]) -> Walk<'a> {
+        let heads = level.iter().filter_map(|(flow, legs)| legs.first().map(|(q, _)| (self.flow_standing(flow, dims), *q, flow.as_str()))).collect();
+        Walk { level, heads }
     }
 
     fn insert_queue(&mut self, id: &str) {
         let Some(l) = self.legs.get(id) else { return };
-        let Some((p, f, q)) = l.key else { return };
-        let sig = l.sig.clone();
+        let Some((p, q)) = l.key else { return };
+        let (sig, flow) = (l.sig.clone(), l.flow.clone());
         if let Some(s) = self.sigs.get_mut(&sig) {
-            s.queue.entry(p).or_default().insert((f, q, id.to_owned()));
+            s.queue.entry(p).or_default().entry(flow).or_default().insert((q, id.to_owned()));
         }
     }
 
     fn unqueue(&mut self, id: &str) {
         let Some(l) = self.legs.get(id) else { return };
-        let Some((p, f, q)) = l.key else { return };
-        let sig = l.sig.clone();
+        let Some((p, q)) = l.key else { return };
+        let (sig, flow) = (l.sig.clone(), l.flow.clone());
         if let Some(s) = self.sigs.get_mut(&sig)
-            && let Some(sub) = s.queue.get_mut(&p)
+            && let Some(level) = s.queue.get_mut(&p)
         {
-            sub.remove(&(f, q, id.to_owned()));
-            if sub.is_empty() {
+            if let Some(legs) = level.get_mut(&flow) {
+                legs.remove(&(q, id.to_owned()));
+                if legs.is_empty() {
+                    level.remove(&flow);
+                }
+            }
+            if level.is_empty() {
                 s.queue.remove(&p);
             }
         }
@@ -1616,26 +1720,29 @@ impl Scheduler {
 
     /// Gives a runner the best queued legs that fit it, until none does: of each signature's
     /// priorities the effective highest (`priority + aging × minutes its next leg has waited`,
-    /// W05-R09), and in it the earliest fair-share start, then arrival.
+    /// W05-R09), and in it the least standing of its flow in the dimensions this runner offers
+    /// (docs/needs.md E2.1), then arrival.
     fn try_runner(&mut self, runner: &str, now: i64, out: &mut Vec<Command>) {
         let aging = self.config().aging_per_minute;
         loop {
             let Some(r) = self.runners.get(runner) else { return };
+            let dims = dims(&r.input, self.config().resources);
             let mut best: Option<((i128, u128, u64), String)> = None;
             for s in self.sigs.values() {
                 if !s.eligible.contains(runner) {
                     continue;
                 }
-                for (p, sub) in s.queue.iter().rev() {
-                    let Some((_, _, head)) = sub.iter().next() else { continue };
+                for (p, level) in s.queue.iter().rev() {
+                    let mut walk = self.walk(level, &dims).peekable();
+                    let Some(&(_, _, head)) = walk.peek() else { continue };
                     let waited = self.legs.get(head).map_or(0, |l| now.saturating_sub(l.queued_at).max(0));
                     let e = effective(*p, aging, waited);
-                    for (f, q, id) in sub {
-                        if best.as_ref().is_some_and(|(k, _)| !ahead((e, *f, *q), *k)) {
+                    for (standing, q, id) in walk {
+                        if best.as_ref().is_some_and(|(k, _)| !ahead((e, standing, q), *k)) {
                             break;
                         }
                         if self.legs.get(id).is_some_and(|l| self.fits(r, l)) {
-                            best = Some(((e, *f, *q), id.clone()));
+                            best = Some(((e, standing, q), id.clone()));
                             break;
                         }
                     }
@@ -1651,7 +1758,41 @@ impl Scheduler {
         }
     }
 
+    /// Charges a leg's flow for its dispatch to `runner` (docs/needs.md E2.1): in each dimension the
+    /// runner offers, its share of the fleet times its expected milliseconds over the flow's weight,
+    /// from where start-time fair queuing starts it there; the virtual time moves up to that start.
+    fn charge(&mut self, id: &str, runner: &str) {
+        let (Some(l), Some(r)) = (self.legs.get(id), self.runners.get(runner)) else { return };
+        let ms = l.input.cost.unwrap_or(self.config().default_cost);
+        let (_, weight, split) = self.flow(id);
+        let shares = shares(&asks(l, r, self.config().resources), &self.fleet);
+        let costs = charges(&shares, ms, weight, split);
+        let flow = l.flow.clone();
+        let finish = self.finish.entry(flow).or_insert([0; DIMS]);
+        for ((f, v), (s, c)) in finish.iter_mut().zip(self.vtime.iter_mut()).zip(shares.iter().zip(costs)) {
+            if *s == 0 {
+                continue;
+            }
+            let start = (*v).max(*f);
+            *f = start.saturating_add(c);
+            *v = (*v).max(start);
+        }
+    }
+
+    /// The fleet's capacity in each dimension: what its connected runners that aren't draining
+    /// offer (docs/needs.md E2.1).
+    fn refresh_fleet(&mut self) {
+        let (mut fleet, resources) = ([0u64; DIMS], self.config().resources);
+        for r in self.runners.values().filter(|r| r.connected && !r.draining) {
+            for (f, o) in fleet.iter_mut().zip(offers(&r.input, resources)) {
+                *f = f.saturating_add(o);
+            }
+        }
+        self.fleet = fleet;
+    }
+
     fn assign(&mut self, id: &str, runner: &str, now: i64, out: &mut Vec<Command>) {
+        self.charge(id, runner);
         self.unqueue(id);
         let expected = self.legs.get(id).map(|l| self.expected_ms(l, runner));
         let Some(l) = self.legs.get_mut(id) else { return };
@@ -1663,10 +1804,9 @@ impl Scheduler {
         l.started = Some(now);
         self.demands.started(id, now);
         let Some(l) = self.legs.get_mut(id) else { return };
-        let (attempt, request, repo, fair) = (l.attempt, l.input.request, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
+        let (attempt, request, repo) = (l.attempt, l.input.request, l.input.repo.clone());
         let req = l.req.clone();
         let (image, docker) = (req.image.clone(), req.docker.clone());
-        self.vtime = self.vtime.max(fair);
         *self.in_progress.entry(repo).or_default() += 1;
         self.admit.started(id, now);
         if self.cadenced.remove(id) {
@@ -1881,13 +2021,17 @@ impl Scheduler {
         if !self.legs.get(exec).is_some_and(|l| l.state == State::Queued && l.input.priority != priority) {
             return;
         }
-        self.unqueue(exec);
-        let fair = self.legs.get_mut(exec).map_or(0, |l| {
+        self.reprioritize(exec, priority);
+    }
+
+    /// A queued leg takes another priority, keeping its arrival, so its place in its flow.
+    fn reprioritize(&mut self, id: &str, priority: u8) {
+        self.unqueue(id);
+        if let Some(l) = self.legs.get_mut(id) {
             l.input.priority = priority;
-            l.key.map_or(0, |k| k.1)
-        });
-        self.set_key(exec, fair);
-        self.insert_queue(exec);
+            l.key = l.key.map(|(_, q)| (priority, q));
+        }
+        self.insert_queue(id);
     }
 
     /// `id` adopted `exec` of `run` (W28-R42): it waits for it, holding no runner, slot or quota,
@@ -2083,6 +2227,7 @@ impl Scheduler {
         }
         let (running, used) = self.runners.get(&id).map(|x| (x.running.clone(), x.used)).unwrap_or_default();
         self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false });
+        self.refresh_fleet();
         self.refresh_eligibility(&id);
         self.release_holds(now, out);
         self.try_avoided(now, out);
@@ -2129,6 +2274,7 @@ impl Scheduler {
             }
             None => return,
         };
+        self.refresh_fleet();
         self.refresh_eligibility(runner);
         self.release_holds(now, out);
         // Its pools' executors went with it.
@@ -2146,16 +2292,18 @@ impl Scheduler {
             let attempt = self.legs.get(&leg).map_or(0, |l| l.attempt);
             self.finished(&leg, attempt, Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }), now, out);
         }
-        let mut changed = self.requeued.take().unwrap_or_default();
+        let mut changed: BTreeSet<String> = self.requeued.take().unwrap_or_default().into_iter().collect();
         changed.extend(self.legs.iter().filter(|(_, l)| l.state == State::Queued && l.avoid.as_ref().is_some_and(|(_, off)| *off == Off::Lost)).map(|(id, _)| id.clone()));
-        let mut changed: Vec<(std::cmp::Reverse<i128>, u128, u64, String)> =
-            changed.into_iter().filter_map(|id| self.legs.get(&id).and_then(|l| self.pick_key(l, now)).map(|(e, f, q)| (std::cmp::Reverse(e), f, q, id))).collect();
-        changed.sort();
-        changed.dedup();
-        for (_, _, _, id) in changed {
-            if self.legs.get(&id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
-                self.offer(&id, true, now, out);
-            }
+        // The next in queue order goes, its place taken again each time: a leg placed moves its
+        // flow's standing, and so the order of the rest (docs/needs.md E2.1).
+        loop {
+            let next = changed
+                .iter()
+                .filter_map(|id| self.legs.get(id).filter(|l| l.state == State::Queued && l.hold.is_none()).and_then(|l| self.pick_key(l, now)).map(|(e, f, q)| (std::cmp::Reverse(e), f, q, id.clone())))
+                .min();
+            let Some((_, _, _, id)) = next else { break };
+            changed.remove(&id);
+            self.offer(&id, true, now, out);
         }
         self.scale_all(now, out);
         self.refresh_reasons(out);
@@ -2531,7 +2679,7 @@ impl Scheduler {
                 .sigs
                 .values()
                 .filter(|s| s.req.pool.as_deref() == Some(pool))
-                .flat_map(|s| s.queue.values().flat_map(|sub| sub.iter().map(|(_, _, id)| id.clone())))
+                .flat_map(|s| s.ids().cloned())
                 .filter_map(|id| self.legs.get(&id).map(|l| (id, l.input.own_executor)))
                 .collect();
             let mut room = p.max.saturating_sub(self.executors.values().filter(|e| e.pool == pool).count());

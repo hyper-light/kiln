@@ -2021,3 +2021,83 @@ proptest! {
     }
 }
 }
+
+/// docs/needs.md E2.1: an item's share of each dimension of the fleet, in millionths rounded up,
+/// and what running charges its flow.
+#[test]
+fn e2_1_shares_and_charges() {
+    use super::state::{charges, offers, shares};
+    let gib = 1u64 << 30;
+    let sized = |slots: u32, cpus: u64, mem: u64, gpu: u32| RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(cpus), mem: mem * gib, gpu, ..Resources::default() }), ..linux("r", slots) };
+    let hour = 3_600_000;
+    // A fleet of 64 CPUs and 128 GiB, in resource mode; in slots mode only its slots count.
+    let fleet = offers(&sized(16, 64, 128, 0), true);
+    assert_eq!(fleet, [16, 64_000, 128 * gib, 0]);
+    assert_eq!(offers(&sized(16, 64, 128, 0), false), [16, 0, 0, 0]);
+    // 32 CPUs for an hour cost 32 times one CPU for an hour.
+    let (one, big) = (shares(&[1, 1_000, 0, 0], &fleet), shares(&[1, 32_000, 0, 0], &fleet));
+    assert_eq!(one, [62_500, 15_625, 0, 0]);
+    assert_eq!(big, [62_500, 500_000, 0, 0]);
+    let ([_, one_cpu, _, _], [_, big_cpu, _, _]) = (charges(&one, hour, 1000, 1), charges(&big, hour, 1000, 1));
+    assert_eq!(big_cpu, 32 * one_cpu);
+    // A memory-heavy test costs by its memory.
+    assert_eq!(shares(&[1, 1_000, 32 * gib, 0], &fleet), [62_500, 15_625, 250_000, 0]);
+    // A GPU, of eight.
+    assert_eq!(shares(&[1, 0, 0, 1], &offers(&sized(8, 32, 64, 8), true)), [125_000, 0, 0, 125_000]);
+    // A slot of 20 on a fleet in slots mode; of three, rounded up.
+    assert_eq!(shares(&[1, 0, 0, 0], &offers(&linux("s", 20), true)), [50_000, 0, 0, 0]);
+    assert_eq!(shares(&[1, 0, 0, 0], &[3, 0, 0, 0]), [333_334, 0, 0, 0]);
+    // An exclusive leg holding its whole runner, the fleet's only one: all of it.
+    assert_eq!(shares(&fleet, &fleet), [1_000_000, 1_000_000, 1_000_000, 0]);
+    // Asking a dimension the fleet lacks costs nothing there.
+    assert_eq!(shares(&[1, 0, 0, 1], &fleet), [62_500, 0, 0, 0]);
+    // The charge: share × milliseconds × split × 1000 / weight (thousandths).
+    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 1000, 1), [3_000_000_000, 0, 0, 0]);
+    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 3000, 1), [1_000_000_000, 0, 0, 0]);
+    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 1000, 2), [6_000_000_000, 0, 0, 0]);
+}
+
+/// docs/needs.md E2.1 (H-DRF's case): a repository whose GPU legs hold every GPU, which no one else
+/// asks for, still gets its share of the runners without GPUs for its other legs: a runner picking
+/// goes by the dimensions it offers, so GPU time doesn't count there.
+#[test]
+fn e2_1_a_repository_holding_every_gpu_keeps_its_share_of_the_cpu_runners() {
+    let gib = 1u64 << 30;
+    let mut sim = Sim::new(Config { resources: true, ..Config::default() });
+    let sized = |name: &str, label: &str, slots: u32, mem: u64, gpu: u32| {
+        let base = linux(name, slots);
+        RunnerIn { view: RunnerView { labels: vec![label.into()], ..base.view.clone() }, capacity: Some(Resources { cpu: Cpus::whole(8), mem: mem * gib, gpu, ..Resources::default() }), ..base }
+    };
+    for n in 0..4 {
+        sim.runner(0, sized(&format!("c{n}"), "cpu", 8, 32, 0));
+    }
+    for n in 0..2 {
+        sim.runner(0, sized(&format!("g{n}"), "gpu", 32, 64, 4));
+    }
+    let task = |id: String, repo: &str, label: &str, request: Resources| LegIn {
+        run: format!("run-{id}"),
+        id,
+        repo: repo.into(),
+        route: LegRoute { labels: vec![label.into()], ..LegRoute::default() },
+        priority: 60,
+        request,
+        cost: Some(60_000),
+        ..LegIn::default()
+    };
+    let (cpu, gpu) = (Resources { cpu: Cpus::whole(1), mem: 2 * gib, ..Resources::default() }, Resources { gpu: 1, ..Resources::default() });
+    for i in 0..600 {
+        sim.leg(1, task(format!("gg{i}"), "acme/gpu", "gpu", gpu), MIN);
+        sim.leg(1, task(format!("gc{i}"), "acme/gpu", "cpu", cpu), MIN);
+        sim.leg(1, task(format!("cc{i}"), "acme/cpu", "cpu", cpu), MIN);
+    }
+    sim.run(60 * MIN);
+    let repo = |leg: &str| if leg.starts_with("cc") { "acme/cpu".to_owned() } else { "acme/gpu".to_owned() };
+    // While both have CPU legs waiting (32 CPU slots, 1,200 one-minute legs: 37 minutes).
+    for w in [0, 10, 20] {
+        let share = sim.dominant_by(w * MIN, (w + 10) * MIN, repo, |r| r.starts_with('c')).get("acme/gpu").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: the GPU repository got {share:.2} of the CPU runners", w + 10);
+    }
+    // Its GPU legs held every GPU meanwhile.
+    let gpus = sim.busy_on.iter().filter(|(l, r, s, e)| l.starts_with("gg") && r.starts_with('g') && *s < 30 * MIN && *e > 0).count();
+    assert!(gpus >= 8 * 29, "only {gpus} GPU legs ran in the first 30 minutes");
+}
