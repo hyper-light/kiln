@@ -4,8 +4,9 @@
  * its commits: its tip's row carries its review, the rest fold under it. Each row is Ship's own:
  * the commit, its stand and the one line saying what it's doing, its journey strip, who and when,
  * its paired actions, and the dropdown (Files with the Conversation, Output, Jobs, Lanes). The
- * facets narrow by host and kind; Review is the lens on changes. Data through Suspense, changes
- * through the endpoints the row names; no effects.
+ * facets narrow by host and kind, and a change's kind is how to see only changes: no toggle of its
+ * own (Ada, 2026-10-28). Data through Suspense, changes through the endpoints the row names; no
+ * effects.
  */
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
@@ -15,7 +16,6 @@ import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip } from "@/components/ui/status-glyph";
-import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
@@ -49,12 +49,11 @@ export default function ShipPage() {
 
 function ShipList() {
   const [params, setParams] = useSearchParams();
-  const lens = params.get("lens") === "review" ? "review" : "all";
   const sort = sortOf(params.get("sort"));
   const chosen: Chosen = Object.fromEntries(FACET_KEYS.map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
   // One value of a facet is the server's to narrow by; several are narrowed here.
   const one = (k: string) => (chosen[k]?.length === 1 ? chosen[k][0] : undefined);
-  const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), lens: lens === "review" ? "review" : undefined, limit: LIMIT };
+  const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), limit: LIMIT };
   const key = `ship/commits/${JSON.stringify(q)}`;
   // Every stage it shows moves on its own event: a run or a leg (checks, build), review, comments and
   // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant).
@@ -87,8 +86,8 @@ function ShipList() {
   const items = order(fold(commits, opened), sort);
   const hold = useListHold(opened.size > 0);
   const { ref: holdRef, ...holdProps } = hold.bind;
-  // Your own change of view (lens, sort, filter) applies at once; only what arrives waits.
-  const view = `${lens}|${sort}|${JSON.stringify(chosen)}`;
+  // Your own change of view (sort, filter) applies at once; only what arrives waits.
+  const view = `${sort}|${JSON.stringify(chosen)}`;
   const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, { it: Item; sig: string }>(), view }));
   // What a refetch brings that reads the same isn't a change (W26-R15): the item keeps its last
   // reference, so its memoized row doesn't render again; a changed item keeps its key and is
@@ -159,19 +158,10 @@ function ShipList() {
             )
           }
         />
-        <Segmented
-          label="Lens"
-          value={lens}
-          onChange={(v) => set("lens", v === "review" ? "review" : null)}
-          options={[
-            { value: "all", label: "All" },
-            { value: "review", label: "Review" },
-          ]}
-        />
         <SelectField className="ship-sort" label="Sort commits" hideLabel value={sort} onChange={(v) => set("sort", v === "needs" ? null : v)} options={SORTS} />
       </div>
       {items.length === 0 ? (
-        <EmptyState title={lens === "review" ? "No changes under review" : "No commits yet"}>Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
+        <EmptyState title="No commits yet">Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
       ) : (
         <ul
           className="ship-list"

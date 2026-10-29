@@ -302,7 +302,9 @@
   color: #0b0c0e;
 }
 
-/* The list bar's sort, on the right; on a phone the filter takes the width and the sort sits under it. */
+/* The list bar's sort, on the right; on a phone the filter takes the width and the sort sits under it.
+   In the column a phone makes, each is its own height: a flex basis there would be a height (the
+   filter's 260px opened a gap under it). */
 .ship-sort {
   flex: 0 0 auto;
   min-width: 11rem;
@@ -314,6 +316,7 @@
   }
   .ship-facet,
   .ship-sort {
+    flex: none;
     width: 100%;
   }
 }
