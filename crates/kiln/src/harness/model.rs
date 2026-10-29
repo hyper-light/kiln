@@ -559,10 +559,15 @@ fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
+/// A task's status, not finished in any way: running, waiting to start, or paused.
+pub fn live_task(status: &str) -> bool {
+    matches!(status, "running" | "pending" | "paused")
+}
+
 impl Task {
     /// Still running (or paused): not finished in any way.
     pub fn live(&self) -> bool {
-        matches!(self.status.as_str(), "running" | "pending" | "paused")
+        live_task(&self.status)
     }
 
     /// One of the agent's own subagents, not something it left running. Older machines only report
@@ -816,6 +821,11 @@ pub struct ModelOption {
     /// The harness's default model: what a session started without one runs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
+    /// The speeds faster than standard it runs at, slowest first, when the harness says (as
+    /// `Meta::speeds` says them for the model in use): kept with the machine's models, so a new
+    /// agent can start at one (`Spec::speed`) before any session of it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speeds: Vec<ControlOption>,
 }
 
 /// An effort level as people read it: "xhigh" is "Extra high", the rest as they are, capitalized.
@@ -1237,6 +1247,11 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub pause: Option<Pause>,
+    /// Since when (Unix ms) it waits for room on its machine to go to work: as many of its agents
+    /// are at work as its limit lets be (`harness::limit`). What it was sent waits in its queue
+    /// meanwhile, and goes once there's room, the longest waiting first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_wait: Option<i64>,
     /// Stop between turns once any of the account's limits is this full (percent), before the
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,0 +1,966 @@
+//! OTLP over HTTP (`docs/observe.md` §8): `POST /v1/metrics`, `/v1/logs` and `/v1/traces`, as the
+//! OpenTelemetry protocol specifies them (opentelemetry-proto v1.5.0, "OTLP/HTTP"): a request's body
+//! in protobuf (`application/x-protobuf`) or JSON (`application/json`), gzip-compressed or not,
+//! answered in the request's own encoding. And OTLP over gRPC: the metrics, logs and trace
+//! services' `Export` ([`grpc`]), its message read by the same decoder. Spans not kept (no valid
+//! trace or span id) are said in the answer's partial success, as the specification has a receiver
+//! say what it rejected.
+//!
+//! JSON is put into protobuf's wire format here and read by the same decoder as protobuf
+//! (`kiln_obs::otlp`), so one mapping serves both. The JSON is OTLP's "JSON Protobuf Encoding":
+//! field names in lowerCamelCase (the proto's own names are taken too), 64-bit integers as numbers
+//! or decimal strings, enums as integers, trace and span ids as hex, other bytes as base64; a field
+//! of a name it does not know is skipped, as the specification requires. The walk keeps a stack of
+//! its own, no recursion, and an `AnyValue` nested past [`MAX_DEPTH`] is dropped.
+//!
+//! A node too far behind on its writes answers 503 with `Retry-After`, which OTLP exporters retry
+//! (the specification's retryable codes), rather than taking points it would drop.
+
+use std::io::Read as _;
+
+use kiln_obs::otlp::pb::Writer;
+use serde_json::Value;
+
+use super::Observe;
+
+/// A request's body, at the most, compressed or not: the OpenTelemetry Collector's default for an
+/// OTLP/HTTP receiver (`confighttp`, `max_request_body_size`, 20 MiB).
+pub const MAX_BODY: usize = 20 << 20;
+/// An `AnyValue` nested deeper is dropped: kiln reads a tag's or a body's value at most this deep
+/// (`kiln_obs::otlp::metrics`'s rendering), and a hostile body cannot make the walk deep.
+const MAX_DEPTH: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Metrics,
+    Logs,
+    Traces,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ty {
+    Msg(Schema),
+    Str,
+    /// Hex, as OTLP's JSON writes trace and span ids.
+    Hex,
+    /// Base64, as proto3's JSON writes other bytes.
+    Base64,
+    Fixed64,
+    Fixed32,
+    Double,
+    /// uint32, uint64, int64 and enums: a varint.
+    Varint,
+    /// An enum: an integer, as OTLP's JSON writes one, or the name of one of its values (each
+    /// value's name at its number), as some writers do.
+    Enum(&'static [&'static str]),
+    Sint,
+    Bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Schema {
+    MetricsRequest,
+    LogsRequest,
+    TracesRequest,
+    ResourceMetrics,
+    ResourceLogs,
+    ResourceSpans,
+    ScopeSpans,
+    Span,
+    SpanEvent,
+    SpanLink,
+    SpanStatus,
+    Resource,
+    Scope,
+    ScopeMetrics,
+    ScopeLogs,
+    Metric,
+    Gauge,
+    Sum,
+    Histogram,
+    ExpHistogram,
+    Summary,
+    NumberPoint,
+    HistogramPoint,
+    ExpPoint,
+    Buckets,
+    SummaryPoint,
+    ValueAtQuantile,
+    LogRecord,
+    KeyValue,
+    AnyValue,
+    ArrayValue,
+    KvList,
+}
+
+struct F {
+    name: &'static str,
+    proto: &'static str,
+    num: u32,
+    ty: Ty,
+    repeated: bool,
+}
+
+const fn f(name: &'static str, proto: &'static str, num: u32, ty: Ty) -> F {
+    F { name, proto, num, ty, repeated: false }
+}
+
+const fn r(name: &'static str, proto: &'static str, num: u32, ty: Ty) -> F {
+    F { name, proto, num, ty, repeated: true }
+}
+
+/// Each message's fields, as opentelemetry-proto v1.5.0 numbers them (exemplars and other fields
+/// kiln reads nothing from are left out, and so skipped).
+fn fields(s: Schema) -> &'static [F] {
+    use Schema as S;
+    use Ty::*;
+    match s {
+        S::MetricsRequest => const { &[r("resourceMetrics", "resource_metrics", 1, Msg(S::ResourceMetrics))] },
+        S::LogsRequest => const { &[r("resourceLogs", "resource_logs", 1, Msg(S::ResourceLogs))] },
+        S::TracesRequest => const { &[r("resourceSpans", "resource_spans", 1, Msg(S::ResourceSpans))] },
+        S::ResourceSpans => const { &[f("resource", "resource", 1, Msg(S::Resource)), r("scopeSpans", "scope_spans", 2, Msg(S::ScopeSpans)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::ScopeSpans => const { &[f("scope", "scope", 1, Msg(S::Scope)), r("spans", "spans", 2, Msg(S::Span)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::Span => const { &[
+            f("traceId", "trace_id", 1, Hex),
+            f("spanId", "span_id", 2, Hex),
+            f("traceState", "trace_state", 3, Str),
+            f("parentSpanId", "parent_span_id", 4, Hex),
+            f("flags", "flags", 16, Fixed32),
+            f("name", "name", 5, Str),
+            f("kind", "kind", 6, Enum(&["SPAN_KIND_UNSPECIFIED", "SPAN_KIND_INTERNAL", "SPAN_KIND_SERVER", "SPAN_KIND_CLIENT", "SPAN_KIND_PRODUCER", "SPAN_KIND_CONSUMER"])),
+            f("startTimeUnixNano", "start_time_unix_nano", 7, Fixed64),
+            f("endTimeUnixNano", "end_time_unix_nano", 8, Fixed64),
+            r("attributes", "attributes", 9, Msg(S::KeyValue)),
+            f("droppedAttributesCount", "dropped_attributes_count", 10, Varint),
+            r("events", "events", 11, Msg(S::SpanEvent)),
+            f("droppedEventsCount", "dropped_events_count", 12, Varint),
+            r("links", "links", 13, Msg(S::SpanLink)),
+            f("droppedLinksCount", "dropped_links_count", 14, Varint),
+            f("status", "status", 15, Msg(S::SpanStatus)),
+        ] },
+        S::SpanEvent => const { &[f("timeUnixNano", "time_unix_nano", 1, Fixed64), f("name", "name", 2, Str), r("attributes", "attributes", 3, Msg(S::KeyValue)), f("droppedAttributesCount", "dropped_attributes_count", 4, Varint)] },
+        S::SpanLink => const { &[
+            f("traceId", "trace_id", 1, Hex),
+            f("spanId", "span_id", 2, Hex),
+            f("traceState", "trace_state", 3, Str),
+            r("attributes", "attributes", 4, Msg(S::KeyValue)),
+            f("droppedAttributesCount", "dropped_attributes_count", 5, Varint),
+            f("flags", "flags", 6, Fixed32),
+        ] },
+        S::SpanStatus => const { &[f("message", "message", 2, Str), f("code", "code", 3, Enum(&["STATUS_CODE_UNSET", "STATUS_CODE_OK", "STATUS_CODE_ERROR"]))] },
+        S::ResourceMetrics => const { &[f("resource", "resource", 1, Msg(S::Resource)), r("scopeMetrics", "scope_metrics", 2, Msg(S::ScopeMetrics)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::ResourceLogs => const { &[f("resource", "resource", 1, Msg(S::Resource)), r("scopeLogs", "scope_logs", 2, Msg(S::ScopeLogs)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::Resource => const { &[r("attributes", "attributes", 1, Msg(S::KeyValue)), f("droppedAttributesCount", "dropped_attributes_count", 2, Varint)] },
+        S::Scope => const { &[f("name", "name", 1, Str), f("version", "version", 2, Str), r("attributes", "attributes", 3, Msg(S::KeyValue)), f("droppedAttributesCount", "dropped_attributes_count", 4, Varint)] },
+        S::ScopeMetrics => const { &[f("scope", "scope", 1, Msg(S::Scope)), r("metrics", "metrics", 2, Msg(S::Metric)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::ScopeLogs => const { &[f("scope", "scope", 1, Msg(S::Scope)), r("logRecords", "log_records", 2, Msg(S::LogRecord)), f("schemaUrl", "schema_url", 3, Str)] },
+        S::Metric => const { &[
+            f("name", "name", 1, Str),
+            f("description", "description", 2, Str),
+            f("unit", "unit", 3, Str),
+            f("gauge", "gauge", 5, Msg(S::Gauge)),
+            f("sum", "sum", 7, Msg(S::Sum)),
+            f("histogram", "histogram", 9, Msg(S::Histogram)),
+            f("exponentialHistogram", "exponential_histogram", 10, Msg(S::ExpHistogram)),
+            f("summary", "summary", 11, Msg(S::Summary)),
+            r("metadata", "metadata", 12, Msg(S::KeyValue)),
+        ] },
+        S::Gauge => const { &[r("dataPoints", "data_points", 1, Msg(S::NumberPoint))] },
+        S::Sum => const { &[r("dataPoints", "data_points", 1, Msg(S::NumberPoint)), f("aggregationTemporality", "aggregation_temporality", 2, Varint), f("isMonotonic", "is_monotonic", 3, Bool)] },
+        S::Histogram => const { &[r("dataPoints", "data_points", 1, Msg(S::HistogramPoint)), f("aggregationTemporality", "aggregation_temporality", 2, Varint)] },
+        S::ExpHistogram => const { &[r("dataPoints", "data_points", 1, Msg(S::ExpPoint)), f("aggregationTemporality", "aggregation_temporality", 2, Varint)] },
+        S::Summary => const { &[r("dataPoints", "data_points", 1, Msg(S::SummaryPoint))] },
+        S::NumberPoint => const { &[
+            r("attributes", "attributes", 7, Msg(S::KeyValue)),
+            f("startTimeUnixNano", "start_time_unix_nano", 2, Fixed64),
+            f("timeUnixNano", "time_unix_nano", 3, Fixed64),
+            f("asDouble", "as_double", 4, Double),
+            // sfixed64: the same eight bytes as fixed64, two's complement.
+            f("asInt", "as_int", 6, Fixed64),
+            f("flags", "flags", 8, Varint),
+        ] },
+        S::HistogramPoint => const { &[
+            r("attributes", "attributes", 9, Msg(S::KeyValue)),
+            f("startTimeUnixNano", "start_time_unix_nano", 2, Fixed64),
+            f("timeUnixNano", "time_unix_nano", 3, Fixed64),
+            f("count", "count", 4, Fixed64),
+            f("sum", "sum", 5, Double),
+            r("bucketCounts", "bucket_counts", 6, Fixed64),
+            r("explicitBounds", "explicit_bounds", 7, Double),
+            f("flags", "flags", 10, Varint),
+            f("min", "min", 11, Double),
+            f("max", "max", 12, Double),
+        ] },
+        S::ExpPoint => const { &[
+            r("attributes", "attributes", 1, Msg(S::KeyValue)),
+            f("startTimeUnixNano", "start_time_unix_nano", 2, Fixed64),
+            f("timeUnixNano", "time_unix_nano", 3, Fixed64),
+            f("count", "count", 4, Fixed64),
+            f("sum", "sum", 5, Double),
+            f("scale", "scale", 6, Sint),
+            f("zeroCount", "zero_count", 7, Fixed64),
+            f("positive", "positive", 8, Msg(S::Buckets)),
+            f("negative", "negative", 9, Msg(S::Buckets)),
+            f("flags", "flags", 10, Varint),
+            f("min", "min", 12, Double),
+            f("max", "max", 13, Double),
+            f("zeroThreshold", "zero_threshold", 14, Double),
+        ] },
+        S::Buckets => const { &[f("offset", "offset", 1, Sint), r("bucketCounts", "bucket_counts", 2, Varint)] },
+        S::SummaryPoint => const { &[
+            r("attributes", "attributes", 7, Msg(S::KeyValue)),
+            f("startTimeUnixNano", "start_time_unix_nano", 2, Fixed64),
+            f("timeUnixNano", "time_unix_nano", 3, Fixed64),
+            f("count", "count", 4, Fixed64),
+            f("sum", "sum", 5, Double),
+            r("quantileValues", "quantile_values", 6, Msg(S::ValueAtQuantile)),
+            f("flags", "flags", 8, Varint),
+        ] },
+        S::ValueAtQuantile => const { &[f("quantile", "quantile", 1, Double), f("value", "value", 2, Double)] },
+        S::LogRecord => const { &[
+            f("timeUnixNano", "time_unix_nano", 1, Fixed64),
+            f("observedTimeUnixNano", "observed_time_unix_nano", 11, Fixed64),
+            f("severityNumber", "severity_number", 2, Varint),
+            f("severityText", "severity_text", 3, Str),
+            f("body", "body", 5, Msg(S::AnyValue)),
+            r("attributes", "attributes", 6, Msg(S::KeyValue)),
+            f("droppedAttributesCount", "dropped_attributes_count", 7, Varint),
+            f("flags", "flags", 8, Fixed32),
+            f("traceId", "trace_id", 9, Hex),
+            f("spanId", "span_id", 10, Hex),
+            f("eventName", "event_name", 12, Str),
+        ] },
+        S::KeyValue => const { &[f("key", "key", 1, Str), f("value", "value", 2, Msg(S::AnyValue))] },
+        S::AnyValue => const { &[
+            f("stringValue", "string_value", 1, Str),
+            f("boolValue", "bool_value", 2, Bool),
+            f("intValue", "int_value", 3, Varint),
+            f("doubleValue", "double_value", 4, Double),
+            f("arrayValue", "array_value", 5, Msg(S::ArrayValue)),
+            f("kvlistValue", "kvlist_value", 6, Msg(S::KvList)),
+            f("bytesValue", "bytes_value", 7, Base64),
+        ] },
+        S::ArrayValue => const { &[r("values", "values", 1, Msg(S::AnyValue))] },
+        S::KvList => const { &[r("values", "values", 1, Msg(S::KeyValue))] },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum JsonError {
+    #[error("not JSON: {0}")]
+    Json(String),
+    #[error("{0} is not an object")]
+    NotObject(&'static str),
+    #[error("field {0}: {1}")]
+    Field(&'static str, &'static str),
+}
+
+fn u64_of(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64().or_else(|| n.as_i64().map(|i| i as u64)),
+        Value::String(s) => s.parse::<u64>().ok().or_else(|| s.parse::<i64>().ok().map(|i| i as u64)),
+        _ => None,
+    }
+}
+
+fn f64_of(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => match s.as_str() {
+            "NaN" => Some(f64::NAN),
+            "Infinity" => Some(f64::INFINITY),
+            "-Infinity" => Some(f64::NEG_INFINITY),
+            s => s.parse().ok(),
+        },
+        _ => None,
+    }
+}
+
+/// Writes one scalar field (or, repeated, a packed run of them).
+fn scalar(w: &mut Writer, field: &F, v: &Value) -> Result<(), JsonError> {
+    let bad = |why| JsonError::Field(field.name, why);
+    if field.repeated {
+        let Value::Array(items) = v else { return Err(bad("not an array")) };
+        let mut packed = Writer::default();
+        for it in items {
+            match field.ty {
+                Ty::Fixed64 => packed.buf.extend_from_slice(&u64_of(it).ok_or_else(|| bad("not a 64-bit integer"))?.to_le_bytes()),
+                Ty::Double => packed.buf.extend_from_slice(&f64_of(it).ok_or_else(|| bad("not a number"))?.to_le_bytes()),
+                Ty::Varint => kiln_obs::varint::put(&mut packed.buf, u64_of(it).ok_or_else(|| bad("not an integer"))?),
+                _ => return Err(bad("a repeated field of this kind")),
+            }
+        }
+        w.bytes(field.num, &packed.buf);
+        return Ok(());
+    }
+    match field.ty {
+        Ty::Str => w.str(field.num, v.as_str().ok_or_else(|| bad("not a string"))?),
+        Ty::Hex => {
+            let s = v.as_str().ok_or_else(|| bad("not a string"))?;
+            if !s.is_empty() {
+                w.bytes(field.num, &hex::decode(s).map_err(|_| bad("not hex"))?);
+            }
+        }
+        Ty::Base64 => {
+            use base64::Engine as _;
+            let s = v.as_str().ok_or_else(|| bad("not a string"))?;
+            w.bytes(field.num, &base64::engine::general_purpose::STANDARD.decode(s).map_err(|_| bad("not base64"))?);
+        }
+        Ty::Fixed64 => w.fixed64(field.num, u64_of(v).ok_or_else(|| bad("not a 64-bit integer"))?),
+        Ty::Fixed32 => {
+            let n = u32::try_from(u64_of(v).ok_or_else(|| bad("not an integer"))?).map_err(|_| bad("past 32 bits"))?;
+            kiln_obs::varint::put(&mut w.buf, (u64::from(field.num) << 3) | 5);
+            w.buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Ty::Double => w.double(field.num, f64_of(v).ok_or_else(|| bad("not a number"))?),
+        Ty::Varint => w.varint(field.num, u64_of(v).ok_or_else(|| bad("not an integer"))?),
+        Ty::Enum(names) => {
+            let n = u64_of(v).or_else(|| v.as_str().and_then(|s| names.iter().position(|n| *n == s)).map(|i| i as u64));
+            w.varint(field.num, n.ok_or_else(|| bad("not one of the enum's values"))?);
+        }
+        Ty::Sint => {
+            let n = match v {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => s.parse().ok(),
+                _ => None,
+            };
+            w.varint(field.num, kiln_obs::varint::zig(n.ok_or_else(|| bad("not an integer"))?));
+        }
+        Ty::Bool => w.varint(field.num, u64::from(v.as_bool().ok_or_else(|| bad("not a boolean"))?)),
+        Ty::Msg(_) => return Err(bad("a message where a value was")),
+    }
+    Ok(())
+}
+
+/// A message being written: its schema, its object's fields left, the field it is of in its parent,
+/// and, while one of its repeated message fields is being written, that array's items left.
+struct Frame<'v> {
+    schema: Schema,
+    entries: serde_json::map::Iter<'v>,
+    num: u32,
+    depth: usize,
+    out: Writer,
+    array: Option<(&'static F, std::slice::Iter<'v, Value>)>,
+}
+
+/// An OTLP/JSON request as the protobuf bytes it stands for.
+pub fn json_to_pb(body: &[u8], signal: Signal) -> Result<Vec<u8>, JsonError> {
+    let v: Value = serde_json::from_slice(body).map_err(|e| JsonError::Json(e.to_string()))?;
+    let Value::Object(root) = &v else { return Err(JsonError::NotObject("the request")) };
+    let schema = match signal {
+        Signal::Metrics => Schema::MetricsRequest,
+        Signal::Logs => Schema::LogsRequest,
+        Signal::Traces => Schema::TracesRequest,
+    };
+    let mut stack: Vec<Frame<'_>> = vec![Frame { schema, entries: root.iter(), num: 0, depth: 0, out: Writer::default(), array: None }];
+    loop {
+        let Some(top) = stack.last_mut() else { return Ok(Vec::new()) };
+        // A repeated message field's next item, if one is under way.
+        if let Some((field, items)) = &mut top.array {
+            let field: &'static F = field;
+            match items.next() {
+                Some(Value::Object(o)) => {
+                    let Ty::Msg(s) = field.ty else { return Err(JsonError::Field(field.name, "not a message")) };
+                    let depth = top.depth + usize::from(s == Schema::AnyValue);
+                    if depth <= MAX_DEPTH {
+                        stack.push(Frame { schema: s, entries: o.iter(), num: field.num, depth, out: Writer::default(), array: None });
+                    }
+                }
+                Some(Value::Null) => {}
+                Some(_) => return Err(JsonError::NotObject(field.name)),
+                None => top.array = None,
+            }
+            continue;
+        }
+        match top.entries.next() {
+            Some((key, value)) => {
+                let Some(field) = fields(top.schema).iter().find(|f| f.name == key || f.proto == key) else { continue };
+                if value.is_null() {
+                    continue;
+                }
+                match (field.ty, field.repeated, value) {
+                    (Ty::Msg(_), true, Value::Array(items)) => top.array = Some((field, items.iter())),
+                    (Ty::Msg(s), false, Value::Object(o)) => {
+                        let depth = top.depth + usize::from(s == Schema::AnyValue);
+                        if depth <= MAX_DEPTH {
+                            let num = field.num;
+                            stack.push(Frame { schema: s, entries: o.iter(), num, depth, out: Writer::default(), array: None });
+                        }
+                    }
+                    (Ty::Msg(_), _, _) => return Err(JsonError::Field(field.name, "not an object or an array of them")),
+                    _ => scalar(&mut top.out, field, value)?,
+                }
+            }
+            None => {
+                let Some(done) = stack.pop() else { return Ok(Vec::new()) };
+                match stack.last_mut() {
+                    Some(parent) => parent.out.bytes(done.num, &done.out.buf),
+                    None => return Ok(done.out.buf),
+                }
+            }
+        }
+    }
+}
+
+/// What a request came to.
+#[derive(Debug)]
+pub enum Answer {
+    /// Taken: what the response says (the export service's response, in the request's encoding:
+    /// empty, or what was rejected as its partial success).
+    Ok { json: bool, points: u64, rejected: u64 },
+    /// Malformed: 400, and why.
+    Bad(String),
+    /// Too big: 413.
+    TooLarge,
+    /// This node is too far behind: 503, and when to try again.
+    Busy,
+}
+
+/// The node's series keys, made once each, for every receiver of the node (the server's and a
+/// runner's, on whichever thread decodes).
+/// The node's receivers' keys (and their cumulative distributions' state), made as observe starts:
+/// a cumulative series begun after this is new to the node, its first point's counts all of it.
+pub(crate) fn keys() -> &'static kiln_obs::otlp::metrics::Keys {
+    static KEYS: std::sync::OnceLock<kiln_obs::otlp::metrics::Keys> = std::sync::OnceLock::new();
+    KEYS.get_or_init(kiln_obs::otlp::metrics::Keys::new)
+}
+
+/// Takes an OTLP request's body: decompressed if gzip (bounded: a small body cannot unfold past
+/// [`MAX_BODY`]), decoded by its content type, written to `o`.
+pub fn take(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &[u8], now_ns: i64) -> Answer {
+    if body.len() > MAX_BODY {
+        return Answer::TooLarge;
+    }
+    if o.busy() {
+        return Answer::Busy;
+    }
+    // Unzipped into bytes handed back after, whatever the answer.
+    let mut plain = o.bytes();
+    let answer = take_plain(o, signal, content_type, gzip, body, now_ns, &mut plain);
+    o.give_bytes(plain);
+    answer
+}
+
+fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &[u8], now_ns: i64, plain: &mut Vec<u8>) -> Answer {
+    let body = if gzip {
+        let mut d = flate2::read::GzDecoder::new(body).take(MAX_BODY as u64 + 1);
+        if d.read_to_end(plain).is_err() {
+            return Answer::Bad("the body is not gzip".into());
+        }
+        if plain.len() > MAX_BODY {
+            return Answer::TooLarge;
+        }
+        plain.as_slice()
+    } else {
+        body
+    };
+    let json = content_type.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"));
+    let pb_owned;
+    let pb = if json {
+        match json_to_pb(body, signal) {
+            Ok(b) => {
+                pb_owned = b;
+                pb_owned.as_slice()
+            }
+            Err(e) => return Answer::Bad(e.to_string()),
+        }
+    } else {
+        body
+    };
+    match signal {
+        Signal::Metrics => {
+            let mut d = o.decoding();
+            match kiln_obs::otlp::metrics::decode_into(pb, now_ns / 1_000_000, keys(), &mut d) {
+                Ok(()) => {
+                    let points = d.points;
+                    if !o.offer_samples(d) {
+                        return Answer::Busy;
+                    }
+                    Answer::Ok { json, points, rejected: 0 }
+                }
+                Err(e) => {
+                    let why = e.to_string();
+                    o.give_decoding(d);
+                    Answer::Bad(why)
+                }
+            }
+        }
+        Signal::Logs => {
+            let mut out = kiln_obs::otlp::logs::Decoded::default();
+            let decoded = with_log_decoder(|d, filters| {
+                // Rows into buffers the node's writes handed back, as spans' are.
+                while d.spares() < 2 {
+                    let b = o.bytes();
+                    if b.capacity() == 0 {
+                        break;
+                    }
+                    d.give_rows(b);
+                }
+                // A record a pipeline reads is made a record, for it to be processed where taken.
+                filters.pipelines = super::pipeline::kept::snapshot();
+                filters.scanner = super::scanner::kept::snapshot();
+                let super::collect::PipelineFilters { pipelines, scratch, scanner, scan, .. } = filters;
+                d.decode(pb, now_ns, &mut |v| pipelines.iter().any(|p| p.reads(v, scratch)) || (!scanner.is_empty() && scanner.reads(v, || v.attrs(), scan)), &mut out)
+            });
+            let give = |parts: Vec<super::ingest::LogPart>| {
+                for part in parts {
+                    if let super::ingest::LogPart::Rows { raw, .. } = part {
+                        o.give_bytes(raw);
+                    }
+                }
+            };
+            match decoded {
+                Ok(()) => {
+                    let n = out.records;
+                    match o.offer_log_parts(super::ingest::Logs::from(out.parts)) {
+                        Ok(()) => Answer::Ok { json, points: n, rejected: 0 },
+                        Err(back) => {
+                            give(back.parts);
+                            Answer::Busy
+                        }
+                    }
+                }
+                Err(e) => {
+                    give(out.parts);
+                    Answer::Bad(e.to_string())
+                }
+            }
+        }
+        Signal::Traces => {
+            let mut spans = kiln_obs::otlp::traces::Spans::default();
+            let decoded = with_trace_decoder(|d| {
+                // Rows into buffers the node's writes handed back (`Observe::bytes`): the batcher
+                // frees on its thread what decoders grow on theirs, so they come back here.
+                while d.spares() < 2 {
+                    let b = o.bytes();
+                    if b.capacity() == 0 {
+                        break;
+                    }
+                    d.give_rows(b);
+                }
+                d.decode(pb, now_ns, &mut spans)
+            });
+            match decoded {
+                Ok(()) => {
+                    let (n, rejected) = (spans.spans, spans.invalid);
+                    if !o.offer_spans(spans.segments) {
+                        return Answer::Busy;
+                    }
+                    Answer::Ok { json, points: n, rejected }
+                }
+                Err(e) => Answer::Bad(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Runs `f` with this thread's log decoder and pipelines' room (kept from one request to the next),
+/// or new ones were they in use.
+fn with_log_decoder<T>(f: impl FnOnce(&mut kiln_obs::otlp::logs::Decoder, &mut super::collect::PipelineFilters) -> T) -> T {
+    thread_local! {
+        static DECODER: std::cell::RefCell<(kiln_obs::otlp::logs::Decoder, super::collect::PipelineFilters)> = std::cell::RefCell::new(Default::default());
+    }
+    DECODER.with(|d| match d.try_borrow_mut() {
+        Ok(mut d) => {
+            let (decoder, filters) = &mut *d;
+            f(decoder, filters)
+        }
+        Err(_) => f(&mut kiln_obs::otlp::logs::Decoder::new(), &mut super::collect::PipelineFilters::default()),
+    })
+}
+
+/// Runs `f` with this thread's trace decoder (its room kept from one request to the next), or a
+/// new one were it in use.
+fn with_trace_decoder<T>(f: impl FnOnce(&mut kiln_obs::otlp::traces::Decoder) -> T) -> T {
+    thread_local! {
+        static DECODER: std::cell::RefCell<kiln_obs::otlp::traces::Decoder> = std::cell::RefCell::new(kiln_obs::otlp::traces::Decoder::new());
+    }
+    DECODER.with(|d| match d.try_borrow_mut() {
+        Ok(mut d) => f(&mut d),
+        Err(_) => f(&mut kiln_obs::otlp::traces::Decoder::new()),
+    })
+}
+
+/// The export service's response to a request some of whose items were rejected: its
+/// `partial_success` (field 1) with `rejected_<items>` (1) and `error_message` (2), in protobuf.
+fn partial_success_pb(rejected: u64, why: &str) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.message(1, |p| {
+        p.varint(1, rejected);
+        p.str(2, why);
+    });
+    w.buf
+}
+
+/// What a request's rejected spans are said as.
+const REJECTED_SPANS: &str = "spans without a valid trace id (16 bytes, not all zero) or span id (8 bytes) are not kept";
+
+/// An OTLP request answered: read whole (at most [`MAX_BODY`]), taken on the blocking pool, and
+/// answered as the specification asks (OTLP/HTTP "Response"): 200 with the export service's
+/// response, empty, in the request's encoding; 400 for what cannot be decoded; 413 past the bound;
+/// 503 with `Retry-After` while this node is behind.
+pub async fn answer(o: &Observe, signal: Signal, req: crate::http::server::Request) -> crate::http::server::Response {
+    use crate::http::server as srv;
+    use http::{StatusCode, header};
+    let content_type = srv::header_str(&req, &header::CONTENT_TYPE).unwrap_or("application/x-protobuf").to_owned();
+    let gzip = srv::header_str(&req, &header::CONTENT_ENCODING).is_some_and(|e| e.trim().eq_ignore_ascii_case("gzip"));
+    let body = match srv::body_bytes(req.into_body(), MAX_BODY + 1).await {
+        Ok(b) => b,
+        Err(_) => return srv::text(StatusCode::PAYLOAD_TOO_LARGE, "an OTLP request is taken up to 20 MiB"),
+    };
+    let (o, now_ns) = (o.clone(), super::clock_ms().saturating_mul(1_000_000));
+    let taken = crate::rt::blocking(move || take(&o, signal, &content_type, gzip, &body, now_ns)).await;
+    match taken {
+        Ok(Answer::Ok { json: true, rejected: 0, .. }) => srv::response(StatusCode::OK, "application/json", srv::full("{}")),
+        Ok(Answer::Ok { json: false, rejected: 0, .. }) => srv::response(StatusCode::OK, "application/x-protobuf", srv::empty()),
+        // Only spans are rejected (`ExportTracePartialSuccess`: `rejectedSpans`, an int64, is a
+        // string in OTLP's JSON).
+        Ok(Answer::Ok { json: true, rejected, .. }) => srv::json(StatusCode::OK, &serde_json::json!({ "partialSuccess": { "rejectedSpans": rejected.to_string(), "errorMessage": REJECTED_SPANS } })),
+        Ok(Answer::Ok { json: false, rejected, .. }) => srv::response(StatusCode::OK, "application/x-protobuf", srv::full(partial_success_pb(rejected, REJECTED_SPANS))),
+        Ok(Answer::Bad(why)) => srv::text(StatusCode::BAD_REQUEST, &why),
+        Ok(Answer::TooLarge) => srv::text(StatusCode::PAYLOAD_TOO_LARGE, "an OTLP request is taken up to 20 MiB"),
+        Ok(Answer::Busy) => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "behind on writes: try again"), header::RETRY_AFTER, "1"),
+        Err(e) => srv::text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+    }
+}
+
+/// OTLP over gRPC's paths: the collector services' unary `Export` (opentelemetry-proto v1.5.0,
+/// "OTLP/gRPC"), over HTTP/2 (with TLS, or without: prior knowledge).
+pub const GRPC_METRICS: &str = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
+pub const GRPC_LOGS: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
+pub const GRPC_TRACES: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
+
+/// The signal a gRPC path exports, if it is one.
+pub fn grpc_signal(path: &str) -> Option<Signal> {
+    match path {
+        GRPC_METRICS => Some(Signal::Metrics),
+        GRPC_LOGS => Some(Signal::Logs),
+        GRPC_TRACES => Some(Signal::Traces),
+        _ => None,
+    }
+}
+
+/// gRPC's status codes kiln answers with (grpc/doc/statuscodes.md).
+pub mod grpc_code {
+    pub const OK: u32 = 0;
+    pub const INVALID_ARGUMENT: u32 = 3;
+    pub const RESOURCE_EXHAUSTED: u32 = 8;
+    pub const UNIMPLEMENTED: u32 = 12;
+    pub const INTERNAL: u32 = 13;
+    pub const UNAVAILABLE: u32 = 14;
+    pub const UNAUTHENTICATED: u32 = 16;
+}
+
+/// A status's message as gRPC's trailers carry one: percent-encoded outside printable ASCII
+/// (and `%` itself).
+fn grpc_message(m: &str) -> String {
+    let mut out = String::with_capacity(m.len());
+    for b in m.bytes() {
+        if (0x20..=0x7e).contains(&b) && b != b'%' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A gRPC answer: 200, `application/grpc`, the export's response (an empty message) when it
+/// worked, and its status in trailers.
+pub fn grpc_answer(code: u32, message: &str) -> crate::http::server::Response {
+    grpc_answer_with(code, message, &[])
+}
+
+/// As [`grpc_answer`], the export's response `response` (a message, its partial success) when it
+/// worked.
+pub fn grpc_answer_with(code: u32, message: &str, response: &[u8]) -> crate::http::server::Response {
+    use http_body_util::BodyExt as _;
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("grpc-status", http::HeaderValue::from(code));
+    if code != grpc_code::OK
+        && let Ok(v) = http::HeaderValue::from_str(&grpc_message(message))
+    {
+        trailers.insert("grpc-message", v);
+    }
+    let mut frames: Vec<Result<http_body::Frame<bytes::Bytes>, std::io::Error>> = Vec::with_capacity(2);
+    if code == grpc_code::OK {
+        // The response message, uncompressed: its flag, its length (big-endian), itself.
+        let mut m = Vec::with_capacity(5 + response.len());
+        m.push(0);
+        m.extend_from_slice(&u32::try_from(response.len()).unwrap_or(0).to_be_bytes());
+        m.extend_from_slice(response);
+        frames.push(Ok(http_body::Frame::data(bytes::Bytes::from(m))));
+    }
+    frames.push(Ok(http_body::Frame::trailers(trailers)));
+    let body = http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed();
+    let mut r = crate::http::server::response(http::StatusCode::OK, "application/grpc", body);
+    r.headers_mut().insert("grpc-accept-encoding", http::HeaderValue::from_static("identity,gzip"));
+    r
+}
+
+/// An OTLP/gRPC request answered: its one length-prefixed message (gzip-compressed as its
+/// `grpc-encoding` says, or not) taken as an OTLP/HTTP request's protobuf is, and the outcome as
+/// gRPC's status: a body that does not decode `INVALID_ARGUMENT`, past [`MAX_BODY`]
+/// `RESOURCE_EXHAUSTED`, this node behind on its writes `UNAVAILABLE` (which OTLP exporters retry).
+pub async fn grpc(o: &Observe, signal: Signal, req: crate::http::server::Request) -> crate::http::server::Response {
+    use crate::http::server as srv;
+    let ct = srv::header_str(&req, &http::header::CONTENT_TYPE).unwrap_or("");
+    if !ct.trim().to_ascii_lowercase().starts_with("application/grpc") {
+        return srv::text(http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "OTLP/gRPC: content-type application/grpc");
+    }
+    let encoding = req.headers().get("grpc-encoding").and_then(|v| v.to_str().ok()).unwrap_or("identity").trim().to_ascii_lowercase();
+    let body = match srv::body_bytes(req.into_body(), MAX_BODY + 6).await {
+        Ok(b) => b,
+        Err(_) => return grpc_answer(grpc_code::RESOURCE_EXHAUSTED, "an OTLP request is taken up to 20 MiB"),
+    };
+    // One message: a compressed flag, a length (big-endian), the message.
+    let (Some(&flag), Some(len)) = (body.first(), body.get(1..5).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_be_bytes)) else {
+        return grpc_answer(grpc_code::INVALID_ARGUMENT, "a gRPC message: a flag and a length, then the message");
+    };
+    let Some(msg) = body.get(5..).filter(|m| m.len() == len as usize) else {
+        return grpc_answer(grpc_code::INVALID_ARGUMENT, "a unary call's one message, whole");
+    };
+    let gzip = match (flag, encoding.as_str()) {
+        (0, _) => false,
+        (1, "gzip") => true,
+        (1, other) => return grpc_answer(grpc_code::UNIMPLEMENTED, &format!("{other}: compressed as identity or gzip")),
+        _ => return grpc_answer(grpc_code::INVALID_ARGUMENT, "a message's compressed flag: 0 or 1"),
+    };
+    let msg = msg.to_vec();
+    let (o, now_ns) = (o.clone(), super::clock_ms().saturating_mul(1_000_000));
+    match crate::rt::blocking(move || take(&o, signal, "application/x-protobuf", gzip, &msg, now_ns)).await {
+        Ok(Answer::Ok { rejected: 0, .. }) => grpc_answer(grpc_code::OK, ""),
+        Ok(Answer::Ok { rejected, .. }) => grpc_answer_with(grpc_code::OK, "", &partial_success_pb(rejected, REJECTED_SPANS)),
+        Ok(Answer::Bad(why)) => grpc_answer(grpc_code::INVALID_ARGUMENT, &why),
+        Ok(Answer::TooLarge) => grpc_answer(grpc_code::RESOURCE_EXHAUSTED, "an OTLP request is taken up to 20 MiB"),
+        Ok(Answer::Busy) => grpc_answer(grpc_code::UNAVAILABLE, "behind on writes: try again"),
+        Err(e) => grpc_answer(grpc_code::INTERNAL, &format!("{e:#}")),
+    }
+}
+
+/// A runner's OTLP receiver on its loopback (`127.0.0.1:4318`, OTLP/HTTP's port, unless
+/// `KILN_OTLP_ADDR` says another, or `off`): what an app on the machine sends to, as to a collector,
+/// and Datadog's tracers as to their Agent (`super::ddtrace`). Loopback alone, so it asks no token.
+struct Local {
+    o: Observe,
+}
+
+impl crate::http::server::Handler for Local {
+    async fn handle(self: std::sync::Arc<Self>, req: crate::http::server::Request) -> crate::http::server::Response {
+        use crate::http::server as srv;
+        use http::{Method, StatusCode};
+        match (req.method().clone(), req.uri().path()) {
+            (Method::POST, "/v1/metrics") => answer(&self.o, Signal::Metrics, req).await,
+            (Method::POST, "/v1/logs") => answer(&self.o, Signal::Logs, req).await,
+            (Method::POST, "/v1/traces") => answer(&self.o, Signal::Traces, req).await,
+            (Method::POST, "/api/v1/write") => super::remote::answer(&self.o, req).await,
+            (Method::POST, path) if grpc_signal(path).is_some() => match grpc_signal(path) {
+                Some(signal) => grpc(&self.o, signal, req).await,
+                None => grpc_answer(grpc_code::UNIMPLEMENTED, "an OTLP service: metrics, logs or traces"),
+            },
+            (Method::GET, "/healthz") => srv::text(StatusCode::OK, "ok"),
+            (_, path) if super::ddtrace::is_tracer(path) => super::ddtrace::answer(&self.o, req).await,
+            _ => srv::text(
+                StatusCode::NOT_FOUND,
+                "OTLP/HTTP: POST /v1/metrics, /v1/logs or /v1/traces; OTLP/gRPC: the metrics, logs and trace services' Export; Prometheus's remote write: POST /api/v1/write; Datadog's tracers: /v0.4/traces, /v0.5/traces",
+            ),
+        }
+    }
+}
+
+/// The address a runner's receiver listens on, if any.
+pub fn local_addr() -> Option<std::net::SocketAddr> {
+    addr_of("KILN_OTLP_ADDR", 4318)
+}
+
+/// The address a runner's receiver also listens on for gRPC, OTLP/gRPC's port (`127.0.0.1:4317`
+/// unless `KILN_OTLP_GRPC_ADDR` says another, or `off`): either address takes either protocol.
+pub fn local_grpc_addr() -> Option<std::net::SocketAddr> {
+    addr_of("KILN_OTLP_GRPC_ADDR", 4317)
+}
+
+/// The address it listens on for Datadog's tracers too, their Agent's port (`127.0.0.1:8126`
+/// unless `KILN_DD_TRACE_ADDR` says another, or `off`; `super::ddtrace`).
+pub fn local_dd_addr() -> Option<std::net::SocketAddr> {
+    addr_of("KILN_DD_TRACE_ADDR", 8126)
+}
+
+fn addr_of(var: &str, port: u16) -> Option<std::net::SocketAddr> {
+    match std::env::var(var) {
+        Ok(v) if v.trim().eq_ignore_ascii_case("off") => None,
+        Ok(v) => v.trim().parse().ok(),
+        Err(_) => Some(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+    }
+}
+
+/// Serves the runner's receiver until `shutdown`. A port held is said once and tried again.
+pub async fn serve_local(addr: std::net::SocketAddr, o: Observe, shutdown: crate::rt::Shutdown) {
+    use futures::FutureExt as _;
+    let bind = || {
+        std::net::TcpListener::bind(addr)
+            .map_err(anyhow::Error::from)
+            .and_then(|l| hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(l), 128).map_err(|e| anyhow::anyhow!("{e}")))
+    };
+    // A port held (another collector or Agent on it, or this machine's last build, which keeps its
+    // own until it retires after an upgrade) is tried again every five seconds: taken once let go.
+    let mut said = false;
+    let listener = loop {
+        match bind() {
+            Ok(l) => break l,
+            Err(e) => {
+                if !said {
+                    tracing::warn!(%addr, error = %format!("{e:#}"), "the receiver's port is held (another collector or Agent, or this machine's last build retiring): tried again every 5 s");
+                    said = true;
+                }
+                if !shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return;
+                }
+            }
+        }
+    };
+    tracing::info!(%addr, "OTLP receiver listening (HTTP/1.1 and HTTP/2: OTLP/HTTP and OTLP/gRPC)");
+    let handler = std::sync::Arc::new(Local { o });
+    loop {
+        let accepted = futures::select_biased! {
+            () = shutdown.cancelled().fuse() => return,
+            r = listener.accept().fuse() => r,
+        };
+        match accepted {
+            Ok(stream) => {
+                let (h, remote) = (handler.clone(), stream.peer_addr().ok());
+                crate::rt::spawn_spread(async move {
+                    crate::http::server::serve_accepted(stream, h, remote, None).await;
+                });
+            }
+            Err(_) => crate::rt::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The OTLP/JSON examples of the specification's repository, as they are
+    /// (opentelemetry-proto v1.5.0 `examples/metrics.json` and `examples/logs.json`).
+    const METRICS_JSON: &str = include_str!("fixtures/otlp-metrics.json");
+    const LOGS_JSON: &str = include_str!("fixtures/otlp-logs.json");
+    /// opentelemetry-proto v1.5.0 `examples/trace.json`.
+    const TRACES_JSON: &str = include_str!("fixtures/otlp-traces.json");
+
+    fn spans_of(pb: &[u8]) -> anyhow::Result<Vec<kiln_obs::logs::record::Record>> {
+        let mut s = kiln_obs::otlp::traces::Spans::default();
+        kiln_obs::otlp::traces::Decoder::new().decode(pb, 0, &mut s)?;
+        let mut out = Vec::new();
+        for (raw, n) in &s.segments {
+            let mut rows = kiln_obs::logs::record::Rows::new(raw, *n as usize);
+            while let Some(r) = rows.next_row()? {
+                out.push(r.to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn the_specification_s_trace_example_reads_as_its_protobuf_would() -> anyhow::Result<()> {
+        let pb = json_to_pb(TRACES_JSON.as_bytes(), Signal::Traces)?;
+        let spans = spans_of(&pb)?;
+        let s = spans.first().ok_or_else(|| anyhow::anyhow!("a span"))?;
+        anyhow::ensure!((s.ts, s.service.as_str(), s.source.as_str(), s.message.as_str()) == (1_544_712_660_000_000_000, "my.service", "my.library", "I'm a server span"), "{s:?}");
+        anyhow::ensure!(s.trace_id.map(hex::encode).as_deref() == Some("5b8efff798038103d269b633813fc60c"));
+        anyhow::ensure!(s.span_id.map(hex::encode).as_deref() == Some("eee19b7ec3c1b174"));
+        let a = |k: &str| s.attrs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        anyhow::ensure!(a("span.kind") == Some("server") && a("duration") == Some("1000000000") && a("parent_id") == Some("eee19b7ec3c1b173") && a("my.span.attr") == Some("some value"), "{:?}", s.attrs);
+        Ok(())
+    }
+
+    #[test]
+    fn spans_in_json_take_enum_names_and_numbers_alike() -> anyhow::Result<()> {
+        let body = |kind: &str, code: &str| {
+            format!(
+                r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b174",
+                "name":"q","kind":{kind},"startTimeUnixNano":"1","endTimeUnixNano":"3","status":{{"code":{code},"message":"bad"}},
+                "events":[{{"timeUnixNano":"2","name":"exception","attributes":[{{"key":"exception.type","value":{{"stringValue":"E"}}}}]}}],
+                "links":[{{"traceId":"5b8efff798038103d269b633813fc60d","spanId":"eee19b7ec3c1b175"}}]}}]}}]}}]}}"#
+            )
+        };
+        for (kind, code) in [("3", "2"), (r#""SPAN_KIND_CLIENT""#, r#""STATUS_CODE_ERROR""#)] {
+            let spans = spans_of(&json_to_pb(body(kind, code).as_bytes(), Signal::Traces)?)?;
+            let s = spans.first().ok_or_else(|| anyhow::anyhow!("a span"))?;
+            let a = |k: &str| s.attrs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+            anyhow::ensure!(s.severity == 17 && a("span.kind") == Some("client") && a("error.type") == Some("E") && a("error.message") == Some("bad") && a("duration") == Some("2"), "{kind}: {:?}", s.attrs);
+            anyhow::ensure!(a("links").is_some_and(|l| l.contains("eee19b7ec3c1b175")));
+        }
+        anyhow::ensure!(json_to_pb(body(r#""SPAN_KIND_NOPE""#, "0").as_bytes(), Signal::Traces).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_specification_s_metrics_example_reads_as_its_protobuf_would() -> anyhow::Result<()> {
+        let pb = json_to_pb(METRICS_JSON.as_bytes(), Signal::Metrics)?;
+        let d = kiln_obs::otlp::metrics::decode(&pb, 0)?;
+        let names: std::collections::BTreeSet<String> = d.series().iter().filter_map(|(k, _)| kiln_obs::batch::parse_key(&k.key).ok().map(|p| p.metric.to_owned())).collect();
+        for want in ["my.counter", "my.gauge", "my.histogram.count", "my.histogram.sum", "my.histogram.bucket", "my.exponential.histogram.min", "my.exponential.histogram.max"] {
+            anyhow::ensure!(names.contains(want), "{want} missing from {names:?}");
+        }
+        let series = d.series();
+        let gauge = series.iter().find(|(k, _)| kiln_obs::batch::parse_key(&k.key).is_ok_and(|p| p.metric == "my.gauge")).ok_or_else(|| anyhow::anyhow!("the gauge"))?;
+        anyhow::ensure!(gauge.1 == vec![(1_544_712_660_300, 10.0)], "{:?}", gauge.1);
+        let tags = kiln_obs::batch::parse_key(&gauge.0.key)?.tags;
+        anyhow::ensure!(tags.contains(&("service", "my.service")) && tags.contains(&("my.gauge.attr", "some value")), "{tags:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_specification_s_logs_example_reads_whole() -> anyhow::Result<()> {
+        let pb = json_to_pb(LOGS_JSON.as_bytes(), Signal::Logs)?;
+        let d = kiln_obs::otlp::logs::decode(&pb, 0)?;
+        let r = d.records.first().ok_or_else(|| anyhow::anyhow!("a record"))?;
+        anyhow::ensure!((r.ts, r.severity, r.message.as_str()) == (1_544_712_660_300_000_000, 10, "Example log record"), "{r:?}");
+        anyhow::ensure!((r.service.as_str(), r.source.as_str()) == ("my.service", "my.library"));
+        anyhow::ensure!(r.trace_id.map(hex::encode).as_deref() == Some("5b8efff798038103d269b633813fc60c"));
+        anyhow::ensure!(r.span_id.map(hex::encode).as_deref() == Some("eee19b7ec3c1b174"));
+        for (k, v) in [("string.attribute", "some string"), ("boolean.attribute", "true"), ("int.attribute", "10"), ("double.attribute", "637.704"), ("array.attribute", r#"["many","values"]"#), ("map.attribute", r#"{"some.map.key":"some value"}"#)] {
+            anyhow::ensure!(r.attrs.contains(&(k.into(), v.into())), "{k}={v} in {:?}", r.attrs);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn logs_in_json_read_with_hex_ids_and_unknown_fields_skipped() -> anyhow::Result<()> {
+        let body = r#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},
+            "scopeLogs":[{"scope":{"name":"app"},"logRecords":[{"timeUnixNano":"1700000000000000001","severityNumber":17,
+            "body":{"stringValue":"boom"},"traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b174",
+            "somethingNew":{"x":1},"attributes":[{"key":"n","value":{"intValue":"42"}},{"key":"deep","value":{"arrayValue":{"values":[{"boolValue":true}]}}}]}]}]}]}"#;
+        let pb = json_to_pb(body.as_bytes(), Signal::Logs)?;
+        let d = kiln_obs::otlp::logs::decode(&pb, 0)?;
+        let r = d.records.first().ok_or_else(|| anyhow::anyhow!("a record"))?;
+        anyhow::ensure!(r.ts == 1_700_000_000_000_000_001 && r.severity == 17 && r.message == "boom" && r.service == "api" && r.source == "app");
+        anyhow::ensure!(r.trace_id.map(hex::encode).as_deref() == Some("5b8efff798038103d269b633813fc60c"));
+        anyhow::ensure!(r.span_id.map(hex::encode).as_deref() == Some("eee19b7ec3c1b174"));
+        anyhow::ensure!(r.attrs.contains(&("n".into(), "42".into())) && r.attrs.contains(&("deep".into(), "[true]".into())), "{:?}", r.attrs);
+        Ok(())
+    }
+
+    #[test]
+    fn hostile_json_is_an_error_or_nothing_never_a_panic_or_a_deep_walk() -> anyhow::Result<()> {
+        // An AnyValue nested a hundred thousand deep: serde_json refuses it; one nested twenty deep
+        // is walked to MAX_DEPTH and no further.
+        let mut deep = String::from(r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":"#);
+        for _ in 0..20 {
+            deep.push_str(r#"{"arrayValue":{"values":["#);
+        }
+        deep.push_str(r#"{"stringValue":"x"}"#);
+        for _ in 0..20 {
+            deep.push_str("]}}");
+        }
+        deep.push_str("}]}]}]}");
+        let pb = json_to_pb(deep.as_bytes(), Signal::Logs)?;
+        let d = kiln_obs::otlp::logs::decode(&pb, 0)?;
+        anyhow::ensure!(d.records.len() == 1);
+        for bad in [r#"[]"#, r#"{"resourceLogs":7}"#, r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"traceId":"zz"}]}]}]}"#, "not json", r#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"gauge":{"dataPoints":[{"timeUnixNano":true}]}}]}]}]}"#] {
+            anyhow::ensure!(json_to_pb(bad.as_bytes(), Signal::Logs).is_err() || json_to_pb(bad.as_bytes(), Signal::Metrics).is_err(), "{bad} taken");
+        }
+        Ok(())
+    }
+}

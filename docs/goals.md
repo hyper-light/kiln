@@ -187,10 +187,22 @@ hundred goals and more fits, its met goals kept for the record.
 A plan's steps on a stack (run as **Goals**, or a goal's plan, its steps its parts) go as the plan
 says they wait for each other (`needs`; docs/plans.md, "Which steps run when"): a step's goal
 starts once the steps it waits for have ended. Where more than one of its steps can be under way at
-once, kiln hands each step that's ready to a **subagent** of the stack's agent: an agent of its own,
-started for the step (its child: its harness, on its machine, in its folder, its mode at most its
-own), named for it ("Step 3: API") and held to the step on a goal stack of its own, where it splits
-it into its acceptance criteria and tests as the agent would. As many at once as there's room for
+once, kiln hands each step that's ready to a **subagent** of the stack's agent: a session started
+for the step, named for it ("Step 3: API") and held to the step on a goal stack of its own, where it
+splits it into its acceptance criteria and tests as the agent would. It's the agent's subagent, as
+its harness's own are, not an agent of its own (`subagent` on the session): it shows in the agent's
+chat (in the line by its composer and under Tools → Subagents, its thread opening in place, where
+what it asks you is answered and the composer writes to it) and on the agent's row in Mission
+Control, which works through it and carries what it asks you, not as a row of its own. It works
+where and as the agent does: on the agent's own machine, never one kiln picks, in its folder; in
+its harness with its model, effort, speed and mode (at most its own, as every child's); with its
+Subagents setting, its pause point and its way of ending a pause; its harness's other session
+settings (its controls: an approval policy, a sandbox, an ACP agent's options), each given once its
+harness lists it; and, its machine copying them as it opens, with the agent's environment and
+program, so it has the agent's account and configuration (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). It
+stays on the agent's machine: it goes along when the agent moves (a move, a usage limit, a machine
+gone), and isn't moved, nor goes on elsewhere at a limit, by itself. Find (Ctrl/⌘F) in its thread
+searches its own conversation. As many at once as there's room for
 among the agent's subagents at work (its **Subagents → At once** setting, one pool whatever each
 does: docs/agents.md, "Agents that run agents"; none set, no limit); the steps there's no room for
 the agent takes itself, in turn, as it would have, so with no room at all its steps go one after

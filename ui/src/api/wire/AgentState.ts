@@ -178,6 +178,12 @@ switching?: Switching,
  */
 pause?: Pause, 
 /**
+ * Since when (Unix ms) it waits for room on its machine to go to work: as many of its agents
+ * are at work as its limit lets be (`harness::limit`). What it was sent waits in its queue
+ * meanwhile, and goes once there's room, the longest waiting first.
+ */
+room_wait?: number | null, 
+/**
  * Stop between turns once any of the account's limits is this full (percent), before the
  * limit cuts a turn off. None: only when a limit is reached.
  */

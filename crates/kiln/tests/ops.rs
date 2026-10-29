@@ -298,7 +298,7 @@ fn listed_commands(doc: &str) -> Vec<Vec<String>> {
 }
 
 /// What §4.3 lists that isn't built yet: W24's commands, specified before they're built.
-const CLI_LEFT: &[&str] = &["gocacheprog", "rustc", "work gc", "work status", "work verify", "work warm", "work why"];
+const CLI_LEFT: &[&str] = &["rustc", "work gc", "work reap", "work status", "work verify", "work warm", "work why"];
 
 /// W20-AC01 for the CLI: every command docs/ci.md §4.3 lists is one of kiln's (its `--help`
 /// works), what isn't built yet ([`CLI_LEFT`]) aside.

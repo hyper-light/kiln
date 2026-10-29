@@ -1,0 +1,25 @@
+[package]
+name = "vorpal-segment"
+description = "Immutable columnar `.vseg` segment container + dense-id segment directory for vorpal"
+keywords = ["columnar", "mmap", "segment", "storage", "zero-copy"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-mem.workspace = true
+
+bytemuck = "1"
+# `rayon` turns on blake3's tree-parallel `update_rayon` — same digest as the serial hash by
+# construction (blake3 is a tree hash), used for the whole-segment integrity hash at seal.
+blake3 = { workspace = true, features = ["rayon"] }
+rayon.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

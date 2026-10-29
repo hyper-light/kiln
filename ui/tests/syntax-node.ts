@@ -15,7 +15,8 @@ export const nodeAssets: Assets = {
   query: async (path) => readFileSync(new URL(path, SYNTAX), "utf8"),
 };
 
-export const highlighter = new Highlighter(nodeAssets);
+// Generous: a loaded machine mustn't make a test read plain where a person's page would wait.
+export const highlighter = new Highlighter(nodeAssets, { budgetMs: 30_000 });
 
 /** `text` as `lang` highlights it, token by token: `[text, class]` for each coloured run. */
 export async function tokens(lang: string, text: string): Promise<[string, string][]> {

@@ -13,6 +13,7 @@ import "./console.css";
 import { ArrowUp, ChevronRight, CornerDownLeft, Paperclip, Square, X } from "lucide-react";
 import { clientId, harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
 import { Button } from "@/components/ui/button";
+import { foldChips, sameFold, UNFOLDED, type Fold } from "@/components/ui/facet-fold";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
@@ -53,16 +54,81 @@ type BarProps = {
   all?: AgentInfo[];
   /** Pick (or put back) agents: the list's own selection. */
   onPick?: (ids: string[], on: boolean) => void;
+  /** What's written, when Mission control keeps it (it stays as the composer turns to starting an agent and back). */
+  text?: string;
+  onText?: (t: string | ((was: string) => string)) => void;
+  /** Unselect them all: the composer turns to starting an agent. */
+  onClear?: () => void;
+  autoFocus?: boolean;
 };
 
-/** Chips for those picked, at most; past these, how many more. */
-const CHIPS = 4;
+/**
+ * Those picked, on the To line's one line, in the order they were picked: as many as fit, the rest
+ * folded into "+N more" after them (facet-fold.ts, as a filter field's chips). The line never wraps,
+ * so the box keeps its height however many are picked, and picking more moves no chip already there.
+ */
+function ToChips({ picked, onPick }: { picked: AgentInfo[]; onPick?: (ids: string[], on: boolean) => void }) {
+  const [fold, setFold] = React.useState<Fold>(UNFOLDED);
+  // A new ref when those picked change: it measures once they're on the page, then whenever the line
+  // or a chip changes size (the window, a font arriving).
+  const key = picked.map((a) => `${a.id}:${agentLabel(a)}`).join("\n");
+  const fit = React.useCallback(
+    (line: HTMLDivElement | null) => {
+      const copy = line?.querySelector<HTMLElement>(".ms-to-measure");
+      if (!line || !copy) return;
+      const update = () => {
+        const widths = Array.from(copy.children, (el) => el.getBoundingClientRect().width);
+        const all = widths.pop() ?? 0;
+        const more = widths.pop() ?? 0;
+        const gap = parseFloat(getComputedStyle(line).columnGap) || 0;
+        const next = foldChips({ line: line.clientWidth, chips: widths, more, count: all, typed: 0, gap });
+        setFold((was) => (sameFold(was, next) ? was : next));
+      };
+      update();
+      const watch = new ResizeObserver(update);
+      watch.observe(line);
+      for (const el of copy.children) watch.observe(el);
+      return () => watch.disconnect();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [key],
+  );
+  const shown = Math.min(fold.shown, picked.length);
+  const folded = picked.length - shown;
+  const chip = (a: AgentInfo, cut?: number) => (
+    <span key={a.id} className="ms-to-chip" style={cut ? { maxWidth: cut } : undefined}>
+      <span className="hx-trunc">{agentLabel(a)}</span>
+      {onPick && (
+        <button type="button" aria-label={`Not to ${agentLabel(a)}`} onClick={() => onPick([a.id], false)}>
+          <X size={11} />
+        </button>
+      )}
+    </span>
+  );
+  return (
+    <div className="ms-to-chips" ref={fit}>
+      {picked.slice(0, shown).map((a, i) => chip(a, i === 0 ? fold.cut : undefined))}
+      {folded > 0 && <span className="ms-to-more">{shown === 0 && fold.count === "words" ? count(picked.length, "agent") : `+${folded} more`}</span>}
+      {/* Unseen: each chip at its own width, then "+N more" at its widest and the words for them all, what the fold is measured from. */}
+      <div className="ms-to-measure" aria-hidden="true">
+        {picked.map((a) => (
+          <span key={a.id} className="ms-to-chip">
+            <span className="hx-trunc">{agentLabel(a)}</span>
+            {onPick && <span className="ms-to-x" />}
+          </span>
+        ))}
+        <span className="ms-to-more">+{picked.length} more</span>
+        <span className="ms-to-more">{count(picked.length, "agent")}</span>
+      </div>
+    </div>
+  );
+}
 
 /** "@words" being typed at the end: the words. */
-const atOf = (text: string) => text.match(/(?:^|\s)@([^\s@]*)$/)?.[1];
+export const atOf = (text: string) => text.match(/(?:^|\s)@([^\s@]*)$/)?.[1];
 
 /** Agents a few typed letters may mean: by name, then machine, harness or what it's on. */
-function findAgents(all: AgentInfo[], q: string, not: ReadonlySet<string>): AgentInfo[] {
+export function findAgents(all: AgentInfo[], q: string, not: ReadonlySet<string>): AgentInfo[] {
   const w = q.toLowerCase();
   const score = (a: AgentInfo) => {
     const name = agentLabel(a).toLowerCase();
@@ -83,7 +149,7 @@ function findAgents(all: AgentInfo[], q: string, not: ReadonlySet<string>): Agen
 }
 
 /** What an agent is doing, in a word, beside its name in the finder. */
-const doingOf = (a: AgentInfo) => (a.approvals.length > 0 ? "needs you" : a.status === "running" || throughSubagents(a) ? "working" : a.status === "idle" ? "idle" : a.status);
+export const doingOf = (a: AgentInfo) => (a.approvals.length > 0 ? "needs you" : a.status === "running" || throughSubagents(a) ? "working" : a.status === "idle" ? "idle" : a.status);
 
 /** What the agents of a roster ("id:status,…") understand; nothing for no agents, or when it can't be said. */
 const previewOf = (roster: string): Promise<BroadcastPreview | null> =>
@@ -108,21 +174,23 @@ function Previewed({ roster, ...bar }: BarProps & { roster: string }) {
 }
 
 /** A setting the agents can be held to: Any, or one of their catalog's (with which agents have it). */
-type Tune = { mode: string; model: string; effort: string };
-const ANY: Tune = { mode: "", model: "", effort: "" };
+type Tune = { mode: string; model: string; effort: string; speed: string };
+const ANY: Tune = { mode: "", model: "", effort: "", speed: "" };
 
 /** The agents that have every setting chosen (Any leaves all of them). */
 function tuned(agents: AgentInfo[], tune: Tune, preview: BroadcastPreview | null): AgentInfo[] {
-  const lists = { mode: preview?.modes ?? [], model: preview?.models ?? [], effort: preview?.efforts ?? [] };
+  const lists = { mode: preview?.modes ?? [], model: preview?.models ?? [], effort: preview?.efforts ?? [], speed: preview?.speeds ?? [] };
   const sets = (Object.keys(tune) as (keyof Tune)[]).filter((k) => tune[k]).map((k) => new Set(lists[k].find((o) => o.id === tune[k])?.agents ?? []));
   return sets.length === 0 ? agents : agents.filter((a) => sets.every((ids) => ids.has(a.id)));
 }
 
-function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: BarProps & { preview: BroadcastPreview | null }) {
+function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text: given, onText, onClear, autoFocus }: BarProps & { preview: BroadcastPreview | null }) {
   const [tune, setTune] = React.useState<Tune>(ANY);
   // Who gets what's sent from here: those the selectors leave (all of them while each is Any).
   const agents = tuned(everyone, tune, preview);
-  const [text, setText] = React.useState("");
+  const [typed, setTyped] = React.useState("");
+  const text = given ?? typed;
+  const setText = onText ?? setTyped;
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [found, setFound] = React.useState(0);
   const field = React.useRef<HTMLTextAreaElement | null>(null);
@@ -247,6 +315,7 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
       if (tune.mode) settings.push({ type: "set_mode", mode: tune.mode });
       if (tune.model) settings.push({ type: "set_model", model: tune.model });
       if (tune.effort) settings.push({ type: "set_effort", effort: tune.effort });
+      if (tune.speed) settings.push({ type: "set_speed", speed: tune.speed });
       let ok = true;
       for (const c of settings) ok = ok && (await send({ command: c }));
       ok = ok && (await send({ text: body, mode, attachments: files.length > 0 ? attachments.payload() : undefined }));
@@ -273,6 +342,7 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
   const modes = preview?.modes ?? [];
   const models = preview?.models ?? [];
   const efforts = preview?.efforts ?? [];
+  const speeds = preview?.speeds ?? [];
   const counted = <T extends { description?: string; count: number }>(o: T): T =>
     o.count < total ? { ...o, description: [o.description, `${o.count} of ${total} agents`].filter(Boolean).join(" · ") } : o;
   /** One of kiln's own commands (typed, picked, or Stop): asked in the line under the field, run from there. */
@@ -352,7 +422,7 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
   return (
     <section className="ms-msg cp" aria-label="Message agents">
       {/* What they're held to, as the agent page's line: each its own (unset) or one chosen, with which have it. */}
-      {(modes.length > 0 || models.length > 0 || efforts.length > 0) && (
+      {(modes.length > 0 || models.length > 0 || efforts.length > 0 || speeds.length > 0) && (
         <RunSettings
           className="ms-tuner"
           modes={modes.map(counted)}
@@ -364,8 +434,11 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
           efforts={efforts.map(counted)}
           effort={tune.effort}
           onEffort={(effort) => setTune((t) => ({ ...t, effort }))}
+          speeds={speeds.map(counted)}
+          speed={tune.speed}
+          onSpeed={(speed) => setTune((t) => ({ ...t, speed }))}
           trailing={
-            tune.mode || tune.model || tune.effort ? (
+            tune.mode || tune.model || tune.effort || tune.speed ? (
               <button type="button" className="rs-more" aria-label="Leave each agent's own permissions, model and effort" onClick={() => setTune(ANY)}>
                 Reset
               </button>
@@ -389,21 +462,15 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
           <div className="ms-to">
             <span className="ms-to-label">To</span>
             {picked.length > 0 ? (
-              <>
-                {picked.slice(0, CHIPS).map((a) => (
-                  <span key={a.id} className="ms-to-chip">
-                    <span className="hx-trunc">{agentLabel(a)}</span>
-                    {onPick && (
-                      <button type="button" aria-label={`Not to ${agentLabel(a)}`} onClick={() => onPick([a.id], false)}>
-                        <X size={11} />
-                      </button>
-                    )}
-                  </span>
-                ))}
-                {picked.length > CHIPS && <span className="ms-to-more">+{picked.length - CHIPS} more</span>}
-              </>
+              <ToChips picked={picked} onPick={onPick} />
             ) : (
               <span className="ms-to-all">{held ? `${n} of ${total} agents` : reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
+            )}
+            {onClear && picked.length > 0 && (
+              <Button size="xs" variant="secondary" className="mc-clear" onClick={onClear}>
+                <X aria-hidden="true" />
+                Clear
+              </Button>
             )}
           </div>
           {attachments.chips}
@@ -413,6 +480,7 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
             rows={1}
             value={text}
             disabled={n === 0}
+            autoFocus={autoFocus}
             placeholder={placeholder}
             aria-label={`Message ${who}`}
             enterKeyHint="send"
@@ -542,12 +610,7 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
           <Button size="xs" variant={ask.danger ? "danger" : "primary"} disabled={busy} onClick={() => void ask.run()}>
             {ask.label}
           </Button>
-          <Button
-            size="xs"
-            variant="ghost"
-            disabled={busy}
-            onClick={() => setAsk(null)}
-          >
+          <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsk(null)}>
             Cancel
           </Button>
         </div>

@@ -16,3 +16,6 @@ ci/ui/shots/
 # HTTP benchmark build output (bench/http has a workspace of its own: its baseline, hyper on tokio, stays out of kiln's lockfile)
 /bench/http/target/
 /bench/http/Cargo.lock
+# What zig's compiler checks leave beside vendored C a build script compiles (vendor/vorpal's grammars,
+# under the gate's and the release's cargo-zigbuild): not part of the vendored tree.
+/vendor/**/a.o

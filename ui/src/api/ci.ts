@@ -1,5 +1,6 @@
 /** The CI engine (docs/ci.md §4.1): the /api/ci routes the run, leg and editor pages read. */
 import { ApiError, request } from "./client";
+import { pinnedSentence, type Retried, type RetryOptions } from "./retry";
 import type { Schema } from "@/lib/yaml-spot";
 
 const enc = encodeURIComponent;
@@ -855,6 +856,10 @@ export const ci = {
   release: (leg: string) => request<void>("POST", `/api/ci/legs/${enc(leg)}/release`, {}),
   /** A kept leg's step run again in place, as a new section of its log (W17-R04). */
   rerunStep: (leg: string, idx: number) => request<{ leg: string; step: number; idx: number }>("POST", `/api/ci/legs/${enc(leg)}/rerun-step`, { idx }),
+  /** Where a finished leg (or a `.kiln/` pipeline's job) could run again, and whether it can now (W05-R28). */
+  legRunners: (leg: string, signal?: AbortSignal) => request<RetryOptions>("GET", `/api/ci/legs/${enc(leg)}/runners`, undefined, { signal }),
+  /** A finished leg (or pipeline job) again: anywhere it can run, anywhere but where it ran (`elsewhere`), or on `runner` (W05-R28). */
+  retryLeg: (leg: string, body: { runner?: string; elsewhere?: boolean }) => request<Retried>("POST", `/api/ci/legs/${enc(leg)}/retry`, body),
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
   /** A leg's attempts, oldest first, each with its failure class, and its outputs (W21-R05). */
   legDetail: (leg: string, signal?: AbortSignal) =>
@@ -927,6 +932,12 @@ export function waitSentence(w: unknown): string | null {
     offline?: string[];
     failing?: string[];
     runners?: string[];
+    target?: number;
+    /** What a leg waiting for room asks, where, and the runner held for it with when it's to have room (W05). */
+    request?: string;
+    place?: string;
+    held?: string | null;
+    room_at?: number | null;
     group?: string;
     holders?: string[];
     limit?: number;
@@ -952,6 +963,10 @@ export function waitSentence(w: unknown): string | null {
     in_flight?: number;
     runner?: string;
     saves_s?: number;
+    /** Whether its retry asked for another runner (`avoided`), or what it asks for that no runner can hold. */
+    asked?: boolean | string;
+    state?: string;
+    short?: string[];
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   // A lane is a repository's workflow on a branch (W28-R60): its workflow and branch.
@@ -960,6 +975,12 @@ export function waitSentence(w: unknown): string | null {
   switch (o.reason) {
     case "capacity":
       return `Waiting for a free runner: ${o.eligible ?? 0} can take it, ${o.busy ?? 0} busy${o.draining ? `, ${o.draining} draining` : ""}.`;
+    case "oversized":
+      return `It asks for more than any runner that can take it has (${o.asked ?? "its request"})${list(o.short)}.`;
+    case "headroom": {
+      const held = o.held ? `: ${o.held} is held for it, with room about ${time(o.room_at)}` : "";
+      return `Waiting for ${o.request || "room"} free${o.place ? ` on a ${o.place} runner` : ""}${held}. Every runner with room for it would pass ${o.target ?? 85}% use with it${list(o.runners)}.`;
+    }
     case "no-runner":
       return `No runner that can take it is connected${list(o.offline)}.`;
     case "unroutable":
@@ -967,9 +988,12 @@ export function waitSentence(w: unknown): string | null {
     case "capability":
       return `The runners that match need a newer kiln${list(o.runners)}.`;
     case "other-runner":
+      if (o.asked) return `Waiting for a runner other than ${o.avoided ?? "the one it ran on"}, as its retry asked.`;
       return o.refused
         ? `Waiting for a runner other than ${o.avoided ?? "the one"} that refused it.`
         : `Its retry waits for a runner other than ${o.avoided ?? "the one it ran on"}, as its policy asks (runner: different).`;
+    case "pinned":
+      return pinnedSentence(o.runner ?? "the runner", o.state);
     case "concurrency":
       if (o.environment) return `Waiting for ${o.environment}'s other deployments (at most ${o.limit ?? 1} at once).`;
       return `Waiting for concurrency group ${o.group ?? ""}${o.holders?.length ? `, held by ${o.holders.join(", ")}` : ""}.`;

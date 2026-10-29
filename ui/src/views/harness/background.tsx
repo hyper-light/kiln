@@ -6,16 +6,18 @@
 import * as React from "react";
 import { Fold } from "./fold";
 import { ChevronRight, Square } from "lucide-react";
-import { harnessApi, useSession, type Command, type SessionStore, type State, type Task } from "@/api/harness";
+import { harnessApi, useSession, type AgentInfo, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
-import { duration, tildify } from "./derive";
+import { agentLabel, duration, tildify } from "./derive";
 import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
 import { Shimmer } from "./signals";
-import { classOf, isSubagent, LEFT, stopperOf, subagentRunning, subagentTasksAtWork } from "./tasks";
+import { classOf, isSubagent, kilnAtWork, kilnStatus, LEFT, stopperOf, subagentRunning, subagentTasksAtWork } from "./tasks";
+
+const NO_AGENTS: readonly AgentInfo[] = [];
 
 const BACKGROUND = new Set(["shell", "monitor", "mcp"]);
 export const isBackground = (t: Task) => BACKGROUND.has(classOf(t));
@@ -140,7 +142,13 @@ function Row({ t, agent, send }: { t: Task; agent: string; send: (c: Command) =>
   const live = isLive(t);
   const what = t.command || t.description || t.id;
   const facts = [
-    live ? (t.status === "paused" ? "paused" : `running ${duration(now - t.started)}`) : t.exit_code !== undefined ? `ended · exit ${t.exit_code}` : `ended ${t.status !== "completed" ? `· ${t.status}` : ""}`.trim(),
+    live
+      ? t.status === "paused"
+        ? "paused"
+        : `running ${duration(now - t.started)}`
+      : t.exit_code !== undefined
+        ? `ended · exit ${t.exit_code}`
+        : `ended ${t.status !== "completed" ? `· ${t.status}` : ""}`.trim(),
     classOf(t) === "monitor" && t.events ? `${t.events} event${t.events === 1 ? "" : "s"}` : "",
     classOf(t) === "monitor" && t.wakes ? (t.wakes === "agent" ? "wakes the agent" : "wakes its subagent") : "",
     t.cwd ? tildify(t.cwd) : "",
@@ -368,13 +376,83 @@ function ActivityItem({ t, store, mixed, shown, onShow, onOpenTask }: { t: Task;
   );
 }
 
-export function ActivityLine({ store, onOpenTask }: { store: SessionStore; onOpenTask: (toolId: string) => void }) {
+/**
+ * A subagent kiln started for one of its goals or plan steps (a session of its own, on its machine,
+ * with its settings): its thread opens here, as its harness's own do. Stopping it ends it; its goal
+ * or step comes back to the agent.
+ */
+function KilnItem({ a, mixed, onOpenTask }: { a: AgentInfo; mixed: boolean; onOpenTask: (id: string) => void }) {
+  const [asking, setAsking] = React.useState(false);
+  const [stopAt, setStopAt] = React.useState<number | null>(null);
+  const status = kilnStatus(a);
+  const label = agentLabel(a);
+  const stop = () => {
+    setAsking(false);
+    setStopAt(Date.now());
+    harnessApi.end(a.id, true).catch((e: unknown) => {
+      setStopAt(null);
+      toast.error("Couldn't stop it", errorMessage(e));
+    });
+  };
+  const stopButton = (
+    <button type="button" className="al-stop" aria-expanded={asking} aria-label={`Stop ${label}`} onClick={() => setAsking(!asking)}>
+      Stop
+    </button>
+  );
+  return (
+    <li className="al-item">
+      <div className="al-head">
+        <button type="button" className="al-row" onClick={() => onOpenTask(a.id)}>
+          <Shimmer on={status === "running"} flow={a.id} className="al-glyph">
+            <KindGlyph kind="agent" pending={status === "pending"} />
+          </Shimmer>
+          <span className="al-what">
+            {mixed && <span className="al-kind">Subagent</span>}
+            <span className="al-desc">{label}</span>
+          </span>
+          <span className="al-time">
+            {status === "paused" ? (
+              <span className="al-last">{a.approvals.length > 0 || a.status === "waiting" ? "Waits on you" : "Paused"}</span>
+            ) : (
+              a.doing && <span className="al-last">{a.doing}</span>
+            )}
+            <Since from={a.turn_started ?? a.created_at} />
+          </span>
+        </button>
+        {stopAt !== null ? <Stopping at={stopAt}>{stopButton}</Stopping> : stopButton}
+      </div>
+      {asking && (
+        <Confirm
+          className="al-confirm"
+          label="Stop this subagent"
+          tone="danger"
+          actions={
+            <>
+              <Button size="xs" variant="danger" onClick={stop}>
+                Stop it
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>
+                Keep it running
+              </Button>
+            </>
+          }
+        >
+          <p>Stop this subagent? Its goal comes back to the agent, which takes it itself; what it changed stays.</p>
+        </Confirm>
+      )}
+    </li>
+  );
+}
+
+export function ActivityLine({ store, onOpenTask, kiln = NO_AGENTS }: { store: SessionStore; onOpenTask: (toolId: string) => void; kiln?: readonly AgentInfo[] }) {
   const [open, setOpen] = React.useState(false);
   const [shown, setShown] = React.useState<string | null>(null);
   const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
   const subs = subagentTasksAtWork(tasks);
+  // The subagents kiln started for its goals or plan steps, with its harness's own.
+  const others = kilnAtWork(kiln);
   const bg = tasks.filter((t) => !isSubagent(t) && isLive(t));
-  if (subs.length + bg.length === 0) return null;
+  if (subs.length + others.length + bg.length === 0) return null;
   const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
   const of = (cls: string) => bg.filter((t) => classOf(t) === cls).length;
   const shells = of("shell");
@@ -382,11 +460,11 @@ export function ActivityLine({ store, onOpenTask }: { store: SessionStore; onOpe
   const workflows = of("workflow");
   const other = bg.length - shells - monitors - workflows;
   // The header already says what they are; a row names its kind only in a mixed list.
-  const mixed = subs.length > 0 && bg.length > 0;
+  const mixed = subs.length + others.length > 0 && bg.length > 0;
   // One glyph per kind, so the line says what is running at a glance; a subagent running, the
   // prism sweeps through its words (the thinking line's shimmer).
   const segments: { kind: GlyphKind; text: string; live: boolean }[] = [
-    { kind: "agent" as const, text: count(subs.length, "subagent"), live: subagentRunning(subs) },
+    { kind: "agent" as const, text: count(subs.length + others.length, "subagent"), live: subagentRunning(subs) || others.some((a) => kilnStatus(a) === "running") },
     { kind: "shell" as const, text: count(shells, "shell"), live: true },
     { kind: "monitor" as const, text: count(monitors, "monitor"), live: true },
     { kind: "workflow" as const, text: count(workflows, "workflow"), live: true },
@@ -417,7 +495,13 @@ export function ActivityLine({ store, onOpenTask }: { store: SessionStore; onOpe
       </button>
       {open && (
         <ul className="al-list">
-          {[...subs, ...bg].map((t) => (
+          {subs.map((t) => (
+            <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
+          ))}
+          {others.map((a) => (
+            <KilnItem key={a.id} a={a} mixed={mixed} onOpenTask={onOpenTask} />
+          ))}
+          {bg.map((t) => (
             <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
           ))}
         </ul>

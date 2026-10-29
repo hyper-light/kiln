@@ -17,6 +17,10 @@ pub enum SpecError {
     Cycle(String),
     #[error("job `{0}` has no steps")]
     NoSteps(String),
+    /// An exclusive job's share is what it asks (docs/ci.md W05-R03): one that isn't a quantity
+    /// would take the whole runner unsaid.
+    #[error("job `{job}`: {why}")]
+    BadResources { job: String, why: String },
     #[error("matrix for job `{job}` expands to {count} combinations (limit {limit})")]
     MatrixTooLarge { job: String, count: usize, limit: usize },
     #[error("job `{job}`'s requires `{expr}`: {why}")]
@@ -221,6 +225,16 @@ impl PlannedJob {
         self.without_requires = caps & crate::proto::CAP_CI2 == 0;
         self
     }
+
+    /// The job as the runner it's assigned to reads it: [`PlannedJob::for_runner`] with what the
+    /// runner said it can do, or for a job pod (`ephemeral`, [`crate::k8s`]) as this build writes
+    /// it. A pod never says (it sends no `Build`, so its capabilities read none) and runs the
+    /// agent image this server is set up with, which reads `requires`: written without it, every
+    /// `[k8s]` job of v1's went to its pod out of step, refused as malformed or read with no steps
+    /// and passed without running (W05-R22, W28 step 3's replay).
+    pub fn for_assignee(self, caps: u32, ephemeral: bool) -> Self {
+        self.for_runner(if ephemeral { caps | crate::proto::CAP_CI2 } else { caps })
+    }
 }
 
 // By hand for `requires`, which a runner from before the CI work reads a job without: the fields
@@ -371,6 +385,10 @@ fn validate(p: &Pipeline) -> Result<(), SpecError> {
         }
         for r in requirements(job.requires.as_ref()).iter().filter(|r| !r.contains("${{")) {
             kiln_ci::sched::routing::Constraint::parse(r).map_err(|why| SpecError::Requires { job: id.clone(), expr: r.clone(), why })?;
+        }
+        let asked = kiln_ci::sched::pools::ResourceSpec { cpu: job.resources.cpu.clone(), memory: job.resources.memory.clone(), ..Default::default() };
+        if let Err(why) = asked.resources() {
+            return Err(SpecError::BadResources { job: id.clone(), why });
         }
         for need in &job.needs {
             if !p.jobs.contains_key(need) {
@@ -700,6 +718,29 @@ jobs:
             read += 1;
         }
         anyhow::ensure!(read >= 3, "only {read} of kiln's own workflows read");
+        Ok(())
+    }
+
+    /// kiln's own benches hold a share of their machine (docs/ci.md W05-R03): the QUIC bench one
+    /// L3 domain's CPUs on adacachy, the CI engine's bench 8 so it fits every machine it may run on
+    /// (a Mac Studio has 14), and memory above their peaks, other work running beside them. A share
+    /// that isn't a quantity is refused, naming its job, rather than taking the whole runner unsaid.
+    #[test]
+    fn the_benches_hold_a_share_and_a_share_that_isnt_one_is_refused() -> anyhow::Result<()> {
+        use kiln_ci::sched::state::{Incoming, Resources};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln/bench.yaml");
+        let p = parse(&std::fs::read_to_string(dir)?)?;
+        for (job, cpu, gib) in [("quic-transport", 16.0, 48), ("ci-bench", 8.0, 16)] {
+            let j = p.jobs.get(job).ok_or_else(|| anyhow::anyhow!("no {job}"))?;
+            assert_eq!(crate::hub::v1_incoming(j.exclusive, &j.resources), Incoming::Share(Resources { cpu, mem: gib << 30, ..Resources::default() }), "{job}");
+        }
+        let noise = p.jobs.get("noise").ok_or_else(|| anyhow::anyhow!("no noise"))?;
+        assert_eq!(crate::hub::v1_incoming(noise.exclusive, &noise.resources), Incoming::Ordinary, "noise runs beside them");
+        let bad = "name: b\njobs:\n  bench:\n    exclusive: true\n    resources: { cpu: lots }\n    steps: [{ run: \"true\" }]\n";
+        match parse(bad) {
+            Err(SpecError::BadResources { job, why }) => assert!(job == "bench" && why.contains("isn't a number of CPUs"), "{why}"),
+            other => anyhow::bail!("not refused: {other:?}"),
+        }
         Ok(())
     }
 

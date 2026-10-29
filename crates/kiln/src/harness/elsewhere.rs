@@ -133,7 +133,7 @@ fn fullest(limits: &[&Limit], now: i64) -> f64 {
 
 /// Where `info` goes on: the machine (and harness) that takes it over best, or why none can. Its
 /// own harness signed in to another account; else another harness its conversation can be carried
-/// into (Claude Code ⇄ Codex), signed in with room.
+/// into (any other kiln runs as a structured session), signed in with room.
 async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
     use super::kinds::Kind;
     let Some(Location::Machine(from)) = hub.harness.location(&info.id) else { return Err("it runs on the kiln server, not on one of your machines".into()) };

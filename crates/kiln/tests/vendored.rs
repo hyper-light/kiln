@@ -201,10 +201,15 @@ fn ac_m1_4_kiln_links_one_revision_of_each_vendored_project_and_product() -> any
         ("hyper-rt", "hyper-raft"),
         ("hyper-transport", "hyper-raft"),
         ("hyper-durable", "hyper-raft"),
+        // vorpal's crates, the tree-sitter runtime it carries and its grammars (W26-R07).
+        ("vorpal-core", "vorpal"),
+        ("vorpal-kg", "vorpal"),
+        ("tree-sitter", "vorpal"),
+        ("tree-sitter-rust", "vorpal"),
     ] {
         ensure!(v.crates.get(name).map(String::as_str) == Some(project), "{name} isn't among {project}'s vendored crates: {:?}", v.crates);
     }
-    ensure!(["hyper-light/quiver", "hyper-light/focal", "hyper-light/hyper-raft"].iter().all(|r| v.repositories.contains(*r)), "{:?}", v.repositories);
+    ensure!(["hyper-light/quiver", "hyper-light/focal", "hyper-light/hyper-raft", "hyper-light/vorpal"].iter().all(|r| v.repositories.contains(*r)), "{:?}", v.repositories);
     let lock = kiln_lock()?;
     // kiln links them from their folders: none from git.
     ensure!(!lock.lines().any(|l| l.starts_with("source = \"git+https://github.com/hyper-light/")), "a hyper-light product linked from git");

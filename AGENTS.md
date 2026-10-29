@@ -45,8 +45,11 @@ web UI embedded. Read this before you change it, then the documents it points to
 - **Never restart, swap, upgrade or reinstall a runner** (`kiln install`, `kiln join`, replacing
   `~/.local/bin/kiln`, its LaunchAgent or its service). Agents run through runners, likely you
   among them, and a restart ends their sessions. Say what the upgrade is; the person does it.
-- **Production runs on adacachy.** Keep its load low: send heavy builds and tests to fedora or
-  jupiter (kiln's MCP `run`, with `on:`), with `nice -n 10` and your own `CARGO_TARGET_DIR`.
+- **Production runs on adacachy, beside other work.** Heavy builds and tests go where kiln puts
+  them, never to a machine by name: ask for what they need (`kiln run --needs`, or MCP `run` with
+  `needs`). The gate is `kiln run --needs cpus=12,mem=40g,linux/amd64 --detach -- ci/gate.sh`: it
+  holds itself to what it asked and yields to production. Anything else heavy: `nice -n 10` and
+  your own `CARGO_TARGET_DIR`.
 - **Big files go under `~/.cache`, never `/tmp`.** On the Linux machines `/tmp` is a RAM disk
   every session shares.
 - **Stop only what you started,** by the PID you recorded as you started it. Never `pkill -f` or
@@ -65,7 +68,7 @@ web UI embedded. Read this before you change it, then the documents it points to
 
 | You changed | Run |
 |---|---|
-| Rust | `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`: what you touched first, then all of it |
+| Rust | what you touched first (its tests, clippy on its crate), then the gate: `ci/gate.sh` through `kiln run --needs` (clippy for Linux, Windows and macOS, `cargo test --workspace`) |
 | The UI | in `ui/`: `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` |
 | A seam or `docs/seams.md` | `cargo test -p kiln-seams` (its `doc_truth` test holds the doc to the code) |
 | Vendored code | `python3 scripts/vendor.py check` |
@@ -81,6 +84,7 @@ web UI embedded. Read this before you change it, then the documents it points to
 | `crates/kiln-cd` | the deployments' engine (`docs/cd.md`) |
 | `crates/kiln-seams` | the seams to other products, with simulators and conformance suites |
 | `crates/kiln-http` | HTTP/1.1 and HTTP/2 on hyper-rt (`docs/http.md`) |
+| `crates/kiln-search` | the search across a change: kiln-seams' `Search` on vorpal (`vendor/vorpal`) |
 | `ui/` | the web UI (TanStack Start), embedded in the binary |
 | `docs/` | how each part works: start with `docs/architecture.md` |
 | `vendor/` | vendored projects (`vendor/MANIFEST.toml`, `docs/vendoring.md`) |

@@ -85,7 +85,7 @@ impl OutpostInvites {
 /// Whether a runner carries a label a job asks for (`runs-on`), in any case: one of its own, its
 /// name, or what its platform says (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
 /// `aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled so.
-fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
+pub(crate) fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
     want == name || labels.iter().any(|l| l.eq_ignore_ascii_case(want)) || platform_labels(os, arch).iter().any(|l| l.eq_ignore_ascii_case(want))
 }
 
@@ -104,6 +104,18 @@ fn facts_meet(requires: &[String], facts: Option<&kiln_ci::facts::RunnerFacts>, 
     }
     let Some(f) = facts else { return false };
     requires.iter().all(|r| kiln_ci::sched::routing::Constraint::parse(r).is_ok_and(|c| c.eval(f, labels)))
+}
+
+/// Why runner `a` can't take a job of `labels` (`runs-on`) and `requires` whatever its load, as
+/// [`Hub::pick_agent`] places it: each label it lacks, and each constraint its facts don't meet
+/// ([`meets`]). Empty: it can. Where a retry may ask the job to run (docs/ci.md W05-R28).
+pub(crate) fn cannot_take(labels: &[String], requires: &[String], a: &AgentLive) -> Vec<String> {
+    let mut why: Vec<String> = labels.iter().filter(|l| !carries(&a.labels, &a.os, &a.arch, &a.name, l)).map(|l| format!("lacks the label {l}")).collect();
+    match a.facts.as_deref() {
+        None if !requires.is_empty() => why.push("hasn't said what it has, which its `requires` needs".to_owned()),
+        facts => why.extend(requires.iter().filter(|r| !facts_meet(std::slice::from_ref(*r), facts, &a.labels)).map(|r| format!("needs {r}"))),
+    }
+    why
 }
 
 /// For a job waiting on its `requires`: each connected runner its labels fit, with the constraints
@@ -300,6 +312,10 @@ pub struct AgentLive {
     pub dedicated_job: Option<String>,
     #[serde(skip)]
     pub exclusive: bool,
+    /// The shares of it its exclusive jobs and legs hold, by job (docs/ci.md W05-R03): their CPUs
+    /// and memory are theirs alone, other work runs in the rest.
+    #[serde(skip)]
+    pub held: Vec<(String, kiln_ci::sched::state::Resources)>,
     #[serde(skip)]
     pub lost_at: Option<Instant>,
     /// What the runner's probes found and its administrator declared (docs/ci.md W13-R01, R02).
@@ -423,6 +439,9 @@ pub struct Hub {
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
+    /// How many agent sessions each machine runs at once, as set here, and what each said it
+    /// holds (`crate::harness::limit`).
+    pub agent_limits: crate::harness::limit::AgentLimits,
     /// Peered clusters (`crate::peers`).
     pub peered: crate::peers::Peers,
     /// The tailnet's split DNS for the front doors' names (`crate::frontdoor::tailnet`).
@@ -449,6 +468,9 @@ pub struct Hub {
     pub blobs: crate::blobs::Opened,
     /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// The search across a change (docs/ci.md W26-R07): vorpal, its indexes under the server's
+    /// cache (`crate::ci::search`).
+    pub search: Arc<dyn kiln_seams::Search>,
     /// Memo steps in flight, one execution per key and domain (docs/ci.md W28-R72).
     pub flight: crate::ci::services::memo::Flights,
 }
@@ -488,6 +510,8 @@ impl Hub {
         let harness_dir = cfg.data("harness");
         // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
         let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        // The search across a change (W26-R07): an index per tree in the server's cache.
+        let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
@@ -549,6 +573,7 @@ impl Hub {
             handovers: Mutex::new(crate::handovers::Handovers::default()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
+            agent_limits: crate::harness::limit::AgentLimits::default(),
             peered: crate::peers::Peers::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
@@ -561,6 +586,7 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            search,
             flight: Default::default(),
         }))
     }
@@ -839,6 +865,11 @@ impl Hub {
         }
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
+            // A runner too old to report its own figures (`crate::observe::host`): its samples, as
+            // metrics. The server's own machine reports itself.
+            if self.instances.lock().newest_with(agent, proto::CAP_OBSERVE).is_none() {
+                crate::observe::hub::host_sample(agent, &s);
+            }
         }
         self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
     }
@@ -878,6 +909,7 @@ impl Hub {
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
+                    held: Vec::new(),
                     lost_at: None,
                     facts: None,
                     instances: vec![],
@@ -1316,7 +1348,14 @@ impl Hub {
         true
     }
 
-    pub async fn forget_agent(&self, agent: &str) -> anyhow::Result<()> {
+    pub async fn forget_agent(&self, agent: &str, by: &str) -> anyhow::Result<()> {
+        // Its certificates are revoked for good, recorded so a restart keeps it, and refused at
+        // once (W27-R01); enrolling again under the name brings a new key.
+        let at = crate::util::now_unix();
+        let keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, at).await?;
+        if !keys.is_empty() {
+            self.net.command(crate::net::Out::RevokeKeys { keys, why: crate::identities::refusal(at, "runner forgotten", by) }).await;
+        }
         let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
         peers.extend(self.instances.lock().of(agent));
         peers.sort_unstable();
@@ -1332,6 +1371,7 @@ impl Hub {
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
+        self.agent_limits.forget(&self.store, agent).await;
         self.places.forget(agent);
         self.tailnet.wake.notify();
         self.update_slot_gauges();
@@ -1341,7 +1381,8 @@ impl Hub {
     // ------------------------------------------------------------ reach
 
     /// Reach's directory (`crate::reach::directory`): every runner that is not a job pod — what it
-    /// is, how busy it is, its harnesses, its reach identity and whether it takes links.
+    /// is, how busy it is, its harnesses, its reach identity and whether it takes links, and the
+    /// facts it reported (what `kiln run --needs` checks).
     pub fn reach_directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
         let kinds = self.harness.kinds();
         let relay = self.reach.lock();
@@ -1371,6 +1412,7 @@ impl Hub {
                     draining: a.draining,
                     harnesses: kinds.get(&format!("agent:{}", a.name)).map(|ks| ks.iter().filter(|k| k.available).map(|k| k.id.clone()).collect()).unwrap_or_default(),
                     via: a.transport.map(|t| t.to_string()).unwrap_or_default(),
+                    facts: a.facts.clone(),
                 }
             })
             .collect();
@@ -1420,9 +1462,17 @@ impl Hub {
                     // Sync moves to another runner process of the machine that syncs, if any.
                     let syncing = self.instances.lock().newest_with(&name, proto::CAP_SYNC).is_some();
                     self.sync.machine(&name, syncing);
+                    crate::observe::hub::lost(self, &name);
                     if self.instances.lock().of(&name).is_empty() {
                         self.agent_lost(&name, &reason).await;
                     } else {
+                        // Gone while another of its machine's processes goes on: retired, and its
+                        // identity with it (docs/ci.md W27-R01).
+                        if let Some(label) = lost.as_ref().map(|(i, _)| i.label())
+                            && let Err(e) = crate::identities::runner_retired(self, &name, &label).await
+                        {
+                            tracing::warn!(agent = %name, error = %format!("{e:#}"), "a retired runner process's identity wasn't revoked");
+                        }
                         self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason).await;
                     }
                 }
@@ -1549,6 +1599,7 @@ impl Hub {
                 Some(a) => {
                     a.busy = 0;
                     a.exclusive = false;
+                    a.held.clear();
                     std::mem::take(&mut a.running)
                 }
                 None => vec![],
@@ -1638,6 +1689,8 @@ impl Hub {
                     a.sample = Some(s.clone());
                 }
                 self.record_sample(&agent, s);
+                // The CI engine weighs its headroom by it: once a sample, as it comes.
+                self.ci.send(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() });
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {
@@ -1764,6 +1817,9 @@ impl Hub {
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
                 }
+                if caps & proto::CAP_OBSERVE != 0 {
+                    crate::observe::hub::announced(self, &agent).await;
+                }
                 if caps & proto::CAP_CLUSTER != 0 {
                     self.cluster_announced(&agent).await;
                 }
@@ -1785,6 +1841,7 @@ impl Hub {
                 self.emit(&ServerEvent::Updates);
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
+            AgentMsg::Observe { json, bytes } => crate::observe::hub::heard(&agent, json, bytes),
             AgentMsg::Cluster { json, raft } => match (self.store.group(), crate::store::learner::decode(&json)) {
                 // Where kiln.db stands, for a read the runner answers once its replica holds it.
                 (Some(g), Some(crate::store::learner::Msg::Ask { id })) => {
@@ -1847,7 +1904,10 @@ impl Hub {
                     let waited = self.cmds.lock().not_wire(peer);
                     self.send_waited(peer, waited).await;
                 }
+                // One that takes its agent limit from here is sent what's set for its machine.
+                crate::harness::limit::on_caps(self, &agent, peer, caps).await;
             }
+            AgentMsg::AgentLimit { json } => crate::harness::limit::on_held(self, peer, &agent, &json),
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
@@ -1963,6 +2023,8 @@ impl Hub {
                 Ok(_) => {}
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "an unreadable report of warm workspaces"),
             },
+            // An identity it asks for, for a key it made and keeps (docs/ci.md W27-R01).
+            AgentMsg::Identity { json } => crate::identities::on_ask(self, peer, &agent, &json).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -2204,6 +2266,7 @@ impl Hub {
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
+            held: Vec::new(),
             lost_at: None,
             facts: None,
             instances: Vec::new(),
@@ -2230,9 +2293,12 @@ impl Hub {
             }
         }
         let busy = u32::try_from(running.len()).unwrap_or(u32::MAX);
+        // What its jobs still running hold of it, as before (W05-R03).
+        let held: Vec<(String, kiln_ci::sched::state::Resources)> = prev.iter().flat_map(|a| a.held.iter()).filter(|(j, _)| running.contains(j)).cloned().collect();
+        let exclusive = prev.as_ref().is_some_and(|a| a.exclusive) && !running.is_empty();
         let live = match prev {
             Some(prev) if !joined.newest => AgentLive { connected: true, last_seen: now, running, busy, lost_at: None, ..prev },
-            _ => AgentLive { draining, running, busy, facts: prev_facts, battery: prev_battery, ..live },
+            _ => AgentLive { draining, running, busy, facts: prev_facts, battery: prev_battery, held, exclusive, ..live },
         };
         self.store
             .upsert_agent(AgentRow {
@@ -2257,7 +2323,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2358,6 +2424,10 @@ impl Hub {
         // (ranked oldest), and nothing else tells it to hold it now (until 2026-10-25 a machine
         // upgraded so held no replica until its runner next connected).
         self.cluster_announced(name).await;
+        // And observe's: the newest replicates it (the group's messages go to it), and the build it
+        // took over from lets its own go. Until then that one held it, hearing nothing, until it
+        // ended (its jobs finished), and the new build waited for its folder.
+        crate::observe::hub::announced(self, name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.
@@ -2445,9 +2515,11 @@ impl Hub {
         let mut g = self.agents.lock();
         if let Some(a) = g.get_mut(agent) {
             a.running.retain(|j| j != job);
+            a.held.retain(|(j, _)| j != job);
             a.busy = u32::try_from(a.running.len()).unwrap_or(0);
             if a.running.is_empty() {
                 a.exclusive = false;
+                a.held.clear();
             }
         }
     }
@@ -2470,6 +2542,13 @@ impl Hub {
             #[allow(clippy::cast_precision_loss)]
             m.job_duration.observe((crate::util::now_unix() - started) as f64);
         }
+        if let Some(j) = &job {
+            let mut j = j.clone();
+            j.peak_rss = r.peak_rss.or(j.peak_rss);
+            j.cpu_seconds = r.cpu_seconds.or(j.cpu_seconds);
+            j.error = r.error.clone().or(j.error);
+            crate::observe::kiln::job_finished(&j, run.as_ref(), r.status, crate::util::now_unix());
+        }
         tracing::info!(job = %r.job, agent, status = r.status.as_str(), "job finished");
         let snapshot = self.agents.lock().get(agent).cloned();
         if let Some(a) = snapshot {
@@ -2486,6 +2565,7 @@ impl Hub {
             self.adopt_release(&r.job, run).await;
         }
         if let (Some(status), Some(run)) = (settled, run) {
+            crate::observe::kiln::run_finished(&run, status, crate::util::now_unix());
             crate::gitops::report_status(self, &run, status).await;
         }
         self.update_slot_gauges();
@@ -2610,11 +2690,8 @@ impl Hub {
             let chosen = self.pick_agent(&job);
             match chosen {
                 Some(agent) => {
-                    let executor = if job.labels.iter().any(|l| l == "k8s") && self.agents.lock().get(&agent).is_some_and(|a| a.ephemeral) {
-                        "k8s"
-                    } else {
-                        "baremetal"
-                    };
+                    let ephemeral = self.agents.lock().get(&agent).is_some_and(|a| a.ephemeral);
+                    let executor = if job.labels.iter().any(|l| l == "k8s") && ephemeral { "k8s" } else { "baremetal" };
                     if !self.store.claim_job(job.id.clone(), agent.clone(), executor.into()).await? {
                         continue;
                     }
@@ -2623,7 +2700,7 @@ impl Hub {
                         if let Some(a) = g.get_mut(&agent) {
                             a.running.push(job.id.clone());
                             a.busy = u32::try_from(a.running.len()).unwrap_or(u32::MAX);
-                            a.exclusive = spec.exclusive;
+                            hold_on(a, &job.id, v1_incoming(spec.exclusive, &spec.resources));
                         }
                     }
                     if let Some(q) = job.queued_at {
@@ -2648,7 +2725,7 @@ impl Hub {
                         event: run.event.clone(),
                         run_number: run.number,
                         attempt: job.attempt,
-                        spec: spec.for_runner(self.runner_caps(&agent)),
+                        spec: spec.for_assignee(self.runner_caps(&agent), ephemeral),
                         secrets: self.job_secrets(),
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
@@ -2673,6 +2750,10 @@ impl Hub {
                 None => {
                     let Some(k) = k8s else { continue };
                     if !job.labels.iter().any(|l| l == "k8s") {
+                        continue;
+                    }
+                    // A retry asked for a runner by name (W05-R28): a pod made for it isn't that one.
+                    if job.placement.as_ref().is_some_and(|p| p.runner.is_some()) {
                         continue;
                     }
                     let timeout = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
@@ -2769,8 +2850,11 @@ impl Hub {
     fn pick_agent(&self, job: &Job) -> Option<String> {
         let declined = self.declined.lock().clone();
         let g = self.agents.lock();
-        let exclusive = job.spec.as_ref().is_some_and(|s| s.exclusive);
-        g.values()
+        let incoming = job.spec.as_ref().map_or(kiln_ci::sched::state::Incoming::Ordinary, |s| v1_incoming(s.exclusive, &s.resources));
+        let asked = job.spec.as_ref().map(|s| v1_asked(&s.resources)).unwrap_or_default();
+        let (target, now) = (crate::ci::dispatch::target_use(&self.cfg.ci.scheduler), crate::util::now_ms());
+        let found = g
+            .values()
             .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
             .filter(|a| !a.running.contains(&job.id))
             .filter(|a| {
@@ -2784,17 +2868,15 @@ impl Hub {
             })
             .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
             .filter(|a| meets(job, a))
-            .filter(|a| if exclusive { a.running.is_empty() } else { a.busy < a.slots })
+            // Where a person's retry asked it to run (docs/ci.md W05-R28).
+            .filter(|a| job.placement.as_ref().is_none_or(|p| p.allows(&a.name)))
+            .filter(|a| agent_room(a.slots, a.facts.as_deref(), &a.held, a.exclusive, a.running.len(), incoming))
             // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
             // job goes to another, or waits for one (a pod made for it is its own).
             .filter(|a| a.ephemeral || !strain_of(a).overloaded)
-            // The one with the most room: by its idle cores, free memory and CI slots taken, as
-            // reach measures it; then the most slots.
-            .max_by(|a, b| {
-                let (ra, rb) = (crate::reach::directory::room(strain_of(a), a.busy, a.slots), crate::reach::directory::room(strain_of(b), b.busy, b.slots));
-                ra.total_cmp(&rb).then(a.slots.cmp(&b.slots)).then(b.name.cmp(&a.name))
-            })
-            .map(|a| a.name.clone())
+            // By the engine's own rule (W05): within the target use, the most headroom left.
+            .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { fresh_headroom(a, now) }, room: crate::reach::directory::room(strain_of(a), a.busy, a.slots) });
+        v1_best(found, &asked, target).map(str::to_owned)
     }
 
     async fn check_timeouts(&self) -> anyhow::Result<()> {
@@ -2944,6 +3026,70 @@ impl Hub {
     }
 }
 
+/// What a v1 job holds of the runner it runs on (docs/ci.md W05-R03): an exclusive one asking for
+/// CPUs (`resources: { cpu, memory }`) holds them and that memory; asking for none, the whole
+/// runner. A `resources:` that isn't a quantity asks for none.
+pub(crate) fn v1_incoming(exclusive: bool, resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Incoming {
+    kiln_ci::sched::state::Incoming::of(exclusive, &v1_asked(resources))
+}
+
+/// What a v1 job asks of its runner: its `resources:` (none: nothing).
+fn v1_asked(resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Resources {
+    kiln_ci::sched::pools::ResourceSpec { cpu: resources.cpu.clone(), memory: resources.memory.clone(), ..Default::default() }.resources().unwrap_or_default()
+}
+
+/// A runner as the v1 dispatcher's last choice weighs it ([`v1_best`]).
+pub(crate) struct V1Candidate<'a> {
+    pub name: &'a str,
+    pub slots: u32,
+    /// Its headroom by a fresh sample; none for a pod made for the job, or a runner without one.
+    pub headroom: Option<kiln_ci::sched::state::Headroom>,
+    /// Its room as reach measures it, for runners without a fresh sample.
+    pub room: f32,
+}
+
+/// Where a v1 job goes of the runners that could take it, by the engine's own rule (W05, the
+/// scheduler's headroom, [`kiln_ci::sched::place::place`]): within the target use by its live
+/// sample, the one with the most headroom left after it; ties, and runners without a fresh
+/// sample after those, by reach's room, then the most slots, then the name.
+pub(crate) fn v1_best<'a>(candidates: impl IntoIterator<Item = V1Candidate<'a>>, asked: &kiln_ci::sched::state::Resources, target: f64) -> Option<&'a str> {
+    let mut found: Vec<V1Candidate<'a>> = candidates.into_iter().collect();
+    found.sort_by(|a, b| b.room.total_cmp(&a.room).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)));
+    let nodes: Vec<kiln_ci::sched::place::Node<'a>> = found.iter().map(|c| kiln_ci::sched::place::Node { name: c.name, headroom: c.headroom }).collect();
+    kiln_ci::sched::place::place(asked, &nodes, target).ok()
+}
+
+/// A runner's headroom by its sample when it's fresh ([`kiln_ci::sched::state::SAMPLE_FRESH_MS`]).
+fn fresh_headroom(a: &AgentLive, now_ms: i64) -> Option<kiln_ci::sched::state::Headroom> {
+    let s = a.sample.as_ref().filter(|s| now_ms.saturating_sub(s.ts_ms) <= kiln_ci::sched::state::SAMPLE_FRESH_MS)?;
+    Some(kiln_ci::sched::state::Headroom::of(&crate::ci::dispatch::sample_of(s, a.facts.as_deref())))
+}
+
+/// Whether a runner has room for one more job or leg, by the rule the engine's scheduler and the
+/// runner's own admission use (`kiln_ci::sched::state::room`): its slots, its size as its facts
+/// give it, what's held of it and what runs.
+pub(crate) fn agent_room(slots: u32, facts: Option<&kiln_ci::facts::RunnerFacts>, held: &[(String, kiln_ci::sched::state::Resources)], whole: bool, running: usize, incoming: kiln_ci::sched::state::Incoming) -> bool {
+    let size = facts.and_then(|f| {
+        let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
+        (cpus > 0 && f.mem.total > 0).then(|| kiln_ci::sched::state::Resources { cpu: f64::from(cpus), mem: f.mem.total, ..Default::default() })
+    });
+    let mut shares = kiln_ci::sched::state::Resources::default();
+    for (_, q) in held {
+        shares.cpu += q.cpu;
+        shares.mem = shares.mem.saturating_add(q.mem);
+    }
+    kiln_ci::sched::state::room(slots, size, &shares, whole, running.saturating_sub(held.len()), running, incoming)
+}
+
+/// A job or leg now on a runner holds what it holds of it: its share, or the whole runner.
+pub(crate) fn hold_on(a: &mut AgentLive, job: &str, incoming: kiln_ci::sched::state::Incoming) {
+    match incoming {
+        kiln_ci::sched::state::Incoming::Share(q) => a.held.push((job.to_owned(), q)),
+        kiln_ci::sched::state::Incoming::Whole => a.exclusive = true,
+        kiln_ci::sched::state::Incoming::Ordinary => {}
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3018,6 +3164,30 @@ pub(crate) mod tests {
         assert!(!facts_meet(&["tools has".to_owned()], Some(&mac(&["node"])), &labels), "a requirement that doesn't parse holds nowhere");
     }
 
+    /// W05-R28: the runners a retry may ask a pipeline's job onto are those `pick_agent` would
+    /// place it on, its labels and its `requires` both (the release's Linux build, `runs-on:
+    /// [baremetal]`, isn't for a Mac); each other says why not.
+    #[test]
+    fn w05_r28_a_retry_s_runners_are_where_v1_places_the_job() {
+        let runner = |name: &str, os: &str, labels: &[&str], tools: Option<&[&str]>| {
+            let mut a = live_runner(name, os, "x86_64");
+            a.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+            a.facts = tools.map(|t| {
+                Box::new(kiln_ci::facts::RunnerFacts { os: os.into(), arch: "x86_64".into(), tools: t.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), ..Default::default() })
+            });
+            a
+        };
+        let labels = vec!["baremetal".to_owned()];
+        let requires: Vec<String> = ["os == linux", "tools has cargo"].iter().map(|r| (*r).to_owned()).collect();
+        assert!(cannot_take(&labels, &requires, &runner("fedora", "linux", &["baremetal"], Some(&["cargo"]))).is_empty());
+        assert_eq!(cannot_take(&labels, &requires, &runner("mac", "macos", &["baremetal", "macos"], Some(&["cargo"]))), ["needs os == linux"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("bare", "linux", &["baremetal"], Some(&[]))), ["needs tools has cargo"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("quiet", "linux", &["baremetal"], None)), ["hasn't said what it has, which its `requires` needs"]);
+        assert_eq!(cannot_take(&labels, &requires, &runner("pod", "linux", &["k8s"], Some(&["cargo"]))), ["lacks the label baremetal"]);
+        // No `requires`: its labels alone, facts or none.
+        assert!(cannot_take(&labels, &[], &runner("quiet", "linux", &["baremetal"], None)).is_empty());
+    }
+
     /// What a waiting job's runners lack, for an agent to install (`GET /api/jobs/:id/tools`):
     /// nothing while one meets it all (the job waits for a slot), else each runner with what it
     /// doesn't meet: a Mac that only lacks tools and hosts agents first, then one without
@@ -3039,6 +3209,38 @@ pub(crate) mod tests {
         let seen: Vec<(&str, bool, usize, Vec<String>)> = lacks.iter().map(|u| (u.runner.as_str(), u.fixable, u.unmet.len(), u.tools.clone())).collect();
         let tools = vec!["cargo".to_owned(), "node".to_owned()];
         assert_eq!(seen, vec![("studio-3", true, 2, tools.clone()), ("studio-2", false, 2, tools.clone()), ("old", false, 4, tools)], "an agent can fix only the one that hosts agents and lacks only tools");
+    }
+
+    /// A bench holding 16 of a 32-CPU, 64 GiB runner's CPUs leaves two of its four slots: the v1
+    /// dispatcher packs ordinary jobs beside it, and an exclusive job asking nothing still waits
+    /// for the runner to be empty.
+    #[test]
+    fn a_v1_bench_holds_its_share_and_jobs_run_beside_it() {
+        use kiln_ci::sched::state::{Incoming, Resources};
+        let mut facts = kiln_ci::facts::RunnerFacts::default();
+        facts.cpu.threads = 32;
+        facts.mem.total = 64 << 30;
+        let spec = |exclusive: bool, cpu: Option<&str>, memory: Option<&str>| crate::pipeline::JobSpec {
+            exclusive,
+            resources: crate::pipeline::Resources { cpu: cpu.map(str::to_owned), memory: memory.map(str::to_owned) },
+            ..crate::pipeline::JobSpec::default()
+        };
+        let of = |s: crate::pipeline::JobSpec| v1_incoming(s.exclusive, &s.resources);
+        let bench = of(spec(true, Some("16"), Some("16Gi")));
+        assert_eq!(bench, Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() }));
+        assert_eq!(of(spec(true, None, None)), Incoming::Whole);
+        assert_eq!(of(spec(false, Some("16"), None)), Incoming::Ordinary);
+        // Empty: the bench goes in; then two ordinary jobs beside it, not three.
+        assert!(agent_room(4, Some(&facts), &[], false, 0, bench));
+        let held = vec![("bench".to_owned(), Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() })];
+        assert!(agent_room(4, Some(&facts), &held, false, 1, Incoming::Ordinary));
+        assert!(agent_room(4, Some(&facts), &held, false, 2, Incoming::Ordinary));
+        assert!(!agent_room(4, Some(&facts), &held, false, 3, Incoming::Ordinary), "two slots beside half the runner held");
+        assert!(!agent_room(4, Some(&facts), &held, false, 1, Incoming::Whole), "the whole runner waits for it to be empty");
+        // Before: an exclusive job took the whole runner; asking nothing, it still does.
+        assert!(!agent_room(4, Some(&facts), &[], true, 1, Incoming::Ordinary));
+        // A runner whose facts aren't in yet: the bench waits for it to be empty.
+        assert!(!agent_room(4, None, &[], false, 1, bench) && agent_room(4, None, &[], false, 0, bench));
     }
 
     /// A job's labels fit a runner by its own labels, its name, or its platform (`linux`, `amd64`,
@@ -3089,6 +3291,7 @@ pub(crate) mod tests {
             enrolled_at: 0,
             running: vec![],
             busy: 0,
+            held: Vec::new(),
             draining: false,
             sample: None,
             battery: None,
@@ -3140,7 +3343,7 @@ pub(crate) mod tests {
         );
         let (store, (pki, leaf)) = (store??, keys??);
         let pki = Arc::new(pki);
-        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
+        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }
@@ -3218,4 +3421,55 @@ pub(crate) mod tests {
         invites.add("old".into(), Instant::now() - Duration::from_secs(1));
         assert!(!invites.take("old"), "an expired invite doesn't work");
     }
+
+    /// The scheduler's headroom (W05, step 3): one rule places a CI leg, a v1 job and a command
+    /// alike. On one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure),
+    /// asking 4 CPUs and 2 GiB: a would pass the target use, c's disk counts against it, and the
+    /// engine, the v1 dispatcher and kiln run's ranking all pick b.
+    #[test]
+    fn one_headroom_rule_places_a_leg_a_v1_job_and_a_command_alike() -> anyhow::Result<()> {
+        use kiln_ci::sched::routing::{LegRoute, RunnerView};
+        use kiln_ci::sched::state::{Command, Config, Headroom, Input, LegIn, Resources, RunnerIn, Sample, Scheduler};
+        const GIB: u64 = 1 << 30;
+        let fleet = [("a", 0.8, 0.0), ("b", 0.3, 0.0), ("c", 0.1, 60.0)];
+        let sample = |busy: f64, io: f64| Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) };
+        let asked = Resources { cpu: 4.0, mem: 2 * GIB, ..Resources::default() };
+        // The engine.
+        let mut engine = Scheduler::new(Config::default());
+        for (name, busy, io) in fleet {
+            let view = RunnerView { name: name.into(), labels: vec!["local".into()], caps: 1 << 10, ..RunnerView::default() };
+            engine.handle(Input::RunnerUp(Box::new(RunnerIn { id: name.into(), view, slots: 4, ..RunnerIn::default() })), 0);
+            engine.handle(Input::RunnerSample { runner: name.into(), sample: sample(busy, io) }, 1_000);
+        }
+        let leg = LegIn { id: "build".into(), run: "r1".into(), repo: "acme/x".into(), request: asked, route: LegRoute { labels: vec!["local".into()], ..LegRoute::default() }, ..LegIn::default() };
+        let c = engine.handle(Input::LegQueued(Box::new(leg)), 2_000);
+        let by_engine = c.iter().find_map(|x| match x {
+            Command::Assign { runner, .. } => Some(runner.clone()),
+            _ => None,
+        });
+        // The v1 dispatcher.
+        let by_v1 = v1_best(fleet.iter().map(|(name, busy, io)| V1Candidate { name, slots: 4, headroom: Some(Headroom::of(&sample(*busy, *io))), room: 0.0 }), &asked, 0.85);
+        // kiln run.
+        let info: Vec<crate::reach::directory::RunnerInfo> = fleet
+            .iter()
+            .map(|(name, busy, io)| crate::reach::directory::RunnerInfo {
+                name: (*name).into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                connected: true,
+                reach: true,
+                cpus: 32,
+                cpu_pct: (*busy * 100.0) as f32,
+                mem_total: 64 * GIB,
+                mem_used: 16 * GIB,
+                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: Some(*io) }), ..kiln_ci::facts::RunnerFacts::default() })),
+                ..crate::reach::directory::RunnerInfo::default()
+            })
+            .collect();
+        let (ranked, _) = crate::reach::directory::rank(&info, &crate::reach::directory::Want::parse("cpus=4,mem=2g")?, "elsewhere");
+        let by_run = ranked.first().map(|c| c.runner.name.clone());
+        assert_eq!((by_engine.as_deref(), by_v1, by_run.as_deref()), (Some("b"), Some("b"), Some("b")), "{c:?} {ranked:?}");
+        Ok(())
+    }
 }
+

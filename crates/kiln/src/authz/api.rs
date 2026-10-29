@@ -227,9 +227,10 @@ async fn add_user(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fai
 async fn disable_user(hub: &Hub, caller: &Caller, key: &str) -> Result<Response, Fail> {
     let (id, name) = find_user(hub, key).await?;
     let uid = id.clone();
+    // One moment for it all: from it they sign in no more, and what their keys sign is refused.
+    let now = crate::util::now_unix();
     hub.store
         .call(move |c| {
-            let now = crate::util::now_unix();
             let p = format!("user:{uid}");
             c.execute("UPDATE users SET disabled_at = ?2, session_epoch = session_epoch + 1, link_hash = NULL WHERE id = ?1", params![uid, now])?;
             c.execute("UPDATE tokens SET revoked_at = ?2 WHERE (principal = ?1 OR on_behalf_of = ?1) AND revoked_at IS NULL", params![p, now])?;
@@ -237,6 +238,8 @@ async fn disable_user(hub: &Hub, caller: &Caller, key: &str) -> Result<Response,
         })
         .await
         .map_err(internal)?;
+    // Their certificates with them, from that moment (docs/ci.md W27-R01).
+    crate::identities::person_disabled(&hub.store, &hub.pki, &name, &caller.name, now).await.map_err(internal)?;
     hub.store.audit(caller.name.clone(), "users.disable".into(), name).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }

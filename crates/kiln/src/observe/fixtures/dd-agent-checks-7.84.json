@@ -1,0 +1,138 @@
+{
+ "apiKey": "",
+ "agentVersion": "7.84.4",
+ "uuid": "00000000-0000-4000-8000-000000000001",
+ "internalHostname": "probe-host",
+ "meta": {
+  "socket-hostname": "probe-host",
+  "timezones": [
+   "UTC"
+  ],
+  "socket-fqdn": "probe-host",
+  "ec2-hostname": "",
+  "hostname": "probe-host",
+  "host_aliases": [],
+  "instance-id": "",
+  "hostname-resolution-version": 1
+ },
+ "agent_checks": [
+  [
+   "io",
+   "io",
+   "io",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "disk",
+   "disk",
+   "disk:67cc0574430a16ba",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "cloud_hostinfo",
+   "cloud_hostinfo",
+   "cloud_hostinfo",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "container_image",
+   "container_image",
+   "container_image",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "uptime",
+   "uptime",
+   "uptime",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "memory",
+   "memory",
+   "memory",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "discovery",
+   "discovery",
+   "discovery",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "ntp",
+   "ntp",
+   "ntp:3c427a42a70bbf8",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "container_lifecycle",
+   "container_lifecycle",
+   "container_lifecycle",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "telemetry",
+   "telemetry",
+   "telemetry",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "load",
+   "load",
+   "load",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "file_handle",
+   "file_handle",
+   "file_handle",
+   "OK",
+   "",
+   "",
+   []
+  ],
+  [
+   "cpu",
+   "cpu",
+   "cpu",
+   "OK",
+   "",
+   "",
+   []
+  ]
+ ],
+ "external_host_tags": []
+}

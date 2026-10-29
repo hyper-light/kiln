@@ -32,13 +32,11 @@ jobs:
       # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
-        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
       # One x86_64-unknown-linux-musl build per commit for release and the image (W28-R78): the
       # same text and memo in both, after the shared UI step; its commit named, as the binary
       # embeds it (KILN_COMMIT).
       - name: x86_64 musl
         run: KILN_COMMIT=$KILN_SHA nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
-        memo: { inputs: [Cargo.toml, Cargo.lock, .cargo, crates, vendor, ci/release/build.sh, ui/scripts, ui/dist], outputs: [dist/kiln-x86_64-unknown-linux-musl], platform: [os, arch], tools: { rustc: full } }
       - name: aarch64 musl
         run: nice -n 10 ci/release/build.sh aarch64-unknown-linux-musl
     artifacts: ["dist/*"]
@@ -55,7 +53,6 @@ jobs:
       # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
-        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
       - name: build
         run: nice -n 10 ci/release/build.sh x86_64-pc-windows-msvc
     artifacts: ["dist/*"]
@@ -77,7 +74,6 @@ jobs:
       # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
-        memo: { inputs: [ui], outputs: [ui/dist], platform: any, tools: { node: major } }
       - name: build
         run: nice -n 10 ci/release/build.sh aarch64-apple-darwin
     artifacts: ["dist/*"]

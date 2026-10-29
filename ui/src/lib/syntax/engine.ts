@@ -84,7 +84,11 @@ export class Highlighter {
   /** What each grammar's queries lost to fit it (fit.ts), by `<language>/<grammar>`. */
   readonly dropped = new Map<string, string[]>();
 
-  constructor(private assets: Assets) {}
+  /** `budgetMs`: how long one text may take (the page's [`BUDGET_MS`]; the tests, which aren't watched, give more). */
+  constructor(
+    private assets: Assets,
+    private opts: { budgetMs?: number } = {},
+  ) {}
 
   /** Whether `id` highlights now. */
   ready(id: string): boolean {
@@ -158,7 +162,7 @@ export class Highlighter {
     if (!l || text.length > MAX_CHARS) return null;
     const paint = new Uint8Array(text.length);
     const wants = new Set<string>();
-    const deadline = now() + BUDGET_MS;
+    const deadline = now() + (this.opts.budgetMs ?? BUDGET_MS);
     try {
       this.layer(l, text, null, paint, wants, deadline, 0, l.lang.id);
     } catch (e) {

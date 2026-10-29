@@ -34,7 +34,7 @@ type Agent = Pick<AgentInfo, "id" | "name" | "kind" | "kind_name" | "target" | "
 export const movable = (a: Pick<AgentInfo, "target" | "status" | "harness_session">) => a.target.startsWith("agent:") || (a.status === "exited" && !a.harness_session);
 
 /** Names in words: "a", "a and b", "a, b and c". */
-const inWords = (ns: string[]) => (ns.length < 2 ? ns.join("") : `${ns.slice(0, -1).join(", ")} and ${ns[ns.length - 1]}`);
+export const inWords = (ns: string[]) => (ns.length < 2 ? ns.join("") : `${ns.slice(0, -1).join(", ")} and ${ns[ns.length - 1]}`);
 
 function Choices({ agent, picked, onPick }: { agent: Agent; picked: string; onPick: (t: string) => void }) {
   const { byTarget, runners } = useSuspenseResource("harness/move", askPlaces).data;

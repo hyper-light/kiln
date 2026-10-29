@@ -68,6 +68,8 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             {
                 crate::deploy::remote::on_github_event(&d, &event, &v).await;
             }
+            // Ship's mirror of the pull request reads it again (W26-R20).
+            crate::githost::mirror::on_github_event(hub, &event, &v).await;
             let hub2 = Arc::clone(hub);
             let delivery = (!delivery.is_empty()).then_some(delivery);
             crate::rt::spawn(async move {

@@ -1,0 +1,642 @@
+/* Ship's list (after the CI/CD Integration agent's f-ship prototype): one row per commit, its
+   change's other commits folded under it, a dropdown under each. */
+.ship-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px 12px;
+  margin: 0 0 12px;
+}
+.ship-facet {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+.ship-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--k-line, #2a2c31);
+}
+.ship-row {
+  position: relative;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+}
+.ship-row[data-stand="needs_you"]::before,
+.ship-row[data-stand="failing"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #e2cfae;
+  opacity: 0.8;
+}
+.ship-row[data-stand="failing"]::before {
+  background: #e2b9bd;
+  opacity: 0.55;
+}
+.ship-stand[data-stand="superseded"] {
+  color: #8b8e96;
+}
+.ship-row[data-stand="superseded"] {
+  opacity: 0.6;
+}
+.ship-r {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 176px 214px 28px;
+  gap: 4px 18px;
+  align-items: center;
+  padding: 12px 4px 12px 16px;
+}
+.ship-main {
+  all: unset;
+  cursor: pointer;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.ship-main:focus-visible,
+.ship-go:focus-visible,
+.ship-fold:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.ship-name {
+  font-size: 15.5px;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-line {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  min-width: 0;
+}
+.ship-stand {
+  flex: none;
+  font-size: 12.5px;
+  color: #e4e5e7;
+}
+.ship-stand[data-stand="needs_you"] {
+  color: #e2cfae;
+}
+.ship-stand[data-stand="failing"],
+.ship-stand[data-stand="rolled_back"] {
+  color: #e2b9bd;
+}
+.ship-text {
+  color: #a1a4ad;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.ship-metas {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #8b8e96;
+  white-space: nowrap;
+  min-width: 0;
+}
+.ship-metas > span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ship-m2 {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: flex-end;
+  overflow: hidden;
+}
+.ship-change {
+  color: #cdc6ea;
+}
+.ship-tag {
+  color: #d8cbb0;
+}
+.ship-acts {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 104px;
+  gap: 6px;
+  justify-content: end;
+}
+.ship-acts > * {
+  width: 100%;
+}
+.ship-go {
+  all: unset;
+  cursor: pointer;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  color: #8b8e96;
+}
+.ship-go:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #e4e5e7;
+}
+.ship-go svg {
+  transition: transform 0.25s ease;
+}
+.ship-go[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+.ship-fold {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 10px 4px 10px 34px;
+  color: #8b8e96;
+  font-size: 12.5px;
+  border-top: 1px solid var(--k-line-2, #1f2125);
+  background: rgba(226, 207, 174, 0.02);
+}
+.ship-fold:hover {
+  color: #e4e5e7;
+}
+.ship-riders {
+  list-style: none;
+  margin: 0;
+  padding: 0 4px 8px 34px;
+  display: grid;
+  gap: 6px;
+}
+.ship-rider {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: baseline;
+  font-size: 12.5px;
+  color: #a1a4ad;
+}
+.ship-sha {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #8b8e96;
+}
+/* The dropdown's sections one under another, each the lanes card's width at every size (W26-R06). */
+.ship-open {
+  padding: 2px 4px 18px 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+.ship-sec {
+  border: 1px solid var(--k-line, #2a2c31);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  color: #a1a4ad;
+  min-width: 0;
+}
+.ship-sec h3 {
+  margin: 0 0 6px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #b9bbc2;
+}
+.ship-sec p,
+.ship-sec ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-wrap: anywhere;
+}
+.ship-sec a {
+  color: #a6c4ed;
+}
+@media (max-width: 1080px) {
+  .ship-r {
+    grid-template-columns: minmax(0, 1fr) 176px 214px 28px;
+  }
+  .ship-r > .ship-pips {
+    grid-column: 1;
+    grid-row: 2;
+  }
+}
+@media (max-width: 700px) {
+  /* A row keeps one height whatever it says: one line each, its answer beside its details. */
+  .ship-r {
+    grid-template-columns: minmax(0, 1fr) auto 28px;
+    grid-template-areas: "main main go" "pips pips pips" "meta acts acts";
+  }
+  .ship-r > .ship-main {
+    grid-area: main;
+  }
+  .ship-r > .ship-go {
+    grid-area: go;
+    align-self: start;
+  }
+  .ship-r > .ship-pips {
+    grid-area: pips;
+    grid-column: auto;
+    grid-row: auto;
+  }
+  .ship-r > .ship-metas {
+    grid-area: meta;
+    justify-items: start;
+  }
+  .ship-r > .ship-metas .ship-m2 {
+    justify-content: flex-start;
+  }
+  .ship-r > .ship-acts {
+    grid-area: acts;
+    grid-auto-columns: 84px;
+    align-self: center;
+    justify-content: end;
+  }
+  .ship-line {
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ship-rider {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .ship-rider .ship-text {
+    display: none;
+  }
+}
+
+/* Ship's three views: its commits, and the runs and deployments it took the place of in the nav. */
+.ship-views {
+  display: flex;
+  width: fit-content;
+  gap: 0.25rem;
+  margin: 0 0 1.25rem;
+  padding: 0.25rem;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 999px;
+}
+.ship-views__link {
+  padding: 0.45rem 1rem;
+  border-radius: 999px;
+  color: #a3a5ad;
+  font-size: 0.875rem;
+  text-decoration: none;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+.ship-views__link:hover {
+  color: #e4e5e9;
+}
+.ship-views__link.is-current {
+  background: rgb(255 255 255 / 0.9);
+  color: #0b0c0e;
+}
+
+/* The list bar's sort, on the right; on a phone the filter takes the width and the sort sits under it. */
+.ship-sort {
+  flex: 0 0 auto;
+  min-width: 11rem;
+}
+@media (max-width: 640px) {
+  .ship-tools {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .ship-facet,
+  .ship-sort {
+    width: 100%;
+  }
+}
+
+/* A row keeps one height whatever its state (step 5): one line for its name, one for its words, a
+   pair of actions of one width, an empty slot holding its place unseen. */
+.ship-name,
+.ship-text,
+.ship-m2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-acts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.ship-act-slot {
+  visibility: hidden;
+}
+.ship-act-slot > * {
+  width: 100%;
+}
+/* Its one environment: production in mint, another in grey. */
+.ship-env {
+  color: #a1a4ad;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.ship-env[data-prod] {
+  color: #bfdccf;
+}
+
+/* An opened commit's job cards (opened-commit plan, step 1): as many to a view as fit, the cards and
+   their gaps together exactly the lanes card's width, a view at a time. The view's cards alone are
+   drawn (jobs.tsx), so nothing scrolls sideways (W21-AC01). */
+.ship-jobs {
+  container-type: inline-size;
+}
+.ship-jobs__track {
+  --n: 1;
+  --gap: 0.75rem;
+  display: grid;
+  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
+  gap: var(--gap);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@container (min-width: 420px) {
+  .ship-jobs__track {
+    --n: 2;
+  }
+}
+@container (min-width: 620px) {
+  .ship-jobs__track {
+    --n: 3;
+  }
+}
+@container (min-width: 820px) {
+  .ship-jobs__track {
+    --n: 4;
+  }
+}
+@container (min-width: 1100px) {
+  .ship-jobs__track {
+    --n: 6;
+  }
+}
+.ship-job {
+  display: flex;
+  min-height: 4.5rem;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 0.75rem;
+  background: rgb(255 255 255 / 0.02);
+}
+.ship-job__head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #e4e5e9;
+  font-size: 0.875rem;
+}
+.ship-job__state {
+  color: #a3a5ad;
+  font-size: 0.8125rem;
+}
+.ship-jobs__pager {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.25rem;
+  margin-top: 0.5rem;
+}
+.ship-jobs__page {
+  display: inline-grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 999px;
+  color: #e4e5e9;
+}
+.ship-jobs__page:disabled {
+  opacity: 0.35;
+}
+
+/* A card picks its job (opened commit's Output, step 2): the whole card is the button; the picked
+   one is lit. */
+.ship-job__pick {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.ship-job__pick:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 6px;
+  border-radius: 0.5rem;
+}
+.ship-job[data-picked] {
+  border-color: rgb(255 255 255 / 0.42);
+  background: rgb(255 255 255 / 0.06);
+}
+
+/* The opened commit's Output (its step 3): the lanes card's width, one height while it loads, while
+   it streams and when there's nothing to show. */
+.ship-output-slot,
+.ship-output--none {
+  min-height: 230px;
+}
+.ship-output {
+  overflow: hidden;
+  border-radius: 0.5rem;
+}
+.ship-output--none {
+  display: grid;
+  place-items: center;
+  border: 1px dashed rgb(255 255 255 / 0.1);
+}
+
+/* Output's bar: the job's name, and at its right the copy icon (its step 4). */
+.ship-output__bar {
+  display: flex;
+  height: 2rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0 0.25rem 0 0.5rem;
+  color: #a3a5ad;
+  font-size: 0.8125rem;
+}
+.ship-output__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A row's age, one width as it ticks ("9m ago" to "10m ago"), so the line beside it never moves. */
+.ship-ago {
+  display: inline-block;
+  min-width: 8ch;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+/* The Diff button brings Files into view below the page's sticky header (Changes plan step 4); the
+   focus ring shows for the keyboard, not after a click. */
+.ship-open section[aria-label="Files"] {
+  scroll-margin-top: calc(var(--header-h, 64px) + 12px);
+}
+.ship-open section[aria-label="Files"]:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* A commit's own page (Commit page plan, step 1): its title, its stand and line, its journey. */
+.ship-commit {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+.ship-commit__title {
+  margin: 0;
+  font-size: 1.5rem;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.ship-commit__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  color: #a1a4ad;
+  font-size: 0.875rem;
+}
+/* An opened row's way to its commit's page, after the agreed sections. */
+.ship-open__page {
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
+/* The commit page's sections (its step 2): what failed first, the six stage cards, the trace. */
+.ship-commit .ship-sec > h2 {
+  margin: 0 0 8px;
+  color: #e4e5e9;
+  font-size: 13px;
+  font-weight: 500;
+}
+.ship-commit__errors {
+  border-color: rgb(229 115 115 / 0.45);
+}
+.ship-commit__errors ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__error-name {
+  color: #e4e5e9;
+  font-weight: 500;
+}
+.ship-commit__error-stage,
+.ship-commit__error-note {
+  color: #a1a4ad;
+  overflow-wrap: anywhere;
+}
+.ship-commit__stages {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The commit page's step 3: what ships with it, its environments and image, its runs. */
+.ship-commit__rides,
+.ship-commit__envs,
+.ship-commit__runs {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__envs li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__env {
+  color: #e4e5e9;
+}
+.ship-commit__env-note {
+  color: #a1a4ad;
+}
+.ship-commit__image {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+/* The commit page's Build (Build and replant plan, step 1): each platform, the image, runners' binaries. */
+.ship-commit__builds,
+.ship-commit__kept {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__builds li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__kept {
+  margin-top: 8px;
+  color: #a1a4ad;
+}
+
+/* The commit page's Replant (Build and replant plan, step 2): the server's build, then each runner. */
+.ship-commit__replant,
+.ship-commit__found {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ship-commit__replant > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.ship-commit__acts {
+  display: inline-flex;
+  gap: 6px;
+}
+.ship-commit__found {
+  flex-basis: 100%;
+  padding-left: 24px;
+  color: #a1a4ad;
+}
+.ship-commit__server {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}

@@ -355,8 +355,9 @@ pub fn blockers(land: &Land, owners: &[OwnerRule], f: &Facts) -> Vec<String> {
     why
 }
 
-/// A landed commit's message: the diff's (or change request's) and kiln's trailers.
-pub fn landed_message(message: &str, revision: &str, reviewed_by: &[String]) -> String {
+/// A landed commit's message: the diff's (or change request's) and kiln's trailers, with each
+/// landed change's `Kiln-Change` (W26-R03; a stack squashed into one commit carries each).
+pub fn landed_message(message: &str, revision: &str, reviewed_by: &[String], changes: &[String]) -> String {
     let body = message.trim_end();
     let has = crate::review::trailers(body);
     let mut out = String::from(body);
@@ -366,7 +367,7 @@ pub fn landed_message(message: &str, revision: &str, reviewed_by: &[String]) -> 
     for r in reviewed_by {
         out.push_str(&format!("Reviewed-by: {r}\n"));
     }
-    out
+    crate::identity::with_kiln_changes(&out, changes)
 }
 
 /// How many candidates the queue tests together next: the policy's batch, halved after each
@@ -463,8 +464,13 @@ mod tests {
 
     #[test]
     fn w14_r07_trailers_and_batches() {
-        assert_eq!(landed_message("one: a\n\nbody\n\nChange-Id: I1\n", "D12", &["user:bob".into()]), "one: a\n\nbody\n\nChange-Id: I1\nDifferential-Revision: D12\nReviewed-by: user:bob\n");
-        assert_eq!(landed_message("fix", "CR4", &[]), "fix\n\nChange-Request: CR4\n");
+        assert_eq!(landed_message("one: a\n\nbody\n\nChange-Id: I1\n", "D12", &["user:bob".into()], &[]), "one: a\n\nbody\n\nChange-Id: I1\nDifferential-Revision: D12\nReviewed-by: user:bob\n");
+        assert_eq!(landed_message("fix", "CR4", &[], &[]), "fix\n\nChange-Request: CR4\n");
+        // W26-R03: each landed change's trailer, once, beside one the commit already had.
+        let kc = |s: &str| format!("kc-{s:0>16}");
+        assert_eq!(landed_message("fix", "D3", &[], &[kc("a")]), format!("fix\n\nDifferential-Revision: D3\nKiln-Change: {}\n", kc("a")));
+        let had = format!("fix\n\nKiln-Change: {}\n", kc("a"));
+        assert_eq!(landed_message(&had, "D3", &[], &[kc("a"), kc("b")]), format!("fix\n\nKiln-Change: {}\nDifferential-Revision: D3\nKiln-Change: {}\n", kc("a"), kc("b")));
         assert_eq!((next_batch(4, 0), next_batch(4, 1), next_batch(4, 2), next_batch(4, 5), next_batch(0, 0)), (4, 2, 1, 1, 1));
     }
 }

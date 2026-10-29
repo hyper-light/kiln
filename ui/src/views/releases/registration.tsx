@@ -556,7 +556,7 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
   return (
     <>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: app, to: releaseAppHref(app) }, { label: env }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: app, to: releaseAppHref(app) }, { label: env }]} />
         <div className="rel-head-row">
           <h1 className="cd-title">
             {app} <span className="rel-title-in">in</span> {env}

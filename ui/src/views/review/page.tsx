@@ -18,6 +18,7 @@ import { relativeTime, shortSha } from "@/lib/format";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { useListener } from "@/views/harness/dom";
+import { AboutContext } from "@/components/code/about";
 import { anchorOf, FileDiff, ThreadView, type Pick } from "./diff";
 import { Gates } from "./gates";
 import { findMoves, parsePatch } from "./patch";
@@ -101,7 +102,10 @@ function Review({ diffKey }: { diffKey: string }) {
         {compare != null ? (
           <Interdiff diffKey={diffKey} from={Math.min(compare, version)} to={Math.max(compare, version)} />
         ) : (
-          <Files diffKey={diffKey} version={version} split={split} whitespace={whitespace} threads={threads} />
+          // An agent's diff: what's in it can be asked about, the agent answering (components/code/about.tsx).
+          <AboutContext.Provider value={d.author.startsWith("agent:") ? { id: d.author.slice("agent:".length), name: whoSaid(d.author), subagents: true, busy: false } : null}>
+            <Files diffKey={diffKey} version={version} split={split} whitespace={whitespace} threads={threads} />
+          </AboutContext.Provider>
         )}
       </Loadable>
       <Loadable label="Loading its dependency changes" fallback={<></>}>

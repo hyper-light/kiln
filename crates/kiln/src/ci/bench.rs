@@ -240,7 +240,7 @@ fn bench_hub_on(dir: &Path, store: crate::store::Store) -> Result<Arc<Hub>> {
     cfg.ci.enabled = true;
     let pki = Arc::new(crate::pki::Pki::open(&dir.join("pki"))?);
     let leaf = pki.server_leaf(&[])?;
-    let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
+    let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
     let logs = crate::logs::Logs::new(dir.join("logs"), 1 << 20);
     let hub = Hub::new(Arc::new(cfg), store, logs, net, pki, crate::util::random_token(), crate::util::random_token(), crate::rt::Shutdown::new())?;
     crate::ci::dispatch::spawn(Arc::clone(&hub));

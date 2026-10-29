@@ -90,12 +90,14 @@ pub fn kept_until(ws: &Path) -> Option<i64> {
     std::fs::read_to_string(ws.join(KEEP_FILE)).ok()?.trim().parse().ok()
 }
 
-/// Removes a workspace. Files a Docker action wrote as root are removed by a container, as root.
+/// Removes a workspace. Files a Docker action wrote as root are removed by a container, as root
+/// (not on Windows, where what a container writes is the user's: there a container can't help).
 pub(super) fn remove(p: &Path) {
     if std::fs::remove_dir_all(p).is_ok() || !p.exists() {
         return;
     }
-    let (Some(parent), Some(name), Some(bin)) = (p.parent(), p.file_name(), super::docker::find()) else {
+    let docker = if cfg!(windows) { None } else { super::docker::find() };
+    let (Some(parent), Some(name), Some(bin)) = (p.parent(), p.file_name(), docker) else {
         tracing::warn!(workspace = %p.display(), "a leg's workspace could not be removed");
         return;
     };

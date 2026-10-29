@@ -43,7 +43,7 @@ export default function Clusters() {
     <div className="container-console page max-w-[880px]">
       <title>Clusters · kiln</title>
       <PageIntro
-        index={11}
+        index={10}
         label="Clusters"
         title="Clusters"
         lead="Other kiln clusters, opened through this one from the picker in the header, from every runner of this cluster. Each peering is authorized by hand with codes, so the other cluster never has to reach this one."

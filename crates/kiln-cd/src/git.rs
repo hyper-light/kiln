@@ -166,14 +166,24 @@ impl Mirror {
             input.push_str(&spec(commit, p));
             input.push('\n');
         }
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(input.as_bytes())?;
-        }
+        // Written while its answers are read, never all before: git answers each line as it reads
+        // it and stops reading once the pipe its answers go to is full (64 KiB, or 8 KiB once its
+        // user's pipes pass `pipe-user-pages-soft`).
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
         let mut out = String::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            stdout.read_to_string(&mut out)?;
-        }
+        let (wrote, read) = std::thread::scope(|s| {
+            let writer = s.spawn(move || stdin.map_or(Ok(()), |mut stdin| stdin.write_all(input.as_bytes())));
+            let read = stdout.map_or(Ok(0), |mut stdout| stdout.read_to_string(&mut out));
+            if read.is_err() {
+                // The writer may be blocked on a git that no one reads: it ends with git.
+                let _ = child.kill();
+            }
+            (writer.join(), read)
+        });
         child.wait()?;
+        read?;
+        wrote.map_err(|_| anyhow::anyhow!("writing to git failed"))??;
         Ok(out
             .lines()
             .map(|l| {
@@ -543,6 +553,33 @@ mod tests {
         assert!(!out.join("deploy/api").exists());
         let entries = m.list(&two, "deploy", true)?;
         assert_eq!(entries.iter().filter(|e| !e.tree).count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn many_paths_hash_without_git_s_pipes_filling() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("deploy"))?;
+        sh(&work, &["init", "-q", "-b", "main"])?;
+        std::fs::write(work.join("deploy/cm.yaml"), "kind: ConfigMap\n")?;
+        sh(&work, &["add", "."])?;
+        sh(&work, &["commit", "-qm", "one"])?;
+        let head = sh(&work, &["rev-parse", "HEAD"])?;
+        let m = Mirror::open(&tmp.path().join("mirror.git"), work.to_str().unwrap_or(""), Auth::default())?;
+        // ~1 MB of answers: far past a pipe's 64 KiB, let alone the 8 KiB a crowded machine's
+        // pipes get. On a thread of its own, so a git that stops answering fails the test.
+        let mut paths: Vec<String> = (0..20_000).map(|i| format!("deploy/missing-{i}")).collect();
+        paths.push("deploy".to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let _ = tx.send(m.hashes(&head, &paths));
+        });
+        let hashes = rx.recv_timeout(std::time::Duration::from_secs(60)).map_err(|_| anyhow::anyhow!("git cat-file never answered"))??;
+        assert_eq!(hashes.len(), 20_001);
+        assert!(hashes.iter().take(20_000).all(Option::is_none));
+        assert!(hashes.last().is_some_and(Option::is_some), "deploy is there");
         Ok(())
     }
 }

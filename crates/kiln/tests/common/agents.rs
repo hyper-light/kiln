@@ -67,6 +67,8 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
         .arg("--state-dir")
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", &home)
+        // Git's global configuration its home's, as a server's is (`common::server_command`).
+        .env_remove("GIT_CONFIG_GLOBAL")
         .env("NO_COLOR", "1")
         .env("FAKE_CLAUDE_LINES", talk.lines.to_string())
         .env("FAKE_CLAUDE_EVERY_MS", talk.every_ms.to_string())
@@ -75,6 +77,26 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
         .stderr(Stdio::from(log))
         .spawn()?;
     Ok((Runner(child), log_path))
+}
+
+/// A folder of this machine's programs (symlinks to /usr/bin's and /bin's) without any harness kiln
+/// knows ([`kiln::harness::kinds::Kind::all`]'s programs), as a PATH: a harness is on it only where a
+/// test puts one, also on a machine with one installed system-wide (adacachy: pacman's claude-code
+/// and codex in /usr/bin), which a runner or server would otherwise find first.
+pub fn path_without_harnesses(dir: &Path) -> anyhow::Result<String> {
+    let system = dir.join("system-bin");
+    std::fs::create_dir_all(&system)?;
+    let harnesses: Vec<&str> = kiln::harness::kinds::Kind::all().iter().map(|k| k.program).collect();
+    for folder in ["/usr/bin", "/bin"] {
+        for entry in std::fs::read_dir(folder)?.flatten() {
+            let name = entry.file_name();
+            if harnesses.iter().any(|h| name == *h) || std::fs::symlink_metadata(system.join(&name)).is_ok() {
+                continue;
+            }
+            std::os::unix::fs::symlink(entry.path(), system.join(&name))?;
+        }
+    }
+    Ok(system.to_string_lossy().into_owned())
 }
 
 /// Waits until the server lists runner `name` connected.

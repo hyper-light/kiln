@@ -236,7 +236,7 @@ export default function EnvironmentsBoard() {
     <div className="container-console page cd-page">
       <title>Environments · kiln</title>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Environments" }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Environments" }]} />
         <h1 className="cd-title">Environments</h1>
         <p className="cd-note">Every environment your repositories deploy to: what runs in each, what is drifting, and what waits to deploy there.</p>
       </header>

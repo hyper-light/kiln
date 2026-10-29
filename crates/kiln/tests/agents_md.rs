@@ -53,6 +53,36 @@ fn agents_md_routes_agents_and_names_only_real_paths() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Agents gate through kiln (W05-R03): AGENTS.md asks for the gate by what it needs and sends work
+/// to no machine by name, and `ci/gate.sh`, given those needs, says the steps it runs and the caps
+/// it holds itself to before it runs any.
+#[test]
+fn the_gate_is_asked_for_by_what_it_needs() -> anyhow::Result<()> {
+    let root = root();
+    let agents = std::fs::read_to_string(root.join("AGENTS.md"))?;
+    let flat = agents.split_whitespace().collect::<Vec<_>>().join(" ");
+    let recipe = flat.split("`kiln run --needs ").nth(1).filter(|r| r.contains("-- ci/gate.sh`")).ok_or_else(|| anyhow::anyhow!("AGENTS.md doesn't say to gate with `kiln run --needs … -- ci/gate.sh`"))?;
+    let needs = recipe.split_whitespace().next().unwrap_or_default();
+    for name in ["fedora", "jupiter", "--on ", "`on:`"] {
+        assert!(!agents.contains(name), "AGENTS.md sends work to a machine by name ({name:?})");
+    }
+    if cfg!(unix) {
+        let out = std::process::Command::new("bash").arg(root.join("ci/gate.sh")).arg("--dry-run").env("KILN_NEEDS", needs).output()?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "ci/gate.sh --dry-run failed: {said}{}", String::from_utf8_lossy(&out.stderr));
+        for line in [
+            format!("asked: 12 CPUs, 40G of memory (from KILN_NEEDS={needs})"),
+            "caps: MemoryMax=40G CPUWeight=1 Nice=19".to_owned(),
+            "cargo: -j 6, 6 test threads".to_owned(),
+            "clippy-linux: cargo clippy --locked --workspace --all-targets".to_owned(),
+            "test: cargo test --locked --workspace --no-fail-fast".to_owned(),
+        ] {
+            assert!(said.contains(&line), "ci/gate.sh --dry-run doesn't say {line:?}:\n{said}");
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn a_path_that_isnt_there_is_named() {
     let root = root();

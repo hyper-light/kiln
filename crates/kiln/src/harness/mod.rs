@@ -11,6 +11,8 @@
 //! * [`kinds`] — the registry of harnesses and their adapters.
 //! * [`session`] — one agent session: the harness process, its adapter and its state.
 //! * [`host`] — a machine's sessions: limits, commands, continuing them after a restart.
+//! * [`limit`] — how many agent sessions a machine runs at once: set from the server, in its config,
+//!   or kiln's default.
 //! * [`registry`] — the server's mirror of every session, for any number of viewers.
 //! * [`lineage`] — agents an agent starts: its children, held to no more than it has.
 //! * [`ops`] — the `agents.*` operations (HTTP, MCP, code mode, the CLI).
@@ -20,6 +22,7 @@
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 //! * [`builds`] — agents' builds on the runner's work: the cache variables, warm build folders.
 
+pub mod about;
 pub mod acp;
 pub mod antigravity;
 pub mod archive;
@@ -44,6 +47,7 @@ pub mod host;
 pub mod inbox;
 pub mod kept;
 pub mod kinds;
+pub mod limit;
 pub mod lineage;
 pub mod live;
 pub mod model;

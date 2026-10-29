@@ -1,0 +1,48 @@
+// The app dd-trace-java 1.67.1 recorded for the recordings beside this file (its debug dumps,
+// DD_PROFILING_DEBUG_DUMP_PATH: each upload's main.jfr as it would send it, uncompressed; zstd'd
+// here at level 19). Run on eclipse-temurin:21-jdk (21.0.12.1+1) in Docker, compiled with javac,
+// `java -javaagent:dd-java-agent-1.67.1.jar -cp classes Burn` with DD_PROFILING_ENABLED=true,
+// DD_PROFILING_START_DELAY=1, DD_PROFILING_UPLOAD_PERIOD=10,
+// DD_PROFILING_DDPROF_WALL_CONTEXT_FILTER=false, RUN_MS=25000.
+//
+// - dd-trace-java-1.67.1-burn.jfr.zst: its default, the JDK's chunk then ddprof's (its last upload,
+//   5.9 s).
+// - dd-trace-java-1.67.1-burn-jdk.jfr.zst: the JDK's chunk alone (DD_PROFILING_DDPROF_ENABLED=false).
+//
+// Each overwritten in place, at the same length, where it named the machine that took it: its
+// kernel's release (jdk.OSInformation) and its CPU's model (jdk.CPUInformation).
+// A small app for a profiler to watch: its CPU in a recursive Fibonacci, its allocations and
+// exceptions in its loop, two threads taking turns on a monitor (its lock waits), and their sleeps
+// (wall time).
+public class Burn {
+  static volatile long sink;
+  static final Object LOCK = new Object();
+
+  static long fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+
+  static void contend() {
+    while (true) {
+      synchronized (LOCK) {
+        try { Thread.sleep(20); } catch (InterruptedException e) { return; }
+      }
+    }
+  }
+
+  public static void main(String[] a) throws Exception {
+    for (int i = 0; i < 2; i++) {
+      Thread t = new Thread(Burn::contend, "contend-" + i);
+      t.setDaemon(true);
+      t.start();
+    }
+    java.util.List<byte[]> keep = new java.util.ArrayList<>();
+    long end = System.currentTimeMillis() + Long.parseLong(System.getenv("RUN_MS"));
+    for (long i = 0; System.currentTimeMillis() < end; i++) {
+      sink += fib(24);
+      if ((i & 15) == 0) {
+        keep.add(new byte[32 * 1024]);
+        if (keep.size() > 256) keep.clear();
+        try { throw new IllegalStateException("x"); } catch (IllegalStateException e) { sink++; }
+      }
+    }
+  }
+}

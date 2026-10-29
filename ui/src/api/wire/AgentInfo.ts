@@ -80,6 +80,10 @@ reach?: string,
  */
 pause?: Pause, 
 /**
+ * Since when it waits for room on its machine to go to work (as `State::room_wait`).
+ */
+room_wait?: number | null, 
+/**
  * How its last turn ended (as `State::last_turn`).
  */
 last_turn?: TurnEnd, 
@@ -120,6 +124,15 @@ parent?: string,
  * The plan run it does a step of (as `Spec::plan_run`).
  */
 plan_run?: string, 
+/**
+ * What it helps with when it's a card's helper (as `Spec::helper`).
+ */
+helper?: string, 
+/**
+ * Its parent's subagent (as `Spec::subagent`): lists show it in its parent's chat and on its
+ * parent's row, not as an agent of its own.
+ */
+subagent?: boolean, 
 /**
  * It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
  * an agent it starts can't have it either.

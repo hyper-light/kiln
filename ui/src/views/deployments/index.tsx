@@ -27,6 +27,7 @@ import { environmentsHref } from "@/views/environments/shared";
 import { whatDiffers } from "./model";
 import { HEALTH_TONE, HealthPair, StatePair, SYNC_TONE, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
 import "./deployments.css";
+import { ShipViews } from "@/views/ship/views";
 
 const ROW = 68;
 const PAGE = 500;
@@ -141,7 +142,7 @@ export default function Deployments() {
     <div className="container-console page cd-page">
       <title>Deployments · kiln</title>
       <PageIntro
-        index={3}
+        index={2}
         label="Deployments"
         title="Deployments."
         lead="What git says, and what runs: every app's sync and health, live."
@@ -162,6 +163,7 @@ export default function Deployments() {
           </>
         }
       />
+      <ShipViews />
       <Loadable label="the apps" fallback={<DeploymentsHold />}>
         <DeploymentsBody />
       </Loadable>

@@ -52,23 +52,120 @@ export function enginesOf(v: unknown): Record<string, [number, number][]> {
   return Object.fromEntries(Object.entries(v && typeof v === "object" ? v : {}).map(([e, hs]) => [e, heightPairs(hs)]));
 }
 
-/** Whether a tool call is an agent showing a page (Claude Code's and Codex's names for kiln's tool). */
-export const isShowPage = (c: Pick<ToolCall, "name">): boolean => /^mcp__kiln(?:[-_]reach)?__show_page$/.test(c.name);
+/** A tool call, as much of it as says which of kiln's tools it is. */
+export type KilnCall = Pick<ToolCall, "name" | "tool" | "title" | "server" | "tool_short" | "output">;
 
-/** The page a `show_page` call showed, from its answer (one line of JSON, `crate::reach::shown`). */
-export function pageOf(c: Pick<ToolCall, "output">): ShownPage | null {
-  if (!c.output) return null;
-  try {
-    const p = (JSON.parse(c.output) as { kiln_page?: Partial<ShownPage> }).kiln_page;
-    if (!p || typeof p.id !== "string" || !/^[0-9a-f]{32}$/.test(p.id)) return null;
-    const heights = heightPairs(p.heights);
-    const engines = enginesOf(p.engines);
-    // Where it's served (its own path under `/v/<id>`), never anywhere else.
-    const path = typeof p.path === "string" && p.path.startsWith(`/v/${p.id}/`) && !p.path.includes("..") ? p.path : `/v/${p.id}/`;
-    return { id: p.id, title: typeof p.title === "string" && p.title ? p.title : "A page", path, heights, engines, files: p.files };
-  } catch {
-    return null;
+/** kiln's MCP server, as harnesses have it: `kiln`, and `kiln-reach` (`kiln_reach` as Codex names
+ *  it) in sessions from before it was called `kiln`. */
+const OURS = "kiln(?:-reach|_reach)?";
+const SERVER = new RegExp(`^${OURS}$`);
+/** Claude Code's and Codex's name for a call of one of its tools. */
+const NAMED = new RegExp(`^mcp__${OURS}__(\\w+)$`);
+
+/** How ACP agents word a call of one of kiln's tools, the tool's own name first: Devin's "Called
+ *  show_page from kiln", Gemini CLI's "show_page (kiln MCP Server)", opencode's "kiln_show_page",
+ *  Amp's "mcp__kiln__show_page: …". (Goose has a model word each call anew: its calls are known by
+ *  kiln's answer.) */
+const WORDED = [new RegExp(`^Called (\\w+) from ${OURS}\\b`), new RegExp(`^(\\w+) \\(${OURS} MCP Server\\)$`), new RegExp(`^${OURS}_(\\w+)$`), new RegExp(`^mcp__${OURS}__(\\w+)(?::|$)`)];
+
+/** The kiln tool a call's title words it as (`WORDED`). */
+function wordedTool(title: string): string | null {
+  for (const w of WORDED) {
+    const tool = w.exec(title)?.[1];
+    if (tool) return tool;
   }
+  return null;
+}
+
+/** A call whose harness doesn't name the server it called: an ACP agent's (no server, no
+ *  `mcp__` name, its kind not one of its own tools'). */
+const unnamed = (c: Pick<ToolCall, "name" | "tool" | "server">) => !c.server && !c.name.startsWith("mcp__") && (c.tool === "mcp" || c.tool === "other");
+
+/**
+ * Which of kiln's own tools a call is, where its harness says: Claude Code's and Codex's
+ * `mcp__kiln__show_page` (kiln reads its server and the tool's own name from it), or an ACP
+ * agent's words for it (`WORDED`). Null for another server's tool, or a call that doesn't say.
+ */
+export function kilnTool(c: Pick<ToolCall, "name" | "tool" | "title" | "server" | "tool_short">): string | null {
+  if (c.server) return SERVER.test(c.server) ? (c.tool_short ?? null) : null;
+  return NAMED.exec(c.name)?.[1] ?? (unnamed(c) ? wordedTool(c.title) : null);
+}
+
+/**
+ * Whether a call is of kiln's tool `tool`, whatever its harness calls it: by its name for it
+ * (`kilnTool`), or, from a harness that doesn't say which server it called (an ACP agent wording it
+ * its own way), by what kiln answered (`answered`).
+ */
+export function isKilnCall(c: KilnCall, tool: string, answered: (c: KilnCall) => boolean): boolean {
+  const named = kilnTool(c);
+  return named ? named === tool : unnamed(c) && answered(c);
+}
+
+/** Whether a tool call is an agent showing a page (kiln's `show_page`). */
+export const isShowPage = (c: KilnCall): boolean => isKilnCall(c, "show_page", (x) => pageOf(x) !== null);
+
+const read = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
+
+/** The JSON object that opens at `from` in `s`, to the brace that closes it (its strings skipped). */
+function objectAt(s: string, from: number): string {
+  let depth = 0;
+  let quoted = false;
+  for (let i = from; i < s.length; i++) {
+    const ch = s[i];
+    if (quoted) {
+      if (ch === "\\") i++;
+      else if (ch === '"') quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return s.slice(from, i + 1);
+  }
+  return s.slice(from);
+}
+
+/**
+ * What kiln's tool answered under `key` (`kiln_page`, `kiln_stream`: `crate::reach::mcp`), from a
+ * call's output as its harness passed it on: kiln's JSON (one line, `crate::reach::shown`), that
+ * JSON quoted as text again (an ACP agent's raw output, as Devin's can be), among other lines and
+ * content (its picture said in words, MCP's whole result), or cut in its middle, as kiln keeps a
+ * long output (`OUTPUT_MAX`): the answer's own object is read, which comes first, before what a
+ * page printed. Null when it holds no such answer.
+ */
+export function answerOf(output: string | undefined, key: string): Record<string, unknown> | null {
+  if (!output?.includes(key)) return null;
+  const text = /^\s*"/.test(output) ? read(output) : undefined;
+  if (typeof text === "string") return answerOf(text, key);
+  for (const m of output.matchAll(new RegExp(`"${key}"\\s*:\\s*\\{`, "g"))) {
+    const answer = read(objectAt(output, m.index + m[0].length - 1));
+    if (answer && typeof answer === "object" && !Array.isArray(answer)) return answer as Record<string, unknown>;
+  }
+  return null;
+}
+
+/** The page a `show_page` call showed, from kiln's answer to it (`answerOf`). */
+export function pageOf(c: Pick<ToolCall, "output">): ShownPage | null {
+  const p = answerOf(c.output, "kiln_page") as Partial<ShownPage> | null;
+  if (!p || typeof p.id !== "string" || !/^[0-9a-f]{32}$/.test(p.id)) return null;
+  const heights = heightPairs(p.heights);
+  const engines = enginesOf(p.engines);
+  // Where it's served (its own path under `/v/<id>`), never anywhere else.
+  const path = typeof p.path === "string" && p.path.startsWith(`/v/${p.id}/`) && !p.path.includes("..") ? p.path : `/v/${p.id}/`;
+  return { id: p.id, title: typeof p.title === "string" && p.title ? p.title : "A page", path, heights, engines, files: p.files };
+}
+
+/** What a page (or live page) goes by while it's being shown: the title its call gave it (its input,
+ *  as an object or as text), else its call's title unless that's only a harness's words for the
+ *  call (`WORDED`), else `fallback`. */
+export function shownTitle(c: Pick<ToolCall, "title" | "input">, fallback: string): string {
+  const input = typeof c.input === "string" ? read(c.input) : c.input;
+  const title = input && typeof input === "object" ? (input as { title?: unknown }).title : undefined;
+  if (typeof title === "string" && title.trim()) return title.trim();
+  return c.title && !wordedTool(c.title) ? c.title : fallback;
 }
 
 /** Its height at width `w`: the taller of the two measured widths nearest it (a page grows as it

@@ -104,7 +104,7 @@ async fn counts(s: &Site<'_>, d: &Diff) -> (i64, i64) {
         .call(move |c| {
             let n = |file: bool| -> rusqlite::Result<i64> {
                 c.query_row(
-                    &format!("SELECT COUNT(*) FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 AND t.file IS {} NULL", if file { "NOT" } else { "" }),
+                    &format!("SELECT COUNT(*) FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 AND c.deleted_at IS NULL AND t.file IS {} NULL", if file { "NOT" } else { "" }),
                     [&id],
                     |r| r.get(0),
                 )
@@ -302,7 +302,7 @@ async fn comment_rows(s: &Site<'_>, d: &Diff, inline: bool) -> Result<Vec<Row>, 
         .call(move |c| {
             let sql = format!(
                 "SELECT c.rowid, c.thread_id, c.author, c.body, c.created_at, c.updated_at, t.version, t.file, t.side, t.start_line, t.end_line, c.published
-                 FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 AND t.file IS {} NULL ORDER BY c.created_at, c.rowid",
+                 FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 AND c.deleted_at IS NULL AND t.file IS {} NULL ORDER BY c.created_at, c.rowid",
                 if inline { "NOT" } else { "" }
             );
             let mut st = c.prepare(&sql)?;
@@ -512,7 +512,9 @@ pub async fn reviews(s: &Site<'_>, n: &str, job: &Job, body: Option<&Value>) -> 
             return Ok(srv::json(StatusCode::OK, &json!({ "id": 0, "state": "PENDING", "user": user(&format!("job:{}", job.leg)), "body": b.get("body"), "pull_request_url": pr_url })));
         };
         let text = b.get("body").and_then(Value::as_str).unwrap_or_default();
-        match crate::ci::review::review(s.hub, &d, &caller, &json!({ "action": action, "body": text })).await {
+        // GitHub's API has no "approve anyway": an approval through it goes past the gate's warning
+        // of open issues (its answer says what's open), never past what holds it (W26-R11).
+        match crate::ci::review::review(s.hub, &d, &caller, &json!({ "action": action, "body": text, "force": true })).await {
             Ok(r) => {
                 let commit = vs.last().map(|v| v.commit.clone());
                 return Ok(srv::json(

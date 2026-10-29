@@ -47,7 +47,28 @@ fn homed(path: &str, home: Option<&str>) -> String {
 /// its timeline), or why it can't. `now`: the turn under way doesn't finish here; it is
 /// interrupted once the other runner is ready, and picked up there. `kind`: it goes on there in
 /// this other harness, its conversation carried over, with `model` (None: that one's default).
+///
+/// Its subagents (`Info::subagent`) on the machine it leaves go along, each in its own harness, so
+/// they stay on their agent's machine (docs/goals.md, "A plan's steps side by side"); one that
+/// can't says why in its timeline. A subagent doesn't move by itself while its agent is there.
 pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<serde_json::Value, String> {
+    let all = hub.harness.list();
+    if let Some(p) = all.iter().find(|i| i.id == id).filter(|i| i.subagent).and_then(|i| i.parent.as_deref()).and_then(|p| all.iter().find(|a| a.id == p)) {
+        return Err(format!("it's the subagent of {}, and it goes where its agent goes: move {} and it comes along", p.name, p.name));
+    }
+    let leaves = hub.harness.location(id);
+    let moved = start_one(hub, id, to, now, kind, model).await?;
+    let to = to.strip_prefix("agent:").unwrap_or(to);
+    for c in all.iter().filter(|c| c.subagent && c.parent.as_deref() == Some(id) && c.status != super::model::Status::Exited && hub.harness.location(&c.id) == leaves) {
+        if let Err(e) = start_one(hub, &c.id, to, now, None, None).await {
+            say(hub, &c.id, &format!("Couldn't go along with its agent to {to}: {e}")).await;
+        }
+    }
+    Ok(moved)
+}
+
+/// [`start`], for session `id` alone.
+async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<serde_json::Value, String> {
     let to = to.strip_prefix("agent:").unwrap_or(to).to_owned();
     let info = hub.harness.list().into_iter().find(|i| i.id == id).ok_or_else(|| "no such agent".to_owned())?;
     let location = hub.harness.location(id);
@@ -137,7 +158,9 @@ pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec
         Some(Location::Machine(m)) => Some(m),
         _ => None,
     };
-    let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited).cloned().collect();
+    // A subagent whose agent is there goes along with it ([`start`]).
+    let theirs = |i: &super::session::Info| i.subagent && i.parent.as_deref().is_some_and(|p| all.iter().any(|a| a.id == p));
+    let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited && !theirs(i)).cloned().collect();
     let kinds = hub.harness.kinds();
     let runners: Vec<(String, String)> = hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral && !a.outpost && a.name != from).map(|a| (a.name.clone(), a.os.clone())).collect();
     let mut load: HashMap<String, usize> = HashMap::new();

@@ -256,7 +256,7 @@ pub async fn put(hub: &Hub, q: &HashMap<String, String>, body: Value, by: &str) 
 }
 
 /// Where `route` goes now, as the dispatcher explains it.
-async fn route_now(hub: &Hub, route: LegRoute) -> Option<Value> {
+pub(crate) async fn route_now(hub: &Hub, route: LegRoute) -> Option<Value> {
     let (tx, rx) = async_channel::bounded(1);
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
     crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.ok()?.ok()

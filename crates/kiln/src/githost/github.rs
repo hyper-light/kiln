@@ -209,6 +209,15 @@ impl App {
         Ok((status, v))
     }
 
+    /// A conditional GET (docs/ci.md W26-R20): its status, its ETag and its JSON; a 304 when `etag`
+    /// still holds, which GitHub doesn't count against the rate limit.
+    pub async fn get_if(&self, path: &str, token: &str, etag: Option<&str>) -> anyhow::Result<(u16, Option<String>, Value)> {
+        let client = crate::http::client::github()?;
+        let url = if path.starts_with("http://") || path.starts_with("https://") { path.to_owned() } else { format!("{}{path}", self.api) };
+        let req = client.request(Method::Get, &url).header("Accept", "application/vnd.github+json").header("X-GitHub-Api-Version", "2022-11-28").header("User-Agent", "kiln").bearer(token);
+        super::mirror::send_if(req, etag).await.with_context(|| format!("GitHub: {url}"))
+    }
+
     /// GitHub's GraphQL endpoint: `/graphql` beside github.com's REST API, an Enterprise Server's
     /// `/api/graphql` beside its `/api/v3`.
     pub fn graphql_url(&self) -> String {

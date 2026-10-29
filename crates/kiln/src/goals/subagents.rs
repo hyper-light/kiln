@@ -475,18 +475,19 @@ async fn hand_out(hub: &Hub) {
 }
 
 /// Hands goal `u` of `info`'s stack (a plan's step, or any goal) to a subagent of its own: started
-/// for it (its child, in its harness, on its machine, in its folder, in its mode as far as that may
-/// be handed on), held to the goal on its own goal stack (split there as it was here), and the goal
-/// marked here as under way on it. A goal made from no plan step names its subagent by its words
-/// and is held as they say. Refused (the agent may start no more, its harness can't start there…):
-/// why, and the goal stays the agent's.
+/// for it as its subagent (`lineage::start_subagent`: its child, shown in its chat; on its machine,
+/// in its folder, its harness and its settings, its mode as far as that may be handed on), held to
+/// the goal on its own goal stack (split there as it was here), and the goal marked here as under
+/// way on it. A goal made from no plan step names its subagent by its words and is held as they
+/// say. Refused (the agent may start no more, its machine is away…): why, and the goal stays the
+/// agent's.
 async fn hand(hub: &Hub, info: &Info, stack: &Stack, g: &Graph, u: &Item) -> Result<(), String> {
     let brief = g.briefs.get(&u.id).cloned().unwrap_or_else(|| Brief { name: name_of(&u.text), goal: u.text.clone() });
-    let some = |s: &str| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
     let starter = Starter { parent: Some(info.clone()), opener: crate::mcp::acts_for(hub, &info.id).await, actor: "kiln".to_owned(), plan_run: None, asker: None };
-    let ask = Ask { kind: info.kind.clone(), cwd: some(&info.cwd), mode: some(&info.mode), model: some(&info.model), name: Some(brief.name.clone()), count: Some(1), ..Ask::default() };
+    // Where and how it runs is its agent's own: nothing asked here but its name.
+    let ask = Ask { name: Some(brief.name.clone()), ..Ask::default() };
     let mut mark = Mark { agent: info.id.clone(), goal: u.id.clone(), ..Mark::default() };
-    let child = crate::harness::lineage::start(hub, &starter, ask).await.map_err(|(_, m)| m)?.into_iter().next().map(|i| i.id).ok_or_else(|| "it didn't start".to_owned())?;
+    let child = crate::harness::lineage::start_subagent(hub, &starter, ask).await.map_err(|(_, m)| m)?.id;
     // Kept first, so no subagent goes unfollowed: one whose step went meanwhile ends at the next look,
     // and one that can't be kept ends now.
     if let Err(e) = keep_mark(hub, &child, &mark).await {
@@ -821,13 +822,20 @@ mod hub_tests {
             let (two, three) = (sub(2), sub(3));
             assert!(!two.is_empty() && !three.is_empty() && two != three, "{now:?}");
             assert_eq!(now.iter().filter(|r| r.2.is_some()).count(), 2, "at most its setting at once: {now:?}");
+            let agent = hub.harness.info(main).ok_or_else(|| anyhow::anyhow!("the agent isn't there"))?;
             for (id, n, name) in [(&two, 2, "Step 2: API"), (&three, 3, "Step 3: UI")] {
                 let info = hub.harness.info(id).ok_or_else(|| anyhow::anyhow!("subagent {id} isn't there"))?;
                 assert!(info.parent.as_deref() == Some(main) && info.name == name, "{info:?}");
+                // Its subagent, not an agent of its own: on its machine, in its folder and harness,
+                // in its mode and with its Subagents setting.
+                assert!(info.subagent && info.target == agent.target && info.cwd == agent.cwd && info.kind == agent.kind && info.mode == agent.mode && info.max_subagents == Some(2), "{info:?} as {agent:?}");
                 let theirs = super::super::get(&hub, id).await?;
                 let g = theirs.items.first().cloned().unwrap_or_default();
                 assert!(g.step.as_ref().is_some_and(|s| s.n == n) && g.text.starts_with(&format!("Step {n} of 5 of the plan \"Fan out\": ")) && theirs.state == "running", "{theirs:?}");
             }
+            // It goes where its agent goes: not moved by itself.
+            let alone = crate::harness::relocate::start(&hub, &two, "elsewhere", false, None, None).await;
+            assert!(alone.as_ref().is_err_and(|e| e.contains("goes where its agent goes")), "{alone:?}");
             // Paused here, they pause; resumed, they go on.
             super::super::control(&hub, main, Action::Pause).await?;
             tick(&hub, &metrics).await;

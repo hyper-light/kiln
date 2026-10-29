@@ -260,3 +260,53 @@ fn w24_r10_only_affected_test_binaries_run_and_the_rest_replay() -> anyhow::Resu
     anyhow::ensure!(three.log.contains("tests: gamma/lib replayed from run #2") && !three.log.contains("tests: running gamma/lib"), "{}", three.log);
     Ok(())
 }
+
+/// W24-R30, R28 end to end: once a rule kiln proved by its differential test (`true` does
+/// nothing) is registered for the repository, a step whose script differs from an earlier run's
+/// only by that no-op is reused through equivalence, and its log names the class and the run.
+// The rule's differential test runs both sides with a shell (`ci::rules::run`, Unix only).
+#[cfg(unix)]
+#[test]
+fn w24_r30_a_class_hit_names_its_class_and_source_run() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/memo", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let home = dir.path().join("githome");
+    let work = dir.path().join("tree");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/memo.git", s.admin, s.port);
+    std::fs::write(work.join("README.md"), "memo\n")?;
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    let flow = |script: &str| format!("on: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - name: hello\n        memo: {{ inputs: [README.md] }}\n        run: |\n{script}");
+    let commit = |what: &str| -> anyhow::Result<()> {
+        git(&home, &work, &["add", "."])?;
+        git(&home, &work, &["commit", "-qm", what])?;
+        git(&home, &work, &["push", "-q", &push, "main"])?;
+        Ok(())
+    };
+    commit("init")?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok((body.contains("\"last_polled_at\":null")).then_some(body))
+    })?;
+    std::fs::write(work.join(".kiln/ci.yaml"), flow("          echo hello\n"))?;
+    commit("one")?;
+    let (_, first) = finished(&s, 1)?;
+    // The memo step, wherever its job's checkout puts it.
+    let memo_step = |seen: &BTreeMap<String, StepSeen>| seen.values().find(|h| h.log.contains("memo:")).cloned();
+    anyhow::ensure!(memo_step(&first).is_some_and(|h| h.conclusion == "success" && h.log.contains("memo: kept for reuse")), "{first:#?}");
+    // The rule, on its witness: kiln's no-op rule's cases run both ways for real.
+    let p = kiln::ci::rules::kiln().into_iter().find(|p| p.rule.name == "no-op").ok_or_else(|| anyhow::anyhow!("no no-op rule"))?;
+    let w = kiln::ci::rules::witness(&p, &kiln::ci::rules::run)?;
+    let db = rusqlite::Connection::open(dir.path().join("data").join("kiln.db"))?;
+    db.busy_timeout(std::time::Duration::from_secs(10))?;
+    kiln::ci::work::register(&db, &kiln::ci::work::scope("acme/memo", "trusted"), &p.rule, &w)?;
+    std::fs::write(work.join(".kiln/ci.yaml"), flow("          echo hello\n          true\n"))?;
+    commit("two")?;
+    let (_, second) = finished(&s, 2)?;
+    let hello = memo_step(&second).ok_or_else(|| anyhow::anyhow!("{second:#?}"))?;
+    anyhow::ensure!(hello.conclusion == "success" && hello.log.contains("Reused through equivalence with run #1") && hello.log.contains("(class "), "{}", hello.log);
+    Ok(())
+}

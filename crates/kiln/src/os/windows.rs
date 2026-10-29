@@ -18,6 +18,12 @@ pub fn elevated() -> bool {
     super::win32::elevated()
 }
 
+/// Whether standard error's console takes VT escapes, turned on when it can (Windows 10 and
+/// later): `kiln setup` draws in colour only where it does.
+pub fn console_takes_escapes() -> bool {
+    super::win32::console_vt()
+}
+
 /// Run `program` with `parameters` (one command line) as an administrator, its window hidden,
 /// and wait up to `timeout` for its exit code. Windows asks the person at the desktop first
 /// (UAC); an error of kind `PermissionDenied` means they said no.
@@ -176,6 +182,13 @@ pub fn pid_alive(_pid: u32) -> bool {
 /// Not needed on Windows (no launchd); 0.
 pub fn parent_pid() -> u32 {
     0
+}
+
+/// While `on`, this process's memory is kept from its user's other processes (docs/ci.md W27-R02,
+/// a CI leg's key in it, out of its steps' reach): its DACL lets them only wait on it, ask after
+/// it and end it. Off, as it was.
+pub fn private_memory(on: bool) -> io::Result<()> {
+    super::win32::private_memory(on)
 }
 
 /// Process trees are job objects on Windows; nothing to stop one by one.

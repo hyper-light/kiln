@@ -23,6 +23,9 @@ pub const LANE_SYNC: u32 = 3;
 /// Reach's lane (`crate::reach`): links between runners, relayed by the server. Interactive class:
 /// a remote command's output must not queue behind job logs.
 pub const LANE_REACH: u32 = 4;
+/// Observe's lane (`crate::observe`): the observe group's messages and writes, a queue of their own
+/// so replication never sheds a job's, a terminal's or sync's frames, nor waits behind them.
+pub const LANE_OBSERVE: u32 = 5;
 /// The conversation feed's lane (`crate::convo::feed`): a runner's store sent to the server's, in
 /// bulk frames, never in the way of a job's or a terminal's (lane 5 is observe's).
 pub const LANE_CONVO: u32 = 6;
@@ -238,6 +241,22 @@ pub enum AgentMsg {
     /// changed, and every 10 minutes, each superseding the last; only to a server announcing
     /// [`CAP_WORK`]. Appended last: postcard encodes variants by index.
     WorkState { json: String },
+    /// The most agent sessions this machine has at work at once, and where that comes from (JSON
+    /// [`crate::harness::limit::Held`]: what a person set from the server, its config's, or kiln's
+    /// default). Sent as it's welcomed and whenever it changes, each superseding the last; only to
+    /// a server announcing [`CAP_AGENT_LIMIT`]. Appended last: postcard encodes variants by index.
+    AgentLimit { json: String },
+
+    /// An identity asked for (JSON [`IdentityAsk`], docs/ci.md W27-R01): a CSR for a key this
+    /// runner process made and keeps (for itself, an agent session it holds at an epoch, a leg it
+    /// runs); the server answers with [`ServerMsg::Identity`]. Only to a server announcing
+    /// [`CAP_IDENTITY`]. Appended last: postcard encodes variants by index.
+    Identity { json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
+    /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
+    /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
+    /// encodes variants by index.
+    Observe { json: String, bytes: Vec<u8> },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -262,6 +281,9 @@ pub const CAP_DIRS: u32 = 4;
 pub const CAP_TAKEOVER_STOP: u32 = 8;
 /// [`AgentMsg::Build`] capability: the runner syncs repos ([`ServerMsg::Sync`], `crate::sync`).
 pub const CAP_SYNC: u32 = 64;
+/// [`AgentMsg::Build`] capability: the runner replicates the observe group and writes into it
+/// ([`ServerMsg::Observe`], `crate::observe`).
+pub const CAP_OBSERVE: u32 = 128;
 /// [`AgentMsg::Build`] capability: the runner runs a front door ([`ServerMsg::FrontDoor`]: DNS for
 /// a domain, HTTPS in front of the server, a `.local` name) and reports it with
 /// [`AgentMsg::FrontDoorStatus`].
@@ -373,6 +395,43 @@ pub const CAP_HANDOVER: u64 = 1 << 35;
 /// (docs/ci.md W24-R18). A runner that says it tells the server what it holds warm
 /// ([`AgentMsg::WorkState`]); a server that says it takes that.
 pub const CAP_WORK: u64 = 1 << 36;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: the most agent sessions a machine has at
+/// work at once, set from the server (docs/agents.md, "How many agents a machine runs"). A runner that
+/// says it takes [`ServerMsg::AgentLimit`] and says what it holds ([`AgentMsg::AgentLimit`]); a
+/// server that says it takes that.
+pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: identities (docs/ci.md W27-R01). A runner
+/// that says it asks for certificates for keys it makes and keeps ([`AgentMsg::Identity`]); a
+/// server that says it issues them ([`ServerMsg::Identity`]).
+pub const CAP_IDENTITY: u64 = 1 << 38;
+
+/// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IdentityAsk {
+    /// `runner` (this process), `agent` (a session it holds, at `epoch`) or `leg` (one it runs).
+    pub kind: String,
+    pub csr: String,
+    /// `agent`: the session; `leg`: the leg's id.
+    pub of: Option<String>,
+    /// `agent`: the epoch the key is for.
+    pub epoch: Option<u64>,
+}
+
+/// The answer to an [`IdentityAsk`]: its kind and subject, and the certificate (PEM) or why not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IdentityGiven {
+    pub kind: String,
+    pub of: Option<String>,
+    pub epoch: Option<u64>,
+    /// The identity's kiln:// URI.
+    pub uri: String,
+    pub cert_pem: Option<String>,
+    pub error: Option<String>,
+}
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -617,6 +676,20 @@ pub enum ServerMsg {
     /// wire's, the cluster group's and the restarts' `Kept` (CP-T3.2 landed after them): postcard
     /// encodes variants by index.
     HarnessSend { session: String, epoch: u64, json: String },
+    /// What a person set from the server for the most agent sessions this machine has at work at
+    /// once (JSON [`crate::harness::limit::Asked`]), over its config's; none set, its config's (or
+    /// kiln's default) holds. Sent as the runner says [`CAP_AGENT_LIMIT`] and whenever it changes;
+    /// the runner keeps it for its restarts. Appended last: postcard encodes variants by index.
+    AgentLimit { json: String },
+
+    /// The certificate for an [`AgentMsg::Identity`], or why there's none (JSON [`IdentityGiven`],
+    /// docs/ci.md W27-R01). Only to runners announcing [`CAP_IDENTITY`]. Appended last: postcard
+    /// encodes variants by index.
+    Identity { json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
+    /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
+    /// variants by index.
+    Observe { json: String, bytes: Vec<u8> },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -778,6 +851,57 @@ mod tests {
         Ok(())
     }
 
+    /// W05-R22, found by W28 step 3's replay: a job pod (`kiln agent --ephemeral`, v1's `[k8s]`
+    /// jobs) never says what it can do, so it was written every job as for a runner from before the
+    /// CI work, without `requires`, and read it as this build does: `rust` refused as malformed
+    /// ("Found an Option discriminant that wasn't 0 or 1"), `ui` read with no steps and passed
+    /// without running one. A pod reads its job whole; a bare-metal runner that hasn't said keeps
+    /// the old layout (W22-AC09).
+    #[test]
+    fn w05_r22_a_job_pod_reads_its_assignment_whole() -> anyhow::Result<()> {
+        let p = crate::pipeline::parse(concat!(
+            "name: ci\njobs:\n",
+            "  rust:\n    runs-on: [k8s]\n    toolchain: rust\n    resources: { cpu: \"2\", memory: 16Gi }\n",
+            "    steps:\n      - { name: clippy, run: cargo clippy }\n      - { name: test, run: cargo test }\n",
+            "  ui:\n    runs-on: [k8s]\n    toolchain: node\n    steps: [{run: npm ci}, {run: npm run lint}]\n",
+            "  linux:\n    runs-on: [k8s]\n    requires: [\"os == linux\"]\n    steps: [{run: uname}]\n",
+        ))?;
+        let jobs = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+        assert_eq!(jobs.len(), 3);
+        let assign = |spec: PlannedJob| {
+            ServerMsg::Assign(Box::new(Assignment {
+                job_id: "j".into(),
+                run_id: "r".into(),
+                repo: "o/r".into(),
+                clone_url: String::new(),
+                sha: "0".repeat(40),
+                branch: "main".into(),
+                event: "push".into(),
+                run_number: 7,
+                attempt: 0,
+                spec,
+                secrets: vec![("K".into(), "v".into())],
+                job_token: "t".into(),
+                server_url: "http://kiln".into(),
+            }))
+        };
+        for spec in &jobs {
+            // What a pod's own decoder (this build's) reads of what the server writes it.
+            let read = decode::<ServerMsg>(&encode(&assign(spec.clone().for_assignee(0, true)))?)?;
+            let ServerMsg::Assign(a) = read else { anyhow::bail!("{} came back as another message", spec.key) };
+            assert_eq!((&a.spec.key, &a.spec.steps, &a.spec.requires), (&spec.key, &spec.steps, &spec.requires), "{} as its pod reads it", spec.key);
+            assert_eq!((a.secrets.len(), a.server_url.as_str()), (1, "http://kiln"), "{}: the fields after the job", spec.key);
+            // What the pod got before: the layout of a runner from before the CI work.
+            let before = decode::<ServerMsg>(&encode(&assign(spec.clone().for_runner(0)))?);
+            assert!(!matches!(&before, Ok(m) if m == &assign(spec.clone())), "{}: read whole without `requires`", spec.key);
+        }
+        // A bare-metal runner that hasn't said what it can do is still written the old layout.
+        let any = jobs.iter().find(|j| j.key == "ui").cloned().ok_or_else(|| anyhow::anyhow!("no ui"))?;
+        assert_eq!(encode(&assign(any.clone().for_assignee(0, false)))?, encode(&assign(any.clone().for_runner(0)))?);
+        assert_eq!(encode(&assign(any.clone().for_assignee(CAP_CI2, false)))?, encode(&assign(any.for_runner(CAP_CI2)))?);
+        Ok(())
+    }
+
     #[test]
     fn appended_variants_keep_their_indexes() -> anyhow::Result<()> {
         // Older peers decode by variant index: the new ones must come after every existing one.
@@ -860,6 +984,40 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&b)?, m);
         // Bit 34 is T3's CAP_INBOX.
         assert!(CAP_WORK.is_power_of_two() && CAP_WORK == 1 << 36 && CAP_WORK & (CAP_WIRE | CAP_NET_DROPS | 1 << 34 | CAP_HANDOVER) == 0);
+        Ok(())
+    }
+
+    /// A machine's agent limit comes after every older variant both ways (so a peer from before
+    /// reads every older frame as it did), and its bit is a new one.
+    #[test]
+    fn agent_limits_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let work = encode(&AgentMsg::WorkState { json: "{}".into() })?;
+        let held = AgentMsg::AgentLimit { json: r#"{"max_sessions":128,"from":"server","config":100}"#.into() };
+        let b = encode(&held)?;
+        assert_eq!(b.first().copied(), work.first().map(|i| i + 1), "AgentMsg::AgentLimit comes right after WorkState");
+        assert_eq!(b.first(), Some(&52));
+        assert_eq!(decode::<AgentMsg>(&b)?, held);
+        let send = encode(&ServerMsg::HarnessSend { session: "s".into(), epoch: 1, json: "{}".into() })?;
+        let asked = ServerMsg::AgentLimit { json: r#"{"max_sessions":128}"#.into() };
+        let b = encode(&asked)?;
+        assert_eq!(b.first().copied(), send.first().map(|i| i + 1), "ServerMsg::AgentLimit comes right after HarnessSend");
+        assert_eq!(b.first(), Some(&58));
+        assert_eq!(decode::<ServerMsg>(&b)?, asked);
+        assert!(CAP_AGENT_LIMIT.is_power_of_two() && CAP_AGENT_LIMIT == 1 << 37 && CAP_AGENT_LIMIT & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK) == 0);
+        Ok(())
+    }
+
+    /// W27-R01: identities come after every older variant, and their bit is a new one.
+    #[test]
+    fn w27_r01_identities_are_appended_last() -> anyhow::Result<()> {
+        let limit = encode(&AgentMsg::AgentLimit { json: String::new() })?;
+        let asked = encode(&ServerMsg::AgentLimit { json: String::new() })?;
+        let (a, s) = (AgentMsg::Identity { json: "{}".into() }, ServerMsg::Identity { json: "{}".into() });
+        let (ab, sb) = (encode(&a)?, encode(&s)?);
+        assert_eq!(ab.first().copied(), limit.first().map(|i| i + 1), "AgentMsg::Identity comes right after AgentLimit");
+        assert_eq!(sb.first().copied(), asked.first().map(|i| i + 1), "ServerMsg::Identity comes right after AgentLimit");
+        assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
+        assert!(CAP_IDENTITY.is_power_of_two() && CAP_IDENTITY == 1 << 38 && CAP_IDENTITY & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT) == 0);
         Ok(())
     }
 
@@ -1172,6 +1330,57 @@ mod tests {
         assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Undeployed comes right after Executor");
         assert_eq!(decode::<AgentMsg>(&b)?, said);
         assert!(CAP_UNDEPLOY.is_power_of_two() && CAP_UNDEPLOY > CAP_RECEIVED);
+        Ok(())
+    }
+
+    #[test]
+    fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // Right after main's last (deployed first): a machine's limit on agents at work, each way.
+        let last_server = encode(&ServerMsg::Identity { json: "{}".into() })?;
+        let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
+        let b = encode(&s)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after Identity");
+        assert_eq!(decode::<ServerMsg>(&b)?, s);
+        let last_agent = encode(&AgentMsg::Identity { json: "{}".into() })?;
+        let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
+        let b = encode(&a)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after Identity");
+        assert_eq!(decode::<AgentMsg>(&b)?, a);
+        let every = [
+            CAP_UPGRADE,
+            CAP_TAKEOVER,
+            CAP_DIRS,
+            CAP_TAKEOVER_STOP,
+            CAP_SYNC,
+            CAP_FRONT_DOOR,
+            CAP_OUTPOST,
+            CAP_REPOS,
+            CAP_UPDATES,
+            CAP_BLUE_GREEN,
+            CAP_CI2,
+            CAP_ACTIONS,
+            CAP_DOCKER,
+            CAP_FIRECRACKER,
+            CAP_SHARDS,
+            CAP_FACTS,
+            CAP_JOB_TTY,
+            CAP_DOCKER_ROOTLESS,
+            CAP_REACH,
+            CAP_CONVO,
+            CAP_DOCTOR,
+            CAP_FILES,
+            CAP_STREAM,
+            CAP_PREVIEW,
+            CAP_PORTS,
+            CAP_ENGINES,
+            CAP_WORKSPACE,
+            CAP_POOLS,
+            CAP_RECEIVED,
+            CAP_UNDEPLOY,
+            CAP_CLUSTER,
+        ];
+        assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
+        const { assert!(LANE_OBSERVE != LANE_CONVO && LANE_OBSERVE != LANE_FILES && LANE_OBSERVE != LANE_STREAM && LANE_OBSERVE != LANE_PORTS) };
         Ok(())
     }
 

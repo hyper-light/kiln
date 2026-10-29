@@ -153,9 +153,10 @@ they are until you remove them.
 A kiln from before these stores can run on the same data directory again (a rollback), and this
 release after it, with nothing a key holds lost:
 
-- **Before going back,** take `[blobs]` out of `kiln.toml` if it's there: an older kiln refuses a
-  section it doesn't know. A server moved to the S3 store doesn't go back: an older kiln can't read
-  S3, and nothing copies its objects back.
+- **Before going back,** take `[blobs]` out of `kiln.toml`, and `keep_archived_days` out of its
+  `[conversations]`, if they're there: an older kiln refuses a section or a setting it doesn't know
+  (`kiln install` writes both into a `kiln.toml` it makes). A server moved to the S3 store doesn't
+  go back: an older kiln can't read S3, and nothing copies its objects back.
 - **What the older kiln finds:** the content-addressed store as it always was (`cas_objects` and
   the chunks), so caches, artifacts, registry blobs and release assets kept since are there, read
   and let go as before. An object a key other than `cas/<digest>` holds (sync's contents, runner
@@ -170,9 +171,10 @@ release after it, with nothing a key holds lost:
   mark are taken in where they lie, and a file whose content the store holds already is removed; a
   binary it kept newer than the store's is the platform's.
 - **Transcripts:** the older kiln doesn't archive them, nor hold its conversation store's pruning
-  back for them. A conversation that closes while it runs is never archived; one closed just before
-  the rollback is archived when this release starts again, unless the older kiln has let its record
-  go by then (`keep_closed_days` after its close).
+  back for them. A conversation that closes while it runs, or closed just before the rollback, is
+  archived when this release starts again (as it starts, it notes every conversation that ended
+  unnoted), unless the older kiln has let its record go by then (`keep_closed_days` after its
+  close).
 - **One case loses a key:** the older kiln unpins an object when it reads it or keeps the same
   content again as CI's (a release pipeline's artifact is also the runner binary kept of it). If
   nothing of CI refers to it an hour later, it lets it go; coming back, this release drops the keys

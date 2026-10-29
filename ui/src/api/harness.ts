@@ -224,6 +224,8 @@ export interface BroadcastPreview {
   modes: Counted<ModeOption>[];
   models: Counted<ModelOption>[];
   efforts: Counted<ControlOption>[];
+  /** The speeds past standard their models run at (servers before this leave it out). */
+  speeds?: Counted<ControlOption>[];
 }
 
 /** An agent session as lists show it. */
@@ -243,6 +245,47 @@ export interface LandingPlan {
   /** Whether this machine's Slates can take a person's go-ahead from kiln (not on Linux yet), and why not. */
   can_write: boolean;
   why_not?: string;
+}
+
+/** Whether an agent is one of the agents kiln lists: a card's helper (`helper`, `agents.about`) is the card's, no row of them. */
+export const listed = (a: AgentInfo) => !a.helper;
+
+/** What a person asks about a piece of code in an agent's conversation (`agents.about`). */
+export interface AboutAsk {
+  path: string;
+  /** The code around it. */
+  code: string;
+  line?: number;
+  /** The last of the lines, when they're several. */
+  end_line?: number;
+  /** The name tapped; none: the whole line. */
+  selection?: string;
+  /** It's about the change on that line. */
+  change?: boolean;
+  question?: string;
+  /** An agent answering itself does between its steps. */
+  now?: boolean;
+}
+
+/** An agent as kiln's operations brief it. */
+export interface AgentBrief {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  /** How it stands: working, needs, ready, finished, stopped, paused, offline, ended. */
+  stand?: string;
+  /** What it's doing now. */
+  doing?: string;
+  model?: string;
+}
+
+/** What an agent concluded (`agents.result`). */
+export interface AgentResult {
+  agent: AgentBrief;
+  reply?: { text: string; at: number } | null;
+  last_turn?: unknown;
+  cost_usd?: number;
 }
 
 /** An agent's children that still run (and theirs), as `agents.children` gives them. */
@@ -296,6 +339,8 @@ export interface Spec {
   allow_bypass?: boolean;
   /** The effort level to start at (none: the model's own default). */
   effort?: string;
+  /** The speed to start at ("" standard, else one of the model's `speeds`; none: the harness's own). */
+  speed?: string;
   /** Commands on other runners (kiln reach): unset, it may use any; "off", only its own machine; else where it prefers them (a runner, or `linux/x86_64`). */
   reach?: string;
   /** Where it works: its folder itself (none), or a Slates volume of its own laid over the folder (`volume`). */
@@ -435,7 +480,7 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => all.filter(listed)),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
@@ -475,6 +520,10 @@ export const harnessApi = {
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
   end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
+  /** Ask about a piece of code in its conversation: a child of it answers, reading only; with no subagents, it does, in its conversation (`itself`). */
+  about: (id: string, ask: AboutAsk) => call<{ agents: AgentBrief[]; itself: boolean; sent?: { sent: boolean; message?: string } }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/about`, ask),
+  /** What an agent last said, and how it stands. */
+  result: (id: string, signal?: AbortSignal) => call<AgentResult>("GET", `/api/harness/agents/${encodeURIComponent(id)}/result`, undefined, signal),
   /** The agents an agent started that still run (and theirs). */
   children: (id: string) => call<{ children: AgentChild[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/children`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */

@@ -18,11 +18,14 @@ export default function LogViewer({
   step,
   live,
   onStepStatus,
+  rows: fixedRows,
 }: {
   jobId: string;
   step: number;
   live: boolean;
   onStepStatus?: (idx: number, status: Status) => void;
+  /** A fixed height of this many rows (Ship's Output card): the box holds still as lines arrive. */
+  rows?: number;
 }) {
   const kRef = React.useRef<KilnTerminal | null>(null);
   const [follow, setFollow] = React.useState(true);
@@ -33,7 +36,8 @@ export default function LogViewer({
   const [searchOpen, setSearchOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [matches, setMatches] = React.useState<{ idx: number; count: number } | null>(null);
-  const [rows, setRows] = React.useState(MIN_ROWS);
+  const [grown, setRows] = React.useState(MIN_ROWS);
+  const rows = fixedRows ?? grown;
   const cb = React.useRef(onStepStatus);
   cb.current = onStepStatus;
 

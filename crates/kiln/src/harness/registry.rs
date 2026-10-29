@@ -1300,6 +1300,9 @@ impl Registry {
                 info.held = g.get(id).and_then(|m| m.info.held.clone());
                 // So is what of its messages couldn't be read (`crate::wire::unread`).
                 info.refused = g.get(id).and_then(|m| m.info.refused.clone());
+                // So is whether kiln started it as its parent's subagent (`Spec::subagent`): a runner
+                // from before the word doesn't say it, and it stays one.
+                info.subagent |= g.get(id).is_some_and(|m| m.info.subagent);
                 // What kiln's own words were handed is kept too, and what waits in its queue until
                 // the state after this says again (neither goes in an Open): a runner that comes
                 // back doesn't make a word handed look lost (CP-T3.2, the fourteenth adversarial check's).
@@ -1351,7 +1354,16 @@ impl Registry {
                 }
                 // An inbox's answer went to whoever waits for it, before any of this.
                 Update::Reply { .. } | Update::Inbox { .. } => {}
-                Update::Closed => gone = true,
+                Update::Closed => {
+                    gone = true;
+                    // Its identities with it (docs/ci.md W27-R01).
+                    let (store, id) = (hub.store.clone(), id.to_owned());
+                    drop(crate::rt::spawn(async move {
+                        if let Err(e) = crate::identities::agent_ended(&store, &id).await {
+                            tracing::warn!(session = %id, error = %format!("{e:#}"), "an ended agent's identities weren't revoked");
+                        }
+                    }));
+                }
                 Update::Reset { .. } => {
                     m.clear_events();
                     m.started_over();
@@ -1802,6 +1814,7 @@ impl Registry {
                         left_behind: 0,
                         reach: spec.reach.clone(),
                         pause: None,
+                        room_wait: None,
                         last_turn: None,
                         keep_off: false,
                         held: None,
@@ -1812,6 +1825,8 @@ impl Registry {
                         max_subagents: None,
                         parent: spec.parent.clone(),
                         plan_run: spec.plan_run.clone(),
+                        helper: spec.helper.clone(),
+                        subagent: spec.subagent,
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };

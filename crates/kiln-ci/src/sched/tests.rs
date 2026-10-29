@@ -6,7 +6,7 @@ use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
-use super::state::{Command, Config, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason};
+use super::state::{Command, Config, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
 use crate::facts::{Disk, RunnerFacts};
 
 const MIN: i64 = 60_000;
@@ -297,6 +297,136 @@ fn a_leg_gone_with_its_repository_frees_its_runner() {
     assert!(c.is_empty(), "once: {c:?}");
 }
 
+/// A machine of `cpus` CPUs and `gib` GiB, its slots `slots`: a bench's runner.
+fn machine(name: &str, slots: u32, cpus: u32, gib: u64) -> RunnerIn {
+    let mut r = linux(name, slots);
+    r.view.facts.cpu.cores = cpus / 2;
+    r.view.facts.cpu.threads = cpus;
+    r.view.facts.mem.total = gib << 30;
+    r
+}
+
+/// An exclusive leg asking for `cpus` CPUs and `gib` GiB: a bench.
+fn bench(id: &str, cpus: f64, gib: u64) -> LegIn {
+    LegIn { exclusive: true, request: Resources { cpu: cpus, mem: gib << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) }
+}
+
+fn assigned(c: &[Command]) -> Vec<String> {
+    c.iter().filter_map(|x| if let Command::Assign { leg, .. } = x { Some(leg.clone()) } else { None }).collect()
+}
+
+/// An exclusive leg that asks for CPUs holds them and its memory, and ordinary legs pack in
+/// beside it, in what's left: on a 32-CPU, 64 GiB runner of 4 slots, a bench holding 16 CPUs
+/// leaves two slots' worth.
+#[test]
+fn an_exclusive_leg_holds_its_share_and_others_run_beside_it() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1);
+    assert_eq!(assigned(&c), vec!["bench"], "it doesn't wait for an empty runner");
+    let mut on = Vec::new();
+    for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
+        on.extend(assigned(&s.handle(Input::LegQueued(Box::new(leg(id, "acme/x", 60))), 2 + i as i64)));
+    }
+    assert_eq!(on, vec!["o1", "o2"], "two ordinary legs beside it, in the half it doesn't hold");
+    assert!(matches!(s.reason("o3"), Some(WaitReason::Capacity { eligible: 1, busy: 1, draining: 0 })), "{:?}", s.reason("o3"));
+    // Another bench waits for its own share: of the 16 CPUs not held, the two legs there take 16.
+    s.handle(Input::LegQueued(Box::new(bench("bench2", 16.0, 16))), 6);
+    assert!(matches!(s.reason("bench2"), Some(WaitReason::Capacity { .. })), "{:?}", s.reason("bench2"));
+    // The bench ends: all four slots are there again, and the waiting legs take them.
+    let c = s.handle(Input::AttemptFinished { leg: "bench".into(), attempt: 1, outcome: Outcome::Success }, 7);
+    let next = assigned(&c);
+    assert!(next.contains(&"o3".to_owned()) || next.contains(&"bench2".to_owned()), "what waited goes on: {next:?}");
+}
+
+/// Asking for nothing, an exclusive leg still has its runner to itself, as before.
+#[test]
+fn an_exclusive_leg_asking_nothing_still_takes_the_whole_runner() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("busy", "acme/x", 60))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) })), 1);
+    assert_eq!(s.reason("ex"), Some(&WaitReason::Exclusive));
+    let c = s.handle(Input::AttemptFinished { leg: "busy".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    assert_eq!(assigned(&c), vec!["ex"]);
+    let c = s.handle(Input::LegQueued(Box::new(leg("after", "acme/x", 60))), 3);
+    assert!(assigned(&c).is_empty(), "nothing shares the runner with it");
+}
+
+/// After a restart, a bench the runner still runs holds its share as before: nothing new lands
+/// in it.
+#[test]
+fn a_bench_adopted_after_a_restart_keeps_its_share() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16.0, 16)), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
+    let mut on = Vec::new();
+    for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
+        on.extend(assigned(&s.handle(Input::LegQueued(Box::new(leg(id, "acme/x", 60))), 2 + i as i64)));
+    }
+    assert_eq!(on, vec!["o1", "o2"], "the adopted bench still holds half the runner");
+    // And one asking for nothing, adopted, still holds all of it.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::LegRunning { leg: Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) }), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("o", "acme/x", 60))), 2);
+    assert!(assigned(&c).is_empty(), "nothing beside an adopted exclusive leg");
+}
+
+/// The rule both dispatchers and the runner use, in numbers: 32 CPUs, 64 GiB, 4 slots.
+#[test]
+fn the_room_rule_both_dispatchers_and_the_runner_use() {
+    let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
+    let none = Resources::default();
+    let half = Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() };
+    // Nothing held: four ordinary legs, and a share of 16 beside at most two of them.
+    assert!(room(4, size, &none, false, 3, 3, Incoming::Ordinary));
+    assert!(!room(4, size, &none, false, 4, 4, Incoming::Ordinary));
+    assert!(room(4, size, &none, false, 2, 2, Incoming::Share(half)));
+    assert!(!room(4, size, &none, false, 3, 3, Incoming::Share(half)));
+    // Half held: two ordinary slots are left; no second share of 16 beside two legs.
+    assert!(room(4, size, &half, false, 1, 2, Incoming::Ordinary));
+    assert!(!room(4, size, &half, false, 2, 3, Incoming::Ordinary));
+    assert!(!room(4, size, &half, false, 2, 3, Incoming::Share(half)));
+    assert!(room(4, size, &half, false, 0, 1, Incoming::Share(half)));
+    // The whole runner: only an empty one, and nothing beside it.
+    assert!(room(4, size, &none, false, 0, 0, Incoming::Whole) && !room(4, size, &none, false, 1, 1, Incoming::Whole));
+    assert!(!room(4, size, &none, true, 0, 1, Incoming::Ordinary));
+    // A runner whose size isn't known: a share waits for it to be empty, as the whole would.
+    assert!(room(4, None, &none, false, 0, 0, Incoming::Share(half)) && !room(4, None, &none, false, 1, 1, Incoming::Share(half)));
+    // Memory holds as CPUs do: a share asking more memory than is left waits.
+    let big = Resources { cpu: 4.0, mem: 60 << 30, ..Resources::default() };
+    assert!(!room(4, size, &none, false, 1, 1, Incoming::Share(big)));
+    assert_eq!(Incoming::of(true, &half), Incoming::Share(half));
+    assert_eq!(Incoming::of(true, &none), Incoming::Whole);
+    assert_eq!(Incoming::of(false, &half), Incoming::Ordinary);
+}
+
+/// A share bigger than any runner it could run on waits, saying so.
+#[test]
+fn a_share_no_runner_can_hold_waits_saying_why() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
+    s.handle(Input::LegQueued(Box::new(bench("huge", 64.0, 16))), 1);
+    assert!(matches!(s.reason("huge"), Some(WaitReason::Unroutable { failing }) if failing.iter().any(|f| f.contains("64 CPUs"))), "{:?}", s.reason("huge"));
+}
+
+/// In resource mode the share comes out of the runner before overcommit: ordinary legs
+/// overcommit only what no bench holds.
+#[test]
+fn in_resource_mode_ordinary_legs_overcommit_only_what_isnt_held() {
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    let big = RunnerIn { capacity: Some(Resources { cpu: 32.0, mem: 64 << 30, disk: 500 << 30, gpu: 0 }), ..machine("a", 99, 32, 64) };
+    s.handle(Input::RunnerUp(Box::new(big)), 0);
+    assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1)), vec!["bench"]);
+    let cpu = |id: &str| LegIn { request: Resources { cpu: 4.0, mem: 2 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let mut on = 0;
+    for i in 0..8 {
+        on += assigned(&s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}")))), 2 + i)).len();
+    }
+    assert_eq!(on, 6, "16 unheld CPUs × 1.5 overcommit = 24, six legs of 4");
+}
+
 #[test]
 fn resources_mode_and_cancellation() {
     let cfg = Config { resources: true, ..Config::default() };
@@ -314,6 +444,46 @@ fn resources_mode_and_cancellation() {
     assert_eq!(c, vec![Command::Settled { leg: "c3".into(), outcome: Outcome::Cancelled, reason: Some("fail-fast".into()) }]);
     let c = s.handle(Input::LegCancelled { leg: "c0".into(), reason: "run cancelled".into() }, 11);
     assert_eq!(c, vec![Command::Cancel { leg: "c0".into(), attempt: 1, reason: "run cancelled".into() }]);
+}
+
+/// W05-R03 with needs (`sched::needs`): a leg runs only where the runner's facts meet its
+/// constraints and its request has room. One asking for more than any runner that could take it
+/// has waits, saying what it asks and what each has; one only out of room for now waits for room.
+#[test]
+fn w05_r03_needs_place_a_leg_and_one_too_big_waits_saying_so() -> Result<(), String> {
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    let runner = |name: &str, os: &str, arch: &str, cpu: f64, mem: u64| RunnerIn {
+        view: RunnerView { facts: RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() }, ..linux(name, 99).view },
+        capacity: Some(Resources { cpu, mem: mem * GIB, disk: 500 * GIB, gpu: 0 }),
+        ..linux(name, 99)
+    };
+    s.handle(Input::RunnerUp(Box::new(runner("small", "linux", "x86_64", 8.0, 16))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("large", "linux", "x86_64", 16.0, 64))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("mac", "macos", "aarch64", 24.0, 192))), 0);
+    let asking = |id: &str, spec: &str| -> Result<LegIn, String> {
+        let n = super::needs::parse(spec)?;
+        Ok(LegIn { request: n.request, exclusive: n.exclusive, route: LegRoute { labels: vec!["k8s".into()], requires: n.requires, ..LegRoute::default() }, ..leg(id, "acme/x", 60) })
+    };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    // The Mac has more of everything but isn't linux/amd64, and the small runner hasn't 32 GiB.
+    let c = s.handle(Input::LegQueued(Box::new(asking("fits", "cpus=8,mem=32g,linux/amd64")?)), 1);
+    assert_eq!(to(&c, "fits").as_deref(), Some("large"), "{c:?}");
+    // Without the constraint, 128 GiB goes to the one runner with it.
+    let c = s.handle(Input::LegQueued(Box::new(asking("big", "mem=128g")?)), 2);
+    assert_eq!(to(&c, "big").as_deref(), Some("mac"), "{c:?}");
+    // More than any linux/amd64 runner has even idle: it waits saying so, the Mac not named.
+    s.handle(Input::LegQueued(Box::new(asking("huge", "mem=128g,linux/amd64")?)), 3);
+    assert_eq!(s.reason("huge"), Some(&WaitReason::Oversized { asked: "128 GiB of memory".into(), short: vec!["large has 64 GiB of memory".into(), "small has 16 GiB of memory".into()] }));
+    // 40 GiB fits the large runner idle: it waits for room there, not for a larger runner.
+    s.handle(Input::LegQueued(Box::new(asking("second", "cpus=8,mem=40g,linux/amd64")?)), 4);
+    assert!(matches!(s.reason("second"), Some(WaitReason::Capacity { eligible: 2, busy: 2, draining: 0 })), "{:?}", s.reason("second"));
+    Ok(())
 }
 
 /// W05-AC09's core: after a restart, running legs are adopted (not assigned again) and their
@@ -346,7 +516,7 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true }));
+    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true, asked: false }));
 }
 
 /// W05-R16: the default retry after `runner-lost` goes to another runner when one could take it,
@@ -401,9 +571,86 @@ fn w05_r16_a_lost_runners_retry() {
     s.handle(Input::RunnerLost { runner: "a".into() }, 1);
     let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 2);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("z"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false }));
+    assert_eq!(s.reason("z"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false, asked: false }));
     let c = s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 3);
     assert!(assigned(&c, "z", "b", 2), "{c:?}");
+}
+
+/// W05-R28: a retry a person placed. `runner` runs it only there, waiting for it busy, draining,
+/// offline or unable, and saying which; `avoid` runs it anywhere else, waiting for another when
+/// only that one could. Either holds through the attempt's own retries, and a refusal by the
+/// runner asked for doesn't send it away for good.
+#[test]
+fn w05_r28_a_placed_retry() {
+    use super::state::{PinnedState, Placement};
+    let assigned = |c: &[Command], l: &str, r: &str| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == l && runner == r));
+    let on = |r: &str| Placement { runner: Some(r.into()), avoid: None };
+    let off = |r: &str| Placement { runner: None, avoid: Some(r.into()) };
+    let pinned = |r: &str, state: PinnedState| Some(WaitReason::Pinned { runner: r.into(), state });
+
+    // Pinned to b while a is free: it waits for b, busy, and runs there once b has room.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("busy", "acme/x", 60))), 0);
+    let first = if assigned(&c, "busy", "a") { "a" } else { "b" };
+    let other = if first == "a" { "b" } else { "a" };
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on(first), ..leg("x", "acme/x", 60) })), 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{other} is free, and not the one asked for: {c:?}");
+    assert_eq!(s.reason("x"), pinned(first, PinnedState::Busy).as_ref());
+    // The explanation says why the free one can't take it.
+    let free = s.explain("x").into_iter().find(|e| e.runner == other);
+    assert!(free.as_ref().is_some_and(|e| !e.eligible && e.checks.iter().any(|c| !c.pass && c.requirement == format!("runner == {first} (asked by its retry)"))), "{free:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "busy".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    assert!(assigned(&c, "x", first), "{c:?}");
+    // Lost with its runner, its retry waits for that runner, offline, and goes back to it.
+    let c = s.handle(Input::RunnerLost { runner: first.into() }, 3);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "x")), "{c:?}");
+    assert_eq!(s.reason("x"), pinned(first, PinnedState::Offline).as_ref());
+    let c = s.handle(Input::RunnerUp(Box::new(linux(first, 1))), 4);
+    assert!(assigned(&c, "x", first), "{c:?}");
+
+    // Draining, or no longer able to run it (its labels changed): said so.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerDraining { runner: "a".into() }, 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("d", "acme/x", 60) })), 1);
+    assert_eq!(s.reason("d"), pinned("a", PinnedState::Draining).as_ref());
+    let mut gpu = linux("a", 1);
+    gpu.view.labels = vec!["gpu".into()];
+    s.handle(Input::RunnerChanged(Box::new(gpu)), 2);
+    assert_eq!(s.reason("d"), pinned("a", PinnedState::Unable).as_ref());
+
+    // Refused by the runner asked for: it stays that runner's, asked again a while later, on the
+    // same attempt.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("r", "acme/x", 60) })), 0);
+    assert!(assigned(&c, "r", "a"), "{c:?}");
+    let c = s.handle(Input::Rejected { leg: "r".into() }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "neither the other nor at once: {c:?}");
+    assert!(c.contains(&Command::Timer { at: 1 + super::state::REFUSED_AGAIN_MS }), "{c:?}");
+    assert_eq!(s.reason("r"), pinned("a", PinnedState::Busy).as_ref());
+    let c = s.handle(Input::Tick, 1 + super::state::REFUSED_AGAIN_MS);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "r" && runner == "a")), "{c:?}");
+
+    // Anywhere but a: b takes it though a is free; with b busy it waits for room, and with only a
+    // left, for another runner, as its retry asked.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: off("a"), ..leg("e1", "acme/x", 60) })), 1);
+    assert!(assigned(&c, "e1", "b"), "{c:?}");
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: off("a"), ..leg("e2", "acme/x", 60) })), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "e2")), "{c:?}");
+    assert_eq!(s.reason("e2"), Some(&WaitReason::Capacity { eligible: 1, busy: 1, draining: 0 }));
+    s.handle(Input::RunnerLost { runner: "b".into() }, 3);
+    assert_eq!(s.reason("e2"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false, asked: true }));
+    // e1's retry after b was lost doesn't go to a either, though nothing else can take it.
+    assert!(matches!(s.reason("e1"), Some(WaitReason::OtherRunner { asked: true, .. })), "{:?}", s.reason("e1"));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("c", 2))), 4);
+    assert!(assigned(&c, "e1", "c") && assigned(&c, "e2", "c"), "{c:?}");
 }
 
 // ------------------------------------------------------------------ pools (W13-R09, W05-R27)
@@ -1572,4 +1819,220 @@ proptest! {
         prop_assert_eq!(&run(true, true), &before);
     }
 }
+}
+
+/// The scheduler's headroom (W05): a runner's sample sets what it has free; what's placed there
+/// after counts against it until the next sample, which then has it; a sample older than a minute
+/// leaves the runner's headroom unknown, placed as before samples were.
+#[test]
+fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_next() {
+    use super::state::{Headroom, Sample};
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("adacachy", 4))), 0);
+    assert_eq!(s.headroom("adacachy"), None, "no sample yet");
+    let sample = |busy: f64, used_gib: u64| Sample { cpus: 32, busy, load1: 12.0, mem_total: 124 * GIB, mem_used: used_gib * GIB, io_full: Some(2.1) };
+    let near = |h: Option<Headroom>, cpus: f64, mem_gib: u64| h.is_some_and(|h| (h.cpus - cpus).abs() < 1e-9 && h.mem == mem_gib * GIB && h.io_full == Some(2.1) && h.of.cpu == 32.0);
+    s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.4, 60) }, 1_000);
+    assert!(near(s.headroom("adacachy"), 19.2, 64), "{:?}", s.headroom("adacachy"));
+    // A leg placed a second later counts against it until the next sample.
+    let asking = LegIn { request: Resources { cpu: 8.0, mem: 16 * GIB, ..Resources::default() }, ..leg("build", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(asking)), 2_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "build" && runner == "adacachy")), "{c:?}");
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // The next sample has it in it: what's free is what the sample says.
+    s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.65, 76) }, 11_000);
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // A minute on with no sample, it's unknown again.
+    s.handle(Input::Tick, 11_000 + super::state::SAMPLE_FRESH_MS + 1);
+    assert_eq!(s.headroom("adacachy"), None);
+    // A sample for a runner kiln doesn't know is nothing.
+    s.handle(Input::RunnerSample { runner: "nowhere".into(), sample: sample(0.1, 1) }, 80_000);
+    assert_eq!(s.headroom("nowhere"), None);
+}
+
+/// The scheduler's headroom, placement (W05): a leg goes to the runner its live sample leaves the
+/// most headroom after it, within the target use (85%); I/O pressure counts against a runner; a
+/// leg every runner with room would pass the target with waits, saying so, and goes once a sample
+/// shows room; once samples go stale, runners are placed as before them.
+#[test]
+fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
+    use super::state::{SAMPLE_FRESH_MS, Sample};
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 8))), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy: f64, io: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) } }, at)
+    };
+    let asking = |id: &str, cpu: f64, mem_gib: u64| LegIn { request: Resources { cpu, mem: mem_gib * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    // a at 80% of its CPUs, b at 30%: 4 CPUs go to b.
+    say(&mut s, "a", 0.8, 0.0, 1_000);
+    say(&mut s, "b", 0.3, 0.0, 1_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("first", 4.0, 2))), 2_000);
+    assert_eq!(to(&c, "first").as_deref(), Some("b"), "{c:?}");
+    // Even, but a's disk under pressure: b.
+    say(&mut s, "a", 0.5, 20.0, 3_000);
+    say(&mut s, "b", 0.5, 0.0, 3_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("second", 1.0, 2))), 4_000);
+    assert_eq!(to(&c, "second").as_deref(), Some("b"), "{c:?}");
+    // Both at 84%: one more CPU of 32 passes 85% on either. It waits, saying so.
+    say(&mut s, "a", 0.84, 0.0, 5_000);
+    say(&mut s, "b", 0.84, 0.0, 5_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("third", 1.0, 2))), 6_000);
+    assert_eq!(to(&c, "third"), None, "{c:?}");
+    assert!(
+        matches!(s.reason("third"), Some(WaitReason::Headroom { target: 85, runners, request, place, held: None, room_at: None }) if *runners == ["a", "b"] && request == "1 CPU and 2 GiB of memory" && place == "k8s"),
+        "{:?}",
+        s.reason("third")
+    );
+    // b's next sample shows room: it goes there.
+    let c = say(&mut s, "b", 0.5, 0.0, 7_000);
+    assert_eq!(to(&c, "third").as_deref(), Some("b"), "{c:?}");
+    // Memory the same: 40 GiB more on 16 of 64 in use passes the target, wherever CPUs are free.
+    say(&mut s, "a", 0.1, 0.0, 8_000);
+    say(&mut s, "b", 0.1, 0.0, 8_000);
+    let c = s.handle(Input::LegQueued(Box::new(asking("big", 1.0, 40))), 9_000);
+    assert_eq!(to(&c, "big"), None, "{c:?}");
+    assert!(matches!(s.reason("big"), Some(WaitReason::Headroom { target: 85, .. })), "{:?}", s.reason("big"));
+    // A minute on with no samples: placed as before them, by slots.
+    let c = s.handle(Input::LegQueued(Box::new(asking("fourth", 30.0, 2))), 8_000 + SAMPLE_FRESH_MS + 1);
+    assert!(to(&c, "fourth").is_some(), "{c:?}");
+}
+
+
+/// The scheduler's headroom on three runners (W05, step 2): a declared preference (W05-R23) still
+/// comes first, while the runner it prefers stays within the target with the leg; past it, the leg
+/// goes where the most headroom is left.
+#[test]
+fn a_declared_preference_comes_before_headroom_within_the_target() {
+    use super::state::Sample;
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for (name, labels) in [("a", &["k8s", "fast"][..]), ("b", &["k8s"][..]), ("c", &["k8s"][..])] {
+        let mut r = linux(name, 8);
+        r.view.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+        s.handle(Input::RunnerUp(Box::new(r)), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(0.0) } }, at)
+    };
+    let fast = |id: &str| LegIn { prefer: vec![Preference { label: Some("fast".into()), ..Preference::default() }], request: Resources { cpu: 4.0, mem: 2 * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    say(&mut s, "a", 0.6, 1_000);
+    say(&mut s, "b", 0.2, 1_000);
+    say(&mut s, "c", 0.4, 1_000);
+    // a, which it prefers, stays within 85% with it (60%, and 4 CPUs of 32): there, though b has
+    // the most headroom.
+    let c = s.handle(Input::LegQueued(Box::new(fast("first"))), 2_000);
+    assert_eq!(to(&c, "first").as_deref(), Some("a"), "{c:?}");
+    // a at 80% would pass it (92.5%): of the rest, b, the most headroom left.
+    say(&mut s, "a", 0.8, 3_000);
+    let c = s.handle(Input::LegQueued(Box::new(fast("second"))), 4_000);
+    assert_eq!(to(&c, "second").as_deref(), Some("b"), "{c:?}");
+}
+
+/// W05's admission, step 1: a leg first in line that no runner has room for, a minute on, holds the
+/// runner its running legs' expected ends leave room soonest. There a leg expected to end by then
+/// still starts, while one expected to run past it doesn't, though it fits; once the room shows,
+/// the held leg starts there and its hold is done.
+#[test]
+fn a_leg_that_cant_fit_holds_a_runner_for_itself() {
+    use super::state::Sample;
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+    };
+    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu, mem: GIB, ..Resources::default() }, cost: Some(cost_s), ..leg(id, "acme/x", 50) };
+    let to = |c: &[Command], id: &str| {
+        c.iter().find_map(|x| match x {
+            Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
+            _ => None,
+        })
+    };
+    say(&mut s, "a", 0.0, 0);
+    say(&mut s, "b", 0.0, 0);
+    // a runs 12 CPUs for 10 minutes and 12 for 2; b, 27 for 20.
+    for (id, cpu, cost, on) in [("a1", 12.0, 600.0, "a"), ("b1", 27.0, 1200.0, "b"), ("a2", 12.0, 120.0, "a")] {
+        let c = s.handle(Input::LegQueued(Box::new(asking(id, cpu, cost))), 1_000);
+        assert_eq!(to(&c, id).as_deref(), Some(on), "{c:?}");
+    }
+    // 14 CPUs pass 85% on either.
+    let c = s.handle(Input::LegQueued(Box::new(asking("big", 14.0, 600.0))), 2_000);
+    assert_eq!(to(&c, "big"), None, "{c:?}");
+    // A minute on, fresh samples: big holds a, where a2's end leaves it room, with 1.2 CPUs beside.
+    say(&mut s, "a", 24.0, 61_000);
+    say(&mut s, "b", 27.0, 61_000);
+    s.handle(Input::Tick, 62_000);
+    let h = s.held("a").cloned();
+    assert!(h.as_ref().is_some_and(|h| h.leg == "big" && h.shadow == 121_000 && (h.extra.cpu - 1.2).abs() < 1e-9), "{h:?}");
+    assert!(s.held("b").is_none());
+    // Its wait says what it waits for, and the runner held for it.
+    assert!(
+        matches!(s.reason("big"), Some(WaitReason::Headroom { request, held: Some(on), room_at: Some(121_000), .. }) if request == "14 CPUs and 1 GiB of memory" && on == "a"),
+        "{:?}",
+        s.reason("big")
+    );
+    // On a, a leg expected to run past then doesn't start, though it fits; one that ends by then does.
+    let c = s.handle(Input::LegQueued(Box::new(asking("long", 2.0, 600.0))), 63_000);
+    assert_eq!(to(&c, "long"), None, "{c:?}");
+    let c = s.handle(Input::LegQueued(Box::new(asking("short", 2.0, 30.0))), 63_000);
+    assert_eq!(to(&c, "short").as_deref(), Some("a"), "{c:?}");
+    s.handle(Input::AttemptFinished { leg: "short".into(), attempt: 1, outcome: Outcome::Success }, 90_000);
+    let c = say(&mut s, "a", 24.0, 100_000);
+    assert_eq!(to(&c, "long"), None, "{c:?}");
+    say(&mut s, "b", 27.0, 100_000);
+    // a2 ends; a's next sample shows the room: big starts there, and its hold is done.
+    s.handle(Input::AttemptFinished { leg: "a2".into(), attempt: 1, outcome: Outcome::Success }, 121_000);
+    let c = say(&mut s, "a", 12.0, 122_000);
+    assert_eq!(to(&c, "big").as_deref(), Some("a"), "{c:?}");
+    assert!(s.held("a").is_none());
+}
+
+/// W05's admission: a hold ends when its runner goes, the leg then holding another that can take
+/// it, and when its leg leaves the queue.
+#[test]
+fn a_hold_ends_with_its_runner_or_its_leg() {
+    use super::state::Sample;
+    const GIB: u64 = 1 << 30;
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
+    }
+    let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+    };
+    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu, mem: GIB, ..Resources::default() }, cost: Some(cost_s), ..leg(id, "acme/x", 50) };
+    say(&mut s, "a", 0.0, 0);
+    say(&mut s, "b", 0.0, 0);
+    s.handle(Input::LegQueued(Box::new(asking("a1", 24.0, 120.0))), 1_000);
+    s.handle(Input::LegQueued(Box::new(asking("b1", 24.0, 600.0))), 1_000);
+    s.handle(Input::LegQueued(Box::new(asking("big", 14.0, 600.0))), 2_000);
+    say(&mut s, "a", 24.0, 61_000);
+    say(&mut s, "b", 24.0, 61_000);
+    s.handle(Input::Tick, 62_000);
+    assert_eq!(s.held("a").map(|h| h.leg.as_str()), Some("big"));
+    // a goes: big holds b, the one left that can take it.
+    s.handle(Input::RunnerLost { runner: "a".into() }, 63_000);
+    assert!(s.held("a").is_none());
+    assert_eq!(s.held("b").map(|h| (h.leg.as_str(), h.shadow)), Some(("big", 601_000)));
+    // big is cancelled: nothing is held.
+    s.handle(Input::LegCancelled { leg: "big".into(), reason: "the run was cancelled".into() }, 64_000);
+    assert!(s.held("b").is_none());
 }

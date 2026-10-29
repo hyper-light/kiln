@@ -118,6 +118,17 @@ pub struct Resolved {
     pub secrets: Option<AppSecrets>,
 }
 
+/// Keeps `r` as its key's resolution, the newest of `list` (eight at the most): what a deploy of
+/// that key records its commits from. A revert back to content deployed before is the revert's
+/// commit, not the one whose content it restored; a rollback is the commits it went back to.
+fn keep_resolved(list: &mut VecDeque<Resolved>, r: &Resolved) {
+    list.retain(|x| x.key != r.key);
+    list.push_back(r.clone());
+    while list.len() > 8 {
+        list.pop_front();
+    }
+}
+
 impl Resolved {
     /// Makes `artifacts` part of what this resolution stands for: they move its key and content
     /// as a source's files do, so a new digest renders (and syncs) again, and an unchanged one
@@ -183,6 +194,10 @@ pub struct Cd {
     /// The latest status of every app.
     pub statuses: RwLock<BTreeMap<String, Summary>>,
     dirty: Mutex<BTreeSet<String>>,
+    /// Apps this server is deleting through the API, each with whether its objects go too: the
+    /// store's change of a deletion carries no cascade (another member's deletion was that member's
+    /// to cascade), so whichever of the two unregisters the app first does it as this said.
+    deleting: Mutex<BTreeMap<String, bool>>,
     watched: Mutex<BTreeSet<(String, GroupKind)>>,
     connecting: Mutex<BTreeSet<String>>,
     /// Held while an app's inputs are checked against its pin and sent, so the source poll and a
@@ -605,12 +620,7 @@ impl Cd {
         e.commits = r.commits.clone();
         e.deps = r.deps.clone();
         e.error = None;
-        if !e.resolved.iter().any(|x| x.key == r.key) {
-            e.resolved.push_back(r.clone());
-            while e.resolved.len() > 8 {
-                e.resolved.pop_front();
-            }
-        }
+        keep_resolved(&mut e.resolved, r);
         moved
     }
 
@@ -1374,7 +1384,8 @@ impl Cd {
                 }
                 Action::Status(s) => {
                     let app = s.app.to_string();
-                    self.statuses.write().insert(app.clone(), s);
+                    let before = self.statuses.write().insert(app.clone(), s.clone());
+                    crate::observe::kiln::cd_status(before.as_ref(), &s);
                     self.dirty.lock().insert(app);
                 }
                 Action::Record(r) => {
@@ -1393,14 +1404,21 @@ impl Cd {
         if !succeeded {
             tracing::info!(app = %app, op, message = %message, "deployments: a sync failed");
         }
-        let (limit, commits, artifacts) = {
+        let (limit, commits, artifacts, dora) = {
             let apps = self.apps.read();
             let e = apps.get(app.as_ref());
             let r = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)));
             let commits = r.map(|r| r.commits.clone()).unwrap_or_default();
             let artifacts = r.map(|r| r.artifacts.clone()).unwrap_or_default();
-            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts)
+            // What DORA's deployment says (docs/observe.md §10.7): its environment, its first git
+            // source and that source's commit, its team.
+            let dora = e.map(|e| {
+                let source = e.def.sources.iter().zip(commits.iter()).find_map(|(s, c)| c.clone().map(|c| (s.repo.clone(), c)));
+                (e.def.environment.clone(), source, e.def.labels.get("team").cloned())
+            });
+            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts, dora)
         };
+        let started_ms = self.started.lock().get(app.as_ref()).filter(|s| s.op == op).map(|s| s.at_ms);
         let d = Deployment {
             app: app.to_string(),
             op,
@@ -1418,6 +1436,10 @@ impl Cd {
             content,
             artifacts,
         };
+        crate::observe::kiln::deployed(&d);
+        if let Some((env, source, team)) = &dora {
+            crate::observe::dora::cd_deployed(&d, started_ms, env.as_deref(), source.as_ref().map(|(r, c)| (r.as_str(), c.as_str())), team.as_deref());
+        }
         let rx = self.store.submit(Command::Deployed { deployment: Box::new(d), limit });
         crate::rt::spawn(async move {
             if let Ok(Err(e)) = rx.await {
@@ -1609,6 +1631,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         clusters: RwLock::new(BTreeMap::new()),
         statuses: RwLock::new(BTreeMap::new()),
         dirty: Mutex::new(BTreeSet::new()),
+        deleting: Mutex::new(BTreeMap::new()),
         watched: Mutex::new(BTreeSet::new()),
         connecting: Mutex::new(BTreeSet::new()),
         inputs_gate: Mutex::new(()),
@@ -1660,7 +1683,10 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                             c2.register(def);
                         }
                     }
-                    kiln_cd::state::Change::AppDeleted(id) => c2.unregister(&id, false),
+                    kiln_cd::state::Change::AppDeleted(id) => {
+                        let cascade = c2.deleting.lock().remove(&id).unwrap_or(false);
+                        c2.unregister(&id, cascade);
+                    }
                     kiln_cd::state::Change::Cluster(_) => c2.connect_clusters().await,
                     kiln_cd::state::Change::ClusterDeleted(name) => {
                         c2.clusters.write().remove(&name);
@@ -1735,6 +1761,25 @@ mod tests {
         assert!(forgotten(&before, &ids(&["default/kiln-namespaces"]), &kept).is_empty());
         assert_eq!(forgotten(&before, &BTreeSet::new(), &kept), ["default/kiln-namespaces"], "one it no longer renders is forgotten");
         Ok(())
+    }
+
+    /// A revert to content deployed before: its key's resolution is the revert's commit, which a deploy
+    /// of the key records (and DORA reads), not the commit whose content it restored.
+    #[test]
+    fn a_key_resolved_again_is_its_newest_commit() {
+        let at = |key: u64, sha: &str| Resolved { revision: sha.into(), key, commits: vec![Some(sha.into())], ..Resolved::default() };
+        let mut list = VecDeque::new();
+        for r in [at(1, "c1"), at(2, "c2"), at(1, "c3")] {
+            keep_resolved(&mut list, &r);
+        }
+        let kept: Vec<(u64, &str)> = list.iter().map(|r| (r.key, r.revision.as_str())).collect();
+        assert_eq!(kept, [(2, "c2"), (1, "c3")]);
+        assert_eq!(list.iter().find(|r| r.key == 1).map(|r| r.commits.clone()), Some(vec![Some("c3".to_owned())]));
+        for n in 3..20 {
+            keep_resolved(&mut list, &at(n, "cn"));
+        }
+        assert_eq!(list.len(), 8, "eight at the most, the oldest let go");
+        assert_eq!(list.front().map(|r| r.key), Some(12));
     }
 
     #[test]

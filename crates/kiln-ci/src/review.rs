@@ -53,13 +53,13 @@ impl State {
 }
 
 /// Whether `line` is a git trailer (`Key: value`, the key letters, digits and `-`).
-fn trailer(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn trailer(line: &str) -> Option<(&str, &str)> {
     let (k, v) = line.split_once(':')?;
     (!k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && v.starts_with(' ')).then(|| (k, v.trim()))
 }
 
 /// The message's paragraphs, without trailing blank lines.
-fn paragraphs(message: &str) -> Vec<Vec<&str>> {
+pub(crate) fn paragraphs(message: &str) -> Vec<Vec<&str>> {
     let mut out: Vec<Vec<&str>> = vec![Vec::new()];
     for line in message.trim_end().lines() {
         if line.trim().is_empty() {
@@ -121,7 +121,8 @@ pub fn title_and_summary(message: &str) -> (String, String) {
 
 /// A push's options (`git push -o …`): `draft`, `ready`, `reviewer=ada,agent:review`
 /// (repeatable), `message=…` (a note on the new versions), `topic=…`, `title=…` (a change
-/// request's); unknown ones are said back.
+/// request's), `change=<sha>:<D41|new>` (repeatable: which change a commit is, when kiln asked,
+/// W26-R03); unknown ones are said back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     pub draft: bool,
@@ -131,6 +132,8 @@ pub struct Options {
     pub topic: Option<String>,
     /// A change request's title.
     pub title: Option<String>,
+    /// Answers to kiln's questions of which change a commit is.
+    pub answers: Vec<crate::identity::Answer>,
     pub unknown: Vec<String>,
 }
 
@@ -146,6 +149,7 @@ pub fn options<S: AsRef<str>>(given: &[S]) -> Options {
             ("message" | "m", Some(v)) => o.message = Some(v.to_owned()),
             ("topic", Some(v)) if !v.is_empty() => o.topic = Some(v.to_owned()),
             ("title", Some(v)) if !v.is_empty() => o.title = Some(v.to_owned()),
+            ("change", Some(v)) if crate::identity::answer(v).is_some() => o.answers.extend(crate::identity::answer(v)),
             _ => o.unknown.push(opt.to_owned()),
         }
     }
@@ -161,9 +165,11 @@ pub struct Commit {
     pub message: String,
     /// `git patch-id --stable`: the same patch on another base has the same one.
     pub patch_id: String,
+    /// The change it is, as [`crate::identity::identify`] settled it (W26-R03).
+    pub change: String,
 }
 
-/// An open or closed diff with this Change-Id, as the server keeps it: its latest version.
+/// An open or closed diff of this change, as the server keeps it: its latest version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Known {
     pub number: u32,
@@ -173,7 +179,7 @@ pub struct Known {
     pub parent: String,
     /// The trunk commit the version was based on.
     pub base: String,
-    /// The Change-Id of the diff below it in its stack (`None`: it sat on the trunk).
+    /// The change of the diff below it in its stack (`None`: it sat on the trunk).
     pub below: Option<String>,
     pub patch_id: String,
     pub message: String,
@@ -197,7 +203,8 @@ pub enum Step {
 pub struct Planned {
     pub sha: String,
     pub parent: String,
-    pub change_id: String,
+    /// Its change's identity.
+    pub change: String,
     pub title: String,
     pub summary: String,
     pub step: Step,
@@ -207,10 +214,11 @@ pub struct Planned {
 pub const MAX_STACK: usize = 100;
 
 /// What submitting `commits` (bottom first, everything between the trunk and the pushed commit,
-/// based on trunk commit `base`) does to the diffs there are (`known`, by Change-Id); refused
-/// whole, saying why, when any commit can't be a diff. Only the diffs that changed get versions
-/// (review.md): a diff restacked on a changed one below keeps its version; one whose patch only
-/// moved to a new base, or to a new place in the stack, gets a rebase-only version.
+/// based on trunk commit `base`, each with its change) does to the diffs there are (`known`, by
+/// change); refused whole, saying why, when any commit can't be a diff. Only the diffs that
+/// changed get versions (review.md): a diff restacked on a changed one below keeps its version;
+/// one whose patch only moved to a new base, or to a new place in the stack, gets a rebase-only
+/// version (its message compared without kiln's own `Kiln-Change` line, which a restack adds).
 pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> Result<Vec<Planned>, String> {
     if commits.is_empty() {
         return Err("nothing to submit: the commit is already on the trunk".into());
@@ -221,16 +229,17 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
     let mut seen = HashSet::new();
     let mut out: Vec<Planned> = Vec::with_capacity(commits.len());
     for c in commits {
-        let below = out.last().map(|p| p.change_id.clone());
+        let below = out.last().map(|p| p.change.clone());
         let short = c.sha.get(..12).unwrap_or(&c.sha);
         let [parent] = c.parents.as_slice() else {
             return Err(format!("{short} is a merge: a diff is one commit on another (a branch with merges is a change request, refs/for/<trunk>/branch/<name>)"));
         };
-        let Some(id) = change_id(&c.message) else {
-            return Err(format!("{short} has no Change-Id: install kiln's commit-msg hook (`kiln clone`, or `kiln hook install`) and amend, or submit with `kiln submit`, which adds them"));
-        };
+        let id = c.change.clone();
+        if id.is_empty() {
+            return Err(format!("{short} has no change identity"));
+        }
         if !seen.insert(id.clone()) {
-            return Err(format!("{short}: two commits of this push have Change-Id {id}; squash them, or give one a new Change-Id"));
+            return Err(format!("{short}: two commits of this push are one change ({id}); squash them, or take the `Kiln-Change:` line out of one"));
         }
         let (title, summary) = title_and_summary(&c.message);
         if title.is_empty() {
@@ -238,11 +247,11 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
         }
         let step = match known.get(&id) {
             None => Step::New,
-            Some(k) if k.state == State::Landed => return Err(format!("{short}: Change-Id {id} is D{}'s, which landed; give this commit a new Change-Id", k.number)),
+            Some(k) if k.state == State::Landed => return Err(format!("{short} is D{}, which landed: take its `Kiln-Change:` (or `Change-Id:`) line out (`git commit --amend`) and it is a new change", k.number)),
             Some(k) if k.state == State::Abandoned => return Err(format!("{short}: D{} is abandoned; reclaim it first (`kiln diff reclaim D{}`)", k.number, k.number)),
             Some(k) if k.commit == c.sha => Step::Unchanged { number: k.number, n: k.version },
             Some(k) => {
-                let same = !k.patch_id.is_empty() && k.patch_id == c.patch_id && k.message.trim_end() == c.message.trim_end();
+                let same = !k.patch_id.is_empty() && k.patch_id == c.patch_id && crate::identity::without_kiln_change(&k.message) == crate::identity::without_kiln_change(&c.message);
                 let reordered = k.below != below;
                 if same && !reordered && k.base == base {
                     Step::Unchanged { number: k.number, n: k.version }
@@ -251,7 +260,7 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
                 }
             }
         };
-        out.push(Planned { sha: c.sha.clone(), parent: parent.clone(), change_id: id, title, summary, step });
+        out.push(Planned { sha: c.sha.clone(), parent: parent.clone(), change: id, title, summary, step });
     }
     Ok(out)
 }
@@ -386,6 +395,261 @@ pub fn follow(hunks: &[Hunk], start: u32, end: u32) -> Option<(u32, u32)> {
     Some((u32::try_from(s + delta).ok()?, u32::try_from(e + delta).ok()?))
 }
 
+/// Open threads on a change, by kind (W26-R11).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Open {
+    pub question: u32,
+    pub nit: u32,
+    pub issue: u32,
+    pub blocking: u32,
+}
+
+/// What a change's review state is read from (W26-R02).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Facts {
+    pub draft: bool,
+    /// A reviewer asked for changes on the latest revision and hasn't approved since.
+    pub changes_asked: bool,
+    pub open: Open,
+    /// Conflicts unresolved in its latest replay onto trunk.
+    pub conflicts: u32,
+    /// An agent is at work on its threads or conflicts.
+    pub fixing: bool,
+    /// The approvals trunk's policy asks for are given.
+    pub policy_met: bool,
+}
+
+/// Where a change's review stands, as Ship draws it (`kiln_cd::journey::ReviewState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Standing {
+    Draft,
+    Requested,
+    Changes,
+    Blocked,
+    Fixing,
+    Conflict,
+    Approved,
+}
+
+/// A change's review state (W26-R02): a draft is a draft; an agent at work shows as that; then a
+/// conflict, a blocking thread and changes asked, each the author's to answer; approved once its gate
+/// is clear (no blocking thread, no conflict, no changes asked, the policy's approvals given); else
+/// waiting on its reviewers.
+pub fn state(f: &Facts) -> Standing {
+    if f.draft {
+        Standing::Draft
+    } else if f.fixing {
+        Standing::Fixing
+    } else if f.conflicts > 0 {
+        Standing::Conflict
+    } else if f.open.blocking > 0 {
+        Standing::Blocked
+    } else if f.changes_asked {
+        Standing::Changes
+    } else if f.policy_met {
+        Standing::Approved
+    } else {
+        Standing::Requested
+    }
+}
+
+/// A thread's kind (W26-R11), as Conventional Comments has them: a question, a nit, an issue, or
+/// blocking. A thread from before kinds is a question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    #[default]
+    Question,
+    Nit,
+    Issue,
+    Blocking,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Question => "question",
+            Kind::Nit => "nit",
+            Kind::Issue => "issue",
+            Kind::Blocking => "blocking",
+        }
+    }
+
+    /// The kind a request names.
+    pub fn parse(s: &str) -> Option<Kind> {
+        Some(match s.trim() {
+            "question" => Kind::Question,
+            "nit" => Kind::Nit,
+            "issue" => Kind::Issue,
+            "blocking" => Kind::Blocking,
+            _ => return None,
+        })
+    }
+
+    /// A kind as kept: one kiln doesn't know reads as a question.
+    pub fn read(s: &str) -> Kind {
+        Kind::parse(s).unwrap_or_default()
+    }
+}
+
+/// A thread on a change, as the gate reads it (W26-R11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Thread {
+    pub kind: Kind,
+    /// Who opened it, its reviewer, as kiln writes principals (`user:kim`).
+    pub by: String,
+    /// Where it is: a file and its first line; neither for the change as a whole.
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub resolved: bool,
+    /// None of its comments is published yet: it's its reviewer's alone until a review of theirs
+    /// publishes it.
+    pub draft: bool,
+}
+
+/// A conflict a change's latest replay onto its trunk left (W26-R12): where it falls, and whether
+/// it's resolved there, waiting on Commit resolution to make a revision of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Conflict {
+    pub file: String,
+    pub line: Option<u32>,
+    pub taken: bool,
+}
+
+/// What holds approving and merging a change (W26-R11): a blocking thread, or a conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Hold {
+    /// Where it is: `expand.rs:22`, a file, or the conversation.
+    pub at: String,
+    /// A blocking thread's reviewer, who resolves it; none for a conflict.
+    pub by: Option<String>,
+    /// What it says: `expand.rs:22: kim resolves this blocking comment first`.
+    pub reason: String,
+}
+
+/// What the gate says of approving a change (W26-R11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// A blocking thread or a conflict: approving, merging and any automatic merge wait.
+    Hold,
+    /// Open issues: approving asks to go ahead anyway.
+    Warn,
+    /// Open nits: approving says so.
+    Inform,
+    /// Nothing open that the gate weighs.
+    Clear,
+}
+
+/// The gate's word on a change, for whoever asks (W26-R11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Gate {
+    pub verdict: Verdict,
+    /// What holds it: its conflicts, then its blocking threads, oldest first.
+    pub holds: Vec<Hold>,
+    /// Its open threads by kind, as whoever asks sees them.
+    pub open: Open,
+    pub conflicts: u32,
+    /// Its open issues, as approving warns of them: `2 issues open`.
+    pub warning: Option<String>,
+    /// Its open nits, as approving says: `1 nit open`.
+    pub note: Option<String>,
+}
+
+impl Gate {
+    /// Why approving and merging wait, each a sentence; none when they don't. Merging and any
+    /// automatic merge read these alone: an issue or a nit holds neither.
+    pub fn reasons(&self) -> Vec<String> {
+        self.holds.iter().map(|h| h.reason.clone()).collect()
+    }
+
+    /// Approving: refused while the gate holds, saying why, and while issues are open unless asked
+    /// to go ahead anyway (`force`, which goes past a warning and nothing else); else what it says
+    /// of what's still open.
+    pub fn approve(&self, force: bool) -> Result<Option<String>, String> {
+        match self.verdict {
+            Verdict::Hold => Err(self.reasons().join("; ")),
+            Verdict::Warn if !force => Err(format!("{}: approve anyway with `force`", self.warning.as_deref().unwrap_or("issues open"))),
+            _ => {
+                let said: Vec<&str> = [self.warning.as_deref(), self.note.as_deref()].into_iter().flatten().collect();
+                Ok((!said.is_empty()).then(|| said.join(", ")))
+            }
+        }
+    }
+}
+
+/// Where a thread or a conflict is, as the gate's words say it: its file's name and line
+/// (`expand.rs:22`), the file alone, or the conversation.
+pub fn place(file: Option<&str>, line: Option<u32>) -> String {
+    match (file.map(|f| f.rsplit('/').next().unwrap_or(f)), line) {
+        (Some(f), Some(l)) => format!("{f}:{l}"),
+        (Some(f), None) => f.to_owned(),
+        (None, _) => "the conversation".to_owned(),
+    }
+}
+
+/// A principal as the gate's words name it: `user:kim` is kim.
+pub fn named(principal: &str) -> &str {
+    let p = principal.split(" for ").next().unwrap_or(principal);
+    p.rsplit(':').next().unwrap_or(p)
+}
+
+fn open_count(n: u32, kind: &str) -> String {
+    format!("{n} {kind}{} open", if n == 1 { "" } else { "s" })
+}
+
+/// The gate (W26-R11), pure: from a change's threads (each one's kind and reviewer), the conflicts
+/// its latest replay left and who asks (`asking`: whoever approves; none for merging and any
+/// automatic merge), what approving and merging may do. A blocking thread holds both until its
+/// reviewer resolves it, naming them and where it is; so does each conflict until Commit resolution
+/// makes a revision of it (W26-R12), one resolved where it falls saying that's what it waits on. An
+/// open issue warns on approval (approve anyway); an open nit informs; questions are counted and
+/// weigh nothing. A resolved thread isn't open, and a draft is its reviewer's alone: it counts only
+/// when they ask, since approving publishes it.
+pub fn gate(threads: &[Thread], conflicts: &[Conflict], asking: Option<&str>) -> Gate {
+    let theirs = |by: &str| asking.is_some_and(|a| a.eq_ignore_ascii_case(by));
+    let mut holds: Vec<Hold> = conflicts
+        .iter()
+        .map(|c| {
+            let at = place(Some(&c.file), c.line);
+            let reason = if c.taken { format!("{at}: commit its resolution first") } else { format!("{at}: resolve this conflict first") };
+            Hold { reason, at, by: None }
+        })
+        .collect();
+    let mut open = Open::default();
+    for t in threads.iter().filter(|t| !t.resolved && (!t.draft || theirs(&t.by))) {
+        match t.kind {
+            Kind::Question => open.question += 1,
+            Kind::Nit => open.nit += 1,
+            Kind::Issue => open.issue += 1,
+            Kind::Blocking => {
+                open.blocking += 1;
+                let at = place(t.file.as_deref(), t.line);
+                let reason = if theirs(&t.by) { format!("{at}: resolve your blocking comment first") } else { format!("{at}: {} resolves this blocking comment first", named(&t.by)) };
+                holds.push(Hold { at, by: Some(t.by.clone()), reason });
+            }
+        }
+    }
+    let verdict = if !holds.is_empty() {
+        Verdict::Hold
+    } else if open.issue > 0 {
+        Verdict::Warn
+    } else if open.nit > 0 {
+        Verdict::Inform
+    } else {
+        Verdict::Clear
+    };
+    Gate {
+        verdict,
+        holds,
+        open,
+        conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
+        warning: (open.issue > 0).then(|| open_count(open.issue, "issue")),
+        note: (open.nit > 0).then(|| open_count(open.nit, "nit")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,15 +700,18 @@ mod tests {
 
     #[test]
     fn w14_r03_options() {
-        let o = options(&["draft", "reviewer=ada,agent:review", "r=bob", "message=addressed comments", "topic=outputs", "nonsense=1"]);
+        let o = options(&["draft", "reviewer=ada,agent:review", "r=bob", "message=addressed comments", "topic=outputs", "nonsense=1", "change=abc1234:D41", "change=def5678:new", "change=zz:D1"]);
         assert!(o.draft && !o.ready);
         assert_eq!(o.reviewers, ["ada", "agent:review", "bob"]);
         assert_eq!((o.message.as_deref(), o.topic.as_deref()), (Some("addressed comments"), Some("outputs")));
-        assert_eq!(o.unknown, ["nonsense=1"]);
+        assert_eq!(o.unknown, ["nonsense=1", "change=zz:D1"]);
+        // W26-R03: answers to which change a commit is.
+        use crate::identity::{Answer, Choice};
+        assert_eq!(o.answers, [Answer { commit: "abc1234".into(), choice: Choice::Change("D41".into()) }, Answer { commit: "def5678".into(), choice: Choice::New }]);
     }
 
     fn commit(sha: &str, parent: &str, id: &str, title: &str, patch: &str) -> Commit {
-        Commit { sha: sha.repeat(40).get(..40).unwrap_or_default().to_owned(), parents: vec![parent.repeat(40).get(..40).unwrap_or_default().to_owned()], message: format!("{title}\n\nChange-Id: {id}\n"), patch_id: patch.into() }
+        Commit { sha: sha.repeat(40).get(..40).unwrap_or_default().to_owned(), parents: vec![parent.repeat(40).get(..40).unwrap_or_default().to_owned()], message: format!("{title}\n\nChange-Id: {id}\n"), patch_id: patch.into(), change: id.into() }
     }
 
     #[test]
@@ -487,9 +754,13 @@ mod tests {
         // A new message isn't rebase-only.
         let m1 = Commit { sha: "6".repeat(40), message: format!("one, reworded\n\nChange-Id: {A}\n"), ..d1.clone() };
         assert_eq!(steps(plan(&[m1], &k, "t")?), [Step::Version { number: 1, n: 2, rebase_only: false, reordered: false }]);
-        // Refusals: no Change-Id, a merge, the same Change-Id twice, landed and abandoned diffs.
-        let bare = Commit { message: "no id\n".into(), ..d1.clone() };
-        assert!(plan(&[bare], &k, "t").is_err_and(|e| e.contains("no Change-Id")));
+        // W26-R03: a version kiln restacked added its `Kiln-Change` line: still the same message.
+        let restacked: BTreeMap<String, Known> = [(A.to_owned(), Known { message: crate::identity::with_kiln_change(&d1.message, "kc-00000000000000aa"), ..known(1, &d1, None, State::NeedsReview) })].into();
+        let moved = Commit { sha: "3".repeat(40), parents: vec!["u".repeat(40)], ..d1.clone() };
+        assert_eq!(steps(plan(&[moved], &restacked, "u")?), [Step::Version { number: 1, n: 2, rebase_only: true, reordered: false }]);
+        // Refusals: no identity, a merge, one change twice, landed and abandoned diffs.
+        let bare = Commit { message: "no id\n".into(), change: String::new(), ..d1.clone() };
+        assert!(plan(&[bare], &k, "t").is_err_and(|e| e.contains("no change identity")));
         let merge = Commit { parents: vec!["t".repeat(40), "s".repeat(40)], ..d1.clone() };
         assert!(plan(&[merge], &k, "t").is_err_and(|e| e.contains("merge")));
         assert!(plan(&[d1.clone(), Commit { sha: "5".repeat(40), ..d1.clone() }], &k, "t").is_err_and(|e| e.contains("two commits")));
@@ -499,5 +770,152 @@ mod tests {
         assert!(plan(&[Commit { sha: "4".repeat(40), ..d1.clone() }], &gone, "t").is_err_and(|e| e.contains("reclaim")));
         assert!(plan(&[], &k, "t").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn w26_r02_a_review_stands_as_its_records_say() {
+        let open = |blocking, question| Open { blocking, question, ..Open::default() };
+        let approved = Facts { policy_met: true, ..Facts::default() };
+        assert_eq!(state(&Facts::default()), Standing::Requested, "waiting on its reviewers");
+        assert_eq!(state(&approved), Standing::Approved);
+        assert_eq!(state(&Facts { open: open(0, 2), ..approved }), Standing::Approved, "questions don't hold the gate");
+        assert_eq!(state(&Facts { open: open(1, 0), ..approved }), Standing::Blocked, "a blocking thread holds an approval");
+        assert_eq!(state(&Facts { changes_asked: true, ..approved }), Standing::Changes);
+        assert_eq!(state(&Facts { conflicts: 2, open: open(1, 0), ..approved }), Standing::Conflict, "a conflict comes before a thread");
+        assert_eq!(state(&Facts { fixing: true, conflicts: 2, ..approved }), Standing::Fixing, "an agent at work shows as that");
+        assert_eq!(state(&Facts { draft: true, fixing: true, ..approved }), Standing::Draft);
+    }
+
+    const KIM: &str = "user:kim";
+    const ADA: &str = "user:ada";
+    const EXPAND: &str = "crates/kiln-ci/src/plan/expand.rs";
+
+    fn thread(kind: Kind, by: &str, line: u32) -> Thread {
+        Thread { kind, by: by.into(), file: Some(EXPAND.into()), line: Some(line), ..Thread::default() }
+    }
+
+    fn open(question: u32, nit: u32, issue: u32, blocking: u32) -> Open {
+        Open { question, nit, issue, blocking }
+    }
+
+    #[test]
+    fn w26_r11_each_kind_alone() {
+        let one = |kind| gate(&[thread(kind, KIM, 22)], &[], Some(ADA));
+        let q = one(Kind::Question);
+        assert_eq!((q.verdict, q.open, q.approve(false)), (Verdict::Clear, open(1, 0, 0, 0), Ok(None)), "a question weighs nothing");
+        let n = one(Kind::Nit);
+        assert_eq!((n.verdict, n.approve(false)), (Verdict::Inform, Ok(Some("1 nit open".to_owned()))), "a nit informs");
+        let i = one(Kind::Issue);
+        assert_eq!((i.verdict, i.warning.as_deref()), (Verdict::Warn, Some("1 issue open")), "an issue warns");
+        assert_eq!(i.approve(false), Err("1 issue open: approve anyway with `force`".to_owned()));
+        assert_eq!(i.approve(true), Ok(Some("1 issue open".to_owned())));
+        let b = one(Kind::Blocking);
+        assert_eq!((b.verdict, b.reasons()), (Verdict::Hold, vec!["expand.rs:22: kim resolves this blocking comment first".to_owned()]), "blocking holds");
+        assert_eq!(b.holds, vec![Hold { at: "expand.rs:22".into(), by: Some(KIM.into()), reason: "expand.rs:22: kim resolves this blocking comment first".into() }]);
+        // Merging, and any automatic merge (no one asking), read the hold alone.
+        for (kind, held) in [(Kind::Question, false), (Kind::Nit, false), (Kind::Issue, false), (Kind::Blocking, true)] {
+            assert_eq!(!gate(&[thread(kind, KIM, 22)], &[], None).reasons().is_empty(), held, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn w26_r11_kinds_together() {
+        let all = [thread(Kind::Question, KIM, 1), thread(Kind::Nit, KIM, 2), thread(Kind::Issue, KIM, 3), thread(Kind::Issue, "agent:review", 4), thread(Kind::Blocking, KIM, 22)];
+        let g = gate(&all, &[], Some(ADA));
+        assert_eq!((g.verdict, g.open, g.reasons().len()), (Verdict::Hold, open(1, 1, 2, 1), 1), "blocking holds over everything else");
+        assert_eq!((g.warning.as_deref(), g.note.as_deref()), (Some("2 issues open"), Some("1 nit open")), "what's open is still said");
+        let rest = gate(all.get(..4).unwrap_or_default(), &[], Some(ADA));
+        assert_eq!(rest.verdict, Verdict::Warn, "issues warn over nits");
+        assert_eq!(rest.approve(false), Err("2 issues open: approve anyway with `force`".to_owned()));
+        assert_eq!(rest.approve(true), Ok(Some("2 issues open, 1 nit open".to_owned())));
+        let nits = gate(all.get(..2).unwrap_or_default(), &[], Some(ADA));
+        assert_eq!((nits.verdict, nits.approve(false)), (Verdict::Inform, Ok(Some("1 nit open".to_owned()))));
+        // Two blocking threads: each named, oldest first; a reviewer's agent by its name.
+        let two = gate(&[thread(Kind::Blocking, KIM, 22), Thread { kind: Kind::Blocking, by: "agent:review for user:kim".into(), file: None, line: None, ..Thread::default() }], &[], Some(ADA));
+        assert_eq!(two.approve(false), Err("expand.rs:22: kim resolves this blocking comment first; the conversation: review resolves this blocking comment first".to_owned()));
+    }
+
+    #[test]
+    fn w26_r11_conflicts_hold_until_resolved() {
+        let conflicts = [Conflict { file: EXPAND.into(), line: Some(18), ..Conflict::default() }, Conflict { file: "README.md".into(), line: None, ..Conflict::default() }];
+        let g = gate(&[], &conflicts, Some(ADA));
+        assert_eq!((g.verdict, g.conflicts), (Verdict::Hold, 2));
+        assert_eq!(g.reasons(), ["expand.rs:18: resolve this conflict first", "README.md: resolve this conflict first"]);
+        assert_eq!(g.holds.iter().map(|h| h.by.clone()).collect::<Vec<_>>(), [None::<String>, None], "a conflict names no reviewer");
+        assert_eq!(gate(&[], &conflicts, None).reasons(), g.reasons(), "and holds merging alike");
+        // With a blocking thread: the conflicts first, then the thread.
+        let both = gate(&[thread(Kind::Blocking, KIM, 22)], conflicts.get(..1).unwrap_or_default(), Some(ADA));
+        assert_eq!(both.reasons(), ["expand.rs:18: resolve this conflict first", "expand.rs:22: kim resolves this blocking comment first"]);
+        assert_eq!(gate(&[thread(Kind::Issue, KIM, 3)], conflicts.get(..1).unwrap_or_default(), Some(ADA)).approve(true), Err("expand.rs:18: resolve this conflict first".to_owned()), "a conflict isn't a warning to go past");
+        assert_eq!(gate(&[], &[], Some(ADA)).verdict, Verdict::Clear, "resolved, nothing holds");
+    }
+
+    /// W26-R12, AC04: a conflict resolved where it falls still holds approving and merging until
+    /// Commit resolution makes a revision of it, saying so; the revision's replay has none.
+    #[test]
+    fn w26_r12_a_resolved_conflict_waits_on_its_commit() {
+        let taken = Conflict { file: EXPAND.into(), line: Some(18), taken: true };
+        let open = Conflict { file: EXPAND.into(), line: Some(30), ..Conflict::default() };
+        let g = gate(&[], &[taken.clone(), open], Some(ADA));
+        assert_eq!((g.verdict, g.conflicts), (Verdict::Hold, 2));
+        assert_eq!(g.reasons(), ["expand.rs:18: commit its resolution first", "expand.rs:30: resolve this conflict first"]);
+        assert_eq!(gate(&[], &[taken], None).approve(true), Err("expand.rs:18: commit its resolution first".to_owned()), "merging and force wait too");
+        assert_eq!(gate(&[], &[], Some(ADA)).approve(false), Ok(None), "committed: the new revision goes onto main cleanly");
+    }
+
+    #[test]
+    fn w26_r11_resolved_threads_are_done() {
+        let resolved = |kind| Thread { resolved: true, ..thread(kind, KIM, 22) };
+        let g = gate(&[resolved(Kind::Blocking), resolved(Kind::Issue), resolved(Kind::Nit), resolved(Kind::Question)], &[], Some(ADA));
+        assert_eq!((g.verdict, g.open, g.approve(false)), (Verdict::Clear, Open::default(), Ok(None)));
+        assert!(gate(&[resolved(Kind::Blocking)], &[], None).reasons().is_empty(), "a resolved blocking thread holds no merge");
+    }
+
+    #[test]
+    fn w26_r11_a_draft_counts_for_its_reviewer_alone() {
+        let draft = |kind| Thread { draft: true, ..thread(kind, KIM, 22) };
+        // kim's draft is hers: no one else sees it, and nothing merging reads holds on it.
+        for asking in [Some(ADA), None] {
+            let g = gate(&[draft(Kind::Blocking), draft(Kind::Issue)], &[], asking);
+            assert_eq!((g.verdict, g.open), (Verdict::Clear, Open::default()), "{asking:?}");
+        }
+        // kim approving would publish it: her own blocking draft holds her, her issue warns her.
+        let mine = gate(&[draft(Kind::Blocking)], &[], Some(KIM));
+        assert_eq!(mine.approve(true), Err("expand.rs:22: resolve your blocking comment first".to_owned()));
+        assert_eq!(gate(&[draft(Kind::Issue)], &[], Some("User:Kim")).verdict, Verdict::Warn, "principals compare in any case");
+    }
+
+    #[test]
+    fn w26_r11_its_reviewer_asking() {
+        // kim's own blocking thread holds her approval too, until she resolves it (or changes its kind).
+        let g = gate(&[thread(Kind::Blocking, KIM, 22)], &[], Some(KIM));
+        assert_eq!((g.verdict, g.reasons()), (Verdict::Hold, vec!["expand.rs:22: resolve your blocking comment first".to_owned()]));
+        assert_eq!(g.holds.first().and_then(|h| h.by.as_deref()), Some(KIM));
+        // Anyone else, or no one (a merge), is told whose it is.
+        assert_eq!(gate(&[thread(Kind::Blocking, KIM, 22)], &[], Some("user:lee")).reasons(), ["expand.rs:22: kim resolves this blocking comment first"]);
+        assert_eq!(gate(&[thread(Kind::Blocking, KIM, 22)], &[], None).reasons(), ["expand.rs:22: kim resolves this blocking comment first"]);
+        assert_eq!(gate(&[Thread { line: None, ..thread(Kind::Blocking, KIM, 22) }], &[], None).reasons(), ["expand.rs: kim resolves this blocking comment first"], "a file without a line");
+    }
+
+    /// D41 (W26-AC02): kim's blocking thread on expand.rs:22 holds approval; with two open issues
+    /// approving asks for `force`; with a nit open it approves and says so.
+    #[test]
+    fn w26_r11_the_d41_example() {
+        let kim_blocks = gate(&[thread(Kind::Question, "user:lee", 40), thread(Kind::Blocking, KIM, 22)], &[], Some(ADA));
+        assert_eq!(kim_blocks.approve(false), Err("expand.rs:22: kim resolves this blocking comment first".to_owned()));
+        let issues = gate(&[thread(Kind::Issue, KIM, 64), thread(Kind::Issue, "agent:review", 70)], &[], Some(ADA));
+        assert!(issues.approve(false).is_err_and(|e| e.contains("2 issues open") && e.contains("force")));
+        assert_eq!(issues.approve(true), Ok(Some("2 issues open".to_owned())));
+        assert_eq!(gate(&[thread(Kind::Nit, "agent:review", 91)], &[], Some(ADA)).approve(false), Ok(Some("1 nit open".to_owned())));
+    }
+
+    #[test]
+    fn w26_r11_kinds_as_kept() {
+        assert_eq!(["question", "nit", "issue", "blocking"].map(Kind::parse), [Some(Kind::Question), Some(Kind::Nit), Some(Kind::Issue), Some(Kind::Blocking)]);
+        assert_eq!((Kind::parse("nitpick"), Kind::parse("")), (None, None), "a request names one of the four");
+        assert_eq!((Kind::read(""), Kind::read("praise")), (Kind::Question, Kind::Question), "a thread from before kinds, or of a kind kiln doesn't know, reads as a question");
+        assert_eq!(Kind::Blocking.as_str(), "blocking");
+        assert_eq!((named("user:kim"), named("agent:review for user:kim"), named("admin")), ("kim", "review", "admin"));
+        assert_eq!((place(Some(EXPAND), Some(22)), place(None, Some(3))), ("expand.rs:22".to_owned(), "the conversation".to_owned()));
     }
 }

@@ -1,0 +1,80 @@
+---- app
+Traceback (most recent call last):
+  File "/app/errors.py", line 35, in case
+    f()
+    ~^^
+  File "/app/errors.py", line 41, in <lambda>
+    case("app", lambda: checkout(42))
+                        ~~~~~~~~^^^^
+  File "/app/errors.py", line 19, in checkout
+    return Cart([1, 2, -order]).total()
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/app/errors.py", line 14, in total
+    raise ValueError(f"bad item {item} in cart 'c-{item * 7}'")
+ValueError: bad item -42 in cart 'c--294'
+---- app-again
+Traceback (most recent call last):
+  File "/app/errors.py", line 35, in case
+    f()
+    ~^^
+  File "/app/errors.py", line 42, in <lambda>
+    case("app-again", lambda: checkout(7))
+                              ~~~~~~~~^^^
+  File "/app/errors.py", line 19, in checkout
+    return Cart([1, 2, -order]).total()
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/app/errors.py", line 14, in total
+    raise ValueError(f"bad item {item} in cart 'c-{item * 7}'")
+ValueError: bad item -7 in cart 'c--49'
+---- stdlib
+Traceback (most recent call last):
+  File "/app/errors.py", line 35, in case
+    f()
+    ~^^
+  File "/app/errors.py", line 43, in <lambda>
+    case("stdlib", lambda: parse("{not json"))
+                           ~~~~~^^^^^^^^^^^^^
+  File "/app/errors.py", line 23, in parse
+    return json.loads(body)
+           ~~~~~~~~~~^^^^^^
+  File "/usr/local/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/local/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/json/decoder.py", line 361, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ~~~~~~~~~~~~~~^^^^^^^^
+json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+---- chained
+Traceback (most recent call last):
+  File "/app/errors.py", line 28, in load
+    return {"id": order_id, "rows": [1 // 0]}
+                                     ~~^^~~
+ZeroDivisionError: integer division or modulo by zero
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/errors.py", line 35, in case
+    f()
+    ~^^
+  File "/app/errors.py", line 44, in <lambda>
+    case("chained", lambda: load(99))
+                            ~~~~^^^^
+  File "/app/errors.py", line 30, in load
+    raise RuntimeError(f"order {order_id} could not load") from e
+RuntimeError: order 99 could not load
+---- lambda
+Traceback (most recent call last):
+  File "/app/errors.py", line 35, in case
+    f()
+    ~^^
+  File "/app/errors.py", line 45, in <lambda>
+    case("lambda", lambda: [x for x in map(lambda v: 10 // v, [1, 0])])
+                                       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/errors.py", line 45, in <lambda>
+    case("lambda", lambda: [x for x in map(lambda v: 10 // v, [1, 0])])
+                                                     ~~~^^~~
+ZeroDivisionError: integer division or modulo by zero
