@@ -45,6 +45,8 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
         new PerformanceObserver((l) => {
           for (const e of l.getEntries() as unknown as { value: number; hadRecentInput: boolean; sources?: { node?: Node; previousRect: DOMRectReadOnly; currentRect: DOMRectReadOnly }[] }[]) {
             if (e.hadRecentInput) continue;
+            // Ship's own, as ship-perf.spec counts them: the app's approval notices come and go on their own.
+            if (!(e.sources ?? []).some((s) => (s.node instanceof Element ? s.node : (s.node?.parentElement ?? null))?.closest(".ship"))) continue;
             w.__shift += e.value;
             for (const s of e.sources ?? []) {
               const n = s.node as HTMLElement | undefined;
