@@ -82,6 +82,98 @@ struct LegRec {
     attempts: Vec<AttemptRec>,
 }
 
+/// A KilnCD deployment of a commit, as Ship reads it: kiln deploys itself through KilnCD, not CI's
+/// deployments (plan 01a1856fe81375b1bd1d1d86f270a45b, step 4). Its app's environment; the commit
+/// it deployed (an image it pinned was built from it, or else its revision names it); how its sync
+/// and the guard's word after it went (they share an op); and when the sync finished (unix seconds).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CdDeploy {
+    pub app: String,
+    pub environment: String,
+    pub sha: String,
+    /// It pinned an image built from the commit (else its revision named it).
+    pub built: bool,
+    pub op: u64,
+    /// `success` or `failure`.
+    pub state: String,
+    pub description: String,
+    pub at: i64,
+}
+
+/// A tag or a revision that names a commit: seven to forty hex digits.
+fn sha_like(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// One app's history as deployments of commits, oldest first: a sync and the guard's word after it
+/// share an op, and either failing fails the deployment.
+fn deploys_of<'a>(app: &str, environment: &str, history: impl IntoIterator<Item = &'a kiln_cd::state::Deployment>) -> Vec<CdDeploy> {
+    let mut out: Vec<CdDeploy> = Vec::new();
+    for h in history {
+        let pinned = h.artifacts.iter().find_map(|a| a.tag.as_deref().filter(|t| sha_like(t)));
+        let (sha, built) = match (pinned, h.revision.as_deref().filter(|r| sha_like(r))) {
+            (Some(t), _) => (t.to_string(), true),
+            (None, Some(r)) => (r.to_string(), false),
+            (None, None) => continue,
+        };
+        match out.last_mut().filter(|d| d.op == h.op && d.sha == sha) {
+            Some(d) => {
+                if !h.succeeded {
+                    d.state = "failure".into();
+                }
+                d.description = h.message.clone();
+            }
+            None => out.push(CdDeploy {
+                app: app.to_string(),
+                environment: environment.to_string(),
+                sha,
+                built,
+                op: h.op,
+                state: if h.succeeded { "success" } else { "failure" }.to_string(),
+                description: h.message.clone(),
+                at: i64::try_from(h.at_ms / 1000).unwrap_or(i64::MAX),
+            }),
+        }
+    }
+    out
+}
+
+/// Every KilnCD app's deployments of commits, by the environment it deploys to (none without
+/// KilnCD).
+pub fn cd_deploys() -> Vec<CdDeploy> {
+    let Some(cd) = crate::cd::get() else { return Vec::new() };
+    let apps: Vec<(String, String)> = cd.apps.read().iter().filter_map(|(id, e)| e.def.environment.clone().map(|env| (id.clone(), env))).collect();
+    cd.store.read(|d| apps.iter().flat_map(|(id, env)| deploys_of(id, env, d.history.get(id).into_iter().flatten())).collect())
+}
+
+/// What KilnCD's deployments read as, to see they changed: a refresh then reads every commit again.
+fn cd_mark(deploys: &[CdDeploy]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    deploys.hash(&mut h);
+    h.finish()
+}
+
+/// KilnCD's deployments of a repository's commits, as Ship's deployment records. In an environment
+/// where an app pinned images built from them, only those count: another app's git syncs there
+/// don't say what runs.
+fn cd_recs(deploys: &[CdDeploy], commits: &[(String, i64, String)]) -> Vec<DeployRec> {
+    let of = |sha: &str| commits.iter().find(|(s, _, _)| s == sha || (sha.len() >= 7 && s.starts_with(sha))).map(|(s, f, _)| (s.clone(), *f));
+    let mine: Vec<(&CdDeploy, String, i64)> = deploys.iter().filter_map(|d| of(&d.sha).map(|(s, f)| (d, s, f))).collect();
+    mine.iter()
+        .filter(|(d, _, _)| d.built || !mine.iter().any(|(x, _, _)| x.built && x.environment == d.environment))
+        .map(|(d, sha, first_row)| DeployRec {
+            environment: d.environment.clone(),
+            production: d.environment.eq_ignore_ascii_case("production"),
+            sha: sha.clone(),
+            first_row: *first_row,
+            state: Some(d.state.clone()),
+            description: Some(d.description.clone()),
+            at: d.at,
+        })
+        .collect()
+}
+
 /// One environment's deployment of a commit: its latest status and when it was set (unix seconds).
 #[derive(Debug, Clone, Default)]
 struct DeployRec {
@@ -682,16 +774,18 @@ struct RepoCtx {
     current: Vec<DeployRec>,
     waiting: Option<(String, i64)>,
     commits: Vec<(String, i64, String)>,
+    /// KilnCD's deployments of its commits, oldest first.
+    cd: Vec<DeployRec>,
 }
 
-fn repo_ctx(c: &rusqlite::Connection, repo: &str) -> anyhow::Result<Option<RepoCtx>> {
+fn repo_ctx(c: &rusqlite::Connection, repo: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<RepoCtx>> {
     let found: Option<(String, String)> = c.query_row("SELECT id, name FROM repos WHERE name = ?1 OR id = ?1", [repo], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     let Some((id, name)) = found else { return Ok(None) };
     let mut st = c.prepare(&format!(
         "SELECT {DEPLOY_COLS} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment
            AND (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = e.id ORDER BY s.id DESC LIMIT 1) = 'success')"
     ))?;
-    let current = st.query_map([&id], deploy_row)?.collect::<Result<_, _>>()?;
+    let mut current: Vec<DeployRec> = st.query_map([&id], deploy_row)?.collect::<Result<_, _>>()?;
     let waiting = c
         .query_row(
             "SELECT o.item, o.seq FROM deploy_releases d JOIN ship_order o ON o.repo_id = ?1 AND o.item = json_extract(d.spec, '$.version')
@@ -704,13 +798,22 @@ fn repo_ctx(c: &rusqlite::Connection, repo: &str) -> anyhow::Result<Option<RepoC
     let mut st = c.prepare(&format!(
         "SELECT o.item, o.seq, COALESCE((SELECT MIN(r.branch) FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item), '') FROM ship_order o WHERE o.repo_id = ?1 AND {IS_ITEM} ORDER BY o.seq DESC"
     ))?;
-    let commits = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
-    Ok(Some(RepoCtx { id, name, current, waiting, commits }))
+    let commits: Vec<(String, i64, String)> = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    // What each environment runs now: its newest successful deployment, CI's or KilnCD's.
+    let cd = cd_recs(deploys, &commits);
+    for d in cd.iter().filter(|d| d.state.as_deref() == Some("success")) {
+        match current.iter_mut().find(|x| x.environment.eq_ignore_ascii_case(&d.environment)) {
+            Some(x) if x.at > d.at => {}
+            Some(x) => *x = d.clone(),
+            None => current.push(d.clone()),
+        }
+    }
+    Ok(Some(RepoCtx { id, name, current, waiting, commits, cd }))
 }
 
 /// Reads one commit's records (`sha`: the whole sha, or any unique prefix of seven or more).
-fn load(c: &rusqlite::Connection, repo: &str, sha: &str) -> anyhow::Result<Option<Records>> {
-    let Some(ctx) = repo_ctx(c, repo)? else { return Ok(None) };
+fn load(c: &rusqlite::Connection, repo: &str, sha: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<Records>> {
+    let Some(ctx) = repo_ctx(c, repo, deploys)? else { return Ok(None) };
     let found = ctx.commits.iter().find(|(s, _, _)| s == sha || (sha.len() >= 7 && s.starts_with(sha))).map(|(s, f, _)| (s.clone(), *f));
     match found {
         Some((sha, first_row)) => Ok(Some(load_with(c, &ctx, &sha, first_row)?)),
@@ -754,6 +857,13 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     // This commit's latest deployment in each environment; what each runs now is the repository's.
     let mut st = c.prepare(&format!("SELECT {DEPLOY_COLS} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.sha = ?2 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment AND e.sha = d.sha)"))?;
     rec.own = st.query_map(params![repo_id, sha], deploy_row)?.collect::<Result<_, _>>()?;
+    for d in ctx.cd.iter().filter(|d| d.sha == sha) {
+        match rec.own.iter_mut().find(|x| x.environment.eq_ignore_ascii_case(&d.environment)) {
+            Some(x) if x.at > d.at => {}
+            Some(x) => *x = d.clone(),
+            None => rec.own.push(d.clone()),
+        }
+    }
     rec.current = ctx.current.clone();
     // Deploy API releases of this commit (by version), and a newer one production waits on.
     let mut st = c.prepare(
@@ -1126,7 +1236,8 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
 
 /// A repository's commits, newest first, a page at a time (`cursor`: the last page's last
 /// `cursor`), of the repositories named in `only` (JSON, those the caller may read), or all.
-pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
+pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, deploys: &[CdDeploy], now: i64) -> Result<Value, Fail> {
+    let deploys = deploys.to_vec();
     let limit = q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(30).clamp(1, 100);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
     let repo = q.get("repo").filter(|v| !v.is_empty()).cloned();
@@ -1144,7 +1255,7 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
             let keys: Vec<(String, String)> = st.query_map(params![repo, cursor, limit + 1, only, f.kind, f.host, f.review], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let mut out = Vec::new();
             for (repo, sha) in keys {
-                if let Some(rec) = load(c, &repo, &sha)? {
+                if let Some(rec) = load(c, &repo, &sha, &deploys)? {
                     out.push(rec);
                 }
             }
@@ -1166,9 +1277,9 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
 }
 
 /// One commit of a repository, with the records its stand came from.
-pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
-    let (repo, sha) = (repo.to_owned(), sha.to_owned());
-    let rec = store.call(move |c| load(c, &repo, &sha)).await.map_err(internal)?;
+pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, deploys: &[CdDeploy], now: i64) -> Result<Value, Fail> {
+    let (repo, sha, deploys) = (repo.to_owned(), sha.to_owned(), deploys.to_vec());
+    let rec = store.call(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?;
     rec.map(|r| detail(&r, &runners, now, viewer)).ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))
 }
 
@@ -1228,6 +1339,8 @@ struct Held {
     built: bool,
     at_ms: i64,
     repos: HashMap<String, HeldRepo>,
+    /// KilnCD's deployments as last read ([`cd_mark`]).
+    cd: u64,
 }
 
 /// What a refresh read from the store, in one snapshot.
@@ -1296,16 +1409,19 @@ impl ShipCache {
     /// changed since, the gone dropped. One at a time: while one runs, another returns at once
     /// (its reader gets the model as it is, at most [`FRESH_MS`] old). A failure leaves the last
     /// good model, and the next read tries again.
-    pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], now: i64) -> Result<(), Fail> {
+    pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], deploys: &[CdDeploy], now: i64) -> Result<(), Fail> {
         use std::sync::atomic::Ordering;
         if self.refreshing.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         let _flight = Flight(&self.refreshing);
+        // KilnCD's deployments aren't the store's: when they changed, every commit is read again.
+        let cd = cd_mark(deploys);
         let (built, seq) = {
             let h = self.held.read().map_err(|_| poisoned())?;
-            (h.built, h.seq)
+            (h.built && h.cd == cd, h.seq)
         };
+        let deploys = deploys.to_vec();
         let cap = self.cap;
         let waiting: HashMap<String, Vec<String>> = {
             let h = self.held.read().map_err(|_| poisoned())?;
@@ -1336,7 +1452,7 @@ impl ShipCache {
                 }
                 let mut read = Read { top, loaded: Vec::new(), gone_repos: Vec::new() };
                 for (repo, (mut all, mut shas)) in want {
-                    let Some(ctx) = repo_ctx(&tx, &repo)? else {
+                    let Some(ctx) = repo_ctx(&tx, &repo, &deploys)? else {
                         read.gone_repos.push(repo);
                         continue;
                     };
@@ -1401,6 +1517,7 @@ impl ShipCache {
         h.seq = read.top;
         h.built = true;
         h.at_ms = now;
+        h.cd = cd;
         Ok(())
     }
 
@@ -1500,8 +1617,9 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     let now = crate::util::now_ms();
     let c = cache();
     let runners = runners_seen(hub).await;
+    let deploys = cd_deploys();
     if c.stale(now)
-        && let Err((_, e)) = c.refresh(&hub.store, &runners, now).await
+        && let Err((_, e)) = c.refresh(&hub.store, &runners, &deploys, now).await
     {
         tracing::warn!("ship: the read model kept its last good state: {e}");
     }
@@ -1515,7 +1633,7 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
         Some(body) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(body))),
         None => {
             let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
-            Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, viewer.as_ref(), runners, now).await?))
+            Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, viewer.as_ref(), runners, &deploys, now).await?))
         }
     }
 }
@@ -1556,8 +1674,9 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     let now = crate::util::now_ms();
     let c = cache();
     let runners = runners_seen(hub).await;
+    let deploys = cd_deploys();
     if c.stale(now)
-        && let Err((_, e)) = c.refresh(&hub.store, &runners, now).await
+        && let Err((_, e)) = c.refresh(&hub.store, &runners, &deploys, now).await
     {
         tracing::warn!("ship: the read model kept its last good state: {e}");
     }
@@ -1567,7 +1686,7 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     };
     let v = match c.detail(repo, sha, &runners, now, viewer.as_ref()) {
         Some(v) => v,
-        None => get_in(&hub.store, repo, sha, viewer.as_ref(), runners, now).await?,
+        None => get_in(&hub.store, repo, sha, viewer.as_ref(), runners, &deploys, now).await?,
     };
     if !visible(&v, only.as_deref()) {
         return Err((StatusCode::NOT_FOUND, "no such commit".to_string()));
@@ -1676,7 +1795,7 @@ mod tests {
             let sql = production_fixture();
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let now = (NOW_S + 4000) * 1000;
-            let one = get_in(&store, "hyper-light/kiln", C1, None, Vec::new(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, Vec::new(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
             let pip = |v: &Value, stage: &str| v.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).map(|p| text(p, "state")).unwrap_or_default();
             let checks = field(&one, &["checks"]).and_then(Value::as_array).cloned().unwrap_or_default();
@@ -1708,9 +1827,118 @@ mod tests {
             );
             assert_eq!(pip(&one, "build"), "passed");
             // A commit no build ran for: not built, its checks passed.
-            let two = get_in(&store, "hyper-light/kiln", C2, None, Vec::new(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let two = get_in(&store, "hyper-light/kiln", C2, None, Vec::new(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!((pip(&two, "checks"), pip(&two, "build"), field(&two, &["build", "image", "state"]).and_then(Value::as_str)), ("passed".into(), "none".into(), Some("none")));
             assert_eq!((text(&two, "stand"), text(&two, "line")), ("waiting".into(), "Checks passed".into()));
+            Ok(())
+        })
+    }
+
+    /// Three commits of kiln's own, oldest first, each checked and its image built: C3, C1, C2.
+    fn cd_fixture() -> String {
+        let run = |id: &str, n: i64, pipeline: &str, sha: &str| {
+            format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at) VALUES ('{id}', 'kiln', {n}, '{pipeline}', 'push', 'main', '{sha}', 'a commit', 'user.email', 'succeeded', {NOW_S});")
+        };
+        let job = |id: &str, run: &str, key: &str| {
+            format!("INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, started_at, finished_at) VALUES ('{id}', '{run}', '{key}', '{key}', 'succeeded', '[]', '[]', '{{}}', {NOW_S}, {});", NOW_S + 60)
+        };
+        let mut s = String::from("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1);");
+        for (sha, n) in [(C3, 1), (C1, 3), (C2, 5)] {
+            s += &run(&format!("ci{n}"), n, "ci", sha);
+            s += &job(&format!("c{n}"), &format!("ci{n}"), "rust lint + test");
+            s += &run(&format!("im{n}"), n + 1, "image", sha);
+            s += &job(&format!("i{n}"), &format!("im{n}"), "image");
+        }
+        s
+    }
+
+    /// KilnCD's history as kiln-production keeps it (2026-10-28): C3 deployed and held, then C1 at
+    /// `t1`, each sync followed by its guard's word on the same op (the engine numbers its syncs
+    /// afresh when it restarts); and another app in production, its namespaces, syncing C2 from git
+    /// with no image.
+    fn cd_history(t1: i64) -> Vec<CdDeploy> {
+        let entry = |app: &str, op: u64, sha: &str, at: i64, message: &str, image: bool| kiln_cd::state::Deployment {
+            app: app.into(),
+            op,
+            revision: Some(sha.into()),
+            succeeded: true,
+            message: message.into(),
+            at_ms: u64::try_from(at.saturating_mul(1000)).unwrap_or(0),
+            artifacts: if image {
+                vec![kiln_cd::apps::ArtifactRef { name: "image".into(), reference: format!("kiln:{sha}"), repository: "kiln".into(), tag: Some(sha.into()), digest: String::new() }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let (k, t0) = ("default/kiln-production", t1 - 7200);
+        let kiln = [
+            entry(k, 1, C3, t0, "successfully synced (all tasks run)", true),
+            entry(k, 1, C3, t0 + 600, "kiln restarted into kiln:3333333, and stayed healthy for 10m", true),
+            entry(k, 1, C1, t1, "successfully synced (all tasks run)", true),
+            entry(k, 1, C1, t1 + 600, "kiln restarted into kiln:1111111, and stayed healthy for 10m", true),
+        ];
+        let mut out = deploys_of(k, "production", kiln.iter());
+        let namespaces = [entry("default/namespaces", 2, C2, t1 + 900, "successfully synced (all tasks run)", false)];
+        out.extend(deploys_of("default/namespaces", "production", namespaces.iter()));
+        out
+    }
+
+    /// Plan 01a1856fe81375b1bd1d1d86f270a45b, step 4: production as KilnCD keeps it. The commit
+    /// kiln-production runs reads in production (the guard watching for its first ten minutes) and
+    /// replants; the one it replaced reads superseded; the newer one built and waiting. Another
+    /// app's git sync in production says nothing of what runs, and with no staging nothing reads
+    /// in staging. KilnCD's word is read into memory when it changes, though the store didn't.
+    #[test]
+    fn ship_reads_production_from_kilncd() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = cd_fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let t1 = NOW_S - 3600;
+            let deploys = cd_history(t1);
+            assert_eq!(deploys.iter().map(|d| (short(&d.sha), d.built, d.state.as_str())).collect::<Vec<_>>(), vec![
+                (short(C3), true, "success"),
+                (short(C1), true, "success"),
+                (short(C2), false, "success"),
+            ]);
+            let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let pip = |v: &Value, stage: &str| v.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).map(|p| text(p, "state")).unwrap_or_default();
+            let now = NOW_S * 1000;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&one, "production"), text(&one, "stand"), text(&one, "line")), ("healthy".into(), "shipped".into(), "In production · runners 2/2".into()));
+            assert_eq!(field(&one, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));
+            let old = get_in(&store, "hyper-light/kiln", C3, None, runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&old, "production"), text(&old, "stand"), text(&old, "line")), ("passed".into(), "shipped".into(), "Superseded".into()));
+            let newer = get_in(&store, "hyper-light/kiln", C2, None, runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(
+                (pip(&newer, "production"), pip(&newer, "staging"), text(&newer, "stand"), text(&newer, "line")),
+                ("none".into(), "none".into(), "waiting".into(), "Built".into())
+            );
+            // In the guard's ten minutes after the sync: shipping, the guard watching.
+            let watching = get_in(&store, "hyper-light/kiln", C1, None, runners(), &deploys, (t1 + 300) * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&watching, "production"), text(&watching, "stand"), text(&watching, "line")), ("guard".into(), "shipping".into(), "Guard watching".into()));
+            // From memory the same; then KilnCD deploys C2, and the next refresh reads it in.
+            let cache = ShipCache::new();
+            let stands = |cache: &ShipCache| -> Vec<(String, String, String)> {
+                let page: Value = cache.page(None, None, &Facets::default(), None, i64::MAX, 10).ok().flatten().and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default();
+                page.get("commits").and_then(Value::as_array).into_iter().flatten().map(|c| (text(c, "short"), text(c, "stand"), text(c, "line"))).collect()
+            };
+            cache.refresh(&store, &runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(stands(&cache), vec![
+                (short(C2), "waiting".into(), "Built".into()),
+                (short(C1), "shipped".into(), "In production · runners 2/2".into()),
+                (short(C3), "shipped".into(), "Superseded".into()),
+            ]);
+            let mut later = deploys.clone();
+            later.push(CdDeploy { app: "default/kiln-production".into(), environment: "production".into(), sha: C2.into(), built: true, op: 2, state: "success".into(), description: "successfully synced (all tasks run)".into(), at: NOW_S });
+            cache.refresh(&store, &runners(), &later, now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(stands(&cache), vec![
+                (short(C2), "shipping".into(), "Guard watching".into()),
+                (short(C1), "shipped".into(), "Superseded".into()),
+                (short(C3), "shipped".into(), "Superseded".into()),
+            ]);
             Ok(())
         })
     }
@@ -1723,7 +1951,7 @@ mod tests {
             let sql = fixture();
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let now = NOW_S * 1000;
-            let list = list_in(&store, &HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string())]), None, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let list = list_in(&store, &HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string())]), None, None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let commits = list.get("commits").and_then(Value::as_array).cloned().unwrap_or_default();
             let got: Vec<(String, String, String)> = commits
                 .iter()
@@ -1738,7 +1966,7 @@ mod tests {
                 ]
             );
 
-            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let pip = |stage: &str| one.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).and_then(|p| p.get("state")).and_then(Value::as_str).map(str::to_string);
             assert_eq!(pip("checks").as_deref(), Some("flaky"));
             assert_eq!(pip("staging").as_deref(), Some("healthy"));
@@ -1753,14 +1981,14 @@ mod tests {
             assert!(leg.get("start").and_then(Value::as_i64).is_some(), "a leg that ran says when it started: {leg}");
             assert!(one.get("v").and_then(Value::as_str).is_some_and(|v| v.len() == 16), "a row carries its version: {one}");
 
-            let shipped = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let shipped = get_in(&store, "hyper-light/kiln", C1, None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(field(&shipped, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));
             // Every action names an endpoint kiln has: a route in its table, not the unnamed default.
             let mut failed = runners();
             if let Some(r) = failed.get_mut(1) {
                 r.failed = Some("upgrade timed out: no report within 15 minutes".into());
             }
-            let with_failed = list_in(&store, &HashMap::new(), None, None, failed, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let with_failed = list_in(&store, &HashMap::new(), None, None, failed, &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let acts: Vec<(String, String, String)> = with_failed
                 .get("commits")
                 .and_then(Value::as_array)
@@ -1780,7 +2008,7 @@ mod tests {
             for (name, method, path) in &acts {
                 assert!(named(method, path)?, "{name}: {method} {path} is no route kiln has");
             }
-            let missing = get_in(&store, "hyper-light/kiln", "deadbee", None, runners(), now).await;
+            let missing = get_in(&store, "hyper-light/kiln", "deadbee", None, runners(), &[], now).await;
             assert!(matches!(missing, Err((StatusCode::NOT_FOUND, _))));
             Ok(())
         })
@@ -1818,7 +2046,7 @@ mod tests {
             let (kim, sam): (HashSet<String>, HashSet<String>) = (["user:kim".to_string()].into(), ["user:sam".to_string()].into());
             let list = |q: &[(&str, &str)], viewer: Option<HashSet<String>>| {
                 let (store, q) = (store.clone(), q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>());
-                async move { list_in(&store, &q, None, viewer.as_ref(), runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+                async move { list_in(&store, &q, None, viewer.as_ref(), runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
             };
             let rows = |v: &Value| -> Vec<(String, String, String, String)> {
                 let s = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
@@ -2010,7 +2238,7 @@ mod tests {
                 for fq in facets {
                     let mut q = HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string()), ("limit".to_string(), limit.to_string())]);
                     q.extend(fq.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-                    let want = list_in(store, &q, None, viewer, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                    let want = list_in(store, &q, None, viewer, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                     if let Some(got) = cache.page(Some("hyper-light/kiln"), None, &Facets::from_query(&q), viewer, i64::MAX, limit).map_err(|(_, m)| anyhow::anyhow!(m))? {
                         assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the list of {limit} {fq:?} for {viewer:?} from memory isn't the store's");
                         compared += 1;
@@ -2021,7 +2249,7 @@ mod tests {
                     for c in want.get("commits").and_then(Value::as_array).into_iter().flatten() {
                         let sha = c.get("sha").and_then(Value::as_str).unwrap_or_default();
                         if let Some(got) = cache.detail("hyper-light/kiln", sha, &runners(), now, viewer) {
-                            let want = get_in(store, "hyper-light/kiln", sha, viewer, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                            let want = get_in(store, "hyper-light/kiln", sha, viewer, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                             assert_eq!(got, want, "round {round}: {sha}'s detail for {viewer:?} from memory isn't the store's");
                             compared += 1;
                         }
@@ -2068,7 +2296,7 @@ mod tests {
                 }
                 now += FRESH_MS;
                 let before = cache.applied();
-                cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 assert!(cache.applied() >= before, "the change applied went back");
                 compared += same(&store, &cache, now, round).await?;
             }
@@ -2091,21 +2319,21 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::new();
             let mut now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             for n in 0..40u64 {
                 let sql = ops(500 + n, n % 31, if n.is_multiple_of(2) { C2 } else { C3 });
                 let write = store.call(move |c| Ok(c.execute_batch(&sql)?));
                 now += FRESH_MS;
                 let before = cache.applied();
                 let (ra, rb) = (runners(), runners());
-                let (w, a, b) = futures::join!(write, cache.refresh(&store, &ra, now), cache.refresh(&store, &rb, now));
+                let (w, a, b) = futures::join!(write, cache.refresh(&store, &ra, &[], now), cache.refresh(&store, &rb, &[], now));
                 w?;
                 a.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 b.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 assert!(cache.applied() >= before, "the change applied went back");
                 // Whatever a refresh beside the write missed, the next one brings in.
                 now += FRESH_MS;
-                cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 same(&store, &cache, now, usize::try_from(n).unwrap_or(0)).await?;
             }
             Ok(())
@@ -2124,7 +2352,7 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::with_cap(2);
             let now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             for _ in 0..100 {
                 store.call(|c| Ok(c.execute("UPDATE jobs SET conclusion = CASE conclusion WHEN 'success' THEN 'failure' ELSE 'success' END WHERE id = 'l3'", []).map(|_| ())?)).await?;
             }
@@ -2136,12 +2364,12 @@ mod tests {
             let held = cache.page(None, None, &Facets::default(), None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?;
             // The store failing: the refresh says so, memory keeps what it had, and stays stale.
             store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes RENAME TO ship_changes_away")?)).await?;
-            assert!(cache.refresh(&store, &runners(), now + FRESH_MS).await.is_err());
+            assert!(cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.is_err());
             assert_eq!(cache.page(None, None, &Facets::default(), None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?, held);
             assert!(cache.stale(now + FRESH_MS));
             // Back: the next read brings everything in.
             store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes_away RENAME TO ship_changes")?)).await?;
-            cache.refresh(&store, &runners(), now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             same(&store, &cache, now + FRESH_MS, 0).await?;
             Ok(())
         })
@@ -2158,14 +2386,14 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::new();
             let now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let count = |page: Option<String>| -> usize { page.and_then(|p| serde_json::from_str::<Value>(&p).ok()).and_then(|v| v.get("commits").and_then(Value::as_array).map(Vec::len)).unwrap_or(usize::MAX) };
             let other = ["someone/else".to_string()];
             let mine = ["hyper-light/kiln".to_string()];
             assert_eq!(count(cache.page(None, Some(&other), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
             assert_eq!(count(cache.page(Some("hyper-light/kiln"), Some(&other), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
             assert_eq!(count(cache.page(None, Some(&mine), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 3);
-            let one = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert!(visible(&one, None));
             assert!(visible(&one, Some(&mine)));
             assert!(!visible(&one, Some(&other)));
@@ -2185,7 +2413,7 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::new();
             let now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let stand = |cache: &ShipCache| -> Option<String> {
                 let page: Value = serde_json::from_str(&cache.page(None, None, &Facets::default(), None, i64::MAX, 10).ok()??).ok()?;
                 page.get("commits")?.as_array()?.iter().find(|c| c.get("short").and_then(Value::as_str) == Some("2222222"))?.get("stand")?.as_str().map(str::to_string)
@@ -2196,7 +2424,7 @@ mod tests {
             assert!(!cache.stale(now + FRESH_MS - 1));
             assert!(cache.stale(now + FRESH_MS));
             let t = std::time::Instant::now();
-            cache.refresh(&store, &runners(), now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let took = t.elapsed();
             println!("ship: a change brought in in {took:?}");
             assert_eq!(stand(&cache).as_deref(), Some("in_staging"));
@@ -2240,7 +2468,7 @@ mod tests {
             let cache = ShipCache::new();
             let now = NOW_S * 1000;
             let t = std::time::Instant::now();
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let build = t.elapsed();
             let time = |f: &dyn Fn() -> usize| -> (f64, f64, f64, usize) {
                 let mut us: Vec<f64> = Vec::new();
@@ -2280,7 +2508,7 @@ mod tests {
         crate::rt::block_on(async move {
             let sql = fixture();
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
-            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let marks = field(&one, &["review"]).and_then(Value::as_array).cloned().unwrap_or_default();
             assert_eq!(marks.len(), 1, "a commit with no change has the one mark: {marks:?}");
             let m = marks.first().cloned().unwrap_or_default();

@@ -627,9 +627,16 @@ fn stand_and_line(j: &Journey) -> (Stand, String) {
         let left: Vec<&str> = j.build.platforms.iter().filter(|p| matches!(p.state, Part::Queued | Part::Running)).map(|p| p.name.as_str()).collect();
         return (Stand::Building, if left.is_empty() { "Building the image".to_string() } else { format!("Building {}", left.join(", ")) });
     }
-    // Nothing built it: it stands where its checks left it.
-    if build_glyph(&j.build) == Glyph::None && j.staging == Staging::NotYet {
-        return (Stand::Waiting, if checks == Glyph::None { "Landed".to_string() } else { "Checks passed".to_string() });
+    // Never in staging (none of its environments is, or it hasn't gone there): it stands where its
+    // build left it, or its checks when nothing built it (plan 01a1856fe81375b1bd1d1d86f270a45b,
+    // steps 3 and 4: production read every commit as "In staging · Built").
+    if j.staging == Staging::NotYet {
+        let line = match build_glyph(&j.build) {
+            Glyph::None if checks == Glyph::None => "Landed",
+            Glyph::None => "Checks passed",
+            _ => "Built",
+        };
+        return (Stand::Waiting, line.to_string());
     }
     (Stand::InStaging, if j.staging == Staging::Moved { "Passed".to_string() } else { "Built".to_string() })
 }
