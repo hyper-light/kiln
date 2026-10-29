@@ -434,8 +434,10 @@ what was placed.
   `kiln_seams::placement::SimPlacement`: on the node with the most memory free, then by name, a
   million placements.
 - **Used by:** builds that can't starve a machine, and microVM CI legs (CP-T7.1).
-- **Passed by:** the simulator, every clause; Hex, when CP-T7.1 lands it. Every case runs on the
-  same two nodes (`kiln_seams::placement::conformance_nodes`).
+- **Passed by:** the simulator, every clause; kiln's headroom rule (`kiln_ci::sched::place`, the
+  engine's and the v1 dispatcher's, docs/runners.md §5), every clause, its target all of a node;
+  Hex, when CP-T7.1 lands it. Every case runs on the same two nodes
+  (`kiln_seams::placement::conformance_nodes`).
 
 Methods: `place`, `release`, `nodes`.
 

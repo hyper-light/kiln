@@ -8,6 +8,7 @@
  * Rows are found by `data-agent` under the element the returned props go on.
  */
 import type * as React from "react";
+import { flushSync } from "react-dom";
 
 /** Held this long, a press selects. */
 const HOLD_MS = 420;
@@ -46,6 +47,18 @@ export interface TouchSelect {
   selecting: boolean;
 }
 
+/**
+ * Selects (or deselects) with the row under the finger kept where it is: whatever that changes above
+ * it (the list's head as selecting starts, the composer), the page scrolls by as much, at once, so
+ * the row stays under the finger and a drag goes on over the rows it was over.
+ */
+function steady(row: HTMLElement, go: () => void) {
+  const was = row.getBoundingClientRect().top;
+  flushSync(go);
+  const moved = row.getBoundingClientRect().top - was;
+  if (Math.abs(moved) >= 1) window.scrollBy(0, moved);
+}
+
 /** The props for the element around the rows. */
 export function touchSelect(get: () => TouchSelect) {
   let press: Press | null = null;
@@ -71,9 +84,10 @@ export function touchSelect(get: () => TouchSelect) {
   const over = (x: number, y: number) => {
     const p = press;
     if (!p?.held) return;
-    const under = rowOf(document.elementFromPoint(x, y))?.dataset.agent;
+    const row = rowOf(document.elementFromPoint(x, y));
+    const under = row?.dataset.agent;
     const s = get();
-    if (under && s.isSelected(under) !== p.to) s.set([under], p.to);
+    if (row && under && s.isSelected(under) !== p.to) steady(row, () => s.set([under], p.to));
   };
   return {
     // Holding a row stops the page scrolling under the finger, so the drag selects instead. The
@@ -113,7 +127,7 @@ export function touchSelect(get: () => TouchSelect) {
         const s = get();
         p.held = true;
         p.to = !s.isSelected(agent);
-        s.set([agent], p.to);
+        steady(row, () => s.set([agent], p.to));
         swallow = true;
         navigator.vibrate?.(8);
       }, HOLD_MS);
@@ -152,7 +166,7 @@ export function touchSelect(get: () => TouchSelect) {
         delete p.row.dataset.swipe;
         if (p.dx > SWIPE) {
           const s = get();
-          s.set([p.agent], !s.isSelected(p.agent));
+          steady(p.row, () => s.set([p.agent], !s.isSelected(p.agent)));
           navigator.vibrate?.(8);
         }
       }
@@ -183,7 +197,7 @@ export function touchSelect(get: () => TouchSelect) {
       if (s.selecting && by !== "mouse") {
         e.preventDefault();
         e.stopPropagation();
-        s.set([agent], !s.isSelected(agent));
+        steady(row, () => s.set([agent], !s.isSelected(agent)));
       }
     },
   };

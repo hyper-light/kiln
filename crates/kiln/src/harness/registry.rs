@@ -1878,7 +1878,10 @@ impl Registry {
     }
 
     /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
-    /// message to many agents carries to each. One whose upload is gone (expired) is left out.
+    /// message to many agents carries to each. One whose upload is gone (expired, let go for room,
+    /// or the server started again) keeps its name without its bytes, as [`Registry::route_attachments`]
+    /// does: the message is the one it was, so sent again under its key it's answered as its repeat
+    /// where it was taken (CP-T3.2, the twenty-second adversarial check's).
     pub fn inline_uploads(&self, attachments: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -1887,7 +1890,10 @@ impl Registry {
             .filter_map(|mut a| {
                 a.path = None;
                 let Some(fid) = a.file_id.take() else { return (!a.data_base64.is_empty()).then_some(a) };
-                let (name, mime, data) = self.upload_of(&fid)?;
+                let Some((name, mime, data)) = self.upload_of(&fid) else {
+                    a.data_base64.clear();
+                    return (!a.name.is_empty()).then_some(a);
+                };
                 if a.name.is_empty() {
                     a.name = name;
                 }
@@ -1925,7 +1931,16 @@ impl Registry {
                 }
                 None => b64.decode(a.data_base64.as_bytes()).ok().map(bytes::Bytes::from),
             };
-            let Some(data) = data.filter(|d| !d.is_empty()) else { continue };
+            let Some(data) = data.filter(|d| !d.is_empty()) else {
+                // Its upload is gone (the server started again, or let it go for room or age): its
+                // name still goes, so the message is the one it was (CP-T3.2, the twenty-second
+                // adversarial check's). Sent again after its first try was taken, it's answered as
+                // its repeat, never refused as another message under its id (whose Retry would be a
+                // second prompt). New, it goes without the file, which its runner leaves out, said.
+                a.data_base64.clear();
+                out.push(a);
+                continue;
+            };
             match loc {
                 Location::Local => {
                     let fid = crate::util::new_id();
@@ -2182,8 +2197,20 @@ impl Registry {
             Location::Machine(machine) => {
                 let Ok(json) = serde_json::to_string(&c) else { return Pending::Now(Sent::NoSession) };
                 // A runner with inboxes takes a message for an epoch, and answers it.
-                let caps = hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned()));
+                let (caps, away) = {
+                    let inst = hub.instances.lock();
+                    (inst.wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned())), inst.newest(&machine).is_none())
+                };
                 let had_id = message.is_some();
+                // A message with an id is refused at once while its runner is away (docs/wire.md's
+                // `Send`), as before the command streams: parked on one, it would go with no epoch
+                // to the copy there once that runner was back, though its session went on elsewhere
+                // meanwhile (resumed, moved) and took it there too, sent again under its id: one
+                // message, two harnesses (CP-T3.2, the twenty-second adversarial check's). CP-T3.3
+                // parks it under its epoch.
+                if had_id && away {
+                    return Pending::Now(Sent::Unreachable);
+                }
                 if let Some(m) = message.filter(|_| caps & crate::proto::CAP_INBOX != 0) {
                     let wait = self.wait_for(id, &m);
                     if !hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessSend { session: id.to_owned(), epoch, json }).await {
