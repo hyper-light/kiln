@@ -54,6 +54,18 @@ def answer(m):
     out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
 
 
+def record(session, rec):
+    """Claude Code's own record of the session, where kiln follows it and the server resumes it from
+    (`FAKE_CLAUDE_RECORD=1`: a test of resuming, CP-T3.2's sends_away)."""
+    if os.environ.get("FAKE_CLAUDE_RECORD") != "1":
+        return
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    d = os.path.join(base, "projects", "-fake")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, session + ".jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
 def main():
     args = sys.argv[1:]
     if "--version" in args:
@@ -86,6 +98,7 @@ def main():
         if m is None:
             return
         turn += 1
+        record(session, {"type": "user", "uuid": m.get("uuid") or str(uuid.uuid4()), "sessionId": session, "cwd": os.getcwd(), "message": m.get("message")})
         said = os.path.join(os.getcwd(), ".fake-claude-messages")
         if os.path.exists(said):
             with open(said, "a") as f:
@@ -105,6 +118,7 @@ def main():
                 "session_id": session,
             })
             time.sleep(EVERY)
+        record(session, {"type": "assistant", "uuid": str(uuid.uuid4()), "sessionId": session, "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}})
         out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
         if command is not None:
             out({"type": "command_lifecycle", "command_uuid": command, "state": "completed", "uuid": str(uuid.uuid4()), "session_id": session})
