@@ -275,7 +275,10 @@ mod tests {
                     {"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high", "options": [{"value": "high", "name": "High"}]}
                 ]}}),
             ])?;
-            let models = discover(program, Duration::from_millis(200), &dir.path().join("user-config.json")).await?;
+            // The deadline is the whole session's: the handshake within it, then the switch to
+            // "unknown" that this agent never answers takes the rest. 200 ms wasn't room for the
+            // handshake under a loaded gate on fedora (2026-10-29: "did not answer in time").
+            let models = discover(program, Duration::from_secs(2), &dir.path().join("user-config.json")).await?;
             assert_eq!(models.iter().find(|m| m.default).map(|m| m.efforts.clone()), Some(vec!["high".into()]));
             assert!(models.iter().find(|m| m.id == "unknown").is_some_and(|m| m.efforts.is_empty()));
             cleaned(dir.path())?;
