@@ -243,6 +243,12 @@ pub enum AgentMsg {
     /// default). Sent as it's welcomed and whenever it changes, each superseding the last; only to
     /// a server announcing [`CAP_AGENT_LIMIT`]. Appended last: postcard encodes variants by index.
     AgentLimit { json: String },
+
+    /// An identity asked for (JSON [`IdentityAsk`], docs/ci.md W27-R01): a CSR for a key this
+    /// runner process made and keeps (for itself, an agent session it holds at an epoch, a leg it
+    /// runs); the server answers with [`ServerMsg::Identity`]. Only to a server announcing
+    /// [`CAP_IDENTITY`]. Appended last: postcard encodes variants by index.
+    Identity { json: String },
     /// This machine's headroom (JSON [`crate::headroom::Status`], docs/headroom.md): its targets'
     /// latencies, its window, what waits and what is paced. Sent on every (re)connect and when what
     /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
@@ -389,11 +395,43 @@ pub const CAP_WORK: u64 = 1 << 36;
 /// says it takes [`ServerMsg::AgentLimit`] and says what it holds ([`AgentMsg::AgentLimit`]); a
 /// server that says it takes that.
 pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: identities (docs/ci.md W27-R01). A runner
+/// that says it asks for certificates for keys it makes and keeps ([`AgentMsg::Identity`]); a
+/// server that says it issues them ([`ServerMsg::Identity`]).
+pub const CAP_IDENTITY: u64 = 1 << 38;
+
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: headroom (docs/headroom.md). A runner
 /// that says it keeps its machine's headroom from settings the server sends
 /// ([`ServerMsg::Headroom`]) and reports it ([`AgentMsg::HeadroomStatus`]); a server that says it
 /// takes that.
-pub const CAP_HEADROOM: u64 = 1 << 38;
+pub const CAP_HEADROOM: u64 = 1 << 39;
+
+/// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IdentityAsk {
+    /// `runner` (this process), `agent` (a session it holds, at `epoch`) or `leg` (one it runs).
+    pub kind: String,
+    pub csr: String,
+    /// `agent`: the session; `leg`: the leg's id.
+    pub of: Option<String>,
+    /// `agent`: the epoch the key is for.
+    pub epoch: Option<u64>,
+}
+
+/// The answer to an [`IdentityAsk`]: its kind and subject, and the certificate (PEM) or why not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IdentityGiven {
+    pub kind: String,
+    pub of: Option<String>,
+    pub epoch: Option<u64>,
+    /// The identity's kiln:// URI.
+    pub uri: String,
+    pub cert_pem: Option<String>,
+    pub error: Option<String>,
+}
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -643,6 +681,11 @@ pub enum ServerMsg {
     /// kiln's default) holds. Sent as the runner says [`CAP_AGENT_LIMIT`] and whenever it changes;
     /// the runner keeps it for its restarts. Appended last: postcard encodes variants by index.
     AgentLimit { json: String },
+
+    /// The certificate for an [`AgentMsg::Identity`], or why there's none (JSON [`IdentityGiven`],
+    /// docs/ci.md W27-R01). Only to runners announcing [`CAP_IDENTITY`]. Appended last: postcard
+    /// encodes variants by index.
+    Identity { json: String },
     /// This machine's headroom settings (JSON [`crate::headroom::Push`]): applied at once and kept
     /// for the runner's next start. Only to runners announcing [`CAP_HEADROOM`]. Appended last:
     /// postcard encodes variants by index.
@@ -961,6 +1004,35 @@ mod tests {
         assert_eq!(b.first(), Some(&58));
         assert_eq!(decode::<ServerMsg>(&b)?, asked);
         assert!(CAP_AGENT_LIMIT.is_power_of_two() && CAP_AGENT_LIMIT == 1 << 37 && CAP_AGENT_LIMIT & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK) == 0);
+        Ok(())
+    }
+
+    /// W27-R01: identities come after every older variant, and their bit is a new one.
+    #[test]
+    fn w27_r01_identities_are_appended_last() -> anyhow::Result<()> {
+        let limit = encode(&AgentMsg::AgentLimit { json: String::new() })?;
+        let asked = encode(&ServerMsg::AgentLimit { json: String::new() })?;
+        let (a, s) = (AgentMsg::Identity { json: "{}".into() }, ServerMsg::Identity { json: "{}".into() });
+        let (ab, sb) = (encode(&a)?, encode(&s)?);
+        assert_eq!(ab.first().copied(), limit.first().map(|i| i + 1), "AgentMsg::Identity comes right after AgentLimit");
+        assert_eq!(sb.first().copied(), asked.first().map(|i| i + 1), "ServerMsg::Identity comes right after AgentLimit");
+        assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
+        assert!(CAP_IDENTITY.is_power_of_two() && CAP_IDENTITY == 1 << 38 && CAP_IDENTITY & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT) == 0);
+        Ok(())
+    }
+
+    /// Headroom (docs/headroom.md) comes after identities, appended before it, and its bit is a new
+    /// one: neither reads the other's messages as its own.
+    #[test]
+    fn headroom_is_appended_after_identities() -> anyhow::Result<()> {
+        let agent = encode(&AgentMsg::Identity { json: String::new() })?;
+        let server = encode(&ServerMsg::Identity { json: String::new() })?;
+        let (a, s) = (AgentMsg::HeadroomStatus { json: "{}".into() }, ServerMsg::Headroom { json: "{}".into() });
+        let (ab, sb) = (encode(&a)?, encode(&s)?);
+        assert_eq!(ab.first().copied(), agent.first().map(|i| i + 1), "AgentMsg::HeadroomStatus comes right after Identity");
+        assert_eq!(sb.first().copied(), server.first().map(|i| i + 1), "ServerMsg::Headroom comes right after Identity");
+        assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
+        assert!(CAP_HEADROOM.is_power_of_two() && CAP_HEADROOM == 1 << 39 && CAP_HEADROOM & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY) == 0);
         Ok(())
     }
 

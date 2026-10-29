@@ -335,6 +335,7 @@ pub static ROUTES: &[Rule] = &[
     // W10: one's own passkeys and password.
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
+    r("POST", "/api/me/identity", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
     r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/password", SIGNED_IN, At::Server),
@@ -376,7 +377,12 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
+    // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
+    r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
+    r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("DELETE", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
     r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
     r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
@@ -393,6 +399,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/review", "diffs.review", At::Diff(2)),
     r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
+    r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/reclaim", "diffs.submit", At::Diff(2)),
@@ -550,6 +559,11 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/probe", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
+    // Identities kiln's CA issued (W27-R01): revocations read by those who read runners, made by
+    // those who manage settings.
+    r("GET", "/api/identities/revocations", "runners.read", At::Server),
+    r("GET", "/api/identities", "runners.read", At::Server),
+    r("POST", "/api/identities/revoke", "settings.manage", At::Server),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),

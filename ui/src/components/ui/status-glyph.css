@@ -218,7 +218,7 @@
   }
 }
 
-/* The journey strip: six pips joined by a line, lit once the stage before is done, light flowing
+/* The journey strip: seven pips joined by a line, lit once the stage before is done, light flowing
    into a stage with work under way. */
 .js {
   display: inline-flex;

@@ -28,7 +28,7 @@ export default function Metrics() {
     <div className="container-console page">
       <title>Metrics · kiln</title>
       <PageIntro
-        index={8}
+        index={7}
         label="Metrics"
         title="Metrics"
         lead="Host samples read straight from /proc and cgroups — the last hour at 5 s resolution, streamed live. Long-term history belongs in Prometheus + Grafana."

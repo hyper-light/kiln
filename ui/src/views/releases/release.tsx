@@ -27,7 +27,7 @@ function Head({ r }: { r: Release | null; id: number }) {
   return (
     <header className="cd-head">
       <Crumbs
-        index={3}
+        index={2}
         items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, ...(r ? [{ label: r.app, to: releaseAppHref(r.app) }] : []), { label: r ? `#${r.id}` : "…" }]}
       />
       {r && (

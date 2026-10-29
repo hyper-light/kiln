@@ -1,0 +1,21 @@
+[package]
+name = "vorpal-graph"
+description = "Edge graph LSM (delta-log ⋈ CSR/CSC) with compaction-time locality relabel for vorpal"
+keywords = ["graph", "csr", "lsm", "knowledge-graph", "reordering"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rayon.workspace = true
+vorpal-mem.workspace = true
+
+bit-set.workspace = true
+bytemuck = "1.25.2"
+
+[lints]
+workspace = true

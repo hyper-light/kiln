@@ -119,6 +119,9 @@ pub enum ServerEvent {
     /// A runner went away and hasn't come back.
     #[serde(rename = "runner.offline")]
     RunnerOffline { runner: OfflineRunner },
+    /// A change's conflicts changed (W26-R12): its replay found some, one was resolved or taken
+    /// back, or their resolution was committed.
+    Conflict(Box<ConflictChange>),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -208,6 +211,24 @@ pub struct Comment {
     pub end_line: Option<u32>,
     pub diff_author: String,
     pub diff_author_for: Option<String>,
+}
+
+/// A change's conflicts, changed (W26-R12): a replay of `version` found them (`state`
+/// `conflicted`); one of them, `conflict`, was resolved, taking `take` (main, this, both, agent,
+/// edit), or taken back (no `take`), by `by` (`agent` when an agent's, kept for a person to take);
+/// or their resolution was committed (`state` `resolved`, `version` the revision it made).
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ConflictChange {
+    pub repo: String,
+    pub diff: String,
+    pub replay: String,
+    pub version: Option<u32>,
+    pub state: Option<String>,
+    pub conflict: Option<String>,
+    pub take: Option<String>,
+    pub by: Option<String>,
+    pub agent: Option<bool>,
 }
 
 /// A review of a diff.

@@ -221,11 +221,10 @@ server says, and counts every session it has, ended ones included, until it's up
   opened in place with the same controls. The agent is picked as its page switches one: by a model
   of another harness the machine runs, each listed under its name (one that hasn't listed its
   models yet, as "Default"; a machine that hasn't listed a harness's models takes another
-  machine's list). The box is the agent page's composer, the field and its bar. Under it, one line
-  says where it starts ("Claude Code on kiln-a094a12d (fedora-2) in ~/…/kiln") and opens More
-  options, one row each: the machine, the folder, how many, its name, its workspace, where its
-  commands run and a shell to run in (closed, it says what else isn't as it starts out); beside it,
-  the machine's past sessions to continue. Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
+  machine's list). The box is the agent page's composer, the field and its bar. Under it, More
+  options opens to one row each: the machine, the folder, how many, its name, its workspace, where
+  its commands run, a shell to run in and the machine's past sessions to continue (closed, it says
+  what isn't as it starts out). Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
   soon as its first snapshot is in (a moment at most), one view transition carrying each part of
   the composer to its place on the page. Several stay on Mission control: the line under the box
   says what started, and they come into the list. Files go with the first message, sent once the

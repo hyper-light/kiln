@@ -237,7 +237,7 @@ export default function NewFleet() {
     <div className="container-console page cd-page">
       <title>Fleet change · Releases · kiln</title>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: "Fleet change" }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: "Fleet change" }]} />
         <h1 className="cd-title">A fleet change</h1>
         <p className="cd-note">One change to many apps: released to each, through its environment's gates; or proposed in each app's source repository, a pull request each.</p>
       </header>
@@ -330,7 +330,7 @@ function FleetView({ id }: { id: string }) {
   return (
     <>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: `Fleet change ${id}` }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: `Fleet change ${id}` }]} />
         <h1 className="cd-title">Fleet change {id}</h1>
         <p className="cd-note">
           {f.source ? "In apps' sources" : "Released"} · {states || "nothing yet"} · {f.done ? "all done" : "under way"}

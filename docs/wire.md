@@ -372,6 +372,7 @@ takes a new bit, never one that means something already, even in the other direc
 | 35 | `CAP_HANDOVER` | `AgentMsg::Caps`, `ServerMsg::Caps` | hand-overs between a machine's runner processes: an older one hands its sessions to the newest (`HarnessHandOver`, `HarnessAdopted`, `HandedOver`; releases.md, "One runner a machine") |
 | 36 | `CAP_WORK` | `AgentMsg::Caps`, `ServerMsg::Caps` | warm workspaces for placement: the runner says what it holds warm, the server takes it (`WorkState`; ci.md W24-R18) |
 | 37 | `CAP_AGENT_LIMIT` | `AgentMsg::Caps`, `ServerMsg::Caps` | the most agent sessions a machine has at work at once, set from the server: the runner takes it and says what it holds, the server takes that (`AgentLimit`; agents.md, "How many agents a machine runs") |
+| 38 | `CAP_IDENTITY` | `AgentMsg::Caps`, `ServerMsg::Caps` | identities: the runner asks for certificates for keys it makes and keeps, the server issues them (`Identity`; ci.md W27-R01) |
 
 Bits from 38 are free. Take the next one, and add its row here in the same change.
 
@@ -475,6 +476,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
 | `WorkState` | state | What the runner holds warm: each lane's workspaces and how long its legs took there, for placement (ci.md W24-R18). Each supersedes the last. | New: with its samples once it changed, and every 10 minutes, to a server announcing `CAP_WORK`. |
 | `AgentLimit` | state | The most agent sessions the machine has at work at once, and where that comes from: set from the server, its config, or kiln's default (agents.md, "How many agents a machine runs"). Each supersedes the last. | New: as it's welcomed and whenever it changes, to a server announcing `CAP_AGENT_LIMIT`. |
+| `Identity` | ask | A CSR for a key the runner process made and keeps: for itself, an agent session it holds at an epoch, or a leg it runs (ci.md W27-R01). The server answers with `Identity`. | New: on each connection for the process's own, to a server announcing `CAP_IDENTITY`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -540,6 +542,7 @@ Four edges are left, and the lab steers clear of each:
 | `Kept` | state | What the server's copy of each of the runner's sessions has, said in digests, so a stream the runner starts sends only what the copy lacks ("Restarts", above). | Sent before `Welcome` to a runner that keeps the channel, 32 sessions a frame. |
 | `HarnessSend` | command, parked | A message (or a skill run) for an agent session, for the epoch the server last heard it's at: its id made once, its inbox takes it once, refuses it typed (a stale epoch named), and answers either way (CP-T3.2, docs/sends.md). To runners that say `CAP_INBOX` in their `Caps`. | T3: answered (`Update::Inbox`); while its runner is away it's refused at once, until CP-T3.3 parks it. |
 | `AgentLimit` | state | What a person set from the server for the most agent sessions the machine has at work at once, over its config's; none set, its config's (or kiln's default) holds (agents.md, "How many agents a machine runs"). | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent as the runner says `CAP_AGENT_LIMIT` and whenever it changes; the runner keeps it for its restarts. |
+| `Identity` | answer | The certificate kiln's CA issued for an `Identity` the runner asked for, or why there's none (ci.md W27-R01). | New: to runners that say `CAP_IDENTITY`. |
 
 ## Commands to a session: `Command`
 

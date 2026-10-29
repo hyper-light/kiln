@@ -1,0 +1,342 @@
+id: c-include
+language: C
+role: item
+symbolType: module
+rule:
+  kind: preproc_include
+  has:
+    field: path
+    pattern: $PATH
+name: $PATH
+isImport: true
+isExported: false
+---
+id: c-function
+language: C
+role: item
+symbolType: function
+# The declarator chain may wrap the function declarator in pointer declarators
+# (`void *kmalloc(...)`) — without the descend branch every pointer-returning function
+# definition was silently absent from the graph. The name is the identifier at the function
+# declarator's own declarator, descending through parenthesized/pointer wrappers.
+rule:
+  kind: function_definition
+  has:
+    field: declarator
+    any:
+      - kind: function_declarator
+        has:
+          field: declarator
+          any:
+            - kind: identifier
+              pattern: $NAME
+            - has:
+                kind: identifier
+                stopBy: end
+                pattern: $NAME
+      - has:
+          kind: function_declarator
+          stopBy: end
+          has:
+            field: declarator
+            any:
+              - kind: identifier
+                pattern: $NAME
+              - has:
+                  kind: identifier
+                  stopBy: end
+                  pattern: $NAME
+name: $NAME
+# Internal linkage is honest visibility (§3.3): a `static` function is translation-unit-local,
+# so exporting it let the resolver fake cross-file edges to it. Direct-child check only — a
+# `static` local inside the body must not demote the function.
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
+# Parser-swallow recovery (grammar fact): C forbids nested function definitions, yet
+# tree-sitter-c admits `function_definition` as a block item — so once a bare
+# statement-position macro wrecks a body and the closing brace is lost, every later
+# definition in the file parses INSIDE that body with no top-level ERROR (cpython
+# `Objects/object.c` from `_PyObject_GetAttrId`: 77 of 142 functions absent; kernel
+# `net/core/dev.c`: 422; 8,428 kernel files carried the shape). A nested function
+# definition is therefore parser recovery, and the traversal lifts the swallowed
+# definitions as top-level items. See `SerializableItemRule::swallow_recovery`.
+swallowRecovery: true
+---
+id: c-struct
+language: C
+role: item
+symbolType: struct
+# `struct pool` appears as a *type reference* far more often than as a definition; requiring
+# the body keeps references and forward declarations from minting phantom struct nodes.
+rule:
+  kind: struct_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: $NAME
+---
+id: c-union
+language: C
+role: item
+symbolType: union
+rule:
+  kind: union_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: $NAME
+---
+id: c-enum
+language: C
+role: item
+symbolType: enum
+rule:
+  kind: enum_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: enumerator_list
+name: $NAME
+---
+id: c-global-variable
+language: C
+role: item
+symbolType: variable
+# The name is the first identifier inside the declarator — not the declarator's text, which
+# dragged along pointers (`*p`), array suffixes (`arr[8]`), and initializers (`x = 3`). The
+# function-declarator exclusion descends too, so pointer-returning prototypes
+# (`void *f(int);`) no longer surface as garbage-named variables.
+rule:
+  all:
+    - kind: declaration
+    - has:
+        field: declarator
+        any:
+          - kind: identifier
+            pattern: $NAME
+          - has:
+              kind: identifier
+              stopBy: end
+              pattern: $NAME
+    - not:
+        has:
+          field: declarator
+          any:
+            - kind: function_declarator
+            - has:
+                kind: function_declarator
+                stopBy: end
+    - not:
+        inside:
+          kind: compound_statement
+          stopBy: end
+    # A declaration whose type is a NAMED, body-bearing struct/union/enum is first and
+    # foremost a type definition (`struct file_operations { ... } __randomize_layout;` —
+    # the kernel's randomized-layout idiom, or any `struct X { ... } y;`). Declining it
+    # here lets the traversal descend so c-struct/c-union/c-enum mint the TYPE node, whose
+    # fields then extract as members; an item match would swallow the whole subtree and
+    # the type would never exist (measured: file_operations, cpuinfo_x86, and every
+    # __randomize_layout struct were absent at kernel scale). Anonymous bodies keep the
+    # variable — there is no type name to prefer.
+    - not:
+        has:
+          field: type
+          any:
+            - all:
+                - kind: struct_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: union_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: enum_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: enumerator_list }
+name: $NAME
+# Internal linkage is honest visibility (§3.3), same as c-function: a `static` file-scope
+# variable is translation-unit-local. Exporting it did double damage — the resolver could
+# fake cross-file edges to it, AND it sat in the global symbol table as a candidate that
+# call/type resolution could tie against or mispick. Direct-child check only (locals are
+# already excluded by the compound_statement guard above).
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
+---
+id: c-recovered-variable
+language: C
+role: item
+symbolType: variable
+# `c-global-variable` for the swallow-recovery walk only: identical, minus the
+# `not inside compound_statement` guard — a global declaration the parser swallowed
+# into a definition's body IS inside a compound_statement (`PyTypeObject _PyNone_Type
+# = { … }` after the `_PyObject_GetAttrId` swallow). The walk itself supplies the
+# scope discipline this guard encoded: it matches only from the floor on, only at
+# top-level shape (never inside the function-shaped wreckage or a lifted body), so a
+# local can never reach this rule. See `SerializableItemRule::recovery_only`.
+recoveryOnly: true
+rule:
+  all:
+    - kind: declaration
+    - has:
+        field: declarator
+        any:
+          - kind: identifier
+            pattern: $NAME
+          - has:
+              kind: identifier
+              stopBy: end
+              pattern: $NAME
+    - not:
+        has:
+          field: declarator
+          any:
+            - kind: function_declarator
+            - has:
+                kind: function_declarator
+                stopBy: end
+    - not:
+        has:
+          field: type
+          any:
+            - all:
+                - kind: struct_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: union_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: enum_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: enumerator_list }
+name: $NAME
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
+---
+id: c-struct-field
+language: C
+role: member
+parentRuleIds: [c-struct, c-union]
+symbolType: field
+# The name is the field identifier inside the declarator, descending through
+# pointer/array/function-pointer wrappers — binding the whole declarator produced
+# `*allocation`, `buf[4]`, and `(*cb)(int)`.
+rule:
+  kind: field_declaration
+  has:
+    field: declarator
+    any:
+      - kind: field_identifier
+        pattern: $NAME
+      - has:
+          kind: field_identifier
+          stopBy: end
+          pattern: $NAME
+name: $NAME
+isPublic: true
+---
+id: c-enum-member
+language: C
+role: member
+parentRuleIds: [c-enum]
+symbolType: enumMember
+rule:
+  kind: enumerator
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic: true
+---
+id: c-macro
+language: C
+role: item
+symbolType: macro
+# Object-like macro: `#define NAME …` — the preprocessor layer is definition
+# surface too (extraction-coverage campaign: the kernel alone holds ~6.1M of
+# these). Header macros are the C API contract; hiding them hid real symbols.
+rule:
+  kind: preproc_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: c-macro-function
+language: C
+role: item
+symbolType: macro
+# Function-like macro: `#define MAX(a, b) …` — callable surface (`container_of`,
+# `list_for_each_entry`, …); call resolution treats its invocations like calls.
+rule:
+  kind: preproc_function_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: c-typedef
+language: C
+role: item
+symbolType: typeAlias
+# `typedef … name;` — the name is the type identifier reached by descending the
+# declarator chain (pointer/array/function-pointer wrappers), the c-function
+# discipline.
+rule:
+  kind: type_definition
+  all:
+    - has:
+        field: declarator
+        any:
+          - kind: type_identifier
+            pattern: $NAME
+          - has:
+              kind: type_identifier
+              stopBy: end
+              pattern: $NAME
+    # A body-bearing record/enum under typedef is that record's DEFINITION —
+    # extracted by the struct/union/enum rules, which the traversal reaches
+    # once this rule declines. Only bodyless forms (`typedef struct Foo Bar;`,
+    # `typedef int u32;`) are aliases.
+    - not:
+        has:
+          field: type
+          any:
+            - kind: struct_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: union_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: enum_specifier
+              has:
+                field: body
+                kind: enumerator_list
+name: $NAME
+isExported: true

@@ -34,6 +34,7 @@ pub mod harness;
 pub mod headroom;
 pub mod host;
 pub mod hub;
+pub mod identities;
 pub mod install;
 pub mod install_targets;
 pub mod instances;

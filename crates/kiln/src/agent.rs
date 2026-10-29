@@ -1048,13 +1048,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it, and whether this server takes it.
     let mut headroom_sent: Option<String> = None;
     let mut server_headroom = false;
-    let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
+    let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
     // A test build's faults: frames lost, sent twice or sent late below the channel, which it
     // makes up for.
     if let Some(c) = crate::runner::chaos::get() {
         net.command(net::Out::Seed(c.seed)).await;
         for rule in c.faults.iter().copied() {
             net.command(net::Out::Shed(rule)).await;
+        }
+        // And what it sends, copied for a test to read (W27-R02).
+        if let Some(path) = &c.copy {
+            net.command(net::Out::Copy(path.clone())).await;
         }
     }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
@@ -1241,6 +1245,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     let mut server_work = false;
     let mut work_said: Option<(u64, Instant)> = None;
+    // The server issues identities (docs/ci.md W27-R01): this process's sessions' epochs, and
+    // when each identity was last asked for.
+    let mut server_identity = false;
+    let mut session_epochs: HashMap<String, u64> = HashMap::new();
+    let mut identity_asked: HashMap<String, Instant> = HashMap::new();
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
@@ -2012,7 +2021,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | headroom_cap }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2087,6 +2096,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 drops_said = None;
                 server_work = false;
                 work_said = None;
+                server_identity = false;
                 server_limit = false;
                 limit_said = None;
                 if let Some(s) = &sync {
@@ -2174,6 +2184,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
                     }
                     ServerMsg::Caps { caps } => {
+                        // An identity of this process's own, for a key it made and keeps, certified
+                        // on each connection (docs/ci.md W27-R01).
+                        server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
+                        if server_identity {
+                            match crate::runner::identity::ask("runner", None, None) {
+                                Ok(json) => {
+                                    uplink.0.send(Up::Term(AgentMsg::Identity { json })).await.ok();
+                                }
+                                Err(e) => tracing::warn!(error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                            // And each agent session it holds, at its epoch.
+                            for info in harness.as_ref().map(|h| h.list()).unwrap_or_default() {
+                                session_epochs.insert(info.id.clone(), info.epoch);
+                                ask_agent_identity(&uplink, &mut identity_asked, &info.id, info.epoch).await;
+                            }
+                        }
                         server_wire = caps & proto::CAP_WIRE != 0;
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
@@ -2585,6 +2611,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 tracing::debug!(error = %e, "unreadable agent session command");
                                 refuse(&mut answer_after, Refusal::Malformed, format!("{e}"));
                             }
+                        }
+                    }
+                    // A certificate for a key this process holds (docs/ci.md W27-R01).
+                    ServerMsg::Identity { json } => {
+                        let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
+                        if let Err(e) = crate::runner::identity::given(&json, &o.state_dir, &label) {
+                            tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
                     }
                     // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
@@ -3019,6 +3052,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if o.ephemeral {
                             served_dedicated = true;
                         }
+                        // The leg's own identity: a key made here, outside anything its steps can
+                        // reach (docs/ci.md W27-R01).
+                        if server_identity {
+                            match crate::runner::identity::ask("leg", Some(&id), None) {
+                                Ok(json) => uplink.msg(AgentMsg::Identity { json }).await,
+                                Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                        }
                         // A new attempt: its events count from one.
                         journal.remove(&id);
                         unreceived.remove(&id);
@@ -3333,6 +3374,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Harness(session, u) => {
                 note_announced(&mut announced, &session, &u);
+                // Each session this process holds has an identity at its epoch, asked for until it
+                // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
+                match &u {
+                    crate::harness::core::Update::Open { info, .. } => {
+                        session_epochs.insert(session.clone(), info.epoch);
+                    }
+                    crate::harness::core::Update::Closed => {
+                        session_epochs.remove(&session);
+                        crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
+                    }
+                    _ => {}
+                }
+                if server_identity
+                    && connected
+                    && let Some(epoch) = session_epochs.get(&session).copied()
+                {
+                    ask_agent_identity(&uplink, &mut identity_asked, &session, epoch).await;
+                }
                 if updates_on {
                     // Over the channel: kept until the server has it, down or not. A new session's
                     // stream starts with its Open; a closed one's ends once answered.
@@ -3375,6 +3434,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 if jobs.remove(&r.job).is_some() {
                     crate::runner::cpus::pins().release(&r.job);
+                    // The leg's key goes with it (docs/ci.md W27-R01).
+                    crate::runner::identity::forget(&crate::runner::identity::slot("leg", Some(&r.job), None));
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
                     if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
                         unreceived.insert(r.job.clone(), (Instant::now(), b));
@@ -3603,6 +3664,23 @@ fn note_announced(announced: &mut std::collections::HashSet<String>, session: &s
 }
 
 /// Sends what the channel has to send now.
+/// Asks for agent session `session`'s identity at `epoch` (docs/ci.md W27-R01), unless this
+/// process holds one or asked in the last 5 s: a session kiln hasn't heard of yet is refused, and
+/// asked for again as it goes on.
+async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, Instant>, session: &str, epoch: u64) {
+    let slot = crate::runner::identity::slot("agent", Some(session), Some(epoch));
+    if crate::runner::identity::cert(&slot).is_some() || asked.get(&slot).is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+        return;
+    }
+    asked.insert(slot, Instant::now());
+    match crate::runner::identity::ask("agent", Some(session), Some(epoch)) {
+        Ok(json) => {
+            uplink.0.send(Up::Term(AgentMsg::Identity { json })).await.ok();
+        }
+        Err(e) => tracing::warn!(session = %session, error = %format!("{e:#}"), "no identity asked for"),
+    }
+}
+
 async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Uplink) {
     for f in updates.poll(Instant::now()) {
         uplink.0.send(Up::Term(AgentMsg::Wire(f))).await.ok();

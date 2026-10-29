@@ -307,6 +307,35 @@ pub fn parent_pid() -> u32 {
     std::os::unix::process::parent_id()
 }
 
+/// While `on`, this process's memory is kept from its user's other processes (docs/ci.md W27-R02,
+/// a CI leg's key in it, out of its steps' reach): on Linux it isn't dumpable meanwhile, so neither
+/// ptrace nor `/proc/<pid>/mem` (nor `environ`, `fd` or `exe` there) reaches it, whatever Yama's
+/// ptrace scope. Off, it's dumpable again, unless it wasn't before. macOS keeps a process's memory
+/// from its user's others already: `task_for_pid` is refused them.
+#[cfg(target_os = "linux")]
+pub fn private_memory(on: bool) -> io::Result<()> {
+    use rustix::process::{DumpableBehavior, dumpable_behavior, set_dumpable_behavior};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Whether this made it undumpable (so may make it dumpable again).
+    static MADE: AtomicBool = AtomicBool::new(false);
+    if on {
+        if dumpable_behavior()? == DumpableBehavior::Dumpable {
+            set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
+            MADE.store(true, Ordering::SeqCst);
+        }
+    } else if MADE.swap(false, Ordering::SeqCst) {
+        set_dumpable_behavior(DumpableBehavior::Dumpable)?;
+    }
+    Ok(())
+}
+
+/// While `on`, this process's memory is kept from its user's other processes: macOS does so
+/// already (`task_for_pid` is refused them).
+#[cfg(not(target_os = "linux"))]
+pub fn private_memory(_on: bool) -> io::Result<()> {
+    Ok(())
+}
+
 /// Whether `pid` is still running (and signalable by us). A zombie (dead, not yet reaped) is not.
 pub fn pid_alive(pid: u32) -> bool {
     i32::try_from(pid).is_ok_and(|p| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok()) && !is_zombie(pid)

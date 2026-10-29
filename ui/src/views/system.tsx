@@ -87,7 +87,7 @@ export default function System() {
     <div ref={arrived} className="container-console page">
       <title>System · kiln</title>
       <PageIntro
-        index={9}
+        index={8}
         label="System"
         title="System"
         lead="kiln runs every subsystem under an Erlang-style supervisor; `kiln supervise` restarts the whole server with backoff. Generation increments on each process restart."
