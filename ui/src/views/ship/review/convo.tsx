@@ -5,19 +5,33 @@
  * its author's mark and the signature's shield as the mockup draws them (Ship's mockups plan, step 13).
  */
 import * as React from "react";
-import { ShieldCheck } from "lucide-react";
+import { Copy, MoreHorizontal, Quote, Reply, ShieldCheck } from "lucide-react";
 import type { Thread } from "@/api/review";
 import { whoSaid } from "@/api/review";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { relativeTime } from "@/lib/format";
 import { CommentText } from "./comment";
 import { ReviewComposer } from "./composer";
+import { draftKey, useDraftSet } from "./draft";
 import type { LinesOf, Ops } from "./ops";
 import { ThreadView } from "./threads";
 import "./review.css";
 
-/** The change's description, its first entry. */
-export function Description({ author, title, body, at }: { author: string; title?: string; body: string; at?: number }) {
+/**
+ * The change's description, its first entry, its line a comment's: who, the shield, when, and ⋯
+ * with what the mockup gives a comment that isn't yours (Ship's mockups plan, step 13): Reply and
+ * Quote go to the Conversation's comment box (Quote into its draft, as a thread's does), where it
+ * has one (`item`: a change's; a lone commit's has none); Copy takes its markdown.
+ */
+export function Description({ item, author, title, body, at }: { item?: string; author: string; title?: string; body: string; at?: number }) {
+  const [menu, setMenu] = React.useState(false);
+  const setBox = useDraftSet(draftKey({ item: item ?? "" }));
+  const boxOf = (from: HTMLElement) => from.closest(".rv-convo")?.querySelector<HTMLTextAreaElement>(".rv-convo-box textarea") ?? null;
+  const icon = (label: string, onClick: (e: React.MouseEvent<HTMLButtonElement>) => void, children: React.ReactNode) => (
+    <button type="button" className="rv-ib" aria-label={label} title={label} onClick={onClick}>
+      {children}
+    </button>
+  );
   return (
     <li className="rv-m" data-who={author.startsWith("agent:") ? "agent" : "person"}>
       <div className="rv-meta">
@@ -31,7 +45,36 @@ export function Description({ author, title, body, at }: { author: string; title
           </span>
         </span>
         {at != null && <span className="rv-when">{relativeTime(at)}</span>}
+        <button type="button" className="rv-ib rv-dots" aria-label="Description actions" aria-expanded={menu} onClick={() => setMenu(!menu)}>
+          <MoreHorizontal size={15} aria-hidden="true" />
+        </button>
       </div>
+      {menu && (
+        <div className="rv-menu" role="menu" aria-label="Description actions">
+          {item != null &&
+            icon(
+              "Reply",
+              (e) => {
+                const box = boxOf(e.currentTarget);
+                setMenu(false);
+                box?.focus();
+              },
+              <Reply size={14} aria-hidden="true" />,
+            )}
+          {icon("Copy", () => void navigator.clipboard?.writeText(body).catch(() => {}), <Copy size={14} aria-hidden="true" />)}
+          {item != null &&
+            icon(
+              "Quote",
+              (e) => {
+                const box = boxOf(e.currentTarget);
+                setBox((was) => (was.trim() ? `${was.replace(/\n+$/, "")}\n\n> ${body}\n\n` : `> ${body}\n\n`));
+                setMenu(false);
+                box?.focus();
+              },
+              <Quote size={14} aria-hidden="true" />,
+            )}
+        </div>
+      )}
       {title && <p className="rv-title">{title}</p>}
       <div className="rv-body">
         <CommentText body={body || "No description."} />

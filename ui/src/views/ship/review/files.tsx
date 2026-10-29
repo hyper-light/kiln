@@ -326,7 +326,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
           draft={draft?.kind === "reply" ? draft.thread : null}
           setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}
         >
-          <Description author={d.author} title={d.title} body={d.summary} at={d.created_at} />
+          <Description item={fullOps.item} author={d.author} title={d.title} body={d.summary} at={d.created_at} />
         </Conversation>
       }
     >
@@ -411,7 +411,7 @@ function HostFiles({ item }: { item: ShipCommit }) {
           draft={draft?.kind === "reply" ? draft.thread : null}
           setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}
         >
-          <Description author={pull.author} title={pull.title} body={pull.body} at={pull.updated_at ?? undefined} />
+          <Description item={fullOps.item} author={pull.author} title={pull.title} body={pull.body} at={pull.updated_at ?? undefined} />
         </Conversation>
       }
     >

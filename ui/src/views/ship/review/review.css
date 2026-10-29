@@ -302,7 +302,7 @@
   color: #eceef2;
 }
 /* Its send as the mockup draws it: round, its icon alone (Ship's mockups plan, step 13). */
-.rvc .rv-send {
+.rvc .cp-send {
   justify-content: center;
   width: 32px;
   height: 32px;
@@ -312,7 +312,7 @@
   color: #111214;
   transition: transform 0.15s;
 }
-.rvc .rv-send:active:not(:disabled) {
+.rvc .cp-send:active:not(:disabled) {
   transform: scale(0.94);
 }
 .rvc-error {
@@ -446,11 +446,11 @@
 /* Files' count in the head's right, in body text, as the mockup draws it (Ship's mockups plan, step 12). */
 .rv-sum {
   font-family: var(--font-sans);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
-  color: #a1a4ad;
+  color: #e4e5e7;
 }
 .rv-bar {
   display: flex;

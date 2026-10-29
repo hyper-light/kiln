@@ -121,7 +121,7 @@ export function ReviewComposer({
               <X size={15} aria-hidden="true" />
             </button>
           )}
-          <button type="button" className="cp-send rv-send" disabled={!body || sending} aria-label={sendLabel} aria-busy={sending || undefined} title={sending ? "Sending…" : sendLabel} onClick={send}>
+          <button type="button" className="cp-send" disabled={!body || sending} aria-label={sendLabel} aria-busy={sending || undefined} title={sending ? "Sending…" : sendLabel} onClick={send}>
             <Send size={15} aria-hidden="true" />
           </button>
         </div>
