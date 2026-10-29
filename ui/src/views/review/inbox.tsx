@@ -21,7 +21,7 @@ export default function InboxPage() {
     <div className="container-console page rv-page">
       <title>Review · kiln</title>
       <PageIntro
-        index={4}
+        index={3}
         label="Repositories / Review"
         title="Review."
         lead="Diffs and change requests: what waits on you, and where yours stand."

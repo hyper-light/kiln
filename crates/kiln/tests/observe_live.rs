@@ -1,0 +1,2147 @@
+//! docs/observe.md §13: the observe group live. A kiln server and two runners run as processes of
+//! their own on this machine, on real sockets and disks, each with a home of its own and a clean
+//! environment; they are killed (SIGKILL: nothing flushed, nothing said) and started again, and a
+//! runner that was away while the group compacted takes an image whose files it fetches over HTTP.
+//! What the scenario proves is what the API answers, and that every replica holds the same: the
+//! full digest of each (every sample, every record) at one index of the log.
+//!
+//! It starts real processes, so it is not run by default:
+//! `cargo test -p kiln --test observe_live -- --ignored --nocapture`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
+use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+mod common;
+use common::{Fleet, Got, Mock, Service, at, file_url, now_ms, param, raw};
+
+#[test]
+#[ignore = "starts a kiln server and two runners as processes"]
+fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyhow::Result<()> {
+    let mut f = Fleet::new()?;
+    let s = f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["role"]) == "server" && at(s, &["leader"]) == 1)?;
+    anyhow::ensure!(*at(&s, &["voters"]) == json!([1]), "the server alone votes: {s}");
+    let now = crate_now();
+    // On the query's grid (10 s), so the buckets are the points.
+    let t0 = (now - 600_000) / 10_000 * 10_000;
+    // Points before any runner: the server takes them alone.
+    f.write("e2e.temp", &["a", "b", "c"], t0, 30, |h, i| f64::from(h.bytes().next().unwrap_or(0)) + i as f64 / 4.0)?;
+    let want = |hosts: &[&str], n: i64| -> BTreeMap<String, Vec<Option<f64>>> { hosts.iter().map(|h| ((*h).to_owned(), (0..n).map(|i| Some(f64::from(h.bytes().next().unwrap_or(0)) + i as f64 / 4.0)).collect())).collect() };
+    let read = |f: &Fleet| f.query("avg:e2e.temp{*} by {host}", t0, t0 + 300_000 - 1);
+    let start = Instant::now();
+    while read(&f)? != want(&["a", "b", "c"], 30) {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "the points never read back: {:?}\n{}", read(&f)?, f.logs());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Two runners join: each a learner, each catching up from the log.
+    f.start_runner("r1")?;
+    f.start_runner("r2")?;
+    f.until_caught_up(Duration::from_secs(60), "both runners caught up", &["r1", "r2"])?;
+    // Their own figures came through their own writes (runner → server → group).
+    let start = Instant::now();
+    loop {
+        let names = f.call("GET", "/api/observe/v1/metrics?match=kiln.process.*", None)?;
+        let hosts = f.call("GET", "/api/observe/v1/tags?key=host", None)?;
+        let has = |v: &Value, x: &str| v.as_array().is_some_and(|a| a.iter().any(|y| y == x));
+        if has(at(&names, &["metrics"]), "kiln.process.rss_bytes") && has(at(&hosts, &["values"]), "r1") && has(at(&hosts, &["values"]), "r2") {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "runners' own writes never arrived: {names} {hosts}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Logs, searched newest first.
+    let recs: Vec<Value> = (0..200).map(|i| json!({ "message": format!("request {i} {}", if i % 10 == 0 { "failed: connection reset" } else { "ok" }), "timestamp": t0 + i * 1000, "status": if i % 10 == 0 { "error" } else { "info" }, "service": "e2e", "hostname": "a" })).collect();
+    f.call("POST", "/api/observe/v1/logs", Some(&Value::Array(recs)))?;
+    let start = Instant::now();
+    loop {
+        let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "service:e2e status:error \"connection reset\"", "from": t0, "to": now, "limit": 3 })))?;
+        let msgs: Vec<&str> = at(&found, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str()).collect();
+        if msgs == ["request 190 failed: connection reset", "request 180 failed: connection reset", "request 170 failed: connection reset"] {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "the log search answered {found}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    f.until_caught_up(Duration::from_secs(30), "both runners hold the logs too", &["r1", "r2"])?;
+
+    // OTLP: the specification's own JSON example, gzip, to the server with the ingest token.
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    let example = include_str!("../src/observe/fixtures/otlp-metrics.json");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(example.as_bytes())?;
+    let gz = gz.finish()?;
+    let (code, body) = raw(f.http, "POST", "/v1/metrics", &format!("Authorization: Bearer {ingest}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\n"), &gz)?;
+    anyhow::ensure!(code == 200 && body == b"{}", "OTLP/JSON: {code} {}", String::from_utf8_lossy(&body));
+    let (code, _) = raw(f.http, "POST", "/v1/metrics", "Authorization: Bearer wrong\r\nContent-Type: application/json\r\n", example.as_bytes())?;
+    anyhow::ensure!(code == 401, "a wrong token: {code}");
+    let (code, _) = raw(f.http, "POST", "/v1/metrics", &format!("Authorization: Bearer {ingest}\r\nContent-Type: application/x-protobuf\r\n"), &[0x0a, 0xff, 0x01])?;
+    anyhow::ensure!(code == 400, "a malformed body: {code}");
+    // The example's points are of 2018: past the samples' cutoff? No: 455 days is 15 months, and
+    // 2018 is older. They are taken and dropped as expired, alike everywhere; its names are not
+    // listed. Points of now, in protobuf, to a runner's own receiver, come through it.
+    let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    let now_ns = u64::try_from(crate_now()).unwrap_or(0) * 1_000_000;
+    let mut req = kiln_obs::otlp::pb::Writer::default();
+    req.message(1, |rl| {
+        rl.message(1, |res| {
+            res.message(1, |kv| {
+                kv.str(1, "service.name");
+                kv.message(2, |v| v.str(1, "checkout"));
+            });
+        });
+        rl.message(2, |sl| {
+            sl.message(2, |m| {
+                m.str(1, "e2e.otlp.requests");
+                m.message(5, |g| {
+                    g.message(1, |p| {
+                        p.fixed64(3, now_ns);
+                        p.double(4, 42.0);
+                    });
+                });
+            });
+        });
+    });
+    let (code, _) = raw(r1, "POST", "/v1/metrics", "Content-Type: application/x-protobuf\r\n", &req.buf)?;
+    anyhow::ensure!(code == 200, "the runner's receiver: {code}");
+    let mut logs = kiln_obs::otlp::pb::Writer::default();
+    logs.message(1, |rl| {
+        rl.message(2, |sl| {
+            sl.message(2, |r| {
+                r.fixed64(1, now_ns);
+                r.varint(2, 17);
+                r.message(5, |b| b.str(1, "otlp from an app on r1"));
+            });
+        });
+    });
+    let (code, _) = raw(r1, "POST", "/v1/logs", "Content-Type: application/x-protobuf\r\n", &logs.buf)?;
+    anyhow::ensure!(code == 200, "the runner's log receiver: {code}");
+    let start = Instant::now();
+    loop {
+        let q = f.query("sum:e2e.otlp.requests{service:checkout}", crate_now() - 120_000, crate_now() + 60_000)?;
+        let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "\"otlp from an app\"", "from": crate_now() - 120_000, "to": crate_now() + 60_000, "limit": 5 })))?;
+        let got_log = at(&found, &["records"]).as_array().is_some_and(|a| a.len() == 1);
+        if q.values().any(|v| v.contains(&Some(42.0))) && got_log {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "OTLP through r1 never arrived: {q:?} {found}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    f.until_caught_up(Duration::from_secs(30), "both runners hold the OTLP points too", &["r1", "r2"])?;
+    let (index, digest) = f.verify(3)?;
+    eprintln!("three replicas agree at index {index}: {digest:016x}");
+
+    // r2's process ends at once; writes go on; the leader compacts its log past what r2 holds.
+    f.kill_runner("r2");
+    f.write("e2e.temp", &["a", "b", "c"], t0 + 300_000, 30, |h, i| f64::from(h.bytes().next().unwrap_or(0)) + (i + 30) as f64 / 4.0)?;
+    f.write("e2e.away", &["x"], t0, 60, |_, i| i as f64)?;
+    let s = f.until(Duration::from_secs(30), "r2 seen gone", |s| at(s, &["machines"]).as_array().into_iter().flatten().any(|m| at(m, &["machine"]) == "r2" && at(m, &["up"]).as_bool() == Some(false)))?;
+    let before = at(&s, &["applied"]).as_u64().unwrap_or(0);
+    f.call("POST", "/api/observe/v1/compact", Some(&json!({})))?;
+    f.until(Duration::from_secs(30), "the leader compacted", |s| at(s, &["durable"]).as_u64().unwrap_or(0) >= before)?;
+    f.start_runner("r2")?;
+    f.until_caught_up(Duration::from_secs(120), "r2 back by an image", &["r1", "r2"])?;
+    let r2_store = f.root.path().join("r2").join("state").join("observe").join("store");
+    let blocks = std::fs::read_dir(&r2_store)?.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().ends_with(".block")).count();
+    anyhow::ensure!(blocks > 0, "r2 holds the image's blocks (it never cut on its own)");
+    let (index, digest) = f.verify(3)?;
+    eprintln!("after r2's image: three replicas agree at index {index}: {digest:016x}");
+
+    // The server's process ends at once, and starts again: what it answered, it answers again.
+    let before = read(&f)?;
+    f.kill_server();
+    f.start_server()?;
+    f.until(Duration::from_secs(60), "the server leads again", |s| at(s, &["leader"]) == 1)?;
+    let start = Instant::now();
+    while read(&f)? != before {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "after the server's restart it answers {:?}, before {before:?}", read(&f)?);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    f.write("e2e.temp", &["d"], t0, 30, |h, i| f64::from(h.bytes().next().unwrap_or(0)) + i as f64 / 4.0)?;
+    f.until_caught_up(Duration::from_secs(60), "both runners caught up after the server's restart", &["r1", "r2"])?;
+    let (index, digest) = f.verify(3)?;
+    eprintln!("after the server's restart: three replicas agree at index {index}: {digest:016x}");
+    let members = f.members(&f.status()?);
+    anyhow::ensure!(members.len() == 2 && members.values().all(|&m| m >= 2), "each runner kept its member: {members:?}");
+    Ok(())
+}
+
+fn crate_now() -> i64 {
+    i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)).unwrap_or(0)
+}
+
+fn git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let out = Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=kiln", "-c", "user.email=kiln@example.invalid", "-c", "commit.gpgsign=false"]).args(args).output()?;
+    anyhow::ensure!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}
+
+/// A CI run, by hand, of a job that passes and one after it that fails: each job's end a point of
+/// each metric and an event; the run a trace (Datadog's CI visibility's model: the run its root,
+/// each job a span under it, each step under its job, failures marked) found by its spans and read
+/// as a waterfall draws it; a trace analytics monitor of failed CI spans by resource alerting on
+/// those alone.
+#[test]
+#[ignore = "starts a kiln server and a runner as processes, and runs a CI job"]
+fn a_ci_run_is_in_the_metrics_the_events_and_a_trace_a_span_monitor_watches() -> anyhow::Result<()> {
+    // A repository on disk, with a pipeline of two jobs, the second failing, run by hand.
+    let repo_dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(repo_dir.path().join(".kiln"))?;
+    std::fs::write(
+        repo_dir.path().join(".kiln/ci.yaml"),
+        "name: ci\non:\n  manual: true\njobs:\n  hello:\n    runs-on: [baremetal]\n    steps:\n      - name: say\n        run: echo hello from e2e\n  broken:\n    needs: [hello]\n    runs-on: [baremetal]\n    steps:\n      - name: fail\n        run: exit 3\n",
+    )?;
+    git(repo_dir.path(), &["init", "-q", "-b", "main"])?;
+    git(repo_dir.path(), &["add", "."])?;
+    git(repo_dir.path(), &["commit", "-q", "-m", "a pipeline"])?;
+    let url = file_url(repo_dir.path());
+    let mut f = Fleet::with(|_| format!("[[repos]]\nname = \"e2e\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 2\n"))?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    f.start_runner("r1")?;
+    f.until_caught_up(Duration::from_secs(60), "r1 caught up", &["r1"])?;
+    // CI's failures by resource, watched as Datadog's trace analytics monitors watch spans.
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({ "name": "e2e ci failures", "type": "trace-analytics alert", "query": "trace-analytics(\"service:kiln.ci status:error\").by(\"resource_name\").last(\"15m\") > 0", "message": "{{resource_name.name}} failed", "options": { "every": 10, "thresholds": { "critical": 0 } } })),
+    )?;
+    let monitor = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let start = Instant::now();
+    let id = loop {
+        let repos = f.call("GET", "/api/repos", None)?;
+        if let Some(id) = repos.as_array().into_iter().flatten().find(|r| at(r, &["name"]) == "e2e").and_then(|r| at(r, &["id"]).as_str().map(str::to_owned)) {
+            break id;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the repository never appeared: {repos}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let start = Instant::now();
+    loop {
+        // The first poll records the branch; the trigger takes it after.
+        if f.call("POST", &format!("/api/repos/{id}/trigger"), Some(&json!({ "branch": "main", "pipeline": "ci" }))).is_ok() {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the pipeline never triggered\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // The job runs on r1; its end is a point of each metric and an event.
+    let start = Instant::now();
+    loop {
+        let now = crate_now();
+        let jobs = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:kiln.ci.jobs.finished{repo:e2e} by {job,status,runner}.as_count()", "from": now - 600_000, "to": now + 60_000, "step": 60_000 })))?;
+        let events = f.call(
+            "POST",
+            "/api/observe/v1/logs/search",
+            Some(&json!({ "query": "source:kiln.event @event.type:ci.job.finished @repo:e2e @job:hello", "from": now - 600_000, "to": now + 60_000, "limit": 5 })),
+        )?;
+        let series = at(&jobs, &["series"]).as_array().cloned().unwrap_or_default();
+        let one = series.iter().any(|s| at(s, &["tags", "job"]) == "hello" && at(s, &["tags", "runner"]) == "r1" && at(s, &["tags", "status"]) == "succeeded" && at(s, &["values"]).as_array().is_some_and(|v| v.iter().filter_map(Value::as_f64).sum::<f64>() == 1.0));
+        let event = at(&events, &["records"]).as_array().and_then(|a| a.first()).cloned();
+        if one && let Some(e) = event {
+            anyhow::ensure!(at(&e, &["service"]) == "kiln.ci" && at(&e, &["host"]) == "r1" && at(&e, &["attributes", "job"]) == "hello", "the event: {e}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(120), "the job's metrics and event never came: {jobs} {events}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let d = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "max:kiln.ci.job.duration{repo:e2e,job:hello}", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "step": 60_000 })))?;
+    anyhow::ensure!(at(&d, &["series"]).as_array().is_some_and(|s| !s.is_empty()), "the job's duration: {d}");
+
+    // The run, a trace: its root found among CI's spans (the run's, as it ended), then read whole.
+    let start = Instant::now();
+    let trace = loop {
+        let now = crate_now();
+        let roots = f.call(
+            "POST",
+            "/api/observe/v1/spans/search",
+            Some(&json!({ "query": "service:kiln.ci @ci.provider.name:kiln @git.repository:e2e", "from": now - 600_000, "to": now + 60_000, "limit": 5 })),
+        )?;
+        if let Some(t) = at(&roots, &["spans"]).as_array().and_then(|r| r.first()).and_then(|r| at(r, &["trace_id"]).as_str().map(str::to_owned)) {
+            break t;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(120), "the run's span never came: {roots}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let t = f.call("GET", &format!("/api/observe/v1/traces/{trace}"), None)?;
+    let placed = at(&t, &["spans"]).as_array().cloned().unwrap_or_default();
+    let attr = |s: &Value, k: &str| at(s, &["attributes", k]).as_str().unwrap_or("").to_owned();
+    let names: Vec<(String, u64, String)> =
+        placed.iter().map(|s| (at(s, &["resource_name"]).as_str().unwrap_or("").to_owned(), at(s, &["depth"]).as_u64().unwrap_or(99), at(s, &["status"]).as_str().unwrap_or("").to_owned())).collect();
+    let want: Vec<(String, u64, String)> =
+        [("ci", 0, "error"), ("hello", 1, "info"), ("say", 2, "info"), ("broken", 1, "error"), ("fail", 2, "error")].iter().map(|(n, d, s)| ((*n).to_owned(), *d, (*s).to_owned())).collect();
+    let (mut sorted_got, mut sorted_want) = (names.clone(), want.clone());
+    sorted_got.sort();
+    sorted_want.sort();
+    anyhow::ensure!(sorted_got == sorted_want, "the run's spans: {names:?}\n{t}");
+    anyhow::ensure!(at(&t, &["roots"]) == 1 && at(&t, &["errors"]) == 3 && at(&t, &["root", "service"]) == "kiln.ci" && at(&t, &["root", "resource_name"]) == "ci", "the trace: {t}");
+    // Each step under its job, each job under the run; the run's and the failing job's say why.
+    let index = |n: &str| names.iter().position(|(x, _, _)| x == n);
+    let parent_of = |n: &str| index(n).and_then(|i| placed.get(i)).and_then(|s| at(s, &["parent"]).as_u64()).and_then(|p| usize::try_from(p).ok());
+    anyhow::ensure!(
+        parent_of("say") == index("hello") && parent_of("fail") == index("broken") && parent_of("hello") == index("ci") && parent_of("broken") == index("ci") && parent_of("ci").is_none(),
+        "each span its parent's child: {names:?}"
+    );
+    let span = |n: &str| index(n).and_then(|i| placed.get(i)).cloned().unwrap_or(Value::Null);
+    anyhow::ensure!(
+        attr(&span("broken"), "ci.status") == "failed" && attr(&span("broken"), "error.message").contains("step 1") && attr(&span("fail"), "exit_code") == "3" && attr(&span("fail"), "ci.status") == "failed",
+        "the failing job and step: {} {}",
+        span("broken"),
+        span("fail")
+    );
+    anyhow::ensure!(attr(&span("ci"), "ci.status") == "failed" && attr(&span("ci"), "git.branch") == "main" && attr(&span("hello"), "runner") == "r1", "the run: {}", span("ci"));
+    let offsets: Vec<i64> = placed.iter().filter_map(|s| at(s, &["offset_ns"]).as_i64()).collect();
+    anyhow::ensure!(offsets.len() == 5 && offsets.iter().all(|o| *o >= 0) && at(&span("ci"), &["offset_ns"]) == 0, "the waterfall's offsets: {offsets:?}");
+    // The monitor: an alert for each failed span's resource, and none for what passed.
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{monitor}"), None)?;
+        let alerting: BTreeSet<String> = at(&m, &["groups"])
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|g| at(g, &["state"]) == "ALERT")
+            .filter_map(|g| at(g, &["group"]).as_array().and_then(|kv| kv.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        if alerting == BTreeSet::from(["ci".to_owned(), "broken".to_owned(), "fail".to_owned()]) {
+            anyhow::ensure!(at(&m, &["state"]) == "ALERT", "the monitor: {m}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the monitor's alerts: {alerting:?} {m}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // kiln's registry, as Prometheus scraped it (once, as the server started: the families it had
+    // then), with the families observe reports itself left out.
+    let names = f.call("GET", "/api/observe/v1/metrics?match=kiln_*", None)?;
+    let listed = |n: &str| at(&names, &["metrics"]).as_array().is_some_and(|a| a.iter().any(|x| x == n));
+    anyhow::ensure!(listed("kiln_runs_started_total") && listed("kiln_job_duration_seconds_bucket") && !listed("kiln_agent_cpu_percent"), "the registry's families: {names}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "starts a kiln server as a process, and services for it to notify"]
+fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    // The webhook refuses its first delivery (429, Retry-After 1): it is tried again.
+    let mock = Mock::start(&[("/hook", 1)])?;
+    for (name, body) in [
+        ("ops", json!({ "kind": "slack", "url": mock.url("/slack") })),
+        ("ops-d", json!({ "kind": "discord", "url": mock.url("/discord") })),
+        ("ops-t", json!({ "kind": "teams", "url": mock.url("/teams") })),
+        ("oncall", json!({ "kind": "pagerduty", "routing_key": "R0UT1NGKEY", "url": mock.url("/pagerduty") })),
+        ("deploys", json!({ "kind": "webhook", "url": mock.url("/hook"), "secret": "s3cret" })),
+        ("ops-g", json!({ "kind": "opsgenie", "api_key": "G3N13K3Y", "url": mock.url("/opsgenie") })),
+    ] {
+        let (code, b) = f.request("PUT", &format!("/api/observe/v1/integrations/{name}"), Some(&body))?;
+        anyhow::ensure!(code == 204, "integration {name}: {code} {}", String::from_utf8_lossy(&b));
+    }
+    let listed = f.call("GET", "/api/observe/v1/integrations", None)?;
+    anyhow::ensure!(!listed.to_string().contains("R0UT1NGKEY") && !listed.to_string().contains("s3cret") && !listed.to_string().contains("G3N13K3Y"), "secrets are never shown: {listed}");
+    let bad = f.call("POST", "/api/observe/v1/monitors/validate", Some(&json!({ "query": "avg(last_5m):avg:x{*}" })))?;
+    anyhow::ensure!(at(&bad, &["ok"]).as_bool() == Some(false), "a query without a comparison: {bad}");
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e temp high",
+            "query": "last(last_1m):max:e2e.temp{*} by {host} > 100",
+            "message": "{{#is_alert}}temp on {{host.name}} is {{value}} @slack-ops @discord-ops-d @teams-ops-t @pagerduty-oncall @webhook-deploys @opsgenie-ops-g{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @slack-ops @pagerduty-oncall @webhook-deploys @opsgenie-ops-g{{/is_recovery}}",
+            "options": { "every": 10, "thresholds": { "critical": 100 } },
+            "tags": ["team:e2e"],
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let hot = |f: &Fleet, v: f64| -> anyhow::Result<()> {
+        let now = crate_now();
+        f.write("e2e.temp", &["a"], now - 50_000, 6, |_, _| v)
+    };
+    // Hot: every integration hears of it.
+    hot(&f, 150.0)?;
+    let start = Instant::now();
+    while ["/slack", "/discord", "/teams", "/pagerduty", "/hook", "/opsgenie/v2/alerts"].iter().any(|p| mock.at(p).is_empty()) {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "not every integration heard: {:?}\n{}", mock.got.lock().map(|g| g.iter().map(|x| x.path.clone()).collect::<Vec<_>>()).unwrap_or_default(), f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let slack = mock.at("/slack").first().map(Got::json).unwrap_or_default();
+    anyhow::ensure!(at(&slack, &["text"]).as_str().is_some_and(|t| t.contains("[Triggered] e2e temp high on host:a") && t.contains("150")), "slack: {slack}");
+    let discord = mock.at("/discord").first().map(Got::json).unwrap_or_default();
+    let embed = at(&discord, &["embeds"]).as_array().and_then(|e| e.first()).cloned().unwrap_or_default();
+    anyhow::ensure!(at(&embed, &["color"]).as_u64() == Some(0xE0_1E5A) && at(&embed, &["description"]).as_str().is_some_and(|d| d.contains("temp on a is 150") && !d.contains('@')), "discord: {discord}");
+    let pd = mock.at("/pagerduty").first().map(Got::json).unwrap_or_default();
+    anyhow::ensure!(at(&pd, &["event_action"]) == "trigger" && at(&pd, &["routing_key"]) == "R0UT1NGKEY" && at(&pd, &["payload", "severity"]) == "critical" && at(&pd, &["payload", "source"]) == "a", "pagerduty: {pd}");
+    let dedup = at(&pd, &["dedup_key"]).as_str().unwrap_or("").to_owned();
+    // Opsgenie: an alert by its key, aliased as PagerDuty's incident is keyed.
+    let og = mock.at("/opsgenie/v2/alerts").first().cloned().ok_or_else(|| anyhow::anyhow!("opsgenie"))?;
+    anyhow::ensure!(og.header("authorization") == Some("GenieKey G3N13K3Y"), "opsgenie's key: {:?}", og.header("authorization"));
+    let ogj = og.json();
+    anyhow::ensure!(at(&ogj, &["alias"]).as_str() == Some(dedup.as_str()) && at(&ogj, &["priority"]) == "P3" && at(&ogj, &["message"]).as_str().is_some_and(|m| m.starts_with("[Triggered] e2e temp high")), "opsgenie: {ogj}");
+    // The webhook: refused once, delivered on the second try, signed.
+    let start = Instant::now();
+    while mock.at("/hook").len() < 2 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(20), "the webhook was not tried again after its 429");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let hook = mock.at("/hook").last().cloned().ok_or_else(|| anyhow::anyhow!("the webhook"))?;
+    let want = format!("sha256={}", hmac_sha256_hex(b"s3cret", &hook.body));
+    anyhow::ensure!(hook.header("x-kiln-signature") == Some(want.as_str()), "the signature: {:?} want {want}", hook.header("x-kiln-signature"));
+    anyhow::ensure!(at(&hook.json(), &["notice", "state"]) == "ALERT");
+    let state = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+    anyhow::ensure!(at(&state, &["state"]) == "ALERT", "the monitor: {state}");
+    // Cool: it recovers, and PagerDuty's incident is resolved by the same key.
+    hot(&f, 50.0)?;
+    let start = Instant::now();
+    while !mock.at("/pagerduty").iter().any(|g| at(&g.json(), &["event_action"]) == "resolve") {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never recovered\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let resolve = mock.at("/pagerduty").into_iter().map(|g| g.json()).find(|v| at(v, &["event_action"]) == "resolve").unwrap_or_default();
+    anyhow::ensure!(at(&resolve, &["dedup_key"]).as_str() == Some(dedup.as_str()), "resolve: {resolve}");
+    // And Opsgenie's alert closed by its alias.
+    let close = format!("/opsgenie/v2/alerts/{dedup}/close?identifierType=alias");
+    let start = Instant::now();
+    while mock.at(&close).is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "opsgenie's alert never closed: {:?}", mock.got.lock().map(|g| g.iter().map(|x| x.path.clone()).collect::<Vec<_>>()).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(mock.at("/slack").iter().any(|g| at(&g.json(), &["text"]).as_str().is_some_and(|t| t.contains("[Recovered]"))), "slack hears the recovery");
+    anyhow::ensure!(mock.at("/discord").len() == 1, "discord is not named for recoveries");
+    // Muted: it still changes state (an event), and says nothing.
+    f.call("POST", &format!("/api/observe/v1/monitors/{id}/mute"), Some(&json!({})))?;
+    let before = mock.got.lock().map(|g| g.len()).unwrap_or(0);
+    hot(&f, 200.0)?;
+    f.until(Duration::from_secs(60), "the muted monitor alerting", |_| f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).is_ok_and(|m| at(&m, &["state"]) == "ALERT"))?;
+    std::thread::sleep(Duration::from_secs(3));
+    anyhow::ensure!(mock.got.lock().map(|g| g.len()).unwrap_or(0) == before, "a muted monitor notified");
+    let events = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("source:kiln.event @monitor_id:{id} @event.type:monitor.alert"), "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 10 })))?;
+    let alerts: Vec<Value> = at(&events, &["records"]).as_array().cloned().unwrap_or_default();
+    anyhow::ensure!(alerts.len() == 2 && alerts.iter().any(|e| at(e, &["attributes", "muted"]) == "true"), "two alerts, the second muted: {events}");
+    let delivered = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "source:kiln.event @event.type:monitor.notification @result:delivered", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 100 })))?;
+    anyhow::ensure!(at(&delivered, &["records"]).as_array().is_some_and(|a| a.len() >= 8), "every delivery recorded: {delivered}");
+    Ok(())
+}
+
+/// What the Jira stand-in keeps of an issue: its key, its labels, whether it is done, how many
+/// comments it has.
+#[derive(Debug, Clone)]
+struct JiraIssue {
+    key: String,
+    labels: Vec<String>,
+    done: bool,
+    comments: usize,
+}
+
+/// Whether `v` is a document Jira Cloud takes: a `doc` of version 1 of nodes it knows, no text
+/// node empty, no list without items.
+fn adf_ok(v: &Value) -> bool {
+    fn node(v: &Value) -> bool {
+        let content = || v.get("content").and_then(Value::as_array);
+        match v.get("type").and_then(Value::as_str) {
+            Some("text") => v.get("text").and_then(Value::as_str).is_some_and(|t| !t.is_empty()),
+            Some("hardBreak") => true,
+            Some("paragraph") => content().is_some_and(|c| c.iter().all(node)),
+            Some("bulletList" | "listItem") => content().is_some_and(|c| !c.is_empty() && c.iter().all(node)),
+            _ => false,
+        }
+    }
+    v.get("type").and_then(Value::as_str) == Some("doc") && v.get("version").and_then(Value::as_u64) == Some(1) && v.get("content").and_then(Value::as_array).is_some_and(|c| c.iter().all(node))
+}
+
+/// Jira Cloud's REST API 3 as it answers: the account's credentials checked; issues made (the
+/// project and type it has, a summary of one line of 255, a description in Atlassian's document
+/// format, labels without spaces), found by JQL's project and label among those not done, the
+/// newest first, commented on, and moved by their transitions (one of them to done).
+fn jira_cloud(auth: String, issues: std::sync::Arc<std::sync::Mutex<Vec<JiraIssue>>>) -> std::sync::Arc<common::Answer> {
+    std::sync::Arc::new(move |method: &str, got: &Got| -> (u16, String) {
+        if got.header("authorization") != Some(auth.as_str()) {
+            return (401, json!({ "errorMessages": ["You are not authenticated."] }).to_string());
+        }
+        let route = got.path.split('?').next().unwrap_or("");
+        let body = got.json();
+        let mut all = issues.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (method, route) {
+            ("GET", "/rest/api/3/search/jql") => {
+                // The JQL as Jira reads it: the project's issues of the label, those not done alone
+                // when it says so.
+                let jql = param(&got.path, "jql");
+                let label = jql.split("labels = \"").nth(1).and_then(|r| r.split('"').next()).unwrap_or("").to_owned();
+                if !jql.starts_with("project = \"OPS\" AND ") {
+                    return (400, json!({ "errorMessages": [format!("Error in the JQL Query: {jql}")] }).to_string());
+                }
+                let open_only = jql.contains("statusCategory != Done");
+                let found: Vec<Value> = all.iter().rev().filter(|i| (!open_only || !i.done) && i.labels.contains(&label)).take(1).map(|i| json!({ "id": "1", "key": i.key })).collect();
+                (200, json!({ "issues": found, "isLast": true }).to_string())
+            }
+            ("POST", "/rest/api/3/issue") => {
+                let f = at(&body, &["fields"]);
+                let summary = at(f, &["summary"]).as_str().unwrap_or("");
+                let labels: Vec<String> = at(f, &["labels"]).as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+                if at(f, &["project", "key"]) != "OPS" || at(f, &["issuetype", "name"]) != "Task" {
+                    return (400, json!({ "errorMessages": [], "errors": { "issuetype": "Specify a valid issue type" } }).to_string());
+                }
+                if summary.is_empty() || summary.chars().count() > 255 || summary.contains('\n') || !adf_ok(at(f, &["description"])) || labels.iter().any(|l| l.contains(' ')) {
+                    return (400, json!({ "errorMessages": [], "errors": { "description": "Operation value must be an Atlassian Document" } }).to_string());
+                }
+                let key = format!("OPS-{}", all.len() + 1);
+                all.push(JiraIssue { key: key.clone(), labels, done: false, comments: 0 });
+                (201, json!({ "id": format!("1000{}", all.len()), "key": key }).to_string())
+            }
+            _ => {
+                let Some((key, what)) = route.strip_prefix("/rest/api/3/issue/").and_then(|r| r.split_once('/')) else { return (404, String::new()) };
+                let Some(issue) = all.iter_mut().find(|i| i.key == key) else { return (404, json!({ "errorMessages": ["Issue does not exist"] }).to_string()) };
+                match (method, what) {
+                    ("POST", "comment") if adf_ok(at(&body, &["body"])) => {
+                        issue.comments += 1;
+                        (201, json!({ "id": "1" }).to_string())
+                    }
+                    ("GET", "transitions") => (
+                        200,
+                        json!({ "transitions": [{ "id": "21", "to": { "statusCategory": { "key": "indeterminate" } } }, { "id": "31", "to": { "statusCategory": { "key": "done" } } }] }).to_string(),
+                    ),
+                    ("POST", "transitions") => {
+                        issue.done = at(&body, &["transition", "id"]) == "31";
+                        (204, String::new())
+                    }
+                    _ => (400, json!({ "errorMessages": ["not as Jira takes it"] }).to_string()),
+                }
+            }
+        }
+    })
+}
+
+/// What the ServiceNow stand-in keeps of an incident.
+#[derive(Debug, Clone)]
+struct SnowIncident {
+    sys_id: String,
+    number: String,
+    correlation: String,
+    state: String,
+    impact: String,
+    urgency: String,
+    notes: usize,
+    close_code: String,
+}
+
+/// ServiceNow's Table API as it answers: a user's credentials checked; incidents made (a short
+/// description of 160, a correlation id of 100, an impact and urgency of 1 to 3), found by an
+/// encoded query (a correlation id, states not among those given, the newest first), changed by
+/// PATCH, a work note added; resolving one without a close code and notes refused, as its data
+/// policy does.
+fn servicenow(auth: String, incidents: std::sync::Arc<std::sync::Mutex<Vec<SnowIncident>>>) -> std::sync::Arc<common::Answer> {
+    std::sync::Arc::new(move |method: &str, got: &Got| -> (u16, String) {
+        if got.header("authorization") != Some(auth.as_str()) {
+            return (401, json!({ "error": { "message": "User Not Authenticated" }, "status": "failure" }).to_string());
+        }
+        let route = got.path.split('?').next().unwrap_or("");
+        let body = got.json();
+        let text = |k: &str| at(&body, &[k]).as_str().unwrap_or("").to_owned();
+        let mut all = incidents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (method, route) {
+            ("GET", "/api/now/table/incident") => {
+                // The encoded query's terms as an instance reads them: an incident is active until it
+                // is closed or canceled (7, 8), so a resolved one (6) still is.
+                let q = param(&got.path, "sysparm_query");
+                let (mut correlation, mut not_in, mut active) = (None, Vec::new(), None);
+                for term in q.split('^') {
+                    if let Some(v) = term.strip_prefix("correlation_id=") {
+                        correlation = Some(v.to_owned());
+                    } else if let Some(v) = term.strip_prefix("stateNOT IN") {
+                        not_in = v.split(',').map(str::to_owned).collect();
+                    } else if let Some(v) = term.strip_prefix("active=") {
+                        active = Some(v == "true");
+                    } else if !term.starts_with("ORDERBY") {
+                        return (400, json!({ "error": { "message": format!("Invalid query term: {term}") } }).to_string());
+                    }
+                }
+                let held =
+                    |i: &SnowIncident| correlation.as_deref() == Some(i.correlation.as_str()) && !not_in.contains(&i.state) && active.is_none_or(|a| a == !["7", "8"].contains(&i.state.as_str()));
+                let found: Vec<Value> = all.iter().rev().filter(|i| held(i)).take(1).map(|i| json!({ "sys_id": i.sys_id, "number": i.number })).collect();
+                (200, json!({ "result": found }).to_string())
+            }
+            ("POST", "/api/now/table/incident") => {
+                let level = |k: &str| ["1", "2", "3"].contains(&text(k).as_str());
+                let short = text("short_description");
+                if short.is_empty() || short.chars().count() > 160 || text("correlation_id").is_empty() || text("correlation_id").len() > 100 || !level("impact") || !level("urgency") {
+                    return (400, json!({ "error": { "message": "Invalid field values" } }).to_string());
+                }
+                let (sys_id, number) = (format!("{:032x}", all.len() + 1), format!("INC00100{:02}", all.len() + 1));
+                all.push(SnowIncident {
+                    sys_id: sys_id.clone(),
+                    number: number.clone(),
+                    correlation: text("correlation_id"),
+                    state: "1".into(),
+                    impact: text("impact"),
+                    urgency: text("urgency"),
+                    notes: 0,
+                    close_code: String::new(),
+                });
+                (201, json!({ "result": { "sys_id": sys_id, "number": number } }).to_string())
+            }
+            ("PATCH", r) => {
+                let Some(i) = r.strip_prefix("/api/now/table/incident/").and_then(|id| all.iter_mut().find(|i| i.sys_id == id)) else {
+                    return (404, json!({ "error": { "message": "No Record found" } }).to_string());
+                };
+                if text("state") == "6" && (text("close_code").is_empty() || text("close_notes").is_empty()) {
+                    return (403, json!({ "error": { "message": "Data Policy Exception: Resolution code, Resolution notes are mandatory" }, "status": "failure" }).to_string());
+                }
+                if !text("work_notes").is_empty() {
+                    i.notes += 1;
+                }
+                for (k, field) in [("state", &mut i.state), ("impact", &mut i.impact), ("urgency", &mut i.urgency), ("close_code", &mut i.close_code)] {
+                    if body.get(k).is_some() {
+                        *field = text(k);
+                    }
+                }
+                (200, json!({ "result": { "sys_id": i.sys_id, "number": i.number } }).to_string())
+            }
+            _ => (404, String::new()),
+        }
+    })
+}
+
+/// Jira's issues and ServiceNow's incidents through a monitor, against services that answer as
+/// Jira Cloud and ServiceNow's Table API do: as the monitor's group alerts, an issue in the
+/// project (labelled with the group's key) and an incident (correlated by it); as it warns, a
+/// comment on the issue and a work note on the incident (its impact and urgency the warning's);
+/// as it recovers, the issue moved to done and the incident resolved with its close code; as it
+/// alerts again, a new issue and a new incident. Each delivery an event saying what it did.
+#[test]
+#[ignore = "starts a kiln server as a process, and services for it to notify"]
+fn a_monitor_s_group_is_one_jira_issue_and_one_servicenow_incident_until_it_recovers() -> anyhow::Result<()> {
+    use base64::Engine as _;
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let issues: std::sync::Arc<std::sync::Mutex<Vec<JiraIssue>>> = std::sync::Arc::default();
+    let incidents: std::sync::Arc<std::sync::Mutex<Vec<SnowIncident>>> = std::sync::Arc::default();
+    let basic = |u: &str, p: &str| format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}")));
+    let jira = Service::start(jira_cloud(basic("ops@example.com", "J1RA-T0K3N"), issues.clone()))?;
+    let snow = Service::start(servicenow(basic("kiln", "SN0W-PW"), incidents.clone()))?;
+    for (name, body) in [
+        ("ops", json!({ "kind": "jira", "url": jira.url(), "project": "OPS", "user": "ops@example.com", "token": "J1RA-T0K3N" })),
+        ("itsm", json!({ "kind": "servicenow", "url": snow.url(), "user": "kiln", "password": "SN0W-PW" })),
+    ] {
+        let (code, b) = f.request("PUT", &format!("/api/observe/v1/integrations/{name}"), Some(&body))?;
+        anyhow::ensure!(code == 204, "integration {name}: {code} {}", String::from_utf8_lossy(&b));
+    }
+    let listed = f.call("GET", "/api/observe/v1/integrations", None)?;
+    anyhow::ensure!(!listed.to_string().contains("J1RA-T0K3N") && !listed.to_string().contains("SN0W-PW"), "secrets are never shown: {listed}");
+    let (code, b) = f.request("PUT", "/api/observe/v1/integrations/bad", Some(&json!({ "kind": "jira", "url": jira.url(), "project": "ops", "user": "ops@example.com", "token": "t" })))?;
+    anyhow::ensure!(code == 400, "a project's key is capitals: {code} {}", String::from_utf8_lossy(&b));
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e queue deep",
+            "query": "last(last_1m):max:e2e.queue{*} by {host} > 100",
+            "message": "queue on {{host.name}} is {{value}} @jira-ops @servicenow-itsm",
+            "options": { "every": 10, "thresholds": { "critical": 100, "warning": 80 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    // Each depth the newest buckets' alone: the monitor reads the last whole ten seconds, so a
+    // depth before it whose points shared them would be averaged in (150 and 90 make 120, still
+    // past 100: the group stayed alerting).
+    let last_written = std::cell::Cell::new(0i64);
+    let depth = |v: f64| -> anyhow::Result<()> {
+        while crate_now() < last_written.get() + 25_000 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let now = crate_now();
+        last_written.set(now);
+        f.write("e2e.queue", &["q1"], now - 50_000, 6, |_, _| v)
+    };
+    let wait = |what: &str, done: &dyn Fn() -> bool| -> anyhow::Result<()> {
+        let start = Instant::now();
+        while !done() {
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(90),
+                "{what}: Jira {:?}, ServiceNow {:?}\nthe monitor: {}\nthe queue's depth: {:?}\n{}",
+                issues.lock().map(|i| i.clone()).unwrap_or_default(),
+                incidents.lock().map(|i| i.clone()).unwrap_or_default(),
+                f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).map(|m| at(&m, &["groups"]).to_string()).unwrap_or_default(),
+                f.query("max:e2e.queue{*} by {host}", crate_now() - 120_000, crate_now()),
+                f.logs()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Ok(())
+    };
+    let issue = |n: usize| issues.lock().ok().and_then(|i| i.get(n).cloned());
+    let incident = |n: usize| incidents.lock().ok().and_then(|i| i.get(n).cloned());
+    // Alerting: an issue and an incident, its impact and urgency an alert's (P3: 2 and 2).
+    depth(150.0)?;
+    wait("an issue and an incident", &|| issue(0).is_some() && incident(0).is_some())?;
+    let label = issue(0).and_then(|i| i.labels.into_iter().find(|l| l != "kiln")).unwrap_or_default();
+    anyhow::ensure!(label.starts_with(&format!("kiln-{id}-")), "the issue labelled with the group's key: {label}");
+    anyhow::ensure!(incident(0).is_some_and(|i| i.correlation == label && i.impact == "2" && i.urgency == "2"), "the incident correlated by the same key: {:?}", incident(0));
+    // Warning: a comment and a work note on them, no new ones; the incident's urgency lower (P4).
+    depth(90.0)?;
+    wait("a comment and a work note", &|| issue(0).is_some_and(|i| i.comments == 1) && incident(0).is_some_and(|i| i.notes == 1))?;
+    anyhow::ensure!(issue(1).is_none() && incident(1).is_none() && incident(0).is_some_and(|i| i.impact == "2" && i.urgency == "3"), "{:?} {:?}", issue(1), incident(0));
+    // Recovered: the issue moved to done (a comment first), the incident resolved.
+    depth(50.0)?;
+    wait("the issue done and the incident resolved", &|| issue(0).is_some_and(|i| i.done) && incident(0).is_some_and(|i| i.state == "6"))?;
+    anyhow::ensure!(issue(0).is_some_and(|i| i.comments == 2) && incident(0).is_some_and(|i| i.close_code == "Resolved by caller"), "{:?} {:?}", issue(0), incident(0));
+    // Alerting again: a new issue and a new incident, the first ones left as they are.
+    depth(150.0)?;
+    wait("a new issue and a new incident", &|| issue(1).is_some() && incident(1).is_some())?;
+    anyhow::ensure!(
+        issue(1).is_some_and(|i| !i.done && i.labels.contains(&label)) && issue(0).is_some_and(|i| i.done) && incident(1).is_some_and(|i| i.state == "1"),
+        "{:?} {:?}",
+        issue(1),
+        incident(1)
+    );
+    // Each delivery is an event that says what it did, and none failed (a request the services
+    // refused would have).
+    anyhow::ensure!(jira.requests().iter().all(|(_, g)| g.header("content-type") == Some("application/json") || g.body.is_empty()), "JSON, every body");
+    let said = |what: &str| -> anyhow::Result<Vec<String>> {
+        let found = f.call(
+            "POST",
+            "/api/observe/v1/logs/search",
+            Some(&json!({ "query": format!("source:kiln.event @event.type:monitor.notification @integration:{what}"), "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 50 })),
+        )?;
+        Ok(at(&found, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str().map(str::to_owned)).collect())
+    };
+    f.until(Duration::from_secs(30), "every delivery an event", |_| said("ops").is_ok_and(|s| s.len() >= 4) && said("itsm").is_ok_and(|s| s.len() >= 4))?;
+    let (ops, itsm) = (said("ops")?.join("\n"), said("itsm")?.join("\n"));
+    anyhow::ensure!(!ops.contains(": failed,") && !itsm.contains(": failed,"), "a delivery failed:\n{ops}\n{itsm}");
+    for want in ["delivered, 201 made OPS-1", "delivered, commented on OPS-1", "delivered, commented on OPS-1 and closed it", "delivered, 201 made OPS-2"] {
+        anyhow::ensure!(ops.contains(want), "{want:?} in:\n{ops}");
+    }
+    for want in ["delivered, 201 made INC0010001", "delivered, noted on INC0010001", "delivered, resolved INC0010001", "delivered, 201 made INC0010002"] {
+        anyhow::ensure!(itsm.contains(want), "{want:?} in:\n{itsm}");
+    }
+    Ok(())
+}
+
+/// A downtime holds a monitor's groups in its scope while it is active: those say nothing (their
+/// events marked with it) while the others do; as it expires, a group still alerting is told once,
+/// and its first recovery after says nothing, as the downtime asked. A recurring one shows on the
+/// monitor while it holds, and canceled, tells nothing (it asked to be told of expiring only).
+#[test]
+#[ignore = "starts real processes"]
+fn a_downtime_holds_its_groups_and_tells_what_is_still_wrong_as_it_ends() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, b) = f.request("PUT", "/api/observe/v1/integrations/ops", Some(&json!({ "kind": "webhook", "url": mock.url("/hook") })))?;
+    anyhow::ensure!(code == 204, "integration: {code} {}", String::from_utf8_lossy(&b));
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({ "name": "e2e dt", "query": "last(last_1m):max:e2e.dt{*} by {host} > 100", "message": "{{host.name}} at {{value}} @webhook-ops", "options": { "every": 10, "thresholds": { "critical": 100 } }, "tags": ["team:dt"] })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    // Held: host a's groups, by the monitor's tag, for 40 s from now.
+    let now = crate_now();
+    let d = f.call(
+        "POST",
+        "/api/observe/v1/downtimes",
+        Some(&json!({ "monitor_identifier": { "monitor_tags": ["team:dt"] }, "scope": "host:a", "schedule": { "start": now - 1_000, "end": now + 40_000 }, "notify_end_states": ["alert"], "mute_first_recovery_notification": true, "message": "patching a" })),
+    )?;
+    let dt = at(&d, &["id"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(at(&d, &["status"]) == "active" && at(&d, &["window", "end"]).as_i64() == Some(now + 40_000), "{d:#}");
+    let heard = |host: &str, state: &str| -> usize { mock.at("/hook").iter().filter(|g| at(&g.json(), &["notice", "state"]) == state && at(&g.json(), &["notice", "group"]).to_string().contains(&format!("\"{host}\""))).count() };
+    let write = |host: &str, v: f64| f.write("e2e.dt", &[host], crate_now() - 50_000, 6, |_, _| v);
+    write("a", 150.0)?;
+    write("b", 150.0)?;
+    let start = Instant::now();
+    while heard("b", "ALERT") == 0 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(40), "b never alerted\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+    anyhow::ensure!(at(&m, &["state"]) == "ALERT" && at(&m, &["downtimes"]).as_array().is_some_and(|d| d.iter().any(|x| at(x, &["id"]) == dt.as_str())), "{m:#}");
+    anyhow::ensure!(heard("a", "ALERT") == 0, "a group held said something");
+    // a's alert: an event (written as the group's thread gets to it), marked held.
+    let start = Instant::now();
+    loop {
+        let events = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("source:kiln.event @monitor_id:{id} @event.type:monitor.alert @downtime_id:{dt}"), "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 10 })))?;
+        if at(&events, &["records"]).as_array().is_some_and(|r| r.len() == 1 && r.first().is_some_and(|e| at(e, &["attributes", "muted"]) == "true")) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(15), "a's alert, an event marked held: {events}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Expired, a still alerting: told once.
+    let start = Instant::now();
+    while heard("a", "ALERT") == 0 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(70), "a was never told as the downtime ended\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let d = f.call("GET", &format!("/api/observe/v1/downtimes/{dt}"), None)?;
+    anyhow::ensure!(at(&d, &["status"]) == "ended", "{d:#}");
+    std::thread::sleep(Duration::from_secs(12));
+    anyhow::ensure!(heard("a", "ALERT") == 1, "told {} times", heard("a", "ALERT"));
+    // Both recover: b's is told, a's first one is not (the downtime asked so).
+    write("a", 50.0)?;
+    write("b", 50.0)?;
+    let start = Instant::now();
+    while heard("b", "OK") == 0 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(40), "b never recovered\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    f.until(Duration::from_secs(40), "a recovered", |_| f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).is_ok_and(|m| at(&m, &["state"]) == "OK"))?;
+    std::thread::sleep(Duration::from_secs(3));
+    anyhow::ensure!(heard("a", "OK") == 0, "a's first recovery after the downtime was told");
+    // Recurring: a daily window begun a minute ago, in UTC, an hour long; then canceled, which
+    // tells nothing.
+    let t = time::OffsetDateTime::from_unix_timestamp(crate_now() / 1000 - 60).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let start_local = format!("{:04}-{:02}-{:02}T{:02}:{:02}:00", t.year(), u8::from(t.month()), t.day(), t.hour(), t.minute());
+    let r = f.call("POST", "/api/observe/v1/downtimes", Some(&json!({ "monitor_identifier": { "monitor_id": id }, "schedule": { "recurrences": [{ "rrule": "FREQ=DAILY", "start": start_local, "duration": "1h" }], "timezone": "UTC" } })))?;
+    let rid = at(&r, &["id"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(at(&r, &["status"]) == "active", "{r:#}");
+    write("a", 150.0)?;
+    f.until(Duration::from_secs(40), "a alerting again", |_| f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).is_ok_and(|m| at(&m, &["state"]) == "ALERT"))?;
+    let before = mock.at("/hook").len();
+    let (code, _) = f.request("DELETE", &format!("/api/observe/v1/downtimes/{rid}"), None)?;
+    anyhow::ensure!(code == 204, "cancel: {code}");
+    anyhow::ensure!(at(&f.call("GET", &format!("/api/observe/v1/downtimes/{rid}"), None)?, &["status"]) == "canceled");
+    std::thread::sleep(Duration::from_secs(12));
+    anyhow::ensure!(mock.at("/hook").len() == before, "a canceled downtime told: {}", mock.at("/hook").len() - before);
+    let listed = f.call("GET", "/api/observe/v1/downtimes", None)?;
+    anyhow::ensure!(at(&listed, &["downtimes"]).as_array().is_some_and(|d| d.len() == 2), "{listed:#}");
+    Ok(())
+}
+
+/// One OTLP/gRPC call over HTTP/2 in the clear (prior knowledge, as an SDK's insecure channel
+/// speaks): its HTTP status, its gRPC status and message (from trailers, or headers when it has none
+/// else), and its response's bytes.
+fn grpc_call(addr: std::net::SocketAddr, path: &str, token: Option<&str>, encoding: Option<&str>, frame: Vec<u8>) -> anyhow::Result<(u16, u32, String, Vec<u8>)> {
+    let (path, token, encoding) = (path.to_owned(), token.map(str::to_owned), encoding.map(str::to_owned));
+    kiln::rt::block_on(async move {
+        use http_body_util::BodyExt as _;
+        let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (mut send, conn) = kiln_http::client::http2::handshake(kiln::http::io::RtIo::new(tcp)).await?;
+        let _conn = kiln::rt::spawn(conn);
+        let mut req = http::Request::builder().method("POST").uri(format!("http://127.0.0.1{path}")).header("content-type", "application/grpc").header("te", "trailers");
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        if let Some(e) = encoding {
+            req = req.header("grpc-encoding", e);
+        }
+        let resp = send.send_request(req.body(http_body_util::Full::new(bytes::Bytes::from(frame)))?).await?;
+        let status = resp.status().as_u16();
+        let head = resp.headers().clone();
+        let got = resp.into_body().collect().await?;
+        let trailers = got.trailers().cloned().unwrap_or_default();
+        let from = |k: &str| trailers.get(k).or_else(|| head.get(k)).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let code = from("grpc-status").and_then(|c| c.parse().ok()).unwrap_or(u32::MAX);
+        Ok((status, code, from("grpc-message").unwrap_or_default(), got.to_bytes().to_vec()))
+    })
+}
+
+/// A gRPC message: uncompressed (0) or compressed (1), its length, its bytes.
+fn grpc_frame(compressed: bool, msg: &[u8]) -> Vec<u8> {
+    let mut f = vec![u8::from(compressed)];
+    f.extend_from_slice(&u32::try_from(msg.len()).unwrap_or(u32::MAX).to_be_bytes());
+    f.extend_from_slice(msg);
+    f
+}
+
+/// OTLP over gRPC: the metrics and logs services' `Export`, over HTTP/2 in the clear, on the
+/// server (the ingest token as gRPC's metadata) and on a runner's loopback receiver (a port of its
+/// own), a message gzip-compressed or not. What is taken is stored; what is not is told by gRPC's
+/// status: without a token UNAUTHENTICATED, a message cut short or not OTLP INVALID_ARGUMENT, a
+/// compression it does not know UNIMPLEMENTED. (The official Python SDK's gRPC exporters were
+/// checked against it by hand: §13.)
+#[test]
+#[ignore = "starts real processes"]
+fn otlp_over_grpc_is_taken_on_the_server_and_a_runner() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut f = Fleet::new()?;
+    let port = common::free_port()?;
+    f.start_runner_with("r1", &[("KILN_OTLP_GRPC_ADDR", &format!("127.0.0.1:{port}"))])?;
+    f.until_caught_up(Duration::from_secs(90), "r1 a learner, caught up", &["r1"])?;
+    let now_ns = crate_now() * 1_000_000;
+    let metrics = |name: &str, v: f64| -> anyhow::Result<Vec<u8>> {
+        let j = json!({ "resourceMetrics": [{ "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "grpc-e2e" } }] }, "scopeMetrics": [{ "metrics": [{ "name": name, "gauge": { "dataPoints": [{ "asDouble": v, "timeUnixNano": now_ns.to_string(), "attributes": [{ "key": "host", "value": { "stringValue": "g1" } }] }] } }] }] }] });
+        Ok(kiln::observe::otlp::json_to_pb(&serde_json::to_vec(&j)?, kiln::observe::otlp::Signal::Metrics)?)
+    };
+    let logs = json!({ "resourceLogs": [{ "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "grpc-e2e" } }] }, "scopeLogs": [{ "logRecords": [{ "timeUnixNano": now_ns.to_string(), "severityNumber": 17, "body": { "stringValue": "grpc rust e2e" } }] }] }] });
+    let logs = kiln::observe::otlp::json_to_pb(&serde_json::to_vec(&logs)?, kiln::observe::otlp::Signal::Logs)?;
+    let gz = |b: &[u8]| -> anyhow::Result<Vec<u8>> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b)?;
+        Ok(e.finish()?)
+    };
+    let server: std::net::SocketAddr = format!("127.0.0.1:{}", f.http).parse()?;
+    let runner: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let (m, l) = (kiln::observe::otlp::GRPC_METRICS, kiln::observe::otlp::GRPC_LOGS);
+    // Taken: the server's (with its token), plain and gzip; the runner's (no token: its loopback).
+    let ok = |r: (u16, u32, String, Vec<u8>)| r.0 == 200 && r.1 == 0 && r.3 == [0, 0, 0, 0, 0];
+    let r = grpc_call(server, m, Some(&f.admin), None, grpc_frame(false, &metrics("grpc.rust.server", 42.5)?))?;
+    anyhow::ensure!(ok(r.clone()), "the server's export: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), Some("gzip"), grpc_frame(true, &gz(&metrics("grpc.rust.gzip", 7.0)?)?))?;
+    anyhow::ensure!(ok(r.clone()), "a gzip export: {r:?}");
+    // A runner just caught up may say it is behind on its writes (UNAVAILABLE, 14): an exporter tries
+    // again, as OTLP's specification says to, and so does this.
+    let start = Instant::now();
+    let r = loop {
+        let r = grpc_call(runner, m, None, None, grpc_frame(false, &metrics("grpc.rust.runner", 3.0)?))?;
+        if r.1 != 14 || start.elapsed() > Duration::from_secs(10) {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    anyhow::ensure!(ok(r.clone()), "the runner's export: {r:?}");
+    let r = grpc_call(server, l, Some(&f.admin), None, grpc_frame(false, &logs))?;
+    anyhow::ensure!(ok(r.clone()), "a logs export: {r:?}");
+    // Not taken, and said so.
+    let r = grpc_call(server, m, None, None, grpc_frame(false, &metrics("grpc.rust.nope", 1.0)?))?;
+    anyhow::ensure!(r.1 == 16, "without a token: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), None, vec![0, 0, 0, 0, 9, 1, 2])?;
+    anyhow::ensure!(r.1 == 3, "a message cut short: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), None, grpc_frame(false, &[0xff, 0xff, 0xff]))?;
+    anyhow::ensure!(r.1 == 3 && !r.2.is_empty(), "not OTLP: {r:?}");
+    let r = grpc_call(server, m, Some(&f.admin), Some("snappy"), grpc_frame(true, &[1, 2, 3]))?;
+    anyhow::ensure!(r.1 == 12, "a compression it does not know: {r:?}");
+    // What was taken is stored.
+    let start = Instant::now();
+    loop {
+        let got: Vec<Option<f64>> = ["grpc.rust.server", "grpc.rust.gzip", "grpc.rust.runner"].iter().map(|n| f.query(&format!("max:{n}{{*}}"), crate_now() - 120_000, crate_now() + 10_000).ok().and_then(|q| q.values().flatten().flatten().copied().reduce(f64::max))).collect();
+        let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "\"grpc rust e2e\"", "from": crate_now() - 120_000, "to": crate_now() + 60_000, "limit": 5 })))?;
+        let logged = at(&found, &["records"]).as_array().is_some_and(|r| r.len() == 1 && r.first().is_some_and(|x| at(x, &["service"]) == "grpc-e2e" && at(x, &["status"]) == "error"));
+        if got == [Some(42.5), Some(7.0), Some(3.0)] && logged {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "stored: {got:?}, the record {logged}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    use hmac::{KeyInit as _, Mac as _};
+    match hmac::Hmac::<sha2::Sha256>::new_from_slice(key) {
+        Ok(mut m) => {
+            m.update(msg);
+            hex::encode(m.finalize().into_bytes())
+        }
+        Err(_) => String::new(),
+    }
+}
+
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn github_s_webhooks_and_posted_events_are_events_and_counts() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let now_s = crate_now() / 1000;
+    let iso = |s: i64| time::OffsetDateTime::from_unix_timestamp(s).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_default();
+    let push = json!({ "ref": "refs/heads/main", "compare": "https://github.com/acme/web/compare/a...b", "commits": [{}, {}, {}], "repository": { "full_name": "acme/web" }, "sender": { "login": "ada" } });
+    let run = json!({ "action": "completed", "workflow_run": { "name": "ci", "conclusion": "failure", "head_branch": "main", "run_started_at": iso(now_s - 120), "updated_at": iso(now_s), "html_url": "https://github.com/acme/web/actions/runs/1" }, "repository": { "full_name": "acme/web" }, "sender": { "login": "ada" } });
+    for (event, body) in [("push", &push), ("workflow_run", &run)] {
+        let (code, b) = raw(f.http, "POST", "/api/hooks/github", &format!("X-GitHub-Event: {event}\r\nX-GitHub-Delivery: d-{event}\r\nContent-Type: application/json\r\n"), &serde_json::to_vec(body)?)?;
+        anyhow::ensure!(code == 202, "the {event} webhook: {code} {}", String::from_utf8_lossy(&b));
+    }
+    f.call("POST", "/api/observe/v1/events", Some(&json!({ "title": "deploy of web 1.2.3", "text": "rolled out by ada", "tags": ["service:web", "env:prod"], "alert_type": "success", "source_type_name": "deployer" })))?;
+    let start = Instant::now();
+    loop {
+        let found = f.call("POST", "/api/observe/v1/events/search", Some(&json!({ "query": "*", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 20 })))?;
+        let msgs: Vec<String> = at(&found, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str().map(str::to_owned)).collect();
+        let has = |s: &str| msgs.iter().any(|m| m.contains(s));
+        if has("ada pushed 3 commit(s) to acme/web main") && has("acme/web ci failure") && has("deploy of web 1.2.3") {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(20), "events: {msgs:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let failed = f.call("POST", "/api/observe/v1/events/search", Some(&json!({ "query": "service:github status:error @conclusion:failure", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 5 })))?;
+    anyhow::ensure!(at(&failed, &["records"]).as_array().is_some_and(|a| a.len() == 1), "the failed run is an error event: {failed}");
+    let d = f.query("max:github.actions.run.duration{repo:acme/web} by {conclusion}", crate_now() - 600_000, crate_now() + 60_000)?;
+    anyhow::ensure!(d.values().any(|v| v.contains(&Some(120.0))), "the run's duration: {d:?}");
+    let agg = f.call("POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "query": "source:kiln.event", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "by": ["service"] })))?;
+    let by: BTreeMap<String, f64> = at(&agg, &["groups"]).as_array().into_iter().flatten().map(|g| (at(g, &["group", "service"]).as_str().unwrap_or("").to_owned(), at(g, &["value"]).as_f64().unwrap_or(0.0))).collect();
+    anyhow::ensure!(by.get("github") == Some(&2.0) && by.get("web") == Some(&1.0), "events counted by service: {by:?}");
+    Ok(())
+}
+
+/// A runner whose clock is an hour ahead of the server's: the server measures it from the
+/// runner's writes, says so (an event, and the machine's status), and drops the runner's own
+/// figures an hour ahead (counted, not stored), while points the runner takes with true times are
+/// stored. Started again with a true clock, it is said to agree again.
+#[test]
+#[ignore = "starts real processes"]
+fn a_runner_whose_clock_is_an_hour_ahead_is_said_so_and_its_figures_from_the_future_are_not_kept() -> anyhow::Result<()> {
+    let mut f = Fleet::new()?;
+    f.start_runner_with("r1", &[("KILN_OBSERVE_CLOCK_SKEW_MS", "3600000"), ("KILN_OBSERVE_HOST_SECONDS", "2")])?;
+    let skewed = f.until(Duration::from_secs(120), "r1's clock measured an hour ahead, its figures dropped as ahead", |s| {
+        at(s, &["machines"]).as_array().into_iter().flatten().any(|m| {
+            at(m, &["machine"]) == "r1"
+                && at(m, &["clock_skew_ms"]).as_i64().is_some_and(|k| (3_590_000..=3_610_000).contains(&k))
+                && at(m, &["status", "ahead"]).as_u64().unwrap_or(0) > 0
+        })
+    })?;
+    let _ = skewed;
+    // Said once, as an event: written as any record is, so searchable a moment after the status
+    // shows the skew, not at once.
+    let skew_events = |f: &Fleet| -> anyhow::Result<Vec<String>> {
+        let now = crate_now();
+        let said = f.call("POST", "/api/observe/v1/events/search", Some(&json!({ "query": "@event.type:observe.clock_skew", "from": now - 600_000, "to": now + 60_000, "limit": 10 })))?;
+        Ok(at(&said, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str().map(str::to_owned)).collect())
+    };
+    let start = Instant::now();
+    let mut messages = skew_events(&f)?;
+    while messages.is_empty() && start.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(200));
+        messages = skew_events(&f)?;
+    }
+    // Said once: a moment more, and no second one.
+    std::thread::sleep(Duration::from_secs(2));
+    let messages = skew_events(&f)?;
+    anyhow::ensure!(messages.len() == 1 && messages.first().is_some_and(|m| m.contains("r1's clock is 1 h 0 min ahead")), "{messages:?}");
+    // Points with true times, taken by the skewed runner, are stored.
+    let now = crate_now();
+    let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    let mut req = kiln_obs::otlp::pb::Writer::default();
+    req.message(1, |rm| {
+        rm.message(2, |sm| {
+            sm.message(2, |m| {
+                m.str(1, "e2e.true.time");
+                m.message(5, |g| {
+                    g.message(1, |dp| {
+                        dp.fixed64(3, (now as u64) * 1_000_000);
+                        dp.double(4, 7.0);
+                    });
+                });
+            });
+        });
+    });
+    let (code, _) = raw(r1, "POST", "/v1/metrics", "Content-Type: application/x-protobuf\r\n", &req.buf)?;
+    anyhow::ensure!(code == 200, "{code}");
+    let start = Instant::now();
+    loop {
+        let q = f.query("sum:e2e.true.time{*}", now - 60_000, now + 60_000)?;
+        if q.values().any(|v| v.contains(&Some(7.0))) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "a point with a true time never stored: {q:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Its clock set right (started again without the skew): it agrees again, and is said to.
+    f.kill_runner("r1");
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(120), "r1's clock agreeing again", |s| {
+        at(s, &["machines"]).as_array().into_iter().flatten().any(|m| at(m, &["machine"]) == "r1" && at(m, &["clock_skew_ms"]).as_i64().is_some_and(|k| k.abs() < 5_000))
+    })?;
+    let start = Instant::now();
+    loop {
+        let messages = skew_events(&f)?;
+        if messages.iter().any(|m| m.contains("r1's clock agrees with the server's again")) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{messages:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// Ten days of a daily cycle every five minutes, two hosts, b's last point a spike: `anomalies()`
+/// bands both from their history, a's points inside, b's spike past; an anomaly monitor (the share
+/// of its window past the band) alerts b's group alone, and says so to a webhook.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn an_anomaly_is_banded_from_its_history_and_its_monitor_alerts_the_group_it_is_in() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/anomalies", Some(&json!({ "kind": "webhook", "url": mock.url("/anomaly") })))?;
+    anyhow::ensure!(code == 204);
+    let end = crate_now().div_euclid(300_000) * 300_000;
+    let n: i64 = 288 * 10;
+    let mut seed = 21u64;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let mut series = Vec::new();
+    for host in ["a", "b"] {
+        let points: Vec<Value> = (0..n)
+            .map(|i| {
+                let t = end - (n - i) * 300_000;
+                let v = 50.0 + 20.0 * (t as f64 / 86_400_000.0 * std::f64::consts::TAU).sin() + noise();
+                json!([t as f64 / 1000.0, if host == "b" && i == n - 1 { v + 60.0 } else { v }])
+            })
+            .collect();
+        series.push(json!({ "metric": "e2e.cycle", "type": "gauge", "tags": [format!("host:{host}")], "points": points }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    let spike = end - 300_000;
+    let band = |k: f64| json!({ "query": format!("anomalies(avg:e2e.cycle{{*}} by {{host}}, 'robust', {k})"), "from": end - 6 * 3_600_000, "to": end, "step": 300_000 });
+    // At 3 deviations, the series' own 1-in-500 error: of 143 ordinary points, a few at the most
+    // past it (on average 0.3).
+    let start = Instant::now();
+    let answer = loop {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&band(3.0)))?;
+        let ready = at(&a, &["series"]).as_array().is_some_and(|s| s.len() == 2 && s.iter().all(|x| at(x, &["values"]).as_array().is_some_and(|v| v.iter().filter(|p| p.is_number()).count() >= 70)));
+        if ready {
+            break a;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the points were not read: {a}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let past = |a: &Value| -> Vec<(String, i64)> {
+        let (from, step) = (at(a, &["grid", "from"]).as_i64().unwrap_or(0), at(a, &["grid", "step"]).as_i64().unwrap_or(300_000));
+        let mut out = Vec::new();
+        for s in at(a, &["series"]).as_array().into_iter().flatten() {
+            let b = at(s, &["bounds"]);
+            for (i, v) in at(s, &["values"]).as_array().into_iter().flatten().enumerate() {
+                let (Some(v), Some(lo), Some(hi)) = (v.as_f64(), at(b, &["lower"]).get(i).and_then(Value::as_f64), at(b, &["upper"]).get(i).and_then(Value::as_f64)) else { continue };
+                if v < lo || v > hi {
+                    out.push((at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned(), from + step * i as i64));
+                }
+            }
+        }
+        out
+    };
+    let at3 = past(&answer);
+    anyhow::ensure!(at3.contains(&("b".to_owned(), spike)) && at3.len() <= 4, "at 3 deviations: the spike, and few others: {at3:?}");
+    // At 5, every ordinary point is inside, and the spike still past.
+    let answer = f.call("POST", "/api/observe/v1/query", Some(&band(5.0)))?;
+    anyhow::ensure!(past(&answer) == vec![("b".to_owned(), spike)], "at 5 deviations, the spike alone: {:?}", past(&answer));
+    let from = at(&answer, &["grid", "from"]).as_i64().unwrap_or(0);
+    let step = at(&answer, &["grid", "step"]).as_i64().unwrap_or(300_000);
+    for s in at(&answer, &["series"]).as_array().into_iter().flatten() {
+        let host = at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned();
+        let b = at(s, &["bounds"]);
+        anyhow::ensure!(at(b, &["algorithm"]) == "robust" && at(b, &["k"]).as_f64() == Some(5.0), "{b}");
+        let values = at(s, &["values"]).as_array().cloned().unwrap_or_default();
+        for (i, v) in values.iter().enumerate() {
+            let Some(v) = v.as_f64() else { continue };
+            let (lo, hi) = (at(b, &["lower"]).get(i).and_then(Value::as_f64), at(b, &["upper"]).get(i).and_then(Value::as_f64));
+            let (Some(lo), Some(hi)) = (lo, hi) else { anyhow::bail!("{host} bucket {i} has no band: {b}") };
+            let t = from + step * i as i64;
+            if host == "b" && t == spike {
+                anyhow::ensure!(v > hi, "b's spike {v} is past {hi}");
+            } else {
+                anyhow::ensure!(lo <= v && v <= hi, "{host} at {t}: {v} in [{lo}, {hi}]");
+            }
+        }
+    }
+    // The monitor: the share of the last 15 minutes past the band, by host.
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e cycle anomalous",
+            "query": "avg(last_15m):anomalies(avg:e2e.cycle{*} by {host}, 'robust', 5) >= 0.3",
+            "message": "{{host.name}} is anomalous @webhook-anomalies",
+            "options": { "every": 10, "thresholds": { "critical": 0.3 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let start = Instant::now();
+    let state = loop {
+        let s = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        if at(&s, &["state"]) == "ALERT" {
+            break s;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the anomaly monitor never alerted: {s}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let groups = at(&state, &["groups"]).as_array().cloned().unwrap_or_default();
+    let alerting: Vec<String> = groups.iter().filter(|g| at(g, &["state"]) == "ALERT").map(|g| g.to_string()).collect();
+    anyhow::ensure!(alerting.len() == 1 && alerting.iter().all(|g| g.contains("host:b") || g.contains("\"b\"")), "b alone alerts: {state}");
+    let start = Instant::now();
+    while mock.at("/anomaly").is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard nothing");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let notice = mock.at("/anomaly").first().map(Got::json).unwrap_or_default();
+    anyhow::ensure!(at(&notice, &["notice", "state"]) == "ALERT" && at(&notice, &["notice", "message"]).as_str().is_some_and(|m| m.contains("b is anomalous")), "{notice}");
+    Ok(())
+}
+
+/// Two monitors grouped by host, one alerting on web01–05 and the other on web04–09, and a
+/// composite of both (`a && b`, Datadog's): it alerts the hosts both alert on, web04 and web05, and
+/// no other, and a webhook hears of those two alone; web04 recovering in one of them recovers it in
+/// the composite, and is said; a monitor the composite reads is not deleted while it does, and a
+/// composite of a composite, or of a monitor that isn't there, is refused.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn a_composite_alerts_the_groups_its_monitors_share_and_keeps_what_it_reads() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/both", Some(&json!({ "kind": "webhook", "url": mock.url("/both") })))?;
+    anyhow::ensure!(code == 204);
+    let monitor = |name: &str, metric: &str| -> anyhow::Result<String> {
+        let m = f.call("POST", "/api/observe/v1/monitors", Some(&json!({ "name": name, "query": format!("max(last_1m):max:{metric}{{*}} by {{host}} > 10"), "options": { "every": 10, "thresholds": { "critical": 10 } } })))?;
+        Ok(at(&m, &["id"]).as_str().unwrap_or("").to_owned())
+    };
+    let a = monitor("e2e a", "e2e.ca")?;
+    let b = monitor("e2e b", "e2e.cb")?;
+    let (code, _) = f.request("POST", "/api/observe/v1/monitors", Some(&json!({ "name": "nowhere", "type": "composite", "query": format!("{a} && mnosuch") })))?;
+    anyhow::ensure!(code == 400, "a composite of a monitor that isn't there: {code}");
+    let c = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e both",
+            "type": "composite",
+            "query": format!("{a} && {b}"),
+            "message": "{{#is_alert}}both on {{host.name}} @webhook-both{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @webhook-both{{/is_recovery}}",
+            "options": { "every": 10 },
+        })),
+    )?;
+    let cid = at(&c, &["id"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(at(&c, &["composite", "expression"]) == "a && b" && at(&c, &["composite", "named"]) == "e2e a && e2e b", "{c}");
+    let (code, _) = f.request("POST", "/api/observe/v1/monitors", Some(&json!({ "name": "nested", "type": "composite", "query": format!("{cid} || {a}") })))?;
+    anyhow::ensure!(code == 400, "a composite of a composite: {code}");
+    let hosts = |r: std::ops::RangeInclusive<u32>| r.map(|i| format!("web{i:02}")).collect::<Vec<_>>();
+    let write = |metric: &str, hs: &[String], v: f64| -> anyhow::Result<()> {
+        let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
+        f.write(metric, &refs, crate_now() - 30_000, 4, |_, _| v)
+    };
+    write("e2e.ca", &hosts(1..=5), 20.0)?;
+    write("e2e.cb", &hosts(4..=9), 20.0)?;
+    // A group's first tag's value (a group is a list of [key, value]).
+    let host = |group: &Value| group.as_array().and_then(|g| g.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).unwrap_or("").to_owned();
+    let groups = |id: &str| -> BTreeMap<String, String> {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).unwrap_or_default();
+        at(&m, &["groups"]).as_array().into_iter().flatten().map(|g| (host(at(g, &["group"])), at(g, &["state"]).as_str().unwrap_or("").to_owned())).collect()
+    };
+    let both: BTreeMap<String, String> = [("web04", "ALERT"), ("web05", "ALERT")].iter().map(|(h, s)| ((*h).to_owned(), (*s).to_owned())).collect();
+    let start = Instant::now();
+    while groups(&cid) != both {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the composite's groups: {:?} (a: {:?}, b: {:?})\n{}", groups(&cid), groups(&a), groups(&b), f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let said = |mock: &Mock| -> Vec<(String, String)> {
+        mock.at("/both")
+            .iter()
+            .map(|g| {
+                let v = g.json();
+                (at(&v, &["notice", "state"]).as_str().unwrap_or("").to_owned(), host(at(&v, &["notice", "group"])))
+            })
+            .collect()
+    };
+    let start = Instant::now();
+    while said(&mock).len() < 2 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard {:?}", said(&mock));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let mut heard = said(&mock);
+    heard.sort();
+    anyhow::ensure!(heard == [("ALERT".to_owned(), "web04".to_owned()), ("ALERT".to_owned(), "web05".to_owned())], "the webhook heard {heard:?}");
+    // web04 recovers in b: the composite's web04 recovers, and is said.
+    write("e2e.cb", &hosts(4..=4), 0.0)?;
+    let start = Instant::now();
+    while groups(&cid).get("web04").map(String::as_str) != Some("OK") || said(&mock).len() < 3 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "web04 never recovered: {:?}, heard {:?}", groups(&cid), said(&mock));
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(said(&mock).last() == Some(&("OK".to_owned(), "web04".to_owned())) && groups(&cid).get("web05").map(String::as_str) == Some("ALERT"), "heard {:?}, groups {:?}", said(&mock), groups(&cid));
+    // A monitor the composite reads is kept; once the composite goes, it may go.
+    let (code, body) = f.request("DELETE", &format!("/api/observe/v1/monitors/{a}"), None)?;
+    anyhow::ensure!(code == 409 && String::from_utf8_lossy(&body).contains("e2e both"), "deleting what a composite reads: {code} {}", String::from_utf8_lossy(&body));
+    let (code, _) = f.request("DELETE", &format!("/api/observe/v1/monitors/{cid}"), None)?;
+    anyhow::ensure!(code == 204);
+    let (code, _) = f.request("DELETE", &format!("/api/observe/v1/monitors/{a}"), None)?;
+    anyhow::ensure!(code == 204);
+    Ok(())
+}
+
+/// Two disks, one filling a percent an hour from 62 and one steady at 40, two days of a point every
+/// ten minutes: the query API forecasts both past now (the filling one carried on, its band about
+/// it), and Datadog's forecast monitor, `max(next_2d):forecast(..., 'linear', 2) >= 95`, alerts the
+/// filling one alone, which a webhook hears of.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn a_forecast_monitor_alerts_the_disk_that_will_fill_and_says_so() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/disks", Some(&json!({ "kind": "webhook", "url": mock.url("/disks") })))?;
+    anyhow::ensure!(code == 204);
+    let now = crate_now() / 600_000 * 600_000;
+    let n: i64 = 6 * 48;
+    let mut seed = 31u64;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let mut series = Vec::new();
+    for (host, start, rate) in [("filling", 62.0, 1.0), ("steady", 40.0, 0.0)] {
+        let points: Vec<Value> = (0..=n)
+            .map(|i| {
+                let t = now - (n - i) * 600_000;
+                json!([t as f64 / 1000.0, start + rate * (t - now) as f64 / 3_600_000.0 + 0.3 * noise()])
+            })
+            .collect();
+        series.push(json!({ "metric": "e2e.disk", "type": "gauge", "tags": [format!("host:{host}")], "points": points }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    // The query API: up to now the disks themselves, past it their forecasts.
+    let q = json!({ "query": "forecast(avg:e2e.disk{*} by {host}, 'linear', 2)", "from": now - 86_400_000, "to": now + 12 * 3_600_000, "step": 600_000 });
+    let start = Instant::now();
+    let answer = loop {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&q))?;
+        if at(&a, &["series"]).as_array().is_some_and(|s| s.len() == 2 && s.iter().all(|x| at(x, &["bounds", "forecast_from"]).as_u64().is_some())) {
+            break a;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "no forecast: {a}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    for s in at(&answer, &["series"]).as_array().into_iter().flatten() {
+        let host = at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned();
+        let values: Vec<f64> = at(s, &["values"]).as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(f64::NAN)).collect();
+        let from = at(s, &["bounds", "forecast_from"]).as_u64().unwrap_or(0) as usize;
+        let (last, end) = (values.get(from - 1).copied().unwrap_or(f64::NAN), values.last().copied().unwrap_or(f64::NAN));
+        let upper = at(s, &["bounds", "upper"]).as_array().and_then(|u| u.last()).and_then(Value::as_f64).unwrap_or(f64::NAN);
+        let lower = at(s, &["bounds", "lower"]).as_array().and_then(|u| u.last()).and_then(Value::as_f64).unwrap_or(f64::NAN);
+        anyhow::ensure!(from > 0 && from < values.len(), "{host}: the forecast starts at {from} of {}", values.len());
+        match host.as_str() {
+            // Twelve hours on: 74, as the disk will be.
+            "filling" => anyhow::ensure!((end - 74.0).abs() < 2.0 && lower < end && end < upper && (last - 62.0).abs() < 1.5, "filling: {last} now, {end} in [{lower}, {upper}] in 12 h"),
+            _ => anyhow::ensure!((end - 40.0).abs() < 1.0 && lower < 40.0 && 40.0 < upper, "steady: {end} in [{lower}, {upper}]"),
+        }
+    }
+    // The monitor: the filling disk alone.
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e disk fills",
+            "query": "max(next_2d):forecast(avg:e2e.disk{*} by {host}, 'linear', 2) >= 95",
+            "message": "{{#is_alert}}{{host.name}} will be full within two days @webhook-disks{{/is_alert}}",
+            "options": { "every": 10, "thresholds": { "critical": 95 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let check = f.call("POST", "/api/observe/v1/monitors/validate", Some(&json!({ "query": "max(next_2d):forecast(avg:e2e.disk{*} by {host}, 'linear', 2) >= 95" })))?;
+    anyhow::ensure!(at(&check, &["kind"]) == "forecast" && at(&check, &["window_ms"]).as_i64() == Some(2 * 86_400_000), "{check}");
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        let groups: Vec<(String, String)> = at(&m, &["groups"]).as_array().into_iter().flatten().map(|g| {
+            let host = at(g, &["group"]).as_array().and_then(|kv| kv.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).unwrap_or("").to_owned();
+            (host, at(g, &["state"]).as_str().unwrap_or("").to_owned())
+        }).collect();
+        if groups.len() == 2 && groups.iter().any(|g| g == &("filling".to_owned(), "ALERT".to_owned())) && groups.iter().any(|g| g == &("steady".to_owned(), "OK".to_owned())) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the monitor's groups: {groups:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let start = Instant::now();
+    while mock.at("/disks").is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard nothing");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let heard: Vec<Value> = mock.at("/disks").iter().map(Got::json).collect();
+    let [one] = heard.as_slice() else { anyhow::bail!("the webhook heard {} notices: {heard:?}", heard.len()) };
+    anyhow::ensure!(at(one, &["notice", "state"]) == "ALERT" && at(one, &["notice", "message"]).as_str().is_some_and(|m| m.contains("filling will be full")), "{one}");
+    Ok(())
+}
+
+/// Who may do what with observe, as kiln's roles say: a viewer's token reads (a query, a search,
+/// dashboards, monitors, the integrations' list with their secrets left out) and is refused (403)
+/// writing anything; a developer's makes monitors and dashboards and posts data, and is refused
+/// integrations, clouds and the store's operations; a maintainer's manages integrations. The OpenAPI
+/// document says what each of observe's routes needs.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn observe_s_routes_are_each_role_s_as_its_capabilities_say() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mint = |grant: &str| -> anyhow::Result<String> {
+        let t = f.call("POST", "/api/tokens", Some(&json!({ "grants": [grant], "user": "owner", "note": format!("e2e {grant}") })))?;
+        at(&t, &["token"]).as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token: {t}"))
+    };
+    let (viewer, developer, maintainer) = (mint("viewer")?, mint("developer")?, mint("maintainer")?);
+    let ask = |token: &str, method: &str, path: &str, body: Option<Value>| -> anyhow::Result<u16> {
+        let b = body.map(|b| serde_json::to_vec(&b)).transpose()?.unwrap_or_default();
+        Ok(raw(f.http, method, path, &format!("Authorization: Bearer {token}\r\nContent-Type: application/json\r\n"), &b)?.0)
+    };
+    let now = crate_now();
+    let query = json!({ "query": "avg:kiln.process.cpu_seconds{*}", "from": now - 600_000, "to": now });
+    let search = json!({ "query": "*", "from": now - 600_000, "to": now });
+    let monitor = json!({ "name": "e2e roles", "query": "avg(last_5m):avg:e2e.roles{*} > 10", "options": { "thresholds": { "critical": 10 } } });
+    let hook = json!({ "kind": "webhook", "url": "http://127.0.0.1:9/hook" });
+    let series = json!({ "series": [{ "metric": "e2e.roles", "type": "gauge", "points": [[(now / 1000) as f64, 1.0]] }] });
+    let reads: [(&str, &str, Option<Value>); 7] = [
+        ("GET", "/api/observe/v1/status", None),
+        ("POST", "/api/observe/v1/query", Some(query.clone())),
+        ("POST", "/api/observe/v1/logs/search", Some(search.clone())),
+        ("GET", "/api/observe/v1/dashboards", None),
+        ("GET", "/api/observe/v1/monitors", None),
+        ("GET", "/api/observe/v1/integrations", None),
+        ("POST", "/api/observe/v1/monitors/validate", Some(json!({ "query": "avg(last_5m):avg:x{*} > 1" }))),
+    ];
+    for (method, path, body) in reads {
+        let code = ask(&viewer, method, path, body)?;
+        anyhow::ensure!(code == 200, "a viewer reading {method} {path}: {code}");
+    }
+    for (method, path, body) in [
+        ("POST", "/api/observe/v1/monitors", Some(monitor.clone())),
+        ("POST", "/api/observe/v1/dashboards", Some(json!({ "title": "e2e", "widgets": [] }))),
+        ("POST", "/api/observe/v1/series", Some(series.clone())),
+        ("PUT", "/api/observe/v1/integrations/e2e", Some(hook.clone())),
+        ("POST", "/api/observe/v1/compact", Some(json!({}))),
+    ] {
+        let code = ask(&viewer, method, path, body)?;
+        anyhow::ensure!(code == 403, "a viewer writing {method} {path}: {code}");
+    }
+    for (method, path, body, want) in [
+        ("POST", "/api/observe/v1/monitors", Some(monitor.clone()), 201),
+        ("POST", "/api/observe/v1/dashboards", Some(json!({ "title": "e2e", "widgets": [] })), 201),
+        ("POST", "/api/observe/v1/series", Some(series.clone()), 202),
+        ("PUT", "/api/observe/v1/integrations/e2e", Some(hook.clone()), 403),
+        ("PUT", "/api/observe/v1/clouds/e2e", Some(json!({ "kind": "aws", "region": "us-east-1" })), 403),
+        ("POST", "/api/observe/v1/verify", Some(json!({})), 403),
+    ] {
+        let code = ask(&developer, method, path, body)?;
+        anyhow::ensure!(code == want, "a developer's {method} {path}: {code}, not {want}");
+    }
+    anyhow::ensure!(ask(&maintainer, "PUT", "/api/observe/v1/integrations/e2e", Some(hook))? == 204, "a maintainer adds an integration");
+    anyhow::ensure!(ask(&maintainer, "DELETE", "/api/observe/v1/integrations/e2e", None)? == 204, "and removes it");
+    let doc = f.call("GET", "/api/openapi.json", None)?;
+    let needs = |path: &str, method: &str| at(&doc, &["paths", path, method, "x-kiln-capability"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(needs("/api/observe/v1/query", "post") == "observe.read" && needs("/api/observe/v1/compact", "post") == "observe.manage", "the OpenAPI document: {}", at(&doc, &["paths"]).as_object().map(|p| p.keys().filter(|k| k.contains("observe")).cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
+    Ok(())
+}
+
+/// Five hosts' CPU over an hour, one running hot: `outliers()` says it alone is one (DBSCAN, MAD),
+/// and Datadog's outlier monitor, `avg(last_30m):outliers(..., 'dbscan', 1) > 0`, alerts it alone
+/// and a webhook hears of it.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn an_outlier_monitor_alerts_the_host_unlike_its_peers() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/peers", Some(&json!({ "kind": "webhook", "url": mock.url("/peers") })))?;
+    anyhow::ensure!(code == 204);
+    let now = crate_now() / 60_000 * 60_000;
+    let mut seed = 41u64;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let mut series = Vec::new();
+    for (host, level) in [("web-1", 40.0), ("web-2", 42.0), ("web-3", 39.0), ("web-4", 41.0), ("web-5", 80.0)] {
+        let points: Vec<Value> = (0..60).map(|i| json!([(now - (59 - i) * 60_000) as f64 / 1000.0, level + 4.0 * noise()])).collect();
+        series.push(json!({ "metric": "e2e.cpu", "type": "gauge", "tags": [format!("host:{host}")], "points": points }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    for algo in ["dbscan', 1", "mad', 3, 20"] {
+        let q = json!({ "query": format!("outliers(avg:e2e.cpu{{*}} by {{host}}, '{algo})"), "from": now - 3_600_000, "to": now, "step": 60_000 });
+        let start = Instant::now();
+        loop {
+            let a = f.call("POST", "/api/observe/v1/query", Some(&q))?;
+            let flagged: Vec<String> = at(&a, &["series"]).as_array().into_iter().flatten().filter(|s| at(s, &["outlier"]).as_bool() == Some(true)).filter_map(|s| at(s, &["tags", "host"]).as_str().map(str::to_owned)).collect();
+            if at(&a, &["series"]).as_array().is_some_and(|s| s.len() == 5) {
+                anyhow::ensure!(flagged == ["web-5"], "{algo}: {flagged:?}");
+                break;
+            }
+            anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "five series: {a}");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e unlike its peers",
+            "query": "avg(last_30m):outliers(avg:e2e.cpu{*} by {host}, 'dbscan', 1) > 0",
+            "message": "{{#is_alert}}{{host.name}} is unlike its peers @webhook-peers{{/is_alert}}",
+            "options": { "every": 10, "thresholds": { "critical": 0 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        let states: BTreeMap<String, String> = at(&m, &["groups"])
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|g| (at(g, &["group"]).as_array().and_then(|kv| kv.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).unwrap_or("").to_owned(), at(g, &["state"]).as_str().unwrap_or("").to_owned()))
+            .collect();
+        if states.len() == 5 && states.get("web-5").map(String::as_str) == Some("ALERT") && states.iter().filter(|(h, _)| *h != "web-5").all(|(_, s)| s == "OK") {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the monitor's groups: {states:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let start = Instant::now();
+    while mock.at("/peers").is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard nothing");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let heard: Vec<Value> = mock.at("/peers").iter().map(Got::json).collect();
+    let [one] = heard.as_slice() else { anyhow::bail!("the webhook heard {} notices: {heard:?}", heard.len()) };
+    anyhow::ensure!(at(one, &["notice", "message"]).as_str().is_some_and(|m| m.contains("web-5 is unlike its peers")), "{one}");
+    Ok(())
+}
+
+/// Calendar rollups and `weighted()` through the API: three days of a count of one an hour, summed
+/// by UTC days begun at 9am and by New York's days (each a local midnight, 4am or 5am UTC, and as
+/// many ones as the day has hours); and Datadog's pods, a minute's share each.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn calendar_rollups_and_weights_read_as_the_calendar_and_the_pods_say() -> anyhow::Result<()> {
+    const H: i64 = 3_600_000;
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let now = crate_now() / H * H;
+    let first = now - 72 * H;
+    let points: Vec<Value> = (0..72).map(|i| json!([(first + i * H) as f64 / 1000.0, 1.0])).collect();
+    // Datadog's pods: a 12, 16 or 18 for one, two or three 10 s samples of a past minute.
+    let minute = (crate_now() / 60_000 - 10) * 60_000;
+    let mut series = vec![json!({ "metric": "e2e.hits", "type": "count", "tags": [], "points": points })];
+    for (i, (version, value, n)) in [("1", 12.0, 1), ("1", 12.0, 3), ("1", 12.0, 2), ("2", 12.0, 1), ("2", 16.0, 3), ("2", 18.0, 2)].into_iter().enumerate() {
+        let pts: Vec<Value> = (0..n).map(|j| json!([(minute + j * 10_000) as f64 / 1000.0, value])).collect();
+        series.push(json!({ "metric": "e2e.pod.uptime", "type": "gauge", "tags": [format!("version:{version}"), format!("app:app{i}")], "points": pts }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    let ask = |q: &str, from: i64, to: i64, step: Option<i64>| -> anyhow::Result<Value> {
+        let start = Instant::now();
+        loop {
+            let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": to, "step": step })))?;
+            let total: f64 = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
+            if total > 0.0 {
+                return Ok(a);
+            }
+            anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{q}: no data: {a}");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+    let numbers = |a: &Value, path: &[&str]| -> Vec<f64> { at(a, path).as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(f64::NAN)).collect() };
+    // UTC days begun at 9am: every bucket's start a 9am, a day apart; the sum, every hour written.
+    let a = ask("sum:e2e.hits{*}.rollup(sum, daily, 9am)", first, now, None)?;
+    anyhow::ensure!(at(&a, &["grid", "calendar"]).as_str() == Some("daily"), "{a}");
+    let times: Vec<i64> = numbers(&a, &["grid", "times"]).into_iter().map(|t| t as i64).collect();
+    anyhow::ensure!(!times.is_empty() && times.iter().all(|t| t.rem_euclid(86_400_000) == 9 * H) && times.windows(2).all(|w| matches!(w, [a, b] if b - a == 86_400_000)), "{times:?}");
+    let values = numbers(at(&a, &["series"]).get(0).unwrap_or(&Value::Null), &["values"]);
+    anyhow::ensure!(values.iter().filter(|v| v.is_finite()).sum::<f64>() == 72.0, "{values:?}");
+    // New York's days: a local midnight each (4am UTC in summer time, 5am in winter's), and each
+    // whole day as many ones as its hours.
+    let a = ask("sum:e2e.hits{*}.rollup(sum, daily, 'America/New_York')", first, now, None)?;
+    let times: Vec<i64> = numbers(&a, &["grid", "times"]).into_iter().map(|t| t as i64).collect();
+    let values = numbers(at(&a, &["series"]).get(0).unwrap_or(&Value::Null), &["values"]);
+    anyhow::ensure!(times.iter().all(|t| [4 * H, 5 * H].contains(&t.rem_euclid(86_400_000))), "{times:?}");
+    for (i, w) in times.windows(2).enumerate() {
+        let &[start, end] = w else { continue };
+        let hours = (end - start) / H;
+        anyhow::ensure!([23, 24, 25].contains(&hours), "{times:?}");
+        // A day wholly inside the three written: one an hour.
+        if start >= first && end <= now {
+            anyhow::ensure!(values.get(i) == Some(&(hours as f64)), "day {i}: {values:?} of {times:?}");
+        }
+    }
+    anyhow::ensure!(values.iter().filter(|v| v.is_finite()).sum::<f64>() == 72.0, "{values:?}");
+    // The pods: plain, 36 and 46; weighted, 12 and 16.
+    let sums = |q: &str| -> anyhow::Result<Vec<f64>> {
+        let a = ask(q, minute, minute + 60_000, Some(60_000))?;
+        Ok(at(&a, &["series"]).as_array().into_iter().flatten().map(|s| at(s, &["values"]).get(0).and_then(Value::as_f64).unwrap_or(f64::NAN)).collect())
+    };
+    anyhow::ensure!(sums("sum:e2e.pod.uptime{*} by {version}")? == [36.0, 46.0]);
+    let w = sums("sum:e2e.pod.uptime{*} by {version}.weighted()")?;
+    anyhow::ensure!(matches!(w.as_slice(), [a, b] if (a - 12.0).abs() < 1e-9 && (b - 16.0).abs() < 1e-9), "{w:?}");
+    // What the calendar refuses, it says.
+    let (code, body) = f.request("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:e2e.hits{*}.rollup(sum, weekly, 'Mars/Olympus_Mons')", "from": first, "to": now })))?;
+    let body = String::from_utf8_lossy(&body);
+    anyhow::ensure!(code == 400 && body.contains("Mars/Olympus_Mons"), "{code} {body}");
+    Ok(())
+}
+
+/// Distributions (docs/observe.md §4.4, §13): three hosts' latencies posted as Datadog's
+/// distribution points, two more hosts' as OTLP exponential histograms (one delta; one cumulative,
+/// exported twice). p50, p99 and p99.9 across all of them are within the buckets' relative error of
+/// the exact percentiles, and each host's p99 of its own; the average and the count exact; and a
+/// heatmap holds every value once.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    // After the server began: a cumulative series begun now is new to its receiver.
+    let begun_ns = (crate_now() as u64) * 1_000_000;
+    // Every point in one bucket of the query's grid, its step's own, wholly past: the last ten
+    // minutes' bucket before this one.
+    const STEP: i64 = 600_000;
+    let end = crate_now() / STEP * STEP;
+    let (from, t) = (end - STEP, end - 60_000);
+    let mut seed = 77u64;
+    let mut uniform = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-300)
+    };
+    let mut lognormal = |level: f64| -> f64 { ((-2.0 * uniform().ln()).sqrt() * (std::f64::consts::TAU * uniform()).cos() * 0.5 + level).exp() };
+    let mut hosts: Vec<(&str, Vec<f64>)> = Vec::new();
+    // Datadog's distribution points: hosts a, b, c.
+    let mut series = Vec::new();
+    for (h, level) in [("a", -4.0), ("b", -3.0), ("c", -2.5)] {
+        let values: Vec<f64> = (0..2000).map(|_| lognormal(level)).collect();
+        series.push(json!({ "metric": "e2e.lat", "host": h, "points": [[t as f64 / 1000.0, values]] }));
+        hosts.push((h, values));
+    }
+    let posted = f.call("POST", "/api/observe/v1/distribution_points", Some(&json!({ "series": series })))?;
+    anyhow::ensure!(at(&posted, &["values"]) == 6000, "{posted}");
+    // OTLP: d's delta histogram; e's cumulative, exported twice (the second all the first's and more).
+    let histogram = |host: &str, cumulative: bool, start_ns: u64, at_ms: i64, values: &[f64]| -> Value {
+        let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
+        for &v in values {
+            if let Some(kiln_obs::dist::Bucket::Pos(i)) = kiln_obs::dist::bucket_of(v, 5) {
+                *counts.entry(i).or_default() += 1;
+            }
+        }
+        let (lo, hi) = (counts.keys().next().copied().unwrap_or(0), counts.keys().next_back().copied().unwrap_or(0));
+        let dense: Vec<String> = (lo..=hi).map(|i| counts.get(&i).copied().unwrap_or(0).to_string()).collect();
+        let point = json!({
+            "startTimeUnixNano": start_ns.to_string(), "timeUnixNano": (at_ms as u64 * 1_000_000).to_string(),
+            "count": values.len().to_string(), "sum": values.iter().sum::<f64>(), "scale": 5, "zeroCount": "0",
+            "positive": { "offset": lo, "bucketCounts": dense },
+            "min": values.iter().copied().fold(f64::MAX, f64::min), "max": values.iter().copied().fold(f64::MIN, f64::max),
+        });
+        json!({ "resourceMetrics": [{ "resource": { "attributes": [{ "key": "host.name", "value": { "stringValue": host } }] },
+            "scopeMetrics": [{ "metrics": [{ "name": "e2e.lat", "exponentialHistogram": { "aggregationTemporality": if cumulative { 2 } else { 1 }, "dataPoints": [point] } }] }] }] })
+    };
+    let send = |body: &Value| -> anyhow::Result<()> {
+        let (code, answer) = raw(f.http, "POST", "/v1/metrics", &format!("Authorization: Bearer {ingest}\r\nContent-Type: application/json\r\n"), body.to_string().as_bytes())?;
+        anyhow::ensure!(code == 200, "{code} {}", String::from_utf8_lossy(&answer));
+        Ok(())
+    };
+    let d: Vec<f64> = (0..3000).map(|_| lognormal(-3.5)).collect();
+    send(&histogram("d", false, 0, t, &d))?;
+    let e1: Vec<f64> = (0..1000).map(|_| lognormal(-2.0)).collect();
+    let e2: Vec<f64> = (0..1500).map(|_| lognormal(-2.0)).collect();
+    send(&histogram("e", true, begun_ns, t - 30_000, &e1))?;
+    let both: Vec<f64> = e1.iter().chain(&e2).copied().collect();
+    send(&histogram("e", true, begun_ns, t, &both))?;
+    hosts.push(("d", d));
+    hosts.push(("e", both));
+    let mut all: Vec<f64> = hosts.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    all.sort_by(f64::total_cmp);
+    let ask = |q: &str| -> anyhow::Result<Vec<(String, f64)>> {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": end, "step": STEP })))?;
+        Ok(at(&a, &["series"]).as_array().into_iter().flatten().map(|s| (at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned(), s.get("values").and_then(|v| v.get(0)).and_then(Value::as_f64).unwrap_or(f64::NAN))).collect())
+    };
+    let start = Instant::now();
+    loop {
+        let n = ask("count:e2e.lat{*}")?.first().map_or(0.0, |x| x.1);
+        if n == all.len() as f64 {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{n} of {} values counted\n{}", all.len(), f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let exact = |v: &[f64], q: f64| v.get((v.len().saturating_sub(1) as f64 * q).floor() as usize).copied().unwrap_or(f64::NAN);
+    let bound = ((2f64).powi(-kiln_obs::dist::SCALE) * 0.5).exp2() - 1.0;
+    for (q, p) in [("p50", 0.5), ("p99", 0.99), ("p99.9", 0.999)] {
+        let got = ask(&format!("{q}:e2e.lat{{*}}"))?;
+        let want = exact(&all, p);
+        anyhow::ensure!(got.len() == 1 && got.first().is_some_and(|g| ((g.1 - want) / want).abs() <= bound), "{q}: {got:?} for {want} (within {bound})");
+    }
+    let by_host = ask("p99:e2e.lat{*} by {host}")?;
+    for (h, values) in &mut hosts {
+        values.sort_by(f64::total_cmp);
+        let want = exact(values, 0.99);
+        let got = by_host.iter().find(|(x, _)| x == h).map_or(f64::NAN, |x| x.1);
+        anyhow::ensure!(((got - want) / want).abs() <= bound, "host {h}: {got} for {want}");
+    }
+    let mean = all.iter().sum::<f64>() / all.len() as f64;
+    let avg = ask("avg:e2e.lat{*}")?.first().map_or(f64::NAN, |x| x.1);
+    anyhow::ensure!(((avg - mean) / mean).abs() < 1e-9, "avg {avg} for {mean}");
+    // A heatmap of it: every value once, in rows of its buckets.
+    let h = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "p50:e2e.lat{*}", "from": from, "to": end, "step": STEP, "heatmap": 40 })))?;
+    let total: f64 = at(&h, &["heatmap", "counts"]).as_array().into_iter().flatten().flat_map(|row| row.as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_f64()).sum();
+    let rows = at(&h, &["heatmap", "rows"]);
+    anyhow::ensure!(at(&h, &["heatmap", "distribution"]) == true && total == all.len() as f64 && rows.as_array().is_some_and(|r| r.len() <= 40), "{total} of {} in the heatmap: {rows}", all.len());
+    // Datadog's threshold queries: each host's values at or past the 90th percentile of all, within
+    // the one bucket the bound falls in, and a count and its complement every value.
+    let x = exact(&all, 0.9);
+    let (past, short) = (ask(&format!("count(v: v>={x}):e2e.lat{{*}} by {{host}}.as_count()"))?, ask(&format!("count(v: v<{x}):e2e.lat{{*}} by {{host}}"))?);
+    let of = |got: &[(String, f64)], h: &str| got.iter().find(|(x, _)| x == h).map_or(f64::NAN, |x| x.1);
+    for (h, values) in &hosts {
+        let want = values.iter().filter(|&&v| v >= x).count() as f64;
+        let straddle = values.iter().filter(|&&v| kiln_obs::dist::bucket_of(v, kiln_obs::dist::SCALE) == kiln_obs::dist::bucket_of(x, kiln_obs::dist::SCALE)).count() as f64;
+        let (got, below) = (of(&past, h), of(&short, h));
+        anyhow::ensure!((got - want).abs() <= straddle, "host {h}: {got} at or past {x}, exactly {want} (a bucket of {straddle})");
+        anyhow::ensure!((got + below - values.len() as f64).abs() < 1e-6, "host {h}: {got} and {below} of {}", values.len());
+    }
+    Ok(())
+}
+
+/// SLOs (docs/observe.md §9.4): requests counted a minute for three hours, a thousandth failing but
+/// in the last half hour, when half do; a ratio SLO of them and a time slice SLO of a latency; the
+/// standing as the workbook reckons it; a burn-rate monitor of the SLO (the long window and the
+/// short both past 14.4) alerting; an SLO a monitor reads not deleted until the monitor is.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn an_slo_s_standing_and_its_burn_rate_alert_are_the_workbook_s() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    let base = "/api/observe/v1";
+    // Three hours of minutes ending at the last five-minute edge, the last 70 of them bad: every
+    // window the server reads ends at its own last whole step, a few minutes later, so the hour's
+    // and the quarter's hold bad minutes alone, and the week every one.
+    let end = now_ms().div_euclid(300_000) * 300_000;
+    let minutes: Vec<i64> = (0..180).map(|i| end - 180 * 60_000 + i * 60_000).collect();
+    let bad = |t: i64| t >= end - 70 * 60_000;
+    let pts = |f: &dyn Fn(i64) -> f64| -> Vec<Value> { minutes.iter().map(|&t| json!([t as f64 / 1000.0, f(t)])).collect() };
+    f.call(
+        "POST",
+        &format!("{base}/series"),
+        Some(&json!({ "series": [
+            { "metric": "slo.requests", "type": "count", "tags": ["status:ok"], "points": pts(&|t| if bad(t) { 50.0 } else { 99.9 }) },
+            { "metric": "slo.requests", "type": "count", "tags": ["status:error"], "points": pts(&|t| if bad(t) { 50.0 } else { 0.1 }) },
+            { "metric": "slo.latency.p99", "type": "gauge", "tags": ["service:web"], "points": pts(&|t| if bad(t) { 0.9 } else { 0.12 }) },
+        ] })),
+    )?;
+    let ratio = f.call(
+        "POST",
+        &format!("{base}/slos"),
+        Some(&json!({ "name": "requests", "type": "ratio", "good": "sum:slo.requests{status:ok}.as_count()", "total": "sum:slo.requests{*}.as_count()", "target": 99.0, "warning": 99.5, "timeframe": "7d", "tags": ["team:web"] })),
+    )?;
+    let id = at(&ratio, &["id"]).as_str().unwrap_or("").to_owned();
+    // Every minute applied before it is reckoned.
+    let start = Instant::now();
+    let standing = loop {
+        let s = f.call("GET", &format!("{base}/slos/{id}"), None)?;
+        if at(&s, &["standing", "total"]).as_f64() == Some(18_000.0) {
+            break s;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{s:#}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    // 110 minutes of 0.1 failing and 70 of 50: the SLI, the budget left, the burn rates.
+    let (failed, total) = (110.0 * 0.1 + 70.0 * 50.0, 18_000.0);
+    let sli = (1.0 - failed / total) * 100.0;
+    let st = at(&standing, &["standing"]);
+    anyhow::ensure!(at(st, &["state"]) == "BREACHED" && (at(st, &["sli"]).as_f64().unwrap_or(0.0) - sli).abs() < 1e-9, "{sli} {st:#}");
+    let left = 100.0 - (failed / total) / 0.01 * 100.0;
+    anyhow::ensure!((at(st, &["budget_left"]).as_f64().unwrap_or(0.0) - left).abs() < 1e-6, "{left} {st:#}");
+    anyhow::ensure!((at(st, &["burn_rates", "1h"]).as_f64().unwrap_or(0.0) - 50.0).abs() < 1e-9, "the hour, all bad: {st:#}");
+    let all = failed / total / 0.01;
+    anyhow::ensure!((at(st, &["burn_rates", "6h"]).as_f64().unwrap_or(0.0) - all).abs() < 1e-9, "{all} {st:#}");
+    anyhow::ensure!(at(st, &["days"]).as_array().is_some_and(|d| !d.is_empty()), "{st:#}");
+    // A time slice SLO: the five-minute slices whose p99 is under 300 ms.
+    let slices = f.call("POST", &format!("{base}/slos"), Some(&json!({ "name": "latency", "type": "slices", "query": "max:slo.latency.p99{service:web}", "condition": "< 0.3", "slice_s": 300, "target": 99.0, "timeframe": "7d" })))?;
+    let sid = at(&slices, &["id"]).as_str().unwrap_or("").to_owned();
+    let s2 = f.call("GET", &format!("{base}/slos/{sid}"), None)?;
+    let (met, all) = (at(&s2, &["standing", "good"]).as_f64().unwrap_or(0.0), at(&s2, &["standing", "total"]).as_f64().unwrap_or(0.0));
+    anyhow::ensure!(all == 36.0 && met == 22.0, "180 minutes are 36 slices, the last fourteen not met: {met} of {all}");
+    // The burn-rate alert: the hour's and the quarter hour's 50, both past 14.4.
+    let m = f.call(
+        "POST",
+        &format!("{base}/monitors"),
+        Some(&json!({ "name": "requests burning fast", "query": format!("slo(\"{id}\").burn_rate(\"1h\", \"15m\") > 14.4"), "message": "budget burning", "options": { "every": 10 } })),
+    )?;
+    let mid = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("{base}/monitors/{mid}"), None)?;
+        if at(&m, &["state"]) == "ALERT" {
+            let value = at(&m, &["groups"]).get(0).and_then(|g| g.get("value")).and_then(Value::as_f64).unwrap_or(0.0);
+            anyhow::ensure!((value - 50.0).abs() < 1e-9, "the lesser of the two windows' rates: {value} {m:#}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "not alerting: {m:#}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let shown = f.call("GET", &format!("{base}/slos/{id}"), None)?;
+    anyhow::ensure!(at(&shown, &["alerts"]).as_array().is_some_and(|a| a.len() == 1 && a.first().is_some_and(|x| at(x, &["state"]) == "ALERT")), "{shown:#}");
+    // An SLO a monitor reads is not deleted until the monitor is.
+    let (code, _) = f.request("DELETE", &format!("{base}/slos/{id}"), None)?;
+    anyhow::ensure!(code == 409, "{code}");
+    anyhow::ensure!(f.request("DELETE", &format!("{base}/monitors/{mid}"), None)?.0 == 204);
+    anyhow::ensure!(f.request("DELETE", &format!("{base}/slos/{id}"), None)?.0 == 204);
+    let listed = f.call("GET", &format!("{base}/slos"), None)?;
+    anyhow::ensure!(at(&listed, &["slos"]).as_array().is_some_and(|l| l.len() == 1), "{listed:#}");
+    Ok(())
+}
+
+/// Whether `v` is what `schema` says, `doc` holding the schemas it names: OpenAPI 3.1's JSON Schema
+/// as far as the document uses it (`$ref`, `type`, `properties`, `required`, `items`, `enum`,
+/// `anyOf`, `oneOf`, `allOf`, `additionalProperties`); where it is not, the path to what is not.
+/// Datadog's service checks (docs/observe.md §9.4): runs sent as the Agent sends them
+/// (`/api/v1/check_run`, the ingest token) and as DogStatsD's `_sc` datagrams to a listener of the
+/// server's; a service check monitor by host alerting the host whose check fails twice in a row,
+/// and not after once, its notice saying the run's message, recovering on its first OK; a host
+/// whose check passes never told of; the check status widget's answer as each step leaves it.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn a_service_check_monitor_alerts_after_failures_in_a_row_and_says_the_check_s_message() -> anyhow::Result<()> {
+    const CHECK: &str = "e2e.db.can_connect";
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, b) = f.request("PUT", "/api/observe/v1/integrations/checks", Some(&json!({ "kind": "webhook", "url": mock.url("/checks") })))?;
+    anyhow::ensure!(code == 204, "the webhook: {code} {}", String::from_utf8_lossy(&b));
+    let port = common::free_port()?;
+    let (code, b) = f.request("PUT", "/api/observe/v1/statsd/e2e", Some(&json!({ "listen": [format!("udp://127.0.0.1:{port}")], "on": "server" })))?;
+    anyhow::ensure!(code == 204, "the listener: {code} {}", String::from_utf8_lossy(&b));
+    f.until(Duration::from_secs(30), "the listener listening", |_| {
+        f.call("GET", "/api/observe/v1/statsd", None).is_ok_and(|all| {
+            at(&all, &["statsd"])
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|l| at(l, &["machines"]).as_array().into_iter().flatten().any(|m| at(m, &["state", "listening"]).as_array().is_some_and(|a| !a.is_empty())))
+        })
+    })?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    // A run as the Agent submits it, and one as DogStatsD's datagram, each at its own second.
+    let agent = |host: &str, status: u8, at_s: i64, message: &str| -> anyhow::Result<()> {
+        let body = json!([{ "check": CHECK, "host_name": host, "status": status, "timestamp": at_s, "message": message, "tags": ["env:e2e", "db:orders"] }]);
+        let (code, b) = raw(f.http, "POST", "/api/v1/check_run", &format!("DD-API-KEY: {ingest}\r\nContent-Type: application/json\r\n"), body.to_string().as_bytes())?;
+        anyhow::ensure!(code == 202, "check_run: {code} {}", String::from_utf8_lossy(&b));
+        Ok(())
+    };
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let statsd = |host: &str, status: u8, at_s: i64, message: &str| -> anyhow::Result<()> {
+        udp.send_to(format!("_sc|{CHECK}|{status}|d:{at_s}|h:{host}|#env:e2e,db:orders|m:{message}").as_bytes(), ("127.0.0.1", port))?;
+        Ok(())
+    };
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e db reachable",
+            "type": "service check",
+            "query": format!("\"{CHECK}\".over(\"env:e2e\").by(\"host\").last(2).count_by_status()"),
+            "message": "{{#is_alert}}{{host.name}}: {{check_message}} ({{check_status}}) @webhook-checks{{/is_alert}}{{#is_recovery}}{{host.name}} is reachable @webhook-checks{{/is_recovery}}",
+            "options": { "every": 10, "thresholds": { "critical": 2, "ok": 1 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let group = |host: &str| -> anyhow::Result<Value> {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        Ok(at(&m, &["groups"]).as_array().into_iter().flatten().find(|g| at(g, &["group"]).to_string().contains(host)).cloned().unwrap_or(Value::Null))
+    };
+    let status = || -> anyhow::Result<Value> {
+        let now = now_ms();
+        f.call("POST", "/api/observe/v1/checks/status", Some(&json!({ "check": CHECK, "tags": ["env:e2e"], "group_by": ["host"], "from": now - 3_600_000, "to": now + 60_000 })))
+    };
+    // Each notice's message, its mention left out.
+    let notices = || {
+        mock.at("/checks").iter().map(|g| at(&g.json(), &["notice", "message"]).as_str().unwrap_or("").split_whitespace().filter(|w| !w.starts_with('@')).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>()
+    };
+    // web-1 passes, then fails once; web-2 passes twice, by DogStatsD.
+    let s0 = now_ms() / 1000;
+    agent("web-1", 0, s0 - 30, "connected")?;
+    agent("web-1", 2, s0 - 20, "connection refused")?;
+    statsd("web-2", 0, s0 - 30, "connected")?;
+    statsd("web-2", 0, s0 - 20, "connected")?;
+    // Evaluated with web-1's failure its latest (its value CRITICAL's code), and once is not enough.
+    let start = Instant::now();
+    loop {
+        let (one, two) = (group("web-1")?, group("web-2")?);
+        if at(&one, &["value"]).as_f64() == Some(2.0) && at(&two, &["value"]).as_f64() == Some(0.0) {
+            anyhow::ensure!(at(&one, &["state"]) == "OK" && at(&two, &["state"]) == "OK", "one failure alerted: {one} {two}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never evaluated: {one} {two}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let st = status()?;
+    anyhow::ensure!(at(&st, &["status"]) == "CRITICAL" && at(&st, &["counts", "OK"]) == 1 && at(&st, &["counts", "CRITICAL"]) == 1, "the widget's: {st}");
+    anyhow::ensure!(notices().is_empty(), "told of one failure: {:?}", notices());
+    // A second failure in a row: web-1 alerts, its notice the run's message.
+    agent("web-1", 2, s0 - 10, "connection refused by 10.0.0.7:5432")?;
+    let start = Instant::now();
+    while notices().is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never alerted: {}\n{}", group("web-1")?, f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(notices() == ["web-1: connection refused by 10.0.0.7:5432 (CRITICAL)"], "{:?}", notices());
+    anyhow::ensure!(at(&group("web-1")?, &["state"]) == "ALERT" && at(&group("web-2")?, &["state"]) == "OK");
+    // Its first OK, by DogStatsD now: it recovers, and the widget says every host is OK.
+    statsd("web-1", 0, s0, "connected")?;
+    let start = Instant::now();
+    while notices().len() < 2 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never recovered: {}\n{}", group("web-1")?, f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(notices().get(1).map(String::as_str) == Some("web-1 is reachable"), "{:?}", notices());
+    let st = status()?;
+    anyhow::ensure!(at(&st, &["status"]) == "OK" && at(&st, &["counts", "OK"]) == 2 && at(&st, &["total"]) == 2, "the widget's: {st}");
+    // Every run a record too, by both ways in.
+    let now = now_ms();
+    let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("source:service_check @check:{CHECK}"), "from": now - 3_600_000, "to": now + 60_000, "limit": 100 })))?;
+    anyhow::ensure!(at(&found, &["records"]).as_array().map_or(0, Vec::len) == 6, "the runs' records: {found}");
+    Ok(())
+}
+
+fn conforms(doc: &Value, schema: &Value, v: &Value, at: &str) -> Result<(), String> {
+    if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
+        let target = doc.pointer(r.trim_start_matches('#')).ok_or_else(|| format!("{at}: no schema {r}"))?;
+        return conforms(doc, target, v, at);
+    }
+    for (key, all) in [("allOf", true), ("anyOf", false), ("oneOf", false)] {
+        if let Some(list) = schema.get(key).and_then(Value::as_array) {
+            let tried: Vec<Result<(), String>> = list.iter().map(|s| conforms(doc, s, v, at)).collect();
+            let ok = if all { tried.iter().all(Result::is_ok) } else { tried.iter().any(Result::is_ok) };
+            if !ok {
+                return Err(tried.into_iter().filter_map(Result::err).collect::<Vec<_>>().join(" | "));
+            }
+        }
+    }
+    if let Some(t) = schema.get("type").and_then(Value::as_str) {
+        let fits = match t {
+            "string" => v.is_string(),
+            "integer" => v.is_i64() || v.is_u64(),
+            "number" => v.is_number(),
+            "boolean" => v.is_boolean(),
+            "array" => v.is_array(),
+            "object" => v.is_object(),
+            "null" => v.is_null(),
+            _ => true,
+        };
+        if !fits {
+            return Err(format!("{at}: {v} is not {t}"));
+        }
+    }
+    if let (Some(allowed), Some(s)) = (schema.get("enum").and_then(Value::as_array), v.as_str())
+        && !allowed.iter().any(|a| a == s)
+    {
+        return Err(format!("{at}: {s:?} is none of {allowed:?}"));
+    }
+    if let Some(o) = v.as_object() {
+        for r in schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            if !o.contains_key(r) {
+                return Err(format!("{at}: no {r} in {}", Value::Object(o.clone())));
+            }
+        }
+        let props = schema.get("properties").and_then(Value::as_object);
+        for (k, x) in o {
+            match (props.and_then(|p| p.get(k)), schema.get("additionalProperties")) {
+                (Some(s), _) => conforms(doc, s, x, &format!("{at}.{k}"))?,
+                (None, Some(s)) if s.is_object() => conforms(doc, s, x, &format!("{at}.{k}"))?,
+                _ => {}
+            }
+        }
+    }
+    if let (Some(items), Some(a)) = (schema.get("items"), v.as_array()) {
+        for (i, x) in a.iter().enumerate() {
+            conforms(doc, items, x, &format!("{at}[{i}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Observe's OpenAPI document (`/api/observe/v1/openapi.json`) held to what the routes answer: each
+/// route that answers without a service of its own outside (the clouds' and integrations' tests
+/// would reach one) asked as a client would, its answer checked against the schema the document
+/// gives that route and status, and an error against the error's.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn the_api_answers_as_its_openapi_document_says() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    let doc = f.call("GET", "/api/observe/v1/openapi.json", None)?;
+    anyhow::ensure!(at(&doc, &["openapi"]) == "3.1.0" && at(&doc, &["paths"]).as_object().is_some_and(|p| p.len() > 30), "{doc:#}");
+    // The check finds what is wrong: a field of another type, one missing, a value of no enum.
+    let record = json!({ "$ref": "#/components/schemas/Record" });
+    let good = json!({ "ts_ns": 1, "status": "info", "severity": 9, "service": "", "host": "", "source": "", "message": "m", "attributes": {} });
+    anyhow::ensure!(conforms(&doc, &record, &good, "r").is_ok());
+    for bad in [json!({ "ts_ns": "1" }), json!({ "status": "loud" }), json!({ "attributes": { "a": 1 } })] {
+        let mut v = good.clone();
+        if let (Some(o), Value::Object(b)) = (v.as_object_mut(), bad) {
+            o.extend(b);
+        }
+        anyhow::ensure!(conforms(&doc, &record, &v, "r").is_err(), "{v} passed");
+    }
+    let mut missing = good.clone();
+    missing.as_object_mut().map(|o| o.remove("message"));
+    anyhow::ensure!(conforms(&doc, &record, &missing, "r").is_err(), "a missing field passed");
+    let check = |method: &str, path: &str, route: &str, body: Option<Value>, want: u16| -> anyhow::Result<Value> {
+        let (code, b) = f.request(method, path, body.as_ref())?;
+        let v: Value = if b.is_empty() { Value::Null } else { serde_json::from_slice(&b).map_err(|e| anyhow::anyhow!("{method} {path}: {code} not JSON ({e}): {}", String::from_utf8_lossy(&b)))? };
+        anyhow::ensure!(code == want, "{method} {path}: {code}, not {want}: {v}");
+        let op = doc.pointer(&format!("/paths/{}/{}", route.replace('~', "~0").replace('/', "~1"), method.to_ascii_lowercase())).ok_or_else(|| anyhow::anyhow!("{method} {route} is not in the document"))?;
+        let answer = op.pointer(&format!("/responses/{code}")).ok_or_else(|| anyhow::anyhow!("{method} {route}: {code} is not among its answers"))?;
+        if let Some(schema) = answer.pointer("/content/application~1json/schema") {
+            conforms(&doc, schema, &v, &format!("{method} {route} {code}")).map_err(anyhow::Error::msg)?;
+        }
+        Ok(v)
+    };
+    let base = "/api/observe/v1";
+    let now = now_ms();
+    // What there is to read: points, a distribution, records, an event.
+    let points: Vec<Value> = (0..30).map(|i| json!([(now - 600_000 + i * 20_000) as f64 / 1000.0, i as f64])).collect();
+    check("POST", &format!("{base}/series"), &format!("{base}/series"), Some(json!({ "series": [{ "metric": "api.check", "type": "gauge", "tags": ["env:prod"], "host": "h1", "points": points }] })), 202)?;
+    check("POST", &format!("{base}/distribution_points"), &format!("{base}/distribution_points"), Some(json!({ "series": [{ "metric": "api.lat", "host": "h1", "points": [[(now - 60_000) as f64 / 1000.0, [0.1, 0.2, 0.4]]] }] })), 202)?;
+    check("POST", &format!("{base}/logs"), &format!("{base}/logs"), Some(json!([{ "message": "api check failed", "status": "error", "service": "web", "hostname": "h1", "timestamp": now - 30_000, "attributes": { "route": "/pay" } }, { "message": "api check ok", "service": "web", "timestamp": now - 20_000 }])), 202)?;
+    check("POST", &format!("{base}/events"), &format!("{base}/events"), Some(json!({ "title": "deployed", "text": "web 1.2", "tags": ["service:web"], "alert_type": "info" })), 202)?;
+    // Applied before it is read.
+    let start = Instant::now();
+    while at(&f.call("POST", &format!("{base}/logs/search"), Some(&json!({ "query": "service:web", "from": now - 3_600_000, "to": now + 60_000 })))?, &["records"]).as_array().is_none_or(|r| r.len() < 2) {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the records were not applied");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let range = json!({ "from": now - 3_600_000, "to": now + 60_000 });
+    let with = |extra: Value| -> Value {
+        let mut b = range.clone();
+        if let (Some(o), Value::Object(e)) = (b.as_object_mut(), extra) {
+            o.extend(e);
+        }
+        b
+    };
+    let q = check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "avg:api.check{*} by {host}" }))), 200)?;
+    anyhow::ensure!(at(&q, &["series"]).as_array().is_some_and(|s| s.len() == 1), "{q}");
+    check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "p50:api.lat{*}", "heatmap": 20 }))), 200)?;
+    check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "sum:api.check{*}.rollup(sum, daily, 'America/New_York')" }))), 200)?;
+    check("GET", &format!("{base}/query?query=avg:api.check%7B*%7D&from={}&to={}", now - 3_600_000, now), &format!("{base}/query"), None, 200)?;
+    check("POST", &format!("{base}/query"), &format!("{base}/query"), Some(with(json!({ "query": "avg:api.check{" }))), 400)?;
+    check("GET", &format!("{base}/metrics?match=api.*"), &format!("{base}/metrics"), None, 200)?;
+    check("GET", &format!("{base}/tags?key=host"), &format!("{base}/tags"), None, 200)?;
+    let found = check("POST", &format!("{base}/logs/search"), &format!("{base}/logs/search"), Some(with(json!({ "query": "service:web -source:kiln.event" }))), 200)?;
+    anyhow::ensure!(at(&found, &["records"]).as_array().is_some_and(|r| r.len() == 2), "{found}");
+    check("POST", &format!("{base}/logs/aggregate"), &format!("{base}/logs/aggregate"), Some(with(json!({ "query": "*", "by": ["service", "status"] }))), 200)?;
+    check("POST", &format!("{base}/logs/aggregate"), &format!("{base}/logs/aggregate"), Some(with(json!({ "query": "*", "by": ["service"], "step": 60_000 }))), 200)?;
+    check("POST", &format!("{base}/logs/facets"), &format!("{base}/logs/facets"), Some(with(json!({ "facets": ["service", "status", "@route"] }))), 200)?;
+    check("POST", &format!("{base}/logs/patterns"), &format!("{base}/logs/patterns"), Some(with(json!({ "query": "*" }))), 200)?;
+    check("POST", &format!("{base}/events/search"), &format!("{base}/events/search"), Some(with(json!({ "query": "*" }))), 200)?;
+    check("GET", &format!("{base}/status"), &format!("{base}/status"), None, 200)?;
+    // Monitors: made, read, validated, muted, unmuted, listed, deleted.
+    let m = check("POST", &format!("{base}/monitors"), &format!("{base}/monitors"), Some(json!({ "name": "api check high", "query": "avg(last_5m):avg:api.check{*} by {host} > 100", "message": "high", "tags": ["team:web"], "options": { "thresholds": { "critical": 100.0, "warning": 50.0 } } })), 201)?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let mpath = format!("{base}/monitors/{{id}}");
+    check("GET", &format!("{base}/monitors/{id}"), &mpath, None, 200)?;
+    check("PUT", &format!("{base}/monitors/{id}"), &mpath, Some(json!({ "name": "api check high", "query": "avg(last_5m):avg:api.check{*} by {host} > 200" })), 200)?;
+    check("POST", &format!("{base}/monitors/validate"), &format!("{base}/monitors/validate"), Some(json!({ "query": "logs(\"status:error\").last(\"5m\") > 10" })), 200)?;
+    check("POST", &format!("{base}/monitors/{id}/mute"), &format!("{base}/monitors/{{id}}/mute"), Some(json!({ "until": now + 3_600_000 })), 200)?;
+    check("POST", &format!("{base}/monitors/{id}/unmute"), &format!("{base}/monitors/{{id}}/unmute"), None, 200)?;
+    check("GET", &format!("{base}/monitors"), &format!("{base}/monitors"), None, 200)?;
+    check("GET", &format!("{base}/monitors/nope"), &mpath, None, 404)?;
+    check("DELETE", &format!("{base}/monitors/{id}"), &mpath, None, 204)?;
+    // Dashboards: made, read, changed, listed, deleted.
+    let d = check("POST", &format!("{base}/dashboards"), &format!("{base}/dashboards"), Some(json!({ "title": "api", "widgets": [{ "kind": "timeseries", "title": "check", "queries": ["avg:api.check{*}"] }, { "kind": "note", "text": "# hi" }] })), 201)?;
+    let did = at(&d, &["id"]).as_str().unwrap_or("").to_owned();
+    let dpath = format!("{base}/dashboards/{{id}}");
+    check("GET", &format!("{base}/dashboards/{did}"), &dpath, None, 200)?;
+    check("PUT", &format!("{base}/dashboards/{did}"), &dpath, Some(json!({ "title": "api, changed", "widgets": [] })), 200)?;
+    check("GET", &format!("{base}/dashboards"), &format!("{base}/dashboards"), None, 200)?;
+    check("DELETE", &format!("{base}/dashboards/{did}"), &dpath, None, 204)?;
+    // SLOs: made, read with their standing, changed, listed, deleted.
+    let slo = check("POST", &format!("{base}/slos"), &format!("{base}/slos"), Some(json!({ "name": "api", "type": "ratio", "good": "sum:api.check{*}.as_count()", "total": "sum:api.check{*}.as_count()", "target": 99.0, "timeframe": "7d" })), 201)?;
+    let sid = at(&slo, &["id"]).as_str().unwrap_or("").to_owned();
+    let spath = format!("{base}/slos/{{id}}");
+    check("GET", &format!("{base}/slos/{sid}"), &spath, None, 200)?;
+    check("PUT", &format!("{base}/slos/{sid}"), &spath, Some(json!({ "name": "api", "type": "slices", "query": "max:api.check{*}", "condition": "< 100", "slice_s": 60, "target": 99.5, "timeframe": "30d" })), 200)?;
+    check("GET", &format!("{base}/slos"), &format!("{base}/slos"), None, 200)?;
+    check("POST", &format!("{base}/slos"), &format!("{base}/slos"), Some(json!({ "name": "bad", "type": "ratio", "target": 100.0, "timeframe": "7d" })), 400)?;
+    check("DELETE", &format!("{base}/slos/{sid}"), &spath, None, 204)?;
+    // Integrations, scrapes and clouds as they are listed and kept (their tests reach outside).
+    let ipath = format!("{base}/integrations/{{name}}");
+    check("PUT", &format!("{base}/integrations/hook"), &ipath, Some(json!({ "kind": "webhook", "url": "https://example.invalid/hook", "secret": "s" })), 204)?;
+    check("PUT", &format!("{base}/integrations/og"), &ipath, Some(json!({ "kind": "opsgenie", "api_key": "G3N13", "url": "https://api.eu.opsgenie.com" })), 204)?;
+    let mail = json!({ "kind": "email", "to": ["oncall@example.com"], "from": "kiln@example.com", "host": "smtp.example.invalid", "security": "tls", "username": "u", "password": "hunter2" });
+    check("PUT", &format!("{base}/integrations/mail"), &ipath, Some(mail), 204)?;
+    check("PUT", &format!("{base}/integrations/bad"), &ipath, Some(json!({ "kind": "email", "to": [], "from": "kiln@example.com", "host": "h" })), 400)?;
+    let listed = check("GET", &format!("{base}/integrations"), &format!("{base}/integrations"), None, 200)?;
+    anyhow::ensure!(!listed.to_string().contains("\"s\"") && !listed.to_string().contains("G3N13") && !listed.to_string().contains("hunter2"), "a secret is not shown: {listed}");
+    for name in ["hook", "og", "mail"] {
+        check("DELETE", &format!("{base}/integrations/{name}"), &ipath, None, 204)?;
+    }
+    // What each metric is and costs: the list, and one metric's own.
+    let summary = check("GET", &format!("{base}/metrics/summary?limit=5"), &format!("{base}/metrics/summary"), None, 200)?;
+    let first = at(&summary, &["metrics"]).as_array().and_then(|m| m.first()).and_then(|m| at(m, &["name"]).as_str()).unwrap_or("").to_owned();
+    anyhow::ensure!(!first.is_empty(), "no metric summarized: {summary}");
+    check("GET", &format!("{base}/metrics/summary/{first}"), &format!("{base}/metrics/summary/{{name}}"), None, 200)?;
+    check("GET", &format!("{base}/metrics/summary/no.such.metric"), &format!("{base}/metrics/summary/{{name}}"), None, 404)?;
+    // A synthetic test of the server's own: kept, tried, run, listed with its state, removed.
+    let spath = format!("{base}/synthetics/{{name}}");
+    let syn = json!({ "type": "http", "url": "http://127.0.0.1:9/health", "every_s": 3600, "timeout_s": 2, "assertions": [{ "type": "status_code", "operator": "is", "target": 200 }], "alert": { "message": "x", "min_locations": 1 } });
+    check("PUT", &format!("{base}/synthetics/probe"), &spath, Some(syn.clone()), 204)?;
+    check("PUT", &format!("{base}/synthetics/bad"), &spath, Some(json!({ "type": "tcp", "host": "", "port": 1 })), 400)?;
+    check("POST", &format!("{base}/synthetics/probe/test"), &format!("{base}/synthetics/{{name}}/test"), Some(syn), 200)?;
+    check("POST", &format!("{base}/synthetics/probe/run"), &format!("{base}/synthetics/{{name}}/run"), None, 202)?;
+    let start = Instant::now();
+    while !f.call("GET", "/api/observe/v1/synthetics", None)?.to_string().contains("\"runs\":1") {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(20), "the probe never ran");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    check("GET", &format!("{base}/synthetics"), &format!("{base}/synthetics"), None, 200)?;
+    check("DELETE", &format!("{base}/synthetics/probe"), &spath, None, 204)?;
+    check("DELETE", &format!("{base}/synthetics/probe"), &spath, None, 404)?;
+    check("PUT", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), Some(json!({ "url": "http://127.0.0.1:9/metrics", "every_s": 60 })), 204)?;
+    check("GET", &format!("{base}/scrapes"), &format!("{base}/scrapes"), None, 200)?;
+    check("DELETE", &format!("{base}/scrapes/node"), &format!("{base}/scrapes/{{name}}"), None, 204)?;
+    // A log source of the server's own, its file read: tried, kept, listed, removed.
+    let logs = f.root.path().join("conform-logs");
+    std::fs::create_dir_all(&logs)?;
+    std::fs::write(logs.join("a.log"), "{\"level\":\"warn\",\"msg\":\"one\"}\nplain two\n")?;
+    let source = json!({ "type": "file", "paths": [format!("{}/*.log", logs.display())], "start": "beginning", "rules": [{ "type": "exclude_at_match", "pattern": "never" }] });
+    let tried = check("POST", &format!("{base}/log_sources/app/test"), &format!("{base}/log_sources/{{name}}/test"), Some(source.clone()), 200)?;
+    anyhow::ensure!(at(&tried, &["matched"]) == 1 && at(&tried, &["records"]).as_array().is_some_and(|r| r.len() == 2), "{tried:#}");
+    check("PUT", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), Some(source), 204)?;
+    check("PUT", &format!("{base}/log_sources/bad"), &format!("{base}/log_sources/{{name}}"), Some(json!({ "type": "file", "paths": ["relative/*.log"] })), 400)?;
+    check("GET", &format!("{base}/log_sources"), &format!("{base}/log_sources"), None, 200)?;
+    check("DELETE", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), None, 204)?;
+    check("DELETE", &format!("{base}/log_sources/app"), &format!("{base}/log_sources/{{name}}"), None, 404)?;
+    // Pipelines: made, read, changed, ordered, tried, removed; kiln's own turned off, not removed.
+    let pipeline = json!({ "name": "p", "filter": { "query": "source:app" }, "processors": [{ "type": "grok-parser", "name": "g", "grok": { "match_rules": "r %{word:verb} %{notSpace:path}" } }, { "type": "status-remapper", "sources": ["level"] }] });
+    let p1 = check("POST", &format!("{base}/pipelines"), &format!("{base}/pipelines"), Some(pipeline.clone()), 201)?;
+    let p2 = check("POST", &format!("{base}/pipelines"), &format!("{base}/pipelines"), Some(pipeline.clone()), 201)?;
+    let (i1, i2) = (at(&p1, &["id"]).as_str().unwrap_or("").to_owned(), at(&p2, &["id"]).as_str().unwrap_or("").to_owned());
+    let ppath = format!("{base}/pipelines/{{id}}");
+    check("GET", &format!("{base}/pipelines/{i1}"), &ppath, None, 200)?;
+    check("PUT", &format!("{base}/pipelines/{i1}"), &ppath, Some(pipeline.clone()), 200)?;
+    check("POST", &format!("{base}/pipelines"), &format!("{base}/pipelines"), Some(json!({ "name": "bad", "processors": [{ "type": "grok-parser", "grok": { "match_rules": "r %{nonesuch:x}" } }] })), 400)?;
+    check("GET", &format!("{base}/pipelines"), &format!("{base}/pipelines"), None, 200)?;
+    check("PUT", &format!("{base}/pipeline_order"), &format!("{base}/pipeline_order"), Some(json!({ "pipeline_ids": [i2, i1] })), 204)?;
+    check("POST", &format!("{base}/pipeline_test"), &format!("{base}/pipeline_test"), Some(json!({ "pipeline": pipeline, "records": [{ "message": "GET /x", "source": "app" }] })), 200)?;
+    check("PUT", &format!("{base}/pipelines/builtin:apache"), &ppath, Some(json!({ "name": "Apache httpd", "is_enabled": false })), 200)?;
+    check("DELETE", &format!("{base}/pipelines/builtin:apache"), &ppath, None, 400)?;
+    check("PUT", &format!("{base}/pipelines/builtin:apache"), &ppath, Some(json!({ "name": "Apache httpd", "is_enabled": true })), 200)?;
+    for i in [&i1, &i2] {
+        check("DELETE", &format!("{base}/pipelines/{i}"), &ppath, None, 204)?;
+    }
+    // Downtimes: once and recurring; one that names no monitor refused; canceled, kept.
+    let dpath = format!("{base}/downtimes/{{id}}");
+    let once = check("POST", &format!("{base}/downtimes"), &format!("{base}/downtimes"), Some(json!({ "monitor_identifier": { "monitor_tags": ["team:e2e"] }, "scope": "host:a", "schedule": { "end": "2099-01-01T00:00:00Z" }, "message": "m" })), 201)?;
+    let rec = check("POST", &format!("{base}/downtimes"), &format!("{base}/downtimes"), Some(json!({ "monitor_identifier": { "monitor_id": "m0" }, "schedule": { "recurrences": [{ "rrule": "FREQ=WEEKLY;BYDAY=SA,SU", "start": "2026-10-24T02:00", "duration": "4h" }], "timezone": "America/New_York" } })), 201)?;
+    check("POST", &format!("{base}/downtimes"), &format!("{base}/downtimes"), Some(json!({ "monitor_identifier": {}, "schedule": {} })), 400)?;
+    let (d1, d2) = (at(&once, &["id"]).as_str().unwrap_or("").to_owned(), at(&rec, &["id"]).as_str().unwrap_or("").to_owned());
+    check("GET", &format!("{base}/downtimes"), &format!("{base}/downtimes"), None, 200)?;
+    check("GET", &format!("{base}/downtimes/{d2}"), &dpath, None, 200)?;
+    check("PUT", &format!("{base}/downtimes/{d1}"), &dpath, Some(json!({ "monitor_identifier": { "monitor_tags": ["team:e2e"] }, "schedule": {}, "notify_end_types": ["canceled", "expired"] })), 200)?;
+    for d in [&d1, &d2] {
+        check("DELETE", &format!("{base}/downtimes/{d}"), &dpath, None, 204)?;
+    }
+    check("DELETE", &format!("{base}/downtimes/dtnone"), &dpath, None, 404)?;
+    // Metrics from logs: kiln's shape and Datadog's; a name of kiln's refused, as is a second
+    // writer of one's series; what one computes stays.
+    let lm = json!({ "name": "api.errors", "compute": { "aggregation_type": "count" }, "filter": { "query": "status:error" }, "group_by": [{ "path": "service" }] });
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(lm.clone()), 201)?;
+    let dd = json!({ "data": { "id": "api.latency", "type": "logs_metrics", "attributes": { "compute": { "aggregation_type": "distribution", "path": "@duration", "include_percentiles": true }, "filter": { "query": "service:web" } } } });
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(dd), 201)?;
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(json!({ "name": "kiln.mine", "compute": { "aggregation_type": "count" } })), 400)?;
+    check("POST", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), Some(json!({ "name": "api.latency.count", "compute": { "aggregation_type": "count" } })), 409)?;
+    let lpath = format!("{base}/log_metrics/{{name}}");
+    check("GET", &format!("{base}/log_metrics/api.errors"), &lpath, None, 200)?;
+    check("PUT", &format!("{base}/log_metrics/api.errors"), &lpath, Some(json!({ "name": "api.errors", "compute": { "aggregation_type": "count" }, "filter": { "query": "status:warn" } })), 200)?;
+    check("PUT", &format!("{base}/log_metrics/api.errors"), &lpath, Some(json!({ "name": "api.errors", "compute": { "aggregation_type": "distribution", "path": "@d" } })), 400)?;
+    check("GET", &format!("{base}/log_metrics"), &format!("{base}/log_metrics"), None, 200)?;
+    check("POST", &format!("{base}/log_metric_test"), &format!("{base}/log_metric_test"), Some(json!({ "metric": lm })), 200)?;
+    for n in ["api.errors", "api.latency"] {
+        check("DELETE", &format!("{base}/log_metrics/{n}"), &lpath, None, 204)?;
+    }
+    check("DELETE", &format!("{base}/log_metrics/api.errors"), &lpath, None, 404)?;
+    check("PUT", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), Some(json!({ "kind": "aws", "regions": ["us-east-1"], "paused": true, "log_groups": ["/aws/lambda/*"] })), 204)?;
+    // An Azure integration's event hub, at an endpoint where nothing answers: its stream's status.
+    let hubs = json!({ "kind": "azure", "metrics": false, "event_hubs": { "namespace": "kiln-e2e", "hubs": ["insights-logs"], "connection_string": "Endpoint=sb://kiln-e2e.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=s", "endpoint": "127.0.0.1:9", "tls": false } });
+    check("PUT", &format!("{base}/clouds/hubs1"), &format!("{base}/clouds/{{name}}"), Some(hubs), 204)?;
+    let start = Instant::now();
+    while !f.call("GET", "/api/observe/v1/clouds", None)?.to_string().contains("\"streams\"") {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(10), "no stream's status");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    check("GET", &format!("{base}/clouds"), &format!("{base}/clouds"), None, 200)?;
+    for name in ["aws1", "hubs1"] {
+        check("DELETE", &format!("{base}/clouds/{name}"), &format!("{base}/clouds/{{name}}"), None, 204)?;
+    }
+    check("DELETE", &format!("{base}/clouds/aws1"), &format!("{base}/clouds/{{name}}"), None, 404)?;
+    Ok(())
+}

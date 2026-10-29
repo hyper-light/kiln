@@ -199,25 +199,29 @@ server says, and counts every session it has, ended ones included, until it's up
   there's something new.
 - **Answers at once.** An answer shows as given wherever its request showed (its row, its card, the
   agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
-- **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
-  it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
-  many, with Select all and Done. A ring slides in beside each name as selecting starts, and the
-  row under the finger stays under it, whatever the selection changes above it (the page scrolls
-  by as much). With a mouse, rows keep their checkboxes.
-- **What to do with those selected.** The list's head has the same buttons, in the same places,
-  from the moment selecting starts until it ends (by touch, from Select or a row held, before any is
-  picked): **Resume** (those paused at a usage limit, and those whose goals are paused part-way),
-  **Pause** (their goals running), **Move to…**, **End…** and **More**, which holds **Stop their
-  turns**, **Restart** and **Remove** (those stopped or ended), where their commands run, keeping
-  them going, and muting their notifications. A button none of those selected take is turned off,
-  not taken away, and none counts them (the head says how many are selected, each button's title
-  how many it's for), so picking more moves nothing. Moving and ending are asked in a line under
-  the buttons, which stays as others are picked, said for them: Move offers each machine that takes
-  some of them (how many, when not all, and why the rest stay), once their turns are over or now;
-  End says what goes with them and ends the agents they started that still run too, unless
+- **Selecting by touch.** On a touch screen rows have no checkbox: tap Select in the list's head,
+  press and hold a row (and drag over more), or swipe one right; then tap rows. A ring slides in
+  beside each name as selecting starts, and the row under the finger stays under it, whatever the
+  selection changes above it (the page scrolls by as much). Clear, or putting back the last one
+  picked, ends selecting. With a mouse, rows keep their checkboxes.
+- **What to do with those selected.** While selecting, the list's head is one line, the same from
+  the moment it starts until it ends (by touch, from Select or a row held, before any is picked):
+  the ring or checkbox that picks every agent shown (or none), over the rows' own, how many are
+  selected, **Actions** and **Clear**. Actions is one agent's own menu for all of them, each action
+  with its icon: **Resume** (those paused at a usage limit, and those whose goals are paused
+  part-way), **Pause** (their goals running), **Move to…**, **Stop their turns**, **Restart**,
+  where their commands run, keeping them going, muting their notifications, **End…** and
+  **Remove** (those stopped or ended). One that none of them takes is turned off, not taken away,
+  and one that's for some of them says how many ("2 of 3"); nothing in the line counts them but the
+  head, so picking more moves nothing. Moving, ending and where their commands run are asked in a
+  line under it, which stays as others are picked, said for them: Move offers each machine that
+  takes some of them (how many, when not all, and why the rest stay), once their turns are over or
+  now; End says what goes with them and ends the agents they started that still run too, unless
   unticked. Each goes to every agent it's for at once; a line says how it went (done, skipped,
   failed), opens to each agent's outcome and why, and stays until it's put away or the next one
-  goes. Those all ended leave the selection.
+  goes. Those all ended leave the selection. Turning to selecting and back crossfades in place
+  (Select for Actions and Clear, the count's words), and each line under the head slides open and
+  shut, the list under it moving smoothly; where motion is paused, each change is at once.
 - **The composer.** At the top of the page, on a desktop and a phone alike, whole and the agent
   page's composer's size from the start. There is no New agents button and no dialog: with nothing selected it starts an
   agent, its words the agent's first message. Above the box is the agent page's own line,
@@ -240,8 +244,9 @@ server says, and counts every session it has, ended ones included, until it's up
 - **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
   or harness), the same composer writes to them, each named in the To line where the folder was,
   in the order they were picked (each new one at the end), put back with its ×, Clear for them
-  all; what's written stays as it turns, and it keeps the height it had starting an agent, so the
-  list under it doesn't move as the first is picked or the last put back. A prompt goes with
+  all. The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
+  written stays as it turns, and it keeps the height it had starting an agent, so the list under
+  it doesn't move as the first is picked or the last put back. A prompt goes with
   files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
   now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
   chosen (the speed too), only the agents that have it are sent to, and given it first (Reset

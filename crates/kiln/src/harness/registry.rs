@@ -1354,7 +1354,16 @@ impl Registry {
                 }
                 // An inbox's answer went to whoever waits for it, before any of this.
                 Update::Reply { .. } | Update::Inbox { .. } => {}
-                Update::Closed => gone = true,
+                Update::Closed => {
+                    gone = true;
+                    // Its identities with it (docs/ci.md W27-R01).
+                    let (store, id) = (hub.store.clone(), id.to_owned());
+                    drop(crate::rt::spawn(async move {
+                        if let Err(e) = crate::identities::agent_ended(&store, &id).await {
+                            tracing::warn!(session = %id, error = %format!("{e:#}"), "an ended agent's identities weren't revoked");
+                        }
+                    }));
+                }
                 Update::Reset { .. } => {
                     m.clear_events();
                     m.started_over();

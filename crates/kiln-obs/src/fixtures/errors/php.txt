@@ -1,0 +1,58 @@
+---- app
+#0 /app/errors.php(17): Shop\Cart->total()
+#1 /app/errors.php(27): Shop\checkout(42)
+#2 /app/errors.php(21): {closure:/app/errors.php:27}()
+#3 /app/errors.php(27): Shop\run('app', Object(Closure))
+#4 {main}
+---- app-string
+InvalidArgumentException: bad item -42 in cart 'c--294' in /app/errors.php:11
+Stack trace:
+#0 /app/errors.php(17): Shop\Cart->total()
+#1 /app/errors.php(27): Shop\checkout(42)
+#2 /app/errors.php(21): {closure:/app/errors.php:27}()
+#3 /app/errors.php(27): Shop\run('app', Object(Closure))
+#4 {main}
+---- app-again
+#0 /app/errors.php(17): Shop\Cart->total()
+#1 /app/errors.php(28): Shop\checkout(7)
+#2 /app/errors.php(21): {closure:/app/errors.php:28}()
+#3 /app/errors.php(28): Shop\run('app-again', Object(Closure))
+#4 {main}
+---- app-again-string
+InvalidArgumentException: bad item -7 in cart 'c--49' in /app/errors.php:11
+Stack trace:
+#0 /app/errors.php(17): Shop\Cart->total()
+#1 /app/errors.php(28): Shop\checkout(7)
+#2 /app/errors.php(21): {closure:/app/errors.php:28}()
+#3 /app/errors.php(28): Shop\run('app-again', Object(Closure))
+#4 {main}
+---- builtin
+#0 /app/errors.php(18): json_decode('{not json', NULL, 512, 4194304)
+#1 /app/errors.php(29): Shop\parse('{not json')
+#2 /app/errors.php(21): {closure:/app/errors.php:29}()
+#3 /app/errors.php(29): Shop\run('builtin', Object(Closure))
+#4 {main}
+---- builtin-string
+JsonException: Syntax error in /app/errors.php:18
+Stack trace:
+#0 /app/errors.php(18): json_decode('{not json', NULL, 512, 4194304)
+#1 /app/errors.php(29): Shop\parse('{not json')
+#2 /app/errors.php(21): {closure:/app/errors.php:29}()
+#3 /app/errors.php(29): Shop\run('builtin', Object(Closure))
+#4 {main}
+---- closure
+#0 /app/errors.php(30): intdiv(10, 0)
+#1 [internal function]: {closure:{closure:/app/errors.php:30}:30}(0)
+#2 /app/errors.php(30): array_map(Object(Closure), Array)
+#3 /app/errors.php(21): {closure:/app/errors.php:30}()
+#4 /app/errors.php(30): Shop\run('closure', Object(Closure))
+#5 {main}
+---- closure-string
+DivisionByZeroError: Division by zero in /app/errors.php:30
+Stack trace:
+#0 /app/errors.php(30): intdiv(10, 0)
+#1 [internal function]: {closure:{closure:/app/errors.php:30}:30}(0)
+#2 /app/errors.php(30): array_map(Object(Closure), Array)
+#3 /app/errors.php(21): {closure:/app/errors.php:30}()
+#4 /app/errors.php(30): Shop\run('closure', Object(Closure))
+#5 {main}

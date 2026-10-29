@@ -5,7 +5,8 @@
 //! §2.4) so that adding one is adding a file, never editing a shared list; and embeds the UI server
 //! kiln carries (Bun and the UI server's files, packed by `npm run build` into `ui/dist/embed/`:
 //! vendor/bun/README.md). Nothing is built here: the UI is built separately (`ui/dist/client`,
-//! embedded by rust-embed).
+//! embedded by rust-embed). On Windows it gives the binary's main thread the stack Linux and macOS
+//! give it.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -14,6 +15,18 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let target = std::env::var("TARGET").unwrap_or_default();
     println!("cargo:rustc-env=KILN_TARGET={target}");
+
+    // The main thread's stack: 8 MiB, as Linux and macOS give it (`ulimit -s`), where kiln is built
+    // and tested. Windows gives 1 MiB (MSVC's linker; MinGW's 2), and a debug build's server
+    // overflowed it as it started: the future it runs is made on the main thread before the
+    // runtime takes it.
+    if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") {
+        let stack = 8 << 20;
+        match std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default().as_str() {
+            "msvc" => println!("cargo:rustc-link-arg-bins=/STACK:{stack}"),
+            _ => println!("cargo:rustc-link-arg-bins=-Wl,--stack,{stack}"),
+        }
+    }
 
     // From the environment first: the Dockerfile passes it in (its build context has no .git).
     println!("cargo:rerun-if-env-changed=KILN_COMMIT");

@@ -82,6 +82,20 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
+/// Lowers the calling thread's scheduling priority, ten nice levels below its own (19 at the
+/// most): work that may wait (a query's helper threads) yields to what may not (the writes the
+/// server takes). Linux's threads each have their own nice value (`setpriority(PRIO_PROCESS, tid)`);
+/// elsewhere the thread runs as it was.
+pub fn lower_thread_priority() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let me = rustix::thread::gettid();
+        if let Ok(now) = rustix::process::getpriority_process(Some(me)) {
+            let _ = rustix::process::setpriority_process(Some(me), (now + 10).min(19));
+        }
+    }
+}
+
 /// The first executable called `name` on `PATH`. On Windows a name without a program's extension
 /// is looked for as cmd.exe looks for it, as `name` + each `PATHEXT` extension a process starts
 /// from, never bare: npm puts a shell script `codex`, which Windows can't start, beside `codex.cmd`.
@@ -463,5 +477,23 @@ mod tests {
         let n = read_at(&f, &mut buf, 0)?;
         assert_eq!(buf.get(..n), Some(&b"hello world"[..]));
         Ok(())
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod priority_tests {
+    /// A thread lowered runs ten nice levels below the process; the rest keep theirs.
+    #[test]
+    fn a_lowered_thread_runs_ten_nice_levels_below_the_rest() {
+        let me = rustix::thread::gettid();
+        let before = rustix::process::getpriority_process(Some(me)).unwrap_or(0);
+        let lowered = std::thread::spawn(|| {
+            super::lower_thread_priority();
+            rustix::process::getpriority_process(Some(rustix::thread::gettid())).unwrap_or(-100)
+        })
+        .join()
+        .unwrap_or(-100);
+        assert_eq!(lowered, (before + 10).min(19));
+        assert_eq!(rustix::process::getpriority_process(Some(me)).unwrap_or(-100), before);
     }
 }
