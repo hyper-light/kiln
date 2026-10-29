@@ -33,6 +33,7 @@ pub mod handovers;
 pub mod harness;
 pub mod host;
 pub mod hub;
+pub mod identities;
 pub mod install;
 pub mod install_targets;
 pub mod instances;

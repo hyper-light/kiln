@@ -2337,10 +2337,12 @@ version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
+ "aws-lc-rs",
  "base64 0.23.1",
  "fancy-regex",
  "jiff",
  "proptest",
+ "rcgen",
  "regex",
  "serde",
  "serde_json",
@@ -2349,6 +2351,7 @@ dependencies = [
  "thiserror 2.0.21",
  "toml",
  "ts-rs",
+ "x509-parser",
  "yaml-rust2",
 ]
 
@@ -2401,15 +2404,20 @@ dependencies = [
 name = "kiln-seams"
 version = "0.2.0"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
  "event-listener",
  "futures",
  "hex",
  "parking_lot",
+ "rcgen",
  "regex",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
+ "time",
+ "x509-parser",
  "zeroize",
 ]
 

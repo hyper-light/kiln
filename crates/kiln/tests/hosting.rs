@@ -159,7 +159,8 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 /// W14-AC01: submitting three commits makes D1–D3, a stack; amending D2 adds D2 v2 only; the
 /// stack rebased onto a moved trunk gets rebase-only versions, marked; reordering is seen; an
 /// interdiff of D2 v1..v2 shows the amend; every version is kept at its ref; and the push's
-/// refusals (no Change-Id, not a trunk, an abandoned diff, a viewer) say why. With real git.
+/// refusals (a trailer and an alias that disagree, not a trunk, an abandoned diff, a viewer) say
+/// why. With real git.
 #[test]
 fn w14_ac01_stacks() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -247,12 +248,13 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
     assert!(out.contains("D3 v3 (moved in the stack)") && out.contains("D2 v4 (moved in the stack)") && out.contains("D1 v2 (unchanged)"), "{out}");
     assert_eq!((text(&api(&s, &dev, "GET", "/api/diffs/D3")?, "parent"), text(&api(&s, &dev, "GET", "/api/diffs/D2")?, "parent")), ("D1", "D3"));
 
-    // Refused, saying why, nothing kept: no Change-Id; not a trunk; a viewer.
+    // Refused, saying why, nothing kept: a Kiln-Change that disagrees with its Change-Id (W26-R03);
+    // not a trunk; a viewer.
     std::fs::write(work.join("d.txt"), "four\n")?;
     must(git(&home, &work, &["add", "d.txt"]), "add")?;
-    must(git(&home, &work, &["commit", "-qm", "no id"]), "commit")?;
+    must(git(&home, &work, &["commit", "-qm", &format!("two ids\n\nKiln-Change: kc-00000000000000ff\nChange-Id: {i1}")]), "commit")?;
     let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/for/main"])?;
-    assert!(!ok && out.contains("no Change-Id") && out.contains("remote: kiln:"), "{out}");
+    assert!(!ok && out.contains("can't name two changes") && out.contains("remote: kiln:"), "{out}");
     let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/for/nope"])?;
     assert!(!ok && out.contains("isn't a trunk"), "{out}");
     must(git(&home, &work, &["reset", "-q", "--hard", "HEAD~1"]), "drop it")?;
@@ -318,7 +320,7 @@ fn kiln(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> anyh
 }
 
 /// The client side of W14-R03: `kiln clone` (kiln's credentials, the commit-msg hook), commits
-/// that get Change-Ids by themselves, `kiln submit` adding the ones a commit lacks, `kiln diffs`,
+/// that get a Kiln-Change by themselves, `kiln submit` pushing them as they are, `kiln diffs`,
 /// `kiln checkout D2@v1`, and `kiln sync` dropping a diff the trunk already has.
 #[test]
 fn w14_r03_cli() -> anyhow::Result<()> {
@@ -331,7 +333,7 @@ fn w14_r03_cli() -> anyhow::Result<()> {
     let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
 
     let out = must(kiln(&home, dir.path(), &s, &dev, &["clone", "acme/app", "work"]), "kiln clone")?;
-    assert!(out.contains("Change-Id"), "{out}");
+    assert!(out.contains("Kiln-Change"), "{out}");
     let work = dir.path().join("work");
     let g = |args: &[&str]| must(kiln_git(&home, &work, &s, &dev, args), &args.join(" "));
     std::fs::write(work.join("README.md"), "app\n")?;
@@ -340,18 +342,20 @@ fn w14_r03_cli() -> anyhow::Result<()> {
     g(&["push", "-q", "origin", "HEAD:main"])?;
     g(&["fetch", "-q", "origin"])?;
     g(&["remote", "set-head", "origin", "main"])?;
-    // The hook gives commits their Change-Ids; one made without it gets one from `kiln submit`.
+    // The hook gives commits their Kiln-Change (W26-R03); one made without it needs none:
+    // `kiln submit` pushes the commits as they are.
     std::fs::write(work.join("a.txt"), "one\n")?;
     g(&["add", "a.txt"])?;
     g(&["commit", "-qm", "one: a"])?;
-    assert!(g(&["log", "-1", "--format=%B"])?.contains("Change-Id: I"), "the hook");
+    assert!(g(&["log", "-1", "--format=%B"])?.contains("Kiln-Change: kc-"), "the hook");
     std::fs::write(work.join("b.txt"), "two\n")?;
     g(&["add", "b.txt"])?;
     g(&["commit", "-q", "--no-verify", "-m", "two: b"])?;
-    assert!(!g(&["log", "-1", "--format=%B"])?.contains("Change-Id"));
+    assert!(!g(&["log", "-1", "--format=%B"])?.contains("Kiln-Change"));
+    let head = g(&["rev-parse", "HEAD"])?;
     let out = must(kiln(&home, &work, &s, &dev, &["submit", "--draft", "-r", "user:dev"]), "kiln submit")?;
-    assert!(out.contains("gave 1 commit a Change-Id") && out.contains("D1 v1 (new)") && out.contains("D2 v1 (new)"), "{out}");
-    assert!(g(&["log", "-1", "--format=%B"])?.contains("Change-Id: I"), "HEAD moved to the rewritten commit");
+    assert!(out.contains("D1 v1 (new)") && out.contains("D2 v1 (new)"), "{out}");
+    assert_eq!(g(&["rev-parse", "HEAD"])?, head, "kiln submit rewrites nothing");
     assert_eq!(g(&["status", "--porcelain"])?, "", "the working tree is as it was");
 
     let out = must(kiln(&home, &work, &s, &dev, &["review", "D2"]), "kiln review")?;
@@ -484,6 +488,11 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     let commits: Vec<&str> = log.split('\x1e').map(str::trim).filter(|c| !c.is_empty()).collect();
     assert_eq!(commits.len(), 2, "{log}");
     assert!(commits.iter().any(|c| c.contains("Differential-Revision: D1")) && commits.iter().any(|c| c.contains("Differential-Revision: D2") && c.contains("Reviewed-by: user:rev")), "{log}");
+    // W26-R03: each commit kiln lands carries its change's Kiln-Change.
+    for d in ["D1", "D2"] {
+        let change = text(&api(&s, &dev, "GET", &format!("/api/diffs/{d}"))?, "change").to_owned();
+        assert!(change.starts_with("kc-") && commits.iter().any(|c| c.contains(&format!("Differential-Revision: {d}")) && c.contains(&format!("Kiln-Change: {change}"))), "{d} {change}: {log}");
+    }
     let d1 = api(&s, &dev, "GET", "/api/diffs/D1")?;
     assert_eq!(text(&d1, "state"), "landed");
 
@@ -512,6 +521,7 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     let log = must(git(&home, &work, &["log", "--format=%B%x1e", &format!("{before}..origin/main")]), "log")?;
     let one: Vec<&str> = log.split('\x1e').map(str::trim).filter(|c| !c.is_empty()).collect();
     assert!(one.len() == 1 && one.first().is_some_and(|c| c.contains("Differential-Revision: D4") && c.contains("Differential-Revision: D5")), "{log}");
+    assert_eq!(one.first().map(|c| c.matches("Kiln-Change: kc-").count()), Some(2), "a squashed stack carries each change's Kiln-Change: {log}");
     let tip = must(git(&home, &work, &["rev-parse", "origin/main"]), "rev-parse")?.trim().to_owned();
     until(30, "D6 restacked", || {
         let d6 = api(&s, &dev, "GET", "/api/diffs/D6")?;

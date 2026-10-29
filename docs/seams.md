@@ -575,3 +575,34 @@ Methods: `build`, `built`, `search`, `forget`.
 - **SEARCH-11** building a tree already built keeps it as it was built
 - **SEARCH-12** past its bound of trees, building another forgets the one searched least recently
 - **SEARCH-13** a code pattern given a language, by name or alias, searches only that language's files
+
+## Sigstore
+
+An outside Fulcio and Rekor (docs/ci.md W18-R02, W27-R12). Fulcio certifies a key for whoever an
+identity token names, the key's holder proving it has it by signing the token's subject; Rekor logs
+entries, numbered in the order they come, promises each (its signed entry timestamp), proves each
+is in its tree, and gives each back by its number.
+
+- **Implementations:** kiln's client of the Fulcio and Rekor `[ci.attest]` names
+  (`kiln::ci::signing::Remote`: Fulcio's `/api/v2/signingCert`, Rekor's `/api/v1/log/entries`);
+  `kiln_seams::sigstore::SimSigstore`, which certifies with a CA of its own and logs in an RFC 6962
+  tree of its own, its promises and checkpoints signed with a key of its own:
+  `SimSigstore::trusted_root` is Sigstore's trust in it, so kiln's verifier verifies what it signs.
+  Its keys come from a seed; its certificates are for code signing and valid ten minutes; its log
+  holds 100,000 entries (past it, refused `Full`), each request a second after the last from the
+  start it's given.
+- **Used by:** kiln's keyless signing (`[ci.attest] signing = "keyless"`, `ci/signing.rs`).
+- **Passed by:** the simulator, every clause; kiln's client, every clause, over Fulcio's and
+  Rekor's HTTP APIs against an HTTP front of the simulator (`ci::signing`'s tests). Not yet against
+  a real Fulcio and Rekor (one deployed in kiln's cluster, W18-R02).
+
+Methods: `certify`, `log`, `entry`.
+
+- **SIGSTORE-1** a key with a token it takes is certified: a chain of PEM certificates, the key's first (for code signing, naming the token's issuer), then what issued it
+- **SIGSTORE-2** a token that isn't one is refused Unauthorized; a key that isn't one, or a proof that isn't the key's, is refused Invalid, naming which
+- **SIGSTORE-3** an entry logged is found again at its index, with the same uuid, body and time
+- **SIGSTORE-4** entries are numbered in the order they're logged, and their times never go back
+- **SIGSTORE-5** the same entry logged twice is refused Conflict, naming where it is
+- **SIGSTORE-6** an index never logged is refused NotFound
+- **SIGSTORE-7** an entry comes with the log's promise and the proof of its inclusion: its index in a tree of more entries than that, the tree's root, and a checkpoint of that tree
+- **SIGSTORE-8** an entry whose signature isn't its verifier's is refused Invalid, naming the entry

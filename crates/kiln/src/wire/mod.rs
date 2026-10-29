@@ -198,6 +198,7 @@ classes! {
         AgentMsg::HarnessAdopted { .. } => Class::Answer,
         AgentMsg::WorkState { .. } => Class::State,
         AgentMsg::AgentLimit { .. } => Class::State,
+        AgentMsg::Identity { .. } => Class::Ask,
         AgentMsg::Observe { .. } => OBSERVE,
     }
 }
@@ -264,6 +265,7 @@ classes! {
         ServerMsg::Kept { .. } => Class::State,
         ServerMsg::HarnessSend { .. } => PARKED,
         ServerMsg::AgentLimit { .. } => Class::State,
+        ServerMsg::Identity { .. } => Class::Answer,
         ServerMsg::Observe { .. } => OBSERVE,
     }
 }
