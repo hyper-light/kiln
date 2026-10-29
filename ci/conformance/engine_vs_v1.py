@@ -354,13 +354,13 @@ def retry_timeouts(sides, sha, rec, prod, timeout):
         runs.update(got)
         late = late or slow
     new = record(sides, sha, runs, late)
-    new.update({k: rec[k] for k in ("subject", "before", "seconds") if k in rec})
+    new.update({k: rec[k] for k in ("subject", "before", "seconds", "reentered") if k in rec})
     new["retried"] = [f"{s.side}:{d['workflow']}/{d['job']}" for s, _, d in again]
     new["first_record"] = {side: {wf: f.get("jobs") for wf, f in v.items()} for side, v in rec["sides"].items()}
     if QUIET:
         new["first_conditions"] = rec.get("conditions")
         new["conditions"] = {"retry": conditions(t_retry)}
-        new["quiet"] = was_quiet(new["conditions"])
+        new["quiet"] = was_quiet(new["conditions"]) and not rec.get("reentered")
         # Differed under noise and matched when quiet: a bug under noise, not a wrong answer.
         if not was_quiet(rec.get("conditions")) and compare(new, prod)["match"]:
             new["noise_bug"] = {"diffs": compare(rec, prod)["diffs"], "conditions": rec.get("conditions")}
@@ -476,6 +476,9 @@ def main():
         subject = git(waves[0][1], "log", "-1", "--format=%s", sha)
         print(f"{time.strftime('%H:%M:%S')} {sha[:10]} {subject}", flush=True)
         t0 = time.time()
+        # Runs of it already there: the driver stopped partway (the lab's guard, a restart), so its
+        # waves were disturbed and their conditions are partial; the record says so.
+        reentered = any(s.runs(sha) for s in sides)
         runs, timed_out, conds = {}, False, {}
         for side, repo in waves:
             wait_quiet(f"{side[0].side}'s wave of {sha[:10]}")
@@ -487,8 +490,10 @@ def main():
             conds[side[0].side] = conditions(t_wave)
         rec = record(sides, sha, runs, timed_out)
         rec.update({"subject": subject, "before": current, "seconds": round(time.time() - t0)})
+        if reentered:
+            rec["reentered"] = True
         if QUIET:
-            rec["conditions"], rec["quiet"] = conds, was_quiet(conds)
+            rec["conditions"], rec["quiet"] = conds, was_quiet(conds) and not reentered
         if a.retry_timeouts:
             rec = retry_timeouts(sides, sha, rec, prod, a.timeout)
         with open(path + ".part", "w") as f:
