@@ -10,7 +10,13 @@
 //! conversation (`--conversation`). Its model, effort and mode are flags, so a new one starts it
 //! again too, between turns.
 //!
-//! Written against agy 1.4.2, from what it was seen to send.
+//! kiln's MCP server is in agy's own config, the only place agy reads one from (`Kind::prepare`),
+//! whom it serves in agy's environment; its calls (`call_mcp_tool`) read as Claude Code's and
+//! Codex's do. As agy can't ask, kiln's page tools are allowed in agy's settings (a person's own
+//! rule for them wins); agy decides on its other tools itself (1.4.2 denied MCP calls outside
+//! Bypass; 1.4.8 judges each).
+//!
+//! Written against agy 1.4.2, from what it was seen to send; seen the same with 1.4.8.
 
 use std::collections::HashMap;
 
@@ -603,9 +609,16 @@ impl Agy {
                     _ => tool_call(&id, &name, info.get("parameters").unwrap_or(&Value::Null), &core.state.cwd),
                 };
                 if let Some(out) = info.get("output").and_then(Value::as_str).filter(|o| !o.is_empty()) {
-                    let (text, cut) = clip_middle(out, OUTPUT_MAX);
+                    // kiln's own tools' answers as the conversation shows them (`crate::reach::shown`):
+                    // a page's on one line, a command's output, exit code and machine.
+                    let shown = crate::reach::shown(&call.name, &Value::String(out.to_owned()));
+                    let (text, cut) = clip_middle(shown.as_ref().map_or(out, |s| s.output.as_str()), OUTPUT_MAX);
                     call.output = Some(text);
                     call.truncated = cut;
+                    if let Some(s) = shown {
+                        call.exit_code = s.exit_code.or(call.exit_code);
+                        call.runner = s.runner.or(call.runner);
+                    }
                 }
                 if let Some(code) = info.get("exit_code").and_then(Value::as_i64) {
                     call.exit_code = i32::try_from(code).ok();
@@ -740,6 +753,36 @@ fn parse_models(output: &str) -> Vec<ModelOption> {
 
 /// A tool call as it starts: what kind of tool, and its title from its input.
 fn tool_call(id: &str, name: &str, params: &Value, cwd: &str) -> ToolCall {
+    // An MCP server's tool (`call_mcp_tool`), named as Claude Code's and Codex's are
+    // (`mcp__<server>__<tool>`: its server and own name are read from that), its input the tool's;
+    // kiln's own read as theirs do (`crate::reach::describe`).
+    if name == "call_mcp_tool"
+        && let (Some(server), Some(tool)) = (params.get("ServerName").and_then(Value::as_str), params.get("ToolName").and_then(Value::as_str))
+    {
+        let args = params.get("Arguments").unwrap_or(&Value::Null);
+        let (kind, title, detail) = crate::reach::describe(server, tool, args).unwrap_or_else(|| (ToolKind::Mcp, format!("{server} · {tool}"), None));
+        return ToolCall {
+            tool_id: id.to_owned(),
+            name: format!("mcp__{server}__{tool}"),
+            tool: kind,
+            title,
+            detail,
+            input: clip_json(args, 16 * 1024),
+            status: ToolStatus::Running,
+            output: None,
+            truncated: false,
+            diffs: Vec::new(),
+            todos: Vec::new(),
+            task: None,
+            exit_code: None,
+            started: Core::now(),
+            ended: None,
+            server: None,
+            tool_short: None,
+            skill: None,
+            runner: crate::reach::remote(server, tool, args),
+        };
+    }
     let tool = match name {
         "run_command" | "send_command_input" | "command_status" => ToolKind::Shell,
         "write_to_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" => ToolKind::Edit,
@@ -893,6 +936,38 @@ mod tests {
         // The queued message went next; the reply isn't said twice.
         assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/message/content")).and_then(Value::as_str), Some("then this"));
         assert_eq!(core.events().filter(|e| matches!(&e.body, Body::Assistant { .. })).count(), 1);
+    }
+
+    /// An MCP tool's call (`call_mcp_tool`) as agy 1.4.2 sends it: named and read as Claude Code's
+    /// and Codex's are, kiln's own read as theirs (a page's answer on one line; its picture is
+    /// agy's to keep).
+    #[test]
+    fn mcp_calls_read_as_the_other_harnesses_do() {
+        let (mut a, mut core) = started(&Spec::default());
+        send(&mut a, &mut core, "m1", "Show it", SendMode::Queue);
+        let call = json!({"name": "call_mcp_tool", "parameters": {"Arguments": {"html": "<p>hi</p>", "title": "Harness check"}, "ServerName": "kiln", "ToolName": "show_page"}});
+        let answer = r#"{"kiln_page":{"id":"0123456789abcdef0123456789abcdef","title":"Harness check","path":"/v/0123456789abcdef0123456789abcdef/","heights":[[390,300]]},"seen":{"said":[]}}"#;
+        let mut done = call.clone();
+        if let Some(o) = done.as_object_mut() {
+            o.insert("output".into(), json!(format!("{answer}\n[Resource offloaded to file:///Users/ada/.gemini/antigravity-cli/brain/{CID}/.system_generated/steps/2/media_0.png]")));
+        }
+        let tool = |core: &Core| {
+            core.events().find_map(|e| match &e.body {
+                Body::Tool(t) => Some(t.as_ref().clone()),
+                _ => None,
+            })
+        };
+        feed(&mut a, &mut core, &[step(2, "ACTIVE", "tool", json!({"tool_name": "call_mcp_tool", "tool_info": call}))]);
+        let t = tool(&core);
+        assert!(matches!(&t, Some(t) if t.name == "mcp__kiln__show_page" && t.server.as_deref() == Some("kiln") && t.tool_short.as_deref() == Some("show_page") && t.title == "Harness check" && t.input == json!({"html": "<p>hi</p>", "title": "Harness check"})), "{t:?}");
+        feed(&mut a, &mut core, &[step(2, "DONE", "tool", json!({"tool_name": "call_mcp_tool", "tool_info": done}))]);
+        let t = tool(&core);
+        let shown: Option<Value> = t.as_ref().and_then(|t| t.output.as_deref()).and_then(|o| serde_json::from_str(o).ok());
+        assert_eq!(shown.as_ref().and_then(|v| v.pointer("/kiln_page/id")).and_then(Value::as_str), Some("0123456789abcdef0123456789abcdef"), "{t:?}");
+        assert!(matches!(&t, Some(t) if t.status == ToolStatus::Done));
+        // Another server's: its server and tool as it said them.
+        feed(&mut a, &mut core, &[step(3, "ACTIVE", "tool", json!({"tool_name": "call_mcp_tool", "tool_info": {"name": "call_mcp_tool", "parameters": {"Arguments": {"q": "x"}, "ServerName": "github", "ToolName": "search_issues"}}}))]);
+        assert!(core.events().any(|e| matches!(&e.body, Body::Tool(t) if t.name == "mcp__github__search_issues" && t.title == "github · search_issues" && t.server.as_deref() == Some("github"))));
     }
 
     #[test]

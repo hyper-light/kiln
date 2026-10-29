@@ -279,9 +279,17 @@ over the runner's own connection (`AgentMsg::ReachAsk`), answered with `Ev::Answ
 kiln gives every agent it starts on a runner its own MCP server, `kiln` (`kiln reach mcp`, run by
 the runner's kiln): Claude Code through `--mcp-config` (with kiln's skills through `--plugin-dir`),
 Codex through `-c mcp_servers.kiln.*` (with a tool timeout as long as a program may run, where Codex
-otherwise gives up after 60 s), and ACP agents (Gemini CLI, opencode, Goose, Amp) through their
-session's `mcpServers`. Antigravity's headless mode takes no MCP servers; its agents use `kiln run`
-from their shell. Its instructions name the kiln's machines (asked of the runner when the server
+otherwise gives up after 60 s), ACP agents (Gemini CLI, opencode, Goose, Amp) through their
+session's `mcpServers`, and Antigravity through its own config (`~/.gemini/config/mcp_config.json`,
+the only place agy reads MCP servers from). There kiln puts its server as a session starts, unless
+it's there already or a person turned it off (`agy mcp disable kiln`), and starts agy with the
+session's identity in its environment, which agy hands on to the servers it starts. A person
+running agy outside kiln has it too, without a session: its machines' tools work, and what needs
+kiln says so. agy can't ask once started, so kiln also allows its page tools there
+(`mcp(kiln/show_page)` and `mcp(kiln/preview_page)` in `~/.gemini/antigravity-cli/settings.json`'s
+`permissions.allow`), unless a person's own rule covers them (an `ask` or `deny` rule for one,
+`mcp(kiln/*)` or `mcp(*)`), which then decides; agy decides on kiln's other tools itself.
+Its instructions name the kiln's machines (asked of the runner when the server
 starts), tell the agent who it is (its id in kiln) and how its goal stack and plans work, and tell
 the model when reach helps. When a step has to happen on another machine, such as
 the person's Mac, the agent runs it there itself rather than handing the person a command to type.

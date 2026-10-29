@@ -2998,6 +2998,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 if blocked.is_none() && spec.program.is_none() && !kind.available() {
                     crate::reach::serve::login_env().await;
                 }
+                // What it needs before it starts (kiln's MCP server in Antigravity's own config).
+                if blocked.is_none() {
+                    kind.prepare(&spec).await;
+                }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as
