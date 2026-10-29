@@ -8683,8 +8683,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     `w26_r14_the_review_lanes_marks`), `tests/suggestions.rs` (`w26_ac03_*`), `tests/conflicts.rs`
     (`w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision`,
     `w26_r12_a_change_requests_resolution_is_a_merge_commit`, on real git), `tests/search.rs`
-    (`w26_r07_a_search_across_the_change`, a 1,000-file change), `ship.rs`
-    (`w26_r14_a_commit_with_no_change_carries_its_push`).
+    (`w26_r07_a_search_across_the_change`, a 1,000-file change, the search's checks; its 250 ms at
+    p95 is `w26_r07_warm_searches_p95_within_250ms`, a benchmark run alone on an idle machine),
+    `ship.rs` (`w26_r14_a_commit_with_no_change_carries_its_push`).
   - UI, in Chromium and WebKit at desktop and phone widths: `e2e/ship-review.spec.ts` (open, reply,
     resolve, change a kind, delete, apply a suggestion, the whole file, search, every way to resolve
     a conflict and commit it), `ship-lanes.spec.ts` (the sections' order on four kinds of item, and
