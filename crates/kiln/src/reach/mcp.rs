@@ -1073,6 +1073,30 @@ pub fn agy_has(config: &Value, kiln: &std::path::Path) -> bool {
         || (s.get("command").and_then(Value::as_str) == Some(kiln.to_string_lossy().as_ref()) && s.get("args") == Some(&json!(["reach", "mcp"])))
 }
 
+/// The tools of this server Antigravity calls without asking (it can't ask once started): showing
+/// and previewing a page. Its others are agy's to decide on.
+pub const AGY_ALLOWED: [&str; 2] = ["mcp(kiln/show_page)", "mcp(kiln/preview_page)"];
+
+/// agy's settings (`settings`, its `~/.gemini/antigravity-cli/settings.json`) with `AGY_ALLOWED` in
+/// `permissions.allow`, each unless a rule of a person's covers it already (allowed, asked or
+/// denied, the tool or all of this server's or every server's: agy's deny > ask > allow then
+/// decides). None when nothing needs adding, or the settings aren't as agy writes them.
+pub fn agy_allow(settings: &Value) -> Option<Value> {
+    let covers = |rule: &str| {
+        let rules = ["allow", "deny", "ask"].into_iter().filter_map(|k| settings.pointer(&format!("/permissions/{k}")).and_then(Value::as_array)).flatten();
+        rules.filter_map(Value::as_str).any(|r| r == rule || r == "mcp(kiln/*)" || r == "mcp(*)")
+    };
+    let missing: Vec<&str> = AGY_ALLOWED.into_iter().filter(|r| !covers(r)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut out = settings.clone();
+    let permissions = out.as_object_mut()?.entry("permissions").or_insert_with(|| json!({}));
+    let allow = permissions.as_object_mut()?.entry("allow").or_insert_with(|| json!([]));
+    allow.as_array_mut()?.extend(missing.into_iter().map(Value::from));
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1117,29 @@ mod tests {
         assert!(!agy_has(&json!({"mcpServers": {}}), kiln));
         let off = json!({"mcpServers": {"kiln": {"args": ["reach", "mcp"], "command": "/opt/old", "disabled": true}}});
         assert!(agy_has(&off, kiln), "turned off by a person: kept");
+    }
+
+    /// Its page tools are allowed in agy's settings beside a person's own rules, unless a rule of
+    /// theirs covers them (agy's deny > ask > allow decides then).
+    #[test]
+    fn antigravity_allows_its_page_tools_unless_a_person_said_otherwise() {
+        let allow = |s: &Value| agy_allow(s).and_then(|s| s.pointer("/permissions/allow").cloned());
+        // As agy keeps its settings, without rules: both added, the rest kept; once.
+        let agys = json!({"model": "gemini-3.8-flash-low", "trustedWorkspaces": ["/w"]});
+        let added = agy_allow(&agys);
+        assert_eq!(added.as_ref().and_then(|s| s.pointer("/permissions/allow")), Some(&json!(AGY_ALLOWED)));
+        assert_eq!(added.as_ref().and_then(|s| s.get("trustedWorkspaces")), Some(&json!(["/w"])));
+        assert_eq!(added.as_ref().and_then(agy_allow), None);
+        // A person's own rules stay, beside them.
+        let theirs = json!({"permissions": {"allow": ["command(git)"], "deny": ["command(rm -rf)"]}});
+        assert_eq!(allow(&theirs), Some(json!(["command(git)", "mcp(kiln/show_page)", "mcp(kiln/preview_page)"])));
+        // One a person asks for, or this server or every server they deny or ask for, stays theirs.
+        assert_eq!(allow(&json!({"permissions": {"ask": ["mcp(kiln/show_page)"]}})), Some(json!(["mcp(kiln/preview_page)"])));
+        assert_eq!(agy_allow(&json!({"permissions": {"deny": ["mcp(kiln/*)"]}})), None);
+        assert_eq!(agy_allow(&json!({"permissions": {"ask": ["mcp(*)"]}})), None);
+        // Settings not as agy writes them are left alone.
+        assert_eq!(agy_allow(&json!(["x"])), None);
+        assert_eq!(agy_allow(&json!({"permissions": {"allow": "mcp(*)"}})), None);
     }
 
     /// The agent tools are the server's: those it names (each as its registry has it, one it

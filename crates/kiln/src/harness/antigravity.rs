@@ -12,9 +12,11 @@
 //!
 //! kiln's MCP server is in agy's own config, the only place agy reads one from (`Kind::prepare`),
 //! whom it serves in agy's environment; its calls (`call_mcp_tool`) read as Claude Code's and
-//! Codex's do. Outside Bypass agy denies MCP calls, kiln's included, as it can't ask.
+//! Codex's do. As agy can't ask, kiln's page tools are allowed in agy's settings (a person's own
+//! rule for them wins); agy decides on its other tools itself (1.4.2 denied MCP calls outside
+//! Bypass; 1.4.8 judges each).
 //!
-//! Written against agy 1.4.2, from what it was seen to send.
+//! Written against agy 1.4.2, from what it was seen to send; seen the same with 1.4.8.
 
 use std::collections::HashMap;
 
