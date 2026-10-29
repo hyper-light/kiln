@@ -663,6 +663,12 @@ export interface Outgoing {
   at: number;
   state: "sending" | "sent" | "failed";
   why?: string;
+  /**
+   * Refused for good by the server, which keeps that answer under its id: a retry is a new message.
+   * Failed with no answer, or its agent ending first, it may have got there: a retry goes again under
+   * its own id, which its inbox takes once (CP-T3.2).
+   */
+  fresh?: boolean;
 }
 
 const ENDED = "the agent ended before it got there";
@@ -925,12 +931,16 @@ export class SessionStore {
   };
 
   /**
-   * Sends a message refused for good again, as a new message with its words, files and reply (its
-   * id's answer stays the refusal): false while the session isn't connected.
+   * Sends a message that didn't get there again: refused for good, as a new message with its words,
+   * files and reply (its id's answer stays the refusal); with no answer, or its agent ended first,
+   * under its own id, as it may have got there and its inbox takes it once (CP-T3.2). False while
+   * the session isn't connected.
    */
   resend = (id: string): boolean => {
     const m = this.out.get(id);
-    if (m?.o.state !== "failed" || !this.send({ ...m.c, id: clientId() })) return false;
+    if (m?.o.state !== "failed") return false;
+    if (!m.o.fresh) return this.send(m.c);
+    if (!this.send({ ...m.c, id: clientId() })) return false;
     this.out.delete(id);
     this.outChanged();
     return true;
@@ -976,7 +986,8 @@ export class SessionStore {
     const a = this.asked.get(id);
     if (!a) return;
     this.asked.set(id, { ...a, state: "refused", code, why });
-    this.fail([id], why);
+    // Unanswered (no answer came, or the server's own word that none did), it may have got there.
+    this.fail([id], why, code !== "unanswered");
     window.setTimeout(() => {
       if (this.asked.get(id)?.state !== "refused") return;
       this.asked.delete(id);
@@ -1202,6 +1213,14 @@ export class SessionStore {
       case "nack":
         // Not this time (its machine away, its inbox full ...): it waits, and goes again.
         if (u.id != null && u.again) return this.later(u.id, u.why);
+        // Its id was taken before, its inbox says: this page's own message got there (something of
+        // it changed on the way since, such as a file whose upload left the server). It shows as
+        // sent, never failed, so it's never sent again as a new message: a second prompt (CP-T3.2).
+        if (u.id != null && u.code === "reused" && this.out.has(u.id)) {
+          this.took(u.id);
+          if (this.asked.delete(u.id)) this.patch({ asked: [...this.asked.values()] });
+          return;
+        }
         if (u.id != null && this.asked.has(u.id)) {
           this.refuse(u.id, u.code, u.why);
           this.patch({ asked: [...this.asked.values()], error: u.why });
@@ -1450,13 +1469,13 @@ export class SessionStore {
     this.outChanged();
   }
 
-  /** Messages `ids` didn't get there, `why` (one its machine took did, whatever's said after). */
-  private fail(ids: string[], why: string) {
+  /** Messages `ids` didn't get there, `why` (one its machine took did, whatever's said after); `fresh`: refused for good ({@link Outgoing.fresh}). */
+  private fail(ids: string[], why: string, fresh = false) {
     let changed = false;
     for (const id of ids) {
       const m = this.out.get(id);
       if (!m || m.o.state === "sent") continue;
-      this.out.set(id, { ...m, o: { ...m.o, state: "failed", why } });
+      this.out.set(id, { ...m, o: { ...m.o, state: "failed", why, fresh } });
       changed = true;
     }
     if (changed) this.outChanged();

@@ -1056,6 +1056,16 @@ fn start_once(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, 
     let (port, quic) = (free_port()?, free_udp_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
+    // Runners' live samples place nothing (W05-R03's headroom): a test's runners share the machine
+    // running the tests, whose load isn't theirs to wait for. A test that says otherwise has
+    // `headroom` in a `[ci.scheduler]` of its own.
+    let extra = if o.extra.contains("headroom") {
+        o.extra.to_owned()
+    } else if o.extra.contains("[ci.scheduler]") {
+        o.extra.replacen("[ci.scheduler]", "[ci.scheduler]\nheadroom = false", 1)
+    } else {
+        format!("{}\n[ci.scheduler]\nheadroom = false\n", o.extra)
+    };
     let config = format!(
         r#"[server]
 http_addr = "127.0.0.1:{port}"
@@ -1095,7 +1105,7 @@ enabled = true
         scheme = if https { "https" } else { "http" },
         agent = o.agent,
         ci = o.ci,
-        extra = o.extra,
+        extra = extra,
         // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
         cd = if o.extra.contains("[cd]") {
             ""

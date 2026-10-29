@@ -27,6 +27,8 @@ that same id: to the server, to the runner, into the session's queue, its timeli
 | A goal planned now by a subagent (`goals.plan` asked by someone other than its agent) | made from the plan and when it was last sent: asked for twice at once, one message; again within half an hour, it isn't sent again |
 | `kiln agents send --key` (a kiln shell's socket) | made from the key and the agent: the key is the machine's user's (only they reach its socket); an agent's goes to the server as `agents.send` |
 | A session's first prompt | made from the session's id |
+| kiln's word to keep an agent going (`goals::keep`) | made once as it's sent (`KEEP_ID` and the time): never sent again, each is its own word |
+| A change request's news to the agent that opened it (`workspace::follow`) | made once for each piece of news as it's sent: never sent again; one that didn't reach the agent is said, not retried |
 
 A skill run (the console's palette and tools, a `/name` that's a skill in Mission Control) is
 delivered like a message, and goes through the inbox the same way: the console makes its id, and a
@@ -145,7 +147,12 @@ the session again.
 **Files.** A file uploaded for a message is kept after the message carries it, until it expires
 (30 minutes; short of room, those messages carried already go first): a message sent again
 carries it too, and reads as the same message, its repeat; and the server's sending once more for
-the epoch named carries it.
+the epoch named carries it. Uploads live in the server's memory: once one is gone (expired, let go
+for room, or the server started again), a message sent again (by the conversation, Mission
+Control's message box under its key, or the API) still carries the file's name, so it reads as the
+same message and is answered as its repeat if its first try was taken; new, it goes without the
+file, which its runner leaves out, said. The conversation counts a `reused` refusal of
+its own message as taken (it shows as sent), so its Retry never sends it as a new message.
 
 **Bounds.** A session's inbox keeps the ids of its last 4,096 messages; past 4,096 and 256 more, its
 oldest go, down to its newest 4,096, once the take that passed the bound is answered (not on the
@@ -349,9 +356,11 @@ host's.
 - **Goals added again after they were cleared.** `goals.add` under its key finds the goals it added
   by the ids its key made: taken out of the stack since (cleared), they're added again.
 - **Lost, not doubled.** A message its inbox took that's handed to its session's lane just as an
-  upgrade in place freezes the session, or a move's ids read once its wait for the lane to settle
-  (10 s) ran out with a message still on its way, is taken but never reaches the session: sent
-  again, it's answered as its repeat. CP-T3.1's journal and CP-T3.5's reconciliation take these. So
+  upgrade in place freezes the session, or, as a blue/green upgrade hands the sessions to the new
+  build, its ids read once their lanes' wait to settle (10 s) ran out with a message still on its
+  way (it can't stay by then: its harness went to the new build; a move or a hand-over to a newer
+  process fails then, and the session stays), is taken but never reaches the session: sent again,
+  it's answered as its repeat. CP-T3.1's journal and CP-T3.5's reconciliation take these. So
   does a goal that went as an edit of the stack's word after the agent had taken that word (the edit
   too late), its server restarting before it noted it went: sent again under the word's id, it's
   that word's repeat, and its words reach the agent with the next reminder. And a goal whose first
@@ -375,6 +384,17 @@ host's.
   starting Codex or ACP harness's adapter holds: that word still reaches the agent, once, and the
   goal, brought back, is said again, as one put back always is (the twenty-first adversarial
   check's).
+- **A message changed on the way between its tries.** A message sent again reads as another under
+  its id when something of it changed on the server's side since its first try other than a
+  named file's bytes: a file attached with no name whose upload left the server (the first try
+  took the upload's name, which the server no longer has), or a broadcast's slash command routed
+  otherwise (a skill one try, words the next) as the agent's catalog changed. Its inbox refuses
+  it `reused`. The conversation counts that as taken (it shows as sent); a broadcast reports it
+  failed, and sent again under a new key it's a second prompt. The composer and Mission Control
+  name every file (the twenty-second adversarial check's).
+- **A slow Retry after an unchecked message.** A message sent in a runner's first moment, before
+  it says its inbox, goes unchecked; ended `unanswered`, that answer is kept under its id for 10
+  minutes, and the conversation's Retry under the id gets it again until then. Slow, not doubled.
 - **Goals given as a harness's own control.** A harness whose goal is a control of its own (Codex's
   `thread/goal/set`) is given it as a command, with no message id: started again after a server
   restart between giving it and noting it, the same goal is set again.

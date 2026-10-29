@@ -1658,7 +1658,22 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   does one on a runner whose size isn't known. The v1 dispatcher and each runner's own admission
   hold to the same rule, so neither dispatcher's work lands in the other's share. A job's
   `resources:`, `requires:` and `exclusive:` are its needs, in the one spelling `kiln run --needs`
-  and the MCP tools take too: docs/runners.md.
+  and the MCP tools take too: docs/runners.md. **Headroom**, in either mode: each runner's live
+  sample (what it has in use of its CPUs and memory, and its I/O pressure, every 5 s) reaches the
+  engine, and a leg goes only where what the sample has in use, what kiln placed there since and
+  the leg's request stay within `[ci.scheduler] target_use` (0.85 by default, at most 1) of the
+  runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
+  by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
+  everywhere (kiln's integration tests do: their runners share the machine running the tests; so
+  does `kiln workflow run`'s server, whose one runner is the machine it was asked to run on). The engine and the v1 dispatcher place through one function
+  shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
+  over (docs/runners.md §5). **None starves**: smaller legs would otherwise take every gap before a
+  bigger one, so the first legs in a queue that no runner has had room for since a minute hold a
+  runner each (EASY backfilling's reservation, one a leg as conservative backfilling has it, up to
+  a runner each): the one whose running legs' expected ends leave it room within the target
+  soonest (its shadow). There, another leg starts only if it's expected to end by the shadow, or
+  fits in what the held leg will leave; the hold ends when its leg starts or leaves the queue, or
+  its runner goes or drains.
 - **W05-R04 Data structures.** Requirements are interned into **signatures**; each signature keeps
   its eligible runner set (recomputed when a runner or a rule changes) and a priority queue of its
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
@@ -1699,9 +1714,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R10 Fair share.** Within a priority, start-time fair queuing across repositories (or
   organizations, `[ci.scheduler] fair_by`), weighted by `[ci.fairness] weights`: each leg's virtual
   start is `max(V, finish[repo])`, and `finish[repo] += expected_cost / weight`, with
-  `expected_cost` the leg's median runner-seconds from history (W19) or a default. Under
-  saturation, two equally weighted repositories each get within 10 % of half the capacity
-  (W05-AC04).
+  `expected_cost` the leg's median runner-seconds from history (W19) or a default, times the CPUs
+  it asks (one at the least: a leg asking none costs its runner-seconds). Under saturation, two
+  equally weighted repositories each get within 10 % of half the capacity (W05-AC04), and of the
+  fleet's CPU-time whether their legs ask 8 CPUs or 1.
 - **W05-R11 Quotas** (opt-in): per repository or organization, maximum legs in progress and
   runner-minutes per day, per pool.
 - **W05-R12 Reservations** (opt-in): a pool or runner reserved for matching legs during windows
@@ -1710,7 +1726,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R13 Wait reasons.** Every waiting leg has exactly one current reason, from: `needs`,
   `capacity` (with counts: eligible runners, busy, draining), `oversized` (in resource mode, it
   asks for more than any eligible runner has even idle: what it asks, and what each of them has of
-  it), `no-runner` (none eligible is
+  it), `headroom` (every runner with room for it would pass `[ci.scheduler] target_use` with it,
+  by its live samples: what it asks and where, "waiting for 14 CPUs and 1 GiB of memory free on a
+  linux/x86_64 runner", the target and those runners, and the runner held for it with when it's to
+  have room there), `no-runner` (none eligible is
   connected; lists the ones offline), `unroutable` (no runner known to kiln could ever run it; lists
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
@@ -1824,9 +1843,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R23 Preferences** (opt-in: only when a rule or the job declares them): weighted terms over
   facts (`higher`/`lower`), labels, pools, `affinity: { job: <id> }` (the runner that ran that
   job's leg last, for warm caches), `spread: host`. Score = Σ weight × term (each term
-  normalized to 0..1 across the eligible set). Ties break by least loaded, then most free
-  capacity, then name. **Without preferences** the choice is today's: least loaded, then most free
-  slots.
+  normalized to 0..1 across the eligible set). Ties break by the most headroom left by the
+  runners' live samples (W05-R03: the larger of the CPUs' and the memory's share in use after the
+  leg, I/O pressure on top, the lowest; runners without a fresh sample after those), then least
+  loaded, then most free capacity, then name. **Without preferences** the choice is the most
+  headroom left, then least loaded, then most free slots.
 - **W05-R24 Unroutable legs.** When no runner kiln has ever seen, and no pool, could satisfy a
   leg, it waits with reason `unroutable` and the failing requirements, or fails after
   `[ci.routing] unroutable_timeout` if one is set.
@@ -8664,8 +8685,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     `w26_r14_the_review_lanes_marks`), `tests/suggestions.rs` (`w26_ac03_*`), `tests/conflicts.rs`
     (`w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision`,
     `w26_r12_a_change_requests_resolution_is_a_merge_commit`, on real git), `tests/search.rs`
-    (`w26_r07_a_search_across_the_change`, a 1,000-file change), `ship.rs`
-    (`w26_r14_a_commit_with_no_change_carries_its_push`).
+    (`w26_r07_a_search_across_the_change`, a 1,000-file change, the search's checks; its 250 ms at
+    p95 is `w26_r07_warm_searches_p95_within_250ms`, a benchmark run alone on an idle machine),
+    `ship.rs` (`w26_r14_a_commit_with_no_change_carries_its_push`).
   - UI, in Chromium and WebKit at desktop and phone widths: `e2e/ship-review.spec.ts` (open, reply,
     resolve, change a kind, delete, apply a suggestion, the whole file, search, every way to resolve
     a conflict and commit it), `ship-lanes.spec.ts` (the sections' order on four kinds of item, and
