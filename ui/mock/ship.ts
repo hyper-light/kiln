@@ -6,7 +6,7 @@
  * does.
  */
 import type http from "node:http";
-import type { ShipChange, ShipCommit, ShipDetail, ShipMark, ShipPage, ShipPip } from "../src/api/ship.ts";
+import type { ShipChange, ShipCommit, ShipDetail, ShipMark, ShipPace, ShipPage, ShipPip } from "../src/api/ship.ts";
 import { STATES } from "../src/components/ui/status-glyph-spec.ts";
 import { Trunk } from "./ship-sim.ts";
 
@@ -409,6 +409,25 @@ function marksOf(c: ShipCommit): ShipMark[] {
   return marks;
 }
 
+/** The pace line as the server reads it from its rows (plan 01a1856fe81375b1bd1d1d86f270a45b, step
+ * 5): those in flight and the agents behind them; for each repository, the newest row each
+ * environment runs, production with the rows newer than it. */
+function paceOf(list: ShipCommit[]): ShipPace {
+  const flight = list.filter((c) => c.stand === "landing" || c.stand === "checking" || c.stand === "building");
+  const agents = new Set(flight.filter((c) => c.author.startsWith("agent:")).map((c) => c.author));
+  const envs: ShipPace["envs"] = [];
+  for (const repo of [...new Set(list.map((c) => c.repo))].sort()) {
+    const rows = list.filter((c) => c.repo === repo);
+    for (const production of [false, true]) {
+      const at = rows.findIndex((c) => c.environments?.some((e) => e.production === production));
+      const row = rows[at];
+      const env = row?.environments?.find((e) => e.production === production);
+      if (row && env) envs.push({ repo, environment: env.environment, short: row.short, behind: production ? at : null });
+    }
+  }
+  return { in_flight: flight.length, agents: agents.size, envs, runners: null };
+}
+
 /** Every row: those a test added, the trunk's commits (newest first), then the fixed ones. */
 const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...commits()];
 
@@ -425,7 +444,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const list = all().filter(
       (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
     );
-    const page: ShipPage = { commits: list, next_cursor: null };
+    const page: ShipPage = { commits: list, next_cursor: null, pace: paceOf(all().filter((c) => !repo || c.repo === repo)) };
     ctx.json(res, 200, page);
     return true;
   }

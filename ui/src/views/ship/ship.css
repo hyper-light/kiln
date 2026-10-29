@@ -302,6 +302,43 @@
   color: #0b0c0e;
 }
 
+/* The pace line under the list bar (f-ship's): one line of what's moving, scrolling sideways when it
+   doesn't fit (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5). */
+.ship-pace {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px 16px;
+  margin: 0 0 10px;
+  line-height: 18px;
+  min-height: 18px;
+  color: #8b8e96;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.ship-pace::-webkit-scrollbar {
+  display: none;
+}
+/* Its counts in figures of one width, each starting where it starts with room for two after it, and
+   a plural's s held when it's one: a count that changes moves no text, its own or any beside it
+   (the opened row's layout shift stays 0). */
+.ship-pace b {
+  font-weight: 450;
+  color: #b9bbc2;
+  font-variant-numeric: tabular-nums;
+}
+.ship-pace__count {
+  display: inline-block;
+  min-width: 2ch;
+}
+.ship-pace__held {
+  visibility: hidden;
+}
+.ship-pace__sha {
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
 /* The list bar's sort, on the right; on a phone the filter takes the width and the sort sits under it.
    In the column a phone makes, each is its own height: a flex basis there would be a height (the
    filter's 260px opened a gap under it). */

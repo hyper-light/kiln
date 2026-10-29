@@ -1164,13 +1164,21 @@ struct Rendered {
     others: Value,
     yours: Option<Value>,
     whose: Vec<String>,
+    /// Where it stands, and the agent behind it when one is: what the pace line counts.
+    stand: journey::Stand,
+    agent: Option<String>,
 }
 
 fn render(rec: &Records, runners: &[RunnerSeen], now: i64) -> Rendered {
     let j = journey_of(rec, runners, now);
     let whose = whose(&j);
     let yours = (!whose.is_empty()).then(|| summary_of(rec, &j, now, true));
-    Rendered { others: summary_of(rec, &j, now, false), yours, whose }
+    let stand = journey::standing(&j, now).stand;
+    let agent = match &j.author {
+        Author::Agent { name, .. } => Some(name.clone()),
+        Author::Person(_) => None,
+    };
+    Rendered { others: summary_of(rec, &j, now, false), yours, whose, stand, agent }
 }
 
 /// A leg as the detail shows it; `job` and `run` only once it has run (optional new fields).
@@ -1314,6 +1322,8 @@ struct Row {
     whose: Vec<String>,
     kind: &'static str,
     host: Option<String>,
+    stand: journey::Stand,
+    agent: Option<String>,
 }
 
 impl Row {
@@ -1322,7 +1332,7 @@ impl Row {
         let text = |v: &Value| serde_json::to_string(v).map_err(|e| internal(e.into()));
         let (others, yours) = (text(&x.others)?, x.yours.as_ref().map(text).transpose()?);
         let (kind, host) = (kind_of(&rec), rec.change.as_ref().map(|c| c.host.clone()));
-        Ok(Self { rec, others, yours, whose: x.whose, kind, host })
+        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent })
     }
 
     fn json(&self, viewer: Option<&HashSet<String>>) -> &str {
@@ -1571,6 +1581,39 @@ impl ShipCache {
         Ok(Some(out))
     }
 
+    /// The list's pace line for the repositories in view, from memory (plan
+    /// 01a1856fe81375b1bd1d1d86f270a45b, step 5): the commits in flight (landing, checking,
+    /// building) and the agents behind them; what each environment of each repository runs now,
+    /// and how many commits production is behind; and how many of the connected runners run
+    /// production's commit. None until the model is built.
+    pub fn pace(&self, repo: Option<&str>, only: Option<&[String]>, runners: &[RunnerSeen]) -> Option<Value> {
+        let h = self.held.read().ok()?;
+        if !h.built {
+            return None;
+        }
+        let mut repos: Vec<(&String, &HeldRepo)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
+        repos.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let flight: Vec<&Row> = repos.iter().flat_map(|(_, r)| r.rows.values()).filter(|row| matches!(row.stand, journey::Stand::Landing | journey::Stand::Checking | journey::Stand::Building)).collect();
+        let agents: HashSet<&str> = flight.iter().filter_map(|row| row.agent.as_deref()).collect();
+        let runs = |r: &RunnerSeen, sha: &str| r.commit.as_deref().is_some_and(|c| sha.starts_with(c) || c.starts_with(sha));
+        let mut envs = Vec::new();
+        let mut on = Value::Null;
+        for (name, r) in repos {
+            // Staging before production, as a commit goes.
+            let mut current: Vec<&DeployRec> = r.ctx.current.iter().collect();
+            current.sort_by_key(|d| d.production);
+            for d in current {
+                let behind = d.production.then(|| r.ctx.commits.iter().filter(|(_, f, _)| *f > d.first_row).count());
+                envs.push(json!({ "repo": name, "environment": d.environment, "short": short(&d.sha), "behind": behind }));
+                if d.production && on.is_null() && runners.iter().any(|x| runs(x, &d.sha)) {
+                    let live: Vec<&RunnerSeen> = runners.iter().filter(|x| x.connected).collect();
+                    on = json!({ "on": live.iter().filter(|x| runs(x, &d.sha)).count(), "of": live.len() });
+                }
+            }
+        }
+        Some(json!({ "in_flight": flight.len(), "agents": agents.len(), "envs": envs, "runners": on }))
+    }
+
     /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more), if held.
     pub fn detail(&self, repo: &str, sha: &str, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Option<Value> {
         let h = self.held.read().ok()?;
@@ -1629,8 +1672,20 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
         Some(c) => Some(principals(hub, c).await),
         None => None,
     };
-    match c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
-        Some(body) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(body))),
+    let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
+    match c.page(repo, only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
+        Some(mut body) => {
+            // The pace line's words go with the page (an optional field).
+            if let Some(pace) = c.pace(repo, only.as_deref(), &runners).and_then(|p| serde_json::to_string(&p).ok())
+                && body.ends_with('}')
+            {
+                body.pop();
+                body.push_str(",\"pace\":");
+                body.push_str(&pace);
+                body.push('}');
+            }
+            Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
+        }
         None => {
             let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
             Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, viewer.as_ref(), runners, &deploys, now).await?))
@@ -1926,6 +1981,11 @@ mod tests {
                 page.get("commits").and_then(Value::as_array).into_iter().flatten().map(|c| (text(c, "short"), text(c, "stand"), text(c, "line"))).collect()
             };
             cache.refresh(&store, &runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            // Step 5's pace line: nothing in flight, production on C1 one commit behind, both runners on it.
+            assert_eq!(
+                cache.pace(Some("hyper-light/kiln"), None, &runners()),
+                Some(json!({ "in_flight": 0, "agents": 0, "envs": [{ "repo": "hyper-light/kiln", "environment": "production", "short": short(C1), "behind": 1 }], "runners": { "on": 2, "of": 2 } }))
+            );
             assert_eq!(stands(&cache), vec![
                 (short(C2), "waiting".into(), "Built".into()),
                 (short(C1), "shipped".into(), "In production · runners 2/2".into()),
@@ -1939,6 +1999,11 @@ mod tests {
                 (short(C1), "shipped".into(), "Superseded".into()),
                 (short(C3), "shipped".into(), "Superseded".into()),
             ]);
+            // Production on C2, behind by nothing; no runner on it yet, so no runners' count.
+            assert_eq!(
+                cache.pace(None, None, &runners()),
+                Some(json!({ "in_flight": 0, "agents": 0, "envs": [{ "repo": "hyper-light/kiln", "environment": "production", "short": short(C2), "behind": 0 }], "runners": null }))
+            );
             Ok(())
         })
     }

@@ -63,9 +63,24 @@ export interface ShipCommit {
   v?: string;
 }
 
+/**
+ * The pace line's words (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5): the commits in flight
+ * (landing, checking, building) and the agents behind them; what each environment of each
+ * repository in view runs now, production with how many commits it's behind; and how many of the
+ * connected runners run production's commit (null when none does).
+ */
+export interface ShipPace {
+  in_flight: number;
+  agents: number;
+  envs: { repo: string; environment: string; short: string; behind: number | null }[];
+  runners: { on: number; of: number } | null;
+}
+
 export interface ShipPage {
   commits: ShipCommit[];
   next_cursor: number | null;
+  /** With a page the server read from memory. */
+  pace?: ShipPace;
 }
 
 /** A build part's state (`Part` in kiln_cd::journey): `none` when nothing built it. */

@@ -3,9 +3,11 @@
  * in Ship's list as Needs you · kim: empty matrix meant? · 1 thread, first, with Ship's Hand off
  * and Review pair; the change request's other commit folds under its head; the kind and host facets
  * narrow the list; an item opens to Files, Output, Jobs and Lanes, in that order. The list bar is the
- * filter and the sort, nothing between them, at every width.
+ * filter and the sort, nothing between them, at every width; the pace line under it says what's
+ * moving in one line (plan 01a1856fe81375b1bd1d1d86f270a45b, steps 1 and 5).
  */
 import { expect, test } from "@playwright/test";
+import type { ShipPage } from "../src/api/ship";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
@@ -104,8 +106,46 @@ test("the list bar is the filter and the sort, nothing between them, from 320 to
       expect(Math.abs(sort.y - filter.y), at).toBeLessThanOrEqual(1);
       expect(sort.x, at).toBeGreaterThan(filter.x + filter.width);
     }
-    // And the list comes right after the bar.
-    expect(rows.y - (bar.y + bar.height), at).toBeLessThanOrEqual(13);
+    // And the pace line comes right after the bar, the list right after it.
+    const pace = await box(".ship-pace");
+    expect(pace.y - (bar.y + bar.height), at).toBeLessThanOrEqual(13);
+    expect(rows.y - (pace.y + pace.height), at).toBeLessThanOrEqual(11);
+  }
+});
+
+test("the pace line says what's moving, in the server's numbers, on one line from 320 to 1440 px", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the widths are set here; the desktop projects run them");
+  test.setTimeout(90_000);
+  const pace = ((await (await page.request.get("/api/ship/commits")).json()) as ShipPage).pace;
+  if (!pace) throw new Error("the list came with no pace");
+  const words = [
+    `${pace.in_flight} in flight · ${pace.agents} agent${pace.agents === 1 ? "" : "s"}`,
+    ...pace.envs.map((e) => `${e.environment} ${e.short}${e.behind === null ? "" : ` · ${e.behind} behind`}`),
+    ...(pace.runners ? [`runners ${pace.runners.on}/${pace.runners.of}`] : []),
+  ];
+  expect(words.length).toBeGreaterThan(1);
+  for (const width of [320, 390, 640, 641, 1280, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/ship");
+    const line = page.getByLabel("Pace", { exact: true });
+    await expect(line).toBeVisible({ timeout: 15_000 });
+    // (As it reads: a plural's s held unseen at one is no word of it.)
+    await expect(line.locator(":scope > span")).toHaveText(words, { useInnerText: true });
+    // One line however narrow: it scrolls sideways rather than wrap.
+    expect((await line.boundingBox())?.height ?? 0, `at ${width}`).toBeLessThanOrEqual(19);
+  }
+  // Commits arriving leave it one line where it is.
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto("/ship");
+  const line = page.getByLabel("Pace", { exact: true });
+  await expect(line).toBeVisible({ timeout: 15_000 });
+  const before = await line.boundingBox();
+  try {
+    await page.request.post("/api/mock/ship/agents?n=6&over=2");
+    await page.waitForTimeout(3_000);
+    expect(await line.boundingBox()).toEqual(before);
+  } finally {
+    await page.request.post("/api/mock/ship/arrive?clear=1");
   }
 });
 

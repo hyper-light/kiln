@@ -10,7 +10,7 @@
  */
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
-import { shipApi, type ShipAction, type ShipCommit, type ShipQuery } from "@/api/ship";
+import { shipApi, type ShipAction, type ShipCommit, type ShipPace, type ShipQuery } from "@/api/ship";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable } from "@/components/ui/loading";
@@ -160,6 +160,7 @@ function ShipList() {
         />
         <SelectField className="ship-sort" label="Sort commits" hideLabel value={sort} onChange={(v) => set("sort", v === "needs" ? null : v)} options={SORTS} />
       </div>
+      <Pace pace={page.data.pace} />
       {items.length === 0 ? (
         <EmptyState title="No commits yet">Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
       ) : (
@@ -178,6 +179,47 @@ function ShipList() {
         </ul>
       )}
     </>
+  );
+}
+
+/**
+ * The pace line under the list bar, as f-ship draws it (plan 01a1856fe81375b1bd1d1d86f270a45b, step
+ * 5): what's in flight and the agents behind it, what each environment runs and how far production
+ * is behind, and the runners on production's commit. One line, scrolling sideways when it doesn't
+ * fit; it keeps its height when the server sends none.
+ */
+function Pace({ pace }: { pace?: ShipPace }) {
+  const repos = new Set(pace?.envs.map((e) => e.repo) ?? []);
+  return (
+    <p className="ship-pace" aria-label="Pace">
+      {pace ? (
+        <>
+          <span>
+            <b className="ship-pace__count">{pace.in_flight}</b> in flight · <b className="ship-pace__count">{pace.agents}</b> agent
+            <span className={pace.agents === 1 ? "ship-pace__held" : undefined}>s</span>
+          </span>
+          {pace.envs.map((e) => (
+            <span key={`${e.repo} ${e.environment}`}>
+              {repos.size > 1 ? `${e.repo.split("/").pop() ?? e.repo} ` : ""}
+              {e.environment} <span className="ship-pace__sha">{e.short}</span>
+              {e.behind !== null && (
+                <>
+                  {" "}
+                  · <b className="ship-pace__count">{e.behind}</b> behind
+                </>
+              )}
+            </span>
+          ))}
+          {pace.runners && (
+            <span>
+              runners <b>{pace.runners.on}</b>/{pace.runners.of}
+            </span>
+          )}
+        </>
+      ) : (
+        "\u00a0"
+      )}
+    </p>
   );
 }
 
