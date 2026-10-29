@@ -8,7 +8,7 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowUpRight, ChevronRight, X } from "lucide-react";
+import { ArrowUpRight, ChevronRight, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
@@ -200,7 +200,8 @@ const Row = React.memo(function Row({
       ) : (
         <button type="button" className="ms-main" onClick={open} aria-pressed={picking ? selected : undefined}>
           <span className="ms-name">
-            {picking && <span className="ms-pick" aria-hidden="true" />}
+            {/* Always there by touch, so it slides in as picking starts rather than knocking the name aside. */}
+            <span className="ms-pick" data-on={picking || undefined} aria-hidden="true" />
             {label}
           </span>
           {line}
@@ -465,12 +466,27 @@ function MissionComposer({
   const text = useDrafts((s) => s.drafts[MISSION_DRAFT] ?? "");
   const setDraft = useDrafts((s) => s.setDraft);
   const onText = React.useCallback((t: string | ((was: string) => string)) => setDraft(MISSION_DRAFT, typeof t === "function" ? t(useDrafts.getState().drafts[MISSION_DRAFT] ?? "") : t), [setDraft]);
+  // Its height as it starts an agent, held while it messages those selected (shorter, with room for
+  // its To line to grow), so the list under it stays where it is as the first is picked and the last put back.
+  const [held] = React.useState(() => ({ height: 0 }));
+  const measured = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el) return;
+      // To the fraction of a pixel (offsetHeight rounds), or the list would still move by it.
+      const seen = new ResizeObserver(([e]) => {
+        held.height = e?.borderBoxSize[0]?.blockSize ?? el.getBoundingClientRect().height;
+      });
+      seen.observe(el);
+      return () => seen.disconnect();
+    },
+    [held],
+  );
   return picked.length > 0 ? (
-    <div className="mc-mode" key="message">
+    <div className="mc-mode" key="message" style={held.height > 0 ? { minHeight: held.height } : undefined}>
       <MessageBar agents={picked} reach="selected" onEnded={onClear} all={all} onPick={onPick} text={text} onText={onText} onClear={onClear} autoFocus={focusFor === "message"} />
     </div>
   ) : (
-    <div className="mc-mode" key="new">
+    <div className="mc-mode" key="new" ref={measured}>
       <NewAgent text={text} onText={onText} all={all} onPick={onPick} autoFocus={focusFor === "new"} />
     </div>
   );
@@ -489,6 +505,13 @@ function Agents() {
     setSelected(new Set());
     setPicking(false);
   };
+  // Putting back the last one picked (a row, its chip, the ring that picks them all) ends selecting, as Clear does.
+  const [hadPicked, setHadPicked] = React.useState(false);
+  if (selected.size > 0 && !hadPicked) setHadPicked(true);
+  if (selected.size === 0 && hadPicked) {
+    setHadPicked(false);
+    setPicking(false);
+  }
   // Where the composer's field takes the focus as it turns: to messaging, from an agent picked with @ in it; back to starting one, from Clear.
   const [focusFor, setFocusFor] = React.useState<"new" | "message" | null>(null);
 
@@ -545,6 +568,13 @@ function Agents() {
     if (![...selected].every((id) => here.has(id))) setSelected(new Set([...selected].filter((id) => here.has(id))));
   }
   const checked = selectable.filter((r) => selected.has(r.a.id));
+  // In the order they were picked: the composer's To line and the bulk bar add each one picked at the
+  // end, and nothing picked before it moves (the list's own order changes as they work).
+  const shownById = new Map(checked.map((r) => [r.a.id, r.a]));
+  const picked = [...selected].flatMap((id) => {
+    const a = shownById.get(id);
+    return a ? [a] : [];
+  });
   const liveChecked = live.filter((r) => selected.has(r.a.id)).length;
   const some = liveChecked > 0 && liveChecked < live.length;
   const allBox = React.useCallback(
@@ -557,7 +587,7 @@ function Agents() {
   // Nothing selected, it starts an agent; agents selected, it messages those (and nothing else: "every agent shown" is Select all).
   const composer = (
     <MissionComposer
-      picked={checked.map((r) => r.a)}
+      picked={picked}
       all={findable}
       onPick={(ids, on) => {
         setMany(ids, on);
@@ -598,67 +628,63 @@ function Agents() {
         <>
           <div className="ms-listhead" data-selecting={(touchScreen && selecting) || undefined}>
             {touchScreen ? (
-              // By touch: Select (or hold a row), then tap rows; All, and Done.
-              <>
+              // By touch: Select (or hold a row), then tap rows. Selecting, a ring where the rows' rings are
+              // selects them all (or none, which ends it, as putting back the last one does); Clear ends it.
+              <span className="ms-all">
+                <input
+                  ref={allBox}
+                  type="checkbox"
+                  className="ms-pick-all"
+                  data-on={selecting || undefined}
+                  tabIndex={selecting ? undefined : -1}
+                  aria-hidden={selecting ? undefined : true}
+                  disabled={!selecting || live.length === 0}
+                  checked={live.length > 0 && liveChecked === live.length}
+                  onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
+                  aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
+                />
                 <span className="ms-count" aria-live="polite">
-                  {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${all.length} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                  <span key={selecting ? "picked" : "all"} className="ms-swap">
+                    {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${all.length} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                  </span>
                 </span>
-                {selecting ? (
-                  <span className="ms-picks">
-                    <button
-                      type="button"
-                      className="ms-link"
-                      disabled={live.length === 0 || liveChecked === live.length}
-                      onClick={() =>
-                        setMany(
-                          live.map((r) => r.a.id),
-                          true,
-                        )
-                      }
-                    >
-                      Select all
-                    </button>
-                    <button type="button" className="ms-link ms-done" onClick={clear}>
-                      Done
-                    </button>
-                  </span>
-                ) : (
-                  live.length > 0 && (
-                    <button type="button" className="ms-link ms-select" onClick={() => setPicking(true)}>
-                      Select
-                    </button>
-                  )
-                )}
-              </>
+              </span>
             ) : (
-              <>
-                <label className="ms-all">
-                  <input
-                    ref={allBox}
-                    type="checkbox"
-                    className="check"
-                    disabled={live.length === 0}
-                    checked={live.length > 0 && liveChecked === live.length}
-                    onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
-                    aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
-                  />
-                  <span>
-                    {checked.length > 0
-                      ? `${checked.length} of ${selectable.length} selected`
-                      : filtered
-                        ? `${live.length + ended.length} of ${all.length} agents`
-                        : `${all.length} agent${all.length === 1 ? "" : "s"}`}
-                  </span>
-                </label>
-                {checked.length > 0 && (
-                  <button type="button" className="ms-link" onClick={clear}>
-                    Clear selection
-                  </button>
-                )}
-              </>
+              <label className="ms-all">
+                <input
+                  ref={allBox}
+                  type="checkbox"
+                  className="check"
+                  disabled={live.length === 0}
+                  checked={live.length > 0 && liveChecked === live.length}
+                  onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
+                  aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
+                />
+                <span key={checked.length > 0 ? "picked" : "all"} className="ms-swap">
+                  {checked.length > 0
+                    ? `${checked.length} of ${selectable.length} selected`
+                    : filtered
+                      ? `${live.length + ended.length} of ${all.length} agents`
+                      : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                </span>
+              </label>
             )}
-            {/* What to do with those selected, in the head (held in view by touch while selecting); what they started, from every agent kiln runs. */}
-            <BulkBar agents={checked.map((r) => r.a)} all={list} onGone={clear} />
+            {/* What to do with those selected, on the head's one line (held in view by touch while selecting, there from the start; by touch Select in its place before); what they started, from every agent kiln runs. */}
+            <BulkBar
+              agents={picked}
+              all={list}
+              open={selecting}
+              idle={
+                touchScreen && live.length > 0 ? (
+                  <Button size="xs" variant="secondary" onClick={() => setPicking(true)}>
+                    <ListChecks aria-hidden="true" />
+                    Select
+                  </Button>
+                ) : undefined
+              }
+              onGone={clear}
+              onClear={clear}
+            />
           </div>
           {live.length > 0 ? (
             <div {...touch.props} data-held={held || undefined}>
