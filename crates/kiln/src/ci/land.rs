@@ -404,7 +404,7 @@ fn holding(g: Gate, why: &str) -> Gate {
 /// The files of the first diff that isn't clear when it's a conflict with the trunk (W28-R107).
 fn first_conflict(gates: &[(String, Gate)]) -> Option<Vec<String>> {
     match gates.iter().map(|(_, g)| g).find(|g| !g.ready()) {
-        Some(Gate::Conflict { files }) => Some(files.clone()),
+        Some(Gate::Conflict { files, .. }) => Some(files.clone()),
         _ => None,
     }
 }

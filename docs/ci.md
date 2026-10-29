@@ -9036,8 +9036,9 @@ the queue)
   entry whose upper diffs stop being clear before its move lands its prefix, tested on its own.
 - **W28-R107 Conflicts go back to Review.** An entry that conflicts with the trunk isn't ejected: it's
   `returned` to Review, saying where (`needs rebase: conflicts with the trunk in README.md`, the
-  files kept in `conflicts`), and the same entry joins the queue again once a version resolves it and
-  Review's gate clears that version.
+  files kept in `conflicts`) and, beside it, what Review's gate says of the diff (W26's conflicts,
+  each where it falls: `README.md:3: resolve this conflict first`), and the same entry joins the
+  queue again once a version resolves it and Review's gate clears that version.
 - **W28-R108 The land record.** Each land keeps (`land_records`, one row per entry; `record` in
   `GET /api/repos/:repo/queue`): the change and its kind (`diff`, `stack`, `change_request`,
   `host`), the strategy, the approved revisions with their patch-ids, the candidate tested and the

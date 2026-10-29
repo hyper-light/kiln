@@ -286,13 +286,17 @@ fn w28_r100_units_of_package_graphs() {
 fn w28_r104_the_gate() {
     assert_eq!(Gate::of(Vec::new(), Vec::new()), Gate::Ready);
     assert_eq!(Gate::of(vec!["0 of 1 accepts".into()], Vec::new()), Gate::Hold { why: vec!["0 of 1 accepts".into()] });
-    assert_eq!(Gate::of(vec!["0 of 1 accepts".into()], vec!["README.md".into()]), Gate::Conflict { files: vec!["README.md".into()] }, "a conflict goes back to Review");
+    assert_eq!(Gate::of(vec!["0 of 1 accepts".into()], vec!["README.md".into()]), Gate::Conflict { files: vec!["README.md".into()], why: vec!["0 of 1 accepts".into()] }, "a conflict goes back to Review");
+    // Review's own reasons stay beside the conflict, each said (W26's conflicts where they fall).
+    let with = Gate::of(vec!["expand.rs:3: resolve this conflict first".into()], vec!["expand.rs".into()]);
+    assert_eq!(with.reason().as_deref(), Some("needs rebase: conflicts with the trunk in expand.rs; expand.rs:3: resolve this conflict first"));
+    assert_eq!(prefix(&[("D1".to_owned(), with)]).held, [("D1".to_owned(), vec!["needs rebase: conflicts with the trunk in expand.rs".to_owned(), "expand.rs:3: resolve this conflict first".to_owned()])]);
     let entry = [("D1".to_owned(), Gate::Ready), ("D2".to_owned(), Gate::Hold { why: vec!["user:rev asked for changes".into()] })];
     let g = Gate::of_entry(&entry);
     assert_eq!(g.reason().as_deref(), Some("D2: user:rev asked for changes"));
     assert!(!g.ready() && Gate::of_entry(&[("D1".to_owned(), Gate::Ready)]).ready());
     let many: Vec<String> = (1..=7).map(|n| format!("f{n}")).collect();
-    assert_eq!(Gate::Conflict { files: many }.reason().as_deref(), Some("needs rebase: conflicts with the trunk in f1, f2, f3, f4, f5 and 2 more"));
+    assert_eq!(Gate::Conflict { files: many, why: Vec::new() }.reason().as_deref(), Some("needs rebase: conflicts with the trunk in f1, f2, f3, f4, f5 and 2 more"));
 }
 
 /// W28-R105: a pinned revision holds through rebase-only revisions with its patch-id, and a newer
@@ -324,7 +328,7 @@ fn w28_r106_a_stack_lands_its_clear_prefix() {
             ("D5".to_owned(), vec!["D3, below it, holds".to_owned(), "1 open thread".to_owned()])
         ]
     );
-    let blocked = prefix(&[("D1".to_owned(), Gate::Conflict { files: vec!["a".into()] }), ("D2".to_owned(), Gate::Ready)]);
+    let blocked = prefix(&[("D1".to_owned(), Gate::Conflict { files: vec!["a".into()], why: Vec::new() }), ("D2".to_owned(), Gate::Ready)]);
     assert!(blocked.clear.is_empty() && blocked.held.len() == 2, "{blocked:?}");
     // A diff's reasons stay apart, so each is said with its name (W26-R11's blocking thread among them).
     let two = prefix(&[("D1".to_owned(), Gate::Hold { why: vec!["0 of 1 accepts".into(), "expand.rs:2: kim resolves this blocking comment first".into()] })]);

@@ -327,15 +327,21 @@ pub enum Gate {
     Ready,
     /// It holds, these the reasons.
     Hold { why: Vec<String> },
-    /// It conflicts with the trunk in these files: back to Review's conflict ladder (R107).
-    Conflict { files: Vec<String> },
+    /// It conflicts with the trunk in these files: back to Review's conflict ladder (R107), with
+    /// Review's own reasons beside them (W26's, each conflict where it falls).
+    Conflict {
+        files: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        why: Vec<String>,
+    },
 }
 
 impl Gate {
-    /// A diff's gate from its blockers and the files it conflicts with the trunk in.
+    /// A diff's gate from its blockers and the files it conflicts with the trunk in: a conflict
+    /// keeps the blockers beside it, so Review's words for each conflict are said too.
     pub fn of(blockers: Vec<String>, conflicts: Vec<String>) -> Gate {
         if !conflicts.is_empty() {
-            Gate::Conflict { files: conflicts }
+            Gate::Conflict { files: conflicts, why: blockers }
         } else if !blockers.is_empty() {
             Gate::Hold { why: blockers }
         } else {
@@ -346,11 +352,17 @@ impl Gate {
     /// An entry's gate from its diffs', bottom first: a conflict in any sends it back to Review;
     /// else any diff's blockers hold it, each named by its diff.
     pub fn of_entry(diffs: &[(String, Gate)]) -> Gate {
-        let files: BTreeSet<String> = diffs.iter().flat_map(|(_, g)| if let Gate::Conflict { files } = g { files.clone() } else { Vec::new() }).collect();
+        let files: BTreeSet<String> = diffs.iter().flat_map(|(_, g)| if let Gate::Conflict { files, .. } = g { files.clone() } else { Vec::new() }).collect();
+        let why: Vec<String> = diffs
+            .iter()
+            .flat_map(|(d, g)| match g {
+                Gate::Hold { why } | Gate::Conflict { why, .. } => why.iter().map(|w| format!("{d}: {w}")).collect(),
+                Gate::Ready => Vec::new(),
+            })
+            .collect();
         if !files.is_empty() {
-            return Gate::Conflict { files: files.into_iter().collect() };
+            return Gate::Conflict { files: files.into_iter().collect(), why };
         }
-        let why: Vec<String> = diffs.iter().flat_map(|(d, g)| if let Gate::Hold { why } = g { why.iter().map(|w| format!("{d}: {w}")).collect() } else { Vec::new() }).collect();
         if why.is_empty() { Gate::Ready } else { Gate::Hold { why } }
     }
 
@@ -363,7 +375,7 @@ impl Gate {
         match self {
             Gate::Ready => None,
             Gate::Hold { why } => Some(why.join("; ")),
-            Gate::Conflict { files } => Some(conflicts_in(files)),
+            Gate::Conflict { files, why } => Some(std::iter::once(conflicts_in(files)).chain(why.iter().cloned()).collect::<Vec<_>>().join("; ")),
         }
     }
 }
@@ -438,7 +450,7 @@ pub fn prefix(stack: &[(String, Gate)]) -> Prefix {
         let why: Vec<String> = match g {
             Gate::Ready => Vec::new(),
             Gate::Hold { why } => why.clone(),
-            Gate::Conflict { files } => vec![conflicts_in(files)],
+            Gate::Conflict { files, why } => std::iter::once(conflicts_in(files)).chain(why.iter().cloned()).collect(),
         };
         match &below {
             None if g.ready() => out.clear.push(d.clone()),
