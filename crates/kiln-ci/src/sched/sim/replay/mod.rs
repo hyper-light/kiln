@@ -87,7 +87,16 @@ pub struct Policy {
     pub share: Option<f64>,
     /// P4: bisection runs are speculative demands of their lane, under its AIMD window (W28-R68).
     pub window: Option<admit::Window>,
+    /// W28-R80's overflow: a k8s job whose pod hasn't started this many seconds after the quota
+    /// took it runs on a slot of a Linux machine instead, once one has room (looking again every
+    /// [`OVERFLOW_AGAIN_S`]); `None`, it waits for its pod as the week's did.
+    pub overflow: Option<i64>,
 }
+
+/// How often a k8s job past its overflow's `after` looks again for a Linux machine with room.
+pub const OVERFLOW_AGAIN_S: i64 = 30;
+/// The overflow's `after`, the scheduler's default (`sched::pools::OVERFLOW_AFTER_MS`).
+pub const OVERFLOW_AFTER_S: i64 = crate::sched::pools::OVERFLOW_AFTER_MS / 1000;
 
 /// The defaults W25's later steps take, from the sweeps in ci/sim/README.md: finish work no one
 /// wants when it has 5 min left (less waste than 2 min, within a point of its verdicts); a warm
@@ -101,7 +110,7 @@ pub const MAX_WAIT: i64 = 600;
 
 impl Policy {
     fn demands(name: &str) -> Policy {
-        Policy { name: name.into(), groups: None, finish_within: FINISH_WITHIN, warm_credit: WARM_CREDIT, verdicts: false, coalesce: None, cadence: false, share: None, window: None }
+        Policy { name: name.into(), groups: None, finish_within: FINISH_WITHIN, warm_credit: WARM_CREDIT, verdicts: false, coalesce: None, cadence: false, share: None, window: None, overflow: None }
     }
 
     /// P0: today, as recorded (cancel-in-progress where the workflows said so).
@@ -135,8 +144,19 @@ impl Policy {
     }
 
     /// P0 to P5.
+    /// P3 with W28-R80's overflow at its default `after`: a k8s job whose pod hasn't started in
+    /// 2 min runs on a Linux machine's slot.
+    pub fn p3_overflow() -> Policy {
+        Policy { overflow: Some(OVERFLOW_AFTER_S), ..Policy::p3() }.named("P3 + overflow")
+    }
+
+    /// P4 with W28-R80's overflow.
+    pub fn p4_overflow() -> Policy {
+        Policy { overflow: Some(OVERFLOW_AFTER_S), ..Policy::p4() }.named("P4 + overflow")
+    }
+
     pub fn all() -> Vec<Policy> {
-        vec![Policy::p0(), Policy::p1(), Policy::p2(), Policy::p3(), Policy::p4(), Policy::p5()]
+        vec![Policy::p0(), Policy::p1(), Policy::p2(), Policy::p3(), Policy::p4(), Policy::p5(), Policy::p3_overflow(), Policy::p4_overflow()]
     }
 
     pub fn named(mut self, name: &str) -> Policy {
@@ -302,6 +322,8 @@ enum ExecSt {
 enum Ev {
     Finish(usize),
     Launched(usize),
+    /// A k8s job's pod is past its overflow's `after` (W28-R80).
+    Overflow(usize),
     /// Admission's timer (P4): what it held may go.
     Review,
     Arrive(usize),
@@ -311,7 +333,7 @@ impl Ev {
     fn order(self) -> u8 {
         match self {
             Ev::Finish(_) => 0,
-            Ev::Launched(_) => 1,
+            Ev::Launched(_) | Ev::Overflow(_) => 1,
             Ev::Review => 2,
             Ev::Arrive(_) => 3,
         }
@@ -512,6 +534,7 @@ impl Engine<'_> {
                 Ev::Arrive(r) => self.arrive(r),
                 Ev::Review => self.review_admit(),
                 Ev::Launched(x) => self.launched(x),
+                Ev::Overflow(x) => self.overflow(x),
                 Ev::Finish(x) => {
                     self.finish(x);
                     // Capacity freed: a burst held only while its pools were saturated may go.
@@ -1138,6 +1161,10 @@ impl Engine<'_> {
                 *s = ExecSt::Launching;
             }
             self.at(self.now + delay, Ev::Launched(x));
+            // W28-R80: a pod later than the overflow's `after` may be overtaken by a machine's slot.
+            if let Some(after) = self.policy.overflow.filter(|a| delay > *a) {
+                self.at(self.now + after, Ev::Overflow(x));
+            }
         } else {
             self.begin(x);
         }
@@ -1249,6 +1276,49 @@ impl Engine<'_> {
         if self.exec_st.get(x) == Some(&ExecSt::Launching) {
             self.begin(x);
         }
+    }
+
+    /// W28-R80: a k8s job whose pod still hasn't started goes to a slot of a Linux machine (a pool
+    /// labelled `linux` with room, the least busy first), giving its quota back; with none free it
+    /// looks again in [`OVERFLOW_AGAIN_S`], until its pod starts.
+    fn overflow(&mut self, x: usize) {
+        if self.exec_st.get(x) != Some(&ExecSt::Launching) {
+            return;
+        }
+        let trace = self.trace;
+        let Some(e) = self.execs.get(x) else { return };
+        let (r, j, from) = (e.run, e.job, e.pool);
+        let req = self.job_of(r, j).and_then(|job| job.req).unwrap_or(DEFAULT_REQ);
+        let mut best: Option<(usize, u32, u32)> = None;
+        for (i, spec) in trace.pools.iter().enumerate() {
+            let (Some(slots), true) = (spec.slots, spec.labels.iter().any(|l| l == "linux")) else { continue };
+            let Some(ps) = self.pools.get(i) else { continue };
+            if ps.exclusive || ps.busy >= slots {
+                continue;
+            }
+            let better = best.is_none_or(|(_, b_busy, b_slots)| u64::from(ps.busy) * u64::from(b_slots) < u64::from(b_busy) * u64::from(slots));
+            if better {
+                best = Some((i, ps.busy, slots));
+            }
+        }
+        let Some((to, _, _)) = best else {
+            self.at(self.now + OVERFLOW_AGAIN_S, Ev::Overflow(x));
+            return;
+        };
+        if let Some(ps) = from.and_then(|p| self.pools.get_mut(p)) {
+            ps.cpu = ps.cpu.saturating_sub(req.0);
+            ps.mem = ps.mem.saturating_sub(req.1);
+            ps.pods = ps.pods.saturating_sub(1);
+        }
+        if let Some(ps) = self.pools.get_mut(to) {
+            ps.busy += 1;
+        }
+        if let Some(e) = self.execs.get_mut(x) {
+            e.pool = Some(to);
+        }
+        let name = trace.pools.get(to).map_or("", |p| p.name.as_str());
+        self.note(r, format!("execution {x}'s pod hadn't started: it runs on {name} (W28-R80)"));
+        self.begin(x);
     }
 
     fn begin(&mut self, x: usize) {

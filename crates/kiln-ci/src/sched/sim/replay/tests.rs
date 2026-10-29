@@ -479,3 +479,86 @@ fn w28_ac45_p2_through_the_demand_table_wastes_at_most_5_percent() -> Result<(),
     assert!(median <= 0.05, "P2 wastes {:.2}% of runner time (median over seeds 1-8)", median * 100.0);
     Ok(())
 }
+
+/// A lane of `lane`'s kind with three jobs a run: `rust` (8 min), `ui` (25 min) and `ui-checks`
+/// after both, a push every `every` seconds until `until`, on `slots` runner slots.
+fn tail_lane(every: i64, until: i64, slots: u32) -> Trace {
+    let mut commits = Vec::new();
+    let mut runs = Vec::new();
+    for i in 0..(until / every) {
+        let at = i * every;
+        commits.push(Commit { keys: BTreeMap::from([("lane".to_owned(), format!("{i:04}"))]) });
+        let j = |key: &str, needs: &[&str], took: i64| Job {
+            key: key.into(),
+            labels: vec!["runner".into()],
+            needs: needs.iter().map(|x| (*x).to_owned()).collect(),
+            class: Some("lane".into()),
+            queued: Some(at),
+            started: Some(at),
+            finished: Some(at + took),
+            status: "succeeded".into(),
+            ..Job::default()
+        };
+        let jobs = vec![j("rust", &[], 480), j("ui", &[], 1500), j("ui-checks", &["rust", "ui"], 300)];
+        runs.push(Run { workflow: "lane".into(), event: "push".into(), branch: "main".into(), group: Some("lane".into()), cancel_in_progress: true, at, commit: usize::try_from(i).unwrap_or(0), status: "succeeded".into(), finished: Some(at + 1800), jobs });
+    }
+    Trace { end: until + 4 * 3600, measured: None, pools: vec![machine("runners", &["runner"], slots)], commits, runs }
+}
+
+/// W25 step 5's step 2, test (W28-AC51's synthetic lane): a push every 10 min for 3 hours, rust
+/// 8 min, ui-checks starting 25 min after its push. P3 keeps what a lane has under way, so every
+/// commit has a direct or covered verdict within 60 min, and ui-checks runs at least once an hour.
+#[test]
+fn w28_ac51_a_steady_lane_keeps_its_tail_jobs() {
+    let (every, until) = (600, 3 * 3600);
+    for slots in [3, 4, 8] {
+        let t = tail_lane(every, until, slots);
+        let out = replay(&t, &Policy::p3(), 1);
+        let v = verdicts(&t, &out);
+        for (r, x) in v.iter().enumerate() {
+            let at = t.runs.get(r).map_or(0, |run| run.at);
+            assert!(x.is_some_and(|x| x.at - at <= 3600 && matches!(x.kind, Kind::Direct | Kind::Covered)), "{slots} slots: run {r}, pushed at {at} s: {x:?}");
+        }
+        let mut starts: Vec<i64> = out.execs.iter().filter(|e| t.runs.get(e.run).and_then(|r| r.jobs.get(e.job)).is_some_and(|j| j.key == "ui-checks")).filter_map(|e| e.started).collect();
+        starts.sort_unstable();
+        for hour in 0..3 {
+            assert!(starts.iter().any(|s| (hour * 3600..(hour + 1) * 3600).contains(s)), "{slots} slots: no ui-checks in hour {hour}: {starts:?}");
+        }
+        // P2 withdraws a run's later jobs with each push: ui-checks runs once, for the last push,
+        // and every commit before it waits past the hour.
+        let out = replay(&t, &Policy::p2(), 1);
+        let v = verdicts(&t, &out);
+        let late = v.iter().enumerate().filter(|(r, x)| !x.is_some_and(|x| x.at - t.runs.get(*r).map_or(0, |run| run.at) <= 3600)).count();
+        let ui = out.execs.iter().filter(|e| e.started.is_some() && t.runs.get(e.run).and_then(|r| r.jobs.get(e.job)).is_some_and(|j| j.key == "ui-checks")).count();
+        assert_eq!((late, ui), (v.len() - 1, 1), "{slots} slots, P2");
+    }
+}
+
+
+/// The median of `xs` (the upper one of an even count's two, as the report's quantile is near).
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    xs.get(xs.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// W28-AC81 (W25 step 5's step 2): on the recorded week, with W28-R80's overflow at its default,
+/// P3 gives at least 95% of ci's commits a direct or covered verdict within 60 min and wastes at
+/// most 2.4 runner-h, the medians over seeds 1-8; release's, the image's and the bench's shares are
+/// no lower than P3's without it; and P4 with it meets W28-AC51's 95%.
+#[test]
+fn w28_ac81_the_week_with_overflow() -> Result<(), String> {
+    let t = week()?;
+    let per = |p: &Policy| -> Vec<Outcome> { SEEDS.iter().map(|s| replay(&t, p, *s)).collect() };
+    let (with, without, p4) = (per(&Policy::p3_overflow()), per(&Policy::p3()), per(&Policy::p4_overflow()));
+    let soon = |outs: &[Outcome], wf: &str| median(outs.iter().map(|o| report::workflow(&t, o, wf).soon).collect());
+    let wasted = median(with.iter().map(|o| report::row(&t, o).wasted_h).collect());
+    assert!(soon(&with, "ci") >= 0.95, "P3 + overflow: ci {:.3}", soon(&with, "ci"));
+    assert!(wasted <= 2.4, "P3 + overflow wastes {wasted:.2} runner-h");
+    for wf in ["release", "image", "bench"] {
+        assert!(soon(&with, wf) >= soon(&without, wf), "{wf}: {:.3} with the overflow, {:.3} without", soon(&with, wf), soon(&without, wf));
+    }
+    assert!(soon(&p4, "ci") >= 0.95, "P4 + overflow: ci {:.3}", soon(&p4, "ci"));
+    // Without it, P3 stays short: the week's late pods hold it (the README's account).
+    assert!(soon(&without, "ci") < 0.95);
+    Ok(())
+}

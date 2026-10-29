@@ -134,6 +134,8 @@ Medians over seeds 1-8, with their ranges; ci's commits on main; latency over ev
 | P3 | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
 | P4 | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
 | P5 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
+| P3 + overflow | 2.4 (1.8–3.0) | 99.6% (98.5%–100.0%) | 13 min (13 min–14 min) | 36 min (34 min–36 min) | 6.7 h (6.6 h–6.7 h) | 49 min (40 min–1.8 h) | 20 min (19 min–21 min) | 0.28 (0.27–0.28) |
+| P4 + overflow | 0.2 (0.1–0.4) | 95.2% (94.1%–97.0%) | 14 min (13 min–14 min) | 42 min (40 min–46 min) | 6.7 h (6.6 h–6.7 h) | 1.2 h (1.1 h–1.8 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
 
 P0's calibration against the measured week:
 
@@ -153,6 +155,8 @@ Where ci's commits on main without a verdict an hour after their push stood then
 | P3 | 0 (0–2) | 13 (9–15) | 0 (0–1) | 4 (1–6) | 5 (3–9) | 4 (3–8) | 1 (0–2) |
 | P4 | 0 (0–2) | 13 (9–14) | 6 (4–8) | 7 (4–8) | 7 (5–11) | 4 (3–8) | 3 (0–5) |
 | P5 | 0 (0–2) | 13 (9–14) | 6 (4–8) | 4 (2–6) | 7 (6–11) | 4 (3–8) | 1 (0–3) |
+| P3 + overflow | 0 (0–1) | 0 | 0 | 0 (0–1) | 0 (0–1) | 0 | 0 (0–1) |
+| P4 + overflow | 0 (0–1) | 0 | 5 (4–7) | 3 (0–5) | 2 (1–3) | 0 | 2 (0–5) |
 
 ci on main:
 
@@ -165,6 +169,8 @@ ci on main:
 | P3 | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 68.9 (65.8–70.5) | 0.0 | 0.26 (0.24–0.26) |
 | P4 | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 68.5 (65.1–69.8) | 0.0 | 0.25 (0.24–0.26) |
 | P5 | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 62.7 (59.6–63.7) | 0.0 | 0.23 (0.22–0.24) |
+| P3 + overflow | 99.6% (98.5%–100.0%) | 13 min (13 min–14 min) | 36 min (34 min–36 min) | 6.7 h (6.6 h–6.7 h) | 49 min (40 min–1.8 h) | 74.4 (72.1–75.8) | 0.0 | 0.28 (0.27–0.28) |
+| P4 + overflow | 95.2% (94.1%–97.0%) | 14 min (13 min–14 min) | 42 min (40 min–46 min) | 6.7 h (6.6 h–6.7 h) | 1.2 h (1.1 h–1.8 h) | 74.1 (71.3–75.3) | 0.0 | 0.27 (0.27–0.28) |
 
 release on main:
 
@@ -177,6 +183,8 @@ release on main:
 | P3 | 88.8% (86.2%–91.9%) | 31 min (30 min–32 min) | 1.1 h (56 min–1.2 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.1 h–1.4 h) | 225.5 (222.0–230.3) | 1.1 (0.5–1.7) | 0.89 (0.87–0.90) |
 | P4 | 83.1% (81.2%–85.8%) | 33 min (31 min–34 min) | 1.3 h (1.2 h–1.4 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.3 h–2.2 h) | 215.9 (208.1–219.7) | 0.0 | 0.85 (0.83–0.86) |
 | P5 | 84.2% (82.3%–86.5%) | 31 min (30 min–32 min) | 1.3 h (1.1 h–1.4 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.3 h–2.2 h) | 209.0 (202.1–213.2) | 0.0 | 0.82 (0.81–0.83) |
+| P3 + overflow | 88.8% (86.2%–91.9%) | 31 min (30 min–32 min) | 1.1 h (56 min–1.2 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.1 h–1.4 h) | 225.5 (222.2–230.3) | 1.0 (0.5–1.6) | 0.89 (0.87–0.90) |
+| P4 + overflow | 83.5% (81.2%–85.8%) | 33 min (31 min–34 min) | 1.3 h (1.2 h–1.4 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.3 h–2.2 h) | 215.9 (209.0–220.1) | 0.0 | 0.85 (0.83–0.86) |
 
 image on main:
 
@@ -189,6 +197,8 @@ image on main:
 | P3 | 97.1% (96.3%–97.8%) | 23 min (23 min–24 min) | 43 min (41 min–43 min) | 6.6 h (6.5 h–6.6 h) | 58 min (51 min–1.1 h) | 94.6 (91.3–95.5) | 1.2 (0.9–1.3) | 0.35 (0.34–0.35) |
 | P4 | 88.6% (86.4%–89.3%) | 27 min (25 min–27 min) | 1.0 h (1.0 h–1.1 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 82.8 (82.2–85.3) | 0.3 (0.1–0.5) | 0.31 (0.30–0.31) |
 | P5 | 88.2% (86.4%–89.0%) | 27 min (25 min–27 min) | 1.0 h (1.0 h–1.1 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 84.0 (81.9–84.4) | 0.2 (0.1–0.4) | 0.31 (0.30–0.31) |
+| P3 + overflow | 97.1% (96.3%–97.8%) | 23 min (23 min–24 min) | 42 min (40 min–43 min) | 6.6 h (6.5 h–6.6 h) | 58 min (51 min–1.1 h) | 94.9 (92.0–95.8) | 1.1 (0.9–1.3) | 0.35 (0.34–0.35) |
+| P4 + overflow | 88.6% (86.4%–89.3%) | 26 min (25 min–27 min) | 1.0 h (1.0 h–1.1 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 83.6 (82.1–85.3) | 0.2 (0.1–0.4) | 0.31 (0.30–0.31) |
 
 bench on main:
 
@@ -201,6 +211,8 @@ bench on main:
 | P3 | 72.3% (70.9%–73.3%) | 41 min (41 min–42 min) | 2.2 h (1.9 h–2.4 h) | 7.3 h (7.3 h–7.8 h) | 4.5 h (3.7 h–6.3 h) | 19.8 (19.3–20.2) | 0.2 (0.1–0.2) | 0.10 (0.09–0.10) |
 | P4 | 86.9% (85.4%–87.9%) | 23 min (22 min–23 min) | 1.1 h (1.1 h–1.2 h) | 6.8 h | 3.2 h (2.3 h–3.9 h) | 28.2 (27.7–28.9) | 0.0 | 0.14 (0.13–0.14) |
 | P5 | 86.9% (85.0%–87.9%) | 23 min (22 min–23 min) | 1.1 h (1.1 h–1.2 h) | 6.8 h | 3.2 h (2.3 h–3.9 h) | 28.2 (27.7–28.9) | 0.0 | 0.14 (0.13–0.14) |
+| P3 + overflow | 72.3% (70.9%–73.3%) | 41 min | 2.2 h (1.9 h–2.4 h) | 7.3 h (7.3 h–7.8 h) | 4.5 h (3.7 h–6.3 h) | 19.7 (19.3–20.2) | 0.2 (0.1–0.2) | 0.10 (0.09–0.10) |
+| P4 + overflow | 87.4% (85.9%–87.9%) | 23 min (22 min–23 min) | 1.1 h (1.1 h–1.2 h) | 6.8 h | 3.1 h (1.9 h–3.9 h) | 28.2 (27.7–28.6) | 0.0 | 0.14 (0.13–0.14) |
 <!-- /report -->
 
 ## Defaults for later steps
@@ -217,6 +229,7 @@ over seeds 1-8).
 | cadence | on (exclusive jobs, the macOS release) | The bench waits 7 min (p50) with it, 21 min without, at about 4 points of ci's verdicts within 60 min (85.6% against 90.0%): the drain holds the server's slots that ci's release-binary also needs. |
 | speculation window | 4 (floor 1, cap 20) | No effect measured: P4's bisection runs, its lane's speculative demands (W28-R68), never overlapped on the week, so windows of 1 to 8 and none give the same numbers. 4 leaves room for the intermediate commits W25's step 5 keeps for direct verdicts, and halves to 1 on failures. |
 | `image_compile_share` | 0 | No effect in the replay: the image starts beside release's Linux build, not after it, so there is no finished compile to take. W25's step 7, which has the Dockerfile take release's binary, decides it. |
+| `overflow.after` | 120 s | W28-R80, on P3: 120, 300 and 600 s each give 99.6% of ci's commits a verdict within 60 min (90.0% without), wasting 2.4, 2.5 and 2.5 runner-h; on P4, 95.2% each (85.6% without). Half the week's pods started within 8 s and three in four within 21 s: past 120 s a pod was already in the slowest 13% (87 of 657), past 300 s the slowest 8%. 120 s sends the most late pods' work on and wastes the least. |
 
 ## What the numbers say
 
@@ -246,7 +259,13 @@ over seeds 1-8).
   week, 95% is out of reach for verdicts: the pods alone leave 13 commits a week late.
   Replayed with every pool's capacity unlimited (runner slots, the k8s quota's CPU, memory and pods),
   P3 reaches 93.3% (89.6%–95.9%) and P4 89.6%: 8 commits a week still wait at the hour on pods the
-  recorded week started late, so no scheduling or verdict policy reaches 95% on this trace.
+  recorded week started late, so no policy that waits for its pods reaches 95% on this trace.
+- **P3 + overflow** (W28-R80, docs/ci.md: a k8s job whose pod hasn't started 2 min after the quota
+  took it runs on a Linux machine's free slot instead, looking again every 30 s) gives 99.6%
+  (98.5%–100.0%) of ci's commits a verdict within 60 min, wasting 2.4 runner-h (1.8–3.0), with a
+  median latency of 13 min: no commit is left late for a pod. Release (88.8%), the image (97.1%)
+  and the bench (72.3%) are as under P3: their jobs aren't the pods'. The replay keeps each job's
+  recorded duration on the machine it overflows to, as it does everywhere (the limits below).
 - **P4** brings the bench's wait to 7 min (W25's step 6 asks at most 15) and waste to 0.3 runner-h,
   at 85.6% of ci's verdicts within 60 min. It has steps 4 and 6 on (the demand table and
   admission), so W28-AC51 is measured on it: which commits it leaves late is below.
@@ -264,7 +283,7 @@ approximation of W24's observed reads; verdicts are by job, not by test.
 
 W28-AC51 asks that 95% of ci's commits on main be answered within an hour of their push, with
 steps 4 and 6 on: P4 (the demand table and admission) answers 85.6% (84.8%–86.3%) over seeds 1-8,
-P3 (no admission) 90.0%. `cargo run -p kiln-ci --example replay -- ci/sim/trace.json --late` lists
+P3 (no admission) 90.0%; with W28-R80's overflow, P4 answers 95.2% (94.1%–97.0%) and P3 99.6%. `cargo run -p kiln-ci --example replay -- ci/sim/trace.json --late` lists
 each commit P3 and P4 leave late in any seed, where it stood at the hour (as the table under the
 report counts them) and what held it. P4's, each run by its place in `trace.json` and pushed that
 many hours into the window:
@@ -416,6 +435,19 @@ image_compile_share on P5 (assumed: the trace can't split the image's build):
 | image_compile_share 0 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
 | image_compile_share 0.3 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
 | image_compile_share 0.6 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
+
+overflow on P3 and P4 (W28-R80: a pod not started by then gives way to a Linux machine's slot):
+
+| Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
+|---|---|---|---|---|---|---|---|---|
+| P3, no overflow | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
+| P3, overflow after 120 s | 2.4 (1.8–3.0) | 99.6% (98.5%–100.0%) | 13 min (13 min–14 min) | 36 min (34 min–36 min) | 6.7 h (6.6 h–6.7 h) | 49 min (40 min–1.8 h) | 20 min (19 min–21 min) | 0.28 (0.27–0.28) |
+| P3, overflow after 300 s | 2.5 (1.7–3.2) | 99.6% (98.5%–100.0%) | 14 min (13 min–14 min) | 37 min (36 min–38 min) | 6.7 h (6.6 h–6.8 h) | 51 min (51 min–1.4 h) | 20 min (20 min–21 min) | 0.27 (0.26–0.28) |
+| P3, overflow after 600 s | 2.5 (2.0–3.3) | 99.6% (98.5%–100.0%) | 15 min (15 min–16 min) | 39 min (37 min–41 min) | 6.8 h (6.7 h–6.8 h) | 57 min (51 min–1.4 h) | 21 min (20 min–21 min) | 0.27 (0.26–0.28) |
+| P4, no overflow | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| P4, overflow after 120 s | 0.2 (0.1–0.4) | 95.2% (94.1%–97.0%) | 14 min (13 min–14 min) | 42 min (40 min–46 min) | 6.7 h (6.6 h–6.7 h) | 1.2 h (1.1 h–1.8 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
+| P4, overflow after 300 s | 0.3 (0.1–0.6) | 95.2% (94.1%–96.7%) | 14 min (14 min–15 min) | 43 min (40 min–47 min) | 6.7 h (6.6 h–6.8 h) | 1.2 h (1.1 h–1.4 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
+| P4, overflow after 600 s | 0.3 (0.1–0.7) | 95.2% (94.1%–96.7%) | 17 min (16 min–17 min) | 45 min (42 min–49 min) | 6.8 h (6.7 h–6.8 h) | 1.2 h (1.1 h–1.4 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
 
 ## The land queue
 

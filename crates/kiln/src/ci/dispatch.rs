@@ -1198,7 +1198,7 @@ impl Dispatch {
             }
             Msg::Explain { leg, reply } => {
                 let demand = self.decisions.get(&leg).map(|d| serde_json::json!({ "decision": d, "why": d.why() }));
-                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "standing": self.sched.standing(&leg), "runners": self.sched.explain(&leg), "demand": demand });
+                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "standing": self.sched.standing(&leg), "runners": self.sched.explain(&leg), "demand": demand, "overflow": self.sched.overflowed(&leg) });
                 let _ = reply.try_send(v);
                 Ok(())
             }
@@ -2325,6 +2325,13 @@ impl Dispatch {
                     r
                 }
                 Command::Adopted { leg, from, outcome } => self.adopted(&leg, &from, outcome).await,
+                // Its pool's executor was late, so it goes to the overflow's runners (W28-R80): the
+                // leg says why, on its run's page and in its routing.
+                Command::Overflowed { leg, why } => {
+                    let r = runs::annotation(&self.hub, &leg, None, "notice", Some("overflow".into()), &why, None, None, None, None, None).await;
+                    self.hub.emit_job(&leg).await;
+                    r
+                }
             };
             if let Err(e) = r {
                 tracing::warn!(error = %format!("{e:#}"), "CI dispatcher command");

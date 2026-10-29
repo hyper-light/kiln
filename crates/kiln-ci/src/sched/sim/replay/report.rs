@@ -404,6 +404,15 @@ pub fn sweeps(trace: &Trace, seeds: &[u64]) -> String {
     cases.push(("no window".into(), Policy { window: None, ..Policy::p4() }));
     sweep("speculation window on P4 (bisection runs; floor 1, cap 20)", cases);
     sweep("image_compile_share on P5 (assumed: the trace can't split the image's build)", [0.0, 0.3, 0.6].into_iter().map(|c| (format!("image_compile_share {c}"), Policy { share: Some(c), ..Policy::p5() })).collect());
+    // W28-R80: a k8s job whose pod is this late runs on a Linux machine's slot instead.
+    let mut cases: Vec<(String, Policy)> = Vec::new();
+    for (name, p) in [("P3", Policy::p3()), ("P4", Policy::p4())] {
+        cases.push((format!("{name}, no overflow"), p.clone()));
+        for after in [120, 300, 600] {
+            cases.push((format!("{name}, overflow after {after} s"), Policy { overflow: Some(after), ..p.clone() }));
+        }
+    }
+    sweep("overflow on P3 and P4 (W28-R80: a pod not started by then gives way to a Linux machine's slot)", cases);
     s
 }
 

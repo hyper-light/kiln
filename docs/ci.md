@@ -8890,7 +8890,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
 `01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
 `01a1751638e773b98b5092662fc06bf5`) and its third step's, R100–R109, and step 5's, R50–R59 (kiln plan
 `01a17604e26a73e187efb3a2859aaacb`); the other steps take their ranges as they come. Commits
-before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`).
+before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`); step 8's, spreading load, R80–R89.
 
 **Requirements: the conflict graph**
 
@@ -9440,7 +9440,12 @@ cluster started 2.5 h late or never (superseded first), which no policy answers 
 trace; 6 (P4 alone) wait for release-binary on the server machine, which the bench's cadence keeps
 free for its exclusive job; 7 for a job running, 7 for a job's needs, 4 for a push made after the
 hour, and 3 have no answer before the window ends. With every pool's capacity unlimited P4 reaches
-89.6%.
+89.6%. With step 8's overflow (W28-R80: a pod not started in 2 min gives way to a Linux machine's
+slot) AC51 is met: P4 answers 95.2% (94.1%–97.0%) and P3 99.6% (98.5%–100.0%), wasting 2.4
+runner-h, release, the image and the bench as before (W28-AC81, 2026-10-29); the synthetic lane of
+W25 step 5's step 2 (a push every 10 min, ui-checks 25 min after its push) answers every commit
+within the hour and runs ui-checks every hour under P3, where P2 answers only the last
+(`w28_ac51_a_steady_lane_keeps_its_tail_jobs`).
 
 **Requirements: identical steps shared across pipelines** (step 7's, R70–R79; kiln plan
 `01a1751638db73ba809b8bf4abb6f386`)
@@ -9518,6 +9523,56 @@ hour, and 3 have no answer before the window ends. With every pool's capacity un
 flight}`, `crates/kiln/src/ci/services/memo.rs`, `crates/kiln/src/runner/runtime/memo.rs`, `.kiln/`
 and the `Dockerfile`, on W24's ledger and memo steps (land/w24, through ci-w25-engine) and the
 runner's cache service (ci-w24-m2-cache), merged in. Live counts wait for step 3's switch.
+
+**Requirements: spreading load across machines** (step 8's, R80–R89; kiln plan
+`01a1751638df77cbb4720dbbb4e407ff`)
+
+- **W28-R80 Overflow.** A `k8s` pool may say where its legs go when their pods are late: `overflow
+  = { hosts = "os == linux && tools has cargo", after = "2m" }` in its `[[ci.pools]]`, `hosts` a
+  constraint over runners' facts as a pool's own `hosts` is, `after` a duration (2 min when left
+  out; another pool kind's `overflow` is refused). A leg of the pool that its executor hasn't
+  taken `after` it was queued (its pod not started, or none started for it within `max`) goes to
+  a runner meeting `hosts` and its own `requires`, capabilities and preferences, on the host and
+  never a pool's executor, as soon as one has room for it, asking of that runner what its
+  `resources:` ask (W05-R03); until one has, it keeps waiting for its pod and looks again every
+  30 s. Its own pod, still starting, stops. Once gone it stays there, its retries too. An untrusted
+  leg goes only when `host` is among its executors (W18-R07). Without `overflow`, a pool's legs
+  wait for its pods, as before. 2 min: half the recorded week's pods started within 8 s, and one
+  not started by 2 min was already in the slowest 13% (ci/sim/README.md).
+- **W28-R81 Every overflow says why.** The leg's notice (`overflow`) and its routing
+  (`ci.legs.routing`'s `overflow`: `pool`, `hosts`, `waited_s`, `at`, `why`) say what it waited
+  for, how long, and where it may run now: `its executor in pool k8s hadn't taken it 2 min after
+  it was queued (1 of the pool's starting, 3 of 64 in all): it runs on a runner where os == linux
+  && tools has cargo, on the host`. Its routing's runners are measured against the overflow's
+  checks from then on, and admission by load (W24-R19) and warm placement (W24-R18) weigh them
+  as any runner.
+- **W28-R82 The replay.** Step 1's replayer models it (`Policy::overflow`): a k8s job whose pod
+  hasn't started `after` the quota took it runs on a free slot of a machine labelled `linux`, the
+  least busy, giving the quota back, and looks again every 30 s; ci/sim/README.md reports "P3 +
+  overflow" and "P4 + overflow" beside P0 to P5, and sweeps `after`.
+
+**Acceptance criteria: spreading load**
+
+- **W28-AC80 Overflow, simulated.** A leg whose pod is late runs, `after` it was queued, on a runner
+  of `hosts` with room and never on one lacking what `hosts` or its own `requires` ask; its pod,
+  starting, stops; it says why, and its routing shows the overflow's checks. A pod on time keeps
+  its leg, a pool without `overflow` waits for its pods however late, a leg with no room keeps
+  waiting and goes within 30 s of a runner freeing (or runs in its pod if that comes first), and
+  an untrusted leg goes only with `host` among its executors. `overflow` is a `k8s` pool's, with
+  a constraint and a duration, and an unknown key in it is refused. *Unit tests* (`cargo test -p
+  kiln-ci w28_r80`).
+- **W28-AC81 The recorded week.** With the overflow at 2 min, P3 gives at least 95% of ci's commits
+  on main a direct or covered verdict within 60 min over seeds 1-8 (99.6%: 90.0% without), wasting
+  at most 2.4 runner-h (2.38); release's, the image's and the bench's shares are no lower than
+  P3's without it; and P4 with it meets W28-AC51 (95.2%). *Replay test* (`cargo test -p kiln-ci
+  w28_ac81`).
+
+**Progress (step 8).** v1's part on main (eb400ce1c, cfba6d8c3: benches and release's Linux and
+Windows builds and ci's release-binary placed by `requires`). R80–R82 and AC80–AC81 built
+(2026-10-29) in `kiln_ci::sched::{pools, state}` and the replay. Production's change (W28 step 3's,
+docs/trains/w28-step3.md) carries the `k8s` pool's `overflow` and `[ci.scheduler.admission]`;
+adacachy's load per CPU over CI hours (1.62 before, at most 1.0 asked) is measured from
+`GET /api/metrics/history` once production runs them.
 
 **M2 (built 2026-10-25, awaiting review).**
 
