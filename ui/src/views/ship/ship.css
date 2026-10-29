@@ -486,6 +486,100 @@
     --n: 6;
   }
 }
+/* A stage's card in an opened commit, f-ship's station (plan 01a1856fe81375b1bd1d1d86f270a45b,
+   step 8): its head (glyph, name, how many done or how it stands) over every job it has, each its
+   glyph, name and time. One height whatever it holds, so nothing grows as jobs begin; a long list
+   scrolls inside it. Its edge takes its stage's tone. */
+.ship-stn {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 15rem;
+  min-width: 0;
+  border: 1px solid var(--k-line, #2a2c31);
+  border-radius: 10px;
+  background: #0d0e11;
+}
+.ship-stn[data-state="needs"] {
+  border-color: rgb(226 207 174 / 0.45);
+}
+.ship-stn[data-state="failed"],
+.ship-stn[data-state="partial"],
+.ship-stn[data-state="rolledback"] {
+  border-color: rgb(226 185 189 / 0.4);
+}
+.ship-stn[data-state="running"],
+.ship-stn[data-state="guard"],
+.ship-stn[data-state="replanting"],
+.ship-stn[data-state="soaking"] {
+  border-color: rgb(205 198 234 / 0.35);
+}
+.ship-stn__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+  color: #e4e5e7;
+  font-size: 12.5px;
+}
+.ship-stn__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-stn__n {
+  margin-left: auto;
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ship-stn__parts {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  margin: 0;
+  padding: 6px 4px 8px;
+  overflow-y: auto;
+  list-style: none;
+}
+/* A job: picks what Output shows; the picked one lit. */
+.ship-part {
+  all: unset;
+  box-sizing: border-box;
+  display: grid;
+  width: 100%;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  color: #b9bbc2;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ship-part:hover {
+  background: rgb(255 255 255 / 0.04);
+}
+.ship-part[aria-pressed="true"] {
+  background: rgb(205 198 234 / 0.1);
+  color: #e4e5e7;
+}
+.ship-part:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: -2px;
+}
+.ship-part__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-part__v {
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
 .ship-job {
   display: flex;
   min-height: 4.5rem;

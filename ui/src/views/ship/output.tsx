@@ -8,28 +8,29 @@ import * as React from "react";
 import { Check, Copy } from "lucide-react";
 import { api } from "@/api/client";
 import { shipApi, type ShipCommit } from "@/api/ship";
-import { STAGE_WORD, type Stage } from "@/components/ui/status-glyph-spec";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import LogViewer from "@/views/run-detail/log-viewer";
 import { stepToShow } from "@/views/updates/logs";
-import { pickCard } from "./model";
+import { partOf, pickPart, stationsOf } from "./jobs";
 
 /** The card's height in terminal rows, whatever the log holds. */
 const OUTPUT_ROWS = 14;
 
-export function ShipOutput({ commit, stage }: { commit: ShipCommit; stage: string | null }) {
+export function ShipOutput({ commit, picked }: { commit: ShipCommit; picked: string | null }) {
   const detail = useSuspenseResource(`ship/commit/${commit.repo}/${commit.sha}`, (s) => shipApi.commit(commit.repo, commit.sha, s), { pollMs: 15_000, on: ["run", "job"] });
-  // Checks' jobs are its legs, the shown one picked by the same rule as the cards.
-  const legs = stage === "checks" ? (detail.data.checks ?? []).flatMap((c) => c.legs) : [];
-  // As legs come and go the job shown changes: the one shown stays until the next has loaded, so
+  // The job picked in Jobs, else the one Jobs shows picked by its rule (plan
+  // 01a1856fe81375b1bd1d1d86f270a45b, step 8): one that ran has its job's output.
+  const stations = stationsOf(detail.data);
+  const part = partOf(stations, picked ?? pickPart(stations));
+  // As jobs come and go the job shown changes: the one shown stays until the next has loaded, so
   // the card isn't torn down meanwhile and a focus in it survives (opened commit's step 3).
-  const job = React.useDeferredValue(legs[pickCard(legs)]?.job);
+  const job = React.useDeferredValue(part?.lane.job);
   if (!job)
     return (
       <div className="ship-output ship-output--none">
-        <p>{stage ? `${STAGE_WORD[stage as Stage] ?? stage} has no job output yet.` : "No job output yet."}</p>
+        <p>{part ? `${part.group.label} · ${part.lane.name} has no output yet.` : "No job output yet."}</p>
       </div>
     );
   return <JobOutput job={job} />;

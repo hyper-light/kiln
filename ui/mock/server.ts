@@ -109,6 +109,14 @@ function liveJob() {
   const sj = all.find((j) => j.job.status === "running") ?? all[0];
   return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
 }
+/** The run of Ship's live job, each of its jobs (ship.ts: a commit's Checks, each leg its own job,
+ * as production's v1 runs have them; plan 01a1856fe81375b1bd1d1d86f270a45b, step 8). */
+function liveRun() {
+  const live = liveJob();
+  if (!live) return null;
+  const jobs = (jobsByRun.get(live.run) ?? []).map((s) => ({ job: s.job.id, name: s.job.display || s.job.key, status: s.job.status, start: s.job.started_at, end: s.job.finished_at, error: s.job.error }));
+  return { run: live.run, jobs };
+}
 const logs = new Map<string, LogStream>();
 const agents = new Map<string, Agent>();
 const agentState = new Map<string, HostState>();
@@ -1456,7 +1464,7 @@ const server = http.createServer(async (req, res) => {
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
-    if (await handleShip(req, res, url, { json, liveJob, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
+    if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;

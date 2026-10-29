@@ -31,6 +31,9 @@ export interface ShipLane {
   note?: string;
   /** The mark's signer; null = unsigned until W27-R03, a name once signed. */
   seal?: string | null;
+  /** The job a Checks leg ran, once it has: what Output shows when it's picked (plan
+   * 01a1856fe81375b1bd1d1d86f270a45b, step 8). */
+  job?: string;
 }
 
 export interface ShipLaneGroup {

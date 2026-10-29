@@ -14,6 +14,7 @@ interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   /** One of the mock's own jobs, running if one is (server.ts), for a fixed row's leg to stream. */
   liveJob?: () => { run: string; job: string; name: string; state: string } | null;
+  liveRun?: () => { run: string; jobs: { job: string; name: string; status: string; start: number | null; end: number | null; error: string | null }[] } | null;
   /** CI starting on a pushed commit (server.ts's run on kiln's repository): its run and job events reach the page as a real push's do. */
   push?: () => void;
 }
@@ -409,6 +410,18 @@ function marksOf(c: ShipCommit): ShipMark[] {
   return marks;
 }
 
+/** A run's job status as a leg's glyph (ship.rs reads v1's the same way). */
+const LEG_STATE: Record<string, string> = {
+  queued: "queued",
+  pending: "queued",
+  running: "running",
+  succeeded: "passed",
+  failed: "failed",
+  timed_out: "failed",
+  cancelled: "superseded",
+  skipped: "superseded",
+};
+
 /** The pace line as the server reads it from its rows (plan 01a1856fe81375b1bd1d1d86f270a45b, step
  * 5): those in flight and the agents behind them; for each repository, the newest row each
  * environment runs, production with the rows newer than it. */
@@ -478,16 +491,15 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
                           },
                         ]
                       : []),
-                    {
-                      name: live.name,
-                      state: live.state === "running" ? "running" : "passed",
+                    // Then each job of the live run, as it stands: its own job, its times once it has them.
+                    ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({
+                      name: j.name,
+                      state: LEG_STATE[j.status] ?? "queued",
                       attempts: 1,
-                      note: "",
-                      job: live.job,
-                      run: live.run,
-                      start: T0 - 120,
-                      ...(live.state === "running" ? {} : { end: T0 - 60 }),
-                    },
+                      note: j.error ?? "",
+                      ...(j.start != null ? { job: j.job, run: live.run, start: j.start } : {}),
+                      ...(j.end != null ? { end: j.end } : {}),
+                    })),
                   ],
                 },
               ]

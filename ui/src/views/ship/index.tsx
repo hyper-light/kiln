@@ -29,7 +29,7 @@ import { Shimmer } from "@/views/harness/signals";
 import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
-import { firstStage, JobCards } from "./jobs";
+import { JobCards } from "./jobs";
 import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { SectionHead } from "./head";
@@ -437,9 +437,8 @@ function showFiles(open: HTMLElement): (() => void) | undefined {
 
 /** An item's dropdown, in its order: Files (with the Conversation), Output, Jobs, Lanes. */
 function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
-  // The picked job card: yours once you click one, else the cards' rule; Output shows its job.
-  const [stage, setStage] = React.useState<string | null>(null);
-  const shown = stage ?? firstStage(commit);
+  // The picked job (its stage and lane): yours once you click one, else the cards' rule; Output shows it.
+  const [picked, setPicked] = React.useState<string | null>(null);
   // A Diff press (reveal counts them) brings Files into view; opening the row any other way doesn't.
   const files = React.useCallback((el: HTMLDivElement | null) => (el && reveal > 0 ? showFiles(el) : undefined), [reveal]);
   return (
@@ -452,11 +451,11 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
         <section aria-label="Output" className="ship-sec">
           <SectionHead label="Output" />
           <Loadable label="Loading the output" className="ship-output-slot">
-            <ShipOutput commit={commit} stage={shown} />
+            <ShipOutput commit={commit} picked={picked} />
           </Loadable>
         </section>
         <section aria-label="Jobs" className="ship-sec">
-          <JobCards commit={commit} onPick={setStage} />
+          <JobCards commit={commit} picked={picked} onPick={setPicked} />
           <ul>
             {(commit.runs ?? []).map((r) => (
               <li key={r.id}>

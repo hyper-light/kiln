@@ -81,12 +81,14 @@ test("scrolled up, the output stays where you are", async ({ page, isMobile }) =
   expect(await viewport.evaluate((v) => v.scrollTop)).toBe(0);
 });
 
-/** Opens the first row at its Checks card and waits for the log; its job and step. */
+/** Opens the first row at a job of its Checks that has run and waits for the log; its job and step. */
 async function openOutput(page: import("@playwright/test").Page) {
   await page.goto("/ship");
   const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
   await row.getByRole("button", { name: /^Open / }).click();
-  await row.getByRole("list", { name: "Stages" }).getByRole("button").nth(1).click();
+  const checks = row.getByRole("list", { name: "Checks jobs" });
+  await expect(checks.getByRole("button").first()).toBeVisible({ timeout: 15_000 });
+  await checks.getByRole("button").last().click();
   const out = row.locator(".ship-output");
   await expect(out.locator(".xterm")).toBeVisible({ timeout: 15_000 });
   return { out, url: `/api/jobs/${encodeURIComponent((await out.getAttribute("data-job")) ?? "")}/logs?step=${(await out.getAttribute("data-step")) ?? "0"}` };
