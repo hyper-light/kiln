@@ -515,7 +515,8 @@ enum State {
     Done,
 }
 
-/// How long a leg a person's retry placed on a runner waits when that runner refuses it (W05-R28).
+/// How long a leg waits to be offered again to a runner that refused it, when that runner alone
+/// may run it (a person's retry placed it there, W05-R28) or alone could (W05-R16).
 pub const REFUSED_AGAIN_MS: i64 = 15_000;
 
 /// Why a leg stays off a runner (W05-R16).
@@ -787,17 +788,27 @@ impl Scheduler {
                 if let Some(runner) = self.release(&leg) {
                     self.stopped(&leg);
                     self.discard_used(&leg, &mut out);
-                    // Refused by the runner a person's retry asked for (W05-R28): only it may run
-                    // the leg, so it's asked again in a while, as v1 offers a declined job again.
-                    if self.legs.get(&leg).is_some_and(|l| l.input.placement.runner.as_deref() == Some(runner.as_str())) {
+                    // Refused by the runner a person's retry asked for (W05-R28), which alone may
+                    // run the leg, or by the only runner that could take it (W05-R16; an
+                    // assignment that couldn't reach a runner away for a moment, or handing over
+                    // to a newer process, comes back refused too): it's asked again in a while, on
+                    // the same attempt, as v1 offers a declined job again. Otherwise the leg waits
+                    // for another runner.
+                    let pinned = self.legs.get(&leg).is_some_and(|l| l.input.placement.runner.as_deref() == Some(runner.as_str()));
+                    if pinned || self.legs.get(&leg).is_some_and(|l| !self.another_could(l, &runner)) {
                         let at = now + REFUSED_AGAIN_MS;
                         if let Some(l) = self.legs.get_mut(&leg) {
                             l.state = State::Retrying { at };
                         }
                         self.timers.entry(at).or_default().push(leg.clone());
                         out.push(Command::Timer { at });
-                        let name = self.runners.get(&runner).map_or_else(|| runner.clone(), |r| r.input.view.name.clone());
-                        self.set_reason(&leg, WaitReason::Pinned { runner: name, state: PinnedState::Busy }, &mut out);
+                        let reason = if pinned {
+                            let name = self.runners.get(&runner).map_or_else(|| runner.clone(), |r| r.input.view.name.clone());
+                            WaitReason::Pinned { runner: name, state: PinnedState::Busy }
+                        } else {
+                            WaitReason::Retry { at }
+                        };
+                        self.set_reason(&leg, reason, &mut out);
                     } else {
                         if let Some(l) = self.legs.get_mut(&leg) {
                             l.avoid = Some((runner.clone(), Off::Refused));
