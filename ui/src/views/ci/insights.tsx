@@ -37,6 +37,7 @@ const TAIL = "#7f6ca6";
 const REASONS: Record<string, string> = {
   capacity: "Runners busy",
   oversized: "Too big for any runner",
+  headroom: "Runners at their target use",
   "no-runner": "No runner connected",
   unroutable: "No runner could run it",
   capability: "Runners lack a capability",

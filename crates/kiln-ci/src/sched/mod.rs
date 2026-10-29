@@ -22,6 +22,7 @@ pub mod load;
 pub mod groups;
 pub mod intent;
 pub mod needs;
+pub mod place;
 pub mod pools;
 pub mod reserve;
 pub mod retry;

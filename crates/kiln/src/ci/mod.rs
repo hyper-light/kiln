@@ -42,6 +42,8 @@ pub mod ops;
 pub mod otel;
 #[cfg(test)]
 mod own_workflows;
+#[cfg(test)]
+mod placement;
 pub mod preview;
 pub mod previews;
 pub mod providers;

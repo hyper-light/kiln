@@ -13,6 +13,7 @@ import "./console.css";
 import { ArrowUp, ChevronRight, CornerDownLeft, Paperclip, Square, X } from "lucide-react";
 import { clientId, harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
 import { Button } from "@/components/ui/button";
+import { foldChips, sameFold, UNFOLDED, type Fold } from "@/components/ui/facet-fold";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
@@ -61,8 +62,67 @@ type BarProps = {
   autoFocus?: boolean;
 };
 
-/** Chips for those picked, at most; past these, how many more. */
-const CHIPS = 4;
+/**
+ * Those picked, on the To line's one line, in the order they were picked: as many as fit, the rest
+ * folded into "+N more" after them (facet-fold.ts, as a filter field's chips). The line never wraps,
+ * so the box keeps its height however many are picked, and picking more moves no chip already there.
+ */
+function ToChips({ picked, onPick }: { picked: AgentInfo[]; onPick?: (ids: string[], on: boolean) => void }) {
+  const [fold, setFold] = React.useState<Fold>(UNFOLDED);
+  // A new ref when those picked change: it measures once they're on the page, then whenever the line
+  // or a chip changes size (the window, a font arriving).
+  const key = picked.map((a) => `${a.id}:${agentLabel(a)}`).join("\n");
+  const fit = React.useCallback(
+    (line: HTMLDivElement | null) => {
+      const copy = line?.querySelector<HTMLElement>(".ms-to-measure");
+      if (!line || !copy) return;
+      const update = () => {
+        const widths = Array.from(copy.children, (el) => el.getBoundingClientRect().width);
+        const all = widths.pop() ?? 0;
+        const more = widths.pop() ?? 0;
+        const gap = parseFloat(getComputedStyle(line).columnGap) || 0;
+        const next = foldChips({ line: line.clientWidth, chips: widths, more, count: all, typed: 0, gap });
+        setFold((was) => (sameFold(was, next) ? was : next));
+      };
+      update();
+      const watch = new ResizeObserver(update);
+      watch.observe(line);
+      for (const el of copy.children) watch.observe(el);
+      return () => watch.disconnect();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [key],
+  );
+  const shown = Math.min(fold.shown, picked.length);
+  const folded = picked.length - shown;
+  const chip = (a: AgentInfo, cut?: number) => (
+    <span key={a.id} className="ms-to-chip" style={cut ? { maxWidth: cut } : undefined}>
+      <span className="hx-trunc">{agentLabel(a)}</span>
+      {onPick && (
+        <button type="button" aria-label={`Not to ${agentLabel(a)}`} onClick={() => onPick([a.id], false)}>
+          <X size={11} />
+        </button>
+      )}
+    </span>
+  );
+  return (
+    <div className="ms-to-chips" ref={fit}>
+      {picked.slice(0, shown).map((a, i) => chip(a, i === 0 ? fold.cut : undefined))}
+      {folded > 0 && <span className="ms-to-more">{shown === 0 && fold.count === "words" ? count(picked.length, "agent") : `+${folded} more`}</span>}
+      {/* Unseen: each chip at its own width, then "+N more" at its widest and the words for them all, what the fold is measured from. */}
+      <div className="ms-to-measure" aria-hidden="true">
+        {picked.map((a) => (
+          <span key={a.id} className="ms-to-chip">
+            <span className="hx-trunc">{agentLabel(a)}</span>
+            {onPick && <span className="ms-to-x" />}
+          </span>
+        ))}
+        <span className="ms-to-more">+{picked.length} more</span>
+        <span className="ms-to-more">{count(picked.length, "agent")}</span>
+      </div>
+    </div>
+  );
+}
 
 /** "@words" being typed at the end: the words. */
 export const atOf = (text: string) => text.match(/(?:^|\s)@([^\s@]*)$/)?.[1];
@@ -402,26 +462,15 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
           <div className="ms-to">
             <span className="ms-to-label">To</span>
             {picked.length > 0 ? (
-              <>
-                {picked.slice(0, CHIPS).map((a) => (
-                  <span key={a.id} className="ms-to-chip">
-                    <span className="hx-trunc">{agentLabel(a)}</span>
-                    {onPick && (
-                      <button type="button" aria-label={`Not to ${agentLabel(a)}`} onClick={() => onPick([a.id], false)}>
-                        <X size={11} />
-                      </button>
-                    )}
-                  </span>
-                ))}
-                {picked.length > CHIPS && <span className="ms-to-more">+{picked.length - CHIPS} more</span>}
-              </>
+              <ToChips picked={picked} onPick={onPick} />
             ) : (
               <span className="ms-to-all">{held ? `${n} of ${total} agents` : reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
             )}
             {onClear && picked.length > 0 && (
-              <button type="button" className="ms-link mc-clear" onClick={onClear}>
+              <Button size="xs" variant="secondary" className="mc-clear" onClick={onClear}>
+                <X aria-hidden="true" />
                 Clear
-              </button>
+              </Button>
             )}
           </div>
           {attachments.chips}

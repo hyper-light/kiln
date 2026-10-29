@@ -489,6 +489,11 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
         "capacity" | "retry" | "" => return None,
         "unroutable" => (format!("no runner meets its requirements ({})", list("failing")), true),
         "oversized" => (format!("a runner with {} ({})", text("asked"), list("short")), true),
+        "headroom" => {
+            let held = o.get("held").and_then(Value::as_str).map(|r| format!("; {r} is held for it")).unwrap_or_default();
+            let place = Some(text("place")).filter(|p| !p.is_empty()).map(|p| format!(" on a {p} runner")).unwrap_or_default();
+            (format!("{} free{place}, under {}% use ({} would pass it){held}", Some(text("request")).filter(|r| !r.is_empty()).unwrap_or_else(|| "room".into()), o.get("target").and_then(Value::as_u64).unwrap_or(85), list("runners")), false)
+        }
         "capability" => (format!("{} can't run what it uses (Docker, or actions)", list("runners")), true),
         "no-runner" => ("no runner that can take it is connected".to_owned(), false),
         "other-runner" if o.get("refused").and_then(Value::as_bool) == Some(true) => (format!("a runner other than {}, which refused it", text("avoided")), true),

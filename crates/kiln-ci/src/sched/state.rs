@@ -73,6 +73,12 @@ pub struct Config {
     pub admission: Option<super::load::Admission>,
     /// Warm-aware placement's settings (W24-R18).
     pub warm: warm::Model,
+    /// The share of a runner's CPUs and memory placement fills it to, by its live headroom (W05):
+    /// a leg goes only where it leaves the runner within it, its memory never past all of it.
+    pub target_use: f64,
+    /// How long a leg first in its queue waits with no runner having room for it before it holds
+    /// one for itself ([`RoomHold`], W05's admission).
+    pub hold_after_ms: i64,
 }
 
 /// A level of fair share (W28-R66).
@@ -104,6 +110,8 @@ impl Default for Config {
             fair_by: vec![FairBy::Repo],
             admission: None,
             warm: warm::Model::default(),
+            target_use: TARGET_USE,
+            hold_after_ms: HOLD_AFTER_MS,
         }
     }
 }
@@ -267,6 +275,94 @@ pub enum Input {
     /// far each is behind and what warm runs took there, and its bandwidth. From the runners'
     /// reports of their workspaces and the ledger's history.
     Warm { runner: String, held: WarmHeld },
+    /// What a runner has in use now, from the samples it sends the server: its [`Headroom`] until
+    /// the next, or until it's older than [`SAMPLE_FRESH_MS`] (the scheduler's headroom, W05).
+    RunnerSample { runner: String, sample: Sample },
+}
+
+/// What a runner has in use now, by its latest sample: what placement weighs of it besides its
+/// facts ([`Input::RunnerSample`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Sample {
+    /// Its CPUs (hardware threads).
+    pub cpus: u32,
+    /// The share of them busy, 0 to 1.
+    pub busy: f64,
+    /// Its load average over the last minute.
+    pub load1: f64,
+    /// Its memory, and how much of it is in use, in bytes.
+    pub mem_total: u64,
+    pub mem_used: u64,
+    /// The share of time all its tasks stalled on I/O at once, in percent (Linux's PSI, `full`
+    /// avg10), where it says.
+    pub io_full: Option<f64>,
+}
+
+/// A runner's headroom by its latest sample: the CPUs and memory it has free, what kiln placed
+/// there since counted in use until the next sample shows it, and its I/O pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Headroom {
+    pub cpus: f64,
+    pub mem: u64,
+    pub io_full: Option<f64>,
+    /// What it has in all: its CPUs and memory.
+    pub of: Resources,
+}
+
+impl Headroom {
+    /// A runner's headroom by its sample as it is, nothing placed since: what the v1 dispatcher
+    /// and reach weigh, from the samples the server holds. Its free CPUs are those neither its
+    /// busy share nor its load average takes, whichever leaves fewer (work waiting on disk or
+    /// memory shows in its load, not its busy share).
+    pub fn of(s: &Sample) -> Headroom {
+        let all = f64::from(s.cpus);
+        let by_busy = all * (1.0 - s.busy.clamp(0.0, 1.0));
+        let by_load = (all - s.load1.max(0.0)).max(0.0);
+        Headroom { cpus: by_busy.min(by_load), mem: s.mem_total.saturating_sub(s.mem_used), io_full: s.io_full, of: Resources { cpu: all, mem: s.mem_total, ..Resources::default() } }
+    }
+
+    /// Its CPUs' and its memory's share in use with `request` on it.
+    pub fn use_with(&self, request: &Resources) -> (f64, f64) {
+        let cpu = if self.of.cpu > 0.0 { 1.0 - (self.cpus - request.cpu) / self.of.cpu } else { 0.0 };
+        let mem = if self.of.mem > 0 { 1.0 - (self.mem as f64 - request.mem as f64) / self.of.mem as f64 } else { 0.0 };
+        (cpu, mem)
+    }
+
+    /// Whether `request` leaves it within `target` of its CPUs and of its memory.
+    pub fn within(&self, request: &Resources, target: f64) -> bool {
+        let (cpu, mem) = self.use_with(request);
+        cpu <= target + 1e-9 && mem <= target + 1e-9
+    }
+
+    /// How full `request` leaves it: the larger of its CPUs' and its memory's share in use, its
+    /// I/O pressure (the share of time its tasks all stalled) on top. Lower is the more headroom:
+    /// placement's order for the engine, the v1 dispatcher and reach alike.
+    pub fn fullness(&self, request: &Resources) -> f64 {
+        let (cpu, mem) = self.use_with(request);
+        cpu.max(mem) + self.io_full.unwrap_or(0.0) / 100.0
+    }
+}
+
+/// [`Config::target_use`] by default.
+pub const TARGET_USE: f64 = 0.85;
+
+/// How long a runner's sample stands: past it, its headroom is unknown, and it's placed as before
+/// samples were (W05-R23's order).
+pub const SAMPLE_FRESH_MS: i64 = 60_000;
+
+/// [`Config::hold_after_ms`] by default.
+pub const HOLD_AFTER_MS: i64 = 60_000;
+
+/// A runner held for a leg first in its queue that no runner has had room for (W05's admission,
+/// EASY backfilling's one reservation): smaller legs no longer take every gap before it. Until it
+/// starts there, another leg starts on the runner only if it's expected to end by `shadow`, when
+/// the runner's running legs are expected to leave the held leg room, or fits in what the held leg
+/// will leave beside it (`extra`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomHold {
+    pub leg: String,
+    pub shadow: i64,
+    pub extra: Resources,
 }
 
 /// Why a leg waits (W05-R13): exactly one, the current one.
@@ -316,6 +412,11 @@ pub enum WaitReason {
     /// It asks for more than any runner that could take it has, even idle (resource mode,
     /// W05-R03): what it asks, and what each of those runners has of what it's short of.
     Oversized { asked: String, short: Vec<String> },
+    /// Every runner with room for it would pass the target use with it, by its live headroom
+    /// (W05): what it asks (`request`) and where (`place`: its platform, else its labels), the
+    /// target in percent, those runners, and the runner held for it (W05's admission) with when
+    /// that's expected to have room for it.
+    Headroom { target: u32, runners: Vec<String>, request: String, place: String, held: Option<String>, room_at: Option<i64> },
 }
 
 /// Why the runner a retry asked for can't take its leg now (W05-R28).
@@ -481,6 +582,10 @@ struct Runner {
     used: Resources,
     connected: bool,
     draining: bool,
+    /// Its latest sample and when it came ([`Input::RunnerSample`]).
+    sample: Option<(Sample, i64)>,
+    /// What was placed on it since its latest sample.
+    since: Resources,
 }
 
 /// What an exclusive leg holds of its runner (W05-R03): asking for CPUs, those and the memory it
@@ -617,6 +722,8 @@ pub struct Scheduler {
     drained: BTreeMap<String, String>,
     /// Exclusive legs on a cadence that are queued.
     cadenced: BTreeSet<String>,
+    /// Runners held for a leg that no runner has room for (W05's admission): runner, hold.
+    holds: BTreeMap<String, RoomHold>,
     /// Fair share's active members under each parent, and their legs (W28-R66): `repo` →
     /// actors, `repo\0actor` → lanes.
     members: HashMap<String, HashMap<String, usize>>,
@@ -729,7 +836,13 @@ impl Scheduler {
             }
             Input::Tick => self.tick(now, &mut out),
             Input::Warm { runner, held } => self.warm_changed(runner, held),
+            Input::RunnerSample { runner, sample } => {
+                self.sampled(&runner, sample, now);
+                self.try_runner(&runner, now, &mut out);
+            }
         }
+        // Whatever came, the runners held for legs that can't fit, as they now stand (W05).
+        self.refresh_holds(now, &mut out);
         out
     }
 
@@ -1019,7 +1132,7 @@ impl Scheduler {
             l.ends = ends;
         }
         // The runner may not have reconnected yet: keep what it runs until it does.
-        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false });
+        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, sample: None, since: Resources::default() });
         r.running.push(id.clone());
         add(&mut r.used, &request);
         // W28-R42: what its runner still runs is the execution of its work. A queued duplicate
@@ -1081,7 +1194,9 @@ impl Scheduler {
 
     fn queue(&mut self, id: &str, now: i64, since: i64, out: &mut Vec<Command>) {
         let Some(leg) = self.legs.get(id) else { return };
-        let cost = leg.input.cost.unwrap_or(self.config().default_cost);
+        // What it costs its repository: its expected runner-seconds times the CPUs it asks, one at
+        // the least, so repositories at equal weights get equal CPU-time, big legs or small (W05).
+        let cost = leg.input.cost.unwrap_or(self.config().default_cost) * leg.input.request.cpu.max(1.0);
         let cadenced = leg.input.exclusive && leg.input.admission.as_ref().is_some_and(|a| a.cadence.is_some());
         self.count(id);
         // Start-time fair queuing across repositories (W05-R10), and inside each by actor and lane
@@ -1220,8 +1335,9 @@ impl Scheduler {
         }
     }
 
-    /// Eligible runners with room for the leg, in the order to try them: by declared preference,
-    /// else least loaded, then most free slots, then name (W05-R23).
+    /// Eligible runners with room for the leg, in the order to try them: by declared preference
+    /// (W05-R23), then those with the most headroom left after it by their live samples (W05),
+    /// then least loaded, most free slots, and name, as runners without a fresh sample go.
     fn candidates(&self, id: &str) -> Vec<String> {
         let Some(l) = self.legs.get(id) else { return Vec::new() };
         let Some(s) = self.sigs.get(&l.sig) else { return Vec::new() };
@@ -1230,7 +1346,8 @@ impl Scheduler {
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
         order.sort_by(|(i, a), (j, b)| {
             let (sa, sb) = (scores.get(*i).copied().unwrap_or(0.0), scores.get(*j).copied().unwrap_or(0.0));
-            sb.total_cmp(&sa).then_with(|| load(a).total_cmp(&load(b))).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
+            let (ha, hb) = (headroom_of(a, self.now), headroom_of(b, self.now));
+            sb.total_cmp(&sa).then_with(|| super::place::before(&l.input.request, ha.as_ref(), hb.as_ref())).then_with(|| load(a).total_cmp(&load(b))).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
         });
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
@@ -1277,7 +1394,7 @@ impl Scheduler {
     /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a
     /// busy warm runner, it's that one or one where the leg would take no longer (W24-R18).
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
-        self.room(r, l) && l.hold.as_ref().is_none_or(|h| h.runner == r.input.id || self.estimate(l, &r.input.id, &Self::wants(l)).busy_s() <= h.there_s)
+        self.room(r, l) && self.under_target(r, l) && l.hold.as_ref().is_none_or(|h| h.runner == r.input.id || self.estimate(l, &r.input.id, &Self::wants(l)).busy_s() <= h.there_s)
     }
 
     /// Whether a runner could take a leg now: it would ([`Self::admits`]), and has room for it
@@ -1299,6 +1416,15 @@ impl Scheduler {
         }
         // Kept for an exclusive leg on a cadence (W28-R62).
         if self.drained.get(&r.input.id).is_some_and(|owner| *owner != l.input.id) {
+            return false;
+        }
+        // Held for a leg that couldn't fit (W05): another starts only if it's expected to end by
+        // the time the held leg is to have room, or fits in what that leaves beside it.
+        if let Some(h) = self.holds.get(&r.input.id)
+            && h.leg != l.input.id
+            && self.now.saturating_add(ms(self.expected_s(l, &r.input.id))) > h.shadow
+            && !beside(&l.input.request, &h.extra)
+        {
             return false;
         }
         if self.reserved_against(r, l).is_some() {
@@ -1470,10 +1596,21 @@ impl Scheduler {
         if self.cadenced.remove(id) {
             self.drained.retain(|_, owner| owner.as_str() != id);
         }
+        // Its hold is done; one that started beside another's hold, past its shadow, takes of what
+        // that leaves.
+        self.holds.retain(|_, h| h.leg != id);
+        if let Some(h) = self.holds.get_mut(runner)
+            && now.saturating_add(ms(expected.unwrap_or(0.0))) > h.shadow
+        {
+            sub(&mut h.extra, &request);
+        }
         let mut executor = None;
         if let Some(r) = self.runners.get_mut(runner) {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
+            if r.sample.is_some() {
+                add(&mut r.since, &request);
+            }
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
         // Its pool's idle executor there, which it alone uses.
@@ -1877,8 +2014,8 @@ impl Scheduler {
                 None => {}
             }
         }
-        let (running, used) = self.runners.get(&id).map(|x| (x.running.clone(), x.used)).unwrap_or_default();
-        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false });
+        let (running, used, sample, since) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.sample, x.since)).unwrap_or_default();
+        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false, sample, since });
         self.refresh_eligibility(&id);
         self.release_holds(now, out);
         self.try_avoided(now, out);
@@ -1992,6 +2129,139 @@ impl Scheduler {
         self.reap_idle(now, out);
         self.scale_all(now, out);
         self.review_admission(now, out);
+    }
+
+    // ------------------------------------------------------------------ headroom (W05)
+
+    /// A runner's sample came ([`Input::RunnerSample`]): its headroom from now on, what was placed
+    /// on it before now in the sample.
+    fn sampled(&mut self, runner: &str, sample: Sample, now: i64) {
+        if let Some(r) = self.runners.get_mut(runner) {
+            r.sample = Some((sample, now));
+            r.since = Resources::default();
+        }
+    }
+
+    /// A runner's headroom now ([`Headroom`]): `None` before its first sample, or with its latest
+    /// older than [`SAMPLE_FRESH_MS`].
+    pub fn headroom(&self, runner: &str) -> Option<Headroom> {
+        self.runners.get(runner).and_then(|r| headroom_of(r, self.now))
+    }
+
+    /// Whether a leg leaves a runner within the target use ([`Config::target_use`]): its CPUs and
+    /// its memory both ([`super::place::fits`]). A runner with no fresh sample is placed as before
+    /// samples were: within it.
+    fn under_target(&self, r: &Runner, l: &Leg) -> bool {
+        super::place::fits(&l.input.request, headroom_of(r, self.now).as_ref(), self.config().target_use)
+    }
+
+    /// Every runner as placement weighs it (kiln-seams' `Placement::nodes`): its headroom now,
+    /// `None` without a fresh sample ([`super::place::Node`]), by id.
+    pub fn nodes(&self) -> Vec<super::place::Node<'_>> {
+        self.runners.values().map(|r| super::place::Node { name: &r.input.id, headroom: headroom_of(r, self.now) }).collect()
+    }
+
+    /// The leg a runner is held for ([`RoomHold`]), and when it's expected to have room there.
+    pub fn held(&self, runner: &str) -> Option<&RoomHold> {
+        self.holds.get(runner)
+    }
+
+    /// Holds runners for the legs first in their queues that no runner has had room for since
+    /// [`Config::hold_after_ms`] (W05's admission): in each signature's order, a runner each, of
+    /// those that could take it the one its running legs' expected ends leave room soonest, then
+    /// the one with the most headroom now; as many legs as the signature has runners at most. A hold
+    /// ends when its leg starts or leaves the queue, or its runner goes or drains; a runner without
+    /// a fresh sample isn't held, and is placed as before.
+    fn refresh_holds(&mut self, now: i64, out: &mut Vec<Command>) {
+        let (legs, runners) = (&self.legs, &self.runners);
+        let mut changed: Vec<String> = Vec::new();
+        self.holds.retain(|r, h| {
+            let keep = legs.get(&h.leg).is_some_and(|l| l.state == State::Queued) && runners.get(r).is_some_and(|x| x.connected && !x.draining);
+            if !keep {
+                changed.push(h.leg.clone());
+            }
+            keep
+        });
+        let wait = self.config().hold_after_ms;
+        let mut firsts: Vec<String> = Vec::new();
+        for s in self.sigs.values() {
+            firsts.extend(self.queued_in_order(s, now, s.eligible.len()));
+        }
+        for id in firsts {
+            let waiting = self.legs.get(&id).is_some_and(|l| now.saturating_sub(l.queued_at) >= wait && !self.fits_anywhere(l));
+            if !waiting || self.holds.values().any(|h| h.leg == id) {
+                continue;
+            }
+            if let Some((runner, hold)) = self.hold_for(&id, now) {
+                self.holds.insert(runner, hold);
+                changed.push(id);
+            }
+        }
+        // Their waits say so.
+        for id in changed {
+            if self.legs.get(&id).is_some_and(|l| l.state == State::Queued) {
+                let reason = self.wait_reason(&id);
+                self.set_reason(&id, reason, out);
+            }
+        }
+    }
+
+    /// A signature's first `limit` queued legs as [`Self::try_runner`] orders them: by the effective
+    /// priority of each priority's first, then fair-share start, then arrival.
+    fn queued_in_order(&self, s: &Sig, now: i64, limit: usize) -> Vec<String> {
+        let aging = self.config().aging_per_minute;
+        let mut subs: Vec<((f64, u64, u64), &BTreeSet<(u64, u64, String)>)> = Vec::new();
+        for (p, sub) in &s.queue {
+            let Some((f, q, id)) = sub.iter().next() else { continue };
+            let waited = self.legs.get(id).map_or(0, |l| (now - l.queued_at).max(0));
+            subs.push(((f64::from(*p) + aging * waited as f64 / 60_000.0, *f, *q), sub));
+        }
+        subs.sort_by(|(a, _), (b, _)| if ahead(*a, *b) { std::cmp::Ordering::Less } else if ahead(*b, *a) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal });
+        subs.into_iter().flat_map(|(_, sub)| sub.iter().map(|(_, _, id)| id.clone())).take(limit).collect()
+    }
+
+    /// Whether any runner that could take a leg has room for it now.
+    fn fits_anywhere(&self, l: &Leg) -> bool {
+        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).any(|r| self.fits(r, l)))
+    }
+
+    /// The runner to hold for a leg, and the hold: of the sampled runners that could take it and
+    /// aren't held, the one where its running legs, ending as expected, leave it room within the
+    /// target soonest (its shadow), then the one with the most headroom now.
+    fn hold_for(&self, id: &str, now: i64) -> Option<(String, RoomHold)> {
+        let l = self.legs.get(id)?;
+        let s = self.sigs.get(&l.sig)?;
+        let (q, target) = (l.input.request, self.config().target_use);
+        let mut best: Option<((i64, f64), String, RoomHold)> = None;
+        for r in s.eligible.iter().filter_map(|r| self.runners.get(r)) {
+            if !r.connected || r.draining || self.holds.contains_key(&r.input.id) || !self.admits(r, l) {
+                continue;
+            }
+            let Some(mut free) = headroom_of(r, now) else { continue };
+            let full = free.fullness(&q);
+            let mut ends: Vec<(i64, Resources)> = r.running.iter().filter_map(|x| self.legs.get(x)).map(|x| (x.ends.unwrap_or(i64::MAX), x.input.request)).collect();
+            ends.sort_by_key(|(at, _)| *at);
+            let mut shadow = now;
+            for (at, freed) in &ends {
+                if free.within(&q, target) {
+                    break;
+                }
+                free.cpus += freed.cpu;
+                free.mem = free.mem.saturating_add(freed.mem);
+                shadow = *at;
+            }
+            if shadow == i64::MAX || !free.within(&q, target) {
+                continue;
+            }
+            // What it leaves beside the held leg then, within the target.
+            let keep = Resources { cpu: free.of.cpu * (1.0 - target), mem: (free.of.mem as f64 * (1.0 - target)) as u64, ..Resources::default() };
+            let extra = Resources { cpu: (free.cpus - keep.cpu - q.cpu).max(0.0), mem: free.mem.saturating_sub(keep.mem).saturating_sub(q.mem), ..Resources::default() };
+            let key = (shadow, full);
+            if best.as_ref().is_none_or(|(b, _, _)| key.0 < b.0 || (key.0 == b.0 && key.1 < b.1)) {
+                best = Some((key, r.input.id.clone(), RoomHold { leg: id.to_owned(), shadow, extra }));
+            }
+        }
+        best.map(|(_, r, h)| (r, h))
     }
 
     // ------------------------------------------------------------------ warm placement (W24-R18)
@@ -2348,6 +2618,9 @@ impl Scheduler {
             self.executors.insert(id.clone(), Executor { id: id.clone(), pool: pool.to_owned(), runner: host.clone(), state: ExecState::Starting, since: now, reserved: p.request, leg: None });
             if let Some(r) = self.runners.get_mut(&host) {
                 add(&mut r.used, &p.request);
+                if r.sample.is_some() {
+                    add(&mut r.since, &p.request);
+                }
             }
             out.push(Command::StartExecutor { pool: pool.to_owned(), executor: id, runner: host, kind: p.executor.clone(), image: p.image.clone(), leg: None });
             want -= 1;
@@ -2564,6 +2837,20 @@ impl Scheduler {
             if l.input.exclusive && eligible.iter().all(|r| matches!(claim(&l.input, size(r)), Some(Claim::Whole)) && (!r.running.is_empty() || r.draining)) {
                 return WaitReason::Exclusive;
             }
+            // The runners with room for it all past the target use with it, by their samples (W05).
+            let mut past: Vec<String> = eligible.iter().filter(|r| r.connected && !r.draining && self.room(r, l) && !self.under_target(r, l)).map(|r| r.input.view.name.clone()).collect();
+            past.sort();
+            if !past.is_empty() {
+                let held = self.holds.iter().find(|(_, h)| h.leg == l.input.id);
+                return WaitReason::Headroom {
+                    target: (self.config().target_use * 100.0).round() as u32,
+                    runners: past,
+                    request: needs::request_words(&l.input.request).join(" and "),
+                    place: place_of(&l.req),
+                    held: held.map(|(r, _)| name(r)),
+                    room_at: held.map(|(_, h)| h.shadow),
+                };
+            }
             let draining = eligible.iter().filter(|r| r.draining).count();
             let busy = eligible.iter().filter(|r| !r.draining && !self.fits(r, l)).count();
             return WaitReason::Capacity { eligible: eligible.len(), busy, draining };
@@ -2739,6 +3026,37 @@ fn ahead(a: (f64, u64, u64), b: (f64, u64, u64)) -> bool {
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => (a.1, a.2) < (b.1, b.2),
     }
+}
+
+/// Where a leg runs, in words: its platform where its constraints say one (`linux/x86_64`), else
+/// the labels it asks for.
+fn place_of(req: &Requirement) -> String {
+    let said = |fact: &str| {
+        req.constraints.iter().find_map(|(text, _)| {
+            let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            t.strip_prefix(fact).and_then(|r| r.strip_prefix("==")).map(|v| v.trim_matches(|c| c == '\'' || c == '"').to_owned())
+        })
+    };
+    match (said("os"), said("arch")) {
+        (Some(os), Some(arch)) => format!("{os}/{arch}"),
+        (Some(os), None) => os,
+        _ => req.labels.join(", "),
+    }
+}
+
+/// Whether `request` fits in what a hold leaves beside its leg.
+fn beside(request: &Resources, extra: &Resources) -> bool {
+    request.cpu <= extra.cpu + 1e-9 && request.mem <= extra.mem
+}
+
+/// [`Scheduler::headroom`] of a runner at `now`.
+fn headroom_of(r: &Runner, now: i64) -> Option<Headroom> {
+    let (s, at) = r.sample.as_ref()?;
+    if now.saturating_sub(*at) > SAMPLE_FRESH_MS {
+        return None;
+    }
+    let h = Headroom::of(s);
+    Some(Headroom { cpus: (h.cpus - r.since.cpu).max(0.0), mem: h.mem.saturating_sub(r.since.mem), ..h })
 }
 
 fn load(r: &Runner) -> f64 {
