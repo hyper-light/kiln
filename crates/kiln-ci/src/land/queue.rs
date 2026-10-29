@@ -433,13 +433,20 @@ pub fn prefix(stack: &[(String, Gate)]) -> Prefix {
     let mut out = Prefix::default();
     let mut below: Option<String> = None;
     for (d, g) in stack {
-        match (&below, g.reason()) {
-            (None, None) => out.clear.push(d.clone()),
-            (None, Some(why)) => {
-                out.held.push((d.clone(), vec![why]));
+        // Each reason its own, so each is said with its diff's name (`D1: …; D1: …`), as Review
+        // says a diff's blockers.
+        let why: Vec<String> = match g {
+            Gate::Ready => Vec::new(),
+            Gate::Hold { why } => why.clone(),
+            Gate::Conflict { files } => vec![conflicts_in(files)],
+        };
+        match &below {
+            None if g.ready() => out.clear.push(d.clone()),
+            None => {
+                out.held.push((d.clone(), why));
                 below = Some(d.clone());
             }
-            (Some(b), why) => out.held.push((d.clone(), std::iter::once(format!("{b}, below it, holds")).chain(why).collect())),
+            Some(b) => out.held.push((d.clone(), std::iter::once(format!("{b}, below it, holds")).chain(why).collect())),
         }
     }
     out
