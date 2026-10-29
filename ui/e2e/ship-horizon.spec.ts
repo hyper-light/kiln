@@ -18,14 +18,13 @@ const sample = (page: Page) =>
     .first()
     .locator(".ship-lanesbox")
     .evaluate((box) => ({
-      span: box.querySelector(".ship-lanesbox__span")?.textContent ?? "",
-      bars: [...box.querySelectorAll(".ship-lane")].flatMap((lane) => {
-        const bar = lane.querySelector<HTMLElement>(".ship-lane__bar");
+      span: (box as HTMLElement).dataset.horizon ?? "",
+      bars: [...box.querySelectorAll(".ship-lrow[data-lane]")].flatMap((lane) => {
+        const bar = lane.querySelector<HTMLElement>(".ship-lbar");
         if (!bar) return [];
-        const name = lane.querySelector(".ship-lane__name")?.textContent ?? "";
-        // A finished span says when it ended; a bar under way grows to now, so only its start is kept.
-        const done = (lane.querySelector(".ship-lane__when")?.textContent ?? "").includes("–") || bar.classList.contains("ship-lane__bar--point");
-        return [{ name, left: bar.style.left, width: done ? bar.style.width : null }];
+        const name = lane.querySelector(".ship-ll__name")?.textContent ?? "";
+        // A finished bar keeps its span; one under way grows to now, so only its start is kept.
+        return [{ name, left: bar.style.left, width: bar.dataset.done !== undefined ? bar.style.width : null }];
       }),
     }));
 
@@ -39,7 +38,7 @@ test("over 60 s the lanes' bars keep their scale", async ({ page, isMobile }) =>
   await row.locator(".ship-go").click();
   // The lanes drawn, with their bars (a point has no box of its own, so it's counted, not seen).
   await expect(row.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });
-  await expect.poll(() => row.locator(".ship-lanesbox .ship-lane__bar").count(), { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect.poll(() => row.locator(".ship-lanesbox .ship-lbar").count(), { timeout: 15_000 }).toBeGreaterThan(0);
   const samples = [await sample(page)];
   for (let i = 0; i < 6; i++) {
     await page.waitForTimeout(10_000);
@@ -74,7 +73,7 @@ test("open, the horizon holds past a 10-minute step, and Now catches it up", asy
   await row.locator(".ship-go").click();
   const lanes = row.locator('section[aria-label="Lanes"]');
   await expect(lanes.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });
-  await expect.poll(() => lanes.locator(".ship-lanesbox .ship-lane__bar").count(), { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect.poll(() => lanes.locator(".ship-lanesbox .ship-lbar").count(), { timeout: 15_000 }).toBeGreaterThan(0);
   const now = lanes.getByRole("button", { name: "Now" });
   await expect(now).toBeDisabled();
   const before = await sample(page);

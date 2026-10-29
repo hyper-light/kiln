@@ -822,9 +822,10 @@ export class Trunk {
       actions.push({ name: "approve", method: "POST", path: `/api/deploy/releases/ship-rel-${c.id}/approve`, body: {} });
       actions.push({ name: "hold", method: "POST", path: `/api/deploy/releases/ship-rel-${c.id}/reject`, body: {} });
     }
+    // Hand off first, while no one has the failure (Ship's one endpoint decides where it goes, W26-R18).
     if (c.checks.state === "failed" && !c.fixedBy) {
+      if (!c.handled) actions.push({ name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: this.repo, sha: c.sha } });
       actions.push({ name: "retry", method: "POST", path: `/api/ci/runs/${run}/rerun`, body: { mode: "failed" } });
-      actions.push({ name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: this.repo, run } });
     }
     if (sim.production.at === c.id)
       for (const r of sim.runners) if (r.state === "failed" && r.target === c.id) actions.push({ name: "retry_runner", method: "POST", path: `/api/updates/runners/${r.name}`, body: null });
@@ -923,9 +924,11 @@ export class Trunk {
     this.advance();
     return this.sim.retry(run.replace(/^ship-run-/, ""));
   }
-  handOff(run: string) {
+  /** Hands the trunk's commit `sha` off, as `POST /api/ship/hand-off` does: its failure, to ci-doctor. Null when it isn't the trunk's. */
+  handOff(sha: string): boolean | null {
     this.advance();
-    return this.sim.handOff(run.replace(/^ship-run-/, ""));
+    const c = this.sim.commits.find((x) => x.sha === sha);
+    return c ? this.sim.handOff(c.id) : null;
   }
   retryRunner(name: string) {
     this.advance();

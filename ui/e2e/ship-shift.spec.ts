@@ -18,7 +18,8 @@ interface Shift {
   what: string[];
 }
 
-/** Every layout-shift entry on the page from here on, kept on `window.shifts`. */
+/** Every layout-shift entry of Ship's from here on (a source in `.ship`, as ship-perf.spec counts them: the
+ * app's approval notices come and go on their own), kept on `window.shifts`. */
 const watch = (page: Page) =>
   page.addInitScript(() => {
     const w = window as unknown as { shifts: Shift[] };
@@ -33,7 +34,8 @@ const watch = (page: Page) =>
     const rect = (r: DOMRectReadOnly) => `${Math.round(r.x)},${Math.round(r.y)} ${Math.round(r.width)}x${Math.round(r.height)}`;
     new PerformanceObserver((list) => {
       for (const e of list.getEntries() as unknown as { value: number; hadRecentInput: boolean; sources?: { node?: Node | null; previousRect: DOMRectReadOnly; currentRect: DOMRectReadOnly }[] }[])
-        w.shifts.push({ value: e.value, input: e.hadRecentInput, what: (e.sources ?? []).map((s) => `${name(s.node)} ${rect(s.previousRect)} → ${rect(s.currentRect)}`) });
+        if ((e.sources ?? []).some((s) => (s.node instanceof Element ? s.node : (s.node?.parentElement ?? null))?.closest(".ship")))
+          w.shifts.push({ value: e.value, input: e.hadRecentInput, what: (e.sources ?? []).map((s) => `${name(s.node)} ${rect(s.previousRect)} → ${rect(s.currentRect)}`) });
     }).observe({ type: "layout-shift", buffered: true });
   });
 

@@ -525,6 +525,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let repo = format!("{owner}/{name}");
             boxed(|| crate::ci::diffs::ship_commit_blob(&hub, &repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m))
         }
+        // A row's Hand off: what the commit has open, to the agent that takes it (W26-R18).
+        (&Method::POST, ["api", "ship", "hand-off"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::hand_off(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         (_, ["api", "cd", rest @ ..]) => boxed(|| crate::cd::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => boxed(|| crate::deploy::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ci", "legs", id, "terminal"]) => {
@@ -635,6 +640,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| crate::toolfix::fix(Arc::clone(&hub), caller.clone(), &id, ask)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
         }
         (&Method::GET, ["api", "jobs", id, "logs"]) => boxed(|| job_logs(&hub, id, &q)).await,
+        (&Method::GET, ["api", "jobs", id, "logs", "times"]) => boxed(|| job_log_times(&hub, id, &q)).await,
         (&Method::GET, ["api", "jobs", id, "logs", "ws"]) => {
             let (id, step) = ((*id).to_owned(), q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0));
             job_logs_ws(hub.clone(), id, step, req)
@@ -2701,6 +2707,23 @@ async fn job_logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
         data = hub.logs.read(&from, step).await;
     }
     Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)))
+}
+
+/// When each piece of a step's log arrived (`{ times: [[offset, unix_ms], ...], size }`, oldest
+/// first, and how long the log was as they were read: the lines they cover), for the times Ship's
+/// Output puts beside its lines (plan 01a1856fe81375b1bd1d1d86f270a45b, step 9); a CI leg a rerun
+/// kept answers with its original's, as its log does.
+async fn job_log_times(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+    let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut of = id.to_owned();
+    if hub.logs.size(&of, step).await == 0
+        && let Some(from) = hub.store.reused_from(id.to_owned()).await?
+    {
+        of = from;
+    }
+    let size = hub.logs.size(&of, step).await;
+    let times = hub.logs.times(&of, step).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "times": times, "size": size })))
 }
 
 fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {

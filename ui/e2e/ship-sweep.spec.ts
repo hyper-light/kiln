@@ -22,16 +22,16 @@ test("from 320 to 1440 px an opened commit is never wider than its window, its l
   const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
   await expect(row).toBeVisible({ timeout: 15_000 });
   await row.locator(".ship-go").click();
-  await expect(row.locator(".rv-s > h3, .ship-sec > h3")).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"], { timeout: 15_000 });
+  await expect(row.locator(".rv-s > h3, .ship-sech > h3")).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"], { timeout: 15_000 });
   await expect(row.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });
-  const toggle = row.locator('section[aria-label="Lanes"]').getByRole("button", { name: /^(Detail|Fit)$/ });
+  const scale = row.locator('section[aria-label="Lanes"]').getByRole("group", { name: "Lanes' scale" });
   const wide: string[] = [];
   for (const width of WIDTHS) {
     await page.setViewportSize({ width, height: 900 });
     for (const room of ["Fit", "Detail"]) {
-      // The toggle names the room it goes to: showing "Detail" means the lanes are in Fit.
-      if ((await toggle.textContent()) === room) await toggle.click();
-      await expect(toggle).toHaveText(room === "Fit" ? "Detail" : "Fit");
+      // Fit and Detail, side by side in the Lanes' head (f-ship's): the one pressed is the one shown.
+      await scale.getByRole("button", { name: room }).click();
+      await expect(scale.getByRole("button", { name: room })).toHaveAttribute("aria-pressed", "true");
       await page.waitForTimeout(100);
       const w = await widths(page);
       if (w.scroll !== w.client) wide.push(`${width} px, ${room}: ${w.scroll} wide in ${w.client}`);

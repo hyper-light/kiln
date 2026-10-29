@@ -94,6 +94,8 @@ interface SimJob {
 }
 interface LogStream {
   data: string;
+  /** When each piece arrived: its byte offset and unix ms (kiln's `<step>.times`). */
+  times: [number, number][];
   done: boolean;
   subs: Set<WebSocket>;
 }
@@ -108,6 +110,14 @@ function liveJob() {
   const all = [...jobsById.values()];
   const sj = all.find((j) => j.job.status === "running") ?? all[0];
   return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
+}
+/** The run of Ship's live job, each of its jobs (ship.ts: a commit's Checks, each leg its own job,
+ * as production's v1 runs have them; plan 01a1856fe81375b1bd1d1d86f270a45b, step 8). */
+function liveRun() {
+  const live = liveJob();
+  if (!live) return null;
+  const jobs = (jobsByRun.get(live.run) ?? []).map((s) => ({ job: s.job.id, name: s.job.display || s.job.key, status: s.job.status, start: s.job.started_at, end: s.job.finished_at, error: s.job.error }));
+  return { run: live.run, jobs };
 }
 const logs = new Map<string, LogStream>();
 const agents = new Map<string, Agent>();
@@ -545,14 +555,31 @@ function getStream(sj: SimJob, idx: number): LogStream {
   if (!s) {
     const step = sj.steps[idx];
     const done = !step || !["running", "pending", "queued"].includes(step.status);
-    s = { data: step && done ? completedLog(sj, step) : "", done, subs: new Set() };
+    const data = step && done ? completedLog(sj, step) : "";
+    s = { data, times: step && data ? spread(data, step) : [], done, subs: new Set() };
     logs.set(k, s);
   }
   return s;
 }
 
+/** A finished step's log made at once: its lines' times spread across the step's run, as kiln would have noted them. */
+function spread(data: string, step: SimStep): [number, number][] {
+  const from = (step.started_at ?? now()) * 1000;
+  const to = Math.max(from, (step.finished_at ?? step.started_at ?? now()) * 1000);
+  const starts: number[] = [0];
+  let at = 0;
+  for (const line of data.split("\n").slice(0, -1)) {
+    at += Buffer.byteLength(line, "utf8") + 1;
+    if (at < Buffer.byteLength(data, "utf8")) starts.push(at);
+  }
+  return starts.map((o, i) => [o, Math.round(from + ((to - from) * i) / Math.max(1, starts.length - 1))]);
+}
+
 function appendLog(sj: SimJob, idx: number, text: string) {
+  // Nothing to add, nothing to note (kiln notes only pieces that hold bytes).
+  if (!text) return;
   const s = getStream(sj, idx);
+  s.times.push([Buffer.byteLength(s.data, "utf8"), Date.now()]);
   s.data += text;
   const buf = Buffer.from(text, "utf8");
   for (const ws of s.subs) if (ws.readyState === WebSocket.OPEN) ws.send(buf, { binary: true });
@@ -1456,7 +1483,7 @@ const server = http.createServer(async (req, res) => {
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
-    if (await handleShip(req, res, url, { json, liveJob, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
+    if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
@@ -1607,6 +1634,14 @@ const server = http.createServer(async (req, res) => {
       if (!sj.steps[idx]) return err(res, 404, "no such step");
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       return void res.end(getStream(sj, idx).data);
+    }
+    if ((mm = p.match(/^\/api\/jobs\/([^/]+)\/logs\/times$/)) && m === "GET") {
+      const sj = jobsById.get(decodeURIComponent(mm[1]!));
+      if (!sj) return err(res, 404, "no such job");
+      const idx = Number(url.searchParams.get("step") ?? 0);
+      if (!sj.steps[idx]) return err(res, 404, "no such step");
+      const s = getStream(sj, idx);
+      return json(res, 200, { times: s.times, size: Buffer.byteLength(s.data, "utf8") });
     }
     if ((mm = p.match(/^\/api\/jobs\/([^/]+)\/tools$/)) && m === "GET") {
       const sj = jobsById.get(decodeURIComponent(mm[1]!));

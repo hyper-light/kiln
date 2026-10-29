@@ -6811,8 +6811,9 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 
 - **W21-AC01** For each page: a Playwright script runs in Chromium and WebKit at 1440×900 and
   390×844, checks the page's primary task end to end against a live or mock server, asserts that no
-  element scrolls horizontally, asserts that no element is `position: fixed` other than the shell's
-  own, and saves screenshots for review. *UI check, in CI.*
+  element scrolls horizontally but a code block, which keeps each line on one line (a comment's code
+  in Ship's Files and Conversation, marked `data-code-scroll`), asserts that no element is
+  `position: fixed` other than the shell's own, and saves screenshots for review. *UI check, in CI.*
 - **W21-AC02** The editor flags every negative-corpus file (F-04) at the right range, completes
   `needs.`, `steps.`, `matrix.`, `secrets.` and `uses:` correctly in fixtures, and round-trips a
   commented file through the flow view with comments intact. *UI test.*
@@ -8674,6 +8675,16 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   references. Drafts live in the browser's drafts store, which live updates never touch;
   mutations are React Actions with optimistic state; there are no effects; an open item holds
   still and is patched in place.
+- *R18*, Hand off (`crates/kiln/src/ship.rs`'s `hand_off`, `POST /api/ship/hand-off`, migration
+  `20261029-0100_w26_handoffs`). A row's Hand off names one endpoint, and the server decides
+  where it goes. While the change's author's agent runs, it gets the conflicts, open threads and
+  failed checks in one message, the way its comments reach it (docs/agentic.md C3). A failure
+  with no agent of its own goes to the agent attached to what failed, as the failure itself
+  wakes it (W20-R08: the same incident, never a second one). Each hand-off is kept, so the row
+  says who is on it. A person's failure reads "<who> fixing · …" and needs no one; a change
+  reads its agent fixing, with no Hand off and Review pair, until a new revision. With nothing
+  open, or no agent to take it, Hand off says why. Not yet: the switch that lets agents fix from
+  agents' feedback, and "Fixed in" once the fix lands.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
@@ -8685,11 +8696,15 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     `w26_r12_a_change_requests_resolution_is_a_merge_commit`, on real git), `tests/search.rs`
     (`w26_r07_a_search_across_the_change`, a 1,000-file change, the search's checks; its 250 ms at
     p95 is `w26_r07_warm_searches_p95_within_250ms`, a benchmark run alone on an idle machine),
-    `ship.rs` (`w26_r14_a_commit_with_no_change_carries_its_push`).
+    `ship.rs` (`w26_r14_a_commit_with_no_change_carries_its_push`, and R18's
+    `w26_r18_what_was_handed_off_says_who_is_on_it`,
+    `w26_r18_hand_off_gives_a_failure_to_the_agent_attached_to_it`,
+    `w26_r18_hand_off_gives_a_changes_threads_to_its_authors_agent`).
   - UI, in Chromium and WebKit at desktop and phone widths: `e2e/ship-review.spec.ts` (open, reply,
     resolve, change a kind, delete, apply a suggestion, the whole file, search, every way to resolve
     a conflict and commit it), `ship-lanes.spec.ts` (the sections' order on four kinds of item, and
-    D41's Review lanes), `ship-diff.spec.ts` (the Diff button), `ship-perf.spec.ts` (AC06: no
+    D41's Review lanes), `ship-diff.spec.ts` (the Diff button), `ship-hand-off.spec.ts` (R18),
+    `ship-perf.spec.ts` (AC06: no
     layout shift through 30 s of live updates; a keystroke renders its composer alone); unit tests
     `comment-markdown.test.ts` and `review-composer.test.ts`.
   - AC06 against a real server (`ci/ui/ship_ac06.mjs` on `ci/ui/review_setup.py`'s 10,000-line
