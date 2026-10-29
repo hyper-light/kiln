@@ -8,7 +8,7 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowUpRight, ChevronRight } from "lucide-react";
+import { ArrowUpRight, ChevronRight, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
@@ -41,6 +41,8 @@ import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
+import { isMarked, markNotices, useMarks } from "./notices";
+import { swipeAway } from "./swipe-away";
 import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
@@ -291,7 +293,7 @@ export default function Mission() {
   return (
     <div className="container-console page ms-page">
       <title>Agents · kiln</title>
-      <PageIntro index={6} label="Agents" title="Mission control." compact />
+      <PageIntro index={5} label="Agents" title="Mission control." compact />
       <React.Suspense fallback={<div className="st" aria-hidden="true" />}>
         <StandsNow />
       </React.Suspense>
@@ -344,6 +346,11 @@ function Found({ all }: { all: { a: AgentInfo }[] }) {
 
 /** A machine offline this long, with agents on it, may be gone: they can go on elsewhere. */
 const GONE_AFTER_S = 120;
+/**
+ * The notice that machine `machine`, offline since `since` (s), may be gone: put away (× or a swipe)
+ * or acted on, it stays so for you everywhere (notices.ts) until the machine goes offline again.
+ */
+const goneKey = (machine: string, since: number) => `machine-gone:${machine}:${Math.round(since)}`;
 
 /**
  * Machines that have been offline a while with agents on them: if one is gone, its agents go on
@@ -353,6 +360,7 @@ const GONE_AFTER_S = 120;
 function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   const runners = useAgentsLive().data;
   const nowS = useNow() / 1000;
+  const marks = useMarks();
   const offline = new Map<string, number>();
   for (const { a, stand } of rows) {
     if (stand !== "offline" || a.target === "local") continue;
@@ -361,7 +369,7 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   }
   const gone = [...offline].flatMap(([machine, count]) => {
     const r = runners.find((x) => x.name === machine);
-    return r && !r.connected && nowS - r.last_seen > GONE_AFTER_S ? [{ machine, count, since: r.last_seen }] : [];
+    return r && !r.connected && nowS - r.last_seen > GONE_AFTER_S && !isMarked(marks, goneKey(machine, r.last_seen)) ? [{ machine, count, since: r.last_seen }] : [];
   });
   const others = runners.filter((r) => r.connected && !r.ephemeral && !r.outpost).map((r) => r.name);
   // A machine on battery that is low: its agents stop when it sleeps.
@@ -383,12 +391,16 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
 function RecoverMachine({ machine, count, since, others }: { machine: string; count: number; since: number; others: string[] }) {
   const [to, setTo] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const key = goneKey(machine, since);
+  const away = () => markNotices([key], "away");
   const go = async () => {
     setBusy(true);
     try {
       const { moved } = await harnessApi.recover(machine, to || undefined);
       const failed = moved.filter((m) => m.error);
       const n = moved.length - failed.length;
+      // All of them on elsewhere: done with, here and everywhere. Some left: the card stays for those.
+      if (n > 0 && failed.length === 0) markNotices([key], "done");
       if (n > 0)
         toast({
           title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`,
@@ -404,7 +416,7 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
     }
   };
   return (
-    <div className="ms-recover" role="status">
+    <div className="ms-recover" role="status" {...swipeAway<HTMLDivElement>(away)}>
       <span>
         {machine} has been offline since {relativeTime(since)}. If it&rsquo;s gone, its {count} agent{count === 1 ? "" : "s"} can go on elsewhere from kiln&rsquo;s copy of
         {count === 1 ? " its conversation" : " their conversations"}.
@@ -425,6 +437,9 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
       ) : (
         <span className="ms-recover-none">No other machine is connected to take them.</span>
       )}
+      <button type="button" className="icon-btn ms-recover-close" data-variant="bare" data-size="sm" aria-label={`Put away ${machine}'s notice`} title="Put away" onClick={away}>
+        <X size={14} />
+      </button>
     </div>
   );
 }

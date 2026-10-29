@@ -1712,7 +1712,9 @@ impl Dispatch {
                             continue;
                         }
                         let cmds = self.sched.handle(Input::LegCancelled { leg: id, reason }, now_ms());
-                        Box::pin(self.commands(cmds)).await;
+                        if let Some(cmds) = self.after(cmds) {
+                            Box::pin(self.commands(cmds)).await;
+                        }
                     }
                 }
                 PlanAction::Warn { leg, message } => {
@@ -1737,7 +1739,9 @@ impl Dispatch {
                     }
                     self.hub.ci.runs.lock().remove(run);
                     self.hub.emit_run(run).await;
-                    Box::pin(self.commands(cmds)).await;
+                    if let Some(cmds) = self.after(cmds) {
+                        Box::pin(self.commands(cmds)).await;
+                    }
                 }
             }
         }
@@ -1927,7 +1931,9 @@ impl Dispatch {
                     }
                 }
                 let cmds = self.sched.handle(Input::LegQueued(Box::new(h.leg)), now_ms());
-                Box::pin(self.commands(cmds)).await;
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
             }
             kiln_ci::env::Gate::Refused(m) => {
                 self.held.remove(id);
@@ -2071,7 +2077,9 @@ impl Dispatch {
             return self.gate(&id).await;
         }
         let cmds = self.sched.handle(Input::LegQueued(Box::new(leg)), now_ms());
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
         Ok(())
     }
 
@@ -2127,6 +2135,20 @@ impl Dispatch {
         let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
         self.actions(run, acts).await
+    }
+
+    /// Commands that come of carrying one out go after it, from the loop already under way: handed
+    /// to `next` here, with nothing for the caller to run, so no second `commands` frame goes on the
+    /// stack. A debug build gives that frame a slot for every future it awaits inline, and two of
+    /// them overflowed a shard's 2 MiB stack (a queued leg's commands, from `commands`' own work).
+    /// Otherwise the commands, for the caller to carry out.
+    fn after(&mut self, cmds: Vec<Command>) -> Option<Vec<Command>> {
+        if self.in_commands {
+            self.next.extend(cmds);
+            None
+        } else {
+            Some(cmds)
+        }
     }
 
     /// Carries out what the scheduler decided.
@@ -2451,7 +2473,9 @@ impl Dispatch {
                 }
                 runs::requeue(&self.hub, leg, attempt, Some(format!("the assignment could not be delivered: {}", a.words()))).await?;
                 let cmds = self.sched.handle(Input::Rejected { leg: leg.to_owned() }, now_ms());
-                Box::pin(self.commands(cmds)).await;
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
             }
             None => pending.log_when_answered(crate::hub::LOG_WITHIN),
         }
@@ -2857,7 +2881,9 @@ impl Dispatch {
         self.hub.ci.legs.lock().remove(leg);
         self.hub.logs.finish(leg);
         let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: Outcome::Cancelled }, now_ms());
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
     }
 
     /// A deleted repository's runs, gone with their records: each leg out of the scheduler, a

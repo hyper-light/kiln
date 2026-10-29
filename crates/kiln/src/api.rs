@@ -456,9 +456,19 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Ship's read model: a repository's commits and where each stands (plan 01a175b3a21174bc8769f5e784b90ecb).
         (&Method::GET, ["api", "ship", "commits"]) => boxed(|| crate::ship::list(&hub, &q, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", repo, sha]) => boxed(|| crate::ship::get(&hub, repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", repo, sha, "diff"]) => boxed(|| crate::ci::diffs::ship_commit_diff(&hub, repo, sha, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "commits", repo, sha, "blob"]) => boxed(|| crate::ci::diffs::ship_commit_blob(&hub, repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", owner, name, sha]) => {
             let repo = format!("{owner}/{name}");
             boxed(|| crate::ship::get(&hub, &repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m))
+        }
+        (&Method::GET, ["api", "ship", "commits", owner, name, sha, "diff"]) => {
+            let repo = format!("{owner}/{name}");
+            boxed(|| crate::ci::diffs::ship_commit_diff(&hub, &repo, sha, &caller)).await.map_err(|(c, m)| err(c, m))
+        }
+        (&Method::GET, ["api", "ship", "commits", owner, name, sha, "blob"]) => {
+            let repo = format!("{owner}/{name}");
+            boxed(|| crate::ci::diffs::ship_commit_blob(&hub, &repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m))
         }
         (_, ["api", "cd", rest @ ..]) => boxed(|| crate::cd::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => boxed(|| crate::deploy::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
@@ -587,10 +597,33 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "join-requests"]) => Ok(srv::json(StatusCode::OK, &hub.joins.list(Instant::now(), &hub.pki.ca_der))),
         (&Method::POST, ["api", "join-requests", id, "approve"]) => {
             let id = (*id).to_owned();
-            boxed(|| approve_join(&hub, &id, req)).await
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| approve_join(&hub, &id, req, &by)).await
         }
         (&Method::POST, ["api", "join-requests", id, "deny"]) => boxed(|| deny_join(&hub, id)).await,
-        (&Method::DELETE, ["api", "agents", name]) => boxed(|| forget_agent(&hub, name)).await,
+        (&Method::DELETE, ["api", "agents", name]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| forget_agent(&hub, name, &by)).await
+        }
+        // Identities kiln's CA issued: their revocations, and revoking one (W27-R01).
+        (&Method::GET, ["api", "identities", "revocations"]) => boxed(|| identity_revocations(&hub)).await,
+        // A person's short-lived certificate for a key made on their device (W27-R02).
+        (&Method::POST, ["api", "me", "identity"]) => {
+            let caller = caller_of(&hub, req.headers()).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "sign in first"))?;
+            boxed(|| me_identity(&hub, caller, req)).await
+        }
+        (&Method::GET, ["api", "identities"]) => {
+            let kind = srv::query(&req).remove("kind");
+            boxed(|| async {
+                let list = crate::identities::list(&hub, kind.as_deref()).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                Ok(srv::json(StatusCode::OK, &json!({ "identities": list })))
+            })
+            .await
+        }
+        (&Method::POST, ["api", "identities", "revoke"]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| identity_revoke(&hub, req, &by)).await
+        }
         // What's wrong with a runner, and repairs to it (`crate::doctor`, docs/releases.md).
         (&Method::GET, ["api", "agents", name, "diagnose"]) => boxed(|| crate::doctor::diagnose(&hub, name)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
         (&Method::POST, ["api", "agents", name, "repair"]) => {
@@ -2852,10 +2885,68 @@ async fn get_artifacts(hub: &Hub, id: &str) -> R {
 
 // ------------------------------------------------------------------ agents
 
-async fn forget_agent(hub: &Hub, name: &str) -> R {
-    hub.forget_agent(name).await?;
-    hub.store.audit("admin".into(), "agent.forget".into(), name.to_owned()).await;
+async fn forget_agent(hub: &Hub, name: &str, by: &str) -> R {
+    hub.forget_agent(name, by).await?;
+    hub.store.audit(by.to_owned(), "agent.forget".into(), name.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/me/identity` `{csr}`: the caller's certificate as a person, for the CSR's key, made
+/// on their device (docs/ci.md W27-R02); asked again to renew it while they stay signed in. A
+/// refusal says why, with a `code` the CLI acts on.
+async fn me_identity(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R {
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let csr = b.get("csr").and_then(serde_json::Value::as_str).ok_or_else(|| err(StatusCode::BAD_REQUEST, "send a csr"))?;
+    match crate::identities::issue_person(hub, &caller, csr).await {
+        Ok(i) => {
+            hub.store.audit(caller.name.clone(), "identity.person".into(), i.uri.clone()).await;
+            Ok(srv::json(StatusCode::OK, &json!({ "uri": i.uri, "identity": i.identity, "cert_pem": i.cert_pem, "not_before": i.not_before, "not_after": i.not_after })))
+        }
+        Err(crate::identities::PersonRefused::Failed(e)) => Err(e.into()),
+        Err(r) => Ok(srv::json(r.status(), &json!({ "error": r.to_string(), "code": r.code() }))),
+    }
+}
+
+/// `GET /api/identities/revocations`: every revocation, oldest first (W27-R01).
+async fn identity_revocations(hub: &Hub) -> R {
+    let revs = crate::identities::revocations(&hub.store).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows: Vec<serde_json::Value> = revs.iter().map(|r| json!({ "serial": r.serial, "key": r.key, "at": r.at, "reason": r.reason, "by": r.by })).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "revocations": rows })))
+}
+
+#[derive(Deserialize)]
+struct RevokeReq {
+    serial: Option<String>,
+    key: Option<String>,
+    subject: Option<String>,
+    reason: String,
+}
+
+/// `POST /api/identities/revoke` `{serial | key | subject, reason}`: revoked from now on, refused
+/// at once by the TLS directory (W27-R01).
+async fn identity_revoke(hub: &Hub, req: Request, by: &str) -> R {
+    use crate::identities::Target;
+    let r: RevokeReq = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let target = match (r.serial, r.key, r.subject) {
+        (Some(s), None, None) => Target::Serial(s),
+        (None, Some(k), None) => Target::Key(k),
+        (None, None, Some(s)) => Target::Subject(s),
+        _ => return Err(err(StatusCode::BAD_REQUEST, "name exactly one of serial, key or subject")),
+    };
+    if r.reason.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "say why it's revoked (reason)"));
+    }
+    let at = crate::util::now_unix();
+    let keys = crate::identities::revoke(&hub.store, target.clone(), r.reason.trim(), by, at).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if !keys.is_empty() {
+        hub.net.command(crate::net::Out::RevokeKeys { keys: keys.clone(), why: crate::identities::refusal(at, r.reason.trim(), by) }).await;
+    }
+    hub.store.audit(by.to_owned(), "identity.revoke".into(), format!("{target:?}: {}", r.reason.trim())).await;
+    // The server's or CD's own, revoked, is issued anew at once (a revoked key replaced).
+    if let Err(e) = crate::identities::own_identities(&hub.store, &hub.pki).await {
+        tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued anew");
+    }
+    Ok(srv::json(StatusCode::OK, &json!({ "at": at, "keys": keys })))
 }
 
 #[derive(Deserialize)]
@@ -2982,6 +3073,14 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         365
     };
     let cert = hub.pki.sign_csr(&r.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Who enrolled it (W27-R01): the owner, whose join token or invite it brought; kiln for its
+    // own pods.
+    let by = if ephemeral { "kiln" } else { "admin" };
+    crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // A name forgotten earlier in this server's life is welcome again, as an approved join makes
+    // it: its new key works, and its revoked keys stay refused (W27-R01).
+    hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
     let quic = if ephemeral {
         hub.cfg.kubernetes.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone())
     } else {
@@ -3026,6 +3125,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
     if !known {
         return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
     }
+    crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     hub.store.audit(name.clone(), "agent.instance".into(), String::new()).await;
     tracing::info!(agent = %name, "issued a certificate for a second runner process");
     Ok(srv::json(
@@ -3359,7 +3459,7 @@ async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> String {
 }
 
 /// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
-async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
+async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
     let decision: crate::join::Decision = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
     let c = match hub.joins.candidate(id, Instant::now()) {
         Ok(c) => c,
@@ -3377,6 +3477,8 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
     let days = if outpost { crate::pki::OUTPOST_DAYS } else { 365 };
     let cert = hub.pki.sign_csr(&c.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    crate::identities::enrolled(&hub.store, &name, by).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let quic = hub.cfg.server.quic_advertise.clone();
     let quic_port = hub.discovery.advert.lock().quic;
     let approval = crate::join::Approval {

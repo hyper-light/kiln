@@ -36,6 +36,8 @@ hyper-block = "=0.1.0"
 # The bus kiln's events ride (docs/bus.md): Quiver, vendored at vendor/quiver.
 quiver = "=0.1.0"
 quiver-api = "=0.1.0"
+# The search across a change (docs/ci.md W26-R07): kiln-seams' Search on vorpal (vendor/vorpal).
+kiln-search = { path = "../kiln-search" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"

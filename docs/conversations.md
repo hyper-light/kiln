@@ -179,7 +179,10 @@ that hasn't ended at once, each to the machine that suits it best (connected, it
 installed, the same platform first, then the one running the fewest agents) or all to one machine
 picked there (`POST /api/harness/machines/:machine/recover {"to"?}`; a machine that's connected is
 refused, since its own runner hands its agents over). Each goes on as Move does, and the answer says
-where each went or why it couldn't.
+where each went or why it couldn't. The notice's × (or a swipe on a touch screen) puts it away, and
+moving them all marks it done: either way it stays so for you on every device (a notice mark,
+`machine-gone:<machine>:<offline since>`, as approval cards keep theirs) until the machine goes
+offline again; some that couldn't move keep it there for them.
 
 **After a server restart**, the agents of machines that are away (not ended, heard of in the last 30
 days) are listed from the store, as away, with their recent timeline, so they can be moved on. A

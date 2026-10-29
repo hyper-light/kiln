@@ -200,8 +200,8 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
-| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | ready | specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | ready | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa` |
+| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
 
 ---
 
@@ -4591,7 +4591,8 @@ adapts [review.md](review.md), which it replaces.
 
 - **W14-R03 Stacked diffs**, as review.md specifies: a **diff** is one commit under review,
   numbered (`D123`), whose identity survives amends and rebases through a `Change-Id: I<40 hex>`
-  trailer (Gerrit's format; kiln's commit-msg hook and `kiln submit` add it); each push of a
+  trailer (Gerrit's format; kiln's commit-msg hook and `kiln submit` add it; since W26-R03 the
+  identity is kiln's own `Kiln-Change`, a Change-Id an alias, and no hook is needed); each push of a
   changed commit adds a **version** (`D123 v3`), marked **rebase-only** when its patch is
   unchanged; a **stack** is a chain of diffs; an **interdiff** compares any two versions with
   rebase noise removed (`git range-diff` semantics); every version is kept at
@@ -8449,6 +8450,24 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   latest revisions, same author and branch), and kiln asks only when it can't tell. Gerrit's
   `Change-Id` (which kiln wrote until now) and the `change-id` header jj and GitButler write are
   read as aliases; a trailer and an alias naming different changes are refused, saying why.
+  - *Built* (plan `01a17858021a74259cf8d76f17031d00`). The pure part is `kiln_ci::identity`:
+    - the trailer is `Kiln-Change: kc-<16 hex>`; every one of a squash's trailer paragraphs is
+      read;
+    - the aliases are `Change-Id`, `change-id` and GitButler's older `gitbutler-change-id`,
+      read from `git log --format=raw`;
+    - an alias kiln has never seen says the commit is new;
+    - a commit with neither is matched among the pusher's open diffs on the trunk: by patch-id,
+      else by likeness of changed lines and title (50% with a 15-point margin over the next;
+      30–50%, or a tie, asks), else by its lines lying inside one change;
+    - a split keeps the change for the half most like it; a squash (changes side by side in one
+      commit) keeps the most alike and absorbs the rest;
+    - an answer is `-o change=<commit>:<D12|new>`.
+
+    Records live in migration `20261026-1000_w26_change_identity` (`changes`, `change_aliases`,
+    `change_numbers`, `diffs.kiln_change`), which backfills every diff, its Change-Id as an
+    alias. Lands, restacks, submissions without git, agents' stacks and the optional hook write
+    the trailer; `kiln submit` rewrites nothing. Tests: `w26_r03_*` (kiln-ci, store), and real
+    git without a hook in `crates/kiln/tests/identity.rs` (`w26_ac08_*`).
 - **W26-R04 Revisions and their why.** Each revision says why it exists: pushed, rebase only,
   replayed by kiln, an agent's fix (its thread), a conflict resolved, a suggestion applied. A host
   pull request's heads are kept at `refs/kiln/…` so its revisions survive a force-push. An interdiff
@@ -8563,6 +8582,97 @@ repository):
   push to landed: the stack's commits land in stack order, each reviewed on its own; the branch's
   commits land together under its review. *Integration test on real git.*
 
+**Progress.** In progress. R06 to R15, each Ship item's dropdown owning its review, are built
+(Review plan step 3, kiln plan `01a17856b1aa77df93c0ef014cda0a71`, with the CI/CD Integration
+agent, whose Ship it is). An item's diff is in one place, Files (the person's decision,
+2026-10-27): Ship's Diff button opens the row and brings Files into view, focused. AC02 and AC05
+hold; AC03 and AC04 hold but for their signatures; AC06 holds in Chromium, not yet in WebKit (below).
+
+Not yet: signatures. Nothing R06 to R15 records is signed: the revision an Apply or a conflict's
+resolution makes, a comment, a resolution, an approval and each mark of the Review lanes carry
+`signer: null`, and their seal reads "unsigned", until W27-R03 signs them (the Review plan's step 7).
+
+- *R06* (`ui/src/views/ship/index.tsx`'s Dropdown, `ui/src/views/ship/review/`): Files and the
+  Conversation, then Ship's terminal output, Jobs and Lanes, for a commit with no change, a kiln
+  diff, a change request, a host's pull request and a landed change.
+- *R07* (`review/files.tsx`, `review/diffs.tsx`, `review/search.tsx`):
+  - **The gate's row.** The open threads by kind, with counts, and Approve, in the gate's words (R11).
+  - **Search.** `GET /api/diffs/:id/versions/:n/search?q=` for a kiln change, and `GET
+    /api/repos/:repo/pulls/:n/search?q=` for a host's pull request at its mirrored head
+    (`crates/kiln/src/ci/search.rs`), through the Search seam (docs/seams.md) on vorpal
+    (`crates/kiln-search`, vendored at `vendor/vorpal`): words, a regex or a code pattern, each hit
+    with the definition it's in, changed lines first. It filters the files and jumps to a hit.
+  - **Diffs.** Each file folds; one over 100 lines shows its first lines and the lines carrying a
+    comment, a conflict or a draft. The whole file opens in place, full-screen, never a popup
+    (`GET /api/diffs/:id/versions/:n/blob`; a commit with no change, `GET
+    /api/ship/commits/:repo/:sha/diff` and `/blob`).
+- *R08* (`review/threads.tsx`): threads flat on their lines. Each comment's line says who, its
+  seal, its kind and when, and its ⋯ copies, quotes, edits, deletes and changes the kind; a long
+  press copies; Reply and Resolve sit under it. Edits go through `PATCH /api/comments/:id` (body,
+  kind, state), deletions through `DELETE /api/comments/:id` (a thread's first comment stays,
+  `deleted`, while replies remain).
+- *R09* (`ui/src/lib/markdown.tsx`'s `CommentBody`): GitHub-flavoured markdown, mentions, task
+  lists, tables, and fenced code numbered, with its language and a copy icon; raw HTML stays text
+  and script URLs are dropped.
+- *R10* (`crates/kiln-ci/src/suggest.rs`, `crates/kiln/src/ci/revision.rs`): a `suggestion` block
+  shows against the file's own line numbers. Apply (`POST /api/comments/:id/apply`) commits it as a
+  revision of whoever applies it, its suggesters co-authors, through `revision::commit`, the one
+  commit path W27-R03 will sign. The block then says "applied in vN", or "outdated" once its lines
+  have moved.
+- *R11* (`kiln_ci::review::gate`, pure): hold (a blocking thread open; a conflict unresolved, or
+  resolved and not committed), warn (an issue open), inform (a nit), clear. While it holds,
+  accepting (`POST /api/diffs/:id/review`) is refused 409 with the reasons; `force` goes past a
+  warning only; an accepted review carries its note. Landing (`GET` and `POST
+  /api/diffs/:id/land`) and automatic merges wait the same. A blocking thread is resolved by its
+  author, or by an owner who says why, the reason kept. The threads come with the caller's gate
+  (`GET /api/diffs/:id/comments`).
+- *R12* (`crates/kiln-ci/src/conflicts.rs`, `crates/kiln/src/ci/conflicts.rs`, migration
+  `20261026-2200`): each revision is replayed onto where it lands with `git merge-tree
+  --write-tree` (`review_replays`, `review_conflicts`). `GET /api/diffs/:id/conflicts` gives each
+  conflict at the change's own lines, with main's side, this side and the base; a binary file, a
+  modify/delete and the like are named and resolved by taking a side. `POST` and `DELETE
+  /api/diffs/:id/conflicts/:cid/resolution` take main, this, both, the agent's (kept as the
+  agent's for a person to take) or an edit; `POST /api/diffs/:id/conflicts/commit` makes the
+  revision, its why and note "conflict resolved". Files draws each where it falls, Commit
+  resolution in Approve's place.
+- *R13* (`review/convo.tsx`): the change's list in markdown, line comments in it too, with its
+  comment box. A host's pull request reads and writes its threads through its host
+  (`/api/repos/:repo/pulls/:n`, W23's git-host interface); the kinds are kiln's.
+- *R14*, the Review lane records (`crates/kiln/src/ship.rs`'s `load_change`, `review/lanes.tsx`):
+  Ship's detail (`GET /api/ship/commits/:repo/:sha`) carries `review`, its marks oldest first. Each
+  has a `kind` (push, replay, comment, fix, resolution, approval), `at`, `end`, `by`, `revision`,
+  `state`, `thread`, `note` and `signer` (null until W27-R03), read from what R10 to R12 keep:
+  versions and their why, threads and their resolutions (`<thread>:resolved`), replays, reviewers
+  and reviews. A host's pull request has its pushes, asks and verdicts; a commit with no change,
+  its push. Lanes draws them as the Review group, a lane a mark.
+- *R15* (`review/perf.ts`, `review/files.tsx`, the row's memo in `index.tsx`): an item renders
+  only when it changes, memoized by item and version, and a refetch that reads the same keeps its
+  references. Drafts live in the browser's drafts store, which live updates never touch;
+  mutations are React Actions with optimistic state; there are no effects; an open item holds
+  still and is patched in place.
+- *Tests.*
+  - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
+    `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
+    (`kiln-seams`) and on vorpal (`kiln-search`, `w26_r07_*`).
+  - kiln: `tests/hosting.rs` (`w26_r02_a_blocking_thread_holds_a_diff_out_of_the_queue`,
+    `w26_r11_the_gate_holds_warns_and_informs`, `w26_r11_a_blocking_thread_holds_the_automatic_merge`,
+    `w26_r14_the_review_lanes_marks`), `tests/suggestions.rs` (`w26_ac03_*`), `tests/conflicts.rs`
+    (`w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision`,
+    `w26_r12_a_change_requests_resolution_is_a_merge_commit`, on real git), `tests/search.rs`
+    (`w26_r07_a_search_across_the_change`, a 1,000-file change), `ship.rs`
+    (`w26_r14_a_commit_with_no_change_carries_its_push`).
+  - UI, in Chromium and WebKit at desktop and phone widths: `e2e/ship-review.spec.ts` (open, reply,
+    resolve, change a kind, delete, apply a suggestion, the whole file, search, every way to resolve
+    a conflict and commit it), `ship-lanes.spec.ts` (the sections' order on four kinds of item, and
+    D41's Review lanes), `ship-diff.spec.ts` (the Diff button), `ship-perf.spec.ts` (AC06: no
+    layout shift through 30 s of live updates; a keystroke renders its composer alone); unit tests
+    `comment-markdown.test.ts` and `review-composer.test.ts`.
+  - AC06 against a real server (`ci/ui/ship_ac06.mjs` on `ci/ui/review_setup.py`'s 10,000-line
+    change, 2026-10-27): Chromium's median frame scrolling the whole file in an open item is 16.7
+    ms at 1280 and at 390, and a keystroke takes 1 ms. WebKit's is 46 ms and 49 ms: every line of
+    the whole file is in the page, and WebKit lays them out more slowly. AC06 isn't met in WebKit
+    until the whole file draws only the lines in view.
+
 **Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; research `01a174af7d0476b896d3b236098ddded`;
 the mock `~/.cache/kiln-review-design/ship/review-ship.html` (Ship's prototype, from the CI/CD
 Integration agent's `~/.cache/kiln-cicd-design/proto/f-ship.html`).
@@ -8654,6 +8764,99 @@ require a verified chain; a key never leaves the place it was made.
 **Sources.** Research `01a175c54441773fa28bf1488b82e6aa` (SLSA v1.2's source track, gittuf's
 reference state log, fencing, and kiln's own `pki.rs`, `docs/access.md`, W18, W19-R05 and
 `kiln-ci/src/land.rs`); plan `01a175b7d5e1772f8d3c7cb28e50ab2b`.
+
+**Built: identities (R01, R02, R12; AC01, AC02).** Plan `01a17856b1b0712babf8dfd37ce48756`,
+research `01a17947fdad71e5a4f15866e3541c41`.
+
+- *Identities.* A leaf names its actor in one URI subject alternative name whose path is whom it
+  acts for: `kiln://<org>/person/<name>`; `…/person/<name>/agent/<session>/epoch/<n>`, then
+  `/machine/<machine>/instance/<instance>`, the runner process its key is made and held in (where
+  the key is, not whom the agent acts for: certificates from before it was named have none);
+  `…/person/<enrolled by>/machine/<machine>/instance/<instance>`; a leg, its runner's then
+  `/run/<number>/attempt/<n>/leg/<key>`, W10's claims for it in Fulcio's extensions (*CI legs*,
+  below); `kiln://<org>/server`; `…/server/cd`. The organization is the CA's. kiln adds no OID of
+  its own.
+- *Checking* is `kiln_ci::identity::chain::verify` (and `verify_signed`): RFC 5280 path validation
+  at the time the caller gives, against the revocations it gives. An agent verifies as the agent
+  for its person, never as the person.
+- *Keys stay put.* Every kind is issued from a CSR only (`Pki::issue_identity`). A runner process
+  makes keys in its own memory for itself, for each agent session it holds at each epoch, and for
+  each leg it runs, and asks for their certificates over its channel (`AgentMsg::Identity`,
+  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). The server's and CD's keys are made in
+  `<data>/pki`, each in its own 0600 file (`server-signing.key`, `cd-signing.key`), apart from the
+  TLS leaf, and certified for 90 days (`kiln://<org>/server`; CD's `kiln://<org>/server/cd`, acting
+  for the server). The server looks at them as it starts, every 6 hours while it runs and after any
+  revocation: one with less than 30 days left is renewed, and one revoked is replaced at once, a new
+  key and a certificate for it (a revocation takes the certificate's key with it). Test:
+  `w27_r01_server_and_cd` (each verifies to kiln's root, as the server and as CD for the server;
+  each key in its file and nowhere else in the server's data; the server's certificate revoked,
+  then CD's key, each replaced).
+- *People.* A person's key is made on their own device by `kiln login`, in their config
+  (`~/.config/kiln/identity.key`, 0600), after they sign in there: with the sign-in link they were
+  given (`--link`), their name and password (`--name`), or a personal access token (`--token`; with a
+  passkey, one made in Settings after signing in with it: a passkey signs only WebAuthn's
+  challenges, so it proves the person and the device's key signs). Only a CSR goes
+  (`POST /api/me/identity`), from a person signed in (the owner, a user's session or personal access
+  token; never an agent, a job or a peer). The certificate (`identity.pem`) names them and their
+  organization (`kiln://<org>/person/<name>`: the owner, and the owner's tokens, `admin`; a user
+  their name exactly, so a name that would have to change to fit, or that reads as the owner's, isn't
+  certified) for 12 hours; kiln keeps it, never the key, and certifies no key that was revoked or
+  certifies another identity (the CLI makes a new one). The sign-in is kept beside it
+  (`identity.json`, 0600), and git's credential helper (`kiln git-credential`) renews the certificate
+  once half its life has gone, while that sign-in lasts; signed out, disabled or its token revoked,
+  it's forgotten and the certificate lapses. Disabling a person revokes their certificates at the
+  moment they're disabled, and none is issued after: one is recorded only in the transaction that
+  finds them still enabled.
+- *CI legs.* The runner given a leg makes its key as it's given it and asks for its certificate;
+  kiln issues it only to the machine the leg was given to, for as long as the attempt may run (its
+  timeout and an hour more, as the leg's tokens), and doesn't revoke it: when the leg ends the
+  runner drops the key and its certificate's copy. Its facts are W10's claims for the leg, as
+  Fulcio puts a CI job's (its `github-workflow` templates, kiln's address for GitHub's:
+  `kiln_ci::identity::chain::fulcio::from_claims`): Issuer (.8, kiln's OIDC issuer), Build Signer
+  URI and Digest (.9, .10: the job's workflow by ref and commit), Runner Environment (.11), Source
+  Repository URI, Digest, Ref, Identifier and owner (.12 to .17), Build Config URI and Digest
+  (.18, .19), Build Trigger (.20), Run Invocation URI (.21), visibility (.22) and Deployment
+  Environment (.23); `ci::sigstore` reads them as it reads Fulcio's (`certificate_identity`). A
+  leg's certificate naming no commit or no workflow is refused. No step reaches the key: aws-lc
+  holds it and wipes it when it's dropped (it's never serialized, so it's in no environment, file,
+  frame or log), and while the runner holds a leg's key its memory is kept from its user's other
+  processes, the steps among them (`os::private_memory`: on Linux the runner isn't dumpable then,
+  so neither ptrace nor `/proc/<pid>/mem` reaches it whatever Yama's ptrace scope; on Windows its
+  DACL lets them only wait on it, ask after it and end it; macOS refuses them `task_for_pid`
+  already). A step running as root, or as an elevated administrator with Debug programs enabled,
+  reaches any process's memory: kiln installs runners as their user, and on Windows never
+  elevated. Tests: `w27_r01_leg_certificate` (a leg on a test runner: its certificate verifies to
+  kiln's root with its run, workflow, commit and runner instance) and
+  `w27_r02_no_step_reads_the_legs_key` (its step lists its environment, the files it can read and
+  its runner's memory: of the private keys it finds, its runner's machine key among them, none is
+  the leg's).
+- *Revocations* are rows with when, why and by whom (migration `w27_identities`):
+  forgetting a runner, a runner process retiring, a session moving to a new epoch (the epochs it
+  left), a session ending, a person disabled, or `POST /api/identities/revoke` (`kiln identities
+  revoke`; `kiln forget <runner>` forgets one). The TLS directory refuses revoked keys from the
+  first handshake after a restart, its log naming when, why and by whom (`revoked at ... (runner
+  forgotten, by ada)`), and re-enrolling a name brings a new key the revocation doesn't touch.
+  `GET /api/identities` (`kiln identities list`) lists what kiln issued, each checked now;
+  `kiln identities revocations` lists the rows; enrollment records who enrolled each machine.
+- *Seams.* An outside Fulcio and Rekor is reached through `kiln_seams::Sigstore` (docs/seams.md);
+  `ci/signing.rs`'s client is the real one. The simulator certifies and logs with keys of its own,
+  so a bundle keyless signing makes through it verifies with kiln's Sigstore verifier against its
+  trusted root; it and kiln's client (over Fulcio's and Rekor's HTTP APIs, in front of it) pass the
+  same suite.
+- *Tests.* `kiln-ci` `w27_r01_*` (each kind; expired, revoked, wrongly issued);
+  `crates/kiln/tests/identities.rs`: `w27_ac01_chains`, `w27_ac02_keys`, one per kind,
+  `w27_r01_revocation_survives_restart` and `w27_r01_reenroll_keeps_revocation`, for people
+  `w27_r01_person_login` and `w27_r01_person_disabled`, an agent's `w27_r01_agent_epochs`
+  (started, then moved twice: three epochs, each named by the process holding it, the one left
+  refused saying both epochs) and, in a build with `chaos`, `w27_r02_agent_key_stays` (every frame
+  each runner process sent, and everything on disk: none holds the session's keys, as PEM, PEM
+  body or DER); the migration's `w27_r01_identities_and_revocations_tables`; `identities.rs`'s
+  `w27_r02_*`; `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's
+  client passes the Sigstore suite).
+- *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; nothing
+  signs with these identities yet (commits, reviews, CI output, lands and deploys: R03 to R11); the
+  CLI signs in with a passkey only through a personal access token (no approving a device from the
+  browser yet).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

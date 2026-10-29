@@ -473,6 +473,9 @@ pub struct Hub {
     pub blobs: crate::blobs::Opened,
     /// The bus kiln's events ride: its sessions' live feeds (docs/bus.md).
     pub bus: crate::bus::QuiverBus,
+    /// The search across a change (docs/ci.md W26-R07): vorpal, its indexes under the server's
+    /// cache (`crate::ci::search`).
+    pub search: Arc<dyn kiln_seams::Search>,
     /// Memo steps in flight, one execution per key and domain (docs/ci.md W28-R72).
     pub flight: crate::ci::services::memo::Flights,
 }
@@ -512,6 +515,8 @@ impl Hub {
         let harness_dir = cfg.data("harness");
         // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
         let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
+        // The search across a change (W26-R07): an index per tree in the server's cache.
+        let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
@@ -586,6 +591,7 @@ impl Hub {
             push: crate::push::Service::default(),
             blobs,
             bus,
+            search,
             flight: Default::default(),
         }))
     }
@@ -1342,7 +1348,14 @@ impl Hub {
         true
     }
 
-    pub async fn forget_agent(&self, agent: &str) -> anyhow::Result<()> {
+    pub async fn forget_agent(&self, agent: &str, by: &str) -> anyhow::Result<()> {
+        // Its certificates are revoked for good, recorded so a restart keeps it, and refused at
+        // once (W27-R01); enrolling again under the name brings a new key.
+        let at = crate::util::now_unix();
+        let keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, at).await?;
+        if !keys.is_empty() {
+            self.net.command(crate::net::Out::RevokeKeys { keys, why: crate::identities::refusal(at, "runner forgotten", by) }).await;
+        }
         let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
         peers.extend(self.instances.lock().of(agent));
         peers.sort_unstable();
@@ -1452,6 +1465,13 @@ impl Hub {
                     if self.instances.lock().of(&name).is_empty() {
                         self.agent_lost(&name, &reason).await;
                     } else {
+                        // Gone while another of its machine's processes goes on: retired, and its
+                        // identity with it (docs/ci.md W27-R01).
+                        if let Some(label) = lost.as_ref().map(|(i, _)| i.label())
+                            && let Err(e) = crate::identities::runner_retired(self, &name, &label).await
+                        {
+                            tracing::warn!(agent = %name, error = %format!("{e:#}"), "a retired runner process's identity wasn't revoked");
+                        }
                         self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason).await;
                     }
                 }
@@ -1996,6 +2016,8 @@ impl Hub {
                 Ok(_) => {}
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "an unreadable report of warm workspaces"),
             },
+            // An identity it asks for, for a key it made and keeps (docs/ci.md W27-R01).
+            AgentMsg::Identity { json } => crate::identities::on_ask(self, peer, &agent, &json).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -2294,7 +2316,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -3289,7 +3311,7 @@ pub(crate) mod tests {
         );
         let (store, (pki, leaf)) = (store??, keys??);
         let pki = Arc::new(pki);
-        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
+        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }

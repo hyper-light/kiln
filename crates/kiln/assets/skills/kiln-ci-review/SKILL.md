@@ -6,14 +6,18 @@ description: Submit, review and land changes on kiln-hosted repositories - stack
 # Review and landing on kiln
 
 kiln hosts repositories and reviews changes as **diffs**: one commit each, stacked when one
-builds on another, identified across versions by its `Change-Id:` trailer. A **change request**
+builds on another, identified across versions as its change: by its `Kiln-Change:` trailer, or
+by the change it rewrites when it has none (no hook needed). A **change request**
 is a branch reviewed whole. Nothing reaches a trunk except through the land queue (unless the
 trunk's policy allows a direct push for someone).
 
 ## Submitting
 
 With git, push to the trunk's review ref; each commit becomes a diff, or a new version of its
-diff when its `Change-Id` is one kiln has seen:
+change's diff (its `Kiln-Change:` line, a `Change-Id` or jj's `change-id` header kiln has seen,
+or the open diff it rewrites; if kiln can't tell, the push says so and `-o change=<commit>:D12`
+or `:new` answers). Keep a commit's `Kiln-Change:` line when you amend it, and never give one
+commit two changes' lines:
 
 ```sh
 git push origin HEAD:refs/for/main                      # diffs, one per commit
@@ -22,7 +26,7 @@ git push origin HEAD:refs/for/main/branch/my-feature    # a change request of th
 ```
 
 Push options: `draft`, `ready`, `reviewer=<name>`, `message=<what changed>`, `topic=`,
-`title=` (a change request's). Without git, submit patches:
+`title=` (a change request's), `change=<commit>:<D12|new>`. Without git, submit patches:
 
 ```js
 // code_run: commits as diffs, from `git format-patch --stdout` text.
@@ -46,7 +50,7 @@ Fix the cause; never ask a person to lower the policy so your diff passes.
 
 ## Answering review
 
-Read the threads, fix the code, push a new version (same `Change-Id`), then reply where you
+Read the threads, fix the code, push a new version (same `Kiln-Change`), then reply where you
 changed something and resolve what's settled:
 
 ```js

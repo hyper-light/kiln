@@ -90,12 +90,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let join = crate::util::load_or_create_token(&cfg.data("join.token"))?;
 
     let quic_bind: SocketAddr = cfg.server.quic_addr.parse().with_context(|| format!("quic_addr {}", cfg.server.quic_addr))?;
+    // Revoked keys are refused from the first handshake on (W27-R01).
+    let revoked_keys = crate::identities::revoked_keys(&store).await?;
     let (net, net_events) = crate::net::start(crate::net::Spec {
         bind: quic_bind,
         ca_der: pki.ca_der.clone(),
         leaf: leaf.clone(),
         server: true,
         dial_deadline: crate::net::DIAL_DEADLINE,
+        revoked_keys,
     })?;
     // A test build's faults (`KILN_CHAOS`): frames lost, sent twice or sent late below the channel,
     // which it makes up for.
@@ -108,6 +111,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone())?;
+    // The server's and CD's own signing identities (docs/ci.md W27-R01).
+    if let Err(e) = crate::identities::own_identities(&hub.store, &pki).await {
+        tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
+    }
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
@@ -179,6 +186,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
         child!("land-queue", h => crate::ci::land::run_loop(h));
         child!("github-checks", h => crate::githost::github::checks_loop(h));
+        child!("host-pulls-mirror", h => crate::githost::mirror::run(h));
         child!("host-statuses", h => crate::githost::statuses::statuses_loop(h));
         child!("ci-providers", h => crate::ci::providers::sync_loop(h));
         child!("pool-samples", h => crate::ci::pools::sample_loop(h));
@@ -195,6 +203,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::ci::experiments::interrupted(&h).await;
         });
         child!("registry-collect", h => crate::ci::registry::collect_loop(h));
+        // The server's and CD's own identities, renewed before they expire (docs/ci.md W27-R01).
+        child!("identities", h => crate::identities::own_identities_loop(h));
         // kiln's base chart in its own registry, for apps' charts to depend on (docs/deploy-api.md §3.4).
         child!("kiln-base", h => crate::deploy::init::publish_base(h));
         if cfg.cd.enabled {

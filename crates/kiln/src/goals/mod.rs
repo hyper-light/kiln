@@ -941,6 +941,37 @@ fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, V
     (rows, gone)
 }
 
+/// Goal `id` of `agent`'s back among the goals to go, last, if it has ended (met, not met, skipped):
+/// a plan made from it, run again as goals, gives it its steps again as its parts, before it
+/// (`plans::run_goals`), and it's met once they are ([`met_by_parts`]). One still to go stays as it is.
+pub async fn reopen(hub: &Hub, agent: &str, id: &str) -> R<Stack> {
+    let _one = CHANGING.lock().await;
+    let stack = get(hub, agent).await?;
+    let Some(goal) = stack.items.iter().find(|i| i.id == id) else {
+        return Err(Error::Bad(format!("no goal {id} here (goals_get lists them)")));
+    };
+    if matches!(goal.status.as_str(), "pending" | "active") {
+        return Ok(stack);
+    }
+    let (agent_s, id_s, now) = (agent.to_owned(), id.to_owned(), now_ms(hub));
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let pos: i64 = tx.query_row("SELECT COALESCE(MAX(pos), -1) + 1 FROM goal_items WHERE agent = ?1", params![agent_s], |r| r.get(0))?;
+            tx.execute(
+                "UPDATE goal_items SET status = 'pending', pos = ?2, reason = NULL, how = NULL, ended_at = NULL, started_at = NULL, reminded_at = 0, reminders = 0, busy_at = 0, sent_id = NULL, send_id = NULL WHERE id = ?1",
+                params![id_s, pos],
+            )?;
+            touch(&tx, &agent_s, None, None, now)?;
+            // Done, then given a goal to go again: no longer done, and yours to start (as `set_unsent`).
+            tx.execute("UPDATE goal_stacks SET state = 'paused', reason = NULL WHERE agent = ?1 AND state = 'done'", params![agent_s])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    get(hub, agent).await
+}
+
 /// Adds goals after the ones there; `start` runs the stack.
 pub async fn add(hub: &Hub, agent: &str, texts: Vec<String>, start: bool) -> R<Stack> {
     add_at(hub, agent, texts.into_iter().map(NewGoal::from).collect(), start, &At::End).await
@@ -2114,7 +2145,11 @@ fn met_by_parts(stack: &Stack) -> Option<(String, String)> {
     let why = if count("run") > 0 {
         "Met with its plan: its run is done, every step met.".to_owned()
     } else if count("plan") > 0 {
-        let n = count("plan");
+        // Its plan's steps, each once: a plan run again gives the goal a part for each step again.
+        let mut steps: Vec<Option<usize>> = parts.iter().filter(|i| i.part_kind.as_deref() == Some("plan")).map(|i| i.step.as_ref().map(|s| s.n)).collect();
+        steps.sort_unstable();
+        steps.dedup();
+        let n = steps.len();
         format!("Met with its plan: its {n} step{} met.", if n == 1 { " is" } else { "s are" })
     } else {
         "Met: each of its acceptance criteria and tests is met.".to_owned()
@@ -4723,6 +4758,63 @@ mod stack_tests {
             let g = s.items.iter().find(|i| i.id == goal.id).cloned().unwrap_or_default();
             assert_eq!((g.status.as_str(), g.reason.as_deref()), ("met", Some("Met with its plan: its 2 steps are met.")), "{:?}", words(&s));
             assert_eq!(under_way(&s).map(|u| u.0), Some("ship it".to_owned()));
+            Ok(())
+        })
+    }
+
+    /// A plan made from a goal, run again as goals on the goal's own agent once the goal was met
+    /// (plans.run, mode goals): each step is the goal's part again, saying its step and the run,
+    /// before the goal, which is back among the goals to go; met again, the goal is met with them,
+    /// each step counted once. So its plan shows every step as it stands under it.
+    #[test]
+    fn a_plan_run_again_as_goals_gives_its_goal_its_steps_again() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["agents can search conversations"]).await?;
+            let id = id.as_str();
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            settled(&hub, id).await;
+            let planned = call_ok(crate::ops::call(cx.clone(), "goals.plan", serde_json::json!({"agent": id})).await)?;
+            let (pid, rid) = (at(&planned, &["plan"]).unwrap_or_default().to_owned(), at(&planned, &["research"]).unwrap_or_default().to_owned());
+            let items = vec![
+                crate::plans::Item { title: "Search the store".into(), basis: vec!["f1".into()], ..crate::plans::Item::default() },
+                crate::plans::Item { title: "An op for agents".into(), needs: vec![1], basis: vec!["f1".into(), "f2".into()], ..crate::plans::Item::default() },
+            ];
+            crate::plans::update(&hub, &pid, crate::plans::Patch { items: Some(items), ..crate::plans::Patch::default() }, "admin").await?;
+            researched(&hub, &rid).await?;
+            settled(&hub, id).await;
+            call_ok(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": pid})).await)?;
+            let meet_two = |hub: Arc<Hub>| async move {
+                for _ in 0..2 {
+                    settled(&hub, id).await;
+                    let s = get(&hub, id).await?;
+                    let step = s.items.iter().find(|i| i.status == "active").map(|i| i.id.clone()).unwrap_or_default();
+                    done(&hub, id, Some(&step), None, &By::Itself).await?;
+                }
+                anyhow::Ok(())
+            };
+            meet_two(Arc::clone(&hub)).await?;
+            let s = get(&hub, id).await?;
+            let goal = s.items.iter().find(|i| i.text == "agents can search conversations").cloned().unwrap_or_default();
+            assert_eq!(goal.status, "met", "{:?}", words(&s));
+            // Run again as goals on its agent: its steps, its parts again, before it, and it's to go again.
+            settled(&hub, id).await;
+            let ran = call_ok(crate::ops::call(cx.clone(), "plans.run", serde_json::json!({"id": pid, "session": id, "mode": "goals"})).await)?;
+            let run = at(&ran, &["run"]).unwrap_or_default().to_owned();
+            let s = get(&hub, id).await?;
+            let shape: Vec<(Option<&str>, Option<&str>, usize)> = s
+                .items
+                .iter()
+                .filter(|i| i.step.as_ref().is_some_and(|st| st.run.as_deref() == Some(run.as_str())))
+                .map(|i| (i.part_of.as_deref(), i.part_kind.as_deref(), i.step.as_ref().map_or(0, |st| st.n)))
+                .collect();
+            assert_eq!(shape, [(Some(goal.id.as_str()), Some("plan"), 1), (Some(goal.id.as_str()), Some("plan"), 2)], "{:?}", words(&s));
+            let to_go: Vec<&str> = s.items.iter().filter(|i| matches!(i.status.as_str(), "pending" | "active")).map(|i| i.id.as_str()).collect();
+            assert_eq!((to_go.len(), to_go.last().copied()), (3, Some(goal.id.as_str())), "the goal after its two steps: {:?}", words(&s));
+            // Met again, the goal is met with them, each of its plan's steps counted once.
+            meet_two(Arc::clone(&hub)).await?;
+            let s = get(&hub, id).await?;
+            let g = s.items.iter().find(|i| i.id == goal.id).cloned().unwrap_or_default();
+            assert_eq!((g.status.as_str(), g.reason.as_deref()), ("met", Some("Met with its plan: its 2 steps are met.")), "{:?}", words(&s));
             Ok(())
         })
     }

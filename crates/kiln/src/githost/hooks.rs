@@ -55,8 +55,8 @@ pub async fn gitlab(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
                 }
             });
         }
-        // Merge requests and their notes: the review pages read them from GitLab as they're shown.
-        _ => {}
+        // Merge requests and their notes: Ship's mirror reads the merge request again (W26-R20).
+        _ => crate::githost::mirror::on_gitlab_event(&repo, &event, &v),
     }
     Ok(srv::status(StatusCode::ACCEPTED))
 }
@@ -94,7 +94,7 @@ pub async fn bitbucket(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
                 }
             });
         }
-        _ => {}
+        _ => crate::githost::mirror::on_bitbucket_event(&repo, &event, &v),
     }
     Ok(srv::status(StatusCode::ACCEPTED))
 }

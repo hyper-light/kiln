@@ -71,15 +71,6 @@ export const machinesWith = (byTarget: Record<string, KindInfo[]>, kind: string)
 export const targetOf = (where: string[], wanted: (string | null | undefined)[]): string => wanted.find((t): t is string => Boolean(t) && where.includes(t ?? "")) ?? where[0] ?? "";
 
 /** A machine as people know it: the kiln server, or its name (with its hostname when that differs). */
-/** A folder, short: its last folder under "…" when it's deeper than two ("~/…/kiln"). */
-export function shortPath(cwd: string): string {
-  const t = cwd.trim() || "~";
-  const parts = t.split("/").filter(Boolean);
-  if (parts.length <= 2) return t;
-  const root = t.startsWith("~") ? "~" : "";
-  return `${root}/…/${parts[parts.length - 1]}`;
-}
-
 /** A machine as the composer's slot says it, short: its name without its domain, and its host's when that's another ("kiln-a094a12d (fedora-2)"). */
 export function shortMachineLabel(target: string, machines: Agent[]): string {
   if (target === "local") return "kiln server";
