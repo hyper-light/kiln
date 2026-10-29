@@ -11,7 +11,7 @@
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
 import { shipApi, type ShipAction, type ShipCommit, type ShipPace, type ShipQuery } from "@/api/ship";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
@@ -440,7 +440,14 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
   // The picked job (its stage and lane): yours once you click one, else the cards' rule; Output shows it.
   const [picked, setPicked] = React.useState<string | null>(null);
   // A Diff press (reveal counts them) brings Files into view; opening the row any other way doesn't.
-  const files = React.useCallback((el: HTMLDivElement | null) => (el && reveal > 0 ? showFiles(el) : undefined), [reveal]);
+  const root = React.useRef<HTMLDivElement | null>(null);
+  const files = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      root.current = el;
+      return el && reveal > 0 ? showFiles(el) : undefined;
+    },
+    [reveal],
+  );
   return (
     <div className="ship-open" ref={files}>
       {/* Dropdown boundary agreed with the Ship agent 01a1748c, 2026-10-26 20:28 PDT (NOTES.md):
@@ -456,13 +463,6 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
         </section>
         <section aria-label="Jobs" className="ship-sec">
           <JobCards commit={commit} picked={picked} onPick={setPicked} />
-          <ul>
-            {(commit.runs ?? []).map((r) => (
-              <li key={r.id}>
-                <Link to={`/runs/${r.id}`}>{r.pipeline}</Link>
-              </li>
-            ))}
-          </ul>
         </section>
         <section aria-label="Lanes" className="ship-sec">
           <Loadable
@@ -476,11 +476,26 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
           >
             <ShipLanes commit={commit} />
           </Loadable>
-          {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}
         </section>
-        <p className="ship-open__page">
-          <Link to={`/ship/${commit.repo}/${commit.sha}`}>Commit {commit.short}</Link>, its stages and trace on a page of its own
-        </p>
+        {/* f-ship's foot (plan 01a1856fe81375b1bd1d1d86f270a45b, step 11): the commit's runs (on its
+            page), its Files (here), its page. */}
+        <nav className="ship-foot" aria-label={`${commit.short}'s pages`}>
+          <Link className={buttonVariants({ variant: "secondary", size: "xs" })} to={`/ship/${commit.repo}/${commit.sha}#runs`}>
+            Runs
+          </Link>
+          <Button
+            variant="secondary"
+            size="xs"
+            onClick={() => {
+              if (root.current) showFiles(root.current);
+            }}
+          >
+            Diff
+          </Button>
+          <Link className={`${buttonVariants({ variant: "secondary", size: "xs" })} ship-foot__page`} to={`/ship/${commit.repo}/${commit.sha}`}>
+            Commit ↗
+          </Link>
+        </nav>
       </Loadable>
     </div>
   );

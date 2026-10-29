@@ -232,12 +232,21 @@
   grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
-/* An opened commit's sections as f-ship draws them (plan 01a1856fe81375b1bd1d1d86f270a45b, step 7):
-   each its head, the label on the left and its controls on the right, over its card. */
+/* A commit page's sections: each a card. */
 .ship-sec {
+  border: 1px solid var(--k-line, #2a2c31);
+  border-radius: 10px;
+  padding: 10px 12px;
   font-size: 12.5px;
   color: #a1a4ad;
   min-width: 0;
+}
+/* An opened commit's sections as f-ship draws them (plan 01a1856fe81375b1bd1d1d86f270a45b, step 7):
+   each its head, the label on the left and its controls on the right, over its card. */
+.ship-open .ship-sec {
+  border: 0;
+  border-radius: 0;
+  padding: 0;
 }
 /* Where its controls don't fit beside its label (Lanes' at 320 px), they go under it, still on the right. */
 .ship-sech {
@@ -730,9 +739,15 @@
   font-size: 0.875rem;
 }
 /* An opened row's way to its commit's page, after the agreed sections. */
-.ship-open__page {
-  margin: 0;
-  font-size: 0.8125rem;
+/* An opened commit's foot, f-ship's: Runs, Diff and its page, on the right. */
+.ship-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.ship-foot__page {
+  color: #cdc6ea;
 }
 
 /* The commit page's sections (its step 2): what failed first, the six stage cards, the trace. */
