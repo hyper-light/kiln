@@ -147,6 +147,12 @@ impl Kind {
             // Model, effort, mode and the conversation are flags: a change starts it again.
             Protocol::AgyStreamJson => {
                 p.args(super::antigravity::args(spec));
+                // kiln's MCP server, which `prepare` put in agy's own config: whom it serves is
+                // this session, by agy's environment, which agy hands on to the servers it starts.
+                #[cfg(unix)]
+                if let Some((_, sock, prefer)) = local_tools(spec) {
+                    p.envs(crate::reach::mcp::agy_env(sock, prefer, session));
+                }
             }
             Protocol::Terminal => {}
         }
@@ -179,6 +185,59 @@ impl Kind {
         p.stdin(std::process::Stdio::null());
         Ok(p)
     }
+
+    /// What a session's start needs before its harness starts: kiln's MCP server put in
+    /// Antigravity's own config, the only place agy reads one from (`crate::reach::mcp::agy_add`),
+    /// unless it's there already or a person turned it off; and its page tools allowed in agy's
+    /// settings, as agy can't ask once started (`agy_allow_in`). It names this kiln, so a runner
+    /// upgraded since puts its own. A session whose server couldn't be put there starts without it.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub async fn prepare(&self, spec: &Spec) {
+        #[cfg(unix)]
+        if self.protocol == Protocol::AgyStreamJson
+            && let Some((kiln, _, _)) = local_tools(spec)
+        {
+            let home = crate::os::home_dir();
+            let config = home.join(".gemini/config/mcp_config.json");
+            let k = kiln.clone();
+            let has = crate::rt::blocking(move || std::fs::read(&config).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|c| crate::reach::mcp::agy_has(&c, &k)));
+            if !has.await.unwrap_or(false) {
+                let added = match self.cli(spec, &crate::reach::mcp::agy_add(&kiln)) {
+                    Ok(cmd) => crate::proc::output(cmd, AGY_ADD_TIMEOUT).await.and_then(|o| if o.status.success() { Ok(()) } else { Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&o.stderr).trim())) }),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = added {
+                    tracing::warn!(error = %format!("{e:#}"), "kiln's MCP server couldn't be put in Antigravity's config: its agents start without kiln's tools");
+                }
+            }
+            let settings = home.join(".gemini/antigravity-cli/settings.json");
+            if let Err(e) = crate::rt::blocking(move || agy_allow_in(&settings)).await.and_then(|r| r) {
+                tracing::warn!(error = %format!("{e:#}"), "kiln's page tools couldn't be allowed in Antigravity's settings: agy decides on them as on its other tools");
+            }
+        }
+    }
+}
+
+/// How long `agy mcp add` may take, putting kiln's MCP server in Antigravity's config.
+#[cfg(unix)]
+const AGY_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// kiln's page tools (`crate::reach::mcp::AGY_ALLOWED`) allowed in agy's settings at `path` where
+/// no rule covers them already (`crate::reach::mcp::agy_allow`): its other settings kept, written
+/// whole and readable by its user alone, as agy keeps it. Whether it wrote.
+#[cfg(unix)]
+fn agy_allow_in(path: &std::path::Path) -> anyhow::Result<bool> {
+    let settings = match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(next) = crate::reach::mcp::agy_allow(&settings) else { return Ok(false) };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::runner::auth::write_private(path, &serde_json::to_vec_pretty(&next)?)?;
+    Ok(true)
 }
 
 /// Whether a session gets the runner's own kiln MCP server (`crate::reach::mcp`), and how to
@@ -784,6 +843,32 @@ mod tests {
         assert!(!now.iter().any(|n| n == "set_effort" || n == "gone"), "{now:?}");
         // Again: nothing changes.
         assert_eq!(upgraded_features(super::super::acp::FEATURES, super::super::acp::LEARNED, &now), now);
+    }
+
+    /// kiln's page tools go into Antigravity's settings as agy keeps them: beside its other
+    /// settings, readable by its user alone, once; settings it can't read are left as they are.
+    #[cfg(unix)]
+    #[test]
+    fn antigravitys_settings_get_kilns_page_tools_once() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("antigravity-cli/settings.json");
+        let read = |p: &std::path::Path| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
+        // None yet (agy never ran here): made, with the rules alone.
+        assert!(agy_allow_in(&path)?);
+        assert_eq!(read(&path)?.pointer("/permissions/allow"), Some(&serde_json::json!(crate::reach::mcp::AGY_ALLOWED)));
+        // agy's own: kept, and as private as agy keeps them; once there, left alone.
+        std::fs::write(&path, r#"{"model":"m","trustedWorkspaces":["/w"]}"#)?;
+        assert!(agy_allow_in(&path)?);
+        let kept = read(&path)?;
+        assert_eq!((kept.get("model"), kept.get("trustedWorkspaces")), (Some(&serde_json::json!("m")), Some(&serde_json::json!(["/w"]))));
+        assert_eq!(kept.pointer("/permissions/allow"), Some(&serde_json::json!(crate::reach::mcp::AGY_ALLOWED)));
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert!(!agy_allow_in(&path)?);
+        std::fs::write(&path, "{not json")?;
+        assert!(agy_allow_in(&path).is_err());
+        assert_eq!(std::fs::read(&path)?, b"{not json");
+        Ok(())
     }
 
     #[test]
