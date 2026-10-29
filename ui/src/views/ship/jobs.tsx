@@ -10,6 +10,7 @@ import type { ShipCommit } from "@/api/ship";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
 import { pickCard, strip } from "./model";
+import { SectionHead } from "./head";
 
 /** The cards: the journey's six stages after Review (Review is Files' to show). */
 export const cardsOf = (commit: ShipCommit) => strip(commit.pips).filter((p) => p.stage !== "review");
@@ -48,6 +49,14 @@ export function JobCards({ commit, onPick }: { commit: ShipCommit; onPick?: (sta
   const page = (dir: 1 | -1) => setStart(Math.max(0, Math.min(last, from + dir * n)));
   return (
     <div className="ship-jobs">
+      <SectionHead label="Jobs">
+        <button type="button" className="ship-jobs__page" aria-label="Previous stages" disabled={from === 0} onClick={() => page(-1)}>
+          <ChevronLeft size={16} />
+        </button>
+        <button type="button" className="ship-jobs__page" aria-label="Next stages" disabled={from >= last} onClick={() => page(1)}>
+          <ChevronRight size={16} />
+        </button>
+      </SectionHead>
       <ol className="ship-jobs__track" ref={attach} aria-label="Stages">
         {stages.slice(from, from + n).map((p) => (
           <li key={p.stage} className="ship-job" data-stage={p.stage} data-state={p.state} data-picked={p.stage === shown || undefined}>
@@ -61,14 +70,6 @@ export function JobCards({ commit, onPick }: { commit: ShipCommit; onPick?: (sta
           </li>
         ))}
       </ol>
-      <div className="ship-jobs__pager">
-        <button type="button" className="ship-jobs__page" aria-label="Previous stages" disabled={from === 0} onClick={() => page(-1)}>
-          <ChevronLeft size={16} />
-        </button>
-        <button type="button" className="ship-jobs__page" aria-label="Next stages" disabled={from >= last} onClick={() => page(1)}>
-          <ChevronRight size={16} />
-        </button>
-      </div>
     </div>
   );
 }

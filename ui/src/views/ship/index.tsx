@@ -13,7 +13,7 @@ import { ChevronDown } from "lucide-react";
 import { shipApi, type ShipAction, type ShipCommit, type ShipPace, type ShipQuery } from "@/api/ship";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
-import { Loadable } from "@/components/ui/loading";
+import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { toast } from "@/components/ui/toast";
@@ -32,6 +32,7 @@ import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { firstStage, JobCards } from "./jobs";
 import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
+import { SectionHead } from "./head";
 import { counted } from "./review/perf";
 
 const LIMIT = 100;
@@ -449,13 +450,12 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
       <Loadable label="Loading its review">
         <ReviewFiles item={commit} />
         <section aria-label="Output" className="ship-sec">
-          <h3>Output</h3>
+          <SectionHead label="Output" />
           <Loadable label="Loading the output" className="ship-output-slot">
             <ShipOutput commit={commit} stage={shown} />
           </Loadable>
         </section>
         <section aria-label="Jobs" className="ship-sec">
-          <h3>Jobs</h3>
           <JobCards commit={commit} onPick={setStage} />
           <ul>
             {(commit.runs ?? []).map((r) => (
@@ -466,8 +466,15 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
           </ul>
         </section>
         <section aria-label="Lanes" className="ship-sec">
-          <h3>Lanes</h3>
-          <Loadable label="Loading the lanes" className="ship-lanes-slot">
+          <Loadable
+            label="Loading the lanes"
+            fallback={
+              <>
+                <SectionHead label="Lanes" />
+                <Loading label="Loading the lanes" block className="ship-lanes-slot" />
+              </>
+            }
+          >
             <ShipLanes commit={commit} />
           </Loadable>
           {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}

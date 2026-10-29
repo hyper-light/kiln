@@ -38,7 +38,7 @@ test("changes are Ship items, drawn by Ship's own row, needs you first", async (
 
   // Review opens the item at its files; the dropdown's order.
   await rows.first().getByRole("button", { name: "Review" }).click();
-  const sections = rows.first().locator(".rv-s > h3, .ship-sec > h3");
+  const sections = rows.first().locator(".rv-s > h3, .ship-sech > h3");
   await expect(sections).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"]);
 
   // Changes only, by their kind (no toggle of their own). The host facet: GitHub's.
@@ -173,7 +173,7 @@ test("Ship's list holds still as it loads and as a row opens", async ({ page, br
   const shifts = () => page.evaluate(() => (window as unknown as { shifts: string[] }).shifts);
   expect(await shifts()).toEqual([]);
   await rows.first().getByRole("button", { name: "pipeline: dynamic matrices" }).click();
-  await expect(rows.first().locator(".rv-s > h3, .ship-sec > h3")).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"]);
+  await expect(rows.first().locator(".rv-s > h3, .ship-sech > h3")).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"]);
   await page.waitForTimeout(600);
   expect(await shifts()).toEqual([]);
 });

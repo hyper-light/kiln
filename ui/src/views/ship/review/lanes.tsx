@@ -12,6 +12,10 @@ import { glyphOf, shipGroups } from "../model";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { clockTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
+import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/tabs";
+import { ChevronLeft, ChevronRight } from "lucide-react";
+import { SectionHead } from "../head";
 import * as React from "react";
 import "./review.css";
 
@@ -160,16 +164,26 @@ export function ShipLanes({ commit }: { commit: ShipCommit }) {
   const behind = base[0] !== fresh[0] || base[1] !== fresh[1];
   const step = Math.max(1, Math.round((base[1] - base[0]) / 3));
   const window: [number, number] = walk === 0 ? base : [base[0] + walk * step, base[1] + walk * step];
-  if (groups.length === 0) return null;
+  if (groups.length === 0) return <SectionHead label="Lanes" />;
   return (
-    <div className="ship-lanesbox" data-fit={fit || undefined}>
-      <div className="ship-lanesbox__nav">
-        <button type="button" className="rv-ib" aria-label="Earlier" onClick={() => setWalk(walk - 1)}>
-          previous
-        </button>
-        <button
-          type="button"
-          className="rv-ib"
+    <>
+      <SectionHead label="Lanes">
+        <Segmented
+          size="xs"
+          label="Lanes' scale"
+          value={fit ? "fit" : "detail"}
+          onChange={(v) => setFit(v === "fit")}
+          options={[
+            { value: "fit", label: "Fit" },
+            { value: "detail", label: "Detail" },
+          ]}
+        />
+        <Button variant="secondary" size="icon-sm" aria-label="Earlier" onClick={() => setWalk(walk - 1)}>
+          <ChevronLeft />
+        </Button>
+        <Button
+          variant="secondary"
+          size="xs"
           aria-label="Now"
           disabled={walk === 0 && !behind}
           onClick={() => {
@@ -178,20 +192,19 @@ export function ShipLanes({ commit }: { commit: ShipCommit }) {
           }}
         >
           Now
-        </button>
-        <button type="button" className="rv-ib" aria-label="Later" onClick={() => setWalk(walk + 1)}>
-          next
-        </button>
+        </Button>
+        <Button variant="secondary" size="icon-sm" aria-label="Later" onClick={() => setWalk(walk + 1)}>
+          <ChevronRight />
+        </Button>
+      </SectionHead>
+      <div className="ship-lanesbox" data-fit={fit || undefined}>
         <span className="ship-lanesbox__span">
           {clockTime(window[0] * 1000)} – {clockTime(window[1] * 1000)}
         </span>
-        <button type="button" className="rv-ib" aria-label={fit ? "Detail" : "Fit"} onClick={() => setFit(!fit)}>
-          {fit ? "Detail" : "Fit"}
-        </button>
+        {groups.map((g) => (
+          <LaneGroup key={g.group} group={g} window={window} now={now} />
+        ))}
       </div>
-      {groups.map((g) => (
-        <LaneGroup key={g.group} group={g} window={window} now={now} />
-      ))}
-    </div>
+    </>
   );
 }

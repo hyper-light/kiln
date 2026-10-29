@@ -232,21 +232,38 @@
   grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
+/* An opened commit's sections as f-ship draws them (plan 01a1856fe81375b1bd1d1d86f270a45b, step 7):
+   each its head, the label on the left and its controls on the right, over its card. */
 .ship-sec {
-  border: 1px solid var(--k-line, #2a2c31);
-  border-radius: 10px;
-  padding: 10px 12px;
   font-size: 12.5px;
   color: #a1a4ad;
   min-width: 0;
 }
-.ship-sec h3 {
-  margin: 0 0 6px;
+/* Where its controls don't fit beside its label (Lanes' at 320 px), they go under it, still on the right. */
+.ship-sech {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+  min-height: 32px;
+  margin: 0 0 8px;
+}
+.ship-sech h3 {
+  margin: 0;
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 10px;
+  font-weight: 400;
   letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: #b9bbc2;
+  color: #97999f;
+}
+.ship-sech__ctl {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
 }
 .ship-sec p,
 .ship-sec ul {
@@ -490,12 +507,6 @@
   color: #a3a5ad;
   font-size: 0.8125rem;
 }
-.ship-jobs__pager {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.25rem;
-  margin-top: 0.5rem;
-}
 .ship-jobs__page {
   display: inline-grid;
   width: 2rem;
@@ -543,7 +554,8 @@
 }
 .ship-output {
   overflow: hidden;
-  border-radius: 0.5rem;
+  border: 1px solid var(--k-line, #2a2c31);
+  border-radius: 10px;
 }
 .ship-output--none {
   display: grid;
