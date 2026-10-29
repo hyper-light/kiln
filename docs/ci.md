@@ -6790,8 +6790,9 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 
 - **W21-AC01** For each page: a Playwright script runs in Chromium and WebKit at 1440×900 and
   390×844, checks the page's primary task end to end against a live or mock server, asserts that no
-  element scrolls horizontally, asserts that no element is `position: fixed` other than the shell's
-  own, and saves screenshots for review. *UI check, in CI.*
+  element scrolls horizontally but a code block, which keeps each line on one line (a comment's code
+  in Ship's Files and Conversation, marked `data-code-scroll`), asserts that no element is
+  `position: fixed` other than the shell's own, and saves screenshots for review. *UI check, in CI.*
 - **W21-AC02** The editor flags every negative-corpus file (F-04) at the right range, completes
   `needs.`, `steps.`, `matrix.`, `secrets.` and `uses:` correctly in fixtures, and round-trips a
   commented file through the flow view with comments intact. *UI test.*
