@@ -398,6 +398,10 @@ fn server_config(dir: &Path, http: u16, quic: u16, executor: Option<&str>) -> Co
     c.ci.kiln_workflows = true;
     c.ci.github_labels = true;
     c.ci.local = true;
+    // Its one runner is the machine it was asked to run on, whose load is no reason to wait
+    // (W05-R03's headroom chooses between runners: on a machine always past its target, as
+    // production's host is, it would hold every leg here for good).
+    c.ci.scheduler.headroom = false;
     // Legs in containers get this machine's Docker, as GitHub's Ubuntu machines have one: it's
     // yours, and so are these runs.
     let docker = Some("socket".to_owned());
@@ -691,6 +695,13 @@ mod tests {
         assert_eq!(env.get("QUOTED").map(String::as_str), Some("a b"));
         assert_eq!(env.get("SINGLE").map(String::as_str), Some("x=y"));
         assert_eq!(env.get("MULTI").map(String::as_str), Some("one\ntwo"));
+    }
+
+    /// W05-R03: a local run's server places by room alone, its one runner being the machine it
+    /// was asked to run on.
+    #[test]
+    fn w05_r03_a_local_run_places_by_room_alone() {
+        assert!(!server_config(Path::new("work"), 1, 2, None).ci.scheduler.headroom);
     }
 
     /// W24-R19: a leg held off runners by their load says which, and what's past each limit.

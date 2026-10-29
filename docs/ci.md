@@ -1662,7 +1662,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   the leg's request stay within `[ci.scheduler] target_use` (0.85 by default, at most 1) of the
   runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
   by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
-  everywhere (kiln's integration tests do: their runners share the machine running the tests). The engine and the v1 dispatcher place through one function
+  everywhere (kiln's integration tests do: their runners share the machine running the tests; so
+  does `kiln workflow run`'s server, whose one runner is the machine it was asked to run on). The engine and the v1 dispatcher place through one function
   shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
   over (docs/runners.md §5). **None starves**: smaller legs would otherwise take every gap before a
   bigger one, so the first legs in a queue that no runner has had room for since a minute hold a
@@ -8693,8 +8694,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     `w26_r14_the_review_lanes_marks`), `tests/suggestions.rs` (`w26_ac03_*`), `tests/conflicts.rs`
     (`w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision`,
     `w26_r12_a_change_requests_resolution_is_a_merge_commit`, on real git), `tests/search.rs`
-    (`w26_r07_a_search_across_the_change`, a 1,000-file change), `ship.rs`
-    (`w26_r14_a_commit_with_no_change_carries_its_push`, and R18's
+    (`w26_r07_a_search_across_the_change`, a 1,000-file change, the search's checks; its 250 ms at
+    p95 is `w26_r07_warm_searches_p95_within_250ms`, a benchmark run alone on an idle machine),
+    `ship.rs` (`w26_r14_a_commit_with_no_change_carries_its_push`, and R18's
     `w26_r18_what_was_handed_off_says_who_is_on_it`,
     `w26_r18_hand_off_gives_a_failure_to_the_agent_attached_to_it`,
     `w26_r18_hand_off_gives_a_changes_threads_to_its_authors_agent`).
