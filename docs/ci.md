@@ -1914,6 +1914,20 @@ W20.
   case that parts is cut down and printed with its seed (`KILN_SCHED_REFERENCE_SEED`). kiln-sim's
   scheduler model holds runners within their capacity and settles every leg under the network's
   nemesis (docs/sim.md). *Unit tests, simulation.*
+- **W05-AC14 Fair share whatever the shape** (docs/needs.md G7, grown from W05-AC04). Under
+  saturation each tenant gets its weighted share of dominant-resource time (each leg's time × its
+  largest share of what the fleet has, in slots, CPUs, memory or GPUs) within 10 points over every
+  10-minute window while both are backlogged, whatever order its work came in and whatever its
+  shape: a tenant of 1-CPU, 1-GiB, one-minute legs from minute 0 against one of 1-CPU, 8-GiB,
+  two-minute legs from minute 20 (CPU-heavy against memory-heavy, DRF's case), 50 % each, and 75 %
+  for the first weighted 3:1; a repository whose two actors split its share against one with one
+  actor, 50 % each and 25 % for each actor. W05-AC04 passes as written. Its limits: a resource only
+  some runners offer (GPUs) is counted on the runners that offer it, where its share is measured
+  (a tenant holding every GPU still gets its share of the runners without them); and items whose
+  sizes differ so much that small ones keep refilling the room a big one needs keep their share
+  only through reservations (docs/needs.md E4). Where memory runs out before CPUs (CPUs
+  overcommitted 1.5 times), the 1-GiB legs take each GiB as it frees, and the tenant of 8-GiB legs
+  holds about a third, not half. *Simulation tests (`w05_ac14_…`).*
 
 **Scenarios**
 

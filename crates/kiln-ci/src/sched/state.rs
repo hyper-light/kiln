@@ -277,6 +277,28 @@ pub fn charges(shares: &[u128; DIMS], ms: Ms, weight: PerMille) -> [u128; DIMS] 
     shares.map(|s| s.saturating_mul(u128::from(ms)).saturating_mul(1000) / u128::from(weight.max(1)))
 }
 
+/// Fair share's tags are kept once for every set of dimensions a runner may offer (docs/needs.md
+/// E2.4): a set is a bitmask over [`DIMS`], bit `d` for dimension `d`.
+pub const PROFILES: usize = 1 << DIMS;
+
+/// The set of dimensions `dims` marks, as a bitmask ([`PROFILES`]).
+pub fn profile(dims: &[bool; DIMS]) -> usize {
+    dims.iter().enumerate().filter(|(_, on)| **on).fold(0, |m, (d, _)| m | (1 << d))
+}
+
+/// What charges in each dimension (`costs`) cost in each set of dimensions: the largest there, as
+/// DRFQ charges an item the time of its dominant share (docs/needs.md E2.4). A runner ranks tenants
+/// by the set it offers, so they compare by their dominant resource among what it has: one tag
+/// for each set, not one for each dimension, whose virtual times drift apart when tenants'
+/// dominant resources differ, until a tenant's dominant resource no longer counts.
+pub fn profile_costs(costs: &[u128; DIMS]) -> [u128; PROFILES] {
+    let mut out = [0u128; PROFILES];
+    for (m, o) in out.iter_mut().enumerate() {
+        *o = costs.iter().enumerate().filter(|(d, _)| (m >> d) & 1 == 1).map(|(_, c)| *c).max().unwrap_or(0);
+    }
+    out
+}
+
 /// The tenant tree's levels below its root (W28-R66): the repository, its actors, their lanes.
 pub const LEVELS: usize = 3;
 
@@ -970,12 +992,12 @@ pub struct Scheduler {
     /// Runs by supersede key, oldest first.
     superseding: BTreeMap<String, Vec<String>>,
     run_groups: BTreeMap<String, String>,
-    /// Fair share over the tenant tree, one tree per class (docs/needs.md E2.1 to E2.3): each
+    /// Fair share over the tenant tree, one tree per class (docs/needs.md E2.1 to E2.4): each
     /// node's virtual finish under its parent, and each parent's virtual time (the root's under
-    /// `""`), in every dimension: start-time fair queuing's tags at every node, per dimension as
-    /// DRFQ keeps them.
-    finish: BTreeMap<Class, BTreeMap<String, [u128; DIMS]>>,
-    vtimes: BTreeMap<Class, BTreeMap<String, [u128; DIMS]>>,
+    /// `""`), for every set of dimensions a runner may offer ([`profile_costs`]): start-time fair
+    /// queuing's tags at every node, as DRFQ keeps them.
+    finish: BTreeMap<Class, BTreeMap<String, [u128; PROFILES]>>,
+    vtimes: BTreeMap<Class, BTreeMap<String, [u128; PROFILES]>>,
     /// What the fleet's connected runners that aren't draining offer in each dimension.
     fleet: [u64; DIMS],
     /// What each class's running items hold, in each dimension (W05-R31's floors).
@@ -1636,39 +1658,40 @@ impl Scheduler {
     }
 
     /// A queued leg's place in queue order, as legs whose places changed together go in turn
-    /// ([`Self::runner_lost`]): its class, its leaf's standing in every dimension, its place in its
-    /// tenant's own order, its arrival; the least first. A runner picking goes by the dimensions it
-    /// offers, and lets a class short of its floor go ahead ([`Self::try_runner`]).
+    /// ([`Self::runner_lost`]): its class, its leaf's standing over every dimension, its place in
+    /// its tenant's own order, its arrival; the least first. A runner picking goes by the
+    /// dimensions it offers, and lets a class short of its floor go ahead ([`Self::try_runner`]).
     fn pick_key(&self, l: &Leg) -> Option<(Class, [u128; LEVELS], i128, u64)> {
         let (class, k, q) = l.key?;
-        Some((class, self.standing_of(class, &l.flow, &[true; DIMS]), k, q))
+        Some((class, self.standing_of(class, &l.flow, PROFILES - 1), k, q))
     }
 
-    /// A leaf's standing for a runner offering `dims` (docs/needs.md E2.1, E2.2): at each node from
-    /// its repository down, the latest over those dimensions of where it would start under its
-    /// parent (start-time fair queuing's tag: the parent's virtual time, or the node's own finish
-    /// when that's later). Leaves compare level by level, as hierarchical SFQ walks its tree from
-    /// the root. With every dimension offered each level is DRF over time; a dimension a runner
-    /// doesn't offer (GPUs on a runner without them) doesn't count there.
-    fn standing_of(&self, class: Class, leaf: &str, dims: &[bool; DIMS]) -> [u128; LEVELS] {
-        let none = [0; DIMS];
+    /// A leaf's standing for a runner offering the set of dimensions `set` ([`profile`];
+    /// docs/needs.md E2.1, E2.2, E2.4): at each node from its repository down, where it would start
+    /// under its parent in that set (start-time fair queuing's tag: the parent's virtual time, or
+    /// the node's own finish when that's later). Leaves compare level by level, as hierarchical SFQ
+    /// walks its tree from the root. Each level is DRF over time among the dimensions the runner
+    /// offers: one it doesn't (GPUs on a runner without them) doesn't count there.
+    fn standing_of(&self, class: Class, leaf: &str, set: usize) -> [u128; LEVELS] {
         let (vtimes, finish) = (self.vtimes.get(&class), self.finish.get(&class));
         let (mut out, mut parent) = ([0; LEVELS], "");
         for (slot, node) in out.iter_mut().zip(nodes(leaf)) {
-            let (v, f) = (vtimes.and_then(|v| v.get(parent)).unwrap_or(&none), finish.and_then(|f| f.get(node)).unwrap_or(&none));
-            *slot = v.iter().zip(f).zip(dims).filter(|(_, on)| **on).map(|((v, f), _)| (*v).max(*f)).max().unwrap_or(0);
+            let v = vtimes.and_then(|v| v.get(parent)).and_then(|v| v.get(set)).copied().unwrap_or(0);
+            let f = finish.and_then(|f| f.get(node)).and_then(|f| f.get(set)).copied().unwrap_or(0);
+            *slot = v.max(f);
             parent = node;
         }
         out
     }
 
-    /// One class's legs in the order a runner offering `dims` takes them: by their leaf's standing,
-    /// level by level, then their tenant's own order, then arrival (docs/needs.md E2.1 to E2.3).
-    fn walk<'a>(&self, class: Class, level: &'a BTreeMap<String, BTreeSet<(i128, u64, String)>>, dims: &[bool; DIMS]) -> Walk<'a> {
+    /// One class's legs in the order a runner offering the set of dimensions `set` takes them: by
+    /// their leaf's standing, level by level, then their tenant's own order, then arrival
+    /// (docs/needs.md E2.1 to E2.4).
+    fn walk<'a>(&self, class: Class, level: &'a BTreeMap<String, BTreeSet<(i128, u64, String)>>, set: usize) -> Walk<'a> {
         if let (1, Some((leaf, legs))) = (level.len(), level.first_key_value()) {
-            return Walk::One { standing: self.standing_of(class, leaf, dims), legs: legs.iter() };
+            return Walk::One { standing: self.standing_of(class, leaf, set), legs: legs.iter() };
         }
-        Walk::Many { leaves: level.iter().map(|(leaf, legs)| (self.standing_of(class, leaf, dims), legs.iter().peekable())).collect() }
+        Walk::Many { leaves: level.iter().map(|(leaf, legs)| (self.standing_of(class, leaf, set), legs.iter().peekable())).collect() }
     }
 
     fn insert_queue(&mut self, id: &str) {
@@ -1934,8 +1957,8 @@ impl Scheduler {
     fn try_runner(&mut self, runner: &str, now: i64, out: &mut Vec<Command>) {
         loop {
             let Some(r) = self.runners.get(runner) else { return };
-            let dims = dims(&r.input, self.config().resources);
-            let mut bests = Class::ALL.into_iter().zip(self.bests(r, &dims)).filter_map(|(c, id)| id.map(|id| (c, id)));
+            let set = profile(&dims(&r.input, self.config().resources));
+            let mut bests = Class::ALL.into_iter().zip(self.bests(r, set)).filter_map(|(c, id)| id.map(|id| (c, id)));
             let Some((_, id)) = bests.next() else { return };
             let ahead = bests.filter(|(c, _)| self.short(*c)).find_map(|(c, id)| self.ahead_of(c, id, r, now));
             let (id, over) = ahead.map_or_else(|| (id.clone(), None), |(id, over)| (id.clone(), over));
@@ -1951,15 +1974,15 @@ impl Scheduler {
         }
     }
 
-    /// Each class's best queued leg that fits a runner offering `dims`, by [`Class::index`]: the
-    /// least (its leaf's standing, its tenant's own order, its arrival) over the signatures the
-    /// runner may take, walked once.
-    fn bests(&self, r: &Runner, dims: &[bool; DIMS]) -> [Option<&String>; 5] {
+    /// Each class's best queued leg that fits a runner offering the set of dimensions `set`, by
+    /// [`Class::index`]: the least (its leaf's standing, its tenant's own order, its arrival) over
+    /// the signatures the runner may take, walked once.
+    fn bests(&self, r: &Runner, set: usize) -> [Option<&String>; 5] {
         let mut best: [Option<(([u128; LEVELS], i128, u64), &String)>; 5] = Default::default();
         for s in self.sigs.values().filter(|s| s.eligible.contains(&r.input.id)) {
             for (class, level) in &s.queue {
                 let Some(b) = best.get_mut(class.index()) else { continue };
-                for (standing, k, q, id) in self.walk(*class, level, dims) {
+                for (standing, k, q, id) in self.walk(*class, level, set) {
                     if b.as_ref().is_some_and(|(key, _)| (standing, k, q) >= *key) {
                         break;
                     }
@@ -1973,12 +1996,12 @@ impl Scheduler {
         best.map(|b| b.map(|(_, id)| id))
     }
 
-    /// Charges a leg's tenant for its dispatch to `runner` (docs/needs.md E2.1 to E2.3): in its
-    /// class's tree, at every node from its repository down, in each dimension the runner offers,
-    /// its share of the fleet times its expected milliseconds over the node's weight, from where
-    /// start-time fair queuing starts it under its parent; the parent's virtual time moves up to
-    /// that start. What it charged is kept, to settle when its attempt ends
-    /// ([`Self::settle_charge`]).
+    /// Charges a leg's tenant for its dispatch to `runner` (docs/needs.md E2.1 to E2.4): in its
+    /// class's tree, at every node from its repository down, in each set of dimensions, its
+    /// largest share there of what the fleet has (of what it holds on that runner) times its
+    /// expected milliseconds over the node's weight ([`profile_costs`]), from where start-time
+    /// fair queuing starts it under its parent; the parent's virtual time moves up to that start.
+    /// What it charged is kept, to settle when its attempt ends ([`Self::settle_charge`]).
     fn charge(&mut self, id: &str, runner: &str, now: i64) {
         let (Some(l), Some(r)) = (self.legs.get(id), self.runners.get(runner)) else { return };
         let ms = l.input.cost.unwrap_or(self.config().default_cost);
@@ -1987,17 +2010,17 @@ impl Scheduler {
         let (leaf, weights, class) = (l.flow.clone(), self.weights_of(&l.input), l.key.map_or(l.input.class, |k| k.0));
         let mut parent = "";
         for (node, weight) in nodes(&leaf).zip(weights) {
-            let costs = charges(&shares, ms, weight);
+            let costs = profile_costs(&charges(&shares, ms, weight));
             let (vtimes, finish) = (self.vtimes.entry(class).or_default(), self.finish.entry(class).or_default());
             if !vtimes.contains_key(parent) {
-                vtimes.insert(parent.to_owned(), [0; DIMS]);
+                vtimes.insert(parent.to_owned(), [0; PROFILES]);
             }
             if !finish.contains_key(node) {
-                finish.insert(node.to_owned(), [0; DIMS]);
+                finish.insert(node.to_owned(), [0; PROFILES]);
             }
             if let (Some(v), Some(f)) = (vtimes.get_mut(parent), finish.get_mut(node)) {
-                for ((f, v), (s, c)) in f.iter_mut().zip(v.iter_mut()).zip(shares.iter().zip(costs)) {
-                    if *s == 0 {
+                for ((f, v), c) in f.iter_mut().zip(v.iter_mut()).zip(costs) {
+                    if c == 0 {
                         continue;
                     }
                     let start = (*v).max(*f);
@@ -2039,7 +2062,7 @@ impl Scheduler {
             }
         }
         for (node, weight) in nodes(&c.leaf).zip(c.weights) {
-            let (charged, used) = (charges(&c.shares, c.ms, weight), charges(&c.shares, ran, weight));
+            let (charged, used) = (profile_costs(&charges(&c.shares, c.ms, weight)), profile_costs(&charges(&c.shares, ran, weight)));
             if let Some(f) = self.finish.get_mut(&c.class).and_then(|f| f.get_mut(node)) {
                 for ((f, charged), used) in f.iter_mut().zip(charged).zip(used) {
                     *f = f.saturating_sub(charged).saturating_add(used);

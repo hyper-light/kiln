@@ -4,15 +4,14 @@
 //! order goes to the best runner it may run on. It keeps no counts, signatures or indexes: what a
 //! runner holds is the legs on it, added up when asked.
 //!
-//! - The queue order (W05-R04, R09, R10, R30, docs/needs.md E2.1 to E2.3), for a runner offering
-//!   some of the dimensions fair share counts (slots, CPUs, memory, GPUs: slots always, the rest in
+//! - The queue order (W05-R04, R09, R10, R30, docs/needs.md E2.1 to E2.4), for a runner offering
+//!   a set of the dimensions fair share counts (slots, CPUs, memory, GPUs: slots always, the rest in
 //!   resource mode): by class (critical, land, interactive, batch, background); in a class by its
 //!   tenant's standing in the class's own tree, level by level from its repository (then its actor,
-//!   then its lane, as `fair_by` goes): at each node the latest over those dimensions of
-//!   `max(V[parent][d], finish[node][d])`; then its tenant's own order, `aging_per_minute ×
-//!   queued-at − priority × 60,000,000`, least first; then arrival. A runner taking legs goes by the
-//!   dimensions it offers; legs going to their best runner go by all of them. A leg retried or
-//!   refused is queued again, in the class it came with.
+//!   then its lane, as `fair_by` goes): at each node `max(V[parent][set], finish[node][set])`; then
+//!   its tenant's own order, `aging_per_minute × queued-at − priority × 60,000,000`, least first;
+//!   then arrival. A runner taking legs goes by the set it offers; legs going to their best runner go
+//!   by every dimension. A leg retried or refused is queued again, in the class it came with.
 //! - Floors (W05-R31): a runner takes from the first class with a leg it may run, unless a class
 //!   after it holds less of the fleet than its floor (its running legs' holds, at their largest
 //!   dimension over the connected runners' offers, millionths rounded down) and may go ahead: the
@@ -25,14 +24,14 @@
 //!   it's looked at again a bound after that start; if none did, it goes up a class (background to
 //!   batch, batch to interactive), keeping its place in its tenant's order. Looks due by an
 //!   input's time are taken before the input.
-//! - Fair share's charge (docs/needs.md E2.1 to E2.3): a leg placed on a runner charges each node of
-//!   its tenant in its class's tree, in each dimension that runner offers, its share of the fleet
-//!   (what it holds there, one slot and its request or the whole runner, over what the connected
-//!   runners offer, in millionths rounded up) × its cost × 1000 / the node's weight (a
-//!   repository's from the config, the levels below it 1000), from `start = max(V[parent][d],
-//!   finish[node][d])`; `V[parent][d]` moves up to that start. When its attempt ends (it finished,
-//!   failed, was refused or its runner was lost), each node gives back the charge for its cost and
-//!   takes one for the time it ran.
+//! - Fair share's charge (docs/needs.md E2.1 to E2.4): a leg placed on a runner charges each node of
+//!   its tenant in its class's tree, in every set of dimensions, the largest over the set of its
+//!   share of each dimension of the fleet (what it holds there, one slot and its request or the
+//!   whole runner, over what the connected runners offer, in millionths rounded up) × its cost ×
+//!   1000 / the node's weight (a repository's from the config, the levels below it 1000), from
+//!   `start = max(V[parent][set], finish[node][set])`; `V[parent][set]` moves up to that start.
+//!   When its attempt ends (it finished, failed, was refused or its runner was lost), each node
+//!   gives back the charge for its cost and takes one for the time it ran.
 //! - Where a leg may run (W05-R19, R03, R16, R02): on a connected runner carrying every label it
 //!   asks for, with room for it, that it doesn't stay off: one that refused it, or one that lost it
 //!   while another that could take it is connected (carrying its labels, and big enough: room for
@@ -73,8 +72,9 @@ use crate::facts::RunnerFacts;
 const CASES: u64 = 10_000;
 const MINUTE: i64 = 60_000;
 const GIB: u64 = 1 << 30;
-/// Fair share's dimensions: slots, milli-CPUs, memory bytes, GPUs.
+/// Fair share's dimensions: slots, milli-CPUs, memory bytes, GPUs; and its sets of them, bitmasks.
 const DIMS: usize = 4;
+const SETS: usize = 16;
 
 /// What runs where (each running leg's runner and attempt), and what's queued.
 type Placement = (BTreeMap<String, (String, u32)>, BTreeSet<String>);
@@ -270,9 +270,9 @@ struct Reference {
     cfg: Config,
     runners: BTreeMap<String, Runner>,
     legs: BTreeMap<String, Leg>,
-    /// Fair share's tags, by class and node.
-    vtimes: BTreeMap<(Class, String), [u128; DIMS]>,
-    finish: BTreeMap<(Class, String), [u128; DIMS]>,
+    /// Fair share's tags, by class and node, for each set of dimensions.
+    vtimes: BTreeMap<(Class, String), [u128; SETS]>,
+    finish: BTreeMap<(Class, String), [u128; SETS]>,
     /// When a leg of each class last started at each signature, and when each class may next go
     /// over its floor.
     served: BTreeMap<(String, Class), i64>,
@@ -592,23 +592,17 @@ impl Reference {
     }
 
     /// A leg's tenant's standing in `class`'s tree for a runner offering `dims`, level by level
-    /// from its repository: at each node the latest over them of `max(V[parent][d],
-    /// finish[node][d])`.
+    /// from its repository: at each node `max(V[parent][set], finish[node][set])`, `set` the
+    /// dimensions it offers.
     fn standing(&self, class: Class, l: &LegIn, dims: [bool; DIMS]) -> [u128; 3] {
+        let set = (0..DIMS).filter(|d| dims.get(*d).copied().unwrap_or(false)).fold(0, |m, d| m | (1 << d));
         let mut out = [0; 3];
         let mut parent = String::new();
         for (k, (node, _)) in self.nodes(l).into_iter().enumerate() {
-            let mut s = 0;
-            for d in 0..DIMS {
-                let on = dims.get(d).copied().unwrap_or(false);
-                let v = self.vtimes.get(&(class, parent.clone())).and_then(|v| v.get(d)).copied().unwrap_or(0);
-                let f = self.finish.get(&(class, node.clone())).and_then(|f| f.get(d)).copied().unwrap_or(0);
-                if on {
-                    s = s.max(v.max(f));
-                }
-            }
+            let v = self.vtimes.get(&(class, parent.clone())).and_then(|v| v.get(set)).copied().unwrap_or(0);
+            let f = self.finish.get(&(class, node.clone())).and_then(|f| f.get(set)).copied().unwrap_or(0);
             if let Some(slot) = out.get_mut(k) {
-                *slot = s;
+                *slot = v.max(f);
             }
             parent = node;
         }
@@ -652,15 +646,15 @@ impl Reference {
         let sig = signature(&l.input);
         let mut parent = String::new();
         for (node, weight) in &nodes {
-            let mut v = self.vtimes.get(&(class, parent.clone())).copied().unwrap_or([0; DIMS]);
-            let mut f = self.finish.get(&(class, node.clone())).copied().unwrap_or([0; DIMS]);
-            for d in 0..DIMS {
-                let share = shares.get(d).copied().unwrap_or(0);
-                if let (Some(f), Some(v)) = (f.get_mut(d), v.get_mut(d))
-                    && share > 0
+            let mut v = self.vtimes.get(&(class, parent.clone())).copied().unwrap_or([0; SETS]);
+            let mut f = self.finish.get(&(class, node.clone())).copied().unwrap_or([0; SETS]);
+            for set in 0..SETS {
+                let cost = set_cost(&shares, ms, *weight, set);
+                if let (Some(f), Some(v)) = (f.get_mut(set), v.get_mut(set))
+                    && cost > 0
                 {
                     let start = (*v).max(*f);
-                    *f = start + share * ms * 1000 / weight;
+                    *f = start + cost;
                     *v = (*v).max(start);
                 }
             }
@@ -688,9 +682,9 @@ impl Reference {
         let ran = u128::try_from((now - charged.at).max(0)).unwrap_or(0);
         for (node, weight) in &charged.nodes {
             if let Some(f) = self.finish.get_mut(&(charged.class, node.clone())) {
-                for (f, share) in f.iter_mut().zip(charged.shares) {
-                    if share > 0 {
-                        *f = f.saturating_sub(share * charged.ms * 1000 / weight) + share * ran * 1000 / weight;
+                for (set, f) in f.iter_mut().enumerate() {
+                    if set_cost(&charged.shares, charged.ms, *weight, set) > 0 {
+                        *f = f.saturating_sub(set_cost(&charged.shares, charged.ms, *weight, set)) + set_cost(&charged.shares, ran, *weight, set);
                     }
                 }
             }
@@ -754,6 +748,18 @@ impl Reference {
         }
         p
     }
+}
+
+/// What a placement costs a node of `weight` in a set of dimensions (a bitmask): the largest over
+/// the set of each dimension's share × `ms` × 1000 / `weight`.
+fn set_cost(shares: &[u128; DIMS], ms: u128, weight: u128, set: usize) -> u128 {
+    let mut most = 0;
+    for (d, share) in shares.iter().enumerate() {
+        if (set >> d) & 1 == 1 {
+            most = most.max(share * ms * 1000 / weight);
+        }
+    }
+    most
 }
 
 /// What `held` (each dimension) is of `fleet`: its largest dimension's share, millionths rounded

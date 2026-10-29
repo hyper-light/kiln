@@ -2386,3 +2386,100 @@ fn w05_r31_the_explanation_names_the_class_tenant_and_promotion() -> Result<(), 
     assert_eq!(after.get("promoted_from"), Some(&serde_json::json!("background")));
     Ok(())
 }
+
+// ---------------------------------------------------------------------- G7, grown from W05-AC04 (W05-AC14)
+
+/// The G7 scenario's legs (docs/needs.md E2.4): one CPU and `gib` GiB each, in `repo`, by `actor`,
+/// expected to take `ms` (their history).
+fn shaped(id: String, repo: &str, actor: &str, gib: u64, ms: i64) -> LegIn {
+    LegIn {
+        run: format!("run-{id}"),
+        id,
+        repo: repo.into(),
+        actor: actor.into(),
+        route: LegRoute { labels: vec!["k8s".into()], ..LegRoute::default() },
+        priority: 60,
+        request: Resources { cpu: Cpus::whole(1), mem: gib << 30, ..Resources::default() },
+        cost: u64::try_from(ms).ok(),
+        ..LegIn::default()
+    }
+}
+
+/// 4 runners of 16 CPUs and 64 GiB in resource mode, their CPUs not overcommitted, so CPUs run out
+/// first and a leg that ends frees room either tenant's next leg fits. Where memory runs out first
+/// (CPUs overcommitted 1.5 times, or B weighted 3:1), A's 1-GiB legs refill the room B's 8-GiB legs
+/// need as soon as it frees, and B holds a third rather than half: the limit E4's reservations
+/// lift (docs/ci.md W05-AC14).
+fn g7_fleet(cfg: Config) -> Sim {
+    let mut sim = Sim::new(Config { resources: true, overcommit_cpu: 1000, ..cfg });
+    for n in 0..4 {
+        let base = linux(&format!("r{n}"), 16);
+        sim.runner(0, RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(16), mem: 64 << 30, ..Resources::default() }), ..base });
+    }
+    sim
+}
+
+/// W05-AC14 (G7, docs/needs.md §4, E2.4): under saturation each tenant gets its weighted share of
+/// dominant-resource time within 10 points over every 10-minute window while both are backlogged,
+/// whatever order the work came in and whatever its shape. Tenant A queues 1-CPU, 1-GiB,
+/// one-minute legs from minute 0 (CPU-heavy); tenant B 1-CPU, 8-GiB, two-minute legs from minute
+/// 20 (memory-heavy, DRF's case), each a batch every 10 minutes, more than it runs. From B's first
+/// window each holds half, or A, weighted 3:1, three quarters.
+#[test]
+fn w05_ac14_g7_staggered_arrivals_and_mixed_shapes() {
+    for (weight, want) in [(1000, 0.5), (3000, 0.75)] {
+        let mut sim = g7_fleet(Config { weights: [("a/a".to_owned(), weight)].into_iter().collect(), ..Config::default() });
+        for m in (0..70).step_by(10) {
+            for i in 0..700 {
+                sim.leg(m * MIN, shaped(format!("a{m}-{i}"), "a/a", "a", 1, MIN), MIN);
+            }
+            for i in 0..150 {
+                if m >= 20 {
+                    sim.leg(m * MIN, shaped(format!("b{m}-{i}"), "b/b", "b", 8, 2 * MIN), 2 * MIN);
+                }
+            }
+        }
+        sim.run(75 * MIN);
+        let tenant = |l: &str| l.get(..1).unwrap_or_default().to_owned();
+        for w in (20..70).step_by(10) {
+            let share = sim.dominant_by(w * MIN, (w + 10) * MIN, tenant, |_| true).get("a").copied().unwrap_or(0.0);
+            assert!((share - want).abs() <= 0.10, "A weighted {weight}, window {w}–{}: A held {share:.3} of the dominant-resource time", w + 10);
+        }
+        // Both were backlogged in every window: each had legs from an earlier batch still waiting
+        // when the last one ended.
+        for t in ["a", "b"] {
+            assert!(sim.assigned.iter().any(|a| a.at >= 70 * MIN && tenant(&a.leg) == t && !a.leg.starts_with(&format!("{t}70-"))), "A weighted {weight}: {t} ran out of work");
+        }
+    }
+}
+
+/// W05-AC14 (G7, W28-R66): a repository whose two actors split its share, the second arriving 10
+/// minutes in, against a repository with one actor: each repository holds half in every
+/// 10-minute window, its actors a quarter each once both are there.
+#[test]
+fn w05_ac14_g7_a_repositorys_actors_split_its_share() {
+    use super::state::FairBy;
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor], ..Config::default() });
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..1_000 {
+        sim.leg(0, LegIn { actor: "x1".into(), ..leg(&format!("x1-{i}"), "acme/x", 60) }, MIN);
+        sim.leg(10 * MIN, LegIn { actor: "x2".into(), ..leg(&format!("x2-{i}"), "acme/x", 60) }, MIN);
+        sim.leg(0, LegIn { actor: "y".into(), ..leg(&format!("y-{i}"), "acme/y", 60) }, MIN);
+    }
+    sim.run(70 * MIN);
+    let repo = |l: &str| l.get(..1).unwrap_or_default().to_owned();
+    let actor = |l: &str| l.split('-').next().unwrap_or_default().to_owned();
+    for w in (0..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, repo).get("x").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: acme/x held {share:.3}", w + 10);
+        if w >= 10 {
+            let actors = sim.shares_by(w * MIN, (w + 10) * MIN, actor);
+            for a in ["x1", "x2"] {
+                let s = actors.get(a).copied().unwrap_or(0.0);
+                assert!((s - 0.25).abs() <= 0.10, "window {w}–{}: {a} held {s:.3}", w + 10);
+            }
+        }
+    }
+}
