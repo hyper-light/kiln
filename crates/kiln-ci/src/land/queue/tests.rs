@@ -326,6 +326,9 @@ fn w28_r106_a_stack_lands_its_clear_prefix() {
     );
     let blocked = prefix(&[("D1".to_owned(), Gate::Conflict { files: vec!["a".into()] }), ("D2".to_owned(), Gate::Ready)]);
     assert!(blocked.clear.is_empty() && blocked.held.len() == 2, "{blocked:?}");
+    // A diff's reasons stay apart, so each is said with its name (W26-R11's blocking thread among them).
+    let two = prefix(&[("D1".to_owned(), Gate::Hold { why: vec!["0 of 1 accepts".into(), "expand.rs:2: kim resolves this blocking comment first".into()] })]);
+    assert_eq!(two.held, [("D1".to_owned(), vec!["0 of 1 accepts".to_owned(), "expand.rs:2: kim resolves this blocking comment first".to_owned()])]);
 }
 
 /// W28-R109: which queue lands a repository's changes, and how an entry stands on its host's.

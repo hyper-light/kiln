@@ -2319,6 +2319,41 @@ pub async fn enqueue_host(hub: &Arc<Hub>, repo: &Repo, trunk: &str, changes: &[(
     Ok(json!({ "entry": id, "route": q, "changes": numbers, "state": "queued" }))
 }
 
+/// `POST /api/repos/:repo/queue` (docs/ci.md W28-R109): `{ trunk?, changes: [{ number, head }] }`,
+/// a host's changes into its host's own queue, bottom first, each at the head Review cleared (the
+/// one Ship shows). Each change is read on its host first: one whose head moved since is refused
+/// (409, naming the head it's at), as is one merged or closed already; a repository whose host has
+/// no queue for it is refused as [`enqueue_host`] refuses it (422). `trunk` is the repository's
+/// default branch when left out.
+pub async fn enqueue_route(hub: &Arc<Hub>, repo: &str, body: &Value, by: &str) -> Result<Value, Fail> {
+    let found = hub.store.repos().await.map_err(fail)?.into_iter().find(|r| r.name == repo || r.id == repo);
+    let r = found.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
+    let mut changes = Vec::new();
+    for c in body.get("changes").and_then(Value::as_array).into_iter().flatten() {
+        let (Some(n), Some(head)) = (c.get("number").and_then(Value::as_u64), c.get("head").and_then(Value::as_str).filter(|h| !h.is_empty())) else {
+            return Err((StatusCode::BAD_REQUEST, "each change is `{ number, head }`".into()));
+        };
+        changes.push((n, head.to_owned()));
+    }
+    let trunk = body.get("trunk").and_then(Value::as_str).map(str::to_owned).or_else(|| r.default_branch.clone()).unwrap_or_else(|| "main".into());
+    if let (queue::Route::Host { .. }, Some((forge, name))) = route_of(hub, &r).await {
+        for (n, head) in &changes {
+            match forge.change(&name, *n, None).await {
+                Ok(seam::Fresh::Changed { value, .. }) if !matches!(value.state, seam::State::Open) => {
+                    return Err((StatusCode::CONFLICT, format!("#{n} is merged or closed on its host")));
+                }
+                Ok(seam::Fresh::Changed { value, .. }) if value.head_sha != *head => {
+                    return Err((StatusCode::CONFLICT, format!("#{n} moved on its host: its head is {}, not {head}, the head Review cleared", value.head_sha)));
+                }
+                Ok(_) => {}
+                Err(seam::Refusal::NotFound { .. }) => return Err((StatusCode::NOT_FOUND, format!("no #{n} on {name}'s host"))),
+                Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("#{n} couldn't be read on its host: {e}"))),
+            }
+        }
+    }
+    enqueue_host(hub, &r, &trunk, &changes, by).await
+}
+
 /// How often what's on a host's queue is read back unasked, at most (a read of the queue counts
 /// against the host's rate limit; a change's conditional read costs nothing while it's unchanged).
 const HOST_QUEUE_EVERY: Duration = Duration::from_secs(30);
@@ -2509,6 +2544,15 @@ mod tests {
             let refused = enqueue_host(&hub, &r, seam::TRUNK, &[(one.number, one.head_sha.clone())], "user:ada").await;
             assert!(matches!(&refused, Err((StatusCode::UNPROCESSABLE_ENTITY, why)) if why.contains("no queue on its host")), "{refused:?}");
             sim.set_queue(name, true);
+            // The route reads each change on its host first: one whose head moved since Review
+            // cleared it is refused, naming the head it's at; a change without a head isn't one.
+            sim.push(name, "three", seam::TRUNK, "three")?;
+            let three = sim.open(name, open("three")).await?;
+            let moved = sim.push(name, "three", "three", "three again")?;
+            let stale = enqueue_route(&hub, name, &json!({ "changes": [{ "number": three.number, "head": three.head_sha }] }), "user:ada").await;
+            assert!(matches!(&stale, Err((StatusCode::CONFLICT, why)) if why.contains(&moved)), "{stale:?}");
+            let bad = enqueue_route(&hub, name, &json!({ "changes": [{ "number": three.number }] }), "user:ada").await;
+            assert!(matches!(&bad, Err((StatusCode::BAD_REQUEST, _))), "{bad:?}");
             let a = enqueue_host(&hub, &r, seam::TRUNK, &[(one.number, one.head_sha.clone())], "user:ada").await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let b = enqueue_host(&hub, &r, seam::TRUNK, &[(two.number, two.head_sha.clone())], "user:ada").await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(a.get("route").and_then(Value::as_str), Some("merge queue"));

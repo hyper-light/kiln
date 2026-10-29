@@ -1664,6 +1664,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["repos", repo, "submit"]) => ok(submit_patches(hub, repo, caller, body).await?),
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
+        // W28-R109: a host's changes into its host's own queue, each at the head Review cleared.
+        (&Method::POST, ["repos", repo, "queue"]) => ok(super::land::enqueue_route(hub, repo, body, &caller.name).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => {
             let mut v = super::review::inbox(hub, caller).await?;

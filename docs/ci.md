@@ -9051,6 +9051,12 @@ the queue)
   change takes those below it), `change` read conditionally until it merged (landed, recorded) or
   left the queue unmerged (out), `dequeue` when Review holds or withdraws it. kiln never calls
   githost directly for it; kiln's own git server has no forge, so its repositories land on W28's.
+  `POST /api/repos/:repo/queue` (`ci.queue.enqueue`, `{ trunk?, changes: [{ number, head }] }`,
+  bottom first) puts a host's changes in: each read on its host first, a change whose head isn't the
+  one Review cleared is refused (409, naming the head it moved to), as is one merged or closed, and a
+  repository whose host has no queue for it (422). What it does next is each entry's in
+  `GET /api/repos/:repo/queue`: `state` (queued, testing, landed, ejected with `reason`), `route`,
+  `host` (each change's `state`, `entered`, `queued` and merged `commit`) and, once landed, `record`.
 
 **Acceptance criteria: the land queue by component**
 
@@ -9641,6 +9647,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET/POST | `/api/repos/:repo/change-requests` · `/api/change-requests/:id/...` | `ci.change_requests.list`, `.open`, `.get` (the rest as diffs') | diffs.* | W14 |
 | GET | `/api/review/inbox` | `ci.review.inbox` (your conversations) | diffs.read | W14 |
 | GET · DELETE | `/api/repos/:repo/queue` · `/api/queue/:entry` | `ci.queue.list`, `.remove` | diffs.read, queue.manage | W14 |
+| POST | `/api/repos/:repo/queue` | `ci.queue.enqueue` (`{ trunk?, changes: [{ number, head }] }`: a host's changes into its host's own queue, each at the head Review cleared) | diffs.land | W28-R109 |
 | GET | `/api/stacks/:id` | `ci.stacks.get` | diffs.read | W14 |
 | POST | `/api/repos/:repo/submit` | `ci.diffs.submit_patch` (no git needed) | diffs.submit | W14 |
 | GET/POST · PUT/DELETE · POST | `/api/attachments` · `/:id` · `/pause` (built) | `attachments.list`, `.get`, `.save`, `.remove`, `.pause` | runs.read · agents.attach | W20 |
