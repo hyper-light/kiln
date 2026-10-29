@@ -1689,6 +1689,8 @@ impl Hub {
                     a.sample = Some(s.clone());
                 }
                 self.record_sample(&agent, s);
+                // The CI engine weighs its headroom by it: once a sample, as it comes.
+                self.ci.send(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() });
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {
@@ -2849,7 +2851,10 @@ impl Hub {
         let declined = self.declined.lock().clone();
         let g = self.agents.lock();
         let incoming = job.spec.as_ref().map_or(kiln_ci::sched::state::Incoming::Ordinary, |s| v1_incoming(s.exclusive, &s.resources));
-        g.values()
+        let asked = job.spec.as_ref().map(|s| v1_asked(&s.resources)).unwrap_or_default();
+        let (target, now) = (crate::ci::dispatch::target_use(&self.cfg.ci.scheduler), crate::util::now_ms());
+        let found = g
+            .values()
             .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
             .filter(|a| !a.running.contains(&job.id))
             .filter(|a| {
@@ -2869,13 +2874,9 @@ impl Hub {
             // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
             // job goes to another, or waits for one (a pod made for it is its own).
             .filter(|a| a.ephemeral || !strain_of(a).overloaded)
-            // The one with the most room: by its idle cores, free memory and CI slots taken, as
-            // reach measures it; then the most slots.
-            .max_by(|a, b| {
-                let (ra, rb) = (crate::reach::directory::room(strain_of(a), a.busy, a.slots), crate::reach::directory::room(strain_of(b), b.busy, b.slots));
-                ra.total_cmp(&rb).then(a.slots.cmp(&b.slots)).then(b.name.cmp(&a.name))
-            })
-            .map(|a| a.name.clone())
+            // By the engine's own rule (W05): within the target use, the most headroom left.
+            .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { fresh_headroom(a, now) }, room: crate::reach::directory::room(strain_of(a), a.busy, a.slots) });
+        v1_best(found, &asked, target).map(str::to_owned)
     }
 
     async fn check_timeouts(&self) -> anyhow::Result<()> {
@@ -3029,8 +3030,39 @@ impl Hub {
 /// CPUs (`resources: { cpu, memory }`) holds them and that memory; asking for none, the whole
 /// runner. A `resources:` that isn't a quantity asks for none.
 pub(crate) fn v1_incoming(exclusive: bool, resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Incoming {
-    let asked = kiln_ci::sched::pools::ResourceSpec { cpu: resources.cpu.clone(), memory: resources.memory.clone(), ..Default::default() }.resources().unwrap_or_default();
-    kiln_ci::sched::state::Incoming::of(exclusive, &asked)
+    kiln_ci::sched::state::Incoming::of(exclusive, &v1_asked(resources))
+}
+
+/// What a v1 job asks of its runner: its `resources:` (none: nothing).
+fn v1_asked(resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Resources {
+    kiln_ci::sched::pools::ResourceSpec { cpu: resources.cpu.clone(), memory: resources.memory.clone(), ..Default::default() }.resources().unwrap_or_default()
+}
+
+/// A runner as the v1 dispatcher's last choice weighs it ([`v1_best`]).
+pub(crate) struct V1Candidate<'a> {
+    pub name: &'a str,
+    pub slots: u32,
+    /// Its headroom by a fresh sample; none for a pod made for the job, or a runner without one.
+    pub headroom: Option<kiln_ci::sched::state::Headroom>,
+    /// Its room as reach measures it, for runners without a fresh sample.
+    pub room: f32,
+}
+
+/// Where a v1 job goes of the runners that could take it, by the engine's own rule (W05, the
+/// scheduler's headroom, [`kiln_ci::sched::place::place`]): within the target use by its live
+/// sample, the one with the most headroom left after it; ties, and runners without a fresh
+/// sample after those, by reach's room, then the most slots, then the name.
+pub(crate) fn v1_best<'a>(candidates: impl IntoIterator<Item = V1Candidate<'a>>, asked: &kiln_ci::sched::state::Resources, target: f64) -> Option<&'a str> {
+    let mut found: Vec<V1Candidate<'a>> = candidates.into_iter().collect();
+    found.sort_by(|a, b| b.room.total_cmp(&a.room).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)));
+    let nodes: Vec<kiln_ci::sched::place::Node<'a>> = found.iter().map(|c| kiln_ci::sched::place::Node { name: c.name, headroom: c.headroom }).collect();
+    kiln_ci::sched::place::place(asked, &nodes, target).ok()
+}
+
+/// A runner's headroom by its sample when it's fresh ([`kiln_ci::sched::state::SAMPLE_FRESH_MS`]).
+fn fresh_headroom(a: &AgentLive, now_ms: i64) -> Option<kiln_ci::sched::state::Headroom> {
+    let s = a.sample.as_ref().filter(|s| now_ms.saturating_sub(s.ts_ms) <= kiln_ci::sched::state::SAMPLE_FRESH_MS)?;
+    Some(kiln_ci::sched::state::Headroom::of(&crate::ci::dispatch::sample_of(s, a.facts.as_deref())))
 }
 
 /// Whether a runner has room for one more job or leg, by the rule the engine's scheduler and the
@@ -3389,4 +3421,55 @@ pub(crate) mod tests {
         invites.add("old".into(), Instant::now() - Duration::from_secs(1));
         assert!(!invites.take("old"), "an expired invite doesn't work");
     }
+
+    /// The scheduler's headroom (W05, step 3): one rule places a CI leg, a v1 job and a command
+    /// alike. On one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure),
+    /// asking 4 CPUs and 2 GiB: a would pass the target use, c's disk counts against it, and the
+    /// engine, the v1 dispatcher and kiln run's ranking all pick b.
+    #[test]
+    fn one_headroom_rule_places_a_leg_a_v1_job_and_a_command_alike() -> anyhow::Result<()> {
+        use kiln_ci::sched::routing::{LegRoute, RunnerView};
+        use kiln_ci::sched::state::{Command, Config, Headroom, Input, LegIn, Resources, RunnerIn, Sample, Scheduler};
+        const GIB: u64 = 1 << 30;
+        let fleet = [("a", 0.8, 0.0), ("b", 0.3, 0.0), ("c", 0.1, 60.0)];
+        let sample = |busy: f64, io: f64| Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) };
+        let asked = Resources { cpu: 4.0, mem: 2 * GIB, ..Resources::default() };
+        // The engine.
+        let mut engine = Scheduler::new(Config::default());
+        for (name, busy, io) in fleet {
+            let view = RunnerView { name: name.into(), labels: vec!["local".into()], caps: 1 << 10, ..RunnerView::default() };
+            engine.handle(Input::RunnerUp(Box::new(RunnerIn { id: name.into(), view, slots: 4, ..RunnerIn::default() })), 0);
+            engine.handle(Input::RunnerSample { runner: name.into(), sample: sample(busy, io) }, 1_000);
+        }
+        let leg = LegIn { id: "build".into(), run: "r1".into(), repo: "acme/x".into(), request: asked, route: LegRoute { labels: vec!["local".into()], ..LegRoute::default() }, ..LegIn::default() };
+        let c = engine.handle(Input::LegQueued(Box::new(leg)), 2_000);
+        let by_engine = c.iter().find_map(|x| match x {
+            Command::Assign { runner, .. } => Some(runner.clone()),
+            _ => None,
+        });
+        // The v1 dispatcher.
+        let by_v1 = v1_best(fleet.iter().map(|(name, busy, io)| V1Candidate { name, slots: 4, headroom: Some(Headroom::of(&sample(*busy, *io))), room: 0.0 }), &asked, 0.85);
+        // kiln run.
+        let info: Vec<crate::reach::directory::RunnerInfo> = fleet
+            .iter()
+            .map(|(name, busy, io)| crate::reach::directory::RunnerInfo {
+                name: (*name).into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                connected: true,
+                reach: true,
+                cpus: 32,
+                cpu_pct: (*busy * 100.0) as f32,
+                mem_total: 64 * GIB,
+                mem_used: 16 * GIB,
+                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: Some(*io) }), ..kiln_ci::facts::RunnerFacts::default() })),
+                ..crate::reach::directory::RunnerInfo::default()
+            })
+            .collect();
+        let (ranked, _) = crate::reach::directory::rank(&info, &crate::reach::directory::Want::parse("cpus=4,mem=2g")?, "elsewhere");
+        let by_run = ranked.first().map(|c| c.runner.name.clone());
+        assert_eq!((by_engine.as_deref(), by_v1, by_run.as_deref()), (Some("b"), Some("b"), Some("b")), "{c:?} {ranked:?}");
+        Ok(())
+    }
 }
+
