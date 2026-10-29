@@ -328,11 +328,12 @@ enum Bg {
     Fetched { job: String, exe: PathBuf, build: String },
     /// The new build's runner is connected and ready: hand it everything.
     #[cfg(unix)]
-    Ready { job: String, conn: Arc<crate::bluegreen::Conn> },
+    Ready { job: String, conn: Arc<crate::bluegreen::Conn>, stores: bool },
     /// Everything was sent: what the new build said of each, in order (`broke`: the connection
-    /// failed part-way).
+    /// failed part-way), and where it set aside each conversation store that wouldn't open there
+    /// (`aside`, as [`Given::aside`]).
     #[cfg(unix)]
-    Moved { job: String, conn: Arc<crate::bluegreen::Conn>, acks: Vec<Ack>, broke: Option<String> },
+    Moved { job: String, conn: Arc<crate::bluegreen::Conn>, acks: Vec<Ack>, broke: Option<String>, aside: Option<[Option<PathBuf>; 2]> },
     /// The new build didn't come up: this runner goes on.
     #[cfg(unix)]
     Failed { job: String, why: String },
@@ -342,6 +343,12 @@ enum Bg {
     /// (The new build's runner.) Everything handed over is in: the server hears what runs here.
     #[cfg(unix)]
     TookOver { sessions: usize, terminals: usize, refused: usize },
+    /// (The new build's runner.) The conversation stores it goes on with: the files the runner it
+    /// takes over from moved into this one's folder (`crate::bluegreen::Frame::Stores`: its own and
+    /// its copy of the server's), or none (one of its own, then). Say how it went: what it set aside
+    /// and went on without, or why it keeps none.
+    #[cfg(unix)]
+    Stores { own: Option<PathBuf>, mirror: Option<PathBuf>, done: futures::channel::oneshot::Sender<Taken> },
     /// (The new build's runner.) The runner it took over from is gone (or never answered).
     #[cfg(unix)]
     TakeOverEnded,
@@ -387,6 +394,32 @@ struct Moving {
     /// Server frames about those that reached this runner meanwhile: for the new build once it's
     /// promoted, else handled here.
     held: Vec<Vec<u8>>,
+    /// Its conversation stores, given to the new build: a rollback takes them back.
+    stores: Option<Given>,
+}
+
+/// The conversation stores a runner gave the new build ([`Moving::stores`]): each file, moved from
+/// and to, and the tee its own store was taken from, to give it back to.
+#[cfg(unix)]
+struct Given {
+    held: crate::convo::store::Held,
+    moves: Vec<(PathBuf, PathBuf)>,
+    own_dir: PathBuf,
+    /// Where the new build set aside each (its own, the copy) that wouldn't open there, as it said
+    /// (`crate::bluegreen::Frame::StoresTaken`); None: its answer never came.
+    aside: Option<[Option<PathBuf>; 2]>,
+}
+
+/// (The new build's runner.) How it took the conversation stores handed to it ([`Bg::Stores`],
+/// `crate::bluegreen::Frame::StoresTaken`): whether it keeps one, where it set aside each that
+/// wouldn't open, and what it did.
+#[cfg(unix)]
+#[derive(Default)]
+struct Taken {
+    kept: bool,
+    own_aside: Option<PathBuf>,
+    mirror_aside: Option<PathBuf>,
+    note: Option<String>,
 }
 
 /// One thing handed to the new build (blue/green), as this runner keeps it until then.
@@ -432,11 +465,24 @@ const RETIRE_QUIET: Duration = Duration::from_secs(8);
 /// environment set up, its images pulled) before it's refused.
 const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 
-/// How long a new build that took its sessions over, and whose link to the runner it upgraded
-/// ended with no word of a promotion, holds their messages still (a runner that takes them back
-/// stops it well before).
+/// How long a new build whose link to the runner it upgraded ended with no word of a promotion
+/// (everything handed over, or part of it) holds messages still (a runner that takes its sessions
+/// back stops it well before).
 #[cfg(unix)]
 const TAKE_OVER_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a runner handing its conversation store to the new build waits for what its sessions
+/// said last to go into it (its tee to drain) before it lets go of it.
+#[cfg(unix)]
+const TEE_DRAIN: Duration = Duration::from_secs(10);
+
+/// How many times a new build tries to open a conversation store handed to it, how far apart (one
+/// the runner it takes over from hasn't quite let go of, a slow disk), before it sets it aside and
+/// goes on in a new one.
+#[cfg(unix)]
+const STORE_TRIES: usize = 3;
+#[cfg(unix)]
+const STORE_TRY_EVERY: Duration = Duration::from_secs(1);
 
 #[cfg(unix)]
 use crate::upgrade::with_instance;
@@ -734,7 +780,7 @@ async fn roll_back(
     terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
     term_tx: &async_channel::Sender<(String, PtyOut)>,
     state_dir: &std::path::Path,
-) -> Vec<String> {
+) -> (Vec<String>, Option<crate::convo::store::Store>) {
     use std::os::fd::IntoRawFd as _;
     let empty = tracing::field::Empty;
     let span = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.rollback", reason = %why, result = empty, error = empty);
@@ -756,9 +802,14 @@ async fn roll_back(
         span.record("error", "the new build couldn't be stopped");
         mv.root.record("result", "rolled_back");
         mv.root.record("error", why);
-        return kept;
+        return (kept, None);
     }
     let mut problems = Vec::new();
+    // Its conversation stores first, before what comes back writes into them: moved back out of
+    // the new build's folder (removed below) and opened again, the same ids and numbers. One that
+    // couldn't be moved back keeps that folder.
+    let store = mv.stores.as_ref().and_then(|g| take_stores_back(g, &mut problems));
+    let stranded = !problems.is_empty();
     for (i, item) in mv.items.into_iter().enumerate() {
         match item {
             Item::Terminal { session, state, fd, pid } => {
@@ -786,7 +837,9 @@ async fn roll_back(
             }
         }
     }
-    let _ = std::fs::remove_dir_all(crate::upgrade::instance_dir(state_dir, &mv.instance));
+    if !stranded {
+        let _ = std::fs::remove_dir_all(crate::upgrade::instance_dir(state_dir, &mv.instance));
+    }
     if problems.is_empty() {
         span.record("result", "ok");
     } else {
@@ -795,7 +848,105 @@ async fn roll_back(
     }
     mv.root.record("result", "rolled_back");
     mv.root.record("error", why);
-    problems
+    (problems, store)
+}
+
+/// (The runner being upgraded.) Its conversation stores, let go of for the new build
+/// (`Frame::Stores`): once what its sessions said last went into its own store (its tee drained,
+/// [`TEE_DRAIN`] at most), the tee lets go of it; each store is closed and its files moved as
+/// `moves` says (its own first, then its copy of the server's). What couldn't be is left out, and
+/// the new build opens a store of its own for it.
+#[cfg(unix)]
+fn give_stores(held: &crate::convo::store::Held, own: Option<crate::convo::store::Store>, mirror: Option<crate::convo::store::Store>, moves: &[(PathBuf, PathBuf)]) -> crate::bluegreen::Frame {
+    let until = Instant::now() + TEE_DRAIN;
+    while !held.drained() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = held.take();
+    let closed = |st: Option<crate::convo::store::Store>, what: &str| {
+        st.is_some_and(|st| match st.close() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), store = what, "a conversation store couldn't be let go of; the new build opens one of its own");
+                false
+            }
+        })
+    };
+    let (own_ok, mirror_ok) = (closed(own, "own"), closed(mirror, "mirror"));
+    let moved = |i: usize, ok: bool| -> Option<String> {
+        let (from, to) = moves.get(i).filter(|_| ok)?;
+        match crate::convo::move_file(from, to) {
+            Ok(()) => Some(to.to_string_lossy().into_owned()),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), from = %from.display(), "a conversation store couldn't be moved to the new build; it opens one of its own");
+                None
+            }
+        }
+    };
+    crate::bluegreen::Frame::Stores { own: moved(0, own_ok), mirror: moved(1, mirror_ok) }
+}
+
+/// (The runner being upgraded, rolling back.) Its conversation stores, given to the new build
+/// ([`Given`]), moved back where they were (each that's in the new build's folder) and its own
+/// opened again for its tee: the store to go on with. One the new build set aside (it wouldn't open
+/// there) is this runner's own as it was: that comes back, from where the new build said it put it,
+/// not the new store in its place. What went wrong goes in `problems`.
+#[cfg(unix)]
+fn take_stores_back(g: &Given, problems: &mut Vec<String>) -> Option<crate::convo::store::Store> {
+    for (i, (from, to)) in g.moves.iter().enumerate() {
+        let there = match &g.aside {
+            Some(said) => said.get(i).cloned().flatten().unwrap_or_else(|| to.clone()),
+            // Its answer never came: one it set aside in its folder, new with it, has the first name.
+            None => {
+                let mut first = to.as_os_str().to_owned();
+                first.push(crate::convo::SET_ASIDE);
+                Some(PathBuf::from(first)).filter(|f| f.exists()).unwrap_or_else(|| to.clone())
+            }
+        };
+        let there = &there;
+        if there.exists()
+            && !from.exists()
+            && let Err(e) = crate::convo::move_file(there, from)
+        {
+            problems.push(format!("conversation store {}: {e:#} (it stays at {})", from.display(), there.display()));
+        }
+    }
+    let st = crate::convo::open(&g.own_dir, crate::config::Conversations::default().upkeep())?;
+    g.held.give(st.clone());
+    Some(st)
+}
+
+/// The store's feed to the server (`crate::convo::feed`), and the harnesses' own records followed
+/// into the store (`crate::convo::record`): as the runner starts, or once a new build taking over
+/// has the store it goes on with.
+fn start_feed(st: &crate::convo::store::Store, harness: Option<&Arc<crate::harness::host::Host>>, up: &async_channel::Sender<Up>) -> crate::convo::feed::Shipper {
+    if let Some(h) = harness {
+        let follow = Arc::clone(h);
+        if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || follow.record_sources()) {
+            tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
+        }
+    }
+    let (shipper, said) = crate::convo::feed::Shipper::start(st.clone());
+    let up = up.clone();
+    crate::rt::spawn(async move {
+        while let Ok((json, data)) = said.recv().await {
+            if up.send(Up::Convo(AgentMsg::Convo { json, data })).await.is_err() {
+                break;
+            }
+        }
+    });
+    shipper
+}
+
+/// (The new build's runner.) The stores it goes on with ([`Bg::Stores`]): how it went.
+#[cfg(unix)]
+async fn set_stores(tx: &async_channel::Sender<Bg>, own: Option<PathBuf>, mirror: Option<PathBuf>) -> Taken {
+    let stopping = || Taken { note: Some("this runner is stopping".to_owned()), ..Taken::default() };
+    let (done, said) = futures::channel::oneshot::channel();
+    if tx.send(Bg::Stores { own, mirror, done }).await.is_err() {
+        return stopping();
+    }
+    said.await.unwrap_or_else(|_| stopping())
 }
 
 /// Stops the new build `green`, a rollback's first step: its supervisor `sup` kills it (none, or it
@@ -833,14 +984,15 @@ async fn gone_within(pid: u32, patience: Duration) -> bool {
 /// (The new build's runner, blue/green.) Take over from the runner being upgraded, at `path`: say
 /// it's ready, take each agent session and terminal it hands over (saying how each went), then the
 /// server's frames about them that reached it meanwhile, until that runner ends. Terminals are
-/// taken on this runner's loop (`tx`), which also hears once everything is in.
+/// taken on this runner's loop (`tx`), which also hears once everything is in. `takes_stores`: it
+/// waits for that runner's conversation stores (it keeps conversations).
 #[cfg(unix)]
-async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: String) -> anyhow::Result<()> {
+async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: String, takes_stores: bool) -> anyhow::Result<()> {
     use crate::bluegreen::Frame;
     use base64::Engine as _;
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
     let c = Arc::clone(&conn);
-    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me }, &[])).await??;
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me, stores: takes_stores }, &[])).await??;
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
@@ -857,6 +1009,10 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
     })?;
     let (mut sessions, mut terminals, mut refused) = (0usize, 0usize, 0usize);
     let mut done = false;
+    // Whether it knows which conversation store it goes on with: the runner it takes over from says
+    // first (`Frame::Stores`); one from before says nothing, and this one opens its own then. One
+    // that takes none knows already.
+    let mut stores = !takes_stores;
     while let Ok(got) = frx.recv().await {
         let (frame, fds) = match got {
             Ok(f) => f,
@@ -868,6 +1024,23 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
                 break;
             }
         };
+        if let Frame::Stores { own, mirror } = frame {
+            stores = true;
+            // Whether it keeps one, where it set aside what wouldn't open, and what it did.
+            let t = set_stores(&tx, own.map(PathBuf::from), mirror.map(PathBuf::from)).await;
+            let path = |p: Option<PathBuf>| p.map(|p| p.to_string_lossy().into_owned());
+            let taken = Frame::StoresTaken { kept: t.kept, own_aside: path(t.own_aside), mirror_aside: path(t.mirror_aside), note: t.note };
+            let c = Arc::clone(&conn);
+            crate::rt::blocking(move || c.send(&taken, &[])).await??;
+            continue;
+        }
+        if !stores && matches!(frame, Frame::Session { .. } | Frame::Terminal { .. } | Frame::Done) {
+            stores = true;
+            let t = set_stores(&tx, None, None).await;
+            if !t.kept {
+                tracing::warn!(error = %t.note.unwrap_or_default(), "the conversation store couldn't be opened");
+            }
+        }
         let (id, r) = match frame {
             Frame::Session { id, record, handed } => {
                 let r = take_session(harness.as_ref(), &id, *record, handed, fds).await;
@@ -909,7 +1082,7 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
                 }
                 continue;
             }
-            Frame::Ready { .. } | Frame::Ack { .. } => continue,
+            Frame::Ready { .. } | Frame::Ack { .. } | Frame::Stores { .. } | Frame::StoresTaken { .. } => continue,
         };
         if r.is_err() {
             refused += 1;
@@ -1342,6 +1515,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Conversations kept on disk as they happen (docs/conversations.md), and sent to the server's
     // store over this link (`crate::convo::feed`).
     let mut convo: Option<crate::convo::store::Store> = None;
+    // The store's tee, which holds it so that it can be handed to a new build
+    // (`crate::bluegreen::Frame::Stores`), or in a new build taking over, come from the runner it
+    // takes over from.
+    #[cfg_attr(not(unix), allow(unused_variables, unused_assignments))]
+    let mut convo_held: Option<crate::convo::store::Held> = None;
+    // A new build taking over doesn't know yet which store it goes on with: its feed starts then.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut stores_wait = false;
     // How many agent sessions it has at work at once (docs/agents.md, "How many agents a machine
     // runs"): what was set for this machine from the server (kept here for its restarts), else its
     // config's, else kiln's default. What the server sets is taken as it says it, and the config is
@@ -1354,8 +1535,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
-        convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
-        let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
+        let waits = cfg!(unix) && take_over_pending.is_some() && !crate::convo::off();
+        if !waits {
+            convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
+        }
+        let sink = if convo.is_some() || waits {
+            let (sink, tee) = crate::convo::store::tee_held(harness_tx.clone(), convo.clone(), 8192);
+            convo_held = Some(tee);
+            sink
+        } else {
+            harness_tx.clone()
+        };
+        stores_wait = waits;
         let held = crate::harness::limit::held(limit_asked, limit_config);
         if held.from != crate::harness::limit::Source::Default {
             tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
@@ -1379,25 +1570,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut mirror: Option<crate::convo::feed::Intake> = None;
     let mut mirror_store: Option<crate::convo::store::Store> = None;
     let mut restoring: Option<(String, crate::convo::feed::Shipper)> = None;
-    let shipper = convo.clone().map(|st| {
-        // The harnesses' own records, followed into the store.
-        if let Some(h) = harness.clone() {
-            let follow = h;
-            if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || follow.record_sources()) {
-                tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
-            }
-        }
-        let (shipper, said) = crate::convo::feed::Shipper::start(st);
-        let up = uplink.0.clone();
-        crate::rt::spawn(async move {
-            while let Ok((json, data)) = said.recv().await {
-                if up.send(Up::Convo(AgentMsg::Convo { json, data })).await.is_err() {
-                    break;
-                }
-            }
-        });
-        shipper
-    });
+    // Started again by a blue/green upgrade's hand-over and its rollback (Unix).
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut shipper = convo.as_ref().map(|st| start_feed(st, harness.as_ref(), &uplink.0));
     // What `kiln spawn` in this machine's terminals talks to.
     let harness_sock = harness.as_ref().and_then(|h| {
         let path = crate::harness::socket::path(&name, &o.state_dir);
@@ -1609,11 +1784,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let (tx, j) = (bg_tx.clone(), job.clone());
                                 let waited = std::thread::Builder::new().name("kiln-upgrade".into()).spawn(move || {
                                     let _ = match listener.ready(green.pid, Instant::now() + crate::bluegreen::READY_WITHIN) {
-                                        Ok((conn, _)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn) }),
+                                        Ok((conn, _, stores)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn), stores }),
                                         Err(e) => tx.send_blocking(Bg::Failed { job: j, why: format!("{e:#}") }),
                                     };
                                 });
-                                moving = Some(Moving { green, instance: gid, root, healthy: Some(healthy), handing: false, items: Vec::new(), held: Vec::new() });
+                                moving = Some(Moving { green, instance: gid, root, healthy: Some(healthy), handing: false, items: Vec::new(), held: Vec::new(), stores: None });
                                 if let Err(e) = waited {
                                     let _ = bg_tx.try_send(Bg::Failed { job, why: format!("couldn't wait for the new build: {e}") });
                                 }
@@ -1630,7 +1805,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Bg::Ready { job, conn } => {
+                    Bg::Ready { job, conn, stores } => {
                         let Some(mv) = moving.as_mut() else { continue };
                         if let Some(h) = mv.healthy.take() {
                             h.record("result", "ok");
@@ -1685,10 +1860,53 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let (sessions, terminals) = (mv.items.iter().filter(|i| matches!(i, Item::Session { .. })).count(), mv.items.iter().filter(|i| matches!(i, Item::Terminal { .. })).count());
                         let line = format!("the new build is connected to the server: handing it {sessions} agent session(s) and {terminals} terminal(s), their processes running on");
                         uplink.msg(AgentMsg::UpgradeLog { job: job.clone(), line }).await;
+                        // Its conversation stores go too, to a new build that takes them, first: let
+                        // go of once what its sessions said last is in, and moved into the new
+                        // build's folder, so that the server's feed of them, and the server's to
+                        // this copy of its own, go on where they are and nothing is sent again.
+                        // Its own feed and its copy end here (what the server answers them goes
+                        // nowhere now); a rollback brings them back.
+                        let giving = match (&convo_held, convo.is_some()) {
+                            (Some(held), true) if stores => {
+                                let there = crate::upgrade::instance_dir(&o.state_dir, &mv.instance);
+                                let own = convo.take();
+                                shipper = None;
+                                let copy = if restoring.is_none() { mirror_store.take() } else { None };
+                                if copy.is_some() {
+                                    mirror = None;
+                                }
+                                let mut moves = vec![(own_dir.join(crate::convo::FILE), there.join(crate::convo::FILE))];
+                                if copy.is_some() {
+                                    moves.push((own_dir.join(crate::convo::MIRROR_FILE), there.join(crate::convo::MIRROR_FILE)));
+                                }
+                                mv.stores = Some(Given { held: held.clone(), moves: moves.clone(), own_dir: own_dir.clone(), aside: None });
+                                Some((held.clone(), own, copy, moves))
+                            }
+                            _ => None,
+                        };
                         let tx = bg_tx.clone();
                         let sent = std::thread::Builder::new().name("kiln-handover".into()).spawn(move || {
                             let mut acks = Vec::with_capacity(frames.len());
                             let mut broke: Option<String> = None;
+                            let mut aside = None;
+                            if let Some((held, own, copy, moves)) = giving {
+                                let said = give_stores(&held, own, copy, &moves);
+                                // The stores never hold an upgrade back: one the new build can't open
+                                // it sets aside, kept whole, and goes on in a new one; one that keeps
+                                // none (it couldn't even open a new one) still takes the rest.
+                                match conn.send(&said, &[]).and_then(|()| conn.recv()) {
+                                    Ok((Frame::StoresTaken { kept, own_aside, mirror_aside, note }, _)) => {
+                                        aside = Some([own_aside.map(PathBuf::from), mirror_aside.map(PathBuf::from)]);
+                                        match (kept, note) {
+                                            (true, None) => {}
+                                            (true, Some(note)) => tracing::warn!(%note, "the new build went on with this runner's conversation stores, not all as they were"),
+                                            (false, note) => tracing::warn!(error = %note.unwrap_or_default(), "the new build keeps no conversation store; the upgrade goes on"),
+                                        }
+                                    }
+                                    Ok(_) => broke = Some("the new build answered out of turn".to_owned()),
+                                    Err(e) => broke = Some(format!("{e:#}")),
+                                }
+                            }
                             for (f, fds) in &frames {
                                 if broke.is_some() {
                                     acks.push(Ack::Skipped);
@@ -1713,14 +1931,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             {
                                 broke = Some(format!("{e:#}"));
                             }
-                            let _ = tx.send_blocking(Bg::Moved { job, conn, acks, broke });
+                            let _ = tx.send_blocking(Bg::Moved { job, conn, acks, broke, aside });
                         });
                         if let Err(e) = sent {
                             tracing::error!(error = %e, "couldn't hand over to the new build");
                         }
                     }
-                    Bg::Moved { job, conn, acks, broke } => {
+                    Bg::Moved { job, conn, acks, broke, aside } => {
                         let Some(mut mv) = moving.take() else { continue };
+                        if let Some(g) = mv.stores.as_mut() {
+                            g.aside = aside;
+                        }
                         for (item, ack) in mv.items.iter().zip(&acks) {
                             let sp = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.move", what = item.what(), id = %item.id(), result = empty, error = empty);
                             match ack {
@@ -1805,7 +2026,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             Err(why) => {
                                 let mut held_back = std::mem::take(&mut mv.held);
-                                let problems = roll_back(mv, &acks, &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                                let (problems, back) = roll_back(mv, &acks, &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                                if let Some(st) = back {
+                                    let ship = start_feed(&st, harness.as_ref(), &uplink.0);
+                                    if connected {
+                                        ship.link(crate::convo::feed::Link::Up);
+                                    }
+                                    (convo, shipper) = (Some(st), Some(ship));
+                                }
                                 moved.clear();
                                 draining = false;
                                 serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
@@ -1829,7 +2057,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 h.record("error", why.as_str());
                             }
                             let held_back = std::mem::take(&mut mv.held);
-                            let _ = roll_back(mv, &[], &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                            let (_, back) = roll_back(mv, &[], &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                            if let Some(st) = back {
+                                let ship = start_feed(&st, harness.as_ref(), &uplink.0);
+                                if connected {
+                                    ship.link(crate::convo::feed::Link::Up);
+                                }
+                                (convo, shipper) = (Some(st), Some(ship));
+                            }
                             serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
                             for d in held_back {
                                 let _ = bg_tx.try_send(Bg::Forwarded(d));
@@ -1839,6 +2074,74 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         draining = false;
                         tracing::warn!(%job, error = %why, "the new build didn't come up; this runner goes on");
                         uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("the new build didn't come up ({why}): it was stopped, and this runner goes on as it was")) }).await;
+                    }
+                    Bg::Stores { own, mirror: copy, done } => {
+                        // Moved into this runner's folder by the runner it takes over from (its
+                        // copy of the server's beside it, opened when the server first sends it),
+                        // or none came: one of its own, there. One that won't open is set aside,
+                        // kept whole, and a new one takes its place: the stores never hold an
+                        // upgrade back.
+                        let here = [own_dir.join(crate::convo::FILE), own_dir.join(crate::convo::MIRROR_FILE)];
+                        // Handed where this one doesn't look for them (a build that lays its folder
+                        // out otherwise): moved where it does.
+                        for (handed, here) in [own.as_ref(), copy.as_ref()].into_iter().zip(&here) {
+                            if let Some(p) = handed.filter(|p| *p != here && !here.exists())
+                                && let Err(e) = crate::convo::move_file(p, here)
+                            {
+                                tracing::warn!(error = %format!("{e:#}"), from = %p.display(), "a conversation store handed over couldn't be moved where this runner keeps it");
+                            }
+                        }
+                        // One already open here (said again): kept as it is.
+                        let mut taken = Taken { kept: convo.is_some(), ..Taken::default() };
+                        if convo.is_none()
+                            && let Some(held) = convo_held.clone()
+                        {
+                            let (dir, upkeep, with_copy) = (own_dir.clone(), crate::config::Conversations::default().upkeep(), copy.is_some());
+                            let (st, aside, copy_aside) = crate::rt::blocking(move || {
+                                let (st, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::FILE, upkeep, STORE_TRIES, STORE_TRY_EVERY);
+                                // The copy of the server's handed over: tried now, so that one that
+                                // won't open is set aside and the server's next batch starts a new
+                                // copy (opened then, as ever).
+                                let copy_aside = if with_copy {
+                                    let (c, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::MIRROR_FILE, upkeep, STORE_TRIES, STORE_TRY_EVERY);
+                                    if let Some(c) = c
+                                        && let Err(e) = c.close()
+                                    {
+                                        tracing::warn!(error = %format!("{e:#}"), "the copy of the server's conversation store handed over couldn't be let go of after a look");
+                                    }
+                                    aside
+                                } else {
+                                    None
+                                };
+                                (st, aside, copy_aside)
+                            })
+                            .await
+                            .unwrap_or_default();
+                            let mut notes = Vec::new();
+                            if let Some(a) = &aside {
+                                notes.push(format!("its conversation store wouldn't open here: set aside, kept whole, at {}{}", a.display(), if st.is_some() { ", and a new one took its place" } else { "" }));
+                            }
+                            if let Some(a) = &copy_aside {
+                                notes.push(format!("its copy of the server's store wouldn't open here: set aside, kept whole, at {}, and a new copy is taken", a.display()));
+                            }
+                            match st {
+                                Some(st) => {
+                                    held.give(st.clone());
+                                    let ship = start_feed(&st, harness.as_ref(), &uplink.0);
+                                    if connected {
+                                        ship.link(crate::convo::feed::Link::Up);
+                                    }
+                                    tracing::info!(store = %st.id(), handed = own.is_some(), set_aside = aside.is_some(), "the conversations go on in this store");
+                                    (convo, shipper) = (Some(st), Some(ship));
+                                    taken.kept = true;
+                                }
+                                // What was handed stays here, under its own name, for its next start.
+                                None => notes.push("no conversation store could be opened here".to_owned()),
+                            }
+                            (taken.own_aside, taken.mirror_aside, taken.note) = (aside, copy_aside, (!notes.is_empty()).then(|| notes.join("; ")));
+                        }
+                        stores_wait = false;
+                        let _ = done.send(taken);
                     }
                     Bg::TakeTerminal { session, command, cols, rows, replay, fd, pid, done } => {
                         let state = crate::termsess::Session::detached(session.clone(), "agent".into(), command, cols, rows);
@@ -1859,17 +2162,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if !std::mem::replace(&mut sockets_served, true) {
                             serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
                         }
-                        // Its link to the runner it upgraded ended after it took everything over, and
-                        // no word of its promotion: that one is gone (one that takes its sessions
-                        // back stops this one first). It takes messages again after a while.
-                        if took_over
-                            && let Some(h) = harness.as_ref().filter(|h| h.is_held())
-                        {
-                            let h = Arc::clone(h);
+                        // It ended before the runner it upgraded said which conversation store this
+                        // one goes on with (that one died, or their link broke, before its first
+                        // frame): the store in its own folder, with what that one moved there if it
+                        // got that far.
+                        if stores_wait {
+                            let (done, _) = futures::channel::oneshot::channel();
+                            let _ = bg_tx.try_send(Bg::Stores { own: None, mirror: None, done });
+                        }
+                        // Its link to the runner it upgraded ended, and no word of its promotion: that
+                        // one is gone (one that takes its sessions back stops this one first), whether
+                        // it had handed everything over or ended part-way, with what this one took
+                        // then (CP-T3.2). It takes messages again after a while.
+                        if let Some(h) = harness.as_ref().filter(|h| h.is_held()) {
+                            let (h, whole) = (Arc::clone(h), took_over);
                             crate::rt::spawn(async move {
                                 crate::rt::sleep(TAKE_OVER_GRACE).await;
                                 if h.is_held() {
-                                    tracing::warn!("no word of a promotion after taking over: this runner takes messages again");
+                                    tracing::warn!(took_over = whole, "no word of a promotion after the take-over ended: this runner takes messages again");
                                     h.hold(false);
                                 }
                             });
@@ -2080,8 +2390,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
                 let build_took = building.elapsed();
                 if let AgentMsg::Build { caps, .. } = &mut build {
-                    // It sends its conversations' store: the server keeps them from that.
-                    if shipper.is_some() {
+                    // It sends its conversations' store: the server keeps them from that (a new build
+                    // taking over, the one it goes on with, once it knows which).
+                    if shipper.is_some() || stores_wait {
                         *caps |= proto::CAP_CONVO;
                     }
                     // A runner that keeps no replica does not say it replicates.
@@ -2419,9 +2730,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // connected and welcomed, it says it's ready, and takes everything.
                         #[cfg(unix)]
                         if let Some(path) = take_over.take() {
-                            let (h, tx, me) = (harness.clone(), bg_tx.clone(), instance_id.clone());
+                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), instance_id.clone(), stores_wait);
                             crate::rt::spawn(async move {
-                                if let Err(e) = take_over_from(path, h, tx.clone(), me).await {
+                                if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
                                 }
                                 let _ = tx.send(Bg::TakeOverEnded).await;
@@ -4160,6 +4471,95 @@ fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runner handing its store to the new build lets go of it once what its sessions said is in,
+    /// moves it into the new build's folder and says where; the new build goes on with it, the same
+    /// store. A rollback moves it back, and the tee keeps what passes in it again.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_handed_to_the_new_build_goes_whole_and_comes_back_on_a_rollback() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (blue, green) = (dir.path().join("blue"), dir.path().join("green"));
+            std::fs::create_dir_all(&blue)?;
+            let upkeep = || crate::config::Conversations::default().upkeep();
+            let texts = |st: &crate::convo::store::Store| -> anyhow::Result<Vec<String>> {
+                st.sync()?;
+                Ok(st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect()).unwrap_or_default())
+            };
+            let st = crate::convo::open(&blue, upkeep()).ok_or_else(|| anyhow::anyhow!("no store"))?;
+            let (out, passed) = async_channel::unbounded();
+            let (sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+            sink.send(("a1".to_owned(), said("m1", 1, "before the upgrade"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            let id = st.id().to_owned();
+            let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
+            let (h, m) = (held.clone(), moves.clone());
+            let frame = crate::rt::blocking(move || give_stores(&h, Some(st), None, &m)).await?;
+            let to = green.join(crate::convo::FILE).to_string_lossy().into_owned();
+            assert!(matches!(&frame, crate::bluegreen::Frame::Stores { own: Some(o), mirror: None } if *o == to));
+            assert!(!blue.join(crate::convo::FILE).exists());
+            // The new build opens it where it was moved: the same store, what it held in it.
+            let there = crate::convo::open(&green, upkeep()).ok_or_else(|| anyhow::anyhow!("no store there"))?;
+            assert_eq!(there.id(), id);
+            assert_eq!(texts(&there)?, vec!["before the upgrade".to_owned()]);
+            there.close()?;
+            // Rolled back: moved back, opened again, given to the tee, which keeps what passes in it.
+            let g = Given { held: held.clone(), moves, own_dir: blue.clone(), aside: Some([None, None]) };
+            let mut problems = Vec::new();
+            let back = take_stores_back(&g, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(back.id(), id);
+            sink.send(("a1".to_owned(), said("m2", 2, "after the rollback"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            assert_eq!(texts(&back)?, vec!["before the upgrade".to_owned(), "after the rollback".to_owned()]);
+            Ok(())
+        })
+    }
+
+    /// A store the new build couldn't open it sets aside there, kept whole, and goes on in a new
+    /// one; rolled back, the runner being upgraded takes its own back as it was, from where the new
+    /// build said it set it aside (or, its answer lost, under the first name), not the new build's.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_the_new_build_set_aside_comes_back_as_it_was_on_a_rollback() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
+        crate::rt::block_on(async move {
+            for answered in [true, false] {
+                let dir = tempfile::tempdir()?;
+                let (blue, green) = (dir.path().join("blue"), dir.path().join("green"));
+                std::fs::create_dir_all(&blue)?;
+                let upkeep = || crate::config::Conversations::default().upkeep();
+                let st = crate::convo::open(&blue, upkeep()).ok_or_else(|| anyhow::anyhow!("no store"))?;
+                st.send("a1", &said("m1", 1, "before the upgrade"));
+                let id = st.id().to_owned();
+                let (out, _passed) = async_channel::unbounded();
+                let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+                let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
+                let (h, m) = (held.clone(), moves.clone());
+                crate::rt::blocking(move || give_stores(&h, Some(st), None, &m)).await?;
+                // The new build couldn't open it: set aside there, and a new store in its place.
+                let aside = crate::convo::set_aside(&green.join(crate::convo::FILE))?;
+                let fresh = crate::convo::open(&green, upkeep()).ok_or_else(|| anyhow::anyhow!("no new store"))?;
+                assert_ne!(fresh.id(), id.as_str());
+                fresh.close()?;
+                let answer = answered.then(|| [Some(aside.clone()), None]);
+                let mut problems = Vec::new();
+                let back = take_stores_back(&Given { held, moves, own_dir: blue.clone(), aside: answer }, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
+                assert!(problems.is_empty(), "{problems:?}");
+                assert_eq!(back.id(), id, "its own store, as it was (answered: {answered})");
+                assert!(!aside.exists());
+                back.sync()?;
+                assert_eq!(back.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
+            }
+            Ok(())
+        })
+    }
 
     /// CP-T3.2 (the thirteenth adversarial check's): a rollback takes nothing back until the new
     /// build is seen gone. One its supervisor didn't stop (none found here) is killed, and seen gone.
