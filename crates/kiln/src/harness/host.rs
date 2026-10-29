@@ -372,6 +372,10 @@ impl Handovers {
     }
 }
 
+/// What a session's hand-over or move hears when its host has gone (CP-T3.2): it stays, as its
+/// inbox's ids can't go with it.
+const HOST_GONE: &str = "this runner's host of its sessions is gone, so it stays here";
+
 /// What kiln says first to a session whose turn its restart cut short.
 const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it. Pick up where you left off.";
 
@@ -1012,6 +1016,75 @@ impl Host {
         }
     }
 
+    /// What session `id` reaches its host through: its attached files, branches, letting go, and its
+    /// inbox's ids, fence and hand-overs' record. Its host gone, the session can neither read its
+    /// inbox's ids nor fence it (CP-T3.2): a hand-over or move of it stays, never going without them;
+    /// nor read how a try at handing it over was decided, so it never goes on as if it was refused.
+    fn files_for(&self, id: &str) -> session::Files {
+        let me = self.me.clone();
+        let me2 = self.me.clone();
+        let me3 = self.me.clone();
+        let me4 = self.me.clone();
+        let me5 = self.me.clone();
+        let me6 = self.me.clone();
+        session::Files {
+            dir: self.files_dir.join(id),
+            take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
+            // A branch: another session on this machine.
+            spawn: Arc::new(move |spec: Spec| {
+                if let Some(h) = me2.upgrade()
+                    && let Err(e) = h.open(None, spec)
+                {
+                    tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session");
+                }
+            }),
+            release: Arc::new(move |id: &str| {
+                if let Some(h) = me3.upgrade() {
+                    h.release(id);
+                }
+            }),
+            carried: Arc::new(move |id: String| {
+                let h = me4.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => h.carried(&id).await.map_err(|e| e.to_string()),
+                        None => Err(HOST_GONE.into()),
+                    }
+                })
+            }),
+            fence: Arc::new(move |id: String, on: bool| {
+                let h = me5.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => h.moving_fence(&id, on).await.map_err(|e| e.to_string()),
+                        None => Err(HOST_GONE.into()),
+                    }
+                })
+            }),
+            settle: Arc::new(move |attempt: String, id: String, take_back: bool| {
+                let h = me6.upgrade();
+                Box::pin(async move {
+                    match h {
+                        Some(h) => crate::rt::blocking(move || h.settle(&attempt, &id, take_back)).await.map_err(|e| format!("{e:#}")).and_then(|r| r),
+                        None => Err(HOST_GONE.into()),
+                    }
+                })
+            }),
+            room: {
+                let (me, id) = (self.me.clone(), id.to_owned());
+                Arc::new(move || me.upgrade().is_none_or(|h| h.room_for(&id)))
+            },
+            work: {
+                let (me, id) = (self.me.clone(), id.to_owned());
+                Arc::new(move |work, waits| {
+                    if let Some(h) = me.upgrade() {
+                        h.stands(&id, work, waits);
+                    }
+                })
+            },
+        }
+    }
+
     /// `brought`: the ids of the messages it had where it was before (its inbox's newest, from a
     /// move or blue/green), taken by its inbox here; a seed brings more (its queue and its
     /// timeline's messages). `back`: this host takes it back at the epoch it left at (blue/green
@@ -1051,68 +1124,7 @@ impl Host {
                 h.mark_dirty();
             }
         });
-        let me = self.me.clone();
-        let me2 = self.me.clone();
-        let me3 = self.me.clone();
-        let me4 = self.me.clone();
-        let me5 = self.me.clone();
-        let me6 = self.me.clone();
-        let files = session::Files {
-            dir: self.files_dir.join(&id),
-            take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
-            // A branch: another session on this machine.
-            spawn: Arc::new(move |spec: Spec| {
-                if let Some(h) = me2.upgrade()
-                    && let Err(e) = h.open(None, spec)
-                {
-                    tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session");
-                }
-            }),
-            release: Arc::new(move |id: &str| {
-                if let Some(h) = me3.upgrade() {
-                    h.release(id);
-                }
-            }),
-            carried: Arc::new(move |id: String| {
-                let h = me4.upgrade();
-                Box::pin(async move {
-                    match h {
-                        Some(h) => h.carried(&id).await.map_err(|e| e.to_string()),
-                        None => Ok(Vec::new()),
-                    }
-                })
-            }),
-            fence: Arc::new(move |id: String, on: bool| {
-                let h = me5.upgrade();
-                Box::pin(async move {
-                    match h {
-                        Some(h) => h.moving_fence(&id, on).await.map_err(|e| e.to_string()),
-                        None => Ok(()),
-                    }
-                })
-            }),
-            settle: Arc::new(move |attempt: String, id: String, take_back: bool| {
-                let h = me6.upgrade();
-                Box::pin(async move {
-                    match h {
-                        Some(h) => crate::rt::blocking(move || h.settle(&attempt, &id, take_back)).await.map_err(|e| format!("{e:#}")).and_then(|r| r),
-                        None => Ok(None),
-                    }
-                })
-            }),
-            room: {
-                let (me, id) = (self.me.clone(), id.clone());
-                Arc::new(move || me.upgrade().is_none_or(|h| h.room_for(&id)))
-            },
-            work: {
-                let (me, id) = (self.me.clone(), id.clone());
-                Arc::new(move |work, waits| {
-                    if let Some(h) = me.upgrade() {
-                        h.stands(&id, work, waits);
-                    }
-                })
-            },
-        };
+        let files = self.files_for(&id);
         // What its timeline and queue show first, what its inbox took last (in its own order, the
         // newest last): past its inbox's bound, the newest are the ones its inbox here keeps.
         let brought = match &seed {
@@ -2719,6 +2731,30 @@ mod tests {
         Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())))
     }
 
+    /// CP-T3.2 (seen as a failed test's session, left behind its host, was handed over later with
+    /// no ids): a session whose host is gone can neither read its inbox's ids nor fence it, so a
+    /// hand-over or move of it stays here. It never goes without the ids its inbox took, which the
+    /// process it went to would need to answer one sent again as a repeat, not a new prompt.
+    #[test]
+    fn a_session_whose_host_is_gone_goes_nowhere_without_its_inbox_s_ids() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let files = host.files_for("s1");
+            assert!((files.carried)("s1".into()).await.is_ok(), "its host there, its inbox's ids are read");
+            drop(host);
+            let read = (files.carried)("s1".into()).await;
+            assert!(read.as_ref().is_err_and(|e| e.contains("stays here")), "{read:?}");
+            let fenced = (files.fence)("s1".into(), true).await;
+            assert!(fenced.as_ref().is_err_and(|e| e.contains("stays here")), "{fenced:?}");
+            // Nor is a try at handing it over said undecided: a refusal then would let it go on
+            // here though the machine's record may say it was taken (the twenty-second check's).
+            let decided = (files.settle)("try-1".into(), "s1".into(), true).await;
+            assert!(decided.as_ref().is_err_and(|e| e.contains("stays here")), "{decided:?}");
+            Ok(())
+        })
+    }
+
     /// CP-T3.2: a message sent to a session twice under its id is handed to the session once, and
     /// both sends are answered: the first taken, the second its repeat, with the first's answer. The
     /// harness is sent one prompt.
@@ -3342,6 +3378,23 @@ while True:
             let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
             let s = older.open(Some("h".into()), spec)?;
             until_it("the stand-in harness's start", 30, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            // The stand-in harnesses that read a line (their first, kiln's initialize), in the order they
+            // did. Each is waited for to be reading before what's timed after it: a loaded Mac can hold
+            // a fresh script at its exec for minutes (its policy's checks), and the turns below are timed
+            // from here (the twenty-second adversarial check's: these tests timed out with their stand-in
+            // never run, not with kiln slow).
+            let readers = || -> Vec<u64> {
+                let mut out = Vec::new();
+                for l in std::fs::read_to_string(&heard).unwrap_or_default().lines() {
+                    if let Some(pid) = serde_json::from_str::<serde_json::Value>(l).ok().and_then(|w| w.get("pid").and_then(serde_json::Value::as_u64))
+                        && !out.contains(&pid)
+                    {
+                        out.push(pid);
+                    }
+                }
+                out
+            };
+            until_it("the stand-in harness reading", 300, || !readers().is_empty()).await?;
             assert!(older.command("h", message("m1", "build it")));
             until_it("m1's turn", 30, || s.core.lock().state.status == Status::Running).await?;
             assert!(older.command("h", message("m2", "then test it")));
@@ -3377,6 +3430,7 @@ while True:
                 pkg.get("inbox")
             );
             newer.adopt("an older kiln runner of this machine", &bytes).map_err(anyhow::Error::msg)?;
+            until_it("the newer process's stand-in reading", 300, || readers().len() >= 2).await?;
             if went_away {
                 // The newer process's link drops before its word that it took it reaches the
                 // server, which tells the older one it went away (`Hub::handovers_lost`).
