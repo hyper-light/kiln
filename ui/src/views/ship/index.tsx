@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
-import { JourneyStrip } from "@/components/ui/status-glyph";
+import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
@@ -25,6 +25,8 @@ import { ACTION_WORD, FACET_KEYS, fold, keyOf, HOSTS, KINDS, optionsOf, order, p
 import "./ship.css";
 import { ShipViews } from "./views";
 import { Stands } from "@/views/harness/stands";
+import { Shimmer } from "@/views/harness/signals";
+import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { firstStage, JobCards } from "./jobs";
@@ -33,6 +35,9 @@ import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { counted } from "./review/perf";
 
 const LIMIT = 100;
+
+/** The stands under way, whose word shimmers as Mission control's working agents' do (f-ship's). */
+const UNDER_WAY = new Set(["landing", "checking", "building", "shipping", "replanting"]);
 
 export default function ShipPage() {
   return (
@@ -88,7 +93,7 @@ function ShipList() {
   const { ref: holdRef, ...holdProps } = hold.bind;
   // Your own change of view (sort, filter) applies at once; only what arrives waits.
   const view = `${sort}|${JSON.stringify(chosen)}`;
-  const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, { it: Item; sig: string }>(), view }));
+  const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, { it: Item; sig: string }>(), view, pace: undefined as ShipPace | undefined }));
   // What a refetch brings that reads the same isn't a change (W26-R15): the item keeps its last
   // reference, so its memoized row doesn't render again; a changed item keeps its key and is
   // patched in place, never remounted.
@@ -106,6 +111,9 @@ function ShipList() {
   }
   const shown = hold.held ? kept.order.flatMap((k) => kept.last.get(k)?.it ?? []) : stable;
   if (!hold.held) kept.last = new Map(stable.map((it) => [keyOf(it), { it, sig: JSON.stringify(it) }]));
+  // The pace line holds with the rows: what it counts waits for the release too, so nothing beside
+  // the row you're reading moves (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5).
+  if (!hold.held || kept.pace === undefined) kept.pace = page.data.pace;
   const glide = useGlide(shown.map(keyOf).join("\n"));
 
   const set = (k: string, v: string | null) =>
@@ -160,7 +168,7 @@ function ShipList() {
         />
         <SelectField className="ship-sort" label="Sort commits" hideLabel value={sort} onChange={(v) => set("sort", v === "needs" ? null : v)} options={SORTS} />
       </div>
-      <Pace pace={page.data.pace} />
+      <Pace pace={kept.pace} />
       {items.length === 0 ? (
         <EmptyState title="No commits yet">Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
       ) : (
@@ -195,8 +203,7 @@ function Pace({ pace }: { pace?: ShipPace }) {
       {pace ? (
         <>
           <span>
-            <b className="ship-pace__count">{pace.in_flight}</b> in flight · <b className="ship-pace__count">{pace.agents}</b> agent
-            <span className={pace.agents === 1 ? "ship-pace__held" : undefined}>s</span>
+            <b>{pace.in_flight}</b> in flight · <b>{pace.agents}</b> agent{pace.agents === 1 ? "" : "s"}
           </span>
           {pace.envs.map((e) => (
             <span key={`${e.repo} ${e.environment}`}>
@@ -205,7 +212,7 @@ function Pace({ pace }: { pace?: ShipPace }) {
               {e.behind !== null && (
                 <>
                   {" "}
-                  · <b className="ship-pace__count">{e.behind}</b> behind
+                  · <b>{e.behind}</b> behind
                 </>
               )}
             </span>
@@ -233,12 +240,8 @@ const Row = React.memo(
     // One environment flag: production when it runs there, else the first it runs in.
     const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
     const n = item.riders.length;
-    const what =
-      item.folds === "rides"
-        ? `${n} commit${n === 1 ? "" : "s"} riding with it`
-        : item.folds === "shipped"
-          ? `${n} more shipped`
-          : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
+    // Riders say themselves as f-ship does (below); the rest of a fold says what it holds.
+    const what = item.folds === "shipped" ? `${n} more shipped` : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
     return (
       // Its review starts loading as the pointer comes onto the row or the focus into it (W26-R15).
       <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)} onPointerEnter={() => warmReview(c)} onFocus={() => warmReview(c)}>
@@ -247,17 +250,23 @@ const Row = React.memo(
             <span className="ship-name">{c.message || c.change?.title || c.short}</span>
             <span className="ship-line">
               <span className="ship-stand" data-stand={c.stand}>
-                {standWord(c.stand)}
+                <Shimmer on={UNDER_WAY.has(c.stand)} flow={keyOf(item)}>
+                  {standWord(c.stand)}
+                </Shimmer>
               </span>
               <span className="ship-text">{c.line}</span>
             </span>
           </button>
           <span className="ship-pips">
-            <JourneyStrip pips={strip(c.pips)} labels={false} />
+            <JourneyStrip pips={strip(c.pips)} />
           </span>
           <span className="ship-metas">
             <span>
-              {c.author} ·{" "}
+              <span className="ship-who">
+                <StatusGlyph state={c.author.startsWith("agent:") ? "agent" : "person"} size={12} />
+                <span>{whoSaid(c.author)}</span>
+              </span>{" "}
+              ·{" "}
               <span className="ship-ago">
                 <RelTime ts={c.at} />
               </span>
@@ -270,7 +279,8 @@ const Row = React.memo(
                 </span>
               ))}
               {env && (
-                <span className="ship-env" data-prod={env.production || undefined}>
+                <span className="ship-env" data-env={env.production ? "production" : "staging"}>
+                  <StatusGlyph state="flag" size={12} />
                   {env.environment}
                 </span>
               )}
@@ -291,7 +301,26 @@ const Row = React.memo(
         </div>
         {item.riders.length > 0 && (
           <button type="button" className="ship-fold" aria-expanded={riders} onClick={() => setRiders(!riders)}>
-            {riders ? "Hide" : "Show"} {what}
+            {item.folds === "rides" ? (
+              // f-ship's riders: how many ride with the approval, and the first of them.
+              <>
+                <StatusGlyph state="queued" size={14} />
+                <span>
+                  +{n} riding ·{" "}
+                  <span className="ship-fold__sha">
+                    {item.riders
+                      .slice(0, 3)
+                      .map((r) => r.short)
+                      .join(" ")}
+                  </span>
+                  {n > 3 ? " …" : ""}
+                </span>
+              </>
+            ) : (
+              <span>
+                {riders ? "Hide" : "Show"} {what}
+              </span>
+            )}
           </button>
         )}
         {riders && (

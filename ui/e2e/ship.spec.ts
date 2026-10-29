@@ -129,8 +129,7 @@ test("the pace line says what's moving, in the server's numbers, on one line fro
     await page.goto("/ship");
     const line = page.getByLabel("Pace", { exact: true });
     await expect(line).toBeVisible({ timeout: 15_000 });
-    // (As it reads: a plural's s held unseen at one is no word of it.)
-    await expect(line.locator(":scope > span")).toHaveText(words, { useInnerText: true });
+    await expect(line.locator(":scope > span")).toHaveText(words);
     // One line however narrow: it scrolls sideways rather than wrap.
     expect((await line.boundingBox())?.height ?? 0, `at ${width}`).toBeLessThanOrEqual(19);
   }

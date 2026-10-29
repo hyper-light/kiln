@@ -76,10 +76,16 @@
   align-items: baseline;
   min-width: 0;
 }
+/* The stand word as f-ship and Mission control write it (plan 01a1856fe81375b1bd1d1d86f270a45b,
+   step 6): mono capitals in the stand's colour, a stand under way shimmering (Shimmer). */
 .ship-stand {
   flex: none;
-  font-size: 12.5px;
-  color: #e4e5e7;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: #a1a4ad;
 }
 .ship-stand[data-stand="needs_you"] {
   color: #e2cfae;
@@ -87,6 +93,21 @@
 .ship-stand[data-stand="failing"],
 .ship-stand[data-stand="rolled_back"] {
   color: #e2b9bd;
+}
+.ship-stand[data-stand="landing"],
+.ship-stand[data-stand="checking"],
+.ship-stand[data-stand="building"],
+.ship-stand[data-stand="shipping"],
+.ship-stand[data-stand="replanting"] {
+  color: #cdc6ea;
+}
+.ship-stand[data-stand="in_staging"],
+.ship-stand[data-stand="waiting"] {
+  color: #b8c2d3;
+}
+.ship-stand[data-stand="shipped"],
+.ship-stand[data-stand="fixed"] {
+  color: #bfdccf;
 }
 .ship-text {
   color: #a1a4ad;
@@ -111,12 +132,21 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Its second line holds a flag's height with or without one: a row that gains a flag doesn't grow. */
 .ship-m2 {
   display: flex;
   gap: 6px;
   align-items: center;
   justify-content: flex-end;
+  min-height: 20px;
   overflow: hidden;
+}
+/* Who: a person's or an agent's mark, then the name (f-ship's). */
+.ship-who {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  vertical-align: bottom;
 }
 .ship-change {
   color: #cdc6ea;
@@ -157,7 +187,9 @@
 .ship-fold {
   all: unset;
   cursor: pointer;
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   box-sizing: border-box;
   width: 100%;
   padding: 10px 4px 10px 34px;
@@ -165,6 +197,10 @@
   font-size: 12.5px;
   border-top: 1px solid var(--k-line-2, #1f2125);
   background: rgba(226, 207, 174, 0.02);
+}
+.ship-fold__sha {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
 }
 .ship-fold:hover {
   color: #e4e5e7;
@@ -229,6 +265,13 @@
   .ship-r > .ship-pips {
     grid-column: 1;
     grid-row: 2;
+  }
+}
+/* The strip names its stages under its pips, as f-ship does; on a phone, the pips alone (plan
+   01a1856fe81375b1bd1d1d86f270a45b, step 6). */
+@media (max-width: 640px) {
+  .ship-pips .js-l {
+    display: none;
   }
 }
 @media (max-width: 700px) {
@@ -320,20 +363,10 @@
 .ship-pace::-webkit-scrollbar {
   display: none;
 }
-/* Its counts in figures of one width, each starting where it starts with room for two after it, and
-   a plural's s held when it's one: a count that changes moves no text, its own or any beside it
-   (the opened row's layout shift stays 0). */
 .ship-pace b {
   font-weight: 450;
   color: #b9bbc2;
   font-variant-numeric: tabular-nums;
-}
-.ship-pace__count {
-  display: inline-block;
-  min-width: 2ch;
-}
-.ship-pace__held {
-  visibility: hidden;
 }
 .ship-pace__sha {
   font-family: var(--mono, ui-monospace, monospace);
@@ -378,11 +411,25 @@
   width: 100%;
 }
 /* Its one environment: production in mint, another in grey. */
+/* The environment it runs in, as f-ship's flag: a tab with the flag's mark, production's green,
+   staging's slate. */
 .ship-env {
-  color: #a1a4ad;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px 0 6px;
+  border-radius: 4px 999px 999px 4px;
+  background: rgb(184 194 211 / 0.12);
+  color: #b8c2d3;
   font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
 }
-.ship-env[data-prod] {
+.ship-env[data-env="production"] {
+  background: rgb(191 220 207 / 0.12);
   color: #bfdccf;
 }
 
