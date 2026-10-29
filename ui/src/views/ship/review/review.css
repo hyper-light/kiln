@@ -301,6 +301,20 @@
   background: rgb(255 255 255 / 8%);
   color: #eceef2;
 }
+/* Its send as the mockup draws it: round, its icon alone (Ship's mockups plan, step 13). */
+.rvc .rv-send {
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  background: #e9eaee;
+  color: #111214;
+  transition: transform 0.15s;
+}
+.rvc .rv-send:active:not(:disabled) {
+  transform: scale(0.94);
+}
 .rvc-error {
   margin: 0;
   padding: 0 4px;
@@ -362,6 +376,60 @@
 /* Files takes focus when Ship's Diff button brings it into view: a landmark, no ring. */
 .rv-s[tabindex="-1"]:focus {
   outline: none;
+}
+/* The Conversation's head: its label, and the agent fixes switch on its right (Ship's mockups
+   plan, step 13); everything else under them, full width. */
+.rv-s-convo {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+.rv-s-convo > :not(.rv-h, .rv-switch) {
+  grid-column: 1 / -1;
+}
+.rv-s-convo > .rv-switch {
+  margin: 0 0 6px;
+}
+.rv-switch {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  border: 0;
+  background: none;
+  color: #a1a4ad;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+}
+.rv-switch i {
+  position: relative;
+  width: 30px;
+  height: 18px;
+  border-radius: 99px;
+  background: #33353e;
+  transition: background 0.2s;
+}
+.rv-switch i::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #c9ccd3;
+  transition: transform 0.2s;
+}
+.rv-switch[aria-checked="true"] i {
+  background: #7fb5a0;
+}
+.rv-switch[aria-checked="true"] i::after {
+  transform: translateX(12px);
+}
+.rv-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 .rv-h {
   display: flex;

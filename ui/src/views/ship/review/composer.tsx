@@ -3,11 +3,13 @@
  * (harness/compose-field.tsx, harness/state.ts), so what's typed is kept by where it's written
  * (draft.ts) and renders this and nothing else; a live update never touches it and a reload puts it
  * back. Markdown, with a preview; Insert a suggestion puts the lines it's on in as a suggestion to
- * edit; a new thread on a line has a kind, a question until another is chosen. Sending is a React
- * Action calling kiln's endpoint (the caller's): the draft goes once it's sent, and stays if it isn't.
+ * edit; a new thread on a line has a kind, a question until another is chosen. Its bar as the
+ * mockup draws it (Ship's mockups plan, step 13): Preview and Write, the send round with its icon
+ * alone. Sending is a React Action calling kiln's endpoint (the caller's): the draft goes once it's
+ * sent, and stays if it isn't.
  */
 import * as React from "react";
-import { ArrowUp, Diff, Eye, X } from "lucide-react";
+import { Diff, Eye, Pencil, Send, X } from "lucide-react";
 import type { ThreadKind } from "@/api/review";
 import { ComposeField } from "@/views/harness/compose-field";
 import { useDraft } from "@/views/harness/state";
@@ -105,8 +107,8 @@ export function ReviewComposer({
         />
         <div className="cp-bar">
           {newThread && <KindPicker value={kind} onChange={setKind} />}
-          <button type="button" className="cp-icon" aria-label="Preview" aria-pressed={preview} title={preview ? "Back to writing" : "Preview"} onClick={() => setPreview(!preview)}>
-            <Eye size={15} aria-hidden="true" />
+          <button type="button" className="cp-icon" aria-label={preview ? "Write" : "Preview"} aria-pressed={preview} title={preview ? "Write" : "Preview"} onClick={() => setPreview(!preview)}>
+            {preview ? <Pencil size={15} aria-hidden="true" /> : <Eye size={15} aria-hidden="true" />}
           </button>
           {picked && (
             <button type="button" className="cp-icon" aria-label="Insert a suggestion" title="Insert a suggestion" onClick={suggest}>
@@ -119,9 +121,8 @@ export function ReviewComposer({
               <X size={15} aria-hidden="true" />
             </button>
           )}
-          <button type="button" className="cp-send" disabled={!body || sending} aria-label={sendLabel} onClick={send}>
-            <ArrowUp size={15} aria-hidden="true" />
-            <span className="cp-label">{sending ? "Sending…" : sendLabel}</span>
+          <button type="button" className="cp-send rv-send" disabled={!body || sending} aria-label={sendLabel} aria-busy={sending || undefined} title={sending ? "Sending…" : sendLabel} onClick={send}>
+            <Send size={15} aria-hidden="true" />
           </button>
         </div>
       </div>

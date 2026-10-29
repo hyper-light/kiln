@@ -1,11 +1,14 @@
 /**
  * The Conversation (docs/ci.md W26-R07, R15): the change's PR-style list — its description in
  * markdown, then every comment in order (line threads' named where they sit), with the comment
- * box at the end. Flat like the inline threads: no cards, each entry its line and its markdown.
+ * box at the end. Flat like the inline threads: no cards, each entry its line and its markdown,
+ * its author's mark and the signature's shield as the mockup draws them (Ship's mockups plan, step 13).
  */
 import * as React from "react";
+import { ShieldCheck } from "lucide-react";
 import type { Thread } from "@/api/review";
 import { whoSaid } from "@/api/review";
+import { StatusGlyph } from "@/components/ui/status-glyph";
 import { relativeTime } from "@/lib/format";
 import { CommentText } from "./comment";
 import { ReviewComposer } from "./composer";
@@ -18,7 +21,15 @@ export function Description({ author, title, body, at }: { author: string; title
   return (
     <li className="rv-m" data-who={author.startsWith("agent:") ? "agent" : "person"}>
       <div className="rv-meta">
-        <span className="rv-who">{whoSaid(author)}</span>
+        <span className="rv-who">
+          <span className="rv-by">
+            <StatusGlyph state={author.startsWith("agent:") ? "agent" : "person"} size={12} />
+            {whoSaid(author)}
+          </span>
+          <span className="rv-seal" title="unsigned" aria-label="unsigned">
+            <ShieldCheck size={13} aria-hidden="true" />
+          </span>
+        </span>
         {at != null && <span className="rv-when">{relativeTime(at)}</span>}
       </div>
       {title && <p className="rv-title">{title}</p>}
@@ -34,13 +45,17 @@ export function Conversation({
   linesOf,
   threads,
   children,
+  box,
   draft,
   setDraft,
 }: {
   ops: Ops;
   linesOf: LinesOf;
   threads: Thread[];
+  /** What comes first: the description. */
   children: React.ReactNode;
+  /** The comment box, at the end, as the mockup draws it (Ship's mockups plan, step 13). */
+  box: React.ReactNode;
   draft: string | null;
   setDraft: (thread: string | null) => void;
 }) {
@@ -61,6 +76,7 @@ export function Conversation({
           />
         </li>
       ))}
+      {box}
     </ul>
   );
 }
