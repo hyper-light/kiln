@@ -1,0 +1,42 @@
+---- app
+System.InvalidOperationException: bad item -42 in cart 'c--294'
+   at Shop.Cart.Total() in /app/shop/Program.cs:line 16
+   at Shop.Program.Checkout(Int32 order) in /app/shop/Program.cs:line 23
+   at Shop.Program.<>c.<Main>b__5_0() in /app/shop/Program.cs:line 36
+   at Shop.Program.Run(String name, Func`1 f) in /app/shop/Program.cs:line 32
+---- app-again
+System.InvalidOperationException: bad item -7 in cart 'c--49'
+   at Shop.Cart.Total() in /app/shop/Program.cs:line 16
+   at Shop.Program.Checkout(Int32 order) in /app/shop/Program.cs:line 23
+   at Shop.Program.<>c.<Main>b__5_1() in /app/shop/Program.cs:line 37
+   at Shop.Program.Run(String name, Func`1 f) in /app/shop/Program.cs:line 32
+---- bcl
+System.FormatException: The input string 'x1' was not in a correct format.
+   at System.Number.ThrowFormatException[TChar](ReadOnlySpan`1 value)
+   at System.Int32.Parse(String s)
+   at Shop.Program.Parse(String s) in /app/shop/Program.cs:line 24
+   at Shop.Program.<>c.<Main>b__5_2() in /app/shop/Program.cs:line 38
+   at Shop.Program.Run(String name, Func`1 f) in /app/shop/Program.cs:line 32
+---- async
+System.Collections.Generic.KeyNotFoundException: order 5 not found
+   at Shop.Program.Fetch(Int32 id) in /app/shop/Program.cs:line 25
+   at Shop.Program.<>c.<Main>b__5_3() in /app/shop/Program.cs:line 39
+   at Shop.Program.Run(String name, Func`1 f) in /app/shop/Program.cs:line 32
+---- chained
+System.ApplicationException: order 99 could not load
+ ---> System.FormatException: The input string 'x99' was not in a correct format.
+   at System.Number.ThrowFormatException[TChar](ReadOnlySpan`1 value)
+   at System.Int32.Parse(String s)
+   at Shop.Program.Parse(String s) in /app/shop/Program.cs:line 24
+   at Shop.Program.Load(Int32 id) in /app/shop/Program.cs:line 28
+   --- End of inner exception stack trace ---
+   at Shop.Program.Load(Int32 id) in /app/shop/Program.cs:line 28
+   at Shop.Program.<>c.<Main>b__5_4() in /app/shop/Program.cs:line 40
+   at Shop.Program.Run(String name, Func`1 f) in /app/shop/Program.cs:line 32
+---- lambda
+System.DivideByZeroException: Attempted to divide by zero.
+   at Shop.Program.<>c.<Main>b__5_6(Int32 v) in /app/shop/Program.cs:line 41
+   at System.Linq.Enumerable.ListSelectIterator`2.Fill(ReadOnlySpan`1 source, Span`1 destination, Func`2 func)
+   at System.Linq.Enumerable.ListSelectIterator`2.ToList()
+   at Shop.Program.<>c.<Main>b__5_5() in /app/shop/Program.cs:line 41
+   at Shop.Program.Run(String name, Func`1 f) in /app/shop/Program.cs:line 32

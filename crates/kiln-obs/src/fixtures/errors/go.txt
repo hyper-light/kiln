@@ -1,0 +1,41 @@
+---- app
+main.checkout
+	/app/errors.go:56
+main.main
+	/app/errors.go:86
+runtime.main
+	/usr/local/go/src/runtime/proc.go:283
+runtime.goexit
+	/usr/local/go/src/runtime/asm_amd64.s:1700
+---- app-again
+main.checkout
+	/app/errors.go:56
+main.main
+	/app/errors.go:87
+runtime.main
+	/usr/local/go/src/runtime/proc.go:283
+runtime.goexit
+	/usr/local/go/src/runtime/asm_amd64.s:1700
+---- panic
+goroutine 1 [running]:
+runtime/debug.Stack()
+	/usr/local/go/src/runtime/debug/stack.go:26 +0x5e
+main.handler.func1()
+	/app/errors.go:64 +0x2f
+panic({0x4a8e80?, 0x5690b0?})
+	/usr/local/go/src/runtime/panic.go:792 +0x132
+main.handler.func2(...)
+	/app/errors.go:69
+main.handler(0x5)
+	/app/errors.go:71 +0x86
+main.main()
+	/app/errors.go:88 +0xc5
+---- parse
+main.parse
+	/app/errors.go:79
+main.main
+	/app/errors.go:89
+runtime.main
+	/usr/local/go/src/runtime/proc.go:283
+runtime.goexit
+	/usr/local/go/src/runtime/asm_amd64.s:1700

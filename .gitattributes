@@ -1,0 +1,5 @@
+# Test inputs are read byte for byte, and some were recorded from real programs: git leaves their
+# line endings as committed on every machine (Git for Windows sets core.autocrlf, which turned a
+# recorded Python traceback's lines into CRLF and failed the test that reads it).
+**/fixtures/** -text
+**/testdata/** -text

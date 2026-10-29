@@ -13,22 +13,6 @@ fn sh(script: &str) -> Option<String> {
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_owned())
 }
 
-/// The tightest memory.max on this process's cgroup and its ancestors, when any is set.
-#[cfg(target_os = "linux")]
-fn cgroup_memory_max() -> Option<u64> {
-    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::"))?.trim().to_owned();
-    let mut dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
-    let mut least: Option<u64> = None;
-    loop {
-        if let Some(m) = std::fs::read_to_string(dir.join("memory.max")).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-            least = Some(least.map_or(m, |l| l.min(m)));
-        }
-        if !dir.pop() || dir == std::path::Path::new("/sys/fs") {
-            return least;
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn close(a: u64, b: u64) -> bool {
     a.abs_diff(b) <= b / 100
@@ -56,10 +40,17 @@ fn w13_ac01_facts() -> anyhow::Result<()> {
     {
         let meminfo = sh("grep MemTotal /proc/meminfo").unwrap_or_default();
         let kb: u64 = meminfo.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0);
-        // What this process may use: the machine's, or less under a cgroup's memory.max (a gate's
-        // unit runs under one).
-        let usable = cgroup_memory_max().map_or(kb * 1024, |m| m.min(kb * 1024));
-        assert!(close(f.mem.total, usable), "memory {} vs /proc/meminfo {} and cgroup limit {:?}", f.mem.total, kb * 1024, cgroup_memory_max());
+        // What this process may use as its cgroups hold it, read here on its own: the least
+        // `memory.max` of its cgroup and those above it (v1's `memory.limit_in_bytes`), as a
+        // capped gate's unit (MemoryMax) is less than the machine (W05-R03).
+        let root = std::path::Path::new("/sys/fs/cgroup");
+        let limit = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::").map(|p| root.join(p.trim().trim_start_matches('/')))))
+            .and_then(|own| own.ancestors().take_while(|d| d.starts_with(root)).filter_map(|d| std::fs::read_to_string(d.join("memory.max")).ok()).filter_map(|t| t.trim().parse::<u64>().ok()).min())
+            .or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok().and_then(|t| t.trim().parse::<u64>().ok()).filter(|l| *l < 1 << 60));
+        let expected = limit.map_or(kb * 1024, |l| l.min(kb * 1024));
+        assert!(close(f.mem.total, expected), "memory {} vs /proc/meminfo {} and the cgroups' limit {limit:?}", f.mem.total, kb * 1024);
         assert_eq!(f.kernel.as_deref(), sh("uname -r").as_deref());
         assert_eq!(f.os_distro.as_deref(), sh(". /etc/os-release && echo \"$ID\"").as_deref().filter(|d| !d.is_empty()));
         let size: u64 = sh(&format!("df -B1 --output=size '{}' | tail -1", dir.path().display())).and_then(|s| s.parse().ok()).unwrap_or(0);

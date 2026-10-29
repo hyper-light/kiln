@@ -2533,7 +2533,9 @@ Gives step execution for `uses:`.
     - R05:
       - Node: `node24` runs on Node 24; `node20`, `node16` and `node12` run on Node 20. Builds
         come from nodejs.org, are checked against `SHASUMS256.txt`, and are kept in
-        `<work>/_externals`.
+        `<work>/_externals`. A download is asked for up to three times, a random 10–30 s apart
+        (a 404 or 403 once), each ask within 10 minutes, its body too, as GitHub's runner asks for
+        an action's archive. Each ask again is said in the step's log.
       - Inputs: `INPUT_*`, with defaults evaluated, and GitHub's "Unexpected input(s)" warning.
       - `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF`.
       - `pre`, `post`, `pre-if`, `post-if` and `STATE_*` (W06-R11). What a pre step saves,
@@ -7056,8 +7058,9 @@ live cluster, fault injection, security, performance, and mixed-version fleets.
   needs the GitHub account.*
 - **W22-AC04 Fault injection.** A test-only runner mode (`kiln agent --chaos <spec>`, compiled
   only with the `chaos` feature) drops connections, kills processes with the OOM signal, fills the
-  disk, delays the network and corrupts uploads. W05's retries and classes, W08's integrity checks
-  and W06's cleanup behave as specified under each.
+  disk, delays the network, corrupts uploads and fails a leg's first ask for a Node build. W05's
+  retries and classes, W08's integrity checks, W06's cleanup and a step's download tries behave as
+  specified under each.
 - **W22-AC05 Live end-to-end suite.** `.kiln/e2e-ci.yaml` (an extension of today's e2e.yaml) on
   pushes to `e2e/*`. It covers:
   - every executor the cluster's runners have;

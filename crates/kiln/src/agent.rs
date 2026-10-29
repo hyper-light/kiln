@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_OBSERVE, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -60,6 +60,9 @@ pub struct Opts {
     /// Reach (`crate::reach`): None leaves it off (the server's own in-process agent); otherwise
     /// whether this runner takes commands from other runners (it can always send them).
     pub reach: Option<bool>,
+    /// Observe (`crate::observe`): whether this runner keeps a replica of the observe group and
+    /// writes into it (off in a job pod and in the server's own in-process agent).
+    pub observe: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. Its terminals, AI sessions and agents work; it takes no jobs, keeps no front
     /// door or repo copies, and is never upgraded by the server.
@@ -119,6 +122,16 @@ fn ca_der(pem: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Load stored credentials, enrolling (or renewing) when needed. Retries until it succeeds.
+/// Shutdown, or (lingering, shutdown already said) the next 50 ms tick, to look again whether the
+/// loop may end.
+async fn shutdown_or_tick(shutdown: &Shutdown, lingering: bool) {
+    if lingering {
+        crate::rt::sleep(Duration::from_millis(50)).await;
+    } else {
+        shutdown.cancelled().await;
+    }
+}
+
 async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     if let Some((ca, leaf)) = &o.credentials {
         return Ok((ca.clone(), leaf.clone(), None));
@@ -1084,6 +1097,53 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         sync
     });
+    // Observe: this machine's replica of the observe group and its writes (none in a job pod).
+    let observe = (o.observe && !o.ephemeral).then(|| {
+        let obs = crate::observe::Observe::start(crate::observe::Settings {
+            dir: o.state_dir.join("observe"),
+            role: crate::observe::Role::Runner { me: name.clone(), http: http.clone(), server: o.server_url.clone() },
+            // The server moves the cutoffs and states the bound.
+            metrics_retention: Duration::ZERO,
+            logs_retention: Duration::ZERO,
+            spans_retention: Duration::ZERO,
+            max_series: 0,
+        });
+        crate::observe::api::set_global(obs.clone());
+        // Prometheus's scrapes of the targets the server says this machine reads.
+        crate::observe::scrape::start(&name, &name, http.clone(), shutdown.clone());
+        // The synthetic tests the server says this machine runs (it is their location by name).
+        crate::observe::synthetics::start(&name, shutdown.clone());
+        // The DogStatsD listeners the server says this machine opens.
+        crate::observe::statsd::start(&name, &name, shutdown.clone());
+        // The logs the server says this machine collects (its files, its journal).
+        crate::observe::collect::start(&name, &name, &o.state_dir.join("observe"), shutdown.clone());
+        // This machine's own figures, as the server's are.
+        let every = std::env::var("KILN_OBSERVE_HOST_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(crate::observe::host::EVERY, Duration::from_secs);
+        crate::observe::host::start(obs.clone(), name.clone(), "runner", every);
+        // Every container this machine runs, as Datadog's container check sees them.
+        crate::observe::containers::start(obs.clone(), name.clone(), every);
+        // What the records this machine takes come to, as Datadog's estimated usage counts it.
+        crate::observe::indexes::start_usage(obs.clone(), name.clone(), crate::observe::indexes::USAGE_EVERY);
+        // And its own registry (`crate::metrics`: what this process counts, its repositories' sync
+        // and its moves among it), as the server's is read, of its host.
+        crate::observe::kiln::start_registry(obs.clone(), name.clone(), every, Some(net.clone()));
+        // Apps on this machine send OTLP here, as to a collector: OTLP/HTTP's port and OTLP/gRPC's,
+        // each taking either; and Datadog's tracers, as to their Agent, on its port too.
+        crate::observe::ddtrace::start(obs.clone(), name.clone(), shutdown.clone());
+        for addr in [crate::observe::otlp::local_addr(), crate::observe::otlp::local_grpc_addr(), crate::observe::otlp::local_dd_addr()].into_iter().flatten() {
+            crate::rt::spawn(crate::observe::otlp::serve_local(addr, obs.clone(), shutdown.clone()));
+        }
+        let (up, out) = (up_tx.clone(), obs.outgoing());
+        crate::rt::spawn(async move {
+            while let Ok(m) = out.recv().await {
+                let msg = AgentMsg::Observe { json: crate::observe::wire::encode(&m.msg), bytes: m.bytes };
+                if up.send(Up::Observe(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        obs
+    });
     // The cluster group's learner: this machine's replica of kiln's records (docs/p2p.md, P2),
     // started once the server says which member it is (never in a job pod or an outpost).
     let cluster: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>> = Arc::default();
@@ -1281,6 +1341,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut retire_at: Option<Instant> = None;
     let mut retire_span: Option<tracing::Span> = None;
     let mut retire_job: Option<String> = None;
+    // Shutting down, until when the loop runs on: the log sources' last writes come back over its
+    // connection before they write their places down (a stop then repeats no record).
+    let mut lingering: Option<Instant> = None;
     #[cfg(unix)]
     let mut moved: std::collections::HashSet<crate::instances::Owned> = std::collections::HashSet::new();
     #[cfg(unix)]
@@ -1426,6 +1489,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             };
             uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
         }
+        if let Some(until) = lingering
+            && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
+        {
+            return Ok(());
+        }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
         if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
@@ -1441,6 +1509,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         if retiring && jobs.is_empty() && terms.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
             tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
+            // What its tracers' spans counted, written before it goes, as a stop's is.
+            crate::observe::ddtrace::finish(Duration::from_secs(3)).await;
             if let Some(job) = retire_job.take() {
                 uplink.msg(AgentMsg::UpgradeLog { job, line: "the old runner's last jobs are done: it retired".to_owned() }).await;
                 crate::rt::sleep(Duration::from_millis(300)).await;
@@ -1453,7 +1523,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             return Ok(());
         }
         let ev = futures::select_biased! {
-            () = shutdown.cancelled().fuse() => Ev::Shutdown,
+            () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
@@ -1480,11 +1550,27 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         };
         match ev {
             Ev::Shutdown => {
+                if lingering.is_some() {
+                    continue;
+                }
                 for r in jobs.values() {
                     r.cancel.cancel();
                 }
+                // The browsers it drives closed before it goes.
                 crate::browser::driven::stop_all().await;
-                return Ok(());
+                // What this machine collected and counted written before it goes: three seconds
+                // at the most.
+                let collecting = match crate::observe::collect::get() {
+                    Some(c) if !c.stopped() => {
+                        c.stop_signal();
+                        true
+                    }
+                    _ => false,
+                };
+                if !collecting && crate::observe::last_written() {
+                    return Ok(());
+                }
+                lingering = Some(Instant::now() + Duration::from_secs(3));
             }
             Ev::Delayed(crate::runner::chaos::Due { lane, kind, data, again }) => {
                 // As an undelayed frame goes: sent while connected and welcomed, kept otherwise,
@@ -1968,6 +2054,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if let Some(s) = &sync {
                         s.connected(false);
                     }
+                    if let Some(ob) = &observe {
+                        ob.up("", false);
+                    }
                     if let Some(r) = &reach {
                         r.feed(crate::reach::node::In::Server(false)).await;
                     }
@@ -1979,6 +2068,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
                 chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
+                // How long saying what it is takes (its build's probes, its facts), told below: the
+                // server's frames wait meanwhile.
+                let said_from = Instant::now();
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
@@ -1999,13 +2091,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
-                // an outpost says it's one instead.
+                // an outpost says it's one instead. Its binary's hash was worked out as this runner
+                // started (`updates::warm_own_binary`), its engine's probes off the event loop.
+                let building = Instant::now();
                 let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
-                // It sends its conversations' store: the server keeps them from that.
-                if shipper.is_some()
-                    && let AgentMsg::Build { caps, .. } = &mut build
-                {
-                    *caps |= proto::CAP_CONVO;
+                let build_took = building.elapsed();
+                if let AgentMsg::Build { caps, .. } = &mut build {
+                    // It sends its conversations' store: the server keeps them from that.
+                    if shipper.is_some() {
+                        *caps |= proto::CAP_CONVO;
+                    }
+                    // A runner that keeps no replica does not say it replicates.
+                    if observe.is_none() {
+                        *caps &= !proto::CAP_OBSERVE;
+                    }
                 }
                 if !o.ephemeral
                     && let Ok(b) = proto::encode(&build)
@@ -2027,10 +2126,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
                 // part of the fleet).
-                if !o.ephemeral
-                    && !o.outpost
-                    && let Ok(b) = proto::encode(&crate::updates::runner_facts())
-                {
+                let started = Instant::now();
+                let facts = (!o.ephemeral && !o.outpost).then(crate::updates::runner_facts);
+                let facts_took = started.elapsed();
+                if let Some(Ok(b)) = facts.as_ref().map(proto::encode) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
                     probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
@@ -2062,6 +2161,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(s) = &sync {
                     s.connected(true);
                 }
+                if let Some(ob) = &observe {
+                    ob.up("", true);
+                }
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Up);
                 }
@@ -2072,6 +2174,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     front_door_sent = Some(json);
+                }
+                // Its frames waited all that while (the server's Welcome, observe's join): a slow one said.
+                let took = said_from.elapsed();
+                let (took_ms, build_ms, facts_ms) = (took.as_millis() as u64, build_took.as_millis() as u64, facts_took.as_millis() as u64);
+                if took > Duration::from_secs(2) {
+                    tracing::warn!(took_ms, build_ms, facts_ms, "saying what this runner is took long: the server's frames waited");
+                } else {
+                    tracing::debug!(took_ms, build_ms, facts_ms, "said what this runner is to the server");
                 }
             }
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
@@ -2101,6 +2211,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 limit_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
+                }
+                if let Some(ob) = &observe {
+                    ob.up("", false);
                 }
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Down);
@@ -2355,6 +2468,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         welcomed = false;
                         if let Some(s) = &sync {
                             s.connected(false);
+                        }
+                        if let Some(ob) = &observe {
+                            ob.up("", false);
                         }
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(false)).await;
@@ -2838,6 +2954,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Sync { json, raft } => {
                         if let Some(s) = &sync {
                             s.heard(&json, raft);
+                        }
+                    }
+                    ServerMsg::Observe { json, bytes } => {
+                        if let Some(ob) = &observe {
+                            ob.heard("", json, bytes);
                         }
                     }
                     ServerMsg::Cluster { json, raft } => {
@@ -3338,6 +3459,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
+                    Up::Observe(m) => (LANE_OBSERVE, Kind::Control, proto::encode(m)),
                     Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
                     Up::File(m) => (LANE_FILES, Kind::Log, proto::encode(m)),
                     Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
@@ -3360,7 +3482,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 } else if again {
                     // Sent from `unreceived` and `journal` once connected again.
-                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_OBSERVE && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.

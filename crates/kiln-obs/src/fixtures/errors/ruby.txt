@@ -1,0 +1,40 @@
+---- app
+errors.rb:8:in 'block in Cart#total': bad item -42 in cart 'c--294' (ArgumentError)
+	from errors.rb:8:in 'Array#each'
+	from errors.rb:8:in 'Cart#total'
+	from errors.rb:13:in 'Object#checkout'
+	from errors.rb:47:in 'block in <main>'
+	from errors.rb:41:in 'Object#run'
+	from errors.rb:47:in '<main>'
+---- app-again
+errors.rb:8:in 'block in Cart#total': bad item -7 in cart 'c--49' (ArgumentError)
+	from errors.rb:8:in 'Array#each'
+	from errors.rb:8:in 'Cart#total'
+	from errors.rb:13:in 'Object#checkout'
+	from errors.rb:48:in 'block in <main>'
+	from errors.rb:41:in 'Object#run'
+	from errors.rb:48:in '<main>'
+---- core
+<internal:kernel>:288:in 'Kernel#Integer': invalid value for Integer(): "x1" (ArgumentError)
+	from errors.rb:14:in 'Object#parse'
+	from errors.rb:49:in 'block in <main>'
+	from errors.rb:41:in 'Object#run'
+	from errors.rb:49:in '<main>'
+---- chained
+errors.rb:19:in 'Object#load': order 99 could not load (RuntimeError)
+	from errors.rb:50:in 'block in <main>'
+	from errors.rb:41:in 'Object#run'
+	from errors.rb:50:in '<main>'
+<internal:kernel>:288:in 'Kernel#Integer': invalid value for Integer(): "x99" (ArgumentError)
+	from errors.rb:14:in 'Object#parse'
+	from errors.rb:17:in 'Object#load'
+	from errors.rb:50:in 'block in <main>'
+	from errors.rb:41:in 'Object#run'
+	from errors.rb:50:in '<main>'
+---- block
+errors.rb:51:in 'Integer#/': divided by 0 (ZeroDivisionError)
+	from errors.rb:51:in 'block (2 levels) in <main>'
+	from errors.rb:51:in 'Array#map'
+	from errors.rb:51:in 'block in <main>'
+	from errors.rb:41:in 'Object#run'
+	from errors.rb:51:in '<main>'

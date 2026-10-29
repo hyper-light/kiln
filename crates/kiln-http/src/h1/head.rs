@@ -187,6 +187,24 @@ fn version(minor: Option<u8>) -> Result<Version, Error> {
     }
 }
 
+/// Whether the request line at the start of `buf` is three parts, the last an HTTP-version as RFC
+/// 9112 §2.3 writes one (`HTTP/` DIGIT `.` DIGIT; or as much of one as has come, the line not whole
+/// yet): only then is a version httparse refuses one this server doesn't serve (505, RFC 9110
+/// §15.6.6). A line of more parts or fewer, or a last part of anything else (a target with a space
+/// in it: `PUT /clouds/bad name HTTP/1.1`), is no request line, which RFC 9112 §3.2 answers 400.
+fn names_a_version(buf: &[u8]) -> bool {
+    const SHAPE: &[u8] = b"HTTP/0.0";
+    let (line, whole) = match buf.iter().position(|&b| b == b'\n') {
+        Some(end) => (buf.get(..end).unwrap_or_default(), true),
+        None => (buf, false),
+    };
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut parts = line.split(|&b| b == b' ');
+    let (Some(_), Some(_), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { return false };
+    let fits = version.iter().zip(SHAPE).all(|(&b, &s)| if s == b'0' { b.is_ascii_digit() } else { b == s });
+    fits && if whole { version.len() == SHAPE.len() } else { version.len() <= SHAPE.len() }
+}
+
 fn head_error(e: httparse::Error) -> Error {
     match e {
         httparse::Error::TooManyHeaders => Error::parse(Parse::HeadTooLarge),
@@ -221,6 +239,8 @@ fn parse_request_in(buf: &mut BytesMut, max: usize, spans: &mut Vec<Spans>, reus
         Ok(httparse::Status::Complete(len)) => len,
         Ok(httparse::Status::Partial) if buf.len() >= max => return Err(Error::parse(Parse::HeadTooLarge)),
         Ok(httparse::Status::Partial) => return Ok(None),
+        // No request line at all: answered 400, not 505 (RFC 9112 §3.2).
+        Err(httparse::Error::Version) if !names_a_version(buf) => return Err(Error::parse(Parse::Head)),
         Err(e) => return Err(head_error(e)),
     };
     if len > max {
@@ -563,6 +583,20 @@ mod tests {
         // The same length repeated is that length; chunked over a length wins, and the connection closes.
         assert!(req("POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\n").is_ok_and(|h| h.is_some_and(|h| h.framing == Framing::Length(5))));
         assert!(req("POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n").is_ok_and(|h| h.is_some_and(|h| h.framing == Framing::Chunked && !h.keep_alive)));
+    }
+
+    /// A version this server doesn't serve is told apart from no request line at all: a target
+    /// with a space in it, a stray word where the version goes (RFC 9112 §3.2, RFC 9110 §15.6.6).
+    #[test]
+    fn a_request_line_that_is_none_is_told_from_a_version_not_served() {
+        let kind = |s: &str| req(s).err().map(|e| e.kind());
+        for bad in ["PUT /api/clouds/bad name HTTP/1.1\r\nHost: x\r\n\r\n", "GET / FOO\r\n\r\n", "GET / HTTP/1.1 x\r\n\r\n", "GET / HTTPS/1.1\r\n\r\n"] {
+            assert_eq!(kind(bad), Some(crate::error::Kind::Parse(Parse::Head)), "{bad:?}");
+        }
+        for unserved in ["GET / HTTP/2.0\r\n\r\n", "GET / HTTP/3.0\r\n\r\n", "GET / HTTP/2"] {
+            assert_eq!(kind(unserved), Some(crate::error::Kind::Parse(Parse::Version)), "{unserved:?}");
+        }
+        assert!(names_a_version(b"GET / HTTP/2.0\r\n") && names_a_version(b"GET / HTTP/") && !names_a_version(b"GET / HTTP/2.0x\r\n") && !names_a_version(b"GET /a b HTTP/1.1"));
     }
 
     #[test]

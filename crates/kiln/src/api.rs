@@ -340,6 +340,61 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let batch = (*batch).to_owned();
             return boxed(|| sync_bundle_put(&hub, &batch, req)).await;
         }
+        // OTLP/HTTP (`crate::observe::otlp`), with the ingest token or the admin's.
+        (&Method::POST, ["v1", "metrics"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Metrics, req, ok).await);
+        }
+        (&Method::POST, ["v1", "logs"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
+        }
+        (&Method::POST, ["v1", "traces"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Traces, req, ok).await);
+        }
+        // Prometheus's remote write (`crate::observe::remote`): the same token, as a bearer token
+        // or basic auth's password.
+        (&Method::POST, ["api", "v1", "write"]) => {
+            let ok = crate::observe::remote::token(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(&t, &hub.admin_token));
+            if !ok {
+                return Ok(srv::text(StatusCode::UNAUTHORIZED, "a remote write sends the ingest token: `authorization: credentials`, `bearer_token`, or basic auth's password"));
+            }
+            return Ok(match crate::observe::api::get() {
+                Some(o) => crate::observe::remote::answer(o, req).await,
+                None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
+            });
+        }
+        // Datadog's Agent (`crate::observe::ddagent`) at Datadog's own paths, its API key the same
+        // token: what Datadog answers a key that is not one.
+        (_, segs) if crate::observe::ddagent::is_datadog(segs) => {
+            let ok = crate::observe::ddagent::api_key(&req).is_some_and(|k| crate::observe::api::ingest_allowed(&k, &hub.admin_token));
+            if !ok {
+                return Ok(srv::json(StatusCode::FORBIDDEN, &serde_json::json!({ "errors": ["Forbidden", "API key is missing or invalid"] })));
+            }
+            return Ok(match crate::observe::api::get() {
+                Some(o) => crate::observe::ddagent::answer(o, segs, req).await,
+                None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
+            });
+        }
+        // OTLP/gRPC (`crate::observe::otlp::grpc`): the same token, as gRPC's metadata.
+        (&Method::POST, [service, "Export"]) if crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).is_some() => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            let signal = crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).unwrap_or(crate::observe::otlp::Signal::Metrics);
+            return Ok(crate::observe::api::otlp_grpc(signal, req, ok).await);
+        }
+        // The clouds' pushes (`crate::observe::cloud::push`), with the ingest token or the admin's:
+        // Firehose sends it as its access key, a Pub/Sub push subscription in its endpoint's query.
+        (&Method::POST, ["v1", "firehose"]) => {
+            let ok = req.headers().get("x-amz-firehose-access-key").and_then(|v| v.to_str().ok()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::cloud::push::firehose(req, ok).await);
+        }
+        (&Method::POST, ["v1", "pubsub"]) => {
+            let ok = srv::query(&req).get("token").is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::cloud::push::pubsub(req, ok).await);
+        }
+        // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
+        (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
@@ -483,6 +538,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let rest: Vec<&str> = rest.to_vec();
             let body: serde_json::Value = if method == Method::POST { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::experiments::route(&hub, &caller, &method, &rest, &q, body)).await.map_err(|(c, m)| err(c, m))
+        }
+        // Observe's routes as a task of their own: its handlers reach out (a cloud's pull, a
+        // synthetic test) and nest deep, and in a debug build the routers' frames under them
+        // (each arm's temporaries a slot of its own) took a shard's 2 MiB stack whole.
+        (_, ["api", "observe", "v1", rest @ ..]) => {
+            let rest: Vec<String> = rest.iter().map(|s| (*s).to_owned()).collect();
+            let q = q.clone();
+            crate::rt::spawn(async move {
+                let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+                crate::observe::api::route(&rest, &q, req).await
+            })
+            .await
+            .unwrap_or_else(|_| Err((StatusCode::INTERNAL_SERVER_ERROR, "the request's task ended before it answered".to_owned())))
+            .map_err(|(c, m)| err(c, m))
         }
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
@@ -3912,6 +3981,8 @@ async fn github_hook(hub: &Arc<Hub>, req: Request) -> R {
             return Err(err(StatusCode::UNAUTHORIZED, "bad signature"));
         }
     }
+    // What GitHub said, as events and metrics (`crate::observe::github`).
+    crate::observe::github::webhook(&event, &body);
     // Without the CI engine a webhook only hints; the poll decides what changed (GitOps: state
     // comes from git). With it, GitHub's payload reaches the workflows (docs/ci.md W03-R07).
     let hub = Arc::clone(hub);
