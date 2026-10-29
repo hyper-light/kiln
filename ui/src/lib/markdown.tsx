@@ -315,7 +315,7 @@ export function CommentCode({ body, lang }: { body: string; lang?: string }) {
         <span className="md-code-lang">{lang ?? "text"}</span>
         <CopyIcon text={body} label="Copy code" />
       </div>
-      <pre className="md-code-body">
+      <pre className="md-code-body" data-code-scroll>
         <code>
           {body.split("\n").map((line, i) => (
             <span key={i} className="md-ln" data-n={i + 1}>

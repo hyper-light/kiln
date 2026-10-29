@@ -166,8 +166,9 @@
 .md-copy[data-done] {
   color: var(--color-ok);
 }
-/* Nothing scrolls sideways (W21-AC01): a long line wraps within its own row, under its text, its
-   number once at its top, as the diff's lines do. */
+/* A long line wraps within its own row, under its text, its number once at its top, as the diff's
+   lines do; in the review's sections it stays on one line and scrolls (.rv-s .md-ln, W21-AC01's
+   one exception: code, marked data-code-scroll). */
 .md-code-body {
   margin: 0;
   padding: 4px 0;
@@ -374,11 +375,14 @@
   text-transform: uppercase;
   color: #b9bbc2;
 }
+/* Files' count in the head's right, in body text, as the mockup draws it (Ship's mockups plan, step 12). */
 .rv-sum {
+  font-family: var(--font-sans);
+  font-size: 13px;
   font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
-  color: #8b8e96;
+  color: #a1a4ad;
 }
 .rv-bar {
   display: flex;
@@ -491,29 +495,16 @@
   color: #bfdccf;
 }
 
-/* the vorpal search */
+/* the vorpal search: a boxed field, as the mockup draws it (the app's .field) */
 .rv-search {
   margin: 8px 0;
 }
 .rv-q {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   color: #8b8e96;
 }
 .rv-q input {
   flex: 1;
-  min-width: 0;
-  border: 0;
-  border-bottom: 1px solid #30323b;
-  background: none;
-  padding: 4px 2px;
-  color: #eceef2;
   font: inherit;
-  outline: none;
-}
-.rv-q input:focus {
-  border-bottom-color: #4a4560;
 }
 .rv-hits {
   display: grid;
@@ -622,6 +613,18 @@
 .rv-code {
   border-top: 1px solid var(--k-line, #2a2c31);
   overflow-x: auto;
+}
+/* A comment's code (a suggestion, a fenced block) on one line that scrolls sideways in its own box,
+   as the mockup draws it (Ship's mockups plan, step 12); the diff's own lines wrap. */
+.rv-s .md-code-body {
+  overflow-x: auto;
+}
+.rv-s .md-ln {
+  grid-template-columns: 38px max-content;
+  min-width: 100%;
+  box-sizing: border-box;
+  white-space: pre;
+  overflow-wrap: normal;
 }
 .rv-l {
   display: grid;
@@ -785,13 +788,25 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  align-items: baseline;
+  align-items: center;
   min-width: 0;
 }
+/* Who, with a person's or an agent's mark, as a Ship row's author (Ship's mockups plan, step 12). */
+.rv-by {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  min-width: 0;
+}
+/* The signature's shield: dim while unsigned (comments are signed from W27-R03). */
 .rv-seal {
   display: inline-flex;
   color: #8fb5a6;
   opacity: 0.55;
+}
+/* The kind's chip in a comment's line: its icon alone. */
+.rv-k.rv-ki {
+  padding: 3px 6px;
 }
 /* Its box one width as it ticks ("9m ago" to "10m ago"), as a row's age is, so pushed right it never
    moves: nothing on screen moves while a row is open (Agent pace and checks, step 2). */

@@ -83,7 +83,7 @@ export function SuggestionBlock({
           <CopyIcon text={lines.join("\n")} label="Copy the suggestion" />
         </span>
       </div>
-      <pre className="md-code-body">
+      <pre className="md-code-body" data-code-scroll>
         <code>
           {old.text.map((t, i) => (
             <span key={`o${i}`} className="md-ln" data-n={old.start + i} data-sign="−">

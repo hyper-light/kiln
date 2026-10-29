@@ -1,14 +1,17 @@
 /**
  * A thread in a Ship item's dropdown (docs/ci.md W26-R07, R08): flat like the agent chat's turns
- * (a lighter band, top and bottom borders, no inset cards). Each comment's line is who, the
- * signature seal, the kind's icon on the thread's first, when, and ⋯ (reply, copy, quote, edit,
- * delete, the kind's, what can't run shown with why); a long press on the body copies it. The
- * body is markdown (step 6's CommentText, its suggestions with Apply). Reply and Resolve are
- * aligned under the last comment; a reply is the step 6 composer.
+ * (a lighter band, top and bottom borders, no inset cards). Each comment's line is as the mockup
+ * draws it (Ship's mockups plan, step 12): who, with a person's or an agent's mark; the signature's
+ * shield (dim, unsigned, until comments are signed: W27-R03); the kind's chip on the thread's
+ * first; when; and ⋯ (reply, copy, quote, edit, delete, the kind's, what can't run shown with
+ * why); a long press on the body copies it. The body is markdown (step 6's CommentText, its
+ * suggestions with Apply). Reply and Resolve are aligned under the last comment; a reply is the
+ * step 6 composer.
  */
 import * as React from "react";
-import { BadgeCheck, Check, Copy, MoreHorizontal, Pencil, Quote, Reply, RotateCcw, Trash2, X } from "lucide-react";
+import { Check, Copy, MoreHorizontal, Pencil, Quote, Reply, RotateCcw, ShieldCheck, Trash2, X } from "lucide-react";
 import { whoSaid, type Thread, type ThreadComment } from "@/api/review";
+import { StatusGlyph } from "@/components/ui/status-glyph";
 import { relativeTime } from "@/lib/format";
 import { CommentText } from "./comment";
 import { ReviewComposer } from "./composer";
@@ -162,12 +165,15 @@ function CommentCard({ c, t, root, ops, linesOf, where, onReplyDraft }: { c: Thr
     <div className="rv-m" data-who={c.author === ops.me ? "you" : c.author.startsWith("agent:") ? "agent" : "person"}>
       <div className="rv-meta">
         <span className="rv-who">
-          {whoSaid(c.author)}
+          <span className="rv-by">
+            <StatusGlyph state={c.author.startsWith("agent:") ? "agent" : "person"} size={12} />
+            {whoSaid(c.author)}
+          </span>
           <span className="rv-seal" title="unsigned" aria-label="unsigned">
-            <BadgeCheck size={12} aria-hidden="true" />
+            <ShieldCheck size={13} aria-hidden="true" />
           </span>
           {KindIcon && (
-            <span className="rv-k" data-k={t.kind} title={t.kind ?? ""} aria-label={t.kind ?? ""}>
+            <span className="rv-k rv-ki" data-k={t.kind} title={t.kind ?? ""} aria-label={t.kind ?? ""}>
               <KindIcon size={12} aria-hidden="true" />
             </span>
           )}
