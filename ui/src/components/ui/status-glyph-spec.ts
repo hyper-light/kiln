@@ -33,6 +33,13 @@ export const STATES = [
   "agent",
   "person",
   "flag",
+  "draft",
+  "requested",
+  "changes",
+  "blocked",
+  "fixing",
+  "conflict",
+  "approved",
 ] as const;
 export type GlyphState = (typeof STATES)[number];
 
@@ -101,7 +108,7 @@ export const GLYPHS: Record<GlyphState, Glyph> = {
       },
     ],
   },
-  superseded: { word: "superseded", parts: [ring("off", 1.2), { k: "path", d: "M3.9 10.1 L10.1 3.9", stroke: "off", w: 1.2, m: "fade" }] },
+  superseded: { word: "superseded", parts: [ring("off", 1.2), { k: "path", d: "M3.9 10.1 L10.1 3.9", stroke: "off", w: 1.2 }] },
   needs: {
     word: "needs you",
     parts: [
@@ -203,6 +210,57 @@ export const GLYPHS: Record<GlyphState, Glyph> = {
       { k: "path", d: "M3 2.2 H11 L9 4.8 L11 7.4 H3", stroke: "done", w: 1.3, m: "flutter" },
     ],
   },
+  draft: {
+    word: "draft",
+    parts: [
+      { k: "path", d: "M3.4 1.8 H8.4 L10.6 4 V12.2 H3.4 Z", stroke: "idle", w: 1.2, m: "fade" },
+      { k: "path", d: "M5.2 7 H8.8 M5.2 9.4 H7.6", stroke: "idle", w: 1.1 },
+    ],
+  },
+  requested: {
+    word: "requested",
+    parts: [
+      { k: "path", d: BUBBLE, stroke: "pause", w: 1.3 },
+      {
+        k: "g",
+        m: "wave",
+        parts: [
+          { k: "circle", cx: 4.6, cy: 5.9, r: 0.8, fill: "pause" },
+          { k: "circle", cx: 7, cy: 5.9, r: 0.8, fill: "pause" },
+          { k: "circle", cx: 9.4, cy: 5.9, r: 0.8, fill: "pause" },
+        ],
+      },
+    ],
+  },
+  changes: {
+    word: "changes asked",
+    parts: [
+      { k: "path", d: BUBBLE, stroke: "warn", w: 1.3 },
+      { k: "path", d: "M4.4 6.2 C5.3 5 6.1 5 7 6.2 S8.7 7.4 9.6 6.2", stroke: "warn", w: 1.3, m: "wave" },
+    ],
+  },
+  blocked: {
+    word: "blocked",
+    parts: [
+      { k: "path", d: "M5 1.6 H9 L12.4 5 V9 L9 12.4 H5 L1.6 9 V5 Z", stroke: "fail", w: 1.3 },
+      { k: "path", d: "M4.6 7 H9.4", stroke: "fail", w: 1.6, m: "throb" },
+    ],
+  },
+  fixing: {
+    word: "fixing",
+    parts: [
+      { k: "g", m: "turn", parts: [ring("work", 1.2, { dash: "3.2 2.4" })] },
+      { k: "path", d: "M7 4.2 L7.8 6.2 L9.8 7 L7.8 7.8 L7 9.8 L6.2 7.8 L4.2 7 L6.2 6.2 Z", stroke: "work", w: 1.1, m: "twinkle" },
+    ],
+  },
+  conflict: {
+    word: "conflicts",
+    parts: [
+      { k: "path", d: "M3.6 12.4 V9 C3.6 6.6 7 6.6 7 4 M10.4 12.4 V9 C10.4 6.6 7 6.6 7 4", stroke: "warn", w: 1.3 },
+      { k: "circle", cx: 7, cy: 2.6, r: 1.1, fill: "fail", m: "blink" },
+    ],
+  },
+  approved: { word: "approved", parts: [ring("done", 1.3), { k: "path", d: "M4.3 7.3 L6.2 9.1 L9.8 5.2", stroke: "done", w: 1.5, m: "glow" }] },
 };
 
 /** The path of a wait's progress: from the top of a 5-unit ring, clockwise, `p` of the way round. */
@@ -231,13 +289,13 @@ export function moves(state: GlyphState): boolean {
   return GLYPHS[state].parts.some((part) => part.m !== undefined);
 }
 
-// ---- The journey: a commit from landing to replanting -------------------------------------------
+// ---- The journey: a commit from review to replanting --------------------------------------------
 
-export const STAGES = ["land", "checks", "build", "staging", "production", "replant"] as const;
+export const STAGES = ["review", "land", "checks", "build", "staging", "production", "replant"] as const;
 export type Stage = (typeof STAGES)[number];
-export const STAGE_WORD: Record<Stage, string> = { land: "Land", checks: "Checks", build: "Build", staging: "Staging", production: "Production", replant: "Replant" };
+export const STAGE_WORD: Record<Stage, string> = { review: "Review", land: "Land", checks: "Checks", build: "Build", staging: "Staging", production: "Production", replant: "Replant" };
 /** The shorter word under a pip, where room is tight. */
-export const STAGE_SHORT: Record<Stage, string> = { land: "Land", checks: "Checks", build: "Build", staging: "Staging", production: "Prod", replant: "Replant" };
+export const STAGE_SHORT: Record<Stage, string> = { review: "Review", land: "Land", checks: "Checks", build: "Build", staging: "Staging", production: "Prod", replant: "Replant" };
 
 export interface Pip {
   stage: Stage;
@@ -248,12 +306,22 @@ export interface Pip {
 
 /** A stage whose work is done, so the line to the next one lights. */
 export function pipDone(state: GlyphState): boolean {
-  return state === "passed" || state === "reused" || state === "flaky" || state === "healthy" || state === "rode" || state === "replanted" || state === "soaking" || state === "partial";
+  return (
+    state === "passed" ||
+    state === "reused" ||
+    state === "flaky" ||
+    state === "healthy" ||
+    state === "rode" ||
+    state === "replanted" ||
+    state === "soaking" ||
+    state === "partial" ||
+    state === "approved"
+  );
 }
 
 /** A stage with work under way (or waiting on you), so light flows into it along the line. */
 export function pipFlows(state: GlyphState): boolean {
-  return state === "running" || state === "guard" || state === "replanting" || state === "needs";
+  return state === "running" || state === "guard" || state === "replanting" || state === "needs" || state === "fixing";
 }
 
 /** The whole strip in words, as its accessible name: each stage and how it stands. */

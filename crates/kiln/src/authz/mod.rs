@@ -73,6 +73,11 @@ pub const CAPABILITIES: &[&str] = &[
     "users.manage",
     "audit.read",
     "binaries.publish",
+    // Observe (docs/observe.md §7): reading it, writing to it (dashboards, monitors, data posted),
+    // managing it (its integrations and clouds, which hold secrets; its store).
+    "observe.read",
+    "observe.write",
+    "observe.manage",
 ];
 
 /// What a route needs when any signed-in principal may call it (who you are, the schemas).
@@ -83,8 +88,8 @@ pub const SIGNED_IN: &str = "signed-in";
 /// manages everyone's agents, debugs, approves, deploys and manages the queue, secrets and
 /// variables; `admin` and `owner` have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
-    const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read"];
-    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use"];
+    const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read", "observe.read"];
+    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use", "observe.write"];
     const MAINTAINER: &[&str] = &[
         "runs.debug",
         "runs.approve",
@@ -97,6 +102,7 @@ pub fn role(name: &str) -> Option<Vec<&'static str>> {
         "variables.manage",
         "secrets.manage",
         "images.build",
+        "observe.manage",
     ];
     Some(match name {
         "viewer" => VIEWER.to_vec(),
@@ -335,6 +341,7 @@ pub static ROUTES: &[Rule] = &[
     // W10: one's own passkeys and password.
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
+    r("POST", "/api/me/identity", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
     r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/password", SIGNED_IN, At::Server),
@@ -376,7 +383,12 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
+    // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
+    r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
+    r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("DELETE", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
     r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
     r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
@@ -393,6 +405,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/review", "diffs.review", At::Diff(2)),
     r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
+    r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/reclaim", "diffs.submit", At::Diff(2)),
@@ -510,6 +525,58 @@ pub static ROUTES: &[Rule] = &[
     // Deployments (docs/cd.md).
     r("GET", "/api/cd/**", "runs.read", At::Server),
     any("/api/cd/**", "environments.deploy", At::Server),
+    // Observe (docs/observe.md §7): every GET and every query, search and check asked by POST
+    // reads; integrations, clouds, scrape targets, log sources (they read machines' files) and the
+    // store's operations manage; the rest writes (dashboards,
+    // monitors, series, logs and events posted). Snapshot files and OTLP are answered before this,
+    // on tokens of their own.
+    r("GET", "/api/observe/v1/**", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/query", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/checks/status", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/search", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/aggregate", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/facets", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/patterns", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/spans/search", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/spans/aggregate", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/spans/facets", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/events/search", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/monitors/validate", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/dora/deployments", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/dora/failures", "observe.read", At::Server),
+    any("/api/observe/v1/integrations/**", "observe.manage", At::Server),
+    any("/api/observe/v1/clouds/**", "observe.manage", At::Server),
+    any("/api/observe/v1/scrapes/**", "observe.manage", At::Server),
+    // Synthetic tests reach endpoints from the machines, as scrapes do.
+    any("/api/observe/v1/synthetics/**", "observe.manage", At::Server),
+    // DogStatsD listeners open sockets on the machines.
+    any("/api/observe/v1/statsd/**", "observe.manage", At::Server),
+    any("/api/observe/v1/log_sources/**", "observe.manage", At::Server),
+    // Pipelines change every record stored from then on: a maintainer's; trying one, a reader's.
+    r("POST", "/api/observe/v1/pipeline_test", "observe.read", At::Server),
+    any("/api/observe/v1/pipelines", "observe.manage", At::Server),
+    any("/api/observe/v1/pipelines/**", "observe.manage", At::Server),
+    any("/api/observe/v1/pipeline_order", "observe.manage", At::Server),
+    // The sensitive data scanner changes every record stored from then on, and its test hashes
+    // with this kiln's key: a maintainer's.
+    any("/api/observe/v1/scanner/**", "observe.manage", At::Server),
+    // Archives write every record they take to a store outside, with a cloud integration's
+    // credentials: a maintainer's.
+    any("/api/observe/v1/archives", "observe.manage", At::Server),
+    any("/api/observe/v1/archives/**", "observe.manage", At::Server),
+    any("/api/observe/v1/archive_order", "observe.manage", At::Server),
+    // Log indexes decide which records are kept for search, how many a day and how long: a
+    // maintainer's.
+    any("/api/observe/v1/logs/config/**", "observe.manage", At::Server),
+    // Rehydrations read archives with a cloud integration's credentials and keep what they read.
+    any("/api/observe/v1/rehydrations", "observe.manage", At::Server),
+    any("/api/observe/v1/rehydrations/**", "observe.manage", At::Server),
+    // Metrics from logs write series, as monitors and dashboards are written; trying one reads.
+    r("POST", "/api/observe/v1/log_metric_test", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/span_metric_test", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/compact", "observe.manage", At::Server),
+    r("POST", "/api/observe/v1/verify", "observe.manage", At::Server),
+    any("/api/observe/v1/**", "observe.write", At::Server),
     // Deploying by API (docs/deploy-api.md §15): releases are deploys; apps, environments and
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
@@ -548,6 +615,11 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/probe", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
+    // Identities kiln's CA issued (W27-R01): revocations read by those who read runners, made by
+    // those who manage settings.
+    r("GET", "/api/identities/revocations", "runners.read", At::Server),
+    r("GET", "/api/identities", "runners.read", At::Server),
+    r("POST", "/api/identities/revoke", "settings.manage", At::Server),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),

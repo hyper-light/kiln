@@ -11,6 +11,8 @@
 //!   killer kills (SIGKILL, and counted where kiln counts the OOM killer's kills);
 //! - `disk=<MiB>`: a leg's job container gets a workspace of that size, so filling it is ENOSPC;
 //! - `corrupt`: a leg's uploads to the server's blob store arrive with a byte flipped;
+//! - `fetch`: a leg's first ask for a Node build from the internet fails as a request that timed
+//!   out does, so its step asks again ([`crate::runner::runtime`]'s download tries);
 //! - `platform=<os>/<arch>`: the runner reports that platform's OS and architecture (and the
 //!   labels they give), a stand-in for a runner of another platform (W04-AC07);
 //! - `rebuild=<duration>`: the server's, not its runner's: the CI engine rebuilds its runs that
@@ -31,9 +33,14 @@
 //! - `old`: the runner says nothing of what it can do past `Build`'s 32 bits (no `Caps`), as a
 //!   runner from before the channel says nothing (docs/wire.md): the server sends it commands and
 //!   takes its updates as it did such runners'.
+//! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
+//!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
+//! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
+//!   appended to `path` under what it's for, so a test can look for those very bytes where they
+//!   must never be (W27-R02).
 //!
-//! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
-//! recovers; `drop` and `delay` are the connection's.
+//! A leg's faults (`oom`, `disk`, `corrupt`, `fetch`) hit its first attempt only, so a retry shows
+//! how it recovers; `drop` and `delay` are the connection's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -55,6 +62,7 @@ pub struct Chaos {
     pub oom_after: Option<Duration>,
     pub disk_mib: Option<u32>,
     pub corrupt: bool,
+    pub fetch: bool,
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
     /// What goes wrong below the channel: `shed`, `twice`, `late`, in the order given, drawn from
@@ -63,6 +71,10 @@ pub struct Chaos {
     pub seed: u64,
     pub fanout: Option<usize>,
     pub old: bool,
+    /// Where every frame this process sends is copied (`copy=`).
+    pub copy: Option<std::path::PathBuf>,
+    /// Where each identity key this process makes is copied (`keys=`).
+    pub keys: Option<std::path::PathBuf>,
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -102,6 +114,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "oom" => c.oom_after = Some(d()?),
             "disk" => c.disk_mib = Some(v.parse().map_err(|_| anyhow::anyhow!("chaos `disk` takes MiB, not `{v}`"))?),
             "corrupt" => c.corrupt = true,
+            "fetch" => c.fetch = true,
             "platform" => {
                 kiln_ci::plan::matrix::Platform::parse(v).map_err(|e| anyhow::anyhow!("chaos `platform`: {e}"))?;
                 c.platform = Some(v.to_owned());
@@ -117,8 +130,17 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             }
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
             "old" => c.old = true,
+            "copy" | "keys" => {
+                anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
+                let path = Some(std::path::PathBuf::from(v));
+                if k == "copy" {
+                    c.copy = path;
+                } else {
+                    c.keys = path;
+                }
+            }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild, shed, twice, late, seed, fanout or old"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
         }
     }
     Ok(c)
@@ -143,6 +165,22 @@ pub fn get() -> Option<&'static Chaos> {
     #[cfg(not(feature = "chaos"))]
     {
         None
+    }
+}
+
+/// An identity key this process just made, for `slot` (`crate::runner::identity`): copied where
+/// `keys=` says, under what it's for. `pem` is asked for only then: nothing serializes a key
+/// without it.
+pub fn made_key(slot: &str, pem: impl FnOnce() -> Option<String>) {
+    use std::io::Write as _;
+    let Some(path) = get().and_then(|c| c.keys.as_ref()) else { return };
+    let Some(pem) = pem() else {
+        tracing::warn!(slot, "chaos: a key made can't be copied");
+        return;
+    };
+    let wrote = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| write!(f, "{slot}\n{pem}\n"));
+    if let Err(e) = wrote {
+        tracing::warn!(error = %e, path = %path.display(), "chaos: can't copy a key made");
     }
 }
 
@@ -324,16 +362,24 @@ mod tests {
                 oom_after: Some(Duration::from_secs(1)),
                 disk_mib: Some(8),
                 corrupt: true,
+                fetch: false,
                 platform: None,
                 rebuild_after: None,
                 faults: Vec::new(),
                 seed: 0,
                 fanout: None,
-                old: false
+                old: false,
+                copy: None,
+                keys: None
             }
         );
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
+        // W27-R02's test copies: what a runner sends, and the keys it makes.
+        let c = parse("copy=/tmp/a.frames,keys=/tmp/a.keys")?;
+        assert_eq!((c.copy.as_deref(), c.keys.as_deref()), (Some(std::path::Path::new("/tmp/a.frames")), Some(std::path::Path::new("/tmp/a.keys"))));
+        assert!(parse("copy=").is_err() && parse("keys").is_err(), "each names its file");
         assert!(parse("drop=6s,old")?.old);
+        assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert!(parse("platform=plan9/mips").is_err());

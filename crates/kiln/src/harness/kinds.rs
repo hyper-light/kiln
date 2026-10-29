@@ -273,7 +273,9 @@ pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
 /// only its user's login shell has (`crate::reach::serve::login_env`, which a runner asks as it
 /// starts and every ten minutes). A runner's service keeps the PATH of the terminal it was
 /// installed from: a harness installed since in a folder that PATH lacks (Claude Code's and
-/// Codex's installers put theirs in `~/.local/bin`) is on its user's PATH alone.
+/// Codex's installers put theirs in `~/.local/bin`) is on its user's PATH alone. CI legs' steps
+/// run with it too, and the runner's tool facts are found on it (docs/ci.md W13-R01, W13-R03): a
+/// toolchain installed since (node from nvm, cargo from rustup) is on its user's PATH alone.
 pub fn search_path() -> Option<std::ffi::OsString> {
     let users = crate::reach::serve::login_path();
     joined_path(std::env::var_os("PATH").as_deref(), users.as_deref().map(std::ffi::OsStr::new))

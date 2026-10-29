@@ -114,6 +114,19 @@ impl RunnerInfo {
         format!("{}/{}", self.os, self.arch)
     }
 
+    /// Its latest sample as the CI engine weighs a runner's ([`kiln_ci::sched::state::Sample`]),
+    /// its I/O pressure from its facts.
+    pub fn sample(&self) -> kiln_ci::sched::state::Sample {
+        kiln_ci::sched::state::Sample {
+            cpus: self.cpus,
+            busy: f64::from(self.cpu_pct.clamp(0.0, 100.0)) / 100.0,
+            load1: f64::from(self.load1),
+            mem_total: self.mem_total,
+            mem_used: self.mem_used,
+            io_full: self.facts.as_ref().and_then(|f| f.work.as_ref()).and_then(|w| w.io_full),
+        }
+    }
+
     /// Its facts as a need's constraints read them: what it last reported, with the platform, cores
     /// and memory of its latest sample over them (fresher than the report, and there before one).
     pub fn facts_now(&self) -> RunnerFacts {
@@ -345,12 +358,18 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
             continue;
         }
         let s = r.strain();
-        // Idle cores count most, free memory next; CI work on it and a tunnelled path count against
+        // The most headroom left after the work first, by the CI engine's own rule (W05:
+        // `kiln_ci::sched::state::Headroom`, its CPUs' and memory's share in use, I/O pressure on
+        // top); a machine that hasn't sampled as one with none. A tunnelled path counts against
         // it, and being overloaded (nearly out of memory, or loaded past twice its cores) most of
         // all: such a machine gets work only when no other suits. This machine itself comes first
         // while it has room and isn't overloaded (nothing crosses the network, and another
         // machine's resources stay its own), and wins a tie when it hasn't.
-        let mut score = room(s, r.busy, r.slots);
+        let headroom = (r.cpus > 0 && r.mem_total > 0).then(|| kiln_ci::sched::state::Headroom::of(&r.sample()));
+        let mut score = headroom.map_or(0.0, |h| (100.0 * (1.0 - h.fullness(&want.needs.request))) as f32);
+        if s.overloaded {
+            score -= OVERLOADED;
+        }
         if r.via == "tunnel" {
             score -= 2.0;
         }

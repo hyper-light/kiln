@@ -1,0 +1,137 @@
+[workspace]
+members = [
+  "crates/*",
+  "xtask"
+]
+default-members = ["crates/*"]
+resolver = "2"
+
+[profile.release]
+lto = true
+
+[workspace.package]
+version = "0.10.2"
+authors = ["Herrington Darkholme <2883231+HerringtonDarkholme@users.noreply.github.com>"]
+edition = "2024"
+license = "MIT"
+documentation = "https://github.com/hyper-light/vorpal"
+homepage = "https://github.com/hyper-light/vorpal"
+repository = "https://github.com/hyper-light/vorpal"
+rust-version = "1.98"
+readme = "README.md"
+
+[workspace.dependencies]
+vorpal-core = { path = "crates/core", version = "0.10.2", default-features = false }
+vorpal-ann = { path = "crates/ann", version = "0.10.2" }
+vorpal-canonical = { path = "crates/canonical", version = "0.10.2" }
+vorpal-config = { path = "crates/config", version = "0.10.2" }
+vorpal-dynamic = { path = "crates/dynamic", version = "0.10.2" }
+vorpal-graph = { path = "crates/graph", version = "0.10.2" }
+vorpal-index = { path = "crates/index", version = "0.10.2", default-features = false }
+vorpal-ingest = { path = "crates/ingest", version = "0.10.2" }
+vorpal-kg = { path = "crates/kg", version = "0.10.2" }
+vorpal-lang-registry = { path = "crates/lang-registry", version = "0.10.2" }
+vorpal-language = { path = "crates/language", version = "0.10.2" }
+vorpal-loader = { path = "crates/loader", version = "0.10.2" }
+vorpal-lsp = { path = "crates/lsp", version = "0.10.2" }
+vorpal-mcp = { path = "crates/mcp", version = "0.10.2" }
+vorpal-mem = { path = "crates/mem", version = "0.10.2" }
+vorpal-outline = { path = "crates/outline", version = "0.10.2" }
+vorpal-query = { path = "crates/query", version = "0.10.2" }
+vorpal-resolve = { path = "crates/resolve", version = "0.10.2" }
+vorpal-segment = { path = "crates/segment", version = "0.10.2" }
+vorpal-transport = { path = "crates/transport", version = "0.10.2" }
+vorpal-wire = { path = "crates/wire", version = "0.10.2" }
+
+bit-set = { version = "0.10.0" }
+blake3 = "1.8"
+ignore = { version = "0.4.22" }
+regex = { version = "1.10.4" }
+serde = { version = "1.0.200", features = ["derive"] }
+serde_regex = "1.2.0"
+serde_yaml = "0.9.33"
+tar = "0.4.44"
+zstd = "0.13.3"
+tree-sitter = { version = "0.26.3" }
+thiserror = "2.0.0"
+schemars = "1.0.0"
+anyhow = "1.0.82"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+dashmap = "6.0.0"
+rayon = "1.10.0"
+
+# Vendored grammars — utter control over the exact parser bytes vorpal ships (and the
+# ability to fix a grammar ourselves, e.g. PEP 810 lazy imports, without waiting on upstream
+# maintainers). Overrides the crates.io grammar with our in-tree copy; consumers reference
+# `tree_sitter_python` unchanged. Grammars are updated deliberately, per vorpal release —
+# one binary, one version, one deterministic parser set. See docs/UPSTREAM.md for the sync
+# ledger.
+[patch.crates-io]
+# Vendored tree-sitter *runtime* (not just grammars): the parser is ~two-thirds of cold-index
+# CPU, so the C runtime (lexer/parser/subtree/stack) is ours to profile and optimize in-tree.
+# See docs/UPSTREAM.md for the sync ledger.
+tree-sitter = { path = "vendor/tree-sitter" }
+# Vendored jemalloc (tikv-jemalloc-sys 0.7.1 / jemalloc 5.3.1): fixes the ctl handler for
+# `arena.<MALLCTL_ARENAS_ALL>.{dirty,muzzy}_decay_ms` — upstream admits the ALL sentinel
+# through the mib resolver but never checks for it, indexing one past the arenas array
+# (observed EXC_BAD_ACCESS in pac_decay_ms_set). The batch indexer sets decay off through
+# that sentinel (fault economics; see BENCHMARKS). Sync ledger: docs/UPSTREAM.md.
+tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
+tree-sitter-cmake = { path = "grammars/tree-sitter-cmake" }
+tree-sitter-astro-next = { path = "grammars/tree-sitter-astro-next" }
+tree-sitter-erlang = { path = "grammars/tree-sitter-erlang" }
+tree-sitter-jsdoc = { path = "grammars/tree-sitter-jsdoc" }
+tree-sitter-svelte-ng = { path = "grammars/tree-sitter-svelte-ng" }
+tree-sitter-vue = { path = "grammars/tree-sitter-vue" }
+tree-sitter-julia = { path = "grammars/tree-sitter-julia" }
+tree-sitter-objc = { path = "grammars/tree-sitter-objc" }
+tree-sitter-ocaml = { path = "grammars/tree-sitter-ocaml" }
+tree-sitter-perl = { path = "grammars/tree-sitter-perl" }
+tree-sitter-powershell = { path = "grammars/tree-sitter-powershell" }
+tree-sitter-r = { path = "grammars/tree-sitter-r" }
+tree-sitter-sequel = { path = "grammars/tree-sitter-sequel" }
+tree-sitter-zig = { path = "grammars/tree-sitter-zig" }
+tree-sitter-dockerfile = { path = "grammars/tree-sitter-dockerfile" }
+tree-sitter-graphql = { path = "grammars/tree-sitter-graphql" }
+tree-sitter-ini = { path = "grammars/tree-sitter-ini" }
+tree-sitter-make = { path = "grammars/tree-sitter-make" }
+tree-sitter-proto = { path = "grammars/tree-sitter-proto" }
+tree-sitter-xml = { path = "grammars/tree-sitter-xml" }
+tree-sitter-bash = { path = "grammars/tree-sitter-bash" }
+tree-sitter-c = { path = "grammars/tree-sitter-c" }
+tree-sitter-c-sharp = { path = "grammars/tree-sitter-c-sharp" }
+tree-sitter-cpp = { path = "grammars/tree-sitter-cpp" }
+tree-sitter-css = { path = "grammars/tree-sitter-css" }
+tree-sitter-dart = { path = "grammars/tree-sitter-dart" }
+tree-sitter-elixir = { path = "grammars/tree-sitter-elixir" }
+tree-sitter-go = { path = "grammars/tree-sitter-go" }
+tree-sitter-haskell = { path = "grammars/tree-sitter-haskell" }
+tree-sitter-hcl = { path = "grammars/tree-sitter-hcl" }
+tree-sitter-html = { path = "grammars/tree-sitter-html" }
+tree-sitter-java = { path = "grammars/tree-sitter-java" }
+tree-sitter-javascript = { path = "grammars/tree-sitter-javascript" }
+tree-sitter-json = { path = "grammars/tree-sitter-json" }
+tree-sitter-kotlin-sg = { path = "grammars/tree-sitter-kotlin-sg" }
+tree-sitter-lua = { path = "grammars/tree-sitter-lua" }
+tree-sitter-md = { path = "grammars/tree-sitter-md" }
+tree-sitter-nix = { path = "grammars/tree-sitter-nix" }
+tree-sitter-php = { path = "grammars/tree-sitter-php" }
+tree-sitter-python = { path = "grammars/tree-sitter-python" }
+tree-sitter-ruby = { path = "grammars/tree-sitter-ruby" }
+tree-sitter-rust = { path = "grammars/tree-sitter-rust" }
+tree-sitter-scala = { path = "grammars/tree-sitter-scala" }
+tree-sitter-solidity = { path = "grammars/tree-sitter-solidity" }
+tree-sitter-swift = { path = "grammars/tree-sitter-swift" }
+tree-sitter-toml-ng = { path = "grammars/tree-sitter-toml-ng" }
+tree-sitter-typescript = { path = "grammars/tree-sitter-typescript" }
+tree-sitter-yaml = { path = "grammars/tree-sitter-yaml" }
+
+# MSRV moved 1.85 → 1.98 at v0.7.1 (the tree already used 1.88 let-chains). Three
+# style lints that the newer floor unlocks (124 pre-existing sites, three crates'
+# worth of mechanical rewrites) are allowed here so the CI `-D warnings` gate keeps
+# measuring real findings; retiring them is separate hygiene work, not release work.
+[workspace.lints.clippy]
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"
+chunks_exact_to_as_chunks = "allow"

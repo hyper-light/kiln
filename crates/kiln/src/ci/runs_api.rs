@@ -101,12 +101,12 @@ async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> R
             let mut st = c.prepare(
                 "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from,
                         CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END, waits,
-                        (SELECT s.run_id FROM jobs s WHERE s.id = jobs.reused_from), (SELECT r.number FROM jobs s JOIN runs r ON r.id = s.run_id WHERE s.id = jobs.reused_from)
+                        (SELECT s.run_id FROM jobs s WHERE s.id = jobs.reused_from), (SELECT r.number FROM jobs s JOIN runs r ON r.id = s.run_id WHERE s.id = jobs.reused_from), reused_class
                  FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
                 let json_col = |i: usize| -> rusqlite::Result<Value> { Ok(r.get::<_, Option<String>>(i)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)) };
-                let work = reused_report(r.get(17)?, r.get(20)?, r.get(21)?, r.get(7)?, r.get(12)?, r.get(13)?);
+                let work = reused_report(r.get(17)?, r.get(20)?, r.get(21)?, r.get(7)?, r.get(12)?, r.get(13)?).map(|w| through(w, r.get::<_, Option<String>>(22).ok().flatten()));
                 let mut leg = json!({
                     "id": r.get::<_, String>(0)?, "key": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?, "job": r.get::<_, Option<String>>(3)?,
                     "matrix": json_col(4)?, "status": r.get::<_, String>(5)?, "conclusion": r.get::<_, Option<String>>(6)?, "runner": r.get::<_, Option<String>>(7)?,
@@ -131,6 +131,19 @@ async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> R
         })
         .await
         .map_err(internal)
+}
+
+/// A reused leg's report naming the class it was found through, when it was (W24-R30, R28):
+/// `reused through equivalence with run #12 ... (class 1a2b3c4d5e6f)`.
+fn through(mut work: Value, class: Option<String>) -> Value {
+    let Some(class) = class else { return work };
+    if let Some(o) = work.as_object_mut() {
+        let summary = o.get("summary").and_then(Value::as_str).unwrap_or_default().replacen("reused from", "reused through equivalence with", 1);
+        let short = class.trim_start_matches("sha256:").get(..12).unwrap_or(&class).to_owned();
+        o.insert("summary".into(), Value::String(format!("{summary} (class {short})")));
+        o.insert("class".into(), Value::String(class));
+    }
+    work
 }
 
 /// A reused leg's report (W24-R28), from its row: the leg and run it took its result from, the
@@ -871,5 +884,15 @@ mod tests {
             anyhow::ensure!(source.get("id") == Some(&json!("src")) && source.get("work").is_none(), "{source}");
             Ok(())
         })
+    }
+
+    /// W24-R30, R28: a leg reused through a class says so in its report, naming the class.
+    #[test]
+    fn w24_r30_a_class_hit_says_so_in_its_report() {
+        let w = reused_report(Some("l1".into()), Some("r1".into()), Some(12), Some("fedora".into()), None, None).map(|w| through(w, Some("sha256:1a2b3c4d5e6f7a8b".into()))).unwrap_or_default();
+        assert_eq!(w.get("summary").and_then(Value::as_str), Some("reused through equivalence with run #12 on fedora (class 1a2b3c4d5e6f)"), "{w}");
+        assert_eq!(w.get("class").and_then(Value::as_str), Some("sha256:1a2b3c4d5e6f7a8b"));
+        let own = reused_report(Some("l1".into()), Some("r1".into()), Some(12), None, None, None).map(|w| through(w, None)).unwrap_or_default();
+        assert_eq!(own.get("summary").and_then(Value::as_str), Some("reused from run #12"), "{own}");
     }
 }

@@ -50,13 +50,13 @@ impl Verdict {
 }
 
 /// Which host a repository is on, for its changes.
-enum On {
+pub(crate) enum On {
     Github(std::sync::Arc<github::App>, String),
     Gitlab(std::sync::Arc<gitlab::Gitlab>, String),
     Bitbucket(std::sync::Arc<bitbucket::Bitbucket>, String),
 }
 
-async fn on(hub: &Hub, repo: &Repo) -> anyhow::Result<On> {
+pub(crate) async fn on(hub: &Hub, repo: &Repo) -> anyhow::Result<On> {
     if let Some(app) = github::app(hub).await
         && let Some(n) = app.name_of(repo)
     {
@@ -140,7 +140,7 @@ async fn gh_all(app: &github::App, token: &str, path: &str) -> anyhow::Result<Ve
     Ok(out)
 }
 
-async fn gh_token(app: &github::App, name: &str, write: bool) -> anyhow::Result<String> {
+pub(crate) async fn gh_token(app: &github::App, name: &str, write: bool) -> anyhow::Result<String> {
     let level = if write { "write" } else { "read" };
     let p: BTreeMap<String, String> = [("pull_requests", level), ("issues", level), ("contents", level), ("checks", "read"), ("metadata", "read")].iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
     app.token(name, &p).await
@@ -152,7 +152,7 @@ fn logins(list: Option<&Value>, key: &str) -> Vec<String> {
 }
 
 /// A GitHub pull request in kiln's shape.
-fn gh_pull(p: &Value) -> Value {
+pub(crate) fn gh_pull(p: &Value) -> Value {
     let state = if p.get("merged_at").is_some_and(|m| !m.is_null()) { "merged" } else { p.get("state").and_then(Value::as_str).unwrap_or("open") };
     json!({
         "host": "github", "number": p.get("number"), "title": st(p, "/title"), "body": st(p, "/body"), "author": st(p, "/user/login"), "state": state,
@@ -163,7 +163,7 @@ fn gh_pull(p: &Value) -> Value {
 }
 
 /// A GitLab merge request in kiln's shape.
-fn gl_pull(m: &Value) -> Value {
+pub(crate) fn gl_pull(m: &Value) -> Value {
     let state = match m.get("state").and_then(Value::as_str).unwrap_or("opened") {
         "opened" | "locked" => "open",
         other => other,
@@ -178,7 +178,7 @@ fn gl_pull(m: &Value) -> Value {
 }
 
 /// A Bitbucket pull request in kiln's shape.
-fn bb_pull(p: &Value) -> Value {
+pub(crate) fn bb_pull(p: &Value) -> Value {
     let state = match p.get("state").and_then(Value::as_str).unwrap_or("OPEN") {
         "MERGED" => "merged",
         "DECLINED" | "SUPERSEDED" => "closed",

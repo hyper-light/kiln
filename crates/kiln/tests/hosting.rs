@@ -159,7 +159,8 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 /// W14-AC01: submitting three commits makes D1–D3, a stack; amending D2 adds D2 v2 only; the
 /// stack rebased onto a moved trunk gets rebase-only versions, marked; reordering is seen; an
 /// interdiff of D2 v1..v2 shows the amend; every version is kept at its ref; and the push's
-/// refusals (no Change-Id, not a trunk, an abandoned diff, a viewer) say why. With real git.
+/// refusals (a trailer and an alias that disagree, not a trunk, an abandoned diff, a viewer) say
+/// why. With real git.
 #[test]
 fn w14_ac01_stacks() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -247,12 +248,13 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
     assert!(out.contains("D3 v3 (moved in the stack)") && out.contains("D2 v4 (moved in the stack)") && out.contains("D1 v2 (unchanged)"), "{out}");
     assert_eq!((text(&api(&s, &dev, "GET", "/api/diffs/D3")?, "parent"), text(&api(&s, &dev, "GET", "/api/diffs/D2")?, "parent")), ("D1", "D3"));
 
-    // Refused, saying why, nothing kept: no Change-Id; not a trunk; a viewer.
+    // Refused, saying why, nothing kept: a Kiln-Change that disagrees with its Change-Id (W26-R03);
+    // not a trunk; a viewer.
     std::fs::write(work.join("d.txt"), "four\n")?;
     must(git(&home, &work, &["add", "d.txt"]), "add")?;
-    must(git(&home, &work, &["commit", "-qm", "no id"]), "commit")?;
+    must(git(&home, &work, &["commit", "-qm", &format!("two ids\n\nKiln-Change: kc-00000000000000ff\nChange-Id: {i1}")]), "commit")?;
     let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/for/main"])?;
-    assert!(!ok && out.contains("no Change-Id") && out.contains("remote: kiln:"), "{out}");
+    assert!(!ok && out.contains("can't name two changes") && out.contains("remote: kiln:"), "{out}");
     let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/for/nope"])?;
     assert!(!ok && out.contains("isn't a trunk"), "{out}");
     must(git(&home, &work, &["reset", "-q", "--hard", "HEAD~1"]), "drop it")?;
@@ -318,7 +320,7 @@ fn kiln(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> anyh
 }
 
 /// The client side of W14-R03: `kiln clone` (kiln's credentials, the commit-msg hook), commits
-/// that get Change-Ids by themselves, `kiln submit` adding the ones a commit lacks, `kiln diffs`,
+/// that get a Kiln-Change by themselves, `kiln submit` pushing them as they are, `kiln diffs`,
 /// `kiln checkout D2@v1`, and `kiln sync` dropping a diff the trunk already has.
 #[test]
 fn w14_r03_cli() -> anyhow::Result<()> {
@@ -331,7 +333,7 @@ fn w14_r03_cli() -> anyhow::Result<()> {
     let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
 
     let out = must(kiln(&home, dir.path(), &s, &dev, &["clone", "acme/app", "work"]), "kiln clone")?;
-    assert!(out.contains("Change-Id"), "{out}");
+    assert!(out.contains("Kiln-Change"), "{out}");
     let work = dir.path().join("work");
     let g = |args: &[&str]| must(kiln_git(&home, &work, &s, &dev, args), &args.join(" "));
     std::fs::write(work.join("README.md"), "app\n")?;
@@ -340,18 +342,20 @@ fn w14_r03_cli() -> anyhow::Result<()> {
     g(&["push", "-q", "origin", "HEAD:main"])?;
     g(&["fetch", "-q", "origin"])?;
     g(&["remote", "set-head", "origin", "main"])?;
-    // The hook gives commits their Change-Ids; one made without it gets one from `kiln submit`.
+    // The hook gives commits their Kiln-Change (W26-R03); one made without it needs none:
+    // `kiln submit` pushes the commits as they are.
     std::fs::write(work.join("a.txt"), "one\n")?;
     g(&["add", "a.txt"])?;
     g(&["commit", "-qm", "one: a"])?;
-    assert!(g(&["log", "-1", "--format=%B"])?.contains("Change-Id: I"), "the hook");
+    assert!(g(&["log", "-1", "--format=%B"])?.contains("Kiln-Change: kc-"), "the hook");
     std::fs::write(work.join("b.txt"), "two\n")?;
     g(&["add", "b.txt"])?;
     g(&["commit", "-q", "--no-verify", "-m", "two: b"])?;
-    assert!(!g(&["log", "-1", "--format=%B"])?.contains("Change-Id"));
+    assert!(!g(&["log", "-1", "--format=%B"])?.contains("Kiln-Change"));
+    let head = g(&["rev-parse", "HEAD"])?;
     let out = must(kiln(&home, &work, &s, &dev, &["submit", "--draft", "-r", "user:dev"]), "kiln submit")?;
-    assert!(out.contains("gave 1 commit a Change-Id") && out.contains("D1 v1 (new)") && out.contains("D2 v1 (new)"), "{out}");
-    assert!(g(&["log", "-1", "--format=%B"])?.contains("Change-Id: I"), "HEAD moved to the rewritten commit");
+    assert!(out.contains("D1 v1 (new)") && out.contains("D2 v1 (new)"), "{out}");
+    assert_eq!(g(&["rev-parse", "HEAD"])?, head, "kiln submit rewrites nothing");
     assert_eq!(g(&["status", "--porcelain"])?, "", "the working tree is as it was");
 
     let out = must(kiln(&home, &work, &s, &dev, &["review", "D2"]), "kiln review")?;
@@ -484,6 +488,11 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     let commits: Vec<&str> = log.split('\x1e').map(str::trim).filter(|c| !c.is_empty()).collect();
     assert_eq!(commits.len(), 2, "{log}");
     assert!(commits.iter().any(|c| c.contains("Differential-Revision: D1")) && commits.iter().any(|c| c.contains("Differential-Revision: D2") && c.contains("Reviewed-by: user:rev")), "{log}");
+    // W26-R03: each commit kiln lands carries its change's Kiln-Change.
+    for d in ["D1", "D2"] {
+        let change = text(&api(&s, &dev, "GET", &format!("/api/diffs/{d}"))?, "change").to_owned();
+        assert!(change.starts_with("kc-") && commits.iter().any(|c| c.contains(&format!("Differential-Revision: {d}")) && c.contains(&format!("Kiln-Change: {change}"))), "{d} {change}: {log}");
+    }
     let d1 = api(&s, &dev, "GET", "/api/diffs/D1")?;
     assert_eq!(text(&d1, "state"), "landed");
 
@@ -512,6 +521,7 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     let log = must(git(&home, &work, &["log", "--format=%B%x1e", &format!("{before}..origin/main")]), "log")?;
     let one: Vec<&str> = log.split('\x1e').map(str::trim).filter(|c| !c.is_empty()).collect();
     assert!(one.len() == 1 && one.first().is_some_and(|c| c.contains("Differential-Revision: D4") && c.contains("Differential-Revision: D5")), "{log}");
+    assert_eq!(one.first().map(|c| c.matches("Kiln-Change: kc-").count()), Some(2), "a squashed stack carries each change's Kiln-Change: {log}");
     let tip = must(git(&home, &work, &["rev-parse", "origin/main"]), "rev-parse")?.trim().to_owned();
     until(30, "D6 restacked", || {
         let d6 = api(&s, &dev, "GET", "/api/diffs/D6")?;
@@ -3733,6 +3743,424 @@ jobs:
     let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
     let (_, leg_json) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
     assert!(leg_json.contains("GraphQL API for something kiln doesn't answer yet (query field `licenses`)"), "{leg_json}");
+    Ok(())
+}
+
+/// W26-R02, R11 (Review in Ship, step 5): a diff under review stays out of the land queue while a
+/// blocking thread is open, saying why, and Ship's row says so to its author; resolved, it lands,
+/// and the commit it landed as carries on as the same Ship item, its review still lit.
+#[test]
+fn w26_r02_a_blocking_thread_holds_a_diff_out_of_the_queue() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    commit(&home, &work, "expand.rs", "fn expand() {}\n", "pipeline: dynamic matrices", &format!("I{}", "4".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+
+    // Accepted, then a blocking thread (W26-R11's gate holds an approval while one is open).
+    let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    anyhow::ensure!(st == 200, "accept: {r}");
+    let (st, c) = post(&s, &rev, "/api/diffs/D1/comments", &json!({ "body": "empty matrix meant?", "file": "expand.rs", "start_line": 1, "kind": "blocking", "publish": true }))?;
+    anyhow::ensure!(st == 200, "comment: {c}");
+    let (st, why) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    assert_eq!(st, 409, "held: {why}");
+    assert!(why.to_string().contains("expand.rs:1: rev resolves this blocking comment first"), "{why}");
+
+    // Ship: the diff's commit, its strip lit at Review, its line naming the thread; its author's to answer.
+    let row = |token: &str| -> anyhow::Result<Value> {
+        let v = api(&s, token, "GET", "/api/ship/commits?repo=acme/app&kind=diff")?;
+        Ok(v.pointer("/commits/0").cloned().unwrap_or_default())
+    };
+    let pip = |v: &Value, stage: &str| v.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).and_then(|p| p.get("state")).and_then(Value::as_str).unwrap_or_default().to_string();
+    let mine = row(&dev)?;
+    assert_eq!((text(&mine, "stand"), text(&mine, "line")), ("needs_you", "expand.rs:1 · 1 blocking thread"), "{mine}");
+    assert_eq!((pip(&mine, "review"), pip(&mine, "land")), ("blocked".to_string(), "none".to_string()));
+    assert_eq!(text(&row(&lead)?, "stand"), "waiting");
+
+    // Resolved: it lands, and carries on as the same item.
+    let (st, r) = http(s.port, "PATCH", &format!("/api/comments/{}", text(&c, "id")), &rev, Some(&json!({ "state": "resolved" })))?;
+    anyhow::ensure!(st == 200, "resolve: {r}");
+    let (st, e) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    anyhow::ensure!(st == 200, "land: {e}");
+    until(180, "D1 lands", || {
+        let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
+        Ok((text(&d, "state") != "landed").then(|| d.to_string()))
+    })?;
+    until(30, "the landed commit carries D1's review", || {
+        let tip = row(&dev)?;
+        Ok((tip.pointer("/change/name").and_then(Value::as_str) != Some("D1") || pip(&tip, "review") != "approved" || pip(&tip, "land") != "passed" || !tip.get("fold_under").is_some_and(Value::is_null)).then(|| tip.to_string()))
+    })?;
+    Ok(())
+}
+
+/// W26-R11, AC02 through the API, as D41 has it: kim's blocking thread holds accepting, for anyone
+/// (naming kim and the line) and for kim herself, holds landing, and stays open when someone else
+/// applies its suggestion; `force` goes past no hold. Only kim resolves it, or an owner who says why,
+/// the reason kept. With two issues open accepting asks for `force`, with a nit it accepts and says
+/// so, and neither holds landing. A thread made without a kind is a question; a thread's kind is
+/// its author's to change; a comment is its author's to delete, a thread's first one staying as
+/// `deleted` while replies remain. Kinds, resolutions and deletions are audited.
+#[test]
+fn w26_r11_the_gate_holds_warns_and_informs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let kim = person(&s, "kim", &["developer@repo:acme/app"])?;
+    let lee = person(&s, "lee", &["developer@repo:acme/app"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    // Open threads alone hold no land here: what holds one is the gate.
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  resolve-threads: false\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    commit(&home, &work, "expand.rs", "fn expand(m: &Matrix) {\n    let first = m.axes[0];\n}\n", "pipeline: dynamic matrices", &format!("I{}", "4".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+
+    let said = |token: &str, body: Value| -> anyhow::Result<(String, String)> {
+        let (st, c) = post(&s, token, "/api/diffs/D1/comments", &body)?;
+        anyhow::ensure!(st == 200, "comment: {st} {c}");
+        Ok((text(&c, "id").to_owned(), text(&c, "thread").to_owned()))
+    };
+    let accept = |token: &str, force: bool| post(&s, token, "/api/diffs/D1/review", &json!({ "action": "accept", "force": force }));
+    let call = |method: &str, token: &str, comment: &str, body: Option<Value>| -> anyhow::Result<(u16, Value)> {
+        let (st, t) = http(s.port, method, &format!("/api/comments/{comment}"), token, body.as_ref())?;
+        Ok((st, serde_json::from_str(&t).unwrap_or(Value::String(t))))
+    };
+    let error = |v: &Value| text(v, "error").to_owned();
+    let threads = |token: &str| api(&s, token, "GET", "/api/diffs/D1/comments");
+    let thread_of = |all: &Value, comment: &str| -> Value {
+        all.get("threads").and_then(Value::as_array).into_iter().flatten().find(|t| t.pointer("/comments/0/id").and_then(Value::as_str) == Some(comment)).cloned().unwrap_or_default()
+    };
+
+    // A thread made without a kind is a question, and weighs nothing.
+    let (question, _) = said(&kim, json!({ "body": "why the first axis?", "file": "expand.rs", "start_line": 1, "publish": true }))?;
+    let all = threads(&lee)?;
+    assert_eq!(thread_of(&all, &question).get("kind"), Some(&json!("question")), "{all}");
+    assert_eq!((all.pointer("/gate/verdict"), all.pointer("/gate/open/question")), (Some(&json!("clear")), Some(&json!(1))), "{all}");
+
+    // kim's blocking thread holds accepting, saying whose it is and where; kim is told it's hers to
+    // resolve; `force` goes past no hold; it holds landing.
+    let (blocking, _) = said(&kim, json!({ "body": "This panics on an empty matrix.", "suggestion": "    let first = m.axes.first()?;", "file": "expand.rs", "start_line": 2, "kind": "blocking", "publish": true }))?;
+    for force in [false, true] {
+        let (st, r) = accept(&lee, force)?;
+        assert_eq!((st, error(&r)), (409, "expand.rs:2: kim resolves this blocking comment first".to_owned()), "force {force}: {r}");
+    }
+    let (st, r) = accept(&kim, false)?;
+    assert_eq!((st, error(&r)), (409, "expand.rs:2: resolve your blocking comment first".to_owned()), "{r}");
+    let all = threads(&lee)?;
+    assert_eq!(thread_of(&all, &blocking).get("kind"), Some(&json!("blocking")), "{all}");
+    assert_eq!((all.pointer("/gate/verdict"), all.pointer("/gate/holds/0/by")), (Some(&json!("hold")), Some(&json!("user:kim"))), "{all}");
+    let (st, r) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    assert!(st == 409 && error(&r).contains("D1: expand.rs:2: kim resolves this blocking comment first"), "{st} {r}");
+    // Its suggestion applied by the author: a new version, and the thread still open for kim.
+    let (st, r) = post(&s, &dev, &format!("/api/comments/{blocking}/apply"), &json!({}))?;
+    assert_eq!((st, text(&r, "state")), (200, "open"), "{r}");
+    assert_eq!(text(&thread_of(&threads(&lee)?, &blocking), "state"), "open");
+
+    // Only kim resolves it: not lee, not lead who lands; an owner, only saying why.
+    for token in [&lee, &lead] {
+        let (st, r) = call("PATCH", token, &blocking, Some(json!({ "state": "resolved" })))?;
+        assert_eq!((st, error(&r)), (403, "expand.rs:2: only kim resolves this blocking comment (or an owner, saying why)".to_owned()), "{r}");
+    }
+    let (st, r) = call("PATCH", &s.admin, &blocking, Some(json!({ "state": "resolved" })))?;
+    assert_eq!((st, error(&r)), (400, "expand.rs:2: an owner resolving kim's blocking comment says why (`reason`)".to_owned()), "{r}");
+    let (st, r) = call("PATCH", &kim, &blocking, Some(json!({ "state": "resolved" })))?;
+    anyhow::ensure!(st == 200, "kim resolves her own: {r}");
+    let done = thread_of(&threads(&lee)?, &blocking);
+    assert_eq!((text(&done, "state"), text(&done, "resolved_by")), ("resolved", "user:kim"), "{done}");
+
+    // A blocking thread whose reviewer has gone: an owner resolves it, saying why, and the reason
+    // stays with it.
+    let (stranded, _) = said(&kim, json!({ "body": "and the last axis", "file": "expand.rs", "start_line": 3, "kind": "blocking", "publish": true }))?;
+    let (st, r) = call("PATCH", &s.admin, &stranded, Some(json!({ "state": "resolved", "reason": "kim is away; D2 handles the empty matrix" })))?;
+    anyhow::ensure!(st == 200, "an owner resolves it, saying why: {r}");
+    let kept = thread_of(&threads(&lee)?, &stranded);
+    assert_eq!((text(&kept, "resolved_by"), text(&kept, "resolution")), ("admin", "kim is away; D2 handles the empty matrix"), "{kept}");
+
+    // A thread's kind is its author's to change: not lee's; kim's question becomes an issue.
+    let (st, r) = call("PATCH", &lee, &question, Some(json!({ "kind": "nit" })))?;
+    assert_eq!((st, error(&r)), (403, "expand.rs:1: only kim changes this thread's kind".to_owned()), "{r}");
+    let (st, r) = call("PATCH", &kim, &question, Some(json!({ "kind": "praise" })))?;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = call("PATCH", &kim, &question, Some(json!({ "kind": "issue" })))?;
+    assert_eq!((st, text(&r, "kind")), (200, "issue"), "{r}");
+
+    // Two issues open warn: accepting asks for `force`, then says what's open; neither holds landing.
+    let (other, _) = said(&kim, json!({ "body": "the docs say nothing of empty matrices", "kind": "issue", "publish": true }))?;
+    let (st, r) = accept(&lee, false)?;
+    assert_eq!((st, error(&r)), (409, "2 issues open: approve anyway with `force`".to_owned()), "{r}");
+    let (st, r) = accept(&lee, true)?;
+    assert_eq!((st, text(&r, "state"), text(&r, "note")), (200, "accepted", "2 issues open"), "{r}");
+    let ready = api(&s, &lead, "GET", "/api/diffs/D1/land")?;
+    assert_eq!(ready.get("blockers"), Some(&json!([])), "{ready}");
+
+    // A nit informs: kim's issue made a nit, the other resolved by lee (anyone who may review resolves
+    // a thread that isn't blocking), accepting says what's open; and a nit holds no land.
+    let (st, r) = call("PATCH", &kim, &question, Some(json!({ "kind": "nit" })))?;
+    anyhow::ensure!(st == 200, "{r}");
+    let (st, r) = call("PATCH", &lee, &other, Some(json!({ "state": "resolved" })))?;
+    anyhow::ensure!(st == 200, "{r}");
+    let (st, r) = accept(&lee, false)?;
+    assert_eq!((st, text(&r, "note")), (200, "1 nit open"), "{r}");
+    let (st, r) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    anyhow::ensure!(st == 200, "a nit holds no land: {r}");
+    until(180, "D1 lands", || {
+        let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
+        Ok((text(&d, "state") != "landed").then(|| d.to_string()))
+    })?;
+
+    // A comment is its author's to delete. The first of a thread with replies stays, saying
+    // `deleted`; with the last one gone, the thread goes too.
+    let (first, thread) = said(&kim, json!({ "body": "is the README still right?", "publish": true }))?;
+    let (reply, _) = said(&dev, json!({ "thread": thread, "body": "it is", "publish": true }))?;
+    let (st, r) = call("DELETE", &dev, &first, None)?;
+    assert_eq!((st, error(&r)), (403, "only its author, kim, deletes a comment".to_owned()), "{r}");
+    let (st, r) = call("DELETE", &kim, &first, None)?;
+    assert_eq!((st, r.get("thread_deleted")), (200, Some(&json!(false))), "{r}");
+    let left = thread_of(&threads(&lee)?, &first);
+    assert_eq!((left.pointer("/comments/0/body"), left.pointer("/comments/0/deleted"), left.pointer("/comments/1/body")), (Some(&json!("deleted")), Some(&json!(true)), Some(&json!("it is"))), "{left}");
+    let (st, r) = call("PATCH", &kim, &first, Some(json!({ "body": "back again" })))?;
+    assert_eq!(st, 409, "{r}");
+    let (st, r) = call("DELETE", &dev, &reply, None)?;
+    assert_eq!((st, r.get("thread_deleted")), (200, Some(&json!(true))), "{r}");
+    assert!(thread_of(&threads(&lee)?, &first).is_null(), "the thread went with its last comment");
+
+    // Kinds, resolutions and deletions are audited, the owner's reason with them.
+    let (_, audit) = http(s.port, "GET", "/api/audit?limit=200", &s.admin, None)?;
+    for want in ["diffs.thread.kind: acme/app D1 thread", "(expand.rs:1): question to issue", "(kim's blocking): kim is away; D2 handles the empty matrix", "diffs.comment.delete: acme/app D1 thread", "and the thread with it"] {
+        assert!(audit.contains(want), "{want} in the audit: {audit}");
+    }
+    Ok(())
+}
+
+/// W26-R11, the automatic merge: a diff waiting to land when ready (GitHub's auto-merge, which its
+/// job asks for whenever one of its lines is commented) stays out of the land queue while a
+/// blocking thread is open, accepted as it is, and lands once the thread's author resolves it;
+/// another, with an issue and a nit open, lands as soon as it may.
+#[test]
+fn w26_r11_a_blocking_thread_holds_the_automatic_merge() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    // The diffs are lead's, who lands: their jobs may ask them to land.
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+    let kim = person(&s, "kim", &["developer@repo:acme/app"])?;
+    let lee = person(&s, "lee", &["developer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&lead), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  resolve-threads: false\n")?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(
+        work.join(".github/workflows/auto.yml"),
+        r#"on: pull_request_review_comment
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  auto:
+    runs-on: local
+    steps:
+      - env:
+          TOKEN: ${{ github.token }}
+          N: ${{ github.event.pull_request.number }}
+        run: |
+          cat > q.json <<JSON
+          {"query":"mutation { enablePullRequestAutoMerge(input: {pullRequestId: \"kiln-pr-$N\"}) { pullRequest { number autoMergeRequest { mergeMethod } } } }"}
+          JSON
+          echo "auto $N: $(curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$GITHUB_GRAPHQL_URL" -d @q.json)"
+"#,
+    )?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    // D1 and D2, each on the trunk.
+    commit(&home, &work, "expand.rs", "fn expand() {}\n", "pipeline: dynamic matrices", &format!("I{}", "4".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "D1")?;
+    must(git(&home, &work, &["checkout", "-q", "-b", "two", "origin/main"]), "a branch from the trunk")?;
+    commit(&home, &work, "matrix.rs", "fn matrix_of() {}\nfn axes() {}\n", "pipeline: a matrix of axes", &format!("I{}", "5".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "D2")?;
+
+    // lee accepts both while nothing is open; then kim's comments on their lines start the job,
+    // which asks each to land when ready: D1 gets a blocking thread, D2 an issue and a nit.
+    for d in ["D1", "D2"] {
+        let (st, r) = post(&s, &lee, &format!("/api/diffs/{d}/review"), &json!({ "action": "accept" }))?;
+        anyhow::ensure!(st == 200, "{d} accepted: {r}");
+    }
+    for (d, file, line, kind) in [("D1", "expand.rs", 1, "blocking"), ("D2", "matrix.rs", 1, "issue"), ("D2", "matrix.rs", 2, "nit")] {
+        let (st, c) = post(&s, &kim, &format!("/api/diffs/{d}/comments"), &json!({ "body": format!("a {kind}"), "file": file, "start_line": line, "kind": kind, "publish": true }))?;
+        anyhow::ensure!(st == 200, "{d}'s {kind}: {c}");
+    }
+    // D2 lands: an issue or a nit holds no automatic merge.
+    until(300, "D2 lands, waiting for nothing", || {
+        let d = api(&s, &lead, "GET", "/api/diffs/D2")?;
+        Ok((text(&d, "state") != "landed").then(|| d.to_string()))
+    })?;
+    // D1's job asked too, and D1 waits, its blocking thread holding the merge.
+    let job_said = |prefix: &str| -> anyhow::Result<Option<String>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=20", &s.admin, None)?;
+        for r in serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
+            let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            for step in 0..2 {
+                let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+                if let Some(said) = log.lines().find_map(|l| l.split_once(prefix).map(|(_, rest)| rest.to_owned())) {
+                    return Ok(Some(said));
+                }
+            }
+        }
+        Ok(None)
+    };
+    let mut asked = String::new();
+    until(240, "D1's job asks it to land when ready", || {
+        asked = job_said("auto 1: ")?.unwrap_or_default();
+        Ok(asked.is_empty().then(|| "no answer yet".to_owned()))
+    })?;
+    assert!(asked.contains("\"autoMergeRequest\":{"), "D1 waits to land: {asked}");
+    std::thread::sleep(Duration::from_secs(7));
+    let d1 = api(&s, &lead, "GET", "/api/diffs/D1")?;
+    assert_eq!(text(&d1, "state"), "accepted", "held out of the queue: {d1}");
+    let ready = api(&s, &lead, "GET", "/api/diffs/D1/land")?;
+    assert!(ready.to_string().contains("expand.rs:1: kim resolves this blocking comment first"), "{ready}");
+    // kim resolves it, and D1 lands as it was asked to.
+    let all = api(&s, &kim, "GET", "/api/diffs/D1/comments")?;
+    let first = all.pointer("/threads/0/comments/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (st, r) = http(s.port, "PATCH", &format!("/api/comments/{first}"), &kim, Some(&json!({ "state": "resolved" })))?;
+    anyhow::ensure!(st == 200, "kim resolves it: {st} {r}");
+    until(180, "D1 lands once its blocking thread is resolved", || {
+        let d = api(&s, &lead, "GET", "/api/diffs/D1")?;
+        Ok((text(&d, "state") != "landed").then(|| d.to_string()))
+    })?;
+    Ok(())
+}
+
+/// W26-R14 (each Ship item's dropdown owns its review, step 8): a change's commit's detail carries
+/// the Review lane group's marks — each push, replay, comment, fix, resolution and approval with
+/// its time, its revision, who did it and its signer (unsigned until W27-R03), oldest first; a
+/// commit with no change has the one mark, its push.
+#[test]
+fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let kim = person(&s, "kim", &["developer@repo:acme/app"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  resolve-threads: false\n")?;
+    std::fs::write(work.join("expand.rs"), "fn expand(m: &Matrix) {\n    let first = 1;\n}\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    commit(&home, &work, "expand.rs", "fn expand(m: &Matrix) {\n    let first = 10;\n}\n", "pipeline: dynamic matrices", &format!("I{}", "4".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+
+    // kim's blocking thread with a suggestion; dev replies; dev applies it (v2, a fix).
+    let (st, c) = post(&s, &kim, "/api/diffs/D1/comments", &json!({ "body": "an empty matrix panics", "suggestion": "    let first = 2;", "file": "expand.rs", "start_line": 2, "kind": "blocking", "publish": true }))?;
+    anyhow::ensure!(st == 200, "comment: {c}");
+    let (cid, tid) = (text(&c, "id").to_owned(), text(&c, "thread").to_owned());
+    let (st, r) = post(&s, &dev, "/api/diffs/D1/comments", &json!({ "thread": tid, "body": "applying it", "publish": true }))?;
+    anyhow::ensure!(st == 200, "reply: {r}");
+    let (st, r) = post(&s, &dev, &format!("/api/comments/{cid}/apply"), &json!({}))?;
+    anyhow::ensure!(st == 200, "apply: {r}");
+    let (st, r) = http(s.port, "PATCH", &format!("/api/comments/{cid}"), &kim, Some(&json!({ "state": "resolved" })))?;
+    anyhow::ensure!(st == 200, "kim resolves: {r}");
+
+    // Main moves on the same line: replayed, the replay conflicts; resolved and committed (v3).
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "owner"]), "the owner's clone")?;
+    let owner = dir.path().join("owner");
+    std::fs::write(owner.join("expand.rs"), "fn expand(m: &Matrix) {\n    let first = 100;\n}\n")?;
+    must(git(&home, &owner, &["add", "-A"]), "add")?;
+    must(git(&home, &owner, &["commit", "-qm", "main moves"]), "commit")?;
+    must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
+    let got = api(&s, &kim, "GET", "/api/diffs/D1/conflicts")?;
+    assert_eq!(got.pointer("/replay/state"), Some(&json!("conflicted")), "{got}");
+    let list = got.get("conflicts").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert_eq!(list.len(), 1, "{got}");
+    for cf in &list {
+        let id = text(cf, "id").to_owned();
+        let (st, r) = post(&s, &dev, &format!("/api/diffs/D1/conflicts/{id}/resolution"), &json!({ "take": "this" }))?;
+        anyhow::ensure!(st == 200, "resolve {id}: {r}");
+    }
+    let (st, r) = post(&s, &dev, "/api/diffs/D1/conflicts/commit", &json!({}))?;
+    anyhow::ensure!(st == 200, "commit resolution: {r}");
+    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(3)), "conflict resolved"), "{r}");
+    let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    anyhow::ensure!(st == 200, "accept: {r}");
+
+    // The change's tip carries the Review lane group, oldest first.
+    let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
+    let tip = d.pointer("/versions/2/commit").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert_eq!(d.pointer("/versions/2/n"), Some(&json!(3)), "{d}");
+    let one = api(&s, &dev, "GET", &format!("/api/ship/commits/acme/app/{tip}"))?;
+    let marks = one.get("review").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(marks.len() >= 6, "a mark per event: {marks:?}");
+    let kinds: Vec<&str> = marks.iter().filter_map(|m| m.get("kind").and_then(Value::as_str)).collect();
+    let ats: Vec<i64> = marks.iter().filter_map(|m| m.get("at").and_then(Value::as_i64)).collect();
+    assert!(ats.windows(2).all(|w| w.first() <= w.last()), "oldest first: {ats:?}");
+    for m in &marks {
+        let (id, kind, by, state) = (text(m, "id"), text(m, "kind"), text(m, "by"), text(m, "state"));
+        assert!(!id.is_empty() && !by.is_empty() && !state.is_empty(), "id, by and state: {m}");
+        assert!(["push", "replay", "comment", "fix", "resolution", "approval"].contains(&kind), "{m}");
+        assert_eq!(m.get("signer"), Some(&Value::Null), "unsigned until W27-R03: {m}");
+        assert!(m.get("at").is_some_and(Value::is_i64) && m.get("end").is_some() && m.get("revision").is_some(), "{m}");
+    }
+    // In order: the push, the talk, the Apply, the replay, the resolution, the verdict.
+    let expect = ["push", "comment", "comment", "comment", "comment", "fix", "replay", "resolution", "approval"];
+    assert_eq!(kinds, expect, "{marks:?}");
+    let find = |kind: &str, note: &str| marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some(kind) && m.get("note").and_then(Value::as_str).unwrap_or_default().contains(note)).cloned();
+    let by = |m: &Value| text(m, "by").to_owned();
+    let push = find("push", "").unwrap_or_default();
+    assert!(by(&push).ends_with("user:dev") && push.get("revision") == Some(&json!(1)), "{push}");
+    let blocked = find("comment", "blocking · expand.rs:2").unwrap_or_default();
+    // Resolved now: the mark that held while it was open reads passed, its end the resolution's.
+    assert!(blocked.get("state") == Some(&json!("passed")) && by(&blocked).ends_with("user:kim") && blocked.get("end").is_some_and(Value::is_i64), "{blocked}");
+    let fix = find("fix", "suggestion applied").unwrap_or_default();
+    assert!(by(&fix).ends_with("user:dev") && fix.get("revision") == Some(&json!(2)), "{fix}");
+    let replay = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("replay")).cloned().unwrap_or_default();
+    assert_eq!((replay.get("by"), replay.get("state"), replay.get("note")), (Some(&json!("kiln")), Some(&json!("passed")), Some(&json!("onto main"))), "{replay}");
+    let resolution = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("resolution")).cloned().unwrap_or_default();
+    assert!(by(&resolution).ends_with("user:dev") && resolution.get("revision") == Some(&json!(3)), "{resolution}");
+    let verdict = marks.last().cloned().unwrap_or_default();
+    assert!(verdict.get("kind") == Some(&json!("approval")) && by(&verdict).ends_with("user:rev") && verdict.get("state") == Some(&json!("approved")) && verdict.get("revision") == Some(&json!(3)), "{verdict}");
+
+    // A commit with no change has the one mark, its push — covered in ship.rs's
+    // w26_r14_a_commit_with_no_change_carries_its_push (a bare trunk commit gets no runs here).
     Ok(())
 }
 

@@ -69,11 +69,18 @@ function measureDigits(el: HTMLDivElement | null) {
   void document.fonts?.ready.then(measure);
 }
 
-export function Stands({ rows }: { rows: readonly MissionRow[] }) {
-  const groups = SHOWN.map((stand) => ({ stand, n: rows.filter((r) => r.stand === stand).length })).filter((g) => g.n > 0);
+/**
+ * Mission control counts its rows. Another page (Ship) brings its own `counts`, and with `every`
+ * shows each of those stands always, a zero dimmed, so nothing moves as counts come and go.
+ */
+export function Stands({ rows = [], counts, every }: { rows?: readonly MissionRow[]; counts?: Partial<Record<Shown, number>>; every?: readonly Shown[] }) {
+  const count = (stand: Shown) => (counts ? (counts[stand] ?? 0) : rows.filter((r) => r.stand === stand).length);
+  const shown = (every ?? SHOWN).map((stand) => ({ stand, n: count(stand) }));
+  const groups = shown.filter((g) => g.n > 0);
+  const listed = every ? shown : groups;
   const narrow = useNarrow();
-  if (rows.length === 0) return <p className="st-lead">Start coding agents on any of your machines and run them all from here.</p>;
-  if (groups.length === 0)
+  if (!every && rows.length === 0) return <p className="st-lead">Start coding agents on any of your machines and run them all from here.</p>;
+  if (!every && groups.length === 0)
     return (
       <div className="st">
         <span className="st-quiet">All quiet</span>
@@ -81,11 +88,11 @@ export function Stands({ rows }: { rows: readonly MissionRow[] }) {
     );
   return (
     <div className="st" ref={measureDigits}>
-      <p className="sr-only">{groups.map((g) => SAYS[g.stand](g.n)).join(", ")}</p>
+      <p className="sr-only">{listed.map((g) => SAYS[g.stand](g.n)).join(", ")}</p>
       <Rule counts={groups.map((g) => `${g.stand}:${g.n}`).join(",")} />
       <ul className="st-row" aria-hidden="true">
-        {groups.map((g) => (
-          <li key={g.stand} className="st-item" data-stand={g.stand} title={SAYS[g.stand](g.n)}>
+        {listed.map((g) => (
+          <li key={g.stand} className="st-item" data-stand={g.stand} data-zero={g.n === 0 || undefined} title={SAYS[g.stand](g.n)}>
             <Badge stand={g.stand} />
             <Count n={g.n} align={narrow ? "start" : "end"} />
             <span className="st-word">{WORD[g.stand]}</span>
@@ -152,7 +159,9 @@ function Rule({ counts }: { counts: string }) {
       const draw = (now: number) => {
         const shown = countsAt(g, now);
         const stands = SHOWN.filter((s) => shown.has(s));
-        if (width <= 0 || stands.length === 0) return;
+        if (width <= 0) return;
+        // Nothing lit (every count at zero, as Ship's can be): an empty rule, not the last picture.
+        if (stands.length === 0) return void ctx.clearRect(0, 0, canvas.width, canvas.height);
         const dpr = Math.min(3, window.devicePixelRatio || 1);
         const w = Math.round(width * dpr);
         const h = Math.round(HEIGHT * dpr);

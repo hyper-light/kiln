@@ -434,8 +434,10 @@ what was placed.
   `kiln_seams::placement::SimPlacement`: on the node with the most memory free, then by name, a
   million placements.
 - **Used by:** builds that can't starve a machine, and microVM CI legs (CP-T7.1).
-- **Passed by:** the simulator, every clause; Hex, when CP-T7.1 lands it. Every case runs on the
-  same two nodes (`kiln_seams::placement::conformance_nodes`).
+- **Passed by:** the simulator, every clause; kiln's headroom rule (`kiln_ci::sched::place`, the
+  engine's and the v1 dispatcher's, docs/runners.md §5), every clause, its target all of a node;
+  Hex, when CP-T7.1 lands it. Every case runs on the same two nodes
+  (`kiln_seams::placement::conformance_nodes`).
 
 Methods: `place`, `release`, `nodes`.
 
@@ -535,3 +537,74 @@ Methods: `abilities`, `open`, `change`, `changes`, `update`, `stack`, `stack_add
 - **FORGE-17** a merged change refuses updates, merges, queueing, stacking and drafts: Closed
 - **FORGE-18** bad requests are refused Invalid and change nothing: a branch that isn't there, a change into itself or from a branch with one open, a blank title, a blank or long comment, an empty stack
 - **FORGE-19** unstacking takes a stack's unmerged changes out of it, leaving those queued in place, and dissolves it once none are left; a host that can't refuses Unsupported
+
+## Search
+
+A tree's files, searched by their text or by the shape of their code, each hit with the definition
+it sits in (docs/ci.md W26-R07, the search across a change). A tree is built once, under its id (a
+git tree's SHA), searched as often as asked, and forgotten. Text is the query's words, as written
+when they hold a capital and in any case when they don't, or the regex between its slashes; code is
+an ast-grep pattern (`$A` one node, `$$$` any run of them) matched in each language the tree's
+files are in, or one by name. A hit is the line a match starts on: its file, line, column, last
+line and text, and the innermost definition holding it, by name and kind.
+
+- **Implementations:** vorpal (`kiln_search::VorpalSearch`, vendored at `vendor/vorpal`: an index
+  per tree in a folder of the server's cache, the files, each one's definitions by vorpal's outline
+  and its trigrams in vorpal's trigram store, which prunes what a query reads; code by vorpal's
+  pattern engine, on the tree-sitter grammars kiln takes, Markdown, which reads any text as prose,
+  only when a query names it); `kiln_seams::search::SimSearch`, which
+  keeps trees in memory and reads definitions and patterns line by line, holding 64 trees (past
+  them, building another forgets the one searched least recently).
+- **Used by:** a change's search (`crates/kiln/src/ci/search.rs`): a kiln diff's version, and a
+  host's pull request at its mirrored head.
+- **Passed by:** the simulator and vorpal, every clause (`crates/kiln-search`'s test).
+- **Bounds:** tree ids 1 to 128 bytes; files to 1 MiB (a bigger one is left out, as a binary one
+  is); 200,000 files and 512 MiB a tree; queries to 1000 bytes; 1000 hits a search, the total
+  counting the rest; 500 characters of a hit's line.
+
+Methods: `build`, `built`, `search`, `forget`.
+
+- **SEARCH-1** a built tree is searched by its words: each hit is a line holding them, with its file, line, column and text, by path then line
+- **SEARCH-2** each hit names the innermost definition it sits in, by name and kind, and a line in none names none
+- **SEARCH-3** words with a capital match as written, words without one in any case, and a query between slashes is a regex
+- **SEARCH-4** a code pattern finds each place of its shape, never a definition's own name, each with the definition it sits in
+- **SEARCH-5** a query nothing answers finds nothing, and isn't refused
+- **SEARCH-6** an empty or long query, a regex or a pattern that doesn't parse, or a language no one knows is refused BadQuery, saying why; a limit of 0 is refused
+- **SEARCH-7** hits past the limit are left out, and the total counts them
+- **SEARCH-8** a tree not built is refused NotBuilt; a forgotten tree reads as never built, and forgetting it again is fine
+- **SEARCH-9** trees are apart: one path in two trees answers from each tree's own files
+- **SEARCH-10** a binary file, one that isn't UTF-8, or one past the bound is left out and counted as skipped
+- **SEARCH-11** building a tree already built keeps it as it was built
+- **SEARCH-12** past its bound of trees, building another forgets the one searched least recently
+- **SEARCH-13** a code pattern given a language, by name or alias, searches only that language's files
+
+## Sigstore
+
+An outside Fulcio and Rekor (docs/ci.md W18-R02, W27-R12). Fulcio certifies a key for whoever an
+identity token names, the key's holder proving it has it by signing the token's subject; Rekor logs
+entries, numbered in the order they come, promises each (its signed entry timestamp), proves each
+is in its tree, and gives each back by its number.
+
+- **Implementations:** kiln's client of the Fulcio and Rekor `[ci.attest]` names
+  (`kiln::ci::signing::Remote`: Fulcio's `/api/v2/signingCert`, Rekor's `/api/v1/log/entries`);
+  `kiln_seams::sigstore::SimSigstore`, which certifies with a CA of its own and logs in an RFC 6962
+  tree of its own, its promises and checkpoints signed with a key of its own:
+  `SimSigstore::trusted_root` is Sigstore's trust in it, so kiln's verifier verifies what it signs.
+  Its keys come from a seed; its certificates are for code signing and valid ten minutes; its log
+  holds 100,000 entries (past it, refused `Full`), each request a second after the last from the
+  start it's given.
+- **Used by:** kiln's keyless signing (`[ci.attest] signing = "keyless"`, `ci/signing.rs`).
+- **Passed by:** the simulator, every clause; kiln's client, every clause, over Fulcio's and
+  Rekor's HTTP APIs against an HTTP front of the simulator (`ci::signing`'s tests). Not yet against
+  a real Fulcio and Rekor (one deployed in kiln's cluster, W18-R02).
+
+Methods: `certify`, `log`, `entry`.
+
+- **SIGSTORE-1** a key with a token it takes is certified: a chain of PEM certificates, the key's first (for code signing, naming the token's issuer), then what issued it
+- **SIGSTORE-2** a token that isn't one is refused Unauthorized; a key that isn't one, or a proof that isn't the key's, is refused Invalid, naming which
+- **SIGSTORE-3** an entry logged is found again at its index, with the same uuid, body and time
+- **SIGSTORE-4** entries are numbered in the order they're logged, and their times never go back
+- **SIGSTORE-5** the same entry logged twice is refused Conflict, naming where it is
+- **SIGSTORE-6** an index never logged is refused NotFound
+- **SIGSTORE-7** an entry comes with the log's promise and the proof of its inclusion: its index in a tree of more entries than that, the tree's root, and a checkpoint of that tree
+- **SIGSTORE-8** an entry whose signature isn't its verifier's is refused Invalid, naming the entry

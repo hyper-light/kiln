@@ -25,15 +25,14 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import { atOf, doingOf, findAgents } from "./broadcast";
-import { MODES, SendModes } from "./composer";
 import { useAttachments } from "./controls";
 import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
 import { usePrefill, type Prefill } from "./new-agent-draft";
 import { machineName } from "./parts";
-import { RunSettings, Scale, WordRow, type Word } from "./run-settings";
+import { RunSettings, WordRow } from "./run-settings";
 import { effortsFor, resumeEffort } from "./spawn-efforts";
-import { harnessesOf, kindOf, machineLabel, machinesWith, modeOf, modelOf, modesFor, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "./spawn-setup";
+import { harnessesOf, kindOf, machineLabel, machinesWithAny, shortMachineLabel, modeOf, modelOf, modesFor, onMachine, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "./spawn-setup";
 import { useHeld } from "./state";
 import { MicButton } from "./voice";
 
@@ -65,7 +64,7 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
 const MACHINES = { pollMs: 60_000 } as const;
 
 const COUNTS = [1, 2, 3, 4, 6, 8, 12];
-type Part = "kind" | "machine" | "count" | null;
+type Part = "machine" | null;
 
 /** Enter starts with a keyboard and pointer; on a touch screen it's a new line (as in the composer). */
 const fine = () => window.matchMedia?.("(pointer: fine)").matches;
@@ -160,13 +159,15 @@ type Choices = ReturnType<typeof useChoices>;
 /** The choices, read against what the machines have: which agent, where, its folder, how it runs. */
 function resolve(c: Choices, m: Machines) {
   const all = harnessesOf(m.byTarget);
-  const kind = kindOf(all, c.seed?.kind ?? c.kind);
-  const where = machinesWith(m.byTarget, kind);
+  // The machine first; then the agents it runs (the others shown, not to be chosen there).
+  const where = machinesWithAny(m.byTarget);
   const target = targetOf(where, [c.picked, c.seed?.target, c.lastTarget]);
+  const here = m.byTarget[target] ?? [];
+  const kind = kindOf(here.length > 0 ? here : all, c.seed?.kind ?? c.kind);
   const recent = c.dirs[target] ?? [];
   // The folder: typed or browsed to on this machine, else the one handed over, else the last one used here.
   const cwd = (c.folder?.target === target ? c.folder.cwd : undefined) ?? (c.seed?.target === target ? c.seed.cwd : undefined) ?? recent[0] ?? "~";
-  const info = m.byTarget[target]?.find((x) => x.id === kind) ?? all.find((x) => x.id === kind);
+  const info = onMachine(m.byTarget, target, kind) ?? all.find((x) => x.id === kind);
   const modes = modesFor(info);
   const mode = modeOf(modes, { unchecked: c.unchecked, remembered: c.seed?.mode ?? c.modeByKind[kind], fallback: info?.default_mode });
   const model = modelOf(info, c.seed?.model ?? c.modelByKind[kind] ?? "");
@@ -176,7 +177,9 @@ function resolve(c: Choices, m: Machines) {
   const speed = oneOf(speeds, c.speedByKind[kind]);
   const canVolume = m.workspaces[target]?.available === true;
   // The other harnesses on that machine, by their models: choosing one starts the agent there.
-  const others = (m.byTarget[target] ?? []).filter((x) => x.available && x.id !== kind && (x.models?.length ?? 0) > 0).map((x) => ({ kind: x.id, name: x.name, models: x.models ?? [] }));
+  // The other harnesses the machine runs, by their models (another machine's list where it has none yet; "Default" where none
+  // has one): choosing one starts the agent there, as the agent page's model select switches it.
+  const others = here.filter((x) => x.available && x.id !== kind).map((x) => ({ kind: x.id, name: x.name, models: onMachine(m.byTarget, target, x.id)?.models ?? [] }));
   return {
     all,
     kind,
@@ -197,7 +200,8 @@ function resolve(c: Choices, m: Machines) {
     others,
     shells: m.shells.filter((s) => s.target === target && !s.exited),
     kindName: info?.name ?? kind,
-    machine: target ? machineLabel(target, m.machines) : "",
+    machine: target ? shortMachineLabel(target, m.machines) : "",
+    machineFull: target ? machineLabel(target, m.machines) : "",
     noHarness: !all.some((k) => k.available),
     // Connected machines whose runner never reported its harnesses: too old to run agents.
     stale: m.machines.filter((x) => !(`agent:${x.name}` in m.byTarget)),
@@ -259,100 +263,6 @@ function HowLine({ c }: { c: Choices }) {
   );
 }
 
-const Dot = () => (
-  <span className="mc-dot" aria-hidden="true">
-    ·
-  </span>
-);
-
-/** In the box's top slot: the agent, its machine, its folder (or a shell), how many, each opened in place. */
-function Slot({ c }: { c: Choices }) {
-  const s = useSetup(c);
-  const toggle = (p: Exclude<Part, null>) => c.setOpen(c.open === p ? null : p);
-  const part = (p: Exclude<Part, null>, text: string, eyebrow?: string) => (
-    <button type="button" className="ip-line mc-part" aria-expanded={c.open === p} onClick={() => toggle(p)}>
-      {eyebrow && <span className="ip-eyebrow">{eyebrow}</span>}
-      <span className="ip-path">
-        <span className="ip-seg" data-last="">
-          {text}
-        </span>
-      </span>
-    </button>
-  );
-  const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
-  const kinds: Word[] = s.all.map((k) => ({ id: k.id, text: k.name, full: k.name, hint: k.available ? (k.verified ? undefined : "Untested") : "Not installed on any connected machine" }));
-  return (
-    <div className="mc-slot">
-      {part("kind", s.kindName)}
-      <Dot />
-      {part("machine", s.machine || "no machine has it", "On")}
-      <Dot />
-      {c.shell ? (
-        <button type="button" className="ip-line mc-part" title="It starts where the shell is: tap for a folder instead" onClick={() => c.setShell("")}>
-          <span className="ip-eyebrow">In shell</span>
-          <span className="ip-path">
-            <span className="ip-seg" data-last="">
-              {shell?.title || "this shell"}
-            </span>
-          </span>
-        </button>
-      ) : s.target ? (
-        <InlinePath target={s.target} value={s.cwd} onChange={(v) => c.setFolder({ target: s.target, cwd: v })} recent={s.recent} label="In" className="mc-where" />
-      ) : null}
-      <Dot />
-      {part("count", `×${c.count}`)}
-      {c.open === "kind" && (
-        <div className="rs-panel mc-slot-panel" role="group" aria-label="Agent">
-          <WordRow
-            label="Agent"
-            words={kinds}
-            value={s.kind}
-            onPick={(w) => {
-              c.setKind(w.id);
-              c.drop("kind");
-              c.setOpen(null);
-            }}
-          />
-          <p className="rs-now">
-            <span className="rs-now-name">{s.kindName}</span>
-            <span className="rs-now-hint">{s.where.length > 0 ? `On ${s.where.map((t) => machineLabel(t, s.machines)).join(", ")}` : "Not on any connected machine"}</span>
-          </p>
-        </div>
-      )}
-      {c.open === "machine" && (
-        <div className="rs-panel mc-slot-panel" role="group" aria-label="Machine">
-          <WordRow
-            label="Machine"
-            words={s.where.map((t) => ({ id: t, text: machineLabel(t, s.machines), full: machineLabel(t, s.machines) }))}
-            value={s.target}
-            onPick={(w) => {
-              c.setPicked(w.id);
-              c.drop("target");
-              c.setShell("");
-              c.setOpen(null);
-            }}
-          />
-        </div>
-      )}
-      {c.open === "count" && (
-        <div className="rs-panel mc-slot-panel" role="group" aria-label="How many">
-          <Scale
-            label="How many"
-            words={COUNTS.map((n) => ({
-              id: String(n),
-              text: String(n),
-              full: n === 1 ? "1 agent" : `${n} agents`,
-              hint: n === 1 ? "One agent" : `Each gets this message, named ${s.kindName} 1–${n}`,
-            }))}
-            value={String(c.count)}
-            onPick={(w) => c.setCount(Number(w.id))}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
 function StartButton({ c, busy, blocked, run }: { c: Choices; busy: boolean; blocked: boolean; run: (s: Setup) => void }) {
   const s = useSetup(c);
   const label = busy ? "Starting…" : c.count > 1 ? `Start ${c.count}` : "Start";
@@ -388,20 +298,83 @@ function Pick({ label, value, onChange, options }: { label: string; value: strin
   );
 }
 
-/** More options, open: one quiet row each, two to a line where there's room. */
-function Options({ c, s }: { c: Choices; s: Setup }) {
+/** A row's value that opens in place under it (the machine). */
+function Opens({ c, part, text, title }: { c: Choices; part: Exclude<Part, null>; text: string; title?: string }) {
+  return (
+    <button type="button" className="mc-pick" aria-expanded={c.open === part} title={title} onClick={() => c.setOpen(c.open === part ? null : part)}>
+      <span>{text}</span>
+      <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
+    </button>
+  );
+}
+
+/**
+ * The options, open: one quiet row each. Where it starts first
+ * (the machine, the folder, how many), then the rest. The agent is picked as the agent page switches
+ * one: by a model of its in the model select above the box.
+ */
+function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past: boolean; setPast: (o: boolean) => void; onResume: (s: Setup, p: PastSession) => void }) {
+  const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
   return (
     <div className="mc-opts">
       <div className="mc-opt">
+        <span className="mc-opt-key">Machine</span>
+        <div className="mc-opt-val">
+          <Opens c={c} part="machine" text={s.machine || "None runs agents"} title={s.machineFull} />
+        </div>
+      </div>
+      {c.open === "machine" && (
+        <div className="rs-panel mc-opt-panel" role="group" aria-label="Machine">
+          <WordRow
+            label="Machine"
+            words={s.where.map((t) => ({ id: t, text: shortMachineLabel(t, s.machines), full: machineLabel(t, s.machines) }))}
+            value={s.target}
+            onPick={(w) => {
+              c.setPicked(w.id);
+              c.drop("target");
+              c.setShell("");
+              c.setOpen(null);
+            }}
+          />
+        </div>
+      )}
+      <div className="mc-opt mc-opt-folder">
+        <span className="mc-opt-key">Folder</span>
+        <div className="mc-opt-val">
+          {c.shell ? (
+            <button type="button" className="mc-pick" title="It starts where the shell is: tap for a folder instead" onClick={() => c.setShell("")}>
+              <span>Shell: {shell?.title || "this shell"}</span>
+            </button>
+          ) : s.target ? (
+            <InlinePath target={s.target} value={s.cwd} onChange={(v) => c.setFolder({ target: s.target, cwd: v })} recent={s.recent} label="Folder" />
+          ) : (
+            <span className="mc-none">—</span>
+          )}
+        </div>
+      </div>
+      <div className="mc-opt">
+        <span className="mc-opt-key">How many</span>
+        <div className="mc-opt-val">
+          <div className="mc-seg" role="radiogroup" aria-label="How many">
+            {COUNTS.map((n) => (
+              <button
+                key={n}
+                type="button"
+                role="radio"
+                aria-checked={c.count === n}
+                title={n === 1 ? "One agent" : `Each gets this message, named ${s.kindName} 1–${n}`}
+                onClick={() => c.setCount(n)}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="mc-opt">
         <span className="mc-opt-key">Name</span>
         <div className="mc-opt-val">
-          <input
-            className="mc-inline-input"
-            value={c.name}
-            onChange={(e) => c.setName(e.target.value)}
-            placeholder={c.count > 1 ? "fix-tests (numbered)" : "It names itself from its work"}
-            aria-label="Name"
-          />
+          <input className="mc-inline-input" value={c.name} onChange={(e) => c.setName(e.target.value)} placeholder={c.count > 1 ? "fix-tests (numbered)" : "Optional"} aria-label="Name" />
         </div>
       </div>
       <div className="mc-opt">
@@ -450,6 +423,24 @@ function Options({ c, s }: { c: Choices; s: Setup }) {
           />
         </div>
       </div>
+      {s.target && (
+        <div className="mc-opt">
+          <span className="mc-opt-key">Continue</span>
+          <div className="mc-opt-val">
+            <button type="button" className="mc-pick" aria-expanded={past} onClick={() => setPast(!past)}>
+              <span>A past session on {s.machine}</span>
+              <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      )}
+      {past && s.target && (
+        <div className="ps-body mc-past mc-opt-panel">
+          <Loadable label="Loading past sessions" fallback={<p className="ps-none">Looking…</p>}>
+            <PastList target={s.target} kind={s.kind} kindName={s.kindName} onPick={(p) => onResume(s, p)} />
+          </Loadable>
+        </div>
+      )}
     </div>
   );
 }
@@ -500,9 +491,7 @@ function Under({
 }) {
   const s = useSetup(c);
   // What More options holds that isn't as it starts out, said while it's closed.
-  const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${c.reach}`), c.shell && "In a shell"]
-    .filter(Boolean)
-    .join(" · ");
+  const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${c.reach}`)].filter(Boolean).join(" · ");
   return (
     <>
       <div className="mc-under">
@@ -519,21 +508,8 @@ function Under({
           {!more && summary && <span className="mc-sum">{summary}</span>}
           <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
         </button>
-        {s.target && (
-          <button type="button" className="mc-toggle" aria-expanded={past} onClick={() => setPast(!past)}>
-            Continue a past session on {s.machine}
-            <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
-          </button>
-        )}
       </div>
-      {more && <Options c={c} s={s} />}
-      {past && s.target && (
-        <div className="ps-body mc-past">
-          <Loadable label="Loading past sessions" fallback={<p className="ps-none">Looking…</p>}>
-            <PastList target={s.target} kind={s.kind} kindName={s.kindName} onPick={(p) => onResume(s, p)} />
-          </Loadable>
-        </div>
-      )}
+      {more && <Options c={c} s={s} past={past} setPast={setPast} onResume={onResume} />}
       {s.stale.length > 0 ? (
         <p className="mc-note">
           <b>{s.stale.map((m) => m.name).join(", ")}</b> {s.stale.length === 1 ? "is" : "are"} connected, but {s.stale.length === 1 ? "its kiln runner is" : "their kiln runners are"} too old to run
@@ -552,11 +528,6 @@ const LineLoading = () => (
     <div className="rs-top">
       <p className="rs-line" />
     </div>
-  </div>
-);
-const SlotLoading = () => (
-  <div className="mc-slot">
-    <span className="mc-looking">Looking at your machines…</span>
   </div>
 );
 
@@ -731,9 +702,6 @@ export function NewAgent({
         }}
       >
         <div className={cn("hx-compose-box", busy && "hx-compose-live")}>
-          <React.Suspense fallback={<SlotLoading />}>
-            <Slot c={c} />
-          </React.Suspense>
           {attachments.chips}
           <textarea
             ref={attach}
@@ -792,12 +760,6 @@ export function NewAgent({
               </button>
             </Tip>
             <MicButton field={field} setText={(t) => onText(t)} onNote={setNote} />
-            {/* The same bar as messaging agents, so nothing moves as the composer turns: a new agent takes its first message at once. */}
-            <Tip content="A new agent takes its first message at once: Queue, Steer and Now are for agents at work">
-              <fieldset className="mc-modes" disabled>
-                <SendModes modes={MODES} mode="queue" onMode={() => undefined} />
-              </fieldset>
-            </Tip>
             <span className="cp-gap" />
             <React.Suspense
               fallback={

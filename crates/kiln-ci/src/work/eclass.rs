@@ -667,6 +667,12 @@ pub enum Rewrite {
     Drop { op: Pattern },
     /// An operation `a` names and one `b` names, different ones, commute: either order is one.
     Commute { a: Pattern, b: Pattern },
+    /// Operations that start with `prefix` and assign different names (what comes before their
+    /// first `=`) commute: environment variables set in either order are one.
+    Assign { prefix: String },
+    /// In an operation `op` names, the words among `flags` (flags that take no value) may come in
+    /// any order: one order stands for them all.
+    Flags { op: Pattern, flags: BTreeSet<String> },
 }
 
 /// A rewrite rule over unit definitions (W24-R30), as data.
@@ -691,8 +697,26 @@ impl Rule {
     fn commutes(&self, x: &str, y: &str) -> bool {
         match &self.rewrite {
             Rewrite::Commute { a, b } => x != y && ((a.matches(x) && b.matches(y)) || (a.matches(y) && b.matches(x))),
-            Rewrite::Drop { .. } => false,
+            Rewrite::Assign { prefix } => {
+                let name = |op: &str| op.trim().strip_prefix(prefix.trim_start()).and_then(|r| r.split_once('=')).map(|(n, _)| n.trim().to_owned());
+                matches!((name(x), name(y)), (Some(m), Some(n)) if !m.is_empty() && !n.is_empty() && m != n)
+            }
+            Rewrite::Drop { .. } | Rewrite::Flags { .. } => false,
         }
+    }
+
+    /// `op` with the flags this rule puts in order sorted in their places, if it names `op`.
+    fn ordered(&self, op: &str) -> Option<String> {
+        let Rewrite::Flags { op: p, flags } = &self.rewrite else { return None };
+        if !p.matches(op) {
+            return None;
+        }
+        let words: Vec<&str> = op.split(' ').collect();
+        let mut listed: Vec<&str> = words.iter().copied().filter(|w| flags.contains(*w)).collect();
+        listed.sort_unstable();
+        let mut next = listed.into_iter();
+        let out: Vec<&str> = words.iter().map(|w| if flags.contains(*w) { next.next().unwrap_or(w) } else { w }).collect();
+        Some(out.join(" "))
     }
 }
 
@@ -724,16 +748,26 @@ pub const ORDER_MAX: usize = 1024;
 /// doesn't commute with, and each level in text order).
 fn normal(rules: &[&Rule], definition: &str) -> (String, BTreeSet<String>) {
     let mut used = BTreeSet::new();
-    let mut ops: Vec<&str> = Vec::new();
+    let mut owned: Vec<String> = Vec::new();
     for op in definition.split('\n') {
         match rules.iter().find(|r| r.drops(op)) {
             Some(r) => {
                 used.insert(r.name.clone());
             }
-            None => ops.push(op),
+            None => {
+                let mut op = op.to_owned();
+                for r in rules {
+                    if let Some(o) = r.ordered(&op).filter(|o| *o != op) {
+                        used.insert(r.name.clone());
+                        op = o;
+                    }
+                }
+                owned.push(op);
+            }
         }
     }
-    let commuting: Vec<&&Rule> = rules.iter().filter(|r| matches!(r.rewrite, Rewrite::Commute { .. })).collect();
+    let mut ops: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let commuting: Vec<&&Rule> = rules.iter().filter(|r| matches!(r.rewrite, Rewrite::Commute { .. } | Rewrite::Assign { .. })).collect();
     if !commuting.is_empty() && ops.len() <= ORDER_MAX {
         let by = |x: &str, y: &str| commuting.iter().find(|r| r.commutes(x, y)).map(|r| r.name.clone());
         let mut levels: Vec<usize> = Vec::with_capacity(ops.len());
@@ -778,6 +812,8 @@ impl Rules {
         let everything = match &rule.rewrite {
             Rewrite::Drop { op } => op.everything(),
             Rewrite::Commute { a, b } => a.everything() || b.everything(),
+            Rewrite::Assign { prefix } => prefix.trim().is_empty(),
+            Rewrite::Flags { op, flags } => op.everything() || flags.is_empty(),
         };
         if everything {
             return fail("it names every operation".into());
@@ -1437,6 +1473,28 @@ mod tests {
         let json = serde_json::to_string(&commute_rule("c", Pattern::Starts("add ".into()), Pattern::Is("true".into()))).map_err(|e| Refused::Digest(e.to_string()))?;
         let back: Rule = serde_json::from_str(&json).map_err(|e| Refused::Digest(e.to_string()))?;
         assert_eq!(back, commute_rule("c", Pattern::Starts("add ".into()), Pattern::Is("true".into())));
+        Ok(())
+    }
+
+    /// W24-R30: assignments of different names commute and those of one name never do; listed
+    /// flags come in one order, in their places; a rule of either kind that names everything is
+    /// refused.
+    #[test]
+    fn w24_r30_assignments_and_flags() -> Result<(), Refused> {
+        let mut rules = Rules::default();
+        let assign = Rule { name: "env-order".into(), kinds: BTreeSet::new(), rewrite: Rewrite::Assign { prefix: "export ".into() } };
+        let flags = Rule { name: "cargo-flags".into(), kinds: BTreeSet::new(), rewrite: Rewrite::Flags { op: Pattern::Starts("cargo ".into()), flags: BTreeSet::from(["--locked".to_owned(), "--release".to_owned()]) } };
+        let refused = |r: Result<(), Refused>| matches!(r, Err(Refused::Rule { .. }));
+        assert!(refused(rules.register(Rule { rewrite: Rewrite::Assign { prefix: " ".into() }, ..assign.clone() }, witness("export B=2\nexport A=1", "export A=1\nexport B=2"))), "every assignment");
+        assert!(refused(rules.register(Rule { rewrite: Rewrite::Flags { op: Pattern::Starts("cargo ".into()), flags: BTreeSet::new() }, ..flags.clone() }, witness("cargo b", "cargo c"))), "no flags");
+        rules.register(assign, witness("export B=2\nexport A=1", "export A=1\nexport B=2"))?;
+        rules.register(flags, witness("cargo build --release --locked", "cargo build --locked --release"))?;
+        let n = |d: &str| rules.normalize(Kind::Step, d).0;
+        assert_eq!(n("export B=2\nexport A=1\nmake"), n("export A=1\nexport B=2\nmake"));
+        assert_ne!(n("export A=1\nexport A=2"), n("export A=2\nexport A=1"), "one name set twice: the last stands");
+        assert_eq!(n("cargo build --release -p x --locked"), "cargo build --locked -p x --release");
+        assert_eq!(n("cargo build --locked -p x --release"), "cargo build --locked -p x --release");
+        assert_eq!(n("make --release --locked"), "make --release --locked", "only the tool it names");
         Ok(())
     }
 
