@@ -59,7 +59,7 @@ test("the lanes' walk, room, rows and focus in an open row survive updates", asy
     await expect(lanes.getByRole("button", { name: "Now" })).toBeEnabled();
     // Each lane's row marked with its name, to tell a row kept from one drawn again. (A lane can be
     // another's: the mock's fixed rows stream whichever of its jobs runs. Those that stay are kept.)
-    const kept = await box.locator(".ship-lane").evaluateAll((els) => els.map((el) => ((el as HTMLElement).dataset.probe = el.querySelector(".ship-lane__name")?.textContent ?? "")));
+    const kept = await box.locator(".ship-lrow[data-lane]").evaluateAll((els) => els.map((el) => ((el as HTMLElement).dataset.probe = el.querySelector(".ship-ll__name")?.textContent ?? "")));
     expect(kept.length).toBeGreaterThan(0);
     const later = lanes.getByRole("button", { name: "Later" });
     await later.focus();
@@ -71,8 +71,8 @@ test("the lanes' walk, room, rows and focus in an open row survive updates", asy
     await expect(lanes.getByRole("button", { name: "Fit" })).toBeVisible();
     await expect(lanes.getByRole("button", { name: "Now" })).toBeEnabled();
     const after = await box
-      .locator(".ship-lane")
-      .evaluateAll((els) => els.map((el) => ({ name: el.querySelector(".ship-lane__name")?.textContent ?? "", probe: (el as HTMLElement).dataset.probe ?? null })));
+      .locator(".ship-lrow[data-lane]")
+      .evaluateAll((els) => els.map((el) => ({ name: el.querySelector(".ship-ll__name")?.textContent ?? "", probe: (el as HTMLElement).dataset.probe ?? null })));
     const stayed = after.filter((l) => kept.includes(l.name));
     expect(stayed.length).toBeGreaterThan(0);
     expect(stayed.filter((l) => l.probe !== l.name)).toEqual([]);

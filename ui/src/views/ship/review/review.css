@@ -1014,13 +1014,256 @@
 /* Ship's Lanes, f-ship drawn (W26-R14/15): a shared horizon, a group per stage — Review first —
    each lane a label pinned left and a bar wearing its rim, Previous / Now / next walking the
    horizon, Fit squeezing the rows and Detail giving each its who/when/seal. */
+/* The opened commit's Lanes as f-ship draws them (plan 01a1856fe81375b1bd1d1d86f270a45b, step 10):
+   one card, a label column pinned left beside the timeline; in Detail the timeline is 140 px a
+   minute and scrolls sideways inside the card, the labels staying where they are. */
 .ship-lanesbox {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 10px 12px;
+  overflow: hidden;
   border: 1px solid var(--k-line, #2a2c31);
   border-radius: 10px;
+  background: #0d0e11;
+}
+.ship-lscroll {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.ship-lin {
+  --lw: 170px;
+  position: relative;
+  padding: 4px 0 8px;
+}
+.ship-lanesbox:not([data-fit]) .ship-lin {
+  --lw: 300px;
+  width: calc(var(--lw) + var(--track, 480px));
+}
+@media (max-width: 700px) {
+  .ship-lin {
+    --lw: 112px;
+  }
+  .ship-lanesbox:not([data-fit]) .ship-lin {
+    --lw: 220px;
+  }
+}
+.ship-lrow {
+  display: flex;
+  align-items: center;
+  height: 21px;
+}
+.ship-lrow--g {
+  height: 25px;
+  align-items: flex-end;
+}
+.ship-ll {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  display: flex;
+  flex: none;
+  box-sizing: border-box;
+  width: var(--lw);
+  height: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  background: #141517;
+  color: #b9bbc2;
+  font-size: 12px;
+}
+.ship-ll__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-ll__when,
+.ship-ll__seal {
+  flex: none;
+  color: #8b8e96;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.ship-lrow--g .ship-ll {
+  align-items: flex-end;
+  padding-bottom: 3px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.ship-lt {
+  position: relative;
+  flex: none;
+  width: calc(100% - var(--lw));
+  height: 10px;
+  border-radius: 5px;
+  background: rgb(255 255 255 / 0.035);
+}
+.ship-lanesbox:not([data-fit]) .ship-lt {
+  width: var(--track, 480px);
+}
+.ship-lrow--g .ship-lt {
+  background: none;
+}
+.ship-lrow--axis .ship-lt {
+  height: 16px;
+  background: none;
+  color: #6d7078;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 9.5px;
+}
+.ship-lrow--axis .ship-lt > span {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+.ship-lrow--axis .ship-lt > span:first-child {
+  transform: none;
+}
+.ship-lrow--axis .ship-lt > span:last-child {
+  transform: translateX(-100%);
+}
+/* A lane's bar: the agent console's pause-button rim laid flat, its state's palette sliding under
+   it while glints pass over (f-ship's); only transform and opacity move, and reduced motion holds
+   them still. */
+.ship-lbar {
+  --rim: linear-gradient(90deg, #8d869f, #aca1d5 21%, #d3c6ee 29%, #8a7cae 42%, #b5a7db 68%, #8d869f, #aca1d5 121%);
+  --glint: rgb(225 215 245 / 35%);
+  --cur: 24s;
+  --spark: 19s;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 4px;
+  overflow: hidden;
+  isolation: isolate;
+  border-radius: 5px;
+}
+.ship-lbar::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: -1;
+  width: 300%;
+  background: var(--rim);
+  background-size: 33.34% 100%;
+  animation: ship-current var(--cur) linear infinite;
+  content: "";
+}
+.ship-lbar::after {
+  position: absolute;
+  inset: 0 auto 0 -100%;
+  width: 300%;
+  background: linear-gradient(100deg, transparent 4%, var(--glint) 7%, transparent 10% 33%, var(--glint) 35%, transparent 38% 69%, var(--glint) 73%, transparent 77%);
+  animation: ship-spark var(--spark) linear infinite reverse;
+  content: "";
+}
+@keyframes ship-current {
+  to {
+    transform: translateX(-33.34%);
+  }
+}
+@keyframes ship-spark {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: translateX(0);
+  }
+  17% {
+    opacity: 1;
+  }
+  21% {
+    transform: translateX(6%);
+  }
+  43% {
+    opacity: 0.3;
+  }
+  47% {
+    transform: translateX(22%);
+  }
+  71% {
+    opacity: 0.8;
+  }
+  76% {
+    transform: translateX(28%);
+  }
+}
+.ship-lbar:is([data-state="running"], [data-state="guard"], [data-state="replanting"]) {
+  --rim: linear-gradient(
+    90deg,
+    #b8d9d2,
+    #7194c9 8%,
+    #c8e0ef 13%,
+    #a6c4ed 23%,
+    #8677ad 32%,
+    #d7c1ee 37%,
+    #b8a6d5 46%,
+    #d6a2aa 55%,
+    #eed6bc 59%,
+    #a2bfae 66%,
+    #d8cbb0 77%,
+    #a6c4ed 85%,
+    #d6a2aa 91%,
+    #b8d9d2
+  );
+  --glint: rgb(245 234 255 / 90%);
+  --cur: 5.3s;
+  --spark: 3.7s;
+}
+.ship-lbar:is([data-state="failed"], [data-state="rolledback"], [data-state="conflict"], [data-state="changes"]) {
+  --rim: linear-gradient(90deg, #996f77, #d1aaad 23%, #e1bdc0 30%, #a17b83 46%, #c29ba1 73%, #996f77);
+  --glint: rgb(233 197 200 / 20%);
+  --cur: 52s;
+  --spark: 43s;
+}
+.ship-lbar:is([data-state="passed"], [data-state="replanted"], [data-state="soaking"], [data-state="reused"], [data-state="healthy"], [data-state="approved"]) {
+  --rim: linear-gradient(90deg, #79978a, #a8c9bc 22%, #d2e6d8 32%, #8aafa0 49%, #b4d0bd 76%, #79978a);
+  --glint: rgb(225 240 229 / 30%);
+  --cur: 32s;
+  --spark: 27s;
+}
+.ship-lbar:is([data-state="needs"], [data-state="requested"], [data-state="blocked"]) {
+  --rim: linear-gradient(90deg, #a8906a, #e2cfae 22%, #f0e2c6 32%, #b39b74 49%, #d8c39d 76%, #a8906a);
+  --glint: rgb(245 232 205 / 55%);
+  --cur: 11s;
+  --spark: 8s;
+}
+.ship-lbar:is([data-state="flaky"], [data-state="partial"]) {
+  --rim: linear-gradient(90deg, #8f7a5c, #d0b591 22%, #e3cfae 32%, #9c8566 49%, #c4a982 76%, #8f7a5c);
+  --glint: rgb(240 225 200 / 35%);
+  --cur: 32s;
+  --spark: 27s;
+}
+.ship-lbar:is([data-state="superseded"], [data-state="offline"], [data-state="none"]) {
+  --rim: linear-gradient(90deg, #555962, #797c84 24%, #898c94 34%, #656872 53%, #777a82 80%, #555962);
+  --glint: rgb(163 166 173 / 10%);
+  --cur: 100s;
+  --spark: 83s;
+}
+.ship-lbar:is([data-state="queued"], [data-state="waiting"]) {
+  opacity: 0.55;
+}
+/* The now line: over the timeline, clipped to it, moved by transform alone. */
+.ship-lnow {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--lw);
+  z-index: 1;
+  width: calc(100% - var(--lw));
+  overflow: hidden;
+  pointer-events: none;
+}
+.ship-lanesbox:not([data-fit]) .ship-lnow {
+  width: var(--track, 480px);
+}
+.ship-lnow > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 100%;
+  border-left: 1px solid rgb(255 255 255 / 0.5);
 }
 /* The nav wraps rather than reach past a narrow window (the opened commit's step 4: from 320 px). */
 .ship-lanesbox__nav {
@@ -1032,13 +1275,13 @@
   font-size: 11px;
   color: #8b8e96;
 }
-.ship-lanesbox__nav .rv-ib {
-  font-size: 11px;
-}
 .ship-lanesbox__span {
   flex: 1;
   text-align: center;
   white-space: nowrap;
+}
+.ship-lanesbox__nav .rv-ib {
+  font-size: 11px;
 }
 .ship-lanegroup__head {
   display: flex;

@@ -37,11 +37,12 @@ test("a landed change opens Files, Conversation, Output, Jobs, Lanes", async ({ 
   await expect(row.locator(".rv-s > h3, .ship-sech > h3")).toHaveText(SECTIONS);
 });
 
-test("a diff's Review lane group shows each mark in order, its time and unsigned", async ({ page }) => {
+test("a diff's Review lane group shows each mark in order, in Detail with its time and unsigned", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
-  const group = row.locator('.ship-lanegroup[data-group="review"]');
-  await expect(group.locator(".ship-lanegroup__head")).toContainText("Review");
-  const lanes = group.locator(".ship-lane");
+  await expect(row.locator('.ship-lrow--g[data-group="review"]')).toContainText("Review");
+  // Detail gives each mark its time and its seal beside its name (W26-R14).
+  await row.getByRole("group", { name: "Lanes' scale" }).getByRole("button", { name: "Detail" }).click();
+  const lanes = row.locator('.ship-lrow[data-group="review"][data-lane]');
   // D41's story, as the step tells it: v5 pushed, kim's blocking comment, kim resolves it, v6 by
   // Apply, v7 its conflict resolved, kim's approval.
   const names = ["v5 · pushed", "kim · comment", "kim · resolved", "v6 · suggestion applied", "v7 · conflict resolved", "approval · kim (v7)"];
@@ -50,13 +51,14 @@ test("a diff's Review lane group shows each mark in order, its time and unsigned
     const lane = lanes.nth(i);
     await expect(lane).toContainText(name);
     await expect(lane).toContainText("unsigned");
-    await expect(lane.locator(".ship-lane__when")).toHaveText(/\d{2}:\d{2}/);
+    await expect(lane.locator(".ship-ll__when")).toHaveText(/\d{2}:\d{2}/);
   }
 });
 
 test("a commit with no change's Review lane group has the one mark, its push", async ({ page }) => {
   const row = await open(page, "sync: a move carries its homes");
-  const lanes = row.locator('.ship-lanegroup[data-group="review"] .ship-lane');
+  await row.getByRole("group", { name: "Lanes' scale" }).getByRole("button", { name: "Detail" }).click();
+  const lanes = row.locator('.ship-lrow[data-group="review"][data-lane]');
   await expect(lanes).toHaveCount(1);
   await expect(lanes.first()).toContainText("pushed");
   await expect(lanes.first()).toContainText("unsigned");
