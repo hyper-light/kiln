@@ -6,7 +6,7 @@
 //! - [`admit`]: admission: coalescing, cadence, speculation windows (W28-R60 to R63, R68).
 //! - [`demand`]: demands, the work in flight, and what becomes of work no one wants (W28-R40 to R44).
 //! - [`groups`]: concurrency groups.
-//! - [`intent`]: priority by intent: gate, waiting, trunk, work in progress (W28-R64, R65).
+//! - [`intent`]: priority and class by intent: gate, waiting, trunk, work in progress (W28-R64, W05-R30).
 //! - [`needs`]: what work needs of a runner, in one grammar (docs/runners.md).
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
@@ -45,4 +45,4 @@ mod replay;
 #[cfg(test)]
 mod tests;
 
-pub use state::{Command, Config, FairBy, Input, LegIn, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};
+pub use state::{Class, ClassConfig, Command, Config, FairBy, Input, LegIn, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};

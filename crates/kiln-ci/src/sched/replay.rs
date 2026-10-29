@@ -1,7 +1,7 @@
 //! E1.4 (docs/needs.md): the engine gives the same commands on every machine. Seeded scenarios
 //! (SplitMix64, as kiln-sim draws) of runners of mixed sizes and platforms, legs of mixed needs,
-//! priorities and repositories, attempts finishing, failing and retried, legs cancelled and
-//! runners lost and back drive the engine through its simulator. Every command it gives is written
+//! classes, priorities and repositories, attempts finishing, failing and retried, legs cancelled
+//! and runners lost and back drive the engine through its simulator. Every command it gives is written
 //! in a stable text form and hashed with SHA-256, and the digest must be the one committed beside
 //! this file (`replay.digest`). kiln's CI runs it on x86-64 and on arm64 (`.kiln/ci.yaml`).
 //!
@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use super::retry::{FailureClass, RetryOn, RetryPolicy, RunnerChoice};
 use super::routing::{LegRoute, RunnerView};
 use super::sim::Sim;
-use super::state::{Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn};
+use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -118,6 +118,7 @@ fn leg(d: &mut Draw, n: u64) -> (LegIn, i64, Vec<FailureClass>) {
         cost,
         actor: format!("a{}", d.below(3)),
         lane: format!("lane{}", d.below(2)),
+        class: Class::ALL.get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or_default(),
         ..LegIn::default()
     };
     let fails = match d.below(6) {
@@ -171,13 +172,19 @@ fn replay(cfg: &Config) -> (Vec<String>, String) {
     let mut h = Sha256::new();
     for seed in 0..SEEDS {
         // Odd seeds in resource mode, where fair share counts CPUs, memory and GPUs beside slots;
-        // fair share by repository, by actor within it, or by lane within that (docs/needs.md E2.2).
+        // fair share by repository, by actor within it, or by lane within that (docs/needs.md E2.2);
+        // the classes' floors and bounds as they come, or every other six seeds higher floors and
+        // bounds of minutes, which a scenario's legs pass (W05-R31).
         let fair_by = match (seed / 2) % 3 {
             0 => vec![FairBy::Repo],
             1 => vec![FairBy::Repo, FairBy::Actor],
             _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
         };
-        let cfg = Config { resources: seed % 2 == 1, fair_by, ..cfg.clone() };
+        let mut cfg = Config { resources: seed % 2 == 1, fair_by, ..cfg.clone() };
+        if (seed / 6) % 2 == 1 {
+            let minutes = |m: u64| Some(m * 60 * 1000);
+            cfg.classes = [(Class::Interactive, ClassConfig { floor: 50, bound: None }), (Class::Batch, ClassConfig { floor: 250, bound: minutes(2) }), (Class::Background, ClassConfig { floor: 100, bound: minutes(3) })].into_iter().collect();
+        }
         for (at, l) in scenario(seed, &cfg) {
             let l = format!("{seed} {at} {l}");
             h.update(l.as_bytes());

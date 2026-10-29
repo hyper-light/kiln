@@ -1,13 +1,16 @@
 //! Priority by intent (docs/ci.md W28-R64, R65), over W05-R09's scale: what a run is for decides
 //! how soon it goes. Gate first (it lands, deploys, or checks the commit a server runs), then what
 //! someone waits on (a person who asked for it, an agent blocked on its verdict), then trunk, then
-//! work in progress. Strict between classes; W05-R09's aging lifts what waits, so nothing starves:
-//! a class `c` behind a saturated stream of gate work starts within `(90 − p_c) / aging` minutes,
-//! and one leg's time.
+//! work in progress. An intent sets a leg's class (W05-R30, docs/needs.md E2.3): a gate `land`,
+//! someone waiting `interactive`, trunk and work in progress `batch`; classes' floors and promotion
+//! keep each from starving (W05-R31), and its priority, with W05-R09's aging, orders its tenant's
+//! own legs.
 //!
 //! Opt-in (`[ci.scheduler] priority = "intent"`); a job's own `priority:` still overrides it.
 
 use serde::Serialize;
+
+use super::state::Class;
 
 /// What a run is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -27,6 +30,16 @@ impl Intent {
             Intent::Waiting => 80,
             Intent::Trunk => 60,
             Intent::Wip => 40,
+        }
+    }
+
+    /// The class it sets (W05-R30): a gate `land`, someone waiting `interactive`, trunk and work in
+    /// progress `batch`.
+    pub fn class(self) -> Class {
+        match self {
+            Intent::Gate => Class::Land,
+            Intent::Waiting => Class::Interactive,
+            Intent::Trunk | Intent::Wip => Class::Batch,
         }
     }
 
@@ -116,5 +129,13 @@ mod tests {
         }
         let p: Vec<u8> = [Intent::Gate, Intent::Waiting, Intent::Trunk, Intent::Wip].iter().map(|i| i.priority()).collect();
         assert!(p.windows(2).all(|w| w.first() > w.get(1)), "strict: {p:?}");
+    }
+
+    /// W05-R30, docs/needs.md E2.3: each intent sets its class.
+    #[test]
+    fn w05_r30_each_intent_sets_its_class() {
+        use super::Class;
+        let classes: Vec<Class> = [Intent::Gate, Intent::Waiting, Intent::Trunk, Intent::Wip].iter().map(|i| i.class()).collect();
+        assert_eq!(classes, vec![Class::Land, Class::Interactive, Class::Batch, Class::Batch]);
     }
 }

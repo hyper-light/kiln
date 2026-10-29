@@ -41,20 +41,35 @@ fn assigns_to_the_least_loaded_and_queues_the_rest() {
     assert_eq!(sim.started("l4"), Some(10 * MIN + 1));
 }
 
-/// W05-AC03: a low-priority leg under a constant stream of high-priority legs starts within the
-/// bound aging gives: (100 − 20) / 1 per minute = 80 minutes.
+/// W05-AC03, within a tenant (docs/needs.md E2.3): a low-priority leg under its own repository's
+/// constant stream of high-priority legs starts within the bound aging gives: (100 − 20) / 1 per
+/// minute = 80 minutes.
 #[test]
 fn w05_ac03_aging_bounds_starvation() {
+    let start = low_under_a_stream("acme/x");
+    assert!((79 * MIN..=82 * MIN).contains(&start), "the low-priority leg started at {} min", start / MIN);
+}
+
+/// W05-AC03's leg in another repository than the stream (docs/needs.md E2.3): aging orders only a
+/// tenant's own legs, fair share orders tenants, so it starts at its tenant's first turn.
+#[test]
+fn w05_ac03_another_tenants_low_leg_waits_for_its_turn_alone() {
+    let start = low_under_a_stream("acme/y");
+    assert!(start - 1 <= MIN, "the low-priority leg waited {} s", (start - 1) / 1000);
+}
+
+/// When a priority-20 leg of `repo` starts, queued under a constant stream of acme/x's priority-100
+/// legs on one slot.
+fn low_under_a_stream(repo: &str) -> i64 {
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("a", 1));
     sim.leg(0, leg("busy", "acme/x", 100), MIN / 2);
-    sim.leg(1, leg("low", "acme/y", 20), MIN / 2);
+    sim.leg(1, leg("low", repo, 20), MIN / 2);
     for i in 0..400 {
         sim.leg(i * MIN / 2 + 2, leg(&format!("high{i}"), "acme/x", 100), MIN / 2);
     }
     sim.run(200 * MIN);
-    let start = sim.started("low").unwrap_or(i64::MAX);
-    assert!((79 * MIN..=82 * MIN).contains(&start), "the low-priority leg started at {} min", start / MIN);
+    sim.started("low").unwrap_or(i64::MAX)
 }
 
 /// W05-AC04: two repositories, 1,000 one-minute legs each on 20 slots: within 10 % of an equal
@@ -444,9 +459,10 @@ fn inputs(seed: u64) -> Vec<(Input, i64)> {
                 let mut l = leg(&id, &format!("acme/r{}", d.below(3)), u8::try_from(d.below(5) * 20).unwrap_or(60));
                 l.run = format!("run{}", d.below(4));
                 l.exclusive = d.below(10) == 0;
-                // Who pushed it and its lane (fair share's levels, W28-R66); work another run may
-                // adopt (W28-R42); a lane admission coalesces (W28-R61).
+                // Who pushed it and its lane (fair share's levels, W28-R66), and its class (W05-R30);
+                // work another run may adopt (W28-R42); a lane admission coalesces (W28-R61).
                 (l.actor, l.lane) = (format!("a{}", d.below(3)), format!("ln{}", d.below(2)));
+                l.class = super::state::Class::ALL.get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or_default();
                 if d.below(4) == 0 {
                     l.work = Some(super::demand::Work { key: Some(format!("K{}", d.below(3))), domain: super::demand::Domain::Trusted, lane: "acme/x".into(), observed: false });
                 }
@@ -487,20 +503,25 @@ fn inputs(seed: u64) -> Vec<(Input, i64)> {
 
 /// E1 (docs/needs.md), W05: the engine decides in a fixed order. The same inputs given to two
 /// schedulers in one process, whose hash maps hash apart (each map draws its own keys), give the
-/// same commands in the same order: 1,000 seeds of runners coming and going, legs queued, finished
-/// and cancelled, runs deprioritized and routing rules changed.
+/// same commands in the same order: 1,000 seeds of runners coming and going, legs of every class
+/// queued, finished and cancelled, runs deprioritized and routing rules changed.
 #[test]
 fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
-    use super::state::FairBy;
+    use super::state::{Class, ClassConfig, FairBy};
     let mut seen = [0u64; 3];
     for seed in 0..1_000u64 {
-        // Fair share across repositories, or within them by actor and lane too (W28-R66).
+        // Fair share across repositories, or within them by actor and lane too (W28-R66); the
+        // classes' floors and bounds as they come, or, every other seed, higher floors and bounds
+        // a seed's minutes pass (W05-R31).
         let fair_by = match seed % 3 {
             0 => vec![FairBy::Repo],
             1 => vec![FairBy::Repo, FairBy::Actor],
             _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
         };
-        let cfg = Config { fair_by, ..Config::default() };
+        let mut cfg = Config { fair_by, ..Config::default() };
+        if seed % 2 == 1 {
+            cfg.classes = [(Class::Batch, ClassConfig { floor: 300, bound: Some(40_000) }), (Class::Background, ClassConfig { floor: 200, bound: Some(60_000) })].into_iter().collect();
+        }
         let (mut a, mut b) = (Scheduler::new(cfg.clone()), Scheduler::new(cfg));
         for (step, ((x, now), (y, _))) in inputs(seed).into_iter().zip(inputs(seed)).enumerate() {
             let (ca, cb) = (a.handle(x, now), b.handle(y, now));
@@ -1504,22 +1525,24 @@ fn w28_ac62_intent_classes_go_in_order() {
     assert_eq!(order, vec!["gate", "waiting", "trunk", "wip"]);
 }
 
-/// W28-R65: W05-R09's aging bounds every class's wait: a WIP leg behind a steady stream of gate
-/// legs (one a minute, each a minute long) starts within (90 − 40) / 1 minutes, and one leg's time.
+/// W28-R65, grown into W05-R31 (docs/needs.md E2.3): a gate leg is `land` and work in progress
+/// `batch`, and a WIP leg behind a steady stream of gate legs (one a minute, each a minute long)
+/// starts through batch's floor as soon as the runner frees, where aging between priorities let it
+/// through only after 50 minutes.
 #[test]
-fn w28_r65_aging_bounds_a_wip_legs_wait_behind_gate() {
+fn w28_r65_a_wip_leg_behind_gate_starts_through_batchs_floor() {
     use super::intent::Intent;
+    use super::state::Class;
+    let gate = |id: &str| LegIn { class: Class::Land, ..leg(id, "acme/x", Intent::Gate.priority()) };
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("a", 1));
-    sim.leg(0, leg("gate-busy", "acme/x", Intent::Gate.priority()), MIN);
-    sim.leg(1, leg("wip", "acme/y", Intent::Wip.priority()), MIN);
+    sim.leg(0, gate("gate-busy"), MIN);
+    sim.leg(1, LegIn { class: Class::Batch, ..leg("wip", "acme/x", Intent::Wip.priority()) }, MIN);
     for i in 0..120 {
-        sim.leg(i * MIN + 2, leg(&format!("gate{i}"), "acme/x", Intent::Gate.priority()), MIN);
+        sim.leg(i * MIN + 2, gate(&format!("gate{i}")), MIN);
     }
     sim.run(150 * MIN);
-    let start = sim.started("wip").unwrap_or(i64::MAX);
-    assert!(start <= 51 * MIN + 1, "the WIP leg started at {} min", start / MIN);
-    assert!(start >= 49 * MIN, "and not before aging lifted it: {} min", start / MIN);
+    assert_eq!(sim.started("wip"), Some(MIN), "the WIP leg starts as the gate leg ahead of it ends");
 }
 
 // ---------------------------------------------------------------------- fair share by actor and lane (W28-R66)
@@ -2186,4 +2209,180 @@ fn e2_2_a_tenant_running_past_its_estimates_keeps_its_share() {
         let share = sim.shares(w * MIN, (w + 10) * MIN).get("a/a").copied().unwrap_or(0.0);
         assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: the tenant running past its estimates got {share:.2}", w + 10);
     }
+}
+
+// ---------------------------------------------------------------------- classes, floors and promotion (W05-R30, R31)
+
+fn classed(id: &str, repo: &str, class: super::state::Class) -> LegIn {
+    LegIn { class, ..leg(id, repo, 60) }
+}
+
+/// The class of a test's leg, by its id's first word.
+fn class_of(leg: &str) -> String {
+    leg.split(|c: char| c.is_ascii_digit() || c == '-').next().unwrap_or_default().to_owned()
+}
+
+/// W05-R31, docs/needs.md E2.3: under a saturating stream of land legs, batch keeps its 15 % floor
+/// of 20 slots in every 10-minute window while it has work, its 15 % floor less two points for a
+/// leg's granularity, and no more once it's there: nothing is preempted, it takes room as land
+/// legs end.
+#[test]
+fn w05_r31_batch_keeps_its_floor_under_a_land_stream() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..400 {
+        sim.leg(0, classed(&format!("batch{i}"), "acme/y", Class::Batch), MIN);
+    }
+    for m in 0..70 {
+        for k in 0..25 {
+            sim.leg(m * MIN + 1, classed(&format!("land{m}-{k}"), "acme/x", Class::Land), MIN);
+        }
+    }
+    sim.run(70 * MIN);
+    for w in (0..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+        assert!(share >= 0.13, "window {w}–{}: batch got {share:.3}", w + 10);
+        if w > 0 {
+            assert!(share <= 0.17, "window {w}–{}: batch got {share:.3}, past its floor", w + 10);
+        }
+    }
+}
+
+/// W05-R31: a floor smaller than a leg holds over time: on one slot under a saturating land stream,
+/// batch's 15 % is the slot 15 % of the time, not every time it frees.
+#[test]
+fn w05_r31_a_floor_less_than_a_leg_holds_over_time() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    for m in 0..70 {
+        sim.leg(m * MIN, classed(&format!("land{m}"), "acme/x", Class::Land), MIN);
+    }
+    for i in 0..100 {
+        sim.leg(1, classed(&format!("batch{i}"), "acme/x", Class::Batch), MIN);
+    }
+    sim.run(70 * MIN);
+    for w in (0..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+        assert!((0.09..=0.21).contains(&share), "window {w}–{}: batch got {share:.3}", w + 10);
+    }
+    let hour = sim.shares_by(0, 60 * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+    assert!((0.12..=0.17).contains(&hour), "over the hour batch got {hour:.3}");
+}
+
+/// W05-R30, R31, docs/needs.md E2.3: interactive and batch work together, batch at its floor:
+/// interactive legs go first every time.
+#[test]
+fn w05_r31_interactive_goes_first_while_batch_holds_its_floor() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..3 {
+        sim.leg(0, classed(&format!("long{i}"), "acme/x", Class::Batch), 120 * MIN);
+    }
+    for i in 0..17 {
+        sim.leg(0, classed(&format!("busy{i}"), "acme/x", Class::Interactive), MIN);
+    }
+    for i in 0..40 {
+        sim.leg(1, classed(&format!("interactive{i}"), "acme/x", Class::Interactive), MIN);
+        sim.leg(1, classed(&format!("batch{i}"), "acme/y", Class::Batch), MIN);
+    }
+    sim.run(10 * MIN);
+    let starts = |class: &str| sim.assigned.iter().filter(|a| class_of(&a.leg) == class).map(|a| a.at).collect::<Vec<_>>();
+    let (interactive, batch) = (starts("interactive"), starts("batch"));
+    assert_eq!(interactive.len(), 40);
+    assert!(interactive.iter().max() <= batch.iter().min(), "a batch leg started before an interactive one");
+}
+
+/// W05-AC15, docs/needs.md E2.3: a background leg under a steady stream of one-minute batch legs on
+/// 20 slots starts when a runner next frees, through its 5 % floor; with every floor at zero, at
+/// its 60-minute bound, promoted to batch, and a leg's time. Its standing names its class and the
+/// one it was promoted from.
+#[test]
+fn w05_ac15_a_background_leg_under_a_batch_stream_starts_within_its_bound() {
+    use super::state::{Class, ClassConfig, default_classes};
+    for floors in [true, false] {
+        let classes = if floors { default_classes() } else { default_classes().into_iter().map(|(c, cc)| (c, ClassConfig { floor: 0, ..cc })).collect() };
+        let mut sim = Sim::new(Config { classes, ..Config::default() });
+        for r in 0..4 {
+            sim.runner(0, linux(&format!("r{r}"), 5));
+        }
+        for i in 0..20 {
+            sim.leg(0, classed(&format!("batch0-{i}"), "acme/x", Class::Batch), MIN);
+        }
+        sim.leg(1, classed("bg", "acme/x", Class::Background), MIN);
+        for m in 1..90 {
+            for i in 0..20 {
+                sim.leg(m * MIN - 1, classed(&format!("batch{m}-{i}"), "acme/x", Class::Batch), MIN);
+            }
+        }
+        sim.run(60 * MIN + MIN / 2);
+        if !floors {
+            let standing = sim.sched.standing("bg").map(|s| (s.class, s.promoted_from, s.tenant));
+            assert_eq!(standing, Some((Class::Batch, Some(Class::Background), vec!["acme/x".to_owned()])), "promoted at its bound");
+        }
+        sim.run(90 * MIN);
+        let waited = sim.started("bg").unwrap_or(i64::MAX) - 1;
+        if floors {
+            assert!(waited <= 2 * MIN, "with floors it waited {} s", waited / 1000);
+        } else {
+            assert!((60 * MIN..=61 * MIN).contains(&waited), "without floors it waited {} s", waited / 1000);
+        }
+    }
+}
+
+/// W05-R31: a class is promoted where it's passed over: batch legs starting all the while on CPU
+/// runners don't keep a batch leg waiting behind interactive GPU work from going up at its bound,
+/// where it takes the GPU runner at its tenant's turn.
+#[test]
+fn w05_r31_a_class_served_at_one_signature_is_still_promoted_at_another() {
+    use super::state::Class;
+    let labelled = |name: &str, label: &str, slots: u32| {
+        let base = linux(name, slots);
+        RunnerIn { view: RunnerView { labels: vec![label.into()], ..base.view.clone() }, ..base }
+    };
+    let on = |l: LegIn, label: &str| LegIn { route: LegRoute { labels: vec![label.into()], ..LegRoute::default() }, ..l };
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, labelled("c0", "cpu", 2));
+    sim.runner(0, labelled("g0", "gpu", 1));
+    for m in 0..60 {
+        sim.leg((m * MIN - 1).max(0), on(classed(&format!("interactive{m}"), "acme/x", Class::Interactive), "gpu"), MIN);
+        for i in 0..2 {
+            sim.leg((m * MIN - 1).max(0), on(classed(&format!("batch{m}-{i}"), "acme/x", Class::Batch), "cpu"), MIN);
+        }
+    }
+    sim.leg(1, on(classed("gpu-batch", "acme/y", Class::Batch), "gpu"), MIN);
+    sim.run(60 * MIN);
+    let start = sim.started("gpu-batch").unwrap_or(i64::MAX);
+    assert!((30 * MIN..=31 * MIN).contains(&start), "the GPU batch leg started at {} s", start / 1000);
+}
+
+/// W05-R30, R31, docs/needs.md E2.3: the routing explanation's standing names a leg's class, its
+/// tenant in fair share's tree and, once promoted, the class it was queued in.
+#[test]
+fn w05_r31_the_explanation_names_the_class_tenant_and_promotion() -> Result<(), String> {
+    use super::state::{Class, ClassConfig, FairBy};
+    let classes = [(Class::Background, ClassConfig { floor: 0, bound: Some(60_000) })].into_iter().collect();
+    let mut s = Scheduler::new(Config { classes, fair_by: vec![FairBy::Repo, FairBy::Actor], ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { actor: "agent:A".into(), ..leg("busy", "acme/x", 60) })), 0);
+    let queued = s.handle(Input::LegQueued(Box::new(LegIn { class: Class::Background, actor: "agent:A".into(), ..leg("bg", "acme/x", 20) })), 1);
+    let json = |s: &Scheduler| serde_json::to_value(s.standing("bg")).map_err(|e| e.to_string());
+    let before = json(&s)?;
+    assert_eq!(before.get("class"), Some(&serde_json::json!("background")));
+    assert_eq!(before.get("tenant"), Some(&serde_json::json!(["acme/x", "agent:A"])));
+    assert_eq!(before.get("promoted_from"), None);
+    // Passed over for its bound (a minute), it's promoted to batch, on the timer the engine asked
+    // for as it was queued.
+    assert!(queued.contains(&Command::Timer { at: MIN + 1 }), "{queued:?}");
+    s.handle(Input::Tick, MIN + 1);
+    let after = json(&s)?;
+    assert_eq!(after.get("class"), Some(&serde_json::json!("batch")));
+    assert_eq!(after.get("promoted_from"), Some(&serde_json::json!("background")));
+    Ok(())
 }

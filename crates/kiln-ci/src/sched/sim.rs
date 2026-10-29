@@ -264,7 +264,6 @@ impl Sim {
         by
     }
 
-    /// When a leg was first assigned.
     /// Each group's share of the dominant-resource time in `[from, to)` (docs/needs.md G7, E2.1):
     /// each leg's time there weighted by its dominant share of the fleet (the largest of what it
     /// holds over what the runners offer, in slots, CPUs, memory and GPUs, as the engine counts
@@ -299,6 +298,7 @@ impl Sim {
         by
     }
 
+    /// When a leg was first assigned.
     pub fn started(&self, leg: &str) -> Option<i64> {
         self.assigned.iter().find(|a| a.leg == leg).map(|a| a.at)
     }

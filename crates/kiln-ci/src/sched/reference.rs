@@ -4,22 +4,35 @@
 //! order goes to the best runner it may run on. It keeps no counts, signatures or indexes: what a
 //! runner holds is the legs on it, added up when asked.
 //!
-//! - The queue order (W05-R04, R09, R10, docs/needs.md E2.1), for a runner offering some of the
-//!   dimensions fair share counts (slots, CPUs, memory, GPUs: slots always, the rest in resource
-//!   mode): within a signature (the labels a leg asks for), each priority's effective priority,
-//!   `priority + aging_per_minute × minutes its next leg has waited` (its next leg the first of
-//!   that priority in what follows), highest first; then its tenant's standing, level by level
-//!   from its repository (then its actor, then its lane, as `fair_by` goes): at each node the
-//!   latest over those dimensions of `max(V[parent][d], finish[node][d])`; then arrival. A runner
-//!   taking legs goes by the dimensions it offers; legs going to their best runner go by all of
-//!   them. A leg retried or refused is queued again.
-//! - Fair share's charge (docs/needs.md E2.1, E2.2): a leg placed on a runner charges each node of
-//!   its tenant, in each dimension that runner offers, its share of the fleet (what it holds there,
-//!   one slot and its request or the whole runner, over what the connected runners offer, in
-//!   millionths rounded up) × its cost × 1000 / the node's weight (a repository's from the config,
-//!   the levels below it 1000), from `start = max(V[parent][d], finish[node][d])`; `V[parent][d]`
-//!   moves up to that start. When its attempt ends (it finished, failed, was refused or its runner
-//!   was lost), each node gives back the charge for its cost and takes one for the time it ran.
+//! - The queue order (W05-R04, R09, R10, R30, docs/needs.md E2.1 to E2.3), for a runner offering
+//!   some of the dimensions fair share counts (slots, CPUs, memory, GPUs: slots always, the rest in
+//!   resource mode): by class (critical, land, interactive, batch, background); in a class by its
+//!   tenant's standing in the class's own tree, level by level from its repository (then its actor,
+//!   then its lane, as `fair_by` goes): at each node the latest over those dimensions of
+//!   `max(V[parent][d], finish[node][d])`; then its tenant's own order, `aging_per_minute ×
+//!   queued-at − priority × 60,000,000`, least first; then arrival. A runner taking legs goes by the
+//!   dimensions it offers; legs going to their best runner go by all of them. A leg retried or
+//!   refused is queued again, in the class it came with.
+//! - Floors (W05-R31): a runner takes from the first class with a leg it may run, unless a class
+//!   after it holds less of the fleet than its floor (its running legs' holds, at their largest
+//!   dimension over the connected runners' offers, millionths rounded down) and may go ahead: the
+//!   first such class whose best leg there keeps it within its floor, or else whose pace has
+//!   passed, which that leg then sets to `now + its dominant share × its cost / (what was left of
+//!   the floor)`, rounded up, settled to the time it ran when it ends. Legs going to their best
+//!   runner go in class order.
+//! - Promotion (W05-R31): a queued leg is looked at a class's bound after it came to its class
+//!   (queued, or promoted): if a leg of its class started at its signature in the bound before,
+//!   it's looked at again a bound after that start; if none did, it goes up a class (background to
+//!   batch, batch to interactive), keeping its place in its tenant's order. Looks due by an
+//!   input's time are taken before the input.
+//! - Fair share's charge (docs/needs.md E2.1 to E2.3): a leg placed on a runner charges each node of
+//!   its tenant in its class's tree, in each dimension that runner offers, its share of the fleet
+//!   (what it holds there, one slot and its request or the whole runner, over what the connected
+//!   runners offer, in millionths rounded up) × its cost × 1000 / the node's weight (a
+//!   repository's from the config, the levels below it 1000), from `start = max(V[parent][d],
+//!   finish[node][d])`; `V[parent][d]` moves up to that start. When its attempt ends (it finished,
+//!   failed, was refused or its runner was lost), each node gives back the charge for its cost and
+//!   takes one for the time it ran.
 //! - Where a leg may run (W05-R19, R03, R16, R02): on a connected runner carrying every label it
 //!   asks for, with room for it, that it doesn't stay off: one that refused it, or one that lost it
 //!   while another that could take it is connected (carrying its labels, and big enough: room for
@@ -36,8 +49,7 @@
 //!   (W05-R16); a runner refusing a leg puts it back in the queue, same attempt (W05-R02); a runner
 //!   lost loses its legs, and comes back with none. A leg that comes back from a runner still
 //!   connected takes W05-R04's two looks in their order: it's offered to the runners it may run on,
-//!   then the runner it left takes what fits it. (Aging by a level's next leg makes their order
-//!   matter: the leg back may be its level's next, and its wait of none lowers the level.)
+//!   then the runner it left takes what fits it.
 //!
 //! Pools, warm placement, reservations, groups, quotas, admission, draining, preferences and retry
 //! policies are outside it, and its cases don't make them.
@@ -54,7 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::retry::{Failed, FailureClass};
 use super::routing::{LegRoute, RunnerView};
-use super::state::{Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler};
+use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, default_classes, own_order};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -100,7 +112,7 @@ impl Step {
             Step::Queued(l) => {
                 let asks = if l.request == Resources::default() { String::new() } else { format!(", asks {} CPUs and {} GiB{}", l.request.cpu, l.request.mem / GIB, if l.request.gpu > 0 { format!(" and {} GPUs", l.request.gpu) } else { String::new() }) };
                 let cost = l.cost.map_or_else(|| "the default cost".to_owned(), |ms| format!("cost {} s", ms / 1000));
-                format!("{} queued: {}, priority {}{}{asks}, labels {:?}, {cost}", l.id, l.repo, l.priority, if l.exclusive { ", exclusive" } else { "" }, l.route.labels)
+                format!("{} queued: {}, {}, priority {}{}{asks}, labels {:?}, {cost}", l.id, l.repo, l.class.as_str(), l.priority, if l.exclusive { ", exclusive" } else { "" }, l.route.labels)
             }
             Step::Ended { leg, attempt, outcome } => {
                 let how = match outcome {
@@ -121,20 +133,33 @@ enum Off {
     Lost,
 }
 
-/// What a placement charged fair share: its tenant's nodes with their weights, its shares, its
-/// cost and when it was placed.
+/// What a placement charged fair share: its class, its tenant's nodes with their weights, its
+/// shares, its cost and when it was placed; what it holds of each dimension, for its class's floor;
+/// and, placed over that floor, the pace it took and what was left of the floor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Charged {
+    class: Class,
     nodes: Vec<(String, u128)>,
     shares: [u128; DIMS],
     ms: u128,
     at: i64,
+    holds: [u64; DIMS],
+    paced: Option<(i64, u128)>,
+}
+
+/// A queued leg's place: its class now, its tenant's own order, its arrival; when to look at its
+/// promotion next, if its class has a bound and one above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Queued {
+    class: Class,
+    own: i128,
+    arrival: u64,
+    look: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum At {
-    /// Queued: its place, (priority, arrival), and when it was queued.
-    Queued((u8, u64), i64),
+    Queued(Queued),
     /// Running there, the `nth` leg placed, and what its placing charged fair share.
     On { runner: String, nth: u64, charged: Charged },
 }
@@ -245,15 +270,38 @@ struct Reference {
     cfg: Config,
     runners: BTreeMap<String, Runner>,
     legs: BTreeMap<String, Leg>,
-    vtimes: BTreeMap<String, [u128; DIMS]>,
-    finish: BTreeMap<String, [u128; DIMS]>,
+    /// Fair share's tags, by class and node.
+    vtimes: BTreeMap<(Class, String), [u128; DIMS]>,
+    finish: BTreeMap<(Class, String), [u128; DIMS]>,
+    /// When a leg of each class last started at each signature, and when each class may next go
+    /// over its floor.
+    served: BTreeMap<(String, Class), i64>,
+    paced: BTreeMap<Class, i64>,
     arrivals: u64,
     placed: u64,
+    /// What it did that the cases are meant to make it do: legs promoted, placed ahead of a class
+    /// before theirs by a floor, and placed over a floor.
+    promoted: u64,
+    ahead: u64,
+    over: u64,
 }
 
 impl Reference {
     fn new(cfg: Config) -> Reference {
-        Reference { cfg, runners: BTreeMap::new(), legs: BTreeMap::new(), vtimes: BTreeMap::new(), finish: BTreeMap::new(), arrivals: 0, placed: 0 }
+        Reference {
+            cfg,
+            runners: BTreeMap::new(),
+            legs: BTreeMap::new(),
+            vtimes: BTreeMap::new(),
+            finish: BTreeMap::new(),
+            served: BTreeMap::new(),
+            paced: BTreeMap::new(),
+            arrivals: 0,
+            placed: 0,
+            promoted: 0,
+            ahead: 0,
+            over: 0,
+        }
     }
 
     fn running(&self, l: &Leg) -> bool {
@@ -273,6 +321,7 @@ impl Reference {
     }
 
     fn handle(&mut self, step: &Step, now: i64) {
+        self.promote(now);
         match step {
             // W05-R04's second look, in the engine's order: the runners that legs stayed off while
             // this one was away take what fits them, then this one takes what fits it, each in its
@@ -296,7 +345,7 @@ impl Reference {
                 }
             }
             Step::Queued(l) => {
-                self.legs.insert(l.id.clone(), Leg { input: l.clone(), attempt: 1, at: At::Queued((0, 0), 0), avoid: None });
+                self.legs.insert(l.id.clone(), Leg { input: l.clone(), attempt: 1, at: At::Queued(Queued { class: l.class, own: 0, arrival: 0, look: None }), avoid: None });
                 self.enqueue(&l.id, now);
             }
             // W05-R04's two looks, in their order: the leg that came back is offered to the runners
@@ -331,15 +380,99 @@ impl Reference {
         self.legs.get(leg).and_then(|l| if let At::On { runner, .. } = &l.at { Some(runner.clone()) } else { None })
     }
 
+    fn class_config(&self, class: Class) -> ClassConfig {
+        self.cfg.classes.get(&class).copied().unwrap_or_default()
+    }
+
+    /// When a leg that came to `class` at `since` is first looked at for promotion: a bound after,
+    /// if the class has one and a class above.
+    fn look(&self, class: Class, since: i64) -> Option<i64> {
+        let bound = self.class_config(class).bound?;
+        class.up()?;
+        Some(since + i64::try_from(bound).unwrap_or(i64::MAX / 2))
+    }
+
+    /// Every look due by `now`, the earliest first: a leg whose class started a leg at its
+    /// signature in the bound before the look is looked at again a bound after that start; one
+    /// whose class started none there goes up a class.
+    fn promote(&mut self, now: i64) {
+        loop {
+            let due = self.legs.iter().filter_map(|(id, l)| if let At::Queued(q) = &l.at { q.look.filter(|t| *t <= now).map(|t| (t, id.clone())) } else { None }).min();
+            let Some((at, id)) = due else { return };
+            let Some(l) = self.legs.get(&id) else { return };
+            let At::Queued(q) = &l.at else { return };
+            let (class, sig) = (q.class, signature(&l.input));
+            let bound = self.class_config(class).bound.map_or(0, |b| i64::try_from(b).unwrap_or(i64::MAX / 2));
+            let last = self.served.get(&(sig, class)).copied().filter(|t| *t > at - bound);
+            let up = class.up().unwrap_or(class);
+            let look = match last {
+                Some(t) => Some(t + bound),
+                None => self.look(up, at),
+            };
+            if last.is_none() {
+                self.promoted += 1;
+            }
+            if let Some(At::Queued(q)) = self.legs.get_mut(&id).map(|l| &mut l.at) {
+                if last.is_none() {
+                    q.class = up;
+                }
+                q.look = look;
+            }
+        }
+    }
+
     /// A runner takes the best queued legs it has room for, in its own pick order (by the dimensions
     /// it offers), until none fits (W05-R04: new capacity looks at what that runner can serve).
     fn fill(&mut self, runner: &str, now: i64) {
         loop {
-            let Some(dims) = self.runners.get(runner).map(|r| self.dims(&r.input)) else { return };
-            let pick = self.order(now, dims).into_iter().find(|id| self.legs.get(id).zip(self.runners.get(runner)).is_some_and(|(l, r)| self.may_run(l, r)));
-            let Some(id) = pick else { return };
-            self.assign(&id, runner, now);
+            let Some((id, over)) = self.pick(runner, now) else { return };
+            self.assign(&id, runner, now, over);
         }
+    }
+
+    /// The leg a runner takes next: the best of the first class with a leg it may run, unless a
+    /// class after that one is short of its floor (W05-R31): then the first such class's best, if
+    /// it keeps the class within its floor, or once its pace has passed if not (with what's left of
+    /// its floor).
+    fn pick(&mut self, runner: &str, now: i64) -> Option<(String, Option<u128>)> {
+        let r = self.runners.get(runner)?;
+        let dims = self.dims(&r.input);
+        let mut best: BTreeMap<Class, (([u128; 3], i128, u64), String)> = BTreeMap::new();
+        for (id, l) in &self.legs {
+            let At::Queued(q) = &l.at else { continue };
+            if !self.may_run(l, r) {
+                continue;
+            }
+            let key = (self.standing(q.class, &l.input, dims), q.own, q.arrival);
+            if best.get(&q.class).is_none_or(|(b, _)| key < *b) {
+                best.insert(q.class, (key, id.clone()));
+            }
+        }
+        let (first, (_, id)) = best.first_key_value()?;
+        let fleet = self.fleet();
+        for (class, (_, x)) in best.iter().filter(|(c, _)| *c > first) {
+            let floor = u128::from(self.class_config(*class).floor) * 1000;
+            let held = self.held(*class);
+            if floor == 0 || share(&held, &fleet) >= floor {
+                continue;
+            }
+            let mut with = held;
+            if let Some(l) = self.legs.get(x) {
+                for (w, h) in with.iter_mut().zip(self.holds(&l.input, &r.input)) {
+                    *w += u128::from(h);
+                }
+            }
+            if share(&with, &fleet) <= floor {
+                self.ahead += 1;
+                return Some((x.clone(), None));
+            }
+            if self.paced.get(class).is_none_or(|t| now >= *t) {
+                self.ahead += 1;
+                self.over += 1;
+                return Some((x.clone(), Some(floor - share(&held, &fleet))));
+            }
+        }
+        Some((id.clone(), None))
     }
 
     /// A leg queued again is offered to the runners it may run on, best first, each taking the best
@@ -375,13 +508,16 @@ impl Reference {
         }
     }
 
-    /// Queues a leg, or queues it again: its place by priority and arrival (fair share's standing is
-    /// taken as legs are picked).
+    /// Queues a leg, or queues it again: in the class it came with, its place in its tenant's own
+    /// order by its priority and `now`, its arrival (fair share's standing is taken as legs are
+    /// picked).
     fn enqueue(&mut self, id: &str, now: i64) {
         self.arrivals += 1;
-        let arrival = self.arrivals;
+        let (arrival, aging) = (self.arrivals, self.cfg.aging_per_minute);
+        let Some(class) = self.legs.get(id).map(|l| l.input.class) else { return };
+        let look = self.look(class, now);
         if let Some(l) = self.legs.get_mut(id) {
-            l.at = At::Queued((l.input.priority, arrival), now);
+            l.at = At::Queued(Queued { class, own: own_order(l.input.priority, aging, now), arrival, look });
         }
     }
 
@@ -396,6 +532,46 @@ impl Reference {
 
     fn dims(&self, r: &RunnerIn) -> [bool; DIMS] {
         self.offers(r).map(|o| o > 0)
+    }
+
+    /// What the connected runners offer, in each dimension.
+    fn fleet(&self) -> [u64; DIMS] {
+        let mut fleet = [0u64; DIMS];
+        for x in self.runners.values().filter(|x| x.connected) {
+            for (f, o) in fleet.iter_mut().zip(self.offers(&x.input)) {
+                *f += o;
+            }
+        }
+        fleet
+    }
+
+    /// What a leg holds of a runner in each dimension: one slot and its request, or held whole, all
+    /// the runner offers; nothing in a dimension it doesn't offer.
+    fn holds(&self, l: &LegIn, r: &RunnerIn) -> [u64; DIMS] {
+        let offers = self.offers(r);
+        let q = l.request;
+        let mut holds = if claim(l, size(r)) == Some(Claim::Whole) { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
+        for (h, o) in holds.iter_mut().zip(offers) {
+            if o == 0 {
+                *h = 0;
+            }
+        }
+        holds
+    }
+
+    /// What a class's running legs hold, in each dimension.
+    fn held(&self, class: Class) -> [u128; DIMS] {
+        let mut held = [0u128; DIMS];
+        for l in self.legs.values() {
+            if let At::On { charged, .. } = &l.at
+                && charged.class == class
+            {
+                for (h, x) in held.iter_mut().zip(charged.holds) {
+                    *h += u128::from(x);
+                }
+            }
+        }
+        held
     }
 
     /// A leg's tenant: its repository, then its actor and its lane as `fair_by` goes, each node with
@@ -415,17 +591,18 @@ impl Reference {
         nodes
     }
 
-    /// A leg's tenant's standing for a runner offering `dims`, level by level from its repository:
-    /// at each node the latest over them of `max(V[parent][d], finish[node][d])`.
-    fn standing(&self, l: &LegIn, dims: [bool; DIMS]) -> [u128; 3] {
+    /// A leg's tenant's standing in `class`'s tree for a runner offering `dims`, level by level
+    /// from its repository: at each node the latest over them of `max(V[parent][d],
+    /// finish[node][d])`.
+    fn standing(&self, class: Class, l: &LegIn, dims: [bool; DIMS]) -> [u128; 3] {
         let mut out = [0; 3];
         let mut parent = String::new();
         for (k, (node, _)) in self.nodes(l).into_iter().enumerate() {
             let mut s = 0;
             for d in 0..DIMS {
                 let on = dims.get(d).copied().unwrap_or(false);
-                let v = self.vtimes.get(&parent).and_then(|v| v.get(d)).copied().unwrap_or(0);
-                let f = self.finish.get(&node).and_then(|f| f.get(d)).copied().unwrap_or(0);
+                let v = self.vtimes.get(&(class, parent.clone())).and_then(|v| v.get(d)).copied().unwrap_or(0);
+                let f = self.finish.get(&(class, node.clone())).and_then(|f| f.get(d)).copied().unwrap_or(0);
                 if on {
                     s = s.max(v.max(f));
                 }
@@ -438,62 +615,33 @@ impl Reference {
         out
     }
 
-    /// The queued legs, as a runner offering `dims` picks them at `now`: by their level's effective
-    /// priority (each signature's priority, aged by its next leg's wait), highest first; then by
-    /// their tenant's standing there, level by level; then by arrival.
-    fn order(&self, now: i64, dims: [bool; DIMS]) -> Vec<String> {
-        let queued: Vec<(&String, &Leg, (u8, u64), i64)> = self.legs.iter().filter_map(|(id, l)| if let At::Queued(k, at) = l.at { Some((id, l, k, at)) } else { None }).collect();
-        // Each signature's priority: its next leg's place, and when that leg was queued.
-        let mut next: BTreeMap<(String, u8), (([u128; 3], u64), i64)> = BTreeMap::new();
-        for (_, l, (p, q), at) in &queued {
-            let place = (self.standing(&l.input, dims), *q);
-            let slot = next.entry((signature(&l.input), *p)).or_insert((place, *at));
-            if place < slot.0 {
-                *slot = (place, *at);
-            }
-        }
-        let mut order: Vec<(std::cmp::Reverse<i128>, [u128; 3], u64, String)> = queued
-            .iter()
-            .map(|(id, l, (p, q), _)| {
-                let waited = next.get(&(signature(&l.input), *p)).map_or(0, |(_, at)| (now - at).max(0));
-                let e = i128::from(*p) * i128::from(MINUTE) * 1000 + i128::from(self.cfg.aging_per_minute) * i128::from(waited);
-                (std::cmp::Reverse(e), self.standing(&l.input, dims), *q, (*id).clone())
-            })
-            .collect();
-        order.sort();
-        order.into_iter().map(|(_, _, _, id)| id).collect()
-    }
-
-    /// While some queued leg may run somewhere, the first in queue order (by every dimension) goes
-    /// to its best runner.
+    /// While some queued leg may run somewhere, the first in queue order (by class, then by every
+    /// dimension) goes to its best runner.
     fn place(&mut self, now: i64) {
         loop {
-            let next = self.order(now, [true; DIMS]).into_iter().find_map(|id| self.best(&id).map(|r| (id, r)));
+            let mut order: Vec<((Class, [u128; 3], i128, u64), String)> =
+                self.legs.iter().filter_map(|(id, l)| if let At::Queued(q) = &l.at { Some(((q.class, self.standing(q.class, &l.input, [true; DIMS]), q.own, q.arrival), id.clone())) } else { None }).collect();
+            order.sort();
+            let next = order.into_iter().find_map(|(_, id)| self.best(&id).map(|r| (id, r)));
             let Some((leg, runner)) = next else { return };
-            self.assign(&leg, &runner, now);
+            self.assign(&leg, &runner, now, None);
         }
     }
 
-    /// A leg placed on a runner, each node of its tenant charged: in each dimension the runner
-    /// offers, its share of the fleet (what it holds there over what the connected runners offer,
-    /// millionths rounded up) × its cost × 1000 / the node's weight, from
-    /// `max(V[parent][d], finish[node][d])`; what it charged kept, to settle when it ends.
-    fn assign(&mut self, leg: &str, runner: &str, now: i64) {
+    /// A leg placed on a runner, each node of its tenant charged in its class's tree: in each
+    /// dimension the runner offers, its share of the fleet (what it holds there over what the
+    /// connected runners offer, millionths rounded up) × its cost × 1000 / the node's weight, from
+    /// `max(V[parent][d], finish[node][d])`; what it charged kept, to settle when it ends. Its
+    /// class started a leg at its signature; placed over its class's floor (`over`, what was left
+    /// of it), the class's pace moves on.
+    fn assign(&mut self, leg: &str, runner: &str, now: i64, over: Option<u128>) {
         let Some((l, r)) = self.legs.get(leg).zip(self.runners.get(runner)) else { return };
-        let offers = self.offers(&r.input);
-        let mut fleet = [0u64; DIMS];
-        for x in self.runners.values().filter(|x| x.connected) {
-            for (f, o) in fleet.iter_mut().zip(self.offers(&x.input)) {
-                *f += o;
-            }
-        }
-        let q = l.input.request;
-        let holds = if claim(&l.input, size(&r.input)) == Some(Claim::Whole) { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
+        let At::Queued(q) = &l.at else { return };
+        let (class, fleet, holds) = (q.class, self.fleet(), self.holds(&l.input, &r.input));
         let mut shares = [0u128; DIMS];
         for d in 0..DIMS {
-            let (o, h, cap) = (offers.get(d).copied().unwrap_or(0), holds.get(d).copied().unwrap_or(0), fleet.get(d).copied().unwrap_or(0));
+            let (h, cap) = (holds.get(d).copied().unwrap_or(0), fleet.get(d).copied().unwrap_or(0));
             if let Some(s) = shares.get_mut(d)
-                && o > 0
                 && h > 0
                 && cap > 0
             {
@@ -501,10 +649,11 @@ impl Reference {
             }
         }
         let (nodes, ms) = (self.nodes(&l.input), u128::from(l.input.cost.unwrap_or(self.cfg.default_cost)));
+        let sig = signature(&l.input);
         let mut parent = String::new();
         for (node, weight) in &nodes {
-            let mut v = self.vtimes.get(&parent).copied().unwrap_or([0; DIMS]);
-            let mut f = self.finish.get(node).copied().unwrap_or([0; DIMS]);
+            let mut v = self.vtimes.get(&(class, parent.clone())).copied().unwrap_or([0; DIMS]);
+            let mut f = self.finish.get(&(class, node.clone())).copied().unwrap_or([0; DIMS]);
             for d in 0..DIMS {
                 let share = shares.get(d).copied().unwrap_or(0);
                 if let (Some(f), Some(v)) = (f.get_mut(d), v.get_mut(d))
@@ -515,30 +664,42 @@ impl Reference {
                     *v = (*v).max(start);
                 }
             }
-            self.vtimes.insert(parent, v);
-            self.finish.insert(node.clone(), f);
+            self.vtimes.insert((class, parent), v);
+            self.finish.insert((class, node.clone()), f);
             parent = node.clone();
         }
+        let paced = over.map(|left| {
+            let took = i64::try_from((shares.iter().copied().max().unwrap_or(0) * ms).div_ceil(left)).unwrap_or(i64::MAX / 2);
+            self.paced.insert(class, now + took);
+            (took, left)
+        });
+        self.served.insert((sig, class), now);
         self.placed += 1;
-        let charged = Charged { nodes, shares, ms, at: now };
+        let charged = Charged { class, nodes, shares, ms, at: now, holds, paced };
         if let Some(l) = self.legs.get_mut(leg) {
             l.at = At::On { runner: runner.to_owned(), nth: self.placed, charged };
         }
     }
 
     /// A placement's charge settled to the time it ran: each node gives back the charge for its cost
-    /// and takes one for the time from its placing to `now`.
+    /// and takes one for the time from its placing to `now`; and a pace it set, alike.
     fn settle(&mut self, leg: &str, now: i64) {
         let Some(At::On { charged, .. }) = self.legs.get(leg).map(|l| l.at.clone()) else { return };
         let ran = u128::try_from((now - charged.at).max(0)).unwrap_or(0);
         for (node, weight) in &charged.nodes {
-            if let Some(f) = self.finish.get_mut(node) {
+            if let Some(f) = self.finish.get_mut(&(charged.class, node.clone())) {
                 for (f, share) in f.iter_mut().zip(charged.shares) {
                     if share > 0 {
                         *f = f.saturating_sub(share * charged.ms * 1000 / weight) + share * ran * 1000 / weight;
                     }
                 }
             }
+        }
+        if let Some((took, left)) = charged.paced
+            && let Some(at) = self.paced.get_mut(&charged.class)
+        {
+            let used = (charged.shares.iter().copied().max().unwrap_or(0) * ran).div_ceil(left);
+            *at = *at - took + i64::try_from(used).unwrap_or(i64::MAX / 2);
         }
     }
 
@@ -595,6 +756,18 @@ impl Reference {
     }
 }
 
+/// What `held` (each dimension) is of `fleet`: its largest dimension's share, millionths rounded
+/// down, over the dimensions the fleet has.
+fn share(held: &[u128; DIMS], fleet: &[u64; DIMS]) -> u128 {
+    let mut most = 0;
+    for (h, f) in held.iter().zip(fleet) {
+        if *f > 0 {
+            most = most.max(h * 1_000_000 / u128::from(*f));
+        }
+    }
+    most
+}
+
 fn ms(d: &mut Draw, below: i64) -> i64 {
     i64::try_from(d.below(u64::try_from(below).unwrap_or(1))).unwrap_or(0)
 }
@@ -642,6 +815,7 @@ fn leg(d: &mut Draw, n: u64) -> LegIn {
         cost: (d.below(2) == 0).then(|| 10_000 * (1 + d.below(60))),
         actor: format!("a{}", d.below(2)),
         lane: format!("l{}", d.below(2)),
+        class: Class::ALL.get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or_default(),
         ..LegIn::default()
     }
 }
@@ -658,7 +832,14 @@ fn case(seed: u64) -> (Config, Vec<(Step, i64)>) {
         1 => vec![FairBy::Repo, FairBy::Actor],
         _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
     };
-    let cfg = Config { resources, fair_by, ..Config::default() };
+    // The classes' floors and bounds (W05-R31): the defaults, or drawn, bounds short enough to pass
+    // in a case; and aging (W05-R09) off, as by default, or fast.
+    let classes = match d.below(3) {
+        0 => default_classes(),
+        _ => Class::ALL.into_iter().map(|c| (c, ClassConfig { floor: [0, 0, 100, 250, 500].get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or(0), bound: (d.below(2) == 0).then(|| 60_000 * (1 + d.below(20))) })).collect(),
+    };
+    let aging_per_minute = [0, 1000, 10_000].get(usize::try_from(d.below(3)).unwrap_or(0)).copied().unwrap_or(1000);
+    let cfg = Config { resources, fair_by, classes, aging_per_minute, ..Config::default() };
     let mut r = Reference::new(cfg.clone());
     let shapes: Vec<RunnerIn> = (0..1 + d.below(4)).map(|n| runner(&mut d, n)).collect();
     let (most, mut queued, mut now, mut steps) = (1 + d.below(12), 0, 0, Vec::new());
@@ -792,8 +973,15 @@ fn shrink(cfg: &Config, steps: Vec<(Step, i64)>, why: String) -> (Vec<(Step, i64
     }
 }
 
+/// A case's settings in words: its mode, fair share's levels, aging, and each class's floor and
+/// bound.
+fn settings(cfg: &Config) -> String {
+    let classes: Vec<String> = cfg.classes.iter().map(|(c, cc)| format!("{} floor {}‰{}", c.as_str(), cc.floor, cc.bound.map_or_else(String::new, |b| format!(" bound {} min", b / 60_000)))).collect();
+    format!("{}, fair by {:?}, aging {}‰ a minute, {}", if cfg.resources { "resource mode" } else { "slots" }, cfg.fair_by, cfg.aging_per_minute, classes.join(", "))
+}
+
 fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
-    let mode = if cfg.resources { "resource mode" } else { "slots" };
+    let mode = settings(cfg);
     let words: Vec<String> = steps.iter().map(|(s, now)| format!("  {:>4}:{:02} {}", now / MINUTE, now % MINUTE / 1000, s.words())).collect();
     format!(
         "seed {seed} ({mode}), cut down to {} inputs:\n{}\n{why}\nreplay it: KILN_SCHED_REFERENCE_SEED={seed} cargo test -p kiln-ci --lib sched::reference -- --nocapture",
@@ -808,7 +996,7 @@ fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
 fn e1_5_the_engine_agrees_with_the_reference() {
     if let Some(seed) = std::env::var("KILN_SCHED_REFERENCE_SEED").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
         let (cfg, steps) = case(seed);
-        println!("seed {seed} ({}):", if cfg.resources { "resource mode" } else { "slots" });
+        println!("seed {seed} ({}):", settings(&cfg));
         let failed = run(&cfg, &steps, |line| println!("{line}")).err().map(|(applied, why)| {
             let (fewer, why) = shrink(&cfg, applied, why);
             report(seed, &cfg, &fewer, &why)
@@ -831,14 +1019,26 @@ fn e1_5_the_engine_agrees_with_the_reference() {
 }
 
 /// The cases cover what the reference is for: both modes, exclusive legs held whole and in
-/// shares, legs refused and retried after a runner was lost, and runners coming back.
+/// shares, legs refused and retried after a runner was lost, runners coming back, every class,
+/// and legs promoted, placed ahead by a floor and placed over one.
 #[test]
 fn e1_5_the_cases_cover_the_rules() {
-    let (mut kinds, mut modes, mut depths) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let (mut kinds, mut modes, mut depths, mut classes) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let (mut promoted, mut ahead, mut over) = (0, 0, 0);
     for seed in 0..500 {
         let (cfg, steps) = case(seed);
         modes.insert(cfg.resources);
         depths.insert(cfg.fair_by.len());
+        let mut r = Reference::new(cfg.clone());
+        for (s, now) in &steps {
+            if r.applies(s) {
+                r.handle(s, *now);
+            }
+            if let Step::Queued(l) = s {
+                classes.insert(l.class);
+            }
+        }
+        (promoted, ahead, over) = (promoted + r.promoted, ahead + r.ahead, over + r.over);
         let mut lost = BTreeSet::new();
         for (s, _) in &steps {
             kinds.insert(match s {
@@ -862,6 +1062,8 @@ fn e1_5_the_cases_cover_the_rules() {
     }
     assert_eq!(modes.len(), 2);
     assert_eq!(depths.len(), 3, "fair share by repository, actor and lane");
+    assert_eq!(classes.len(), Class::ALL.len(), "every class");
+    assert!(promoted > 0 && ahead > 0 && over > 0, "promoted {promoted}, ahead by a floor {ahead}, over one {over}");
     for k in ["up", "up with GPUs", "back", "lost", "queued", "asks a GPU", "exclusive whole", "exclusive share", "ended", "ended lost", "ended retried", "refused"] {
         assert!(kinds.contains(k), "no case has `{k}`");
     }

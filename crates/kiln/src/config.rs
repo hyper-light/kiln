@@ -31,6 +31,8 @@ pub struct Config {
     pub cd: Cd,
     /// CI (docs/ci.md).
     pub ci: ci::Ci,
+    /// The engine that places work (docs/needs.md §21): `[sched.classes.<class>]`.
+    pub sched: Sched,
     /// Signing in with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
     pub sso: sso::Sso,
     /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
@@ -224,6 +226,58 @@ pub struct Conversations {
     /// does it for a whole process). Never read from a config file.
     #[serde(skip)]
     pub off: bool,
+}
+
+/// `[sched]`: the engine that places work (docs/needs.md §21).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Sched {
+    /// Each class's floor and bound (docs/needs.md §7, docs/ci.md W05-R31), by its name:
+    /// `critical`, `land`, `interactive`, `batch` or `background`. What a class leaves out stays
+    /// as kiln has it: a 15 % floor and a 30-minute bound for `batch`, 5 % and an hour for
+    /// `background`, neither for the rest.
+    ///
+    /// ```toml
+    /// [sched.classes.batch]
+    /// floor = 20      # percent of the fleet, at its largest dimension
+    /// bound = "45m"   # promoted a class after waiting this long, its class passed over
+    /// ```
+    pub classes: BTreeMap<kiln_ci::sched::Class, ClassSettings>,
+}
+
+/// `[sched.classes.<class>]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassSettings {
+    /// Its floor share of the fleet, in percent (0 to 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub floor: Option<f64>,
+    /// How long one of its items waits, its class starting nothing where it would run, before it's
+    /// promoted a class (`90s`, `30m`, `6h`), or `never`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound: Option<String>,
+}
+
+impl Sched {
+    /// The classes' floors and bounds as the engine takes them: kiln's defaults, with what's set
+    /// here over them.
+    pub fn classes(&self) -> anyhow::Result<BTreeMap<kiln_ci::sched::Class, kiln_ci::sched::ClassConfig>> {
+        let mut out = kiln_ci::sched::state::default_classes();
+        for (class, set) in &self.classes {
+            let c = out.entry(*class).or_default();
+            if let Some(floor) = set.floor {
+                anyhow::ensure!((0.0..=100.0).contains(&floor), "[sched.classes.{}] floor = {floor}: a percent, 0 to 100", class.as_str());
+                c.floor = kiln_ci::sched::units::thousandths_of(floor / 100.0);
+            }
+            if let Some(bound) = set.bound.as_deref() {
+                c.bound = match bound.trim() {
+                    "never" => None,
+                    b => Some(kiln_ci::work::reap::parse_duration(b).map_err(|e| anyhow::anyhow!("[sched.classes.{}] bound: {e}", class.as_str()))?.saturating_mul(1000)),
+                };
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// `[agents]`: how far agents may start agents (docs/agents.md, "Agents that run agents").

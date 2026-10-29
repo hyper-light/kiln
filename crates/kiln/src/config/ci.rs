@@ -383,7 +383,8 @@ impl Ci {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Scheduler {
-    /// Effective priority a waiting leg gains per minute, so nothing starves.
+    /// Priority a waiting leg gains per minute in its tenant's own order (W05-R09), so a tenant's
+    /// own high-priority stream doesn't starve its low-priority legs.
     pub aging_per_minute: f64,
     /// Seconds a leg is expected to take when its job has no history (W19's medians).
     pub default_cost_seconds: f64,
@@ -394,7 +395,9 @@ pub struct Scheduler {
     pub overcommit: Overcommit,
     pub default_request: kiln_ci::sched::pools::ResourceSpec,
     /// `event` (W05-R09's defaults by event) or `intent` (W28-R64): gate 90, someone waiting 80,
-    /// trunk 60, work in progress 40, a job's own `priority:` still first.
+    /// trunk 60, work in progress 40, a job's own `priority:` still first. Each also sets a leg's
+    /// class (W05-R30): a manual run `interactive`, a land `land`, a schedule `background`, the
+    /// rest `batch`; or a gate `land`, someone waiting `interactive`, the rest `batch`.
     pub priority: String,
     /// What fair share is between, outermost first (W05-R10, W28-R66): `repo`, then `actor` (the
     /// agent or person a commit is attributed to), then `lane` (a workflow on a branch).

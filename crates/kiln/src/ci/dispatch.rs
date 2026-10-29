@@ -412,6 +412,8 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         actor: r.who.actor.as_ref().map(|a| a.id.clone()).unwrap_or_default(),
         lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
         priority: intent.as_ref().map_or_else(|| priority(&r.event.name), |(i, _)| i.priority()),
+        // Its class (W05-R30): from its intent, or from its event.
+        class: intent.as_ref().map_or_else(|| class(&r.event.name), |(i, _)| i.class()),
         intent,
         route,
         exclusive: job.is_some_and(|j| j.kiln.exclusive),
@@ -452,6 +454,11 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         fair_by: s.fair_levels(),
         // Admission by load (W24-R19): off until set, and while it doesn't read.
         admission: s.admission.as_ref().and_then(|a| a.admission().inspect_err(|e| tracing::warn!(error = %e, "admission by load is off")).ok()),
+        // The classes' floors and bounds (W05-R31): kiln's while what's set doesn't read.
+        classes: hub.cfg.sched.classes().unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "the classes' floors and bounds are kiln's own");
+            kiln_ci::sched::state::default_classes()
+        }),
         ..Config::default()
     }
 }
@@ -971,6 +978,19 @@ fn work_of(r: &RunSt, spec: &LegSpec, key: Option<String>) -> Option<Work> {
         (false, false) => Domain::Untrusted,
     };
     Some(Work { key, domain, lane: format!("{}/{}/{}", r.repo.name, r.path, spec.job), observed: false })
+}
+
+/// A leg's class by its run's event (W05-R30, docs/needs.md E2.3), as W05-R09's priorities go: a
+/// manual run `interactive`, a land or merge group `land`, a schedule `background`, the rest
+/// (pushes, pull requests, diffs, agents' runs, `workflow_run`) `batch`.
+fn class(event: &str) -> kiln_ci::sched::Class {
+    use kiln_ci::sched::Class;
+    match event {
+        "workflow_dispatch" | "manual" => Class::Interactive,
+        "merge_group" | "land" => Class::Land,
+        "schedule" => Class::Background,
+        _ => Class::Batch,
+    }
 }
 
 /// Default priority by event (W05-R09).
@@ -3440,6 +3460,56 @@ fn work_slots(a: &crate::hub::AgentLive) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// W05-R30, docs/needs.md E2.3: in W05-R09's event mode a leg's class is its run's event's, in
+    /// W28-R64's intent mode its intent's.
+    #[test]
+    fn w05_r30_each_event_and_intent_has_its_class() {
+        use kiln_ci::sched::Class;
+        use kiln_ci::sched::intent::Intent;
+        let events = [
+            ("workflow_dispatch", Class::Interactive),
+            ("manual", Class::Interactive),
+            ("land", Class::Land),
+            ("merge_group", Class::Land),
+            ("push", Class::Batch),
+            ("pull_request", Class::Batch),
+            ("pull_request_target", Class::Batch),
+            ("diff", Class::Batch),
+            ("agent", Class::Batch),
+            ("workflow_run", Class::Batch),
+            ("pipeline", Class::Batch),
+            ("schedule", Class::Background),
+        ];
+        for (event, want) in events {
+            assert_eq!(super::class(event), want, "{event}");
+        }
+        let intents = [(Intent::Gate, Class::Land), (Intent::Waiting, Class::Interactive), (Intent::Trunk, Class::Batch), (Intent::Wip, Class::Batch)];
+        for (intent, want) in intents {
+            assert_eq!(intent.class(), want, "{}", intent.name());
+        }
+    }
+
+    /// W05-R31: `[sched.classes.<class>]` sets a class's floor (percent) and bound over kiln's
+    /// defaults; a class it leaves out, and what it leaves out of one, stay as they are; a class
+    /// kiln doesn't have, or a floor or bound that doesn't read, is an error.
+    #[test]
+    fn w05_r31_classes_floors_and_bounds_are_read() -> anyhow::Result<()> {
+        use kiln_ci::sched::{Class, ClassConfig};
+        let cfg: crate::config::Config = toml::from_str("[sched.classes.batch]\nfloor = 20\nbound = \"45m\"\n[sched.classes.background]\nbound = \"never\"\n[sched.classes.interactive]\nfloor = 2.5\n")?;
+        let classes = cfg.sched.classes()?;
+        assert_eq!(classes.get(&Class::Batch), Some(&ClassConfig { floor: 200, bound: Some(45 * 60_000) }));
+        assert_eq!(classes.get(&Class::Background), Some(&ClassConfig { floor: 50, bound: None }));
+        assert_eq!(classes.get(&Class::Interactive), Some(&ClassConfig { floor: 25, bound: None }));
+        assert_eq!(classes.get(&Class::Land), None);
+        assert_eq!(crate::config::Config::default().sched.classes()?, kiln_ci::sched::state::default_classes());
+        assert!(toml::from_str::<crate::config::Config>("[sched.classes.urgent]\nfloor = 10\n").is_err(), "no class `urgent`");
+        for bad in ["[sched.classes.batch]\nfloor = 150\n", "[sched.classes.batch]\nbound = \"soon\"\n"] {
+            let cfg: crate::config::Config = toml::from_str(bad)?;
+            assert!(cfg.sched.classes().is_err(), "{bad}");
+        }
+        Ok(())
+    }
+
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
     /// agent's is the person it acts for.
     #[test]
