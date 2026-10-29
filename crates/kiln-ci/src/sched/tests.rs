@@ -2038,7 +2038,7 @@ fn e2_1_shares_and_charges() {
     let (one, big) = (shares(&[1, 1_000, 0, 0], &fleet), shares(&[1, 32_000, 0, 0], &fleet));
     assert_eq!(one, [62_500, 15_625, 0, 0]);
     assert_eq!(big, [62_500, 500_000, 0, 0]);
-    let ([_, one_cpu, _, _], [_, big_cpu, _, _]) = (charges(&one, hour, 1000, 1), charges(&big, hour, 1000, 1));
+    let ([_, one_cpu, _, _], [_, big_cpu, _, _]) = (charges(&one, hour, 1000), charges(&big, hour, 1000));
     assert_eq!(big_cpu, 32 * one_cpu);
     // A memory-heavy test costs by its memory.
     assert_eq!(shares(&[1, 1_000, 32 * gib, 0], &fleet), [62_500, 15_625, 250_000, 0]);
@@ -2051,10 +2051,9 @@ fn e2_1_shares_and_charges() {
     assert_eq!(shares(&fleet, &fleet), [1_000_000, 1_000_000, 1_000_000, 0]);
     // Asking a dimension the fleet lacks costs nothing there.
     assert_eq!(shares(&[1, 0, 0, 1], &fleet), [62_500, 0, 0, 0]);
-    // The charge: share × milliseconds × split × 1000 / weight (thousandths).
-    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 1000, 1), [3_000_000_000, 0, 0, 0]);
-    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 3000, 1), [1_000_000_000, 0, 0, 0]);
-    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 1000, 2), [6_000_000_000, 0, 0, 0]);
+    // The charge: share × milliseconds × 1000 / weight (thousandths).
+    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 1000), [3_000_000_000, 0, 0, 0]);
+    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 3000), [1_000_000_000, 0, 0, 0]);
 }
 
 /// docs/needs.md E2.1 (H-DRF's case): a repository whose GPU legs hold every GPU, which no one else
@@ -2100,4 +2099,91 @@ fn e2_1_a_repository_holding_every_gpu_keeps_its_share_of_the_cpu_runners() {
     // Its GPU legs held every GPU meanwhile.
     let gpus = sim.busy_on.iter().filter(|(l, r, s, e)| l.starts_with("gg") && r.starts_with('g') && *s < 30 * MIN && *e > 0).count();
     assert!(gpus >= 8 * 29, "only {gpus} GPU legs ran in the first 30 minutes");
+}
+
+/// docs/needs.md E2.2: an actor that comes to a saturated repository gets its equal part of it from
+/// its first window: tags taken at dispatch give it no credit, and no debt, from before it came.
+#[test]
+fn e2_2_a_late_actor_gets_its_part_at_once() {
+    use super::state::FairBy;
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor], ..Config::default() });
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    let by = |id: String, actor: &str| LegIn { actor: actor.into(), ..leg(&id, "acme/x", 60) };
+    for i in 0..1_500 {
+        sim.leg(1, by(format!("a{i}"), "alice"), MIN);
+    }
+    for i in 0..600 {
+        sim.leg(30 * MIN, by(format!("b{i}"), "bob"), MIN);
+    }
+    sim.run(150 * MIN);
+    let who = |l: &str| if l.starts_with('b') { "bob".to_owned() } else { "alice".to_owned() };
+    assert!(sim.shares_by(20 * MIN, 30 * MIN, who).get("alice").is_some_and(|s| *s > 0.99), "alice had it all before bob came");
+    for w in [30, 40, 50] {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, who).get("bob").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: bob got {share:.2} of the repository", w + 10);
+    }
+}
+
+/// docs/needs.md E2.2 (H-DRF's example, inside the tenant tree): a repository whose GPU lane holds
+/// every GPU keeps its CPU lane's share of the runners without GPUs, against a repository with only
+/// CPU work.
+#[test]
+fn e2_2_a_gpu_lane_doesnt_cost_its_repositorys_cpu_lane() {
+    use super::state::FairBy;
+    let gib = 1u64 << 30;
+    let mut sim = Sim::new(Config { resources: true, fair_by: vec![FairBy::Repo, FairBy::Lane], ..Config::default() });
+    let sized = |name: &str, label: &str, slots: u32, mem: u64, gpu: u32| {
+        let base = linux(name, slots);
+        RunnerIn { view: RunnerView { labels: vec![label.into()], ..base.view.clone() }, capacity: Some(Resources { cpu: Cpus::whole(8), mem: mem * gib, gpu, ..Resources::default() }), ..base }
+    };
+    for n in 0..4 {
+        sim.runner(0, sized(&format!("c{n}"), "cpu", 8, 32, 0));
+    }
+    for n in 0..2 {
+        sim.runner(0, sized(&format!("g{n}"), "gpu", 32, 64, 4));
+    }
+    let task = |id: String, repo: &str, lane: &str, label: &str, request: Resources| LegIn {
+        run: format!("run-{id}"),
+        id,
+        repo: repo.into(),
+        lane: lane.into(),
+        route: LegRoute { labels: vec![label.into()], ..LegRoute::default() },
+        priority: 60,
+        request,
+        cost: Some(60_000),
+        ..LegIn::default()
+    };
+    let (cpu, gpu) = (Resources { cpu: Cpus::whole(1), mem: 2 * gib, ..Resources::default() }, Resources { gpu: 1, ..Resources::default() });
+    for i in 0..600 {
+        sim.leg(1, task(format!("gg{i}"), "acme/gpu", "train", "gpu", gpu), MIN);
+        sim.leg(1, task(format!("gc{i}"), "acme/gpu", "test", "cpu", cpu), MIN);
+        sim.leg(1, task(format!("cc{i}"), "acme/cpu", "test", "cpu", cpu), MIN);
+    }
+    sim.run(60 * MIN);
+    let repo = |leg: &str| if leg.starts_with("cc") { "acme/cpu".to_owned() } else { "acme/gpu".to_owned() };
+    for w in [0, 10, 20] {
+        let share = sim.dominant_by(w * MIN, (w + 10) * MIN, repo, |r| r.starts_with('c')).get("acme/gpu").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: the GPU repository's CPU lane got {share:.2} of the CPU runners", w + 10);
+    }
+}
+
+/// docs/needs.md E2.2: a tenant whose legs run three times their estimate still gets its share,
+/// each charge settled to the time it ran (as DRFQ needs no time beforehand).
+#[test]
+fn e2_2_a_tenant_running_past_its_estimates_keeps_its_share() {
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..1_000 {
+        sim.leg(1, LegIn { cost: Some(60_000), ..leg(&format!("a{i}"), "a/a", 60) }, 3 * MIN);
+        sim.leg(1, LegIn { cost: Some(60_000), ..leg(&format!("b{i}"), "b/b", 60) }, MIN);
+    }
+    sim.run(100 * MIN);
+    for w in (0..60).step_by(10) {
+        let share = sim.shares(w * MIN, (w + 10) * MIN).get("a/a").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: the tenant running past its estimates got {share:.2}", w + 10);
+    }
 }

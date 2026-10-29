@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use super::retry::{FailureClass, RetryOn, RetryPolicy, RunnerChoice};
 use super::routing::{LegRoute, RunnerView};
 use super::sim::Sim;
-use super::state::{Command, Config, Cpus, Input, LegIn, Outcome, Resources, RunnerIn};
+use super::state::{Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -116,6 +116,8 @@ fn leg(d: &mut Draw, n: u64) -> (LegIn, i64, Vec<FailureClass>) {
         request,
         retry,
         cost,
+        actor: format!("a{}", d.below(3)),
+        lane: format!("lane{}", d.below(2)),
         ..LegIn::default()
     };
     let fails = match d.below(6) {
@@ -168,8 +170,14 @@ fn replay(cfg: &Config) -> (Vec<String>, String) {
     let mut lines = Vec::new();
     let mut h = Sha256::new();
     for seed in 0..SEEDS {
-        // Odd seeds in resource mode, where fair share counts CPUs, memory and GPUs beside slots.
-        let cfg = Config { resources: seed % 2 == 1, ..cfg.clone() };
+        // Odd seeds in resource mode, where fair share counts CPUs, memory and GPUs beside slots;
+        // fair share by repository, by actor within it, or by lane within that (docs/needs.md E2.2).
+        let fair_by = match (seed / 2) % 3 {
+            0 => vec![FairBy::Repo],
+            1 => vec![FairBy::Repo, FairBy::Actor],
+            _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
+        };
+        let cfg = Config { resources: seed % 2 == 1, fair_by, ..cfg.clone() };
         for (at, l) in scenario(seed, &cfg) {
             let l = format!("{seed} {at} {l}");
             h.update(l.as_bytes());

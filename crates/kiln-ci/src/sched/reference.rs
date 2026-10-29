@@ -8,15 +8,18 @@
 //!   dimensions fair share counts (slots, CPUs, memory, GPUs: slots always, the rest in resource
 //!   mode): within a signature (the labels a leg asks for), each priority's effective priority,
 //!   `priority + aging_per_minute × minutes its next leg has waited` (its next leg the first of
-//!   that priority in what follows), highest first; then its repository's standing, the latest over
-//!   those dimensions of `max(V[d], finish[repo][d])`; then arrival. A runner taking legs goes by
-//!   the dimensions it offers; legs going to their best runner go by all of them. A leg retried or
-//!   refused is queued again.
-//! - Fair share's charge (docs/needs.md E2.1): a leg placed on a runner charges its repository, in
-//!   each dimension that runner offers, its share of the fleet (what it holds there, one slot and
-//!   its request or the whole runner, over what the connected runners offer, in millionths rounded
-//!   up) × its cost × 1000 / the repository's weight, from `start = max(V[d], finish[repo][d])`;
-//!   `V[d]` moves up to that start.
+//!   that priority in what follows), highest first; then its tenant's standing, level by level
+//!   from its repository (then its actor, then its lane, as `fair_by` goes): at each node the
+//!   latest over those dimensions of `max(V[parent][d], finish[node][d])`; then arrival. A runner
+//!   taking legs goes by the dimensions it offers; legs going to their best runner go by all of
+//!   them. A leg retried or refused is queued again.
+//! - Fair share's charge (docs/needs.md E2.1, E2.2): a leg placed on a runner charges each node of
+//!   its tenant, in each dimension that runner offers, its share of the fleet (what it holds there,
+//!   one slot and its request or the whole runner, over what the connected runners offer, in
+//!   millionths rounded up) × its cost × 1000 / the node's weight (a repository's from the config,
+//!   the levels below it 1000), from `start = max(V[parent][d], finish[node][d])`; `V[parent][d]`
+//!   moves up to that start. When its attempt ends (it finished, failed, was refused or its runner
+//!   was lost), each node gives back the charge for its cost and takes one for the time it ran.
 //! - Where a leg may run (W05-R19, R03, R16, R02): on a connected runner carrying every label it
 //!   asks for, with room for it, that it doesn't stay off: one that refused it, or one that lost it
 //!   while another that could take it is connected (carrying its labels, and big enough: room for
@@ -51,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::retry::{Failed, FailureClass};
 use super::routing::{LegRoute, RunnerView};
-use super::state::{Command, Config, Cpus, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler};
+use super::state::{Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -118,12 +121,22 @@ enum Off {
     Lost,
 }
 
+/// What a placement charged fair share: its tenant's nodes with their weights, its shares, its
+/// cost and when it was placed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Charged {
+    nodes: Vec<(String, u128)>,
+    shares: [u128; DIMS],
+    ms: u128,
+    at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum At {
     /// Queued: its place, (priority, arrival), and when it was queued.
     Queued((u8, u64), i64),
-    /// Running there, the `nth` leg placed.
-    On { runner: String, nth: u64 },
+    /// Running there, the `nth` leg placed, and what its placing charged fair share.
+    On { runner: String, nth: u64, charged: Charged },
 }
 
 #[derive(Debug, Clone)]
@@ -232,7 +245,7 @@ struct Reference {
     cfg: Config,
     runners: BTreeMap<String, Runner>,
     legs: BTreeMap<String, Leg>,
-    vtime: [u128; DIMS],
+    vtimes: BTreeMap<String, [u128; DIMS]>,
     finish: BTreeMap<String, [u128; DIMS]>,
     arrivals: u64,
     placed: u64,
@@ -240,7 +253,7 @@ struct Reference {
 
 impl Reference {
     fn new(cfg: Config) -> Reference {
-        Reference { cfg, runners: BTreeMap::new(), legs: BTreeMap::new(), vtime: [0; DIMS], finish: BTreeMap::new(), arrivals: 0, placed: 0 }
+        Reference { cfg, runners: BTreeMap::new(), legs: BTreeMap::new(), vtimes: BTreeMap::new(), finish: BTreeMap::new(), arrivals: 0, placed: 0 }
     }
 
     fn running(&self, l: &Leg) -> bool {
@@ -300,6 +313,7 @@ impl Reference {
             }
             Step::Refused(leg) => {
                 let left = self.runner_of(leg);
+                self.settle(leg, now);
                 if let Some(l) = self.legs.get_mut(leg)
                     && let Some(runner) = &left
                 {
@@ -324,7 +338,7 @@ impl Reference {
             let Some(dims) = self.runners.get(runner).map(|r| self.dims(&r.input)) else { return };
             let pick = self.order(now, dims).into_iter().find(|id| self.legs.get(id).zip(self.runners.get(runner)).is_some_and(|(l, r)| self.may_run(l, r)));
             let Some(id) = pick else { return };
-            self.assign(&id, runner);
+            self.assign(&id, runner, now);
         }
     }
 
@@ -346,6 +360,7 @@ impl Reference {
     /// An attempt ended: one its runner lost is retried once, elsewhere when it can be (W05-R16);
     /// the rest settle.
     fn ended(&mut self, id: &str, outcome: &Outcome, now: i64) {
+        self.settle(id, now);
         let Some(l) = self.legs.get_mut(id) else { return };
         let At::On { runner, .. } = &l.at else { return };
         match outcome {
@@ -383,39 +398,66 @@ impl Reference {
         self.offers(r).map(|o| o > 0)
     }
 
-    /// A repository's standing for a runner offering `dims`: the latest over them of
-    /// `max(V[d], finish[repo][d])`.
-    fn standing(&self, repo: &str, dims: [bool; DIMS]) -> u128 {
-        let mut s = 0;
-        for d in 0..DIMS {
-            let (on, v, f) = (dims.get(d).copied().unwrap_or(false), self.vtime.get(d).copied().unwrap_or(0), self.finish.get(repo).and_then(|f| f.get(d)).copied().unwrap_or(0));
-            if on {
-                s = s.max(v.max(f));
-            }
+    /// A leg's tenant: its repository, then its actor and its lane as `fair_by` goes, each node with
+    /// its weight (a repository's from the config, the rest 1000).
+    fn nodes(&self, l: &LegIn) -> Vec<(String, u128)> {
+        let mut nodes = vec![(l.repo.clone(), u128::from(self.cfg.weights.get(&l.repo).copied().filter(|w| *w > 0).unwrap_or(1000)))];
+        let mut name = l.repo.clone();
+        for level in &self.cfg.fair_by {
+            let member = match level {
+                FairBy::Repo => continue,
+                FairBy::Actor => &l.actor,
+                FairBy::Lane => &l.lane,
+            };
+            name = format!("{name}/{member}");
+            nodes.push((name.clone(), 1000));
         }
-        s
+        nodes
+    }
+
+    /// A leg's tenant's standing for a runner offering `dims`, level by level from its repository:
+    /// at each node the latest over them of `max(V[parent][d], finish[node][d])`.
+    fn standing(&self, l: &LegIn, dims: [bool; DIMS]) -> [u128; 3] {
+        let mut out = [0; 3];
+        let mut parent = String::new();
+        for (k, (node, _)) in self.nodes(l).into_iter().enumerate() {
+            let mut s = 0;
+            for d in 0..DIMS {
+                let on = dims.get(d).copied().unwrap_or(false);
+                let v = self.vtimes.get(&parent).and_then(|v| v.get(d)).copied().unwrap_or(0);
+                let f = self.finish.get(&node).and_then(|f| f.get(d)).copied().unwrap_or(0);
+                if on {
+                    s = s.max(v.max(f));
+                }
+            }
+            if let Some(slot) = out.get_mut(k) {
+                *slot = s;
+            }
+            parent = node;
+        }
+        out
     }
 
     /// The queued legs, as a runner offering `dims` picks them at `now`: by their level's effective
     /// priority (each signature's priority, aged by its next leg's wait), highest first; then by
-    /// their repository's standing there; then by arrival.
+    /// their tenant's standing there, level by level; then by arrival.
     fn order(&self, now: i64, dims: [bool; DIMS]) -> Vec<String> {
         let queued: Vec<(&String, &Leg, (u8, u64), i64)> = self.legs.iter().filter_map(|(id, l)| if let At::Queued(k, at) = l.at { Some((id, l, k, at)) } else { None }).collect();
         // Each signature's priority: its next leg's place, and when that leg was queued.
-        let mut next: BTreeMap<(String, u8), ((u128, u64), i64)> = BTreeMap::new();
+        let mut next: BTreeMap<(String, u8), (([u128; 3], u64), i64)> = BTreeMap::new();
         for (_, l, (p, q), at) in &queued {
-            let place = (self.standing(&l.input.repo, dims), *q);
+            let place = (self.standing(&l.input, dims), *q);
             let slot = next.entry((signature(&l.input), *p)).or_insert((place, *at));
             if place < slot.0 {
                 *slot = (place, *at);
             }
         }
-        let mut order: Vec<(std::cmp::Reverse<i128>, u128, u64, String)> = queued
+        let mut order: Vec<(std::cmp::Reverse<i128>, [u128; 3], u64, String)> = queued
             .iter()
             .map(|(id, l, (p, q), _)| {
                 let waited = next.get(&(signature(&l.input), *p)).map_or(0, |(_, at)| (now - at).max(0));
                 let e = i128::from(*p) * i128::from(MINUTE) * 1000 + i128::from(self.cfg.aging_per_minute) * i128::from(waited);
-                (std::cmp::Reverse(e), self.standing(&l.input.repo, dims), *q, (*id).clone())
+                (std::cmp::Reverse(e), self.standing(&l.input, dims), *q, (*id).clone())
             })
             .collect();
         order.sort();
@@ -428,50 +470,81 @@ impl Reference {
         loop {
             let next = self.order(now, [true; DIMS]).into_iter().find_map(|id| self.best(&id).map(|r| (id, r)));
             let Some((leg, runner)) = next else { return };
-            self.assign(&leg, &runner);
+            self.assign(&leg, &runner, now);
         }
     }
 
-    /// A leg placed on a runner, its repository charged: in each dimension the runner offers, its
-    /// share of the fleet (what it holds there over what the connected runners offer, millionths
-    /// rounded up) × its cost × 1000 / its weight, from `max(V[d], finish[repo][d])`.
-    fn assign(&mut self, leg: &str, runner: &str) {
-        if let (Some(l), Some(r)) = (self.legs.get(leg), self.runners.get(runner)) {
-            let offers = self.offers(&r.input);
-            let mut fleet = [0u64; DIMS];
-            for x in self.runners.values().filter(|x| x.connected) {
-                for (f, o) in fleet.iter_mut().zip(self.offers(&x.input)) {
-                    *f += o;
-                }
+    /// A leg placed on a runner, each node of its tenant charged: in each dimension the runner
+    /// offers, its share of the fleet (what it holds there over what the connected runners offer,
+    /// millionths rounded up) × its cost × 1000 / the node's weight, from
+    /// `max(V[parent][d], finish[node][d])`; what it charged kept, to settle when it ends.
+    fn assign(&mut self, leg: &str, runner: &str, now: i64) {
+        let Some((l, r)) = self.legs.get(leg).zip(self.runners.get(runner)) else { return };
+        let offers = self.offers(&r.input);
+        let mut fleet = [0u64; DIMS];
+        for x in self.runners.values().filter(|x| x.connected) {
+            for (f, o) in fleet.iter_mut().zip(self.offers(&x.input)) {
+                *f += o;
             }
-            let q = l.input.request;
-            let holds = if claim(&l.input, size(&r.input)) == Some(Claim::Whole) { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
-            let (repo, cost) = (l.input.repo.clone(), u128::from(l.input.cost.unwrap_or(self.cfg.default_cost)));
-            let weight = u128::from(self.cfg.weights.get(&repo).copied().filter(|w| *w > 0).unwrap_or(1000));
-            let mut finish = self.finish.get(&repo).copied().unwrap_or([0; DIMS]);
+        }
+        let q = l.input.request;
+        let holds = if claim(&l.input, size(&r.input)) == Some(Claim::Whole) { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
+        let mut shares = [0u128; DIMS];
+        for d in 0..DIMS {
+            let (o, h, cap) = (offers.get(d).copied().unwrap_or(0), holds.get(d).copied().unwrap_or(0), fleet.get(d).copied().unwrap_or(0));
+            if let Some(s) = shares.get_mut(d)
+                && o > 0
+                && h > 0
+                && cap > 0
+            {
+                *s = (u128::from(h) * 1_000_000).div_ceil(u128::from(cap));
+            }
+        }
+        let (nodes, ms) = (self.nodes(&l.input), u128::from(l.input.cost.unwrap_or(self.cfg.default_cost)));
+        let mut parent = String::new();
+        for (node, weight) in &nodes {
+            let mut v = self.vtimes.get(&parent).copied().unwrap_or([0; DIMS]);
+            let mut f = self.finish.get(node).copied().unwrap_or([0; DIMS]);
             for d in 0..DIMS {
-                let (o, h, cap) = (offers.get(d).copied().unwrap_or(0), holds.get(d).copied().unwrap_or(0), fleet.get(d).copied().unwrap_or(0));
-                if o == 0 || h == 0 || cap == 0 {
-                    continue;
-                }
-                let share = (u128::from(h) * 1_000_000).div_ceil(u128::from(cap));
-                if let (Some(f), Some(v)) = (finish.get_mut(d), self.vtime.get_mut(d)) {
+                let share = shares.get(d).copied().unwrap_or(0);
+                if let (Some(f), Some(v)) = (f.get_mut(d), v.get_mut(d))
+                    && share > 0
+                {
                     let start = (*v).max(*f);
-                    *f = start + share * cost * 1000 / weight;
+                    *f = start + share * ms * 1000 / weight;
                     *v = (*v).max(start);
                 }
             }
-            self.finish.insert(repo, finish);
+            self.vtimes.insert(parent, v);
+            self.finish.insert(node.clone(), f);
+            parent = node.clone();
         }
         self.placed += 1;
+        let charged = Charged { nodes, shares, ms, at: now };
         if let Some(l) = self.legs.get_mut(leg) {
-            l.at = At::On { runner: runner.to_owned(), nth: self.placed };
+            l.at = At::On { runner: runner.to_owned(), nth: self.placed, charged };
+        }
+    }
+
+    /// A placement's charge settled to the time it ran: each node gives back the charge for its cost
+    /// and takes one for the time from its placing to `now`.
+    fn settle(&mut self, leg: &str, now: i64) {
+        let Some(At::On { charged, .. }) = self.legs.get(leg).map(|l| l.at.clone()) else { return };
+        let ran = u128::try_from((now - charged.at).max(0)).unwrap_or(0);
+        for (node, weight) in &charged.nodes {
+            if let Some(f) = self.finish.get_mut(node) {
+                for (f, share) in f.iter_mut().zip(charged.shares) {
+                    if share > 0 {
+                        *f = f.saturating_sub(share * charged.ms * 1000 / weight) + share * ran * 1000 / weight;
+                    }
+                }
+            }
         }
     }
 
     /// The legs on a runner, in the order they came to it.
     fn on(&self, runner: &str) -> Vec<String> {
-        let mut on: Vec<(u64, &String)> = self.legs.iter().filter_map(|(id, l)| if let At::On { runner: r, nth } = &l.at { (r == runner).then_some((*nth, id)) } else { None }).collect();
+        let mut on: Vec<(u64, &String)> = self.legs.iter().filter_map(|(id, l)| if let At::On { runner: r, nth, .. } = &l.at { (r == runner).then_some((*nth, id)) } else { None }).collect();
         on.sort();
         on.into_iter().map(|(_, id)| id.clone()).collect()
     }
@@ -567,6 +640,8 @@ fn leg(d: &mut Draw, n: u64) -> LegIn {
         exclusive,
         request,
         cost: (d.below(2) == 0).then(|| 10_000 * (1 + d.below(60))),
+        actor: format!("a{}", d.below(2)),
+        lane: format!("l{}", d.below(2)),
         ..LegIn::default()
     }
 }
@@ -576,7 +651,14 @@ fn leg(d: &mut Draw, n: u64) -> LegIn {
 /// runner is lost while connected and comes back once lost.
 fn case(seed: u64) -> (Config, Vec<(Step, i64)>) {
     let mut d = Draw(seed);
-    let cfg = Config { resources: d.below(2) == 0, ..Config::default() };
+    let resources = d.below(2) == 0;
+    // Fair share by repository, then by actor, then by lane (W28-R66, docs/needs.md E2.2).
+    let fair_by = match d.below(3) {
+        0 => vec![FairBy::Repo],
+        1 => vec![FairBy::Repo, FairBy::Actor],
+        _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
+    };
+    let cfg = Config { resources, fair_by, ..Config::default() };
     let mut r = Reference::new(cfg.clone());
     let shapes: Vec<RunnerIn> = (0..1 + d.below(4)).map(|n| runner(&mut d, n)).collect();
     let (most, mut queued, mut now, mut steps) = (1 + d.below(12), 0, 0, Vec::new());
@@ -752,10 +834,11 @@ fn e1_5_the_engine_agrees_with_the_reference() {
 /// shares, legs refused and retried after a runner was lost, and runners coming back.
 #[test]
 fn e1_5_the_cases_cover_the_rules() {
-    let (mut kinds, mut modes) = (BTreeSet::new(), BTreeSet::new());
+    let (mut kinds, mut modes, mut depths) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     for seed in 0..500 {
         let (cfg, steps) = case(seed);
         modes.insert(cfg.resources);
+        depths.insert(cfg.fair_by.len());
         let mut lost = BTreeSet::new();
         for (s, _) in &steps {
             kinds.insert(match s {
@@ -778,6 +861,7 @@ fn e1_5_the_cases_cover_the_rules() {
         }
     }
     assert_eq!(modes.len(), 2);
+    assert_eq!(depths.len(), 3, "fair share by repository, actor and lane");
     for k in ["up", "up with GPUs", "back", "lost", "queued", "asks a GPU", "exclusive whole", "exclusive share", "ended", "ended lost", "ended retried", "refused"] {
         assert!(kinds.contains(k), "no case has `{k}`");
     }
