@@ -296,37 +296,6 @@ export function findMoves(files: PatchFile[]): { del: Map<Place, MovedTo>; add: 
   return { del, add };
 }
 
-/** What a path's language is called, by its name: for highlighting. */
-export function languageOf(path: string): string | null {
-  const name = path.split("/").pop()?.toLowerCase() ?? "";
-  if (name === "dockerfile" || name.endsWith(".dockerfile") || name === "agentfile") return "dockerfile";
-  if (name === "makefile") return null;
-  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
-  const map: Record<string, string> = {
-    rs: "rust",
-    ts: "ts",
-    tsx: "tsx",
-    js: "js",
-    jsx: "jsx",
-    mjs: "js",
-    cjs: "js",
-    py: "python",
-    go: "go",
-    css: "css",
-    json: "json",
-    md: "markdown",
-    html: "html",
-    yml: "yaml",
-    yaml: "yaml",
-    toml: "toml",
-    sh: "shell",
-    bash: "shell",
-    zsh: "shell",
-    lock: "toml",
-  };
-  return map[ext] ?? null;
-}
-
 /** An image git would call binary, that a browser shows. */
 export function isImage(path: string): boolean {
   return /\.(png|jpe?g|gif|webp|avif|svg|ico|bmp)$/i.test(path);

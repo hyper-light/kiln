@@ -27,6 +27,7 @@ import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
 import "./deployments.css";
+import { Highlighted } from "@/components/code/highlighted";
 
 const providersRes: Res<{ providers: CdProvider[] }> = { key: "cd/providers", fetch: (s) => cdApi.providers(s) };
 const reposRes: Res<Awaited<ReturnType<typeof api.repos>>> = { key: "repos", fetch: (s) => api.repos(s) };
@@ -72,7 +73,7 @@ export function toYaml(v: unknown, indent = 0): string {
 
 /* ---------------------------- the draft ---------------------------- */
 
-interface Artifact {
+interface DraftArtifact {
   name: string;
   kind: "image" | "published";
   /** The image (`docker.io/acme/api`), or the published image's name. */
@@ -88,7 +89,7 @@ interface Draft {
   name: string;
   /** Each setting as typed: text, or JSON for object settings. */
   settings: Record<string, string>;
-  artifacts: Artifact[];
+  artifacts: DraftArtifact[];
   auto: boolean;
   selfHeal: boolean;
   prune: boolean;
@@ -181,7 +182,7 @@ export default function NewApp() {
   return (
     <div className="container-console page cd-page cd-new">
       <title>New app · Deployments · kiln</title>
-      <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "New app" }]} />
+      <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "New app" }]} />
       <h1 className="cd-new-title">A new app.</h1>
       <p className="lead">Where it runs, what it is, how it rolls out. Read what kiln makes of it, then keep it.</p>
       <Loadable label="the platforms" fallback={<Hold height={320} />}>
@@ -392,7 +393,7 @@ function Builder() {
                 <SelectField
                   label="From"
                   value={a.kind}
-                  onChange={(v) => set("artifacts", d.artifacts.map((x, j) => (j === i ? { ...x, kind: v as Artifact["kind"] } : x)))}
+                  onChange={(v) => set("artifacts", d.artifacts.map((x, j) => (j === i ? { ...x, kind: v as DraftArtifact["kind"] } : x)))}
                   options={[
                     { value: "image", label: "A registry, tagged by commit" },
                     { value: "published", label: "An image kiln publishes" },
@@ -443,7 +444,9 @@ function Builder() {
                 <code>.kiln/deploy.yaml</code>
                 <CopyBlock text={deploy} />
               </div>
-              <pre>{deploy}</pre>
+              <pre>
+                <Highlighted text={deploy} lang="yaml" />
+              </pre>
             </div>
             {environments && (
               <div className="cd-new-yaml">
@@ -451,7 +454,9 @@ function Builder() {
                   <code>.kiln/environments.yaml</code>
                   <CopyBlock text={environments} />
                 </div>
-                <pre>{environments}</pre>
+                <pre>
+                  <Highlighted text={environments} lang="yaml" />
+                </pre>
               </div>
             )}
             {errors.length > 0 && (
@@ -508,7 +513,9 @@ function Checked({ result, stale }: { result: CdValidation; stale: boolean }) {
                       <summary>
                         {String(o.kind ?? "")} <code>{[meta.namespace, meta.name].filter(Boolean).join("/")}</code>
                       </summary>
-                      <pre>{toYaml(o.spec ?? {})}</pre>
+                      <pre>
+                        <Highlighted text={toYaml(o.spec ?? {})} lang="yaml" />
+                      </pre>
                     </details>
                   </li>
                 );

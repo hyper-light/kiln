@@ -126,6 +126,7 @@ fn empty_plan() -> RunPlan {
     RunPlan {
         name: None,
         concurrency: None,
+        admission: crate::sched::admit::Spec::default(),
         input: RunInput::default(),
         github: Value::Null,
         vars: Value::Null,

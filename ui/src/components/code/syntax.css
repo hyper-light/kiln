@@ -1,0 +1,46 @@
+/* Code in its language's colours (lib/syntax, components/code/highlighted.tsx), the same on every
+   surface (a conversation's code and diffs, the review page, deployments' YAML): kiln's own, the
+   code editor's (components/code/editor.tsx). Names stay bright, keywords and punctuation quiet,
+   data (strings, numbers, properties) in colour. Over a diff's tints, as over its surface. */
+
+.hl-prop,
+.hl-link {
+  color: #a6c4ed;
+}
+.hl-str {
+  color: #b8d9d2;
+}
+.hl-num {
+  color: #d8cbb0;
+}
+.hl-com {
+  color: #6d7078;
+  font-style: italic;
+}
+.hl-kw,
+.hl-punct {
+  color: #8c8f98;
+}
+.hl-meta {
+  color: #b8a6d5;
+}
+.hl-esc {
+  color: #d6c4f0;
+}
+.hl-type,
+.hl-tag {
+  color: #c9d6e6;
+}
+.hl-fn {
+  color: #dfe3ea;
+}
+.hl-strong {
+  color: #e4e5e7;
+  font-weight: 500;
+}
+.hl-em {
+  font-style: italic;
+}
+.hl-strike {
+  text-decoration: line-through;
+}

@@ -7,6 +7,7 @@
 import type http from "node:http";
 import type {
   Agent,
+  AgentLimitView,
   CdApp,
   CdAppDetail,
   CdAutoRollback,
@@ -134,7 +135,7 @@ const apps = new Map<string, MockApp>();
       const revision = hex(r, 40);
       const running = r() < 0.06;
       const op: CdOperation | null = running
-        ? { id: 7, phase: "Running", trigger: "auto", attempt: 1, message: "waiting for healthy state of apps/Deployment/" + name, started_ms: Date.now() - 40_000, finished_ms: null }
+        ? { id: 7, phase: "Running", trigger: "auto", attempt: 1, message: "waiting for healthy state of apps/Deployment/" + name, by: null, started_ms: Date.now() - 40_000, finished_ms: null }
         : {
             id: 6,
             phase: health === "Degraded" && r() < 0.5 ? "Failed" : "Succeeded",
@@ -1407,6 +1408,28 @@ function updates(ctx: PagesCtx): UpdatesOverview {
   };
 }
 
+/** What's set here for each runner's agent limit (`crate::harness::limit`); the mock's configs say nothing. */
+const agentLimits = new Map<string, number>();
+
+function agentLimit(a: Agent): AgentLimitView {
+  const set = agentLimits.get(a.name) ?? null;
+  const sessions = (hashStr(a.name) % 40) + 3;
+  return {
+    runner: a.name,
+    own: false,
+    connected: a.connected,
+    runs_agents: a.connected ? true : null,
+    supported: a.connected ? true : null,
+    max_sessions: set,
+    held: a.connected ? (set === null ? { max_sessions: 64, from: "default" } : { max_sessions: set, from: "server" }) : null,
+    working: a.connected ? hashStr(`${a.name}/working`) % Math.min(sessions, 12) : null,
+    waiting: a.connected ? 0 : null,
+    sessions,
+    default: 64,
+    max: 4096,
+  };
+}
+
 function frontDoor(a: Agent): FrontDoorView {
   const on = a.name === "metal-ryzen-01";
   const listener = (state: "on" | "off", on: string[], to: string[] = []) => ({ state, on, error: null, to, served: on.length ? 1284 : 0, fix: null });
@@ -1607,6 +1630,18 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   if ((mm = p.match(/^\/api\/runners\/([^/]+)\/front-door$/)) && m === "GET") {
     const a = ctx.agents().find((x) => x.name === decodeURIComponent(mm![1]!));
     return (a ? json(res, 200, frontDoor(a)) : err(res, 404, "no such runner"), true);
+  }
+  if ((mm = p.match(/^\/api\/runners\/([^/]+)\/agent-limit$/)) && (m === "GET" || m === "PUT")) {
+    const a = ctx.agents().find((x) => x.name === decodeURIComponent(mm![1]!));
+    if (!a) return (err(res, 404, "no such runner"), true);
+    if (m === "PUT") {
+      const n = (await ctx.body<{ max_sessions?: unknown }>(req)).max_sessions;
+      if (n === null) agentLimits.delete(a.name);
+      else if (typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= 4096) agentLimits.set(a.name, n);
+      else return (err(res, 400, "expected {\"max_sessions\": n}, or {\"max_sessions\": null} for its config's"), true);
+      ctx.emit?.({ type: "agent_limit", runner: a.name });
+    }
+    return (json(res, 200, agentLimit(a)), true);
   }
   if (p === "/api/tailscale" && m === "GET") return (void json(res, 200, TAILSCALE), true);
   if (p === "/api/harness/kinds" && m === "GET") {

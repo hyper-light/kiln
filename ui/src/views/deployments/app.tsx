@@ -493,7 +493,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
 }
 
 function AppCrumbs({ project }: { project: string }) {
-  return <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: project }]} />;
+  return <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: project }]} />;
 }
 
 /** The app while it loads: its crumbs and name (both from the address), then its head's and its objects' space. */
@@ -1150,7 +1150,7 @@ function DiffList({ id, only, onAll }: { id: string; only: Fix | null; onAll: ()
       {list.map((d) => (
         <div key={objectKey(d.key)} className="cd-diff">
           {d.why && <p className="cd-why">{d.why}</p>}
-          <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.hunks }} label={objectLabel(d.key)} defaultOpen={list.length <= 4} />
+          <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.hunks }} label={objectLabel(d.key)} defaultOpen={list.length <= 4} language="yaml" />
         </div>
       ))}
     </div>

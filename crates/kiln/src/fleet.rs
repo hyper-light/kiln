@@ -401,7 +401,7 @@ pub async fn refresh(hub: &Arc<Hub>) -> Option<Target> {
         tracing::info!(commit = short(&t.commit), from = %t.from, "the newest kiln: every runner follows it");
         hub.store.audit("kiln".into(), "upgrade.target".into(), format!("{} runs {}, the newest kiln: every runner follows it", t.from, short(&t.commit))).await;
         hub.updates.wake_in_step();
-        hub.emit(&serde_json::json!({ "type": "updates" }));
+        hub.emit(&crate::wire::events::ServerEvent::Updates);
     }
     hub.updates.fleet.target()
 }
@@ -825,9 +825,14 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
 /// Keep every runner on the newest kiln: decide it, and bring each runner behind to it.
 pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
+    // This server's build is its binary's hash, read whole the first time it is asked
+    // (`updates::own_binary`): read on the blocking pool before this loop asks it on a runtime
+    // thread (`updates::binaries`, `updates::runners`), where a debug build's gigabyte held the
+    // shard, and the HTTP listener on it, back 30 to 60 s.
+    let build = crate::rt::blocking(crate::updates::own_build).await?;
     // What this server runs is remembered, so runners on it are known after it is replaced.
     if is_commit(crate::api::COMMIT) {
-        remember(&hub, &crate::updates::own_build(), crate::api::TARGET, crate::api::COMMIT);
+        remember(&hub, &build, crate::api::TARGET, crate::api::COMMIT);
     }
     let mut tick = crate::rt::Interval::new(EVERY);
     loop {
@@ -944,7 +949,7 @@ pub async fn on_built(hub: &Arc<Hub>, job: &str, sha256: &str, bytes: Option<Vec
     anyhow::ensure!(got == sha256, "the binary's SHA-256 is {got}, not {sha256}");
     let kept = crate::updates::keep_built(hub, &b.target, bytes, &b.machine, &b.commit).await?;
     hub.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} ({}): {} for {}", b.machine, short(&b.commit), kept.build, b.target)).await;
-    hub.emit(&serde_json::json!({ "type": "updates" }));
+    hub.emit(&crate::wire::events::ServerEvent::Updates);
     hub.updates.fleet.wake();
     Ok(())
 }
@@ -1450,6 +1455,7 @@ mod tests {
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
+            refused: None,
             terminal: true,
             outpost: false,
             dedicated_job: None,

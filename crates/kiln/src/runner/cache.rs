@@ -82,7 +82,7 @@ impl Local {
     }
 
     /// A chunk it holds, touched (it's the newest used now).
-    fn get(&self, digest: &str) -> Option<Vec<u8>> {
+    pub(crate) fn get(&self, digest: &str) -> Option<Vec<u8>> {
         let p = self.path(digest);
         let data = std::fs::read(&p).ok()?;
         (hex::encode(Sha256::digest(&data)) == digest).then(|| {
@@ -93,7 +93,7 @@ impl Local {
         })
     }
 
-    fn put(&self, digest: &str, data: &[u8]) -> std::io::Result<()> {
+    pub(crate) fn put(&self, digest: &str, data: &[u8]) -> std::io::Result<()> {
         let p = self.path(digest);
         if p.is_file() {
             return Ok(());

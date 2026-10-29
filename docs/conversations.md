@@ -48,7 +48,8 @@ For each agent session (kiln's id):
   Claude Code keeps its own transcripts 30 days by default too. On the server, a transcript is also
   archived in kiln's store of bytes once its agent ends (docs/blobs.md, `transcripts/`), and the
   store lets no record go before that: it holds back every session that ended since the oldest
-  close not archived yet.
+  close not archived yet, for at most 30 days past `keep_closed_days`, when that archive is given
+  up (`kiln_blobs_archives_given_up_total`).
 - **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
@@ -185,7 +186,10 @@ that hasn't ended at once, each to the machine that suits it best (connected, it
 installed, the same platform first, then the one running the fewest agents) or all to one machine
 picked there (`POST /api/harness/machines/:machine/recover {"to"?}`; a machine that's connected is
 refused, since its own runner hands its agents over). Each goes on as Move does, and the answer says
-where each went or why it couldn't.
+where each went or why it couldn't. The notice's × (or a swipe on a touch screen) puts it away, and
+moving them all marks it done: either way it stays so for you on every device (a notice mark,
+`machine-gone:<machine>:<offline since>`, as approval cards keep theirs) until the machine goes
+offline again; some that couldn't move keep it there for them.
 
 **After a server restart**, the agents of machines that are away (not ended, heard of in the last 30
 days) are listed from the store, as away, with their recent timeline, so they can be moved on. A

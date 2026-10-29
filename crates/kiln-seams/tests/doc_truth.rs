@@ -204,6 +204,46 @@ fn seams() -> Vec<Seam> {
                 count(harness::SIM_INBOX as u64)
             )],
         },
+        Seam {
+            title: "Forge",
+            file: "forge.rs",
+            tr: "Forge",
+            more: &[],
+            cases: said(&forge::cases::<forge::SimForgeFixture>()),
+            bounds: vec![
+                format!("{} changes and {} commits a repository", count(forge::SIM_CHANGES as u64), count(forge::SIM_COMMITS as u64)),
+                format!("{} drafts a change", count(forge::SIM_DRAFTS as u64)),
+                format!("the last {} background merges", count(forge::SIM_TICKETS as u64)),
+                format!("comments to {}", size(forge::BODY_MAX as u64)),
+                format!("titles to {} bytes", forge::TITLE_MAX),
+                format!("{} merge requests a stack at most", forge::GITLAB_STACK_MOST),
+                format!("GitHub {} requests an hour, GitLab {}, Bitbucket {}", forge::GITHUB_HOURLY, forge::GITLAB_HOURLY, forge::BITBUCKET_HOURLY),
+            ],
+        },
+        Seam {
+            title: "Search",
+            file: "search.rs",
+            tr: "Search",
+            more: &[],
+            cases: said(&search::cases::<search::SimSearchFixture>()),
+            bounds: vec![
+                format!("holding {} trees", count(search::SIM_TREES as u64)),
+                format!("tree ids 1 to {} bytes", search::TREE_ID_MAX),
+                format!("files to {}", size(search::FILE_MAX as u64)),
+                format!("{} files and {} a tree", count(search::TREE_FILES_MAX as u64), size(search::TREE_BYTES_MAX)),
+                format!("queries to {} bytes", count(search::QUERY_MAX as u64)),
+                format!("{} hits a search", count(search::HITS_MAX as u64)),
+                format!("{} characters of a hit's line", count(search::LINE_MAX as u64)),
+            ],
+        },
+        Seam {
+            title: "Sigstore",
+            file: "sigstore.rs",
+            tr: "Sigstore",
+            more: &[],
+            cases: said(&sigstore::cases::<sigstore::SimSigstoreFixture>()),
+            bounds: vec![format!("{} entries", count(sigstore::SIM_ENTRIES as u64))],
+        },
     ]
 }
 

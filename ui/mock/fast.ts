@@ -17,8 +17,9 @@
  *   MOCK_FAST_RATE=x     everything x times as fast (0.5: half as fast)
  */
 import type { WebSocket } from "ws";
-import type { AgentInfo, FileChange, FileDiff, HEvent, Meta, State, Task, Todo } from "../src/api/harness.ts";
+import type { AgentInfo, FileChange, FileDiff, HEvent, JsonValue, Meta, State, Task, Todo } from "../src/api/harness.ts";
 import { mulberry32 } from "./data.ts";
+import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 
 const ID = "demo-fast";
 const LISTED = process.env.MOCK_FAST === "1";
@@ -83,6 +84,7 @@ type Tool = Extract<HEvent, { kind: "tool" }>;
 type Said = Extract<HEvent, { kind: "assistant" }> | Extract<HEvent, { kind: "thinking" }>;
 
 const meta: Meta = {
+  ...defaultMeta(),
   version: "2.3.1",
   modes: [
     { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
@@ -91,7 +93,7 @@ const meta: Meta = {
   ],
   models: [
     { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
-    { id: "claude-opus-5-5", label: "claude-opus-5-5" },
+    { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
   ],
   efforts: ["low", "medium", "high", "max"].map((id) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1) })),
   commands: [],
@@ -100,6 +102,7 @@ const meta: Meta = {
 };
 
 const info = (): AgentInfo => ({
+  ...defaultInfo(),
   id: ID,
   kind: "claude",
   kind_name: "Claude Code",
@@ -215,6 +218,7 @@ class Run {
   private state(): State {
     const running = this.status === "running";
     return {
+      ...defaultState(),
       status: this.status,
       doing: running ? this.doing : undefined,
       turn_started: running ? this.turnStarted : undefined,
@@ -505,7 +509,7 @@ class Run {
     return this.sleep(between(r, 20, 90));
   }
 
-  private call(r: () => number, t: Omit<Tool, "id" | "seq" | "at" | "kind" | "tool_id" | "status" | "started" | "input"> & { input?: unknown }, parent?: string): Tool {
+  private call(r: () => number, t: Omit<Tool, "id" | "seq" | "at" | "kind" | "tool_id" | "status" | "started" | "input"> & { input?: JsonValue }, parent?: string): Tool {
     void r;
     const id = this.id(parent ? `F-${parent}-c` : "F-c");
     const at = Date.now();
@@ -636,6 +640,7 @@ class Run {
     const description = k % 2 ? "Audit the timer wheel for the same race" : "Check every caller of the backoff";
     const c = this.call(r, { name: "Task", tool: "agent", title: description, input: { description, prompt: `${description}. Report what you find.`, subagent_type: "general-purpose" } });
     const task: Task = {
+      ...defaultTask(),
       id: `task-${k}`,
       tool_id: c.tool_id,
       description,

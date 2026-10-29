@@ -66,6 +66,60 @@ pub struct PoolSpec {
     pub reserve: Option<super::reserve::ReservationSpec>,
     /// A `k8s` pool's Docker-capable sidecar in each of its pods, for Docker actions (W13-R07).
     pub docker: Option<PodDocker>,
+    /// A `k8s` pool's warm workspaces, kept past each pod (W24-R14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warm: Option<PodWarm>,
+}
+
+/// A `k8s` pool's warm workspaces (docs/ci.md W24-R14). The runner in each of its pods keeps its
+/// lanes' warm workspaces at `<work>/warm` (W24-R11); here that's a folder on the pod's node (a
+/// `hostPath`, `<root>/<pool>`, made by the node when it's missing), which outlives the pod, so
+/// the pool's next pod on that node starts warm. The runners of the node's pods share it, each
+/// lease under its lock. Pods go only to nodes carrying `node_label` (`key` or `key=value`) when
+/// it's given, and are drawn to the nodes that ran the pool's pods last. A pool whose pods may run
+/// untrusted legs (`ci.untrusted.executors` naming `k8s`) keeps none: an untrusted leg would write
+/// where trusted legs read (W24-R21).
+///
+/// The folder is the node's, made by root: the pod's runner must be able to write it (images that
+/// run as root can; otherwise prepare it on each node). Per-lane volumes cloned through CSI
+/// snapshots, R14's other way, aren't built yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PodWarm {
+    pub root: Option<String>,
+    pub node_label: Option<String>,
+}
+
+impl PodWarm {
+    /// The folder on each node its pools' folders are in.
+    pub fn root(&self) -> &str {
+        self.root.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("/var/lib/kiln/warm")
+    }
+
+    /// The node label its pods go to: its key, and its value when it names one.
+    pub fn node_label(&self) -> Option<(String, Option<String>)> {
+        let l = self.node_label.as_deref().map(str::trim).filter(|l| !l.is_empty())?;
+        Some(match l.split_once('=') {
+            Some((k, v)) => (k.trim().to_owned(), Some(v.trim().to_owned())),
+            None => (l.to_owned(), None),
+        })
+    }
+
+    /// What's wrong with it, if anything.
+    pub fn check(&self) -> Result<(), String> {
+        let root = self.root();
+        if !root.starts_with('/') || root.split('/').any(|c| c == "." || c == "..") {
+            return Err(format!("`warm.root` is an absolute folder on each node, not `{root}`"));
+        }
+        if let Some((k, v)) = self.node_label() {
+            let key_ok = !k.is_empty() && k.len() <= 316 && k.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+            let value_ok = v.as_deref().is_none_or(|v| v.len() <= 63 && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')));
+            if !key_ok || !value_ok {
+                return Err(format!("`warm.node_label` is a node label, `key` or `key=value`, not `{}`", self.node_label.as_deref().unwrap_or_default()));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A Docker-capable sidecar in each of a `k8s` pool's pods (W13-R07): `podman` (Podman's Docker
@@ -169,6 +223,12 @@ impl PoolSpec {
                 return Err(format!("pool `{name}`: `docker.engine` is `podman` or `docker`, not `{}`", d.engine()));
             }
         }
+        if let Some(w) = &self.warm {
+            if self.executor != "k8s" {
+                return Err(format!("pool `{name}`: `warm` keeps a `k8s` pool's workspaces past its pods, and this pool's executors are `{}`", self.executor));
+            }
+            w.check().map_err(|e| format!("pool `{name}`: {e}"))?;
+        }
         let max = self.max.unwrap_or(self.min_idle.max(1));
         if max == 0 || self.min_idle > max {
             return Err(format!("pool `{name}`: `min_idle` ({}) is at most `max` ({max}), which is at least 1", self.min_idle));
@@ -269,4 +329,46 @@ pub fn wanted(pool: &Pool, starting: usize, idle: usize, busy: usize, waiting: u
     let total = spare + busy;
     let need = waiting.max(pool.min_idle).saturating_sub(spare);
     need.min(pool.max.saturating_sub(total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pods(warm: PodWarm) -> PoolSpec {
+        PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], warm: Some(warm), ..PoolSpec::default() }
+    }
+
+    /// W24-R14: a `k8s` pool's `warm`: a folder on each node (`/var/lib/kiln/warm` unless it says),
+    /// to nodes carrying a label when it names one; what doesn't check out is refused, saying why;
+    /// only a `k8s` pool keeps workspaces past its pods.
+    #[test]
+    fn w24_r14_a_pools_warm_workspaces() -> Result<(), String> {
+        let plain = PodWarm::default();
+        assert_eq!((plain.root(), plain.node_label(), plain.check()), ("/var/lib/kiln/warm", None, Ok(())));
+        let labeled = PodWarm { root: Some(" /mnt/nvme/kiln ".into()), node_label: Some("kiln.dev/warm=true".into()) };
+        assert_eq!((labeled.root(), labeled.node_label()), ("/mnt/nvme/kiln", Some(("kiln.dev/warm".to_owned(), Some("true".to_owned())))));
+        assert!(pods(labeled.clone()).pool().is_ok());
+        assert_eq!(PodWarm { node_label: Some("nvme".into()), ..PodWarm::default() }.node_label(), Some(("nvme".to_owned(), None)));
+        for (bad, says) in [
+            (PodWarm { root: Some("warm".into()), ..PodWarm::default() }, "absolute folder"),
+            (PodWarm { root: Some("/var/../etc".into()), ..PodWarm::default() }, "absolute folder"),
+            (PodWarm { root: Some("/var/./kiln".into()), ..PodWarm::default() }, "absolute folder"),
+            (PodWarm { node_label: Some("a b=c".into()), ..PodWarm::default() }, "node label"),
+            (PodWarm { node_label: Some("kiln.dev/warm=a/b".into()), ..PodWarm::default() }, "node label"),
+        ] {
+            let e = pods(bad.clone()).pool().err().ok_or_else(|| format!("{bad:?} was taken"))?;
+            assert!(e.contains(says) && e.starts_with("pool `pods`"), "{e}");
+        }
+        let on_docker = PoolSpec { executor: "docker".into(), image: Some("ubuntu".into()), ..pods(labeled) };
+        assert!(on_docker.pool().is_err_and(|e| e.contains("`k8s` pool's workspaces")));
+        // Written in a pool's TOML as it would be; a key it doesn't know is refused; left out of a
+        // pool that has none.
+        let read: PoolSpec = toml::from_str("name = \"rust\"\nexecutor = \"k8s\"\nlabels = [\"rust\"]\nwarm = { node_label = \"kiln.dev/warm\" }\n").map_err(|e| e.to_string())?;
+        assert_eq!(read.warm.as_ref().map(|w| (w.root(), w.node_label())), Some(("/var/lib/kiln/warm", Some(("kiln.dev/warm".to_owned(), None)))));
+        assert!(toml::from_str::<PoolSpec>("name = \"rust\"\nexecutor = \"k8s\"\nwarm = { snapshot_class = \"csi\" }\n").is_err());
+        let plain = serde_json::to_value(PoolSpec::default()).map_err(|e| e.to_string())?;
+        assert!(plain.get("warm").is_none(), "{plain}");
+        Ok(())
+    }
 }

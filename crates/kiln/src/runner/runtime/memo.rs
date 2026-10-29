@@ -47,6 +47,29 @@ async fn together(calls: Vec<Call<'_>>) -> anyhow::Result<()> {
     futures::future::join_all(calls).await.into_iter().collect()
 }
 
+/// What `tool` says of its version (W28-R71: `rustc -vV`, else `--version`), run where the step
+/// runs with the step's `PATH`; why not when it can't be asked.
+async fn probe(tool: &str, path: &str, wd: &Path) -> Result<String, String> {
+    // The program as the step's `PATH` finds it; else where a login shell's `PATH`, or the usual
+    // toolchain folders, have it (a launchd service's `PATH` has none of them, and a step that
+    // adds them to its own `PATH` does so in its script).
+    let home = crate::os::home_dir();
+    let usual = [home.join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
+    let login = crate::reach::serve::login_path().unwrap_or_default();
+    let found = std::env::split_paths(path)
+        .chain(std::env::split_paths(&login))
+        .chain(usual)
+        .flat_map(|d| [d.join(tool), d.join(format!("{tool}.exe"))])
+        .find(|p| p.is_file());
+    let mut c = Command::new(found.as_deref().unwrap_or_else(|| Path::new(tool)));
+    c.args(memo::version_args(tool)).current_dir(wd).env("PATH", path);
+    match crate::proc::output(c, Duration::from_secs(30)).await {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => Err(format!("`{tool}` didn't say its version: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Err(format!("`{tool}` couldn't be asked its version: {e:#}")),
+    }
+}
+
 /// What a request sends: bytes, or a file read as it goes.
 enum Body {
     Bytes(Vec<u8>),
@@ -79,6 +102,8 @@ pub(super) struct Chain {
     base: Option<BTreeSet<String>>,
     /// Why memo steps run without the ledger, once the server said it has none.
     off: Option<String>,
+    /// Memo steps that left a result, by their own key, for portable steps' keys (W28-R70).
+    earlier: Vec<memo::Earlier>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +127,10 @@ pub(super) enum Prepared {
 pub(super) struct Keyed {
     /// Its unit, as the server's ledger keys it (W24-R30).
     unit: Unit,
+    /// The lease it executes under, other legs' identical steps waiting on it (W28-R72), and what
+    /// renews it while it runs.
+    lease: Option<String>,
+    renewal: Option<Renewal>,
     memo: Memo,
     started: Instant,
     env: BTreeMap<String, String>,
@@ -113,10 +142,28 @@ pub(super) struct Keyed {
 /// A recorded success for a step's key.
 pub(super) struct Hit {
     key: String,
+    /// The step's own weak key, as portable steps after it name it (W28-R70).
+    weak: String,
     replay: Replay,
     memo: Memo,
     source: Value,
+    /// The class it was found in, when through equivalence rather than its own key (W24-R30).
+    class: Option<String>,
 }
+
+/// Renews a lease every quarter of its life while the step runs (W28-R72); dropped, it stops.
+pub(super) struct Renewal {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Renewal {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How often a lease is renewed: a quarter of its life.
+const RENEW_EVERY: Duration = Duration::from_millis(kiln_ci::work::flight::LEASE_TTL_MS.unsigned_abs() / 4);
 
 fn short(key: &str) -> &str {
     key.get(..12).unwrap_or(key)
@@ -158,7 +205,7 @@ impl Leg {
     /// Before a step runs (W24-R07): a memo step's key looked up, a hit to replay; else whatever
     /// earlier hits left put in place, as the step may read it.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn memo_prepare(&self, st: &mut State, idx: u32, step: &Step, nested: bool, env: &BTreeMap<String, String>, wd: &Path, shell: Option<&str>, script: Option<&str>, with: &BTreeMap<String, String>) -> Prepared {
+    pub(super) async fn memo_prepare(&self, st: &mut State, idx: u32, step: &Step, nested: bool, env: &BTreeMap<String, String>, wd: &Path, shell: Option<&str>, script: Option<&str>, with: &BTreeMap<String, String>, wait_until: Instant) -> Prepared {
         if nested {
             return Prepared::Run(None);
         }
@@ -188,17 +235,44 @@ impl Leg {
                     Ok(unit) => {
                         // The ledger keys the unit on its one path (W24-R30); its weak key names it here.
                         let weak = key::weak(&unit);
-                        let ask = json!({ "unit": unit, "step": idx, "max_age": m.max_age });
-                        match self.work_post("lookup", &ask, Duration::from_secs(60)).await {
+                        // A miss is a turn among the legs that reach the same step now (W28-R72): one
+                        // executes it, the others wait for it (W28-R75), as long as the job may.
+                        let ask = json!({ "unit": unit, "step": idx, "max_age": m.max_age, "flight": true });
+                        let mut answer = self.work_post("lookup", &ask, Duration::from_secs(60)).await;
+                        let mut waited: Option<(String, Instant)> = None;
+                        while let Ok((202, v)) = &answer {
+                            let said = v.pointer("/in_flight/said").and_then(Value::as_str).unwrap_or("another leg's step").to_owned();
+                            if waited.as_ref().is_none_or(|(w, _)| *w != said) {
+                                let turn = v.pointer("/in_flight/turn").and_then(Value::as_bool).unwrap_or(false);
+                                let why = if turn { format!("waiting for {said} to take its turn at the same work, ahead of this one") } else { format!("waiting on {said}: the same work in flight") };
+                                self.note(idx, &format!("memo: {why} (key {})", short(&weak.hex()))).await;
+                                waited = Some((said, waited.map_or_else(Instant::now, |(_, t)| t)));
+                            }
+                            if Instant::now() >= wait_until {
+                                self.note(idx, "memo: the job's time ran out waiting for the same work in flight: the step runs").await;
+                                answer = Ok((204, Value::Null));
+                                break;
+                            }
+                            answer = self.work_post("wait", &ask, Duration::from_secs(60)).await;
+                        }
+                        if let Some((said, since)) = &waited {
+                            self.note(idx, &format!("memo: waited {:.1} s on {said}", since.elapsed().as_secs_f64())).await;
+                        }
+                        let mut lease = None;
+                        match answer {
                             Ok((200, v)) => {
                                 let replay = serde_json::from_value::<BTreeMap<String, String>>(v.get("outputs").cloned().unwrap_or_default()).map_err(|e| e.to_string()).and_then(|o| Replay::decode(&o));
                                 match replay {
                                     Ok(replay) => {
                                         let key = v.get("key").and_then(Value::as_str).unwrap_or_default().to_owned();
-                                        return Prepared::Hit(Box::new(Hit { key, replay, memo: m, source: v.get("source").cloned().unwrap_or_default() }));
+                                        return Prepared::Hit(Box::new(Hit { key, weak: weak.hex(), replay, memo: m, source: v.get("source").cloned().unwrap_or_default(), class: v.get("class").and_then(Value::as_str).map(str::to_owned) }));
                                     }
                                     Err(e) => self.note(idx, &format!("memo: the recorded result doesn't read ({e}): the step runs")).await,
                                 }
+                            }
+                            Ok((201, v)) => {
+                                lease = v.get("lease").and_then(Value::as_str).map(str::to_owned);
+                                self.note(idx, &format!("memo: no earlier success with these inputs (key {}): the step runs, and the same step elsewhere waits on it", short(&weak.hex()))).await;
                             }
                             Ok((204, _)) => self.note(idx, &format!("memo: no earlier success with these inputs (key {}): the step runs", short(&weak.hex()))).await,
                             Ok((404, v)) if said(&v) == "not found" => {
@@ -209,7 +283,8 @@ impl Leg {
                             Err(e) => self.note(idx, &format!("memo: the work ledger couldn't be reached ({e:#}): the step runs")).await,
                         }
                         if st.memo.off.is_none() {
-                            keyed = Some(Box::new(Keyed { unit, memo: m, started: Instant::now(), env: st.env.clone(), path: st.path.entries().to_vec(), run_env: st.run_env.len(), masks: st.masks_added.len() }));
+                            let renewal = lease.clone().map(|l| self.renew_while_running(l));
+                            keyed = Some(Box::new(Keyed { unit, lease, renewal, memo: m, started: Instant::now(), env: st.env.clone(), path: st.path.entries().to_vec(), run_env: st.run_env.len(), masks: st.masks_added.len() }));
                         }
                     }
                 }
@@ -217,7 +292,43 @@ impl Leg {
         }
         match self.memo_materialize(st, idx).await {
             Ok(()) => Prepared::Run(keyed),
-            Err(e) => Prepared::Fail(e),
+            Err(e) => {
+                if let Some(l) = keyed.and_then(|k| k.lease) {
+                    self.release(&l).await;
+                }
+                Prepared::Fail(e)
+            }
+        }
+    }
+
+    /// Renews `lease` until the step ends (W28-R72): its waiters wait as long as it runs, and take
+    /// their turn within a lease's life if its runner is lost.
+    fn renew_while_running(&self, lease: String) -> Renewal {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, http, url, token) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&self.http), self.work_url("renew"), self.a.runtime.runtime_token.clone());
+        crate::rt::spawn(async move {
+            loop {
+                crate::rt::sleep(RENEW_EVERY).await;
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let held = match http.post(&url).bearer(&token).json(&json!({ "lease": lease })).timeout(Duration::from_secs(30)).send().await {
+                    Ok(r) if r.status() == 200 => r.json(1 << 16).await.ok().and_then(|v: Value| v.get("held").and_then(Value::as_bool)).unwrap_or(true),
+                    _ => true,
+                };
+                if !held {
+                    tracing::debug!(lease, "a step's lease lapsed while it ran: another leg may run it too");
+                    return;
+                }
+            }
+        });
+        Renewal { stop }
+    }
+
+    /// Lets a lease go without a success, so the next leg waiting takes its turn (W28-R73).
+    async fn release(&self, lease: &str) {
+        if let Err(e) = self.work_post("release", &json!({ "lease": lease }), Duration::from_secs(30)).await {
+            tracing::debug!(lease, error = %format!("{e:#}"), "a step's lease couldn't be let go: it lapses");
         }
     }
 
@@ -294,6 +405,20 @@ impl Leg {
             declared_inputs.push(dir.to_owned());
         }
         let inputs = self.memo_inputs(st, &declared_inputs, &m.outputs).await?;
+        if m.platform.is_some() {
+            // A portable step (W28-R70, R71): its toolchains' identities, at the precision it gives.
+            let mut platform = platform;
+            for (tool, precision) in &m.tools {
+                if st.containers.as_ref().is_some_and(|c| c.job.is_some()) {
+                    return Err(format!("`memo.tools` are asked on the runner, and this step runs in a job container, where `{tool}` may differ"));
+                }
+                let text = probe(tool, &super::leg_path(st, env.get("PATH").map(String::as_str)), wd).await?;
+                let id = memo::identity(*precision, &text).ok_or_else(|| format!("`{tool}` names no version (it said `{}`)", text.trim()))?;
+                platform.toolchains.insert(tool.clone(), id);
+            }
+            let facts = Facts { definition, env: all, declared, platform, inputs, upstream, trusted: a.trusted };
+            return Ok(memo::portable_unit(&facts, m, &st.memo.earlier));
+        }
         let facts = Facts { definition, env: all, declared, platform, inputs, upstream, trusted: a.trusted };
         Ok(memo::unit(&facts))
     }
@@ -339,7 +464,7 @@ impl Leg {
     /// A hit, replayed (W24-R07): what it left for the steps after it, its files put in place once
     /// one runs; and where it came from, said in its log and as a notice. Its outputs.
     pub(super) async fn memo_replay(&self, st: &mut State, idx: u32, hit: Hit) -> BTreeMap<String, String> {
-        let Hit { key, replay, memo: m, source } = hit;
+        let Hit { key, weak, replay, memo: m, source, class } = hit;
         for (k, v) in &replay.env {
             st.env.insert(k.clone(), v.clone());
         }
@@ -354,11 +479,16 @@ impl Leg {
             st.memo.pending.push_back(Pending { tree: tree.clone(), from: from.clone() });
         }
         st.memo.upstream.insert(format!("step.{idx}"), replay.digest());
+        st.memo.earlier.push(memo::Earlier { key: weak, outputs: m.outputs.clone(), digest: replay.digest() });
         st.memo.outputs.extend(m.outputs.iter().cloned());
         let runner = Some(text("runner")).filter(|r| !r.is_empty()).map(|r| format!(" on {r}")).unwrap_or_default();
         let took = source.get("ms").and_then(Value::as_u64).map(|ms| format!(", in {:.1} s", ms as f64 / 1000.0)).unwrap_or_default();
         let files = if replay.files.is_some() { "; its files are put in place when a later step runs" } else { "" };
-        let why = format!("Reused from {from}: this step succeeded there with the same inputs{runner}{took} (key {}), so it isn't run again: its log above is that run's{files}.", short(&key));
+        let why = match &class {
+            // Found by its class (W24-R30): another definition the rules make one with it.
+            Some(c) => format!("Reused through equivalence with {from}: a step its rewrite rules make one with this one succeeded there{runner}{took} (class {}, key {}), so it isn't run again: its log above is that run's{files}.", short(c.trim_start_matches("sha256:")), short(&key)),
+            None => format!("Reused from {from}: this step succeeded there with the same inputs{runner}{took} (key {}), so it isn't run again: its log above is that run's{files}.", short(&key)),
+        };
         self.note(idx, &format!("memo: {why}")).await;
         self.annotate(idx, "notice", &why).await;
         replay.outputs
@@ -368,7 +498,17 @@ impl Leg {
     /// what it left as the keys of the steps after it take it. Only where its digest stands for
     /// its files (it took them in) do the keys after it leave those files out of their inputs; else
     /// they read them as any other.
-    pub(super) async fn memo_record(&self, st: &mut State, idx: u32, k: Keyed, outcome: Conclusion, outputs: &BTreeMap<String, String>) {
+    pub(super) async fn memo_record(&self, st: &mut State, idx: u32, mut k: Keyed, outcome: Conclusion, outputs: &BTreeMap<String, String>) {
+        let (lease, renewal) = (k.lease.clone(), k.renewal.take());
+        self.memo_keep(st, idx, k, outcome, outputs).await;
+        drop(renewal);
+        // Kept, the server let the lease go with it; anything else lets it go here (W28-R73).
+        if let Some(l) = lease {
+            self.release(&l).await;
+        }
+    }
+
+    async fn memo_keep(&self, st: &mut State, idx: u32, k: Keyed, outcome: Conclusion, outputs: &BTreeMap<String, String>) {
         let at = format!("step.{idx}");
         if outcome != Conclusion::Success {
             st.memo.upstream.insert(at, format!("{} (not kept)", super::word(outcome)));
@@ -423,12 +563,13 @@ impl Leg {
             }
         }
         st.memo.upstream.insert(at, replay.digest());
+        st.memo.earlier.push(memo::Earlier { key: key::weak(&k.unit).hex(), outputs: k.memo.outputs.clone(), digest: replay.digest() });
         st.memo.outputs.extend(k.memo.outputs.iter().cloned());
         if !stored {
             return;
         }
         let ms = u64::try_from(k.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let body = json!({ "unit": k.unit, "step": idx, "ms": ms, "max_age": k.memo.max_age, "outputs": replay.encode() });
+        let body = json!({ "unit": k.unit, "step": idx, "ms": ms, "max_age": k.memo.max_age, "outputs": replay.encode(), "lease": k.lease });
         match self.work_post("record", &body, Duration::from_secs(120)).await {
             Ok((201, _)) => self.note(idx, &format!("memo: kept for reuse (key {})", short(&key::weak(&k.unit).hex()))).await,
             Ok((status, v)) => self.note(idx, &format!("memo: not kept for reuse: the server said HTTP {status}: {}", said(&v))).await,
@@ -458,7 +599,35 @@ impl Leg {
             self.memo_put(&digest.hash, Body::Bytes(tree)).await?;
             n += 1;
         }
+        // Kept in this runner's content store too (W24-R08), so a hit here puts them in place
+        // without asking the server, and its LAN peers may ask for them (W24-R27).
+        let paths: Vec<PathBuf> = files.values().cloned().collect();
+        self.local_keep(paths).await;
         Ok(n)
+    }
+
+    /// This runner's content store (W24-R08's cache service), and the scope this leg holds objects
+    /// in there: its repository and domain.
+    async fn local_store(&self) -> Option<(std::sync::Arc<crate::runner::work::store::Store>, crate::runner::work::store::Scope)> {
+        let svc = crate::runner::work::service::ensure().await?;
+        Some((std::sync::Arc::clone(svc.store()), crate::runner::work::store::Scope::new(&self.a.repo, if self.a.trusted { "trusted" } else { "untrusted" })))
+    }
+
+    /// Files put in the runner's content store, held for the leg's scope; what can't be is said.
+    async fn local_keep(&self, paths: Vec<PathBuf>) {
+        let Some((store, scope)) = self.local_store().await else { return };
+        let kept = crate::rt::blocking(move || -> anyhow::Result<()> {
+            for p in paths {
+                let (digest, _) = store.put_file(&p)?;
+                store.hold(&scope, &digest)?;
+            }
+            Ok(())
+        })
+        .await
+        .and_then(|r| r);
+        if let Err(e) = kept {
+            tracing::debug!(error = %format!("{e:#}"), "a memo step's files weren't kept in the runner's content store");
+        }
     }
 
     async fn memo_put(&self, digest: &str, body: Body) -> anyhow::Result<()> {
@@ -543,6 +712,19 @@ impl Leg {
     /// A stored object's bytes, into `part`: how many. A small one comes whole and is written
     /// without a sync (the workspace goes with the leg anyway); a large one is written as it comes.
     async fn memo_download(&self, d: &Digest, part: &Path) -> anyhow::Result<u64> {
+        // The runner's content store first (W24-R08): an object this runner kept or fetched before.
+        if let Some((store, _)) = self.local_store().await {
+            let (hash, p) = (d.hash.clone(), part.to_path_buf());
+            if crate::rt::blocking(move || store.copy_to(&hash, &p)).await.and_then(|r| r).unwrap_or(false) {
+                return Ok(d.size_bytes);
+            }
+        }
+        let wrote = self.memo_download_from_server(d, part).await?;
+        self.local_keep(vec![part.to_path_buf()]).await;
+        Ok(wrote)
+    }
+
+    async fn memo_download_from_server(&self, d: &Digest, part: &Path) -> anyhow::Result<u64> {
         let mut resp = self.http.get(&self.work_url(&format!("blobs/{}", d.hash))).bearer(&self.a.runtime.runtime_token).timeout(Duration::from_secs(600)).send().await?;
         anyhow::ensure!(resp.is_success(), "HTTP {}", resp.status());
         if d.size_bytes <= WHOLE {

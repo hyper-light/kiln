@@ -1,0 +1,83 @@
+id: haskell-function
+language: Haskell
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: haskell-signature
+language: Haskell
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: signature
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  SIG:
+    replace:
+      source: $DECL
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: haskell-data
+language: Haskell
+role: item
+symbolType: struct
+rule:
+  all:
+    - any:
+        - kind: data_type
+        - kind: newtype
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: haskell-type-synonym
+language: Haskell
+role: item
+symbolType: typeAlias
+# `type X = Y` (the grammar spells the node `type_synomym`).
+rule:
+  all:
+    - kind: type_synomym
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: haskell-class
+language: Haskell
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: class
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: haskell-class-method
+language: Haskell
+role: member
+parentRuleIds: [haskell-class]
+symbolType: method
+rule:
+  kind: signature
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true

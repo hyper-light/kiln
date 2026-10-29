@@ -197,6 +197,10 @@ pub struct Workflow {
     pub secrets: Vec<SecretDecl>,
     /// kiln: `supersede:` (W05-R08).
     pub supersede: Option<YVal>,
+    /// kiln: `coalesce:` (W28-R61).
+    pub coalesce: Option<YVal>,
+    /// kiln: `cadence:` (W28-R62).
+    pub cadence: Option<YVal>,
     /// kiln: `routing: { infer }` (W05-R19).
     pub routing_infer: bool,
     /// kiln: `run-env: true` (W04-R21).

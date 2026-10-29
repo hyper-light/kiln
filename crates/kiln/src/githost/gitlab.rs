@@ -132,6 +132,11 @@ impl Gitlab {
         self.call_as(&self.token, method, path, body).await
     }
 
+    /// The `Authorization` header kiln's token makes.
+    pub(crate) fn auth_header(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+
     /// One call with someone's own token (W23-R08: what they do from kiln is theirs).
     pub async fn call_as(&self, token: &str, method: Method, path: &str, body: Option<&Value>) -> anyhow::Result<(u16, Value)> {
         let (status, bytes) = self.raw(token, method, path, body, 32 << 20).await?;
@@ -161,6 +166,15 @@ impl Gitlab {
             return Ok((st, r.bytes(limit).await?));
         }
         Ok((status, resp.bytes(limit).await?))
+    }
+
+    /// A conditional GET (docs/ci.md W26-R20): its status, its ETag and its JSON; a 304 when `etag`
+    /// still holds.
+    pub async fn get_if(&self, path: &str, etag: Option<&str>) -> anyhow::Result<(u16, Option<String>, Value)> {
+        let client = crate::http::client::github()?;
+        let url = if path.starts_with("http://") || path.starts_with("https://") { path.to_owned() } else { format!("{}{path}", self.api) };
+        let req = client.request(Method::Get, &url).bearer(&self.token).header("Accept", "application/json");
+        super::mirror::send_if(req, etag).await.with_context(|| format!("GitLab: {url}"))
     }
 
     /// How git reads it: the project's URL and the token as git's password.

@@ -25,6 +25,7 @@ use super::Cd;
 use super::kube::Cluster;
 use super::ops::Fail;
 use crate::http::ws::{self, Message};
+use crate::wire::ui::{CdLogDown, CdLogLine};
 
 /// How long a list or a tree is reused.
 const TTL: Duration = Duration::from_secs(4);
@@ -507,7 +508,7 @@ pub fn container_of(pod: &Node, asked: Option<&str>) -> Option<String> {
 }
 
 /// One log line: its pod, its time, its text.
-fn line(pod: &str, raw: &str) -> Value {
+fn line(pod: &str, raw: &str) -> CdLogLine {
     let raw = raw.strip_suffix('\r').unwrap_or(raw);
     let (ts, text) = match raw.split_once(' ') {
         Some((t, rest)) if t.len() >= 20 && t.as_bytes().get(4) == Some(&b'-') && t.ends_with('Z') => (t, rest),
@@ -522,18 +523,18 @@ fn line(pod: &str, raw: &str) -> Value {
     } else {
         text.to_owned()
     };
-    json!({"pod": pod, "ts": ts, "text": text})
+    CdLogLine { pod: pod.to_owned(), ts: ts.to_owned(), text }
 }
 
 /// The last lines of some pods' logs, merged by time.
-pub async fn logs(c: &Cluster, pods: &[&Node], q: &LogQuery) -> (Vec<Value>, Vec<String>) {
+pub async fn logs(c: &Cluster, pods: &[&Node], q: &LogQuery) -> (Vec<CdLogLine>, Vec<String>) {
     let reads = pods.iter().map(|p| async move {
         let Some(container) = container_of(p, q.container.as_deref()) else {
             return (p.name.clone(), Err(anyhow::anyhow!("it has no containers")));
         };
         (p.name.clone(), c.pod_log(&p.namespace, &p.name, &q.query(&container, false)).await)
     });
-    let mut lines: Vec<Value> = Vec::new();
+    let mut lines: Vec<CdLogLine> = Vec::new();
     let mut errors = Vec::new();
     for (pod, got) in futures::future::join_all(reads).await {
         match got {
@@ -545,11 +546,11 @@ pub async fn logs(c: &Cluster, pods: &[&Node], q: &LogQuery) -> (Vec<Value>, Vec
         }
     }
     // Stable, so each pod's own lines keep their order where times tie.
-    lines.sort_by(|a, b| a["ts"].as_str().cmp(&b["ts"].as_str()));
+    lines.sort_by(|a, b| a.ts.cmp(&b.ts));
     (lines, errors)
 }
 
-/// Streams some pods' logs as they are written to a WebSocket, as JSON text messages:
+/// Streams some pods' logs as they are written to a WebSocket, as [`CdLogDown`]s:
 /// `{type: "lines", lines: [{pod, ts, text}]}`, `{type: "error", pod, message}`, and
 /// `{type: "end"}` once every log has ended. Closing the socket stops it.
 pub async fn follow(c: Arc<Cluster>, pods: Vec<(String, String, String)>, q: LogQuery, socket: ws::WebSocket) -> anyhow::Result<()> {
@@ -581,9 +582,9 @@ pub async fn follow(c: Arc<Cluster>, pods: Vec<(String, String, String)>, q: Log
                 let status = resp.status().as_u16();
                 let body = http_body_util::BodyExt::collect(resp.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
                 let msg = kiln_cd::kube::status_message(status, &body);
-                tx.send(ws::text(json!({"type": "error", "pod": pod, "message": msg}).to_string())).await?;
+                tx.send(ws::text(CdLogDown::Error { pod: pod.clone(), message: msg }.text())).await?;
             }
-            Err(e) => tx.send(ws::text(json!({"type": "error", "pod": pod, "message": format!("{e:#}")}).to_string())).await?,
+            Err(e) => tx.send(ws::text(CdLogDown::Error { pod: pod.clone(), message: format!("{e:#}") }.text())).await?,
         }
     }
     let mut open = streams.len();
@@ -606,28 +607,28 @@ pub async fn follow(c: Arc<Cluster>, pods: Vec<(String, String, String)>, q: Log
                     let Some(end) = buf.rfind('\n') else { continue };
                     let done: String = buf.drain(..=end).collect();
                     let pod = pods.get(i).map(|p| p.1.as_str()).unwrap_or("");
-                    let lines: Vec<Value> = done.lines().filter(|l| !l.is_empty()).map(|l| line(pod, l)).collect();
+                    let lines: Vec<CdLogLine> = done.lines().filter(|l| !l.is_empty()).map(|l| line(pod, l)).collect();
                     if !lines.is_empty() {
-                        tx.send(ws::text(json!({"type": "lines", "lines": lines}).to_string())).await?;
+                        tx.send(ws::text(CdLogDown::Lines { lines }.text())).await?;
                     }
                 }
                 Some(Ev::End(i)) => {
                     open -= 1;
                     let pod = pods.get(i).map(|p| p.1.as_str()).unwrap_or("");
                     if let Some(rest) = partial.get_mut(i).map(std::mem::take).filter(|r| !r.is_empty()) {
-                        tx.send(ws::text(json!({"type": "lines", "lines": [line(pod, &rest)]}).to_string())).await?;
+                        tx.send(ws::text(CdLogDown::Lines { lines: vec![line(pod, &rest)] }.text())).await?;
                     }
                 }
                 Some(Ev::Fail(i, e)) => {
                     open -= 1;
                     let pod = pods.get(i).map(|p| p.1.as_str()).unwrap_or("");
-                    tx.send(ws::text(json!({"type": "error", "pod": pod, "message": e}).to_string())).await?;
+                    tx.send(ws::text(CdLogDown::Error { pod: pod.to_owned(), message: e }.text())).await?;
                 }
                 None => break,
             },
         }
     }
-    tx.send(ws::text(json!({"type": "end"}).to_string())).await?;
+    tx.send(ws::text(CdLogDown::End.text())).await?;
     tx.close(None).await.ok();
     Ok(())
 }

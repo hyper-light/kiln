@@ -37,12 +37,14 @@ on a repository covers its pipelines and environments.
 | Machines | `machines.read`, `machines.manage`, `machines.terminal`, `binaries.publish` |
 | Agents | `agents.run`, `agents.manage`, `agents.attach`, `agents.stop`, `experiments.run` |
 | Secrets | `secrets.use:<name>`, `secrets.manage` |
+| Observe | `observe.read` (queries, searches, live tails, dashboards, monitors, integrations listed without their secrets), `observe.write` (dashboards, monitors, series, logs and events posted), `observe.manage` (integrations and clouds, which hold secrets; the store's compaction and checks) |
 | Server | `settings.manage`, `tokens.manage`, `users.manage`, `audit.read` |
 
-**Roles** are named sets of capabilities: `viewer`, `developer` (trigger, rerun, submit, review),
-`maintainer` (plus land, attach agents, manage everyone's agents, manage the queue), `admin`
-(everything but ownership) and `owner`. Custom roles are allowed. A user holds roles per scope.
-Grants add up across scopes, and an explicit deny wins.
+**Roles** are named sets of capabilities: `viewer` (reads, observe's too), `developer` (trigger,
+rerun, submit, review; observe's dashboards and monitors), `maintainer` (plus land, attach agents,
+manage everyone's agents, manage the queue; observe's integrations and clouds), `admin` (everything
+but ownership) and `owner`. Custom roles are allowed. A user holds roles per scope. Grants add up
+across scopes, and an explicit deny wins.
 
 **Whose agents.** A person reaches the agent sessions they opened, and those sessions' children.
 The owner and anyone with `agents.manage` reach every session. Anyone else gets 404 for a session
@@ -57,12 +59,19 @@ docs/agents.md, "Whose agents", has the whole rule, agents' own reach included.
 | Kind | Format | Lifetime | Notes |
 | --- | --- | --- | --- |
 | Personal access token | `kiln_pat_<id>_<secret>` | chosen, ≤ 1 year | scopes and capabilities chosen at creation; shown once; revocable |
-| Agent token | `kiln_agt_<id>_<secret>` | rotated hourly while the agent lives | minted automatically; revoked when the agent ends |
+| Agent token | `kiln_agt_<id>_<secret>` | rotated hourly while the agent lives | minted automatically; revoked when the agent ends; the session also signs as itself (below) |
 | Job token | `kiln_job_<id>_<secret>` | the job's lifetime | its run, plus what the job's `permissions` ask for (below) |
 | Admin token | unchanged | until rotated | break-glass; the CLI prefers a PAT once one exists |
 
 Secrets are stored hashed (SHA-256: they are long and random), and every token records its last
 use. The prefixes let secret scanners and kiln's own log masking recognise leaked tokens.
+
+**Identities.** Besides its token, each machine and agent signs as itself with a certificate from
+kiln's CA, its key made where it's used and never sent: each runner process
+(`kiln://<org>/person/<enrolled by>/machine/<machine>/instance/<instance>`), each agent session at
+each epoch, for its person, named by the runner process holding its key, and likewise people, CI
+legs, the server and CD. docs/ci.md W27 says what each kind's certificate names, how long it lasts
+and how a revoked one is refused from that moment (`kiln identities`).
 
 **Jobs ask for what they need** with a new pipeline key, so no pipeline needs the admin token in
 a secret:

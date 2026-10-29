@@ -9,7 +9,7 @@
 import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import { harnessApi, type AgentInfo } from "@/api/harness";
+import { harnessApi, listed, type AgentInfo } from "@/api/harness";
 import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
 import { loaded, preload, useSuspenseResource, type ResourceOptions } from "./resource";
 
@@ -56,7 +56,8 @@ export const recentRunsRes = (limit: number): Res<Run[]> => ({ key: `runs/recent
 export function useOverview() {
   const ov = useRes(overviewRes);
   useServerEvents((ev) => {
-    if (ev.type === "queue") ov.setData((d) => ({ ...d, queue: { queued: ev.queued, running: ev.running } }));
+    // `queue` also says where a land queue's entry is: the counts are the scheduler's.
+    if (ev.type === "queue" && "queued" in ev) ov.setData((d) => ({ ...d, queue: { queued: ev.queued, running: ev.running } }));
     else if (ev.type === "sample" && ev.agent === "server") ov.setData((d) => ({ ...d, system: { ...d.system, sample: ev.sample } }));
   });
   return ov;
@@ -146,6 +147,7 @@ export const harnessSessionsRes: Res<AgentInfo[]> = {
     apply: (list, ev) => {
       if (ev.type === "harness_closed") return list.filter((a) => a.id !== ev.id);
       if (ev.type !== "harness") return undefined;
+      if (!listed(ev.info)) return list.filter((a) => a.id !== ev.info.id);
       const i = list.findIndex((a) => a.id === ev.info.id);
       return i === -1 ? [...list, ev.info] : list.map((a, j) => (j === i ? ev.info : a));
     },

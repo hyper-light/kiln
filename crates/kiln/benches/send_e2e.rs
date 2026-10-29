@@ -84,7 +84,7 @@ async fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
     }
     let (tx, rx) = async_channel::unbounded();
-    let host = Host::new(tx, Some(scratch.path().join("harness.json")), Limits { per_machine: sessions.saturating_add(1), per_shell: sessions.saturating_add(1) });
+    let host = Host::new(tx, Some(scratch.path().join("harness.json")), Limits { per_machine: sessions.saturating_add(1) });
     let ids: Vec<String> = (0..sessions).map(|s| format!("e2e-{n}-{s}")).collect();
     for id in &ids {
         let spec = Spec { kind: "claude".into(), cwd: Some(scratch.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };

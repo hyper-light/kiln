@@ -1,0 +1,361 @@
+id: cpp-include
+language: Cpp
+role: item
+symbolType: module
+rule:
+  kind: preproc_include
+  has:
+    field: path
+    pattern: $PATH
+name: $PATH
+isImport: true
+isExported: false
+---
+
+id: cpp-function
+language: Cpp
+role: item
+symbolType: function
+# The function declarator may sit under pointer/reference wrappers (`void *f()`,
+# `Widget &g()`) — without the descend branch those definitions were silently absent. The
+# name node binds whole (identifier, qualified_identifier, operator_name, destructor_name),
+# preserving qualified spellings like `Widget::method`.
+rule:
+  kind: function_definition
+  has:
+    field: declarator
+    any:
+      - kind: function_declarator
+        has:
+          field: declarator
+          pattern: $NAME
+      - has:
+          kind: function_declarator
+          stopBy: end
+          has:
+            field: declarator
+            pattern: $NAME
+name: $NAME
+# Internal linkage is honest visibility: `static` at namespace scope is TU-local.
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
+# Parser-swallow recovery: C++ forbids nested function definitions too (lambdas are
+# `lambda_expression`, local classes' methods sit inside a `class_specifier` the walk
+# never enters), and tree-sitter-cpp shares the block-item shape — see the C rule.
+# Measured on the C corpora first; the shape is the same grammar family.
+swallowRecovery: true
+---
+
+id: cpp-class
+language: Cpp
+role: item
+symbolType: class
+# Type references and forward declarations are not definitions: require the body.
+rule:
+  kind: class_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: $NAME
+---
+
+id: cpp-struct
+language: Cpp
+role: item
+symbolType: struct
+# Type references and forward declarations are not definitions: require the body.
+rule:
+  kind: struct_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: $NAME
+---
+
+id: cpp-enum
+language: Cpp
+role: item
+symbolType: enum
+# Type references and forward declarations are not definitions: require the body.
+rule:
+  kind: enum_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: enumerator_list
+name: $NAME
+---
+
+id: cpp-concept
+language: Cpp
+role: item
+symbolType: interface
+rule:
+  kind: concept_definition
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+---
+
+id: cpp-member-method
+language: Cpp
+role: member
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
+symbolType: method
+# A method's function declarator names a *field identifier directly* (possibly under
+# pointer/reference wrappers for pointer-returning methods). A function-pointer member
+# (`int (*cb)(int);`) fails that test — its declarator is parenthesized — and correctly
+# falls through to the field rule instead of becoming a method named `(*cb)`.
+rule:
+  kind: field_declaration
+  has:
+    field: declarator
+    any:
+      - kind: function_declarator
+        has:
+          field: declarator
+          kind: field_identifier
+          pattern: $NAME
+      - has:
+          kind: function_declarator
+          stopBy: end
+          has:
+            field: declarator
+            kind: field_identifier
+            pattern: $NAME
+name: $NAME
+isPublic: false
+---
+
+id: cpp-member-constructor
+language: Cpp
+role: member
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
+symbolType: constructor
+rule:
+  kind: declaration
+  has:
+    field: declarator
+    kind: function_declarator
+    has:
+      field: declarator
+      pattern: $NAME
+name: $NAME
+isPublic: false
+---
+
+id: cpp-member-field
+language: Cpp
+role: member
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
+symbolType: field
+# The name is the field identifier inside the declarator (pointer fields were `*cursor`).
+# The exclusion mirrors the method rule exactly: anything the method rule claims — a
+# function declarator naming a field identifier directly, wrapped or not — is not a field;
+# function-pointer members don't fit that shape and stay fields.
+rule:
+  kind: field_declaration
+  has:
+    field: declarator
+    any:
+      - kind: field_identifier
+        pattern: $NAME
+      - has:
+          kind: field_identifier
+          stopBy: end
+          pattern: $NAME
+  not:
+    has:
+      field: declarator
+      any:
+        - kind: function_declarator
+          has:
+            field: declarator
+            kind: field_identifier
+        - has:
+            kind: function_declarator
+            stopBy: end
+            has:
+              field: declarator
+              kind: field_identifier
+name: $NAME
+isPublic: false
+---
+
+id: cpp-nested-class
+language: Cpp
+role: member
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
+symbolType: class
+rule:
+  kind: class_specifier
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic: false
+---
+
+id: cpp-nested-struct
+language: Cpp
+role: member
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
+symbolType: struct
+rule:
+  kind: struct_specifier
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic: false
+---
+
+id: cpp-enum-member
+language: Cpp
+role: member
+parentRuleIds: [cpp-enum]
+symbolType: enumMember
+rule:
+  kind: enumerator
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic: true
+---
+
+id: cpp-union
+language: Cpp
+role: item
+symbolType: union
+# Type references and forward declarations are not definitions: require the body.
+rule:
+  kind: union_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: $NAME
+---
+
+id: cpp-namespace
+language: Cpp
+role: item
+symbolType: module
+# `namespace foo { … }` — the C++ module surface (extraction-coverage campaign);
+# anonymous namespaces have no name field and stay un-minted (their members are
+# extracted through the ordinary item rules).
+rule:
+  kind: namespace_definition
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+transparent: true
+isExported: true
+---
+
+id: cpp-macro
+language: Cpp
+role: item
+symbolType: macro
+# Object-like macro: `#define NAME …` — the preprocessor layer is definition
+# surface (extraction-coverage campaign 2026-08-31).
+rule:
+  kind: preproc_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+
+id: cpp-macro-function
+language: Cpp
+role: item
+symbolType: macro
+# Function-like macro: `#define CHECK(x) …` — callable surface.
+rule:
+  kind: preproc_function_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+
+id: cpp-typedef
+language: Cpp
+role: item
+symbolType: typeAlias
+# `typedef … name;` — name = the type identifier reached by descending the
+# declarator chain, the cpp-function discipline.
+rule:
+  kind: type_definition
+  all:
+    - has:
+        field: declarator
+        any:
+          - kind: type_identifier
+            pattern: $NAME
+          - has:
+              kind: type_identifier
+              stopBy: end
+              pattern: $NAME
+    # A body-bearing record/enum under typedef is that record's DEFINITION —
+    # extracted by the class/struct/union/enum rules, which the traversal
+    # reaches once this rule declines. Only bodyless forms are aliases.
+    - not:
+        has:
+          field: type
+          any:
+            - kind: struct_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: union_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: enum_specifier
+              has:
+                field: body
+                kind: enumerator_list
+            - kind: class_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+name: $NAME
+isExported: true
+---
+
+id: cpp-using-alias
+language: Cpp
+role: item
+symbolType: typeAlias
+# `using Name = …;` — the modern alias form.
+rule:
+  kind: alias_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true

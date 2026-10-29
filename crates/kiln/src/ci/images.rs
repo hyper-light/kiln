@@ -127,7 +127,7 @@ pub async fn built(hub: &Hub, leg: &str, name: &str, reference: &str, digest: &s
             Ok(())
         })
         .await?;
-    hub.emit(&json!({ "type": "ci_image", "repo": repo, "name": name, "digest": digest, "platforms": platforms }));
+    hub.emit(&crate::wire::events::ServerEvent::CiImage { repo, name: name.to_owned(), digest, platforms });
     Ok(())
 }
 

@@ -18,8 +18,12 @@ import { ArrowLeft, ArrowRight, Check, ChevronDown, FlaskConical, Minus, Plus, X
 import { Button } from "@/components/ui/button";
 import { useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+import type { ChoiceAnswer } from "@/api/harness";
 import { Optic, PrismLabel } from "./signals";
 import "./choices.css";
+
+/** An answer to one question, as the approval sends it (`Command::Approve`'s `choices`). */
+export type { ChoiceAnswer };
 
 /* ------------------------------------------------------------------ model */
 
@@ -45,15 +49,6 @@ export interface ChoiceQuestion {
   secret?: boolean;
 }
 
-export interface ChoiceAnswer {
-  question: string;
-  id?: string;
-  /** The labels picked, exactly as the agent wrote them, in its order. */
-  selected: string[];
-  /** Your own words: "Other…", or the answer to a free-text question. */
-  other?: string;
-  note?: string;
-}
 
 export type ExperimentStrategy = "each" | "all" | "pairs" | "greedy" | "custom";
 

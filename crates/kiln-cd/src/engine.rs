@@ -89,7 +89,9 @@ impl Default for Config {
 }
 
 /// Why a sync started; also its priority (lower first).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "kebab-case")]
 pub enum Trigger {
     /// A person (or an agent acting for one).
     Manual = 0,
@@ -361,7 +363,8 @@ pub struct Summary {
 }
 
 /// Where a sync stands.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum OpPhase {
     /// Validating every apply first.
     DryRun,
@@ -2001,6 +2004,23 @@ impl Engine {
     /// Every app's id.
     pub fn app_ids(&self) -> impl Iterator<Item = &Str> {
         self.app_by_id.keys()
+    }
+
+    /// The objects an app deploys that another app deploys too, in key order: config two apps'
+    /// deploys share (docs/ci.md W28-R38).
+    pub fn shared_objects(&self, id: &str) -> Vec<ResKey> {
+        let Some(&a) = self.app_by_id.get(id) else { return Vec::new() };
+        let Some(app) = self.app(a) else { return Vec::new() };
+        let deploys = |r: &Res| r.desired.is_some() && !r.made;
+        let mut out: Vec<ResKey> = app
+            .resources
+            .iter()
+            .filter_map(|ix| self.res(app.cluster, *ix))
+            .filter(|r| deploys(r) && self.slots(app.cluster, &r.key).iter().filter_map(|s| self.res(app.cluster, s)).any(|s| s.app != r.app && deploys(s)))
+            .map(|r| r.key.clone())
+            .collect();
+        out.sort();
+        out
     }
 
     /// An app's resources.

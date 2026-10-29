@@ -6,7 +6,33 @@
  * says the same (`stand` in harness/wait.rs, `SubagentBrief::of`, `Task::live`).
  */
 import type { AgentInfo, SendMode, Status, SubagentBrief, Task } from "@/api/harness";
-import { taskLive } from "./derive";
+import { agentLabel, taskLive } from "./derive";
+
+/**
+ * The subagents kiln started for an agent's goals or plan steps side by side (`subagent`): sessions
+ * of their own, on its machine and with its settings, that are its as its harness's own subagents
+ * are, in its chat and on its row (docs/goals.md, "A plan's steps side by side"). Not agents of
+ * their own: Mission Control lists none of them while their agent is there.
+ */
+export const kilnSubagentsOf = (list: readonly AgentInfo[], id: string): AgentInfo[] => list.filter((a) => a.subagent === true && a.parent === id);
+
+/** Where one of them stands, in a task's words: running, paused (on you, or for a usage limit), pending (its machine away), else done. */
+export function kilnStatus(a: Pick<AgentInfo, "status" | "approvals" | "pause" | "exit" | "held">): string {
+  if (a.status === "running" || a.status === "starting") return "running";
+  if (a.status === "waiting" || a.approvals.length > 0 || a.held || a.pause) return "paused";
+  if (a.status === "disconnected") return "pending";
+  if (a.status === "exited" && a.exit?.error) return "failed";
+  return "completed";
+}
+
+/** Those of them at work: running, waiting on you or a limit, or their machine away (as `taskLive` has a task). */
+export const kilnAtWork = (subs: readonly AgentInfo[]): AgentInfo[] => subs.filter((a) => kilnStatus(a) !== "completed" && kilnStatus(a) !== "failed");
+
+/** One of them as lists show an agent's subagents (`SubagentBrief`: its id is its session's). */
+export const kilnBrief = (a: AgentInfo): SubagentBrief => ({ id: a.id, description: agentLabel(a), status: kilnStatus(a), started: a.turn_started ?? a.created_at });
+
+/** An agent as its row shows it: the subagents kiln started for it among its own. */
+export const withKilnSubagents = (a: AgentInfo, subs: readonly AgentInfo[]): AgentInfo => (subs.length > 0 ? { ...a, subagents: [...(a.subagents ?? []), ...subs.map(kilnBrief)] } : a);
 
 /** What a task is; machines from before `class` only say the harness's own task type. */
 export const classOf = (t: Pick<Task, "class" | "kind">): string =>

@@ -155,7 +155,7 @@ impl Bitbucket {
         self.name_of(repo).ok_or_else(|| anyhow!("{} isn't on {}", repo.name, self.web))
     }
 
-    fn api_auth(&self) -> String {
+    pub(crate) fn api_auth(&self) -> String {
         match &self.cred {
             Cred::Token(t) => format!("Bearer {t}"),
             Cred::Basic { user, password } => format!("Basic {}", B64.encode(format!("{user}:{password}"))),
@@ -207,6 +207,15 @@ impl Bitbucket {
             return Ok((st, r.bytes(limit).await?));
         }
         Ok((status, resp.bytes(limit).await?))
+    }
+
+    /// A conditional GET (docs/ci.md W26-R20): its status, its ETag and its JSON; a 304 when `etag`
+    /// still holds.
+    pub async fn get_if(&self, path: &str, etag: Option<&str>) -> anyhow::Result<(u16, Option<String>, Value)> {
+        let client = crate::http::client::github()?;
+        let url = if path.starts_with("http://") || path.starts_with("https://") { path.to_owned() } else { format!("{}{path}", self.api) };
+        let req = client.request(Method::Get, &url).header("Authorization", &self.api_auth()).header("Accept", "application/json");
+        super::mirror::send_if(req, etag).await.with_context(|| format!("Bitbucket: {url}"))
     }
 
     /// How git reads it.

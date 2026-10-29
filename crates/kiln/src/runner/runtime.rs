@@ -135,11 +135,12 @@ fn glob_files(wd: &Path, pattern: &str) -> Vec<String> {
     glob::glob(&full).map(|paths| paths.flatten().filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned()).collect()).unwrap_or_default()
 }
 
-/// The leg's `PATH` from `path` (the runner's own by default): with what its steps added
+/// The leg's `PATH` from `path` (by default the runner's own, then the folders only its user's
+/// login shell has: `crate::harness::kinds::search_path`, W13-R03): with what its steps added
 /// (`GITHUB_PATH`), then kiln's own binary (`kiln auth`, its credential helper).
 fn leg_path(st: &State, path: Option<&str>) -> String {
     let sep = if cfg!(windows) { ';' } else { ':' };
-    let base_path = std::env::var("PATH").unwrap_or_default();
+    let base_path = crate::harness::kinds::search_path().map(|p| p.to_string_lossy().into_owned()).or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
     let mut path = st.path.apply(path.unwrap_or(base_path.as_str()), sep);
     if let Some(d) = &st.kiln_bin {
         path = format!("{path}{sep}{}", d.to_string_lossy());
@@ -147,15 +148,10 @@ fn leg_path(st: &State, path: Option<&str>) -> String {
     path
 }
 
-/// Where `prog` is on `env`'s `PATH`.
+/// Where `prog` is on `env`'s `PATH` (on Windows the `.exe` or `.cmd` there, never npm's or
+/// Maven's shell script of its name beside it).
 fn on_path(env: &BTreeMap<String, String>, prog: &str) -> Option<PathBuf> {
-    let path = env.get("PATH")?;
-    std::env::split_paths(path).flat_map(|d| [d.join(prog), d.join(format!("{prog}.exe"))]).find(|p| p.is_file())
-}
-
-/// Whether a program is on `PATH`.
-fn which(prog: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file() || d.join(format!("{prog}.exe")).is_file()))
+    crate::os::which_in(prog, std::ffi::OsStr::new(env.get("PATH")?))
 }
 
 /// GitHub's view of a typed output (W04-R20): its JSON, but a string as itself.
@@ -269,6 +265,55 @@ impl Layout {
             runner_workspace,
         }
     }
+}
+
+/// Where a kiln-dialect leg's `TMPDIR` is (W02-R06): in its own temp, on the work volume, emptied
+/// with it before every leg.
+fn v1_tmp(l: &Layout) -> PathBuf {
+    l.temp.join("tmp")
+}
+
+/// The event as v1 named it (W02-R06): GitHub's `workflow_dispatch` is v1's `manual`, a tag's
+/// `push` its `tag`; the rest (`push`, `schedule`, kiln's own events) are named alike.
+fn v1_event(github: &serde_json::Value) -> String {
+    let s = |k: &str| github.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    match (s("event_name"), s("ref_type")) {
+        ("workflow_dispatch", _) => "manual".into(),
+        ("push", "tag") => "tag".into(),
+        (e, _) => e.into(),
+    }
+}
+
+/// The variables v1's runner gave every step (W02-R06, docs/pipelines.md), for a kiln-dialect
+/// leg: what kiln's own workflows read (`kiln:$KILN_SHA`, `$KILN_AGENT`). Beneath the job's own
+/// `env`, as every default is. `KILN_JOB` and `KILN_ATTEMPT` keep the engine's meaning.
+fn v1_env(a: &AssignmentV2, runner: &str, l: &Layout) -> Vec<(&'static str, String)> {
+    let g = &a.contexts.github;
+    let s = |k: &str| match g.get(k) {
+        Some(serde_json::Value::String(v)) => v.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    let sha = Some(s("sha")).filter(|v| !v.is_empty()).unwrap_or_else(|| a.sha.clone());
+    let tmp = v1_tmp(l).to_string_lossy().into_owned();
+    let mut v = vec![
+        ("KILN", "true".to_owned()),
+        ("KILN_REPO", a.repo.clone()),
+        ("KILN_SHA", sha),
+        ("KILN_BRANCH", s("ref_name")),
+        ("KILN_EVENT", v1_event(g)),
+        ("KILN_RUN_ID", a.run_id.clone()),
+        ("KILN_RUN_NUMBER", s("run_number")),
+        ("KILN_JOB_ID", a.job_id.clone()),
+        ("KILN_WORKSPACE", l.workspace.to_string_lossy().into_owned()),
+        ("KILN_AGENT", runner.to_owned()),
+    ];
+    // Windows tools find their temp folder through TEMP and TMP rather than TMPDIR.
+    if cfg!(windows) {
+        v.extend([("TEMP", tmp.clone()), ("TMP", tmp.clone())]);
+    }
+    v.push(("TMPDIR", tmp));
+    v
 }
 
 /// In a microVM's leg (W13-R05): its forwarder to the host's egress proxy, and what that proxy
@@ -1037,6 +1082,15 @@ impl Leg {
         let conf = super::credential::docker_config(&a.integrations, Some(&own), base);
         let wanted = map.is_none() || a.integrations.iter().any(|i| i.kind == "oci");
         if wanted && std::fs::create_dir_all(&docker).is_ok() && super::auth::write_private(&docker.join("config.json"), conf.to_string().as_bytes()).is_ok() {
+            // A leg on the host keeps the runner's builders, contexts and plugins, as a v1 job.
+            if map.is_none()
+                && let Some(from) = super::credential::runner_config_dir()
+            {
+                let to = docker.clone();
+                if let Ok(Err(e)) = crate::rt::blocking(move || super::credential::link_runner_config(&from, &to)).await {
+                    tracing::debug!(error = %e, "the runner's Docker config folder couldn't be linked into the leg's");
+                }
+            }
             st.env.insert("DOCKER_CONFIG".into(), seen(&docker));
             st.env.insert("KILN_REGISTRY_HOST".into(), own);
         }
@@ -1181,6 +1235,11 @@ impl Leg {
         if shard_items(a).is_some() {
             set("KILN_SHARD_ITEMS", l.temp.join("_kiln").join("shard-items").to_string_lossy().into_owned());
         }
+        if st.dialect == Dialect::Kiln {
+            for (k, val) in v1_env(a, &self.runner_name, l) {
+                set(k, val);
+            }
+        }
         // The server's own certificate authority beside the machine's roots (§2.6): Node adds
         // it to its own; git, curl, Python and OpenSSL take the bundle. A job's own say wins.
         // In the machine's own store, only Node and Python's requests (which read bundles of
@@ -1265,10 +1324,14 @@ impl Leg {
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         let items = shard_items(a);
+        let tmp = (dialect == Dialect::Kiln).then(|| v1_tmp(&layout));
         crate::rt::blocking(move || -> std::io::Result<()> {
             let _ = std::fs::remove_dir_all(&temp);
             std::fs::create_dir_all(&ws)?;
             std::fs::create_dir_all(&cmds)?;
+            if let Some(t) = tmp {
+                std::fs::create_dir_all(t)?;
+            }
             std::fs::create_dir_all(temp.join("_github_workflow"))?;
             if let Some(text) = items {
                 std::fs::create_dir_all(temp.join("_kiln"))?;
@@ -1277,6 +1340,9 @@ impl Leg {
             std::fs::write(temp.join("_github_workflow").join("event.json"), event)
         })
         .await??;
+        // Its steps' PATH has the folders only the runner's user's login shell has (`leg_path`,
+        // W13-R03): that shell is asked now, unless it answered in the last ten minutes.
+        crate::reach::serve::login_env().await;
         let trust = self.server_trust(&layout).await;
         let secrets: BTreeMap<String, String> = a.secrets.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
         let mut masks: Vec<String> = secrets.iter().filter(|(k, _)| !kiln_ci::secrets::DEBUG_FLAGS.contains(&k.as_str())).map(|(_, v)| v.clone()).collect();
@@ -1607,7 +1673,7 @@ impl Leg {
         anyhow::ensure!(ws.starts_with(&st.layout.workspace) && !c.path.split(['/', '\\']).any(|p| p == ".."), "`path` must stay inside the workspace");
         let remote = format!("{}/{}", st.server_url.trim_end_matches('/'), a.repo);
         let token = a.runtime.github_token.clone();
-        if crate::rt::blocking(|| which("git")).await.unwrap_or(false) {
+        if crate::rt::blocking(|| crate::os::have("git")).await.unwrap_or(false) {
             // The token rides in git's environment config, never on a command line.
             let header = format!("AUTHORIZATION: basic {}", base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}")));
             let w = ws.to_string_lossy().to_string();
@@ -1692,6 +1758,10 @@ impl Leg {
                         }
                         anyhow::bail!("git {}: {said}", args.get(2).copied().unwrap_or_default());
                     }
+                }
+                let dir = ws.clone();
+                if !crate::rt::blocking(move || pack_refs(&dir)).await.unwrap_or(false) {
+                    tracing::debug!(workspace = %w, "git pack-refs failed: the checkout keeps no packed-refs");
                 }
                 let Some(x) = warm.filter(|_| in_place) else { return Ok(()) };
                 // In place: only the files that differ are written, the rest keep their mtimes, and
@@ -1990,7 +2060,7 @@ impl Leg {
         };
         // W24-R07: a `memo:` step is looked up before it runs, a hit replayed instead; what earlier
         // hits left is put in place before anything runs.
-        let keyed = match self.memo_prepare(st, idx, step, nested, &env, &wd, shell.as_deref(), script.as_deref(), &with).await {
+        let keyed = match self.memo_prepare(st, idx, step, nested, &env, &wd, shell.as_deref(), script.as_deref(), &with, job_deadline).await {
             memo::Prepared::Hit(hit) => {
                 let outputs = self.memo_replay(st, idx, *hit).await;
                 self.finish(st, idx, id, Conclusion::Success, Conclusion::Success, Some(0), outputs, nested).await;
@@ -2610,9 +2680,10 @@ impl Leg {
         let oom_after = super::chaos::for_leg(self.a.attempt).and_then(|c| c.oom_after).filter(|_| on_host);
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
-                // In a job container without bash, the default shell is sh (GitHub-exact).
+                // In a job container the default shell is the container's: bash, else sh
+                // (GitHub-exact), whatever the host's is (PowerShell on Windows).
                 let shell = match shell {
-                    None if in_job && st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some_and(|j| !j.has_bash) => Some("sh"),
+                    None if in_job => Some(if st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some_and(|j| j.has_bash) { "bash -e {0}" } else { "sh" }),
                     other => *other,
                 };
                 let (ext, body) = script_file(shell, script);
@@ -3352,6 +3423,59 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
 static NODE_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 static ACTION_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
+/// How many times a step asks the internet for what it needs (a Node build) before it fails, as
+/// GitHub's runner asks for an action's archive: three times, a random 10–30 s apart, and a 404
+/// or a 403 once (actions/runner, `ActionManager.DownloadRepositoryArchive`). nodejs.org's
+/// `SHASUMS256.txt` once stalled past its 60 s and failed its step on the first ask (2026-10-26).
+const DOWNLOAD_TRIES: u32 = 3;
+
+/// How long one ask for a Node build may take, its body read too (a stalled body is asked again).
+const DOWNLOAD_WITHIN: Duration = Duration::from_secs(600);
+
+/// The wait before a download is asked for again: GitHub's runner's, a random 10–30 s.
+fn download_backoff() -> Duration {
+    Duration::from_millis(10_000 + rand::random::<u64>() % 20_001)
+}
+
+/// An answer another ask won't change (a 404, a 403): asked once.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// `ask` (given its try, from 1) until it answers, at most [`DOWNLOAD_TRIES`] times: before each
+/// ask again, `again` is told why, how long it waits ([`download_backoff`], waited by `wait`) and
+/// which try comes. A [`Refused`] ends it at once.
+async fn tried<T, A, AF, G, GF, S, SF>(mut ask: A, mut again: G, mut wait: S) -> anyhow::Result<T>
+where
+    A: FnMut(u32) -> AF,
+    AF: Future<Output = anyhow::Result<T>>,
+    G: FnMut(String, Duration, u32) -> GF,
+    GF: Future<Output = ()>,
+    S: FnMut(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    let mut n = 1;
+    loop {
+        match ask(n).await {
+            Ok(v) => return Ok(v),
+            Err(e) if n < DOWNLOAD_TRIES && !e.is::<Refused>() => {
+                let backoff = download_backoff();
+                again(format!("{e:#}"), backoff, n + 1).await;
+                wait(backoff).await;
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl Leg {
     /// Where an action is: in the workspace (`./`), or fetched at its pinned commit.
     async fn locate(&self, uses: &str) -> anyhow::Result<Located> {
@@ -3417,8 +3541,9 @@ impl Leg {
     /// `node12` on Node 20, as GitHub forces. Official builds from nodejs.org, checked against
     /// their `SHASUMS256.txt`, kept in `<work>/_externals`. Where the C library is musl (an Alpine
     /// job container, or an Alpine machine), musl builds, kept as GitHub's runner keeps them
-    /// (`node20_alpine`): see [`musl_node`].
-    async fn node(&self, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
+    /// (`node20_alpine`): see [`musl_node`]. Asked for up to [`DOWNLOAD_TRIES`] times, each ask
+    /// again said in step `idx`'s log.
+    async fn node(&self, idx: u32, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
         let major = if using == "node24" { 24 } else { 20 };
         let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });
         let bin = if cfg!(windows) { dir.join("node.exe") } else { dir.join("bin").join("node") };
@@ -3435,33 +3560,23 @@ impl Leg {
             "arm" => "armv7l",
             other => anyhow::bail!("no Node {major} build for {other}"),
         };
-        let (url, file, sha) = if musl {
-            musl_node(&self.http, major, arch).await?
-        } else {
-            let os = match std::env::consts::OS {
-                "linux" => "linux",
-                "macos" => "darwin",
-                other => anyhow::bail!("no Node {major} build for {other} here yet"),
-            };
-            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
-            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
-            let suffix = format!("-{os}-{arch}.tar.gz");
-            let (sha, file) =
-                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
-            (format!("{base}/{file}"), file, sha)
-        };
-        let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
-        anyhow::ensure!(resp.is_success(), "downloading {file}: HTTP {}", resp.status());
-        let mut bytes = Vec::new();
-        while let Some(c) = resp.chunk().await? {
-            bytes.extend_from_slice(&c);
-            anyhow::ensure!(bytes.len() < 1 << 30, "{file} is over 1 GiB");
-        }
-        let got = {
-            use sha2::Digest as _;
-            hex::encode(sha2::Sha256::digest(&bytes))
-        };
-        anyhow::ensure!(got == sha, "{file}: SHA-256 {got}, where it's listed as {sha}");
+        // `fetch` chaos: the first ask fails as a request that timed out does.
+        let chaos = super::chaos::for_leg(self.a.attempt).is_some_and(|c| c.fetch);
+        let (bytes, file) = tried(
+            |n| async move {
+                anyhow::ensure!(!(chaos && n == 1), "request timed out after 60s (chaos `fetch`)");
+                match crate::rt::timeout(DOWNLOAD_WITHIN, self.node_build(major, musl, arch)).await {
+                    Ok(got) => got,
+                    Err(_) => anyhow::bail!("Node {major} wasn't downloaded within {DOWNLOAD_WITHIN:?}"),
+                }
+            },
+            |why, backoff, n| {
+                let text = format!("Node {major}'s download: {why}; asking again in {} s (try {n} of {DOWNLOAD_TRIES})", backoff.as_secs());
+                async move { self.note(idx, &text).await }
+            },
+            crate::rt::sleep,
+        )
+        .await?;
         let d = dir.clone();
         crate::rt::blocking(move || -> anyhow::Result<()> {
             let tmp = d.with_extension("partial");
@@ -3488,6 +3603,42 @@ impl Leg {
         .await??;
         anyhow::ensure!(bin.exists(), "{file} has no {}", bin.strip_prefix(&dir).unwrap_or(&bin).display());
         Ok(bin)
+    }
+
+    /// One ask of [`Leg::node`]'s: Node `major`'s build for this machine, its bytes and its file,
+    /// checked against the digest its publisher lists.
+    async fn node_build(&self, major: u32, musl: bool, arch: &str) -> anyhow::Result<(Vec<u8>, String)> {
+        let (url, file, sha) = if musl {
+            musl_node(&self.http, major, arch).await?
+        } else {
+            let os = match std::env::consts::OS {
+                "linux" => "linux",
+                "macos" => "darwin",
+                other => return Err(Refused(format!("no Node {major} build for {other} here yet")).into()),
+            };
+            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
+            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
+            let suffix = format!("-{os}-{arch}.tar.gz");
+            let (sha, file) =
+                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
+            (format!("{base}/{file}"), file, sha)
+        };
+        let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
+        if matches!(resp.status(), 403 | 404) {
+            return Err(Refused(format!("downloading {file}: HTTP {}", resp.status())).into());
+        }
+        anyhow::ensure!(resp.is_success(), "downloading {file}: HTTP {}", resp.status());
+        let mut bytes = Vec::new();
+        while let Some(c) = resp.chunk().await? {
+            bytes.extend_from_slice(&c);
+            anyhow::ensure!(bytes.len() < 1 << 30, "{file} is over 1 GiB");
+        }
+        let got = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&bytes))
+        };
+        anyhow::ensure!(got == sha, "{file}: SHA-256 {got}, where it's listed as {sha}");
+        Ok((bytes, file))
     }
 
     /// An action's inputs (W07-R05): `with`, else the default, evaluated as an expression; inputs
@@ -4480,7 +4631,7 @@ impl Leg {
         aenv.extend(runs_env(st, action, &inputs));
         match action.runs.using.as_str() {
             "node12" | "node16" | "node20" | "node24" => {
-                let node = self.node(&action.runs.using, musl_here(st)).await?;
+                let node = self.node(idx, &action.runs.using, musl_here(st)).await?;
                 let main = action.runs.main.as_deref().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.main`"))?;
                 let script = loc.dir.join(main);
                 let (dir, scripts) = (loc.dir.clone(), [Some(main.to_owned()), action.runs.post.clone()].into_iter().flatten().collect::<Vec<_>>());
@@ -4647,7 +4798,7 @@ impl Leg {
                 if crate::rt::blocking(move || refuses_ghes(&dir, &[script.as_str()])).await.unwrap_or(false) {
                     env.insert("GITHUB_SERVER_URL".into(), st.not_ghes.clone());
                 }
-                match self.node(&action.runs.using, musl_here(st)).await {
+                match self.node(idx, &action.runs.using, musl_here(st)).await {
                     Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &ws, env, deadline).await,
                     Err(e) => Err(e),
                 }
@@ -4747,6 +4898,16 @@ impl Again {
         self.wait = wait.saturating_mul(2).min(Duration::from_secs(15));
         Some(wait)
     }
+}
+
+/// A leg's checkout left as a clone leaves a repository: its refs packed, so `.git/packed-refs`
+/// exists, which a fetch into a new repository never writes. A build script that watches it
+/// (`cargo:rerun-if-changed`, as kiln's own build.rs does) runs again on every cargo command
+/// while it's missing, and its crate is built again each time: W28 step 3's replay saw bench's
+/// quic-transport rebuild kiln on each of its five `cargo test` runs and time out, where v1's
+/// clone built it once. Whether it went.
+fn pack_refs(dir: &std::path::Path) -> bool {
+    std::process::Command::new("git").arg("-C").arg(dir).args(["pack-refs", "--all"]).env("GIT_TERMINAL_PROMPT", "0").output().is_ok_and(|o| o.status.success())
 }
 
 /// Whether git's `said` is of a server it couldn't reach, or one that answered it's unavailable.
@@ -4917,6 +5078,80 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A download asked for as GitHub's runner asks for an action's archive: three times at most,
+    /// 10–30 s apart, each ask again said, and a refused one (a 404, a 403) once.
+    #[test]
+    fn a_download_is_asked_for_three_times_and_a_refused_one_once() -> anyhow::Result<()> {
+        type Said = std::sync::Arc<parking_lot::Mutex<Vec<(String, Duration, u32)>>>;
+        let run = |fails: u32, refused: bool| async move {
+            let (asks, said): (std::sync::Arc<parking_lot::Mutex<u32>>, Said) = Default::default();
+            let (a, s) = (asks.clone(), said.clone());
+            let got = tried(
+                move |n| {
+                    *a.lock() = n;
+                    async move {
+                        if refused {
+                            return Err(Refused("downloading node-v24.11.0-linux-x64.tar.gz: HTTP 404".into()).into());
+                        }
+                        anyhow::ensure!(n > fails, "request timed out after 60s");
+                        Ok(n)
+                    }
+                },
+                move |why, backoff, n| {
+                    s.lock().push((why, backoff, n));
+                    async {}
+                },
+                |_| async {},
+            )
+            .await;
+            let asks = *asks.lock();
+            let said = said.lock().clone();
+            (got, asks, said)
+        };
+        crate::rt::block_on(async move {
+            // Answered on its third ask, after two waits of 10–30 s, each said with the try it
+            // waits for.
+            let (got, asks, said) = run(2, false).await;
+            anyhow::ensure!(got.ok() == Some(3) && asks == 3, "{asks} asks");
+            anyhow::ensure!(said.iter().map(|(_, _, n)| *n).collect::<Vec<_>>() == [2, 3], "{said:?}");
+            anyhow::ensure!(said.iter().all(|(why, w, _)| why.contains("timed out") && (Duration::from_secs(10)..=Duration::from_secs(30)).contains(w)), "{said:?}");
+            // Never answered: three asks, then its last error.
+            let (got, asks, said) = run(5, false).await;
+            anyhow::ensure!(got.is_err_and(|e| e.to_string().contains("timed out")) && asks == 3 && said.len() == 2, "{asks} asks, {said:?}");
+            // Refused: asked once, nothing waited.
+            let (got, asks, said) = run(0, true).await;
+            anyhow::ensure!(got.is_err_and(|e| e.is::<Refused>()) && asks == 1 && said.is_empty(), "{asks} asks, {said:?}");
+            Ok(())
+        })
+    }
+
+    /// W28 step 3's replay: a leg's checkout (a fetch of its commit into a new repository) leaves
+    /// `.git/packed-refs`, as v1's clone does, so a build script watching it stays fresh.
+    #[test]
+    fn w28_a_legs_checkout_leaves_packed_refs_as_a_clone() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let git = |dir: &std::path::Path, args: &[&str]| -> anyhow::Result<String> {
+            let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).env("GIT_CONFIG_NOSYSTEM", "1").env("HOME", tmp.path()).output()?;
+            anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        let (src, w) = (tmp.path().join("src"), tmp.path().join("w"));
+        std::fs::create_dir_all(&src)?;
+        git(&src, &["init", "-q"])?;
+        git(&src, &["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "one"])?;
+        git(&src, &["config", "uploadpack.allowReachableSHA1InWant", "true"])?;
+        let sha = git(&src, &["rev-parse", "HEAD"])?;
+        git(tmp.path(), &["init", "-q", "w"])?;
+        git(&w, &["remote", "add", "origin", &format!("file://{}", src.display())])?;
+        git(&w, &["fetch", "-q", "--no-tags", "--depth=1", "origin", &sha])?;
+        git(&w, &["checkout", "-q", "--detach", "FETCH_HEAD"])?;
+        assert!(!w.join(".git/packed-refs").exists(), "a fetch into a new repository writes none");
+        assert!(pack_refs(&w));
+        assert!(w.join(".git/packed-refs").is_file());
+        assert_eq!(git(&w, &["rev-parse", "HEAD"])?, sha, "nothing else moved");
+        Ok(())
+    }
 
     /// The server URL actions that refuse GitHub Enterprise Server get keeps the server's port, so
     /// what they fetch from it reaches kiln (docs/ci.md W08-R08).
@@ -5717,6 +5952,82 @@ jobs:
         let (r, logs, _) = run_leg("on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: test -z \"$KILN_SHARD_ITEMS\"\n", &[])?;
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
         Ok(())
+    }
+
+    /// The variables a leg's step printed (`env`), by name.
+    #[cfg(unix)]
+    fn printed_env(log: &str) -> BTreeMap<String, String> {
+        log.lines().filter_map(|l| l.trim_end_matches('\r').split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+    }
+
+    /// W02-R06 on the engine: a kiln-dialect leg's steps see v1's job variables with v1's values
+    /// (`KILN_SHA` the commit, `KILN_BRANCH` the ref's name, `KILN_AGENT` the runner, `TMPDIR` in
+    /// the leg's work directory); the job's own `env` wins over them; the engine's `KILN_JOB` keeps
+    /// its meaning; and a GitHub-dialect leg gets none of them.
+    #[cfg(unix)]
+    #[test]
+    fn w02_r06_v1_job_variables() -> anyhow::Result<()> {
+        const ADDED: [&str; 11] = ["KILN", "KILN_REPO", "KILN_SHA", "KILN_BRANCH", "KILN_EVENT", "KILN_RUN_ID", "KILN_RUN_NUMBER", "KILN_JOB_ID", "KILN_WORKSPACE", "KILN_AGENT", "TMPDIR"];
+        let sha = "4f1c0de4f1c0de4f1c0de4f1c0de4f1c0de4f1c0";
+        let tweak = move |a: &mut AssignmentV2| {
+            a.run_id = "run-7".into();
+            a.sha = sha.into();
+            a.contexts.github = serde_json::json!({"event_name": "push", "ref": "refs/heads/main", "ref_name": "main", "ref_type": "branch", "sha": sha, "run_number": "42", "repository": "acme/app", "event": {}});
+        };
+        let wf = "on: push\njobs:\n  t:\n    steps:\n      - run: env\n      - run: test -d \"$TMPDIR\" && mktemp >/dev/null && echo tag=kiln:$KILN_SHA\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Kiln, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        let got = |k: &str| env.get(k).map(String::as_str);
+        let ws = got("GITHUB_WORKSPACE").ok_or_else(|| anyhow::anyhow!("no GITHUB_WORKSPACE: {env:?}"))?;
+        let runner_ws = Path::new(ws).parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
+        for (k, want) in [
+            ("KILN", "true"),
+            ("KILN_REPO", "acme/app"),
+            ("KILN_SHA", sha),
+            ("KILN_BRANCH", "main"),
+            ("KILN_EVENT", "push"),
+            ("KILN_RUN_ID", "run-7"),
+            ("KILN_RUN_NUMBER", "42"),
+            ("KILN_JOB_ID", "leg-1"),
+            ("KILN_WORKSPACE", ws),
+            ("KILN_AGENT", "test-runner"),
+            ("KILN_JOB", "leg-1"),
+        ] {
+            assert_eq!(got(k), Some(want), "{k}: {env:?}");
+        }
+        assert_eq!(got("KILN_SHA"), got("GITHUB_SHA"), "KILN_SHA is github.sha");
+        let tmp = got("TMPDIR").ok_or_else(|| anyhow::anyhow!("no TMPDIR: {env:?}"))?;
+        assert!(Path::new(tmp).starts_with(runner_ws), "TMPDIR {tmp} is in the leg's work directory {}", runner_ws.display());
+        assert!(logs.get(&1).is_some_and(|l| l.contains(&format!("tag=kiln:{sha}"))), "image.yaml's tag is the commit: {logs:?}");
+
+        // The job's own `env` wins.
+        let wf = "on: push\njobs:\n  t:\n    env: { KILN_BRANCH: mine, TMPDIR: /var/tmp }\n    steps:\n      - run: env\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Kiln, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        assert_eq!((env.get("KILN_BRANCH").map(String::as_str), env.get("TMPDIR").map(String::as_str)), (Some("mine"), Some("/var/tmp")), "{env:?}");
+
+        // A GitHub-dialect leg: none of them, but what this process had already.
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: env\n";
+        let (r, logs, _) = run_leg_with(wf, &[], Dialect::Gha, &|_| Ok(()), &tweak)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        let env = printed_env(logs.get(&0).map_or("", String::as_str));
+        for k in ADDED {
+            assert_eq!(env.get(k).cloned(), std::env::var(k).ok(), "{k} isn't added in the GitHub dialect: {env:?}");
+        }
+        Ok(())
+    }
+
+    /// W02-R06: the event as v1 named it.
+    #[test]
+    fn w02_r06_v1_event_names() {
+        let ev = |j: serde_json::Value| v1_event(&j);
+        assert_eq!(ev(serde_json::json!({"event_name": "workflow_dispatch", "ref_type": "branch"})), "manual");
+        assert_eq!(ev(serde_json::json!({"event_name": "push", "ref_type": "tag"})), "tag");
+        assert_eq!(ev(serde_json::json!({"event_name": "push", "ref_type": "branch"})), "push");
+        assert_eq!(ev(serde_json::json!({"event_name": "schedule"})), "schedule");
+        assert_eq!(ev(serde_json::json!({"event_name": "diff"})), "diff");
     }
 
     /// W04-R20 to R22 on the runner: typed outputs, exported environment, `run.env`, and a secret

@@ -1792,7 +1792,7 @@ impl Discovery {
         let weak = Arc::downgrade(&hub);
         let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(h) = weak.upgrade() {
-                h.emit(&serde_json::json!({ "type": "discovery" }));
+                h.emit(&crate::wire::events::ServerEvent::Discovery);
             }
         });
         let d = Arc::clone(&hub.discovery);

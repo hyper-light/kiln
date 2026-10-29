@@ -24,7 +24,7 @@ export default function QueuePage() {
   return (
     <div className="container-console page rv-page">
       <title>Land queue · Review · kiln</title>
-      <PageIntro index={4} label="Repositories / Review / Land queue" title="Land queue." lead="What lands next on each trunk, the batch under test, and what was sent back." />
+      <PageIntro index={3} label="Repositories / Review / Land queue" title="Land queue." lead="What lands next on each trunk, the batch under test, and what was sent back." />
       <Loadable label="Loading the queue" fallback={<Loading label="Loading the queue" block />}>
         <QueueBody />
       </Loadable>

@@ -14,7 +14,7 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
-import { reachChoices } from "./spawn";
+import { reachChoices } from "./spawn-setup";
 
 type Agent = Pick<AgentInfo, "id" | "name" | "kind_name" | "target" | "status" | "reach">;
 

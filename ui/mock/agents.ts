@@ -20,6 +20,7 @@
 import type http from "node:http";
 import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -52,6 +53,7 @@ const CWD = "/home/ada/src/kiln";
 function member(id: string, kind: "claude" | "codex", target: string, name: string, status: AgentInfo["status"], mode: string, prompt: string, reply: string, extra: Partial<AgentInfo> = {}): Member {
   const at = t0 + (id === "fam-orch" ? 0 : 60_000);
   const info: AgentInfo = {
+    ...defaultInfo(),
     id,
     kind,
     kind_name: kind === "claude" ? "Claude Code" : "Codex",
@@ -81,11 +83,12 @@ function member(id: string, kind: "claude" | "codex", target: string, name: stri
 
 const migrApproval: Approval = {
   id: "fam-migr-ap1",
+  tool_id: null,
   tool_name: "Bash",
   tool: "shell",
-  title: "cargo run --bin migrate -- --dry-run",
-  command: "cargo run --bin migrate -- --dry-run",
-  input: { command: "cargo run --bin migrate -- --dry-run" },
+  title: "cargo test -p kiln store::migrations",
+  command: "cargo test -p kiln store::migrations",
+  input: { command: "cargo test -p kiln store::migrations" },
   cwd: CWD,
   at: Date.now() - 90_000,
 };
@@ -141,8 +144,8 @@ const family = new Map<string, Member>(
         "Check the migration",
         "waiting",
         "default",
-        "Dry-run the 20261019 migration against a copy of the production database and report what it would change.",
-        "I'll dry-run it first.",
+        "Check the store's 20261024-2100 migration (goal needs): run its migration tests and report what it changes.",
+        "I'll run the store's migration tests first.",
         { parent: "fam-orch" },
       ),
       approval: migrApproval,
@@ -160,26 +163,72 @@ const family = new Map<string, Member>(
 // subagent too. It coordinates them, at work itself on nothing.
 const fanApproval: Approval = {
   id: "fan-s3-ap1",
+  tool_id: null,
   tool_name: "Bash",
   tool: "shell",
-  title: "cargo run --bin chaos -- --partition 2",
-  command: "cargo run --bin chaos -- --partition 2",
-  input: { command: "cargo run --bin chaos -- --partition 2" },
+  title: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up",
+  command: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up",
+  input: { command: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up" },
   cwd: CWD,
   at: Date.now() - 45_000,
 };
 for (const m of [
-  member("fan-lead", "claude", "local", "Replication lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back."),
-  member("fan-s2", "claude", "agent:metal-ryzen-01", "Step 2: Leader election over QUIC", "running", "default", 'Step 2 of 5 of the plan "Replicated log": Leader election over QUIC', "Electing a leader across three nodes.", {
+  member(
+    "fan-lead",
+    "claude",
+    "local",
+    "Replication lead",
+    "idle",
+    "default",
+    "Replicate the metadata store's log over QUIC, then rotate the release signing key.",
+    "Its steps are out on subagents; I'll check each as it comes back.",
+  ),
+  member(
+    "fan-s2",
+    "claude",
+    "agent:metal-ryzen-01",
+    "Step 2: Leader election over QUIC",
+    "running",
+    "default",
+    'Step 2 of 5 of the plan "Replicated log": Leader election over QUIC',
+    "Electing a leader across three nodes.",
+    {
+      parent: "fan-lead",
+      doing: "Running cargo test -p hyper-raft election",
+    },
+  ),
+  {
+    ...member(
+      "fan-s3",
+      "codex",
+      "agent:metal-epyc-01",
+      "Step 3: Follower catch-up",
+      "waiting",
+      "untrusted",
+      'Step 3 of 5 of the plan "Replicated log": Follower catch-up',
+      "I'll partition a follower and let it catch up.",
+      { parent: "fan-lead" },
+    ),
+    approval: fanApproval,
+  },
+  member(
+    "fan-s4",
+    "claude",
+    "agent:metal-ryzen-02",
+    "Step 4: Snapshot transfer",
+    "running",
+    "default",
+    'Step 4 of 5 of the plan "Replicated log": Snapshot transfer',
+    "Streaming a snapshot to a lagging follower.",
+    {
+      parent: "fan-lead",
+      doing: "Streaming a 10 GB snapshot",
+    },
+  ),
+  member("fan-sign", "claude", "local", "Rotate the release signing key", "running", "default", "Rotate the release signing key and re-sign 0.2.1's binaries", "Re-signing the binaries.", {
     parent: "fan-lead",
-    doing: "Running cargo test -p hyper-raft election",
+    doing: "Signing kiln-x86_64-linux",
   }),
-  { ...member("fan-s3", "codex", "agent:metal-epyc-01", "Step 3: Follower catch-up", "waiting", "untrusted", 'Step 3 of 5 of the plan "Replicated log": Follower catch-up', "I'll partition a follower and let it catch up.", { parent: "fan-lead" }), approval: fanApproval },
-  member("fan-s4", "claude", "agent:metal-ryzen-02", "Step 4: Snapshot transfer", "running", "default", 'Step 4 of 5 of the plan "Replicated log": Snapshot transfer', "Streaming a snapshot to a lagging follower.", {
-    parent: "fan-lead",
-    doing: "Streaming a 10 GB snapshot",
-  }),
-  member("fan-sign", "claude", "local", "Rotate the release signing key", "running", "default", "Rotate the release signing key and re-sign 0.2.1's binaries", "Re-signing the binaries.", { parent: "fan-lead", doing: "Signing kiln-x86_64-linux" }),
 ]) {
   family.set(m.info.id, m);
 }
@@ -191,7 +240,19 @@ for (const m of [
 // Release prep proposed a plan (plan mode), kept by kiln (pages.ts `pl_proposed`), and works through its to-do list.
 {
   const m = family.get("fam-orch");
-  m?.events.push({ id: "fam-orch-plan", seq: 3, at: t0 + 50_000, kind: "tool", tool_id: "tp1", name: "ExitPlanMode", tool: "plan", title: "Plan ready for review", input: { plan: PROPOSED }, status: "done", started: t0 + 50_000 } as unknown as HEvent);
+  m?.events.push({
+    id: "fam-orch-plan",
+    seq: 3,
+    at: t0 + 50_000,
+    kind: "tool",
+    tool_id: "tp1",
+    name: "ExitPlanMode",
+    tool: "plan",
+    title: "Plan ready for review",
+    input: { plan: PROPOSED },
+    status: "done",
+    started: t0 + 50_000,
+  } as unknown as HEvent);
   // It records what it found in its research (pages.ts `rs_quic`), as kiln's MCP tool.
   m?.events.push({
     id: "fam-orch-research",
@@ -314,6 +375,7 @@ for (const m of [
   if (m) {
     m.tasks = [
       {
+        ...defaultTask(),
         id: "a-planner",
         tool_id: "toolu_planner",
         description: "Plan the planner goal",
@@ -328,6 +390,7 @@ for (const m of [
         stoppable: true,
       },
       {
+        ...defaultTask(),
         id: "a-opt",
         tool_id: "toolu_opt",
         description: "Plan the API optimization goal",
@@ -398,14 +461,34 @@ const RUN = "pr_agents1";
 const RUN_PLAN = "pl_release";
 const RUN_TITLE = "Cut the 0.2 release";
 for (const m of [
-  member("run-freeze", "claude", "agent:metal-ryzen-01", "Step 1: Freeze main", "idle", "default", "Step 1 of 3 of the plan \"Cut the 0.2 release\": Freeze main — Stop merging features; only fixes from here. — Done when: Branch protection requires a release label.", "Branch protection now requires a release label on main.", {
-    plan_run: RUN,
-    last_activity: Date.now() - 6 * 60_000,
-  }),
-  member("run-bench", "codex", "agent:metal-epyc-01", "Step 2: Run the full bench", "running", "untrusted", "Step 2 of 3 of the plan \"Cut the 0.2 release\": Run the full bench — Compare against 0.1 on the metal runners.", "Running the bench against 0.1.", {
-    plan_run: RUN,
-    doing: "Running kiln run bench --all",
-  }),
+  member(
+    "run-freeze",
+    "claude",
+    "agent:metal-ryzen-01",
+    "Step 1: Freeze main",
+    "idle",
+    "default",
+    'Step 1 of 3 of the plan "Cut the 0.2 release": Freeze main — Stop merging features; only fixes from here. — Done when: Branch protection requires a release label.',
+    "Branch protection now requires a release label on main.",
+    {
+      plan_run: RUN,
+      last_activity: Date.now() - 6 * 60_000,
+    },
+  ),
+  member(
+    "run-bench",
+    "codex",
+    "agent:metal-epyc-01",
+    "Step 2: Run the full bench",
+    "running",
+    "untrusted",
+    'Step 2 of 3 of the plan "Cut the 0.2 release": Run the full bench — Compare against 0.1 on the metal runners.',
+    "Running the bench against 0.1.",
+    {
+      plan_run: RUN,
+      doing: "Running kiln run bench --all",
+    },
+  ),
 ])
   family.set(m.info.id, m);
 
@@ -597,9 +680,29 @@ const run = {
   reason: null as string | null,
   at: Math.floor((t0 + 30_000) / 1000),
   steps: [
-    { title: "Freeze main", goal: family.get("run-freeze")?.info.goal ?? "", needs: [], status: "met", agent: "run-freeze", reason: "the agent said so: branch protection requires a release label", tries: 1, started_at: null, ended_at: null },
+    {
+      title: "Freeze main",
+      goal: family.get("run-freeze")?.info.goal ?? "",
+      needs: [],
+      status: "met",
+      agent: "run-freeze",
+      reason: "the agent said so: branch protection requires a release label",
+      tries: 1,
+      started_at: null,
+      ended_at: null,
+    },
     { title: "Run the full bench", goal: family.get("run-bench")?.info.goal ?? "", needs: [1], status: "started", agent: "run-bench", reason: null, tries: 1, started_at: null, ended_at: null },
-    { title: "Tag and publish", goal: 'Step 3 of 3 of the plan "Cut the 0.2 release": Tag and publish', needs: [1, 2], status: "waiting", agent: null, reason: null, tries: 0, started_at: null, ended_at: null },
+    {
+      title: "Tag and publish",
+      goal: 'Step 3 of 3 of the plan "Cut the 0.2 release": Tag and publish',
+      needs: [1, 2],
+      status: "waiting",
+      agent: null,
+      reason: null,
+      tries: 0,
+      started_at: null,
+      ended_at: null,
+    },
   ] as MockStep[],
 };
 
@@ -607,16 +710,55 @@ function runView() {
   const steps = run.steps.map((s, i) => {
     const m = s.agent ? family.get(s.agent) : undefined;
     const stand = s.status === "started" ? (m && (m.info.approvals.length || m.info.status === "waiting") ? "needs_you" : "working") : s.status === "taken" ? "yours" : s.status;
-    return { n: i + 1, title: s.title, goal: s.goal, stand, needs: s.needs, given: false, agent: m ? brief(m.info) : null, agent_id: s.agent, started_at: s.started_at, ended_at: s.ended_at, reason: s.reason, tries: s.tries };
+    return {
+      n: i + 1,
+      title: s.title,
+      goal: s.goal,
+      stand,
+      needs: s.needs,
+      given: false,
+      agent: m ? brief(m.info) : null,
+      agent_id: s.agent,
+      started_at: s.started_at,
+      ended_at: s.ended_at,
+      reason: s.reason,
+      tries: s.tries,
+    };
   });
   const met = steps.filter((s) => s.stand === "met").length;
   // Each met step's diff, on the one before's (docs/agentic.md P4).
   const stacked = run.steps
     .map((s, i) => ({ s, n: i + 1 }))
     .filter(({ s }) => s.status === "met")
-    .map(({ n }) => ({ n, state: "made", change: `D${41 + n}`, url: `/diffs/D${41 + n}`, sha: `4b5c6d7e8f${n}a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d`, branch: null, files: n === 1 ? [".github/branch-protection.yml"] : ["bench/results/0.2.json"], pushed: true, error: null }));
+    .map(({ n }) => ({
+      n,
+      state: "made",
+      change: `D${41 + n}`,
+      url: `/diffs/D${41 + n}`,
+      sha: `4b5c6d7e8f${n}a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d`,
+      branch: null,
+      files: n === 1 ? [".github/branch-protection.yml"] : ["bench/results/0.2.json"],
+      pushed: true,
+      error: null,
+    }));
   const stack = stacked.length ? { off: null, provider: "kiln", repo: "hyper-light/kiln", trunk: "main", base: "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d", steps: stacked } : null;
-  return { id: RUN, plan: RUN_PLAN, title: RUN_TITLE, version: 4, state: run.state, reason: run.reason, note: null, at: run.at, ended_at: null, by: "admin", config: {}, steps, met, total: steps.length, stack };
+  return {
+    id: RUN,
+    plan: RUN_PLAN,
+    title: RUN_TITLE,
+    version: 4,
+    state: run.state,
+    reason: run.reason,
+    note: null,
+    at: run.at,
+    ended_at: null,
+    by: "admin",
+    config: {},
+    steps,
+    met,
+    total: steps.length,
+    stack,
+  };
 }
 
 /** The run's routes (before the plans' own, whose `:id` would take "runs"). */
@@ -721,6 +863,7 @@ function descendants(id: string, all: AgentInfo[], live: boolean): AgentInfo[] {
 }
 
 const META: Meta = {
+  ...defaultMeta(),
   version: "2.3.1",
   modes: [
     { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
@@ -776,6 +919,7 @@ function subagentQueue(m: Member, c: { type?: string; id?: string; text?: string
 
 function stateOf(m: Member): State {
   return {
+    ...defaultState(),
     status: m.info.status,
     cwd: m.info.cwd,
     model: m.info.model,
@@ -790,7 +934,7 @@ function stateOf(m: Member): State {
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
-  } as State;
+  };
 }
 
 /** A family member's socket: its snapshot. */
@@ -914,18 +1058,58 @@ const changes = new Map<string, Record<string, unknown>>([
 const now = () => Math.floor(Date.now() / 1000);
 family.set(
   "att-ci",
-  member("att-ci", "claude", "agent:metal-ryzen-01", "ci-doctor: CI failed on main: assertion failed in sync::reconnect", "running", "default", "You are ci-doctor, attached to repo:hyper-light/kiln in kiln, and this woke you (failure): CI failed on main.", "Reproducing the reconnect failure locally.", {
-    doing: "Running cargo test -p kiln sync::reconnect",
-  }),
+  member(
+    "att-ci",
+    "claude",
+    "agent:metal-ryzen-01",
+    "ci-doctor: CI failed on main: assertion failed in sync::reconnect",
+    "running",
+    "default",
+    "You are ci-doctor, attached to repo:hyper-light/kiln in kiln, and this woke you (failure): CI failed on main.",
+    "Reproducing the reconnect failure locally.",
+    {
+      doing: "Running cargo test -p kiln sync::reconnect",
+    },
+  ),
 );
 const attached = new Map<string, Record<string, unknown>>([
   [
     "a1",
-    { id: "a1", name: "ci-doctor", on: "repo:hyper-light/kiln", branches: ["main"], harness: { kind: "claude", on: "metal-ryzen-01", cwd: "/home/ada/src/kiln" }, wake: ["failure", "flaky", "mention"], can: ["read", "rerun", "fix"], limits: { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15 }, playbook: "Rerun what's flaky once; for a regression, open a revert as a diff.", reviewers: ["ada"], by: "owner", paused: false, created_at: now() - 86_400, updated_at: now() - 86_400 },
+    {
+      id: "a1",
+      name: "ci-doctor",
+      on: "repo:hyper-light/kiln",
+      branches: ["main"],
+      harness: { kind: "claude", on: "metal-ryzen-01", cwd: "/home/ada/src/kiln" },
+      wake: ["failure", "flaky", "mention"],
+      can: ["read", "rerun", "fix"],
+      limits: { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15 },
+      playbook: "Rerun what's flaky once; for a regression, open a revert as a diff.",
+      reviewers: ["ada"],
+      by: "owner",
+      paused: false,
+      created_at: now() - 86_400,
+      updated_at: now() - 86_400,
+    },
   ],
   [
     "a2",
-    { id: "a2", name: "runner-doctor", on: "runners", branches: [], harness: { kind: "codex" }, wake: ["offline", "upgrade"], can: ["read", "diagnose", "manage-runners"], limits: { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15 }, playbook: "", reviewers: [], by: "owner", paused: false, created_at: now() - 3 * 86_400, updated_at: now() - 3 * 86_400 },
+    {
+      id: "a2",
+      name: "runner-doctor",
+      on: "runners",
+      branches: [],
+      harness: { kind: "codex" },
+      wake: ["offline", "upgrade"],
+      can: ["read", "diagnose", "manage-runners"],
+      limits: { sessions_per_day: 10, reruns_per_failure: 2, stuck_minutes: 15 },
+      playbook: "",
+      reviewers: [],
+      by: "owner",
+      paused: false,
+      created_at: now() - 3 * 86_400,
+      updated_at: now() - 3 * 86_400,
+    },
   ],
   [
     "hyper-light__kiln.release-watch",
@@ -950,13 +1134,82 @@ const attached = new Map<string, Record<string, unknown>>([
   ],
   [
     "a3",
-    { id: "a3", name: "nightly-gardener", on: "workflow:hyper-light/kiln:.github/workflows/nightly.yml", branches: [], harness: { kind: "codex" }, wake: ["schedule"], schedule: "0 6 * * 1", can: ["read", "edit-pipelines"], limits: { sessions_per_day: 1, reruns_per_failure: 0, stuck_minutes: 15 }, playbook: "Shorten the critical path.", reviewers: ["ada"], by: "owner", paused: true, created_at: now() - 7 * 86_400, updated_at: now() - 2 * 86_400 },
+    {
+      id: "a3",
+      name: "nightly-gardener",
+      on: "workflow:hyper-light/kiln:.github/workflows/nightly.yml",
+      branches: [],
+      harness: { kind: "codex" },
+      wake: ["schedule"],
+      schedule: "0 6 * * 1",
+      can: ["read", "edit-pipelines"],
+      limits: { sessions_per_day: 1, reruns_per_failure: 0, stuck_minutes: 15 },
+      playbook: "Shorten the critical path.",
+      reviewers: ["ada"],
+      by: "owner",
+      paused: true,
+      created_at: now() - 7 * 86_400,
+      updated_at: now() - 2 * 86_400,
+    },
   ],
 ]);
 const incidentList: Record<string, unknown>[] = [
-  { id: "i3", attachment: "a1", name: "ci-doctor", on: "repo:hyper-light/kiln", wake: "failure", repo: "hyper-light/kiln", title: "CI failed on main: assertion failed in sync::reconnect", state: "open", agent: "att-ci", class: null, report: null, links: [], why: null, times: 2, last: { at: now() - 240, what: "CI #412" }, at: now() - 900, updated_at: now() - 240 },
-  { id: "i2", attachment: "a2", name: "runner-doctor", on: "runners", wake: "upgrade", runner: "metal-epyc-01", title: "Upgrading metal-epyc-01 failed: cargo build exited 101", state: "waiting", agent: null, class: null, report: null, links: [], why: "its agent couldn't start: no machine suits codex: none is connected", times: 1, last: { at: now() - 7200, what: "upgrade u9 (build)" }, at: now() - 7200, updated_at: now() - 7200 },
-  { id: "i1", attachment: "a1", name: "ci-doctor", on: "repo:hyper-light/kiln", wake: "flaky", title: "Flaky in CI #409: retry::backoff_caps", state: "resolved", agent: "fam-tests", class: "flaky", report: "retry::backoff_caps races the clock; quarantined it (D41) and opened a fix as D44.", links: ["D41", "D44"], why: null, times: 1, last: { at: now() - 86_000, what: "CI #409" }, at: now() - 86_000, updated_at: now() - 80_000 },
+  {
+    id: "i3",
+    attachment: "a1",
+    name: "ci-doctor",
+    on: "repo:hyper-light/kiln",
+    wake: "failure",
+    repo: "hyper-light/kiln",
+    title: "CI failed on main: assertion failed in sync::reconnect",
+    state: "open",
+    agent: "att-ci",
+    class: null,
+    report: null,
+    links: [],
+    why: null,
+    times: 2,
+    last: { at: now() - 240, what: "CI #412" },
+    at: now() - 900,
+    updated_at: now() - 240,
+  },
+  {
+    id: "i2",
+    attachment: "a2",
+    name: "runner-doctor",
+    on: "runners",
+    wake: "upgrade",
+    runner: "metal-epyc-01",
+    title: "Upgrading metal-epyc-01 failed: cargo build exited 101",
+    state: "waiting",
+    agent: null,
+    class: null,
+    report: null,
+    links: [],
+    why: "its agent couldn't start: no machine suits codex: none is connected",
+    times: 1,
+    last: { at: now() - 7200, what: "upgrade u9 (build)" },
+    at: now() - 7200,
+    updated_at: now() - 7200,
+  },
+  {
+    id: "i1",
+    attachment: "a1",
+    name: "ci-doctor",
+    on: "repo:hyper-light/kiln",
+    wake: "flaky",
+    title: "Flaky in CI #409: retry::backoff_caps",
+    state: "resolved",
+    agent: "fam-tests",
+    class: "flaky",
+    report: "retry::backoff_caps races the clock; quarantined it (D41) and opened a fix as D44.",
+    links: ["D41", "D44"],
+    why: null,
+    times: 1,
+    last: { at: now() - 86_000, what: "CI #409" },
+    at: now() - 86_000,
+    updated_at: now() - 80_000,
+  },
 ];
 
 /** The attachments' and incidents' routes. True when it answered. */
@@ -1001,6 +1254,27 @@ async function handleAttached(req: http.IncomingMessage, res: http.ServerRespons
     return (json(res, 200, { removed: am[1] }), true);
   }
   return false;
+}
+
+/** What a person asked about (agents.about), and the helpers answering. */
+interface AboutQ {
+  path: string;
+  line?: number;
+  selection?: string;
+  change?: boolean;
+}
+const helpers = new Map<string, { at: number; q: AboutQ; name: string }>();
+let aboutSeq = 0;
+
+/** A helper's answer, in the four parts (ABOUT_PARTS in crates/kiln/src/harness/ops.rs). */
+function aboutAnswer(q: AboutQ): [string, string][] {
+  const what = q.change ? "This change" : q.selection ? `\`${q.selection}\`` : `Line ${q.line ?? ""}`;
+  return [
+    ["What it is", `${what}, in \`${q.path}\`${q.line ? ` at line ${q.line}` : ""}: the retry delay for the next attempt, from 100 ms doubling with each one, with full jitter, at most 30 s.`],
+    ["What it does here", "It picks how long this loop sleeps before trying again; `.min(deadline - now)` keeps the last sleep from running past the request's deadline."],
+    ["Used elsewhere", "- `crates/kiln/src/http/retry.rs:31` `pub fn next(&mut self, now: Instant) -> Duration {`\n- `crates/kiln/src/rt/timer.rs:88` `let wait = reconnect.next(now);`\n- `crates/kiln/tests/retry.rs:24` `assert!(b.next(t0) <= Duration::from_millis(200));`"],
+    ["Worth knowing", "It counts attempts, so calling it twice in one pass skips a step. **The test at `tests/retry.rs:24` is the flaky one**: it compares against wall-clock time the jitter can overshoot."],
+  ];
 }
 
 export async function handleFamily(req: http.IncomingMessage, res: http.ServerResponse, url: URL, others: () => AgentInfo[]): Promise<boolean> {
@@ -1055,6 +1329,48 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     });
     return true;
   }
+  // agents.about: a helper of the agent reads, searches, then answers in four parts, a part a moment, as a real one streams.
+  const ab = p.match(/^\/api\/harness\/agents\/([^/]+)\/about$/);
+  if (ab && m === "POST") {
+    const q = await body<AboutQ>(req);
+    const owner = all().find((x) => x.id === decodeURIComponent(ab[1] ?? ""));
+    if (!owner) json(res, 404, { error: "no such agent" });
+    else if (owner.max_subagents === 0) json(res, 200, { agents: [], itself: true, sent: { sent: true } });
+    else {
+      const id = `about-${++aboutSeq}`;
+      const name = `About ${q.selection ?? q.path.split("/").pop() ?? "this"}`;
+      helpers.set(id, { at: Date.now(), q, name });
+      json(res, 200, { agents: [{ id, name, kind: owner.kind, status: "running", stand: "working" }], itself: false });
+    }
+    return true;
+  }
+  const hr = p.match(/^\/api\/harness\/agents\/(about-\d+)\/(result|stop)$/);
+  if (hr) {
+    const id = hr[1] ?? "";
+    const h = helpers.get(id);
+    if (!h) json(res, 404, { error: "it ended" });
+    else if (hr[2] === "stop") {
+      helpers.delete(id);
+      json(res, 200, { ended: [id] });
+    } else {
+      const t = (Date.now() - h.at) / 1000;
+      const parts = aboutAnswer(h.q);
+      const shown = Math.max(0, Math.min(parts.length, Math.floor((t - 1.6) / 0.9) + 1));
+      const done = t > 1.6 + parts.length * 0.9;
+      const text = parts
+        .slice(0, shown)
+        .map(([head, said]) => `## ${head}\n${said}`)
+        .join("\n\n");
+      const doing = t < 0.8 ? `Reading ${h.q.path}` : t < 1.6 ? `Searching the repository for “${h.q.selection ?? "this"}”` : undefined;
+      json(res, 200, {
+        agent: { id, name: h.name, kind: "claude", status: "running", stand: done ? "finished" : "working", doing, model: "sonnet" },
+        reply: text ? { text, at: Date.now() } : null,
+        last_turn: done ? { ok: true } : null,
+        cost_usd: done ? 0.01 : 0,
+      });
+    }
+    return true;
+  }
   const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land))?$/);
   if (!am) return false;
   const id = decodeURIComponent(am[1] ?? "");
@@ -1092,12 +1408,20 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
           grant_required: true,
           landing: 7,
           manifest: "7b9cf3d31bed49590dce5886cb9c9fb21b2efe12ef21cdf3927ca5cd73ef9034",
-          summary: { by_action: [{ action: "replace", count: 1 }, { action: "create", count: 1 }], bytes: 2214, filtered_out: 1834 },
+          summary: {
+            by_action: [
+              { action: "replace", count: 1 },
+              { action: "create", count: 1 },
+            ],
+            bytes: 2214,
+            filtered_out: 1834,
+          },
           conflicts: [],
         },
         excludes: ["/.git"],
         can_write: false,
-        why_not: "Slates on Linux can't take a person's go-ahead from kiln yet (Slates' GAP-A9-10): put the work up for review instead, or approve it with `slates grant` in the session that started Slates",
+        why_not:
+          "Slates on Linux can't take a person's go-ahead from kiln yet (Slates' GAP-A9-10): put the work up for review instead, or approve it with `slates grant` in the session that started Slates",
       });
     } else json(res, 200, { landed: { grant_required: false, outcome: { written: 2 } } });
   } else if (what === "change" && m === "POST") {
@@ -1108,7 +1432,11 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     const b = await body<{ title?: string; fix_checks?: boolean }>(req);
     const was = changes.get(id);
     const now = Math.floor(Date.now() / 1000);
-    const slug = (b.title || a.title || a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+    const slug = (b.title || a.title || a.name)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 40);
     const c = was
       ? { ...was, version: Number(was.version) + 1, checks: undefined, updated_at: now, sha: Math.random().toString(16).slice(2).padEnd(40, "0") }
       : {

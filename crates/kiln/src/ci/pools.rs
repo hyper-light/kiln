@@ -178,7 +178,11 @@ pub async fn put(hub: &Hub, name: &str, body: &Value) -> Result<Response, Fail> 
         .await
         .map_err(internal)?;
     hub.ci.send(super::dispatch::Msg::PoolsChanged);
-    let (diagnostics, preview) = effect(hub, &pool).await;
+    let (mut diagnostics, preview) = effect(hub, &pool).await;
+    // W24-R14: a pool's warm workspaces aren't kept where untrusted legs may write them.
+    if spec.warm.is_some() && hub.cfg.ci.untrusted.executors.iter().any(|e| e == "k8s") {
+        diagnostics.push(json!({ "level": "warning", "message": format!("{}'s pods start cold: untrusted legs may run in k8s pods (`ci.untrusted.executors` names k8s), and they'd write the warm workspaces trusted legs read", pool.name) }));
+    }
     Ok(srv::json(StatusCode::OK, &json!({ "name": pool.name, "executor": pool.executor, "labels": pool.labels, "min_idle": pool.min_idle, "max": pool.max, "diagnostics": diagnostics, "preview": preview })))
 }
 
@@ -247,12 +251,41 @@ fn failed(hub: &Hub, executor: &str, error: String) {
 }
 
 /// What a pod made for a leg holds (docs/ci.md W13-R07), evaluated: the job container's image
-/// (else the pool's) and environment, and the services beside it.
+/// (else the pool's) and environment, and the services beside it. A kiln-dialect leg's pod is
+/// v1's job pod (W02-R06): its image from `image:` or `toolchain:`, its requests from its
+/// `resources:` (memory its limit too), v1's cache variables and v1's deadline.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LegPod {
     pub image: Option<String>,
     pub env: Vec<(String, String)>,
     pub services: Vec<PodService>,
+    /// The leg's `container:` and `services:` are the pod's (its runner starts none).
+    pub containers: bool,
+    /// The leg's own CPU and memory requests, over the pool's.
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    /// v1's toolchain caches under the cache claim (`CARGO_HOME`, `npm_config_cache`, …).
+    pub caches: bool,
+    /// How long the pod may live, in seconds: v1's job pod's, the leg's timeout and 15 minutes.
+    pub deadline_s: Option<i64>,
+}
+
+/// Whether a kiln-dialect job says what its pod is (W02-R06): its `toolchain:`, `image:` or
+/// `resources:`. On a `k8s` pool such a leg gets a pod made for it ([`kiln_pod`]); the pool's
+/// other legs keep the pool's pods.
+pub fn sets_pod(job: &kiln_ci::wf::ir::Job) -> bool {
+    job.kiln.toolchain.is_some() || job.kiln.image.is_some() || job.kiln.resources.is_some()
+}
+
+/// A kiln-dialect job's pod (W02-R06, as v1 makes a `runs-on: [k8s]` job's): `image` (the
+/// job's `image:`, evaluated) else its `toolchain:`'s preset image, else the pool's; its
+/// `resources:` CPU and memory, read as v1 reads them, else the pool's; v1's caches; and v1's
+/// deadline, `timeout_minutes` and 15 minutes.
+pub fn kiln_pod(job: &kiln_ci::wf::ir::Job, image: Option<String>, timeout_minutes: u32) -> LegPod {
+    let image = image.or_else(|| job.kiln.toolchain.as_deref().map(|t| crate::pipeline::toolchain_image(Some(t)).to_owned()));
+    let r = job.kiln.resources.as_ref().and_then(crate::pipeline::resources_of).unwrap_or_default();
+    let given = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    LegPod { image, cpu: given(r.cpu), memory: given(r.memory), caches: true, deadline_s: Some(i64::from(timeout_minutes) * 60 + 900), ..LegPod::default() }
 }
 
 /// A service, as a pod's native sidecar.

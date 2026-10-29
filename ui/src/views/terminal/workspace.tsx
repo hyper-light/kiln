@@ -19,7 +19,7 @@ import { NameField } from "@/components/ui/name-field";
 import { toast } from "@/components/ui/toast";
 import { HarnessMark } from "@/views/harness/parts";
 import { SpawnHereButton } from "@/views/harness/spawn-here";
-import { SpawnDialog } from "@/views/harness/spawn";
+import { startFrom } from "@/views/harness/new-agent-draft";
 import { DesktopNew, MobileBar } from "./switcher";
 import { PastePanel, SelectTextPanel } from "./clipboard";
 import { TerminalSession, type SessionHandle, type SessionState } from "./session";
@@ -115,7 +115,6 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   activeRef.current = activeId;
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const location = useLocation();
-  const navigate = useNavigate();
 
   warm(agentsRes, terminalSessionsRes, aiSessionsRes, harnessSessionsRes);
   const agents = useAgentsLive().data;
@@ -343,7 +342,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
 
   // Phones: one pinned bar (current session, a switcher, new terminal/agents) instead of tabs that scroll off screen.
   const narrow = useMediaQuery("(max-width: 639px)");
-  const [spawn, setSpawn] = React.useState<{ target?: string; shell?: string } | null>(null);
+  // Starting agents is Mission control's composer, filled in (new-agent-draft.ts).
+  const toComposer = useNavigate();
   // Copy and paste: the selection or a plain-text view of the session; the clipboard, or a box to paste into.
   const [selectText, setSelectText] = React.useState<string | null>(null);
   const [pasteBox, setPasteBox] = React.useState(false);
@@ -433,7 +433,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
           onClose={close}
           targets={targets}
           onOpenTarget={open}
-          onNewAgents={() => setSpawn({})}
+          onNewAgents={() => startFrom(toComposer, { from: "From Terminal" })}
           kbVisible={kbVisible}
           onToggleKb={() => setKbVisible(!kbVisible)}
           renaming={renaming !== null && renaming === activeId}
@@ -444,7 +444,11 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
             { label: "Paste", disabled: !active, onSelect: () => void pasteIntoActive() },
             { label: "Select text", disabled: !active, onSelect: () => active && setSelectText(handles.current.get(active.id)?.text() ?? "") },
             { label: "Rename terminal", disabled: !active?.sessionId, onSelect: () => active && setRenaming(active.id) },
-            { label: "Start agents in this shell", onSelect: () => active && setSpawn({ target: active.target, shell: active.sessionId ?? undefined }), disabled: !active?.sessionId },
+            {
+              label: "Start agents in this shell",
+              onSelect: () => active && startFrom(toComposer, { from: "From Terminal: it starts in this shell", target: active.target, shell: active.sessionId ?? undefined }),
+              disabled: !active?.sessionId,
+            },
             { label: "Larger text", onSelect: () => setFontSize(Math.min(24, fontSize + 1)) },
             { label: "Smaller text", onSelect: () => setFontSize(Math.max(9, fontSize - 1)) },
             { label: "Copy on select", pressed: copyOnSelect, onSelect: () => setCopyOnSelect(!copyOnSelect) },
@@ -523,7 +527,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
             </div>
           ))}
         </div>
-        <DesktopNew targets={targets} onOpenTarget={open} onNewAgents={() => setSpawn({})} />
+        <DesktopNew targets={targets} onOpenTarget={open} onNewAgents={() => startFrom(toComposer, { from: "From Terminal" })} />
         <div className="flex shrink-0 items-center gap-0.5 border-l border-[#1d1f23] px-1.5">
           {renderer && (
             <span className="mr-2 hidden font-mono text-[9px] tracking-[0.08em] text-[#6d7078] uppercase md:inline" title="Active renderer">
@@ -643,15 +647,6 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
           }}
         />
       )}
-      <SpawnDialog
-        open={spawn !== null}
-        onOpenChange={(o) => !o && setSpawn(null)}
-        defaults={spawn ?? undefined}
-        onStarted={(started) => {
-          setSpawn(null);
-          navigate(started.length === 1 && started[0] ? `/agents/${started[0].id}` : "/agents");
-        }}
-      />
       {/* sessions */}
       <div className="relative min-h-0 flex-1">
         {tabs.map((t) => (

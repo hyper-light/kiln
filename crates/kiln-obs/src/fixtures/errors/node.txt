@@ -1,0 +1,39 @@
+---- app
+Error: bad item -42 in cart "c--294"
+    at Cart.total (/app/errors.js:6:50)
+    at checkout (/app/errors.js:10:60)
+    at /app/errors.js:18:28
+    at run (/app/errors.js:16:48)
+    at /app/errors.js:18:11
+    at cases (/app/errors.js:24:5)
+    at Object.<anonymous> (/app/errors.js:26:1)
+    at Module._compile (node:internal/modules/cjs/loader:1781:14)
+    at Object..js (node:internal/modules/cjs/loader:1913:10)
+    at Module.load (node:internal/modules/cjs/loader:1505:32)
+---- app-again
+Error: bad item -7 in cart "c--49"
+    at Cart.total (/app/errors.js:6:50)
+    at checkout (/app/errors.js:10:60)
+    at /app/errors.js:19:34
+    at run (/app/errors.js:16:48)
+    at /app/errors.js:19:11
+---- async
+TypeError: order 5 not found
+    at fetchOrder (/app/errors.js:11:83)
+    at async handler (/app/errors.js:12:37)
+    at async run (/app/errors.js:16:42)
+    at async /app/errors.js:20:5
+---- builtin
+SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+    at JSON.parse (<anonymous>)
+    at parse (/app/errors.js:13:36)
+    at /app/errors.js:21:32
+    at run (/app/errors.js:16:48)
+    at /app/errors.js:21:11
+---- anonymous
+RangeError: zero (at index 1)
+    at /app/errors.js:22:79
+    at Array.map (<anonymous>)
+    at /app/errors.js:22:41
+    at run (/app/errors.js:16:48)
+    at /app/errors.js:22:11

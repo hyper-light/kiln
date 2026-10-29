@@ -87,7 +87,7 @@ function Objects({ list, held }: { list: CdPlanObject[]; held?: CdPlanSync["held
             {verb(o)}
           </p>
           {o.hunks ? (
-            <FileDiffView diff={{ path: objectLabel(o.key), hunks: o.hunks }} label={objectLabel(o.key)} defaultOpen={list.length <= 3} />
+            <FileDiffView diff={{ path: objectLabel(o.key), hunks: o.hunks }} label={objectLabel(o.key)} defaultOpen={list.length <= 3} language="yaml" />
           ) : (
             <p className="cd-plan-line">
               <span>{objectLabel(o.key)}</span>
@@ -223,7 +223,7 @@ function PlanView({ plan, show, onShow, onAgain, busy }: { plan: CdPlan; show: S
 function PlansHead() {
   return (
     <header className="cd-head">
-      <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Deploy plans" }]} />
+      <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Deploy plans" }]} />
       <h1 className="cd-title">Deploy plans</h1>
       <p className="cd-note">
         What a branch, a commit or a pull request would deploy before it lands: each commit's own change, the whole stack's against trunk, and what a sync would do against what runs.

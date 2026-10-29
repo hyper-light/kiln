@@ -42,7 +42,7 @@ fn installed_devin_native_history_and_repl_ownership() -> anyhow::Result<()> {
         let env = vec![("XDG_DATA_HOME".into(), data.to_string_lossy().into_owned()), ("XDG_CONFIG_HOME".into(), config.to_string_lossy().into_owned()), ("XDG_CACHE_HOME".into(), dir.path().join("cache").to_string_lossy().into_owned())];
         let spec = Spec { kind: "devin".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), mode: Some("ask".into()), env: env.clone(), reach: Some("off".into()), ..Spec::default() };
         let (tx, _rx) = async_channel::unbounded();
-        let files = Files { dir: dir.path().join("attachments"), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_: String| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_: String, _: bool| Box::pin(async { Ok(()) })), settle: Arc::new(|_: String, _: String, _: bool| Box::pin(async { Ok(None) })) };
+        let files = Files { dir: dir.path().join("attachments"), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_: String| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_: String, _: bool| Box::pin(async { Ok(()) })), settle: Arc::new(|_: String, _: String, _: bool| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}) };
         let running = Running(session::start(crate::util::new_id(), spec, tx, Arc::new(|| {}), files)?);
         let s = &running.0;
         until(|| { let c = s.core.lock(); c.state.status == Status::Idle && !c.meta.models.is_empty() }).await?;

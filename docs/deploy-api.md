@@ -366,7 +366,7 @@ production:
     via: commit                       # or pull-request: the release commit is merged by a reviewer
   sync: { auto: true, prune: true, self_heal: true }
   watch: { timeout: 15m, settle: 30s, refused: 60s }
-  concurrency: queue                  # a second release waits; or reject
+  concurrency: queue                  # a second release takes the first's place; or reject
   agents: { deploy: false, approve: false }   # what agents may do here (cd-targets.md D6)
   argocd: { applications: false }     # Argo CD: true, kiln writes each Application (no ApplicationSet)
   notify: { chat: ["#deploys"], webhooks: [] }
@@ -728,9 +728,18 @@ same names in both providers.
    repository's index, a branch or tag of a git package. A registry that says the version isn't
    there refuses the release (`422`, with the newest versions it has); one kiln can't ask lets it
    through, and the provider has the last word.
-2. **Concurrency.** One release in flight per registration. Another waits in line or is refused
-   (`409`), as the environment says. An `Idempotency-Key` (header, or `idempotency_key`) returns the
-   same release to a retried call, whatever it has become; a retried cancel finds it cancelled.
+2. **Concurrency.** A second release of a registration is refused (`409`) or, with `queue`, takes
+   the first's place: the newest revision rolls out, as rollouts supersede (docs/ci.md W28-R38).
+   The older one ends once the newer one's gates let it go if it was still waiting, once the newer
+   one's commit is made if it was rolling out, and never in the middle of its own commit, which the
+   newer one waits for. It ends cancelled, saying which release superseded it; nothing of it is
+   reverted. Releases of other registrations run at once unless they share a resource (the
+   cluster and namespace, the app, an object both deploy): then they take turns, oldest first,
+   one under way holding what it shares whatever its age, and the one that waits says what they
+   share (`waits for release 5: both deploy to prod's shop-web namespace`). A release its own
+   gates hold holds nothing back. An `Idempotency-Key` (header, or
+   `idempotency_key`) returns the same release to a retried call, whatever it has become; a
+   retried cancel finds it cancelled.
 3. **Gates** (§9.1). A release waiting on one is `waiting`, and says what for.
 4. **Record.** The release, with every gate's result, is written to KilnDB (`committing`).
 5. **Commit.** `release.json` (and `values.yaml` for a config release) on the environment's release

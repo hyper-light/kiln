@@ -146,6 +146,24 @@ impl Logs {
         crate::rt::blocking(move || tail_of(&p, max).unwrap_or_default()).await.unwrap_or_default()
     }
 
+    /// A line after what a step's log holds, where one attempt ends and the next begins: a job
+    /// retried in place keeps its logs (docs/ci.md W05-R28). Written to the file only; a step
+    /// with no log yet gets none.
+    pub async fn mark(&self, job: &str, idx: u32, line: &str) {
+        let path = self.step_path(job, idx);
+        let text = format!("\r\n\x1b[33m[kiln] {line}\x1b[0m\r\n");
+        let r = crate::rt::blocking(move || -> std::io::Result<()> {
+            if std::fs::metadata(&path).map_or(0, |m| m.len()) == 0 {
+                return Ok(());
+            }
+            std::fs::OpenOptions::new().append(true).open(&path)?.write_all(text.as_bytes())
+        })
+        .await;
+        if let Ok(Err(e)) | Err(e) = r.map_err(|e| std::io::Error::other(format!("{e:#}"))) {
+            tracing::warn!(error = %e, job, "a retry's mark in the log failed");
+        }
+    }
+
     /// Size of the backlog already on disk (for the UI's "download" affordance).
     pub async fn size(&self, job: &str, idx: u32) -> u64 {
         let p = self.step_path(job, idx);

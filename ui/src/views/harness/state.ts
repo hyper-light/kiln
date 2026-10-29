@@ -2,9 +2,10 @@
  * What the agent console remembers for you, in this browser:
  * - how a message goes while an agent works (queue, steer, now), until you change it;
  * - where you were in each conversation, so coming back (or reloading) puts you there;
- * - what you were writing to each agent, until it's sent;
+ * - what you were writing to each agent (and in each review comment), until it's sent;
  * - what you sent while it couldn't take it (its machine away), until it can.
  */
+import * as React from "react";
 import { create } from "zustand";
 import { createJSONStorage, persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 import type { Attachment, SendMode } from "@/api/harness";
@@ -119,6 +120,19 @@ export const useDrafts = create<DraftsState>()(
     },
   ),
 );
+
+/**
+ * One draft by its key (an agent's id, or where a review comment is written: ship/review/draft.ts):
+ * what's written there and how to change it. Only what reads that key renders as it changes, so
+ * typing renders its composer and nothing else. Drafts are this browser's, and the pages that show
+ * them are drawn here: what a server render would read is what's kept here.
+ */
+export function useDraft(key: string): [string, (text: string | ((was: string) => string)) => void] {
+  const read = () => useDrafts.getState().drafts[key] ?? "";
+  const text = React.useSyncExternalStore(useDrafts.subscribe, read, read);
+  const set = React.useCallback((t: string | ((was: string) => string)) => useDrafts.getState().setDraft(key, typeof t === "function" ? t(useDrafts.getState().drafts[key] ?? "") : t), [key]);
+  return [text, set];
+}
 
 /* ------------------------------------------------------------------ messages kept here */
 

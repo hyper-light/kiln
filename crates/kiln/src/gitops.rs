@@ -103,17 +103,25 @@ fn has_commits(refs: &BTreeMap<String, String>) -> bool {
     refs.keys().any(|k| k != "HEAD->")
 }
 
+/// A repository's mirror lock: a fetch into the mirror holds it alone, a look at what the mirror
+/// has shares it. git writes a small fetch's objects (fewer than `fetch.unpackLimit`) one by one,
+/// a commit before its tree and a tree before what's in it, so a commit seen while a fetch runs
+/// may lack its files yet (W03-R08: a change request's checks read its workflows while the poller
+/// fetched them, and git couldn't read `.github`).
+fn mirror_lock(repo: &str) -> Arc<async_lock::RwLock<()>> {
+    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::RwLock<()>>>>> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Default::default).lock().entry(repo.to_owned()).or_default().clone()
+}
+
 /// Create or refresh the bare mirror. Concurrent callers for one repo are serialised.
 pub async fn sync_mirror(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
-    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> =
-        std::sync::OnceLock::new();
-    let lock = LOCKS
-        .get_or_init(Default::default)
-        .lock()
-        .entry(repo.name.clone())
-        .or_default()
-        .clone();
-    let _g = lock.lock().await;
+    let lock = mirror_lock(&repo.name);
+    let _g = lock.write().await;
+    refresh(hub, repo).await
+}
+
+/// [`sync_mirror`], its lock held.
+async fn refresh(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
     let path = mirror_path(hub, &repo.name);
     let p = path.to_string_lossy().to_string();
     if path.join("HEAD").exists() {
@@ -141,19 +149,32 @@ pub async fn sync_mirror(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// The mirror, with commit `sha` in it whole: fetched when it isn't there.
 pub(crate) async fn ensure_commit(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<PathBuf> {
     let path = mirror_path(hub, &repo.name);
-    let p = path.to_string_lossy().to_string();
-    let have = path.join("HEAD").exists()
-        && run_git(hub, &["-C", &p, "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT).await.is_ok();
-    if have {
+    let lock = mirror_lock(&repo.name);
+    // Seen while no fetch runs, a commit is there whole ([`mirror_lock`]).
+    {
+        let _seen = lock.read().await;
+        if in_mirror(hub, &path, sha).await {
+            return Ok(path);
+        }
+    }
+    let _g = lock.write().await;
+    // Whoever fetched before may have brought it.
+    if in_mirror(hub, &path, sha).await {
         return Ok(path);
     }
-    let path = sync_mirror(hub, repo).await?;
-    if run_git(hub, &["-C", &p, "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT).await.is_err() {
-        run_git(hub, &["-C", &p, "fetch", "--quiet", "origin", sha], GIT_TIMEOUT).await?;
+    let path = refresh(hub, repo).await?;
+    if !in_mirror(hub, &path, sha).await {
+        run_git(hub, &["-C", &path.to_string_lossy(), "fetch", "--quiet", "origin", sha], GIT_TIMEOUT).await?;
     }
     Ok(path)
+}
+
+/// Whether the mirror at `path` has commit `sha`.
+async fn in_mirror(hub: &Hub, path: &std::path::Path, sha: &str) -> bool {
+    path.join("HEAD").exists() && run_git(hub, &["-C", &path.to_string_lossy(), "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT).await.is_ok()
 }
 
 /// kiln's configuration files under `.kiln/`, which aren't pipelines: deployments
@@ -929,6 +950,136 @@ mod tests {
             anyhow::ensure!(count(&a) == 3 && count(&b) == 2 && count(&c) == 1, "polled more than asked: {:?}", polls.lock());
             hub.shutdown.cancel();
             poller.await??;
+            Ok(())
+        })
+    }
+
+    /// git in `at`, as a test's committer: what it printed.
+    #[cfg(unix)]
+    async fn git_at(hub: &Hub, at: &std::path::Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+        let at = at.to_string_lossy();
+        let mut all = vec!["-C", &*at, "-c", "user.name=T", "-c", "user.email=t@x", "-c", "commit.gpgsign=false"];
+        all.extend_from_slice(args);
+        run_git(hub, &all, LS_REMOTE_TIMEOUT).await
+    }
+
+    /// Lets a held fetch go on, however the test ends.
+    #[cfg(unix)]
+    struct Go(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for Go {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"");
+        }
+    }
+
+    /// A commit a fetch is still writing into the mirror is read whole: its archive waits for the
+    /// fetch (W03-R08: a change request's checks read its workflows while the poller fetched them,
+    /// and git couldn't read `.github`, 2026-10-28). The fetch is caught part-way: the upload-pack
+    /// it talks to passes on the first 70,000 bytes of its answer and holds the rest until `go` is
+    /// there, and the mirror unpacks what it fetches, an object at a time, as git does a small
+    /// fetch.
+    #[cfg(unix)]
+    #[test]
+    fn w03_r08_a_commit_a_fetch_is_still_writing_is_read_whole() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let (origin, work, go) = (dir.path().join("origin.git"), dir.path().join("work"), dir.path().join("go"));
+            let _go = Go(go.clone());
+            let o = origin.to_string_lossy().into_owned();
+            run_git(&hub, &["init", "-q", "--bare", "-b", "main", &o], LS_REMOTE_TIMEOUT).await?;
+            run_git(&hub, &["init", "-q", "-b", "main", &work.to_string_lossy()], LS_REMOTE_TIMEOUT).await?;
+            std::fs::write(work.join("README.md"), "app\n")?;
+            git_at(&hub, &work, &["add", "."]).await?;
+            git_at(&hub, &work, &["commit", "-qm", "first"]).await?;
+            git_at(&hub, &work, &["push", "-q", &o, "main"]).await?;
+            let repo = Repo {
+                id: crate::util::new_id(),
+                name: "acme/app".into(),
+                clone_url: format!("file://{o}"),
+                branches: Vec::new(),
+                poll_seconds: 60,
+                enabled: true,
+                created_at: crate::util::now_unix(),
+                last_polled_at: None,
+                last_error: None,
+                mode: "upstream".into(),
+                default_branch: None,
+                mirror: None,
+            };
+            let mirror = sync_mirror(&hub, &repo).await?;
+            // From now on the mirror's fetches are held part-way until `go` (a minute at most),
+            // and unpacked. `dd` passes on each byte as it comes: git's answers are a conversation.
+            let held = dir.path().join("held-upload-pack");
+            let script = format!(
+                "#!/bin/sh\ngit upload-pack \"$@\" | {{\n  dd bs=1 count=70000 2>/dev/null\n  i=0\n  while [ ! -e '{go}' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i + 1)); done\n  exec cat\n}}\n",
+                go = go.display()
+            );
+            std::fs::write(&held, script)?;
+            std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755))?;
+            git_at(&hub, &mirror, &["config", "remote.origin.uploadpack", &held.to_string_lossy()]).await?;
+            // As git writes a small fetch by default, whatever this machine's git says.
+            for (k, v) in [("fetch.unpackLimit", "100000"), ("fetch.fsckObjects", "false"), ("core.fsyncMethod", "fsync")] {
+                git_at(&hub, &mirror, &["config", k, v]).await?;
+            }
+            // A commit with a workflow, and 128 KiB besides that doesn't compress: more than the
+            // first 70,000 bytes.
+            std::fs::create_dir_all(work.join(".github/workflows"))?;
+            std::fs::write(work.join(".github/workflows/ci.yml"), "on: push\njobs:\n  t:\n    runs-on: local\n    steps:\n      - run: echo hi\n")?;
+            let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+            for i in 0..64 {
+                let mut noise = Vec::with_capacity(2048);
+                while noise.len() < 2048 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    noise.extend_from_slice(&x.to_le_bytes());
+                }
+                std::fs::write(work.join(format!("data{i:02}")), noise)?;
+            }
+            git_at(&hub, &work, &["add", "."]).await?;
+            git_at(&hub, &work, &["commit", "-qm", "a workflow"]).await?;
+            git_at(&hub, &work, &["push", "-q", &o, "main"]).await?;
+            let sha = String::from_utf8_lossy(&git_at(&hub, &work, &["rev-parse", "HEAD"]).await?).trim().to_owned();
+            let last = String::from_utf8_lossy(&git_at(&hub, &work, &["rev-parse", "HEAD:data63"]).await?).trim().to_owned();
+            let whole = git_at(&hub, &origin, &["archive", "--format=tar", &sha]).await?;
+            // The poller's fetch...
+            let fetching = crate::rt::spawn({
+                let (hub, repo) = (Arc::clone(&hub), repo.clone());
+                async move { sync_mirror(&hub, &repo).await }
+            });
+            // ...part-way: the commit is in the mirror, and not all it refers to.
+            let m = mirror.to_string_lossy().into_owned();
+            let until = Instant::now() + Duration::from_secs(30);
+            while run_git(&hub, &["-C", &m, "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT).await.is_err() {
+                anyhow::ensure!(Instant::now() < until, "the fetch never wrote {sha}");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            anyhow::ensure!(run_git(&hub, &["-C", &m, "cat-file", "-e", &last], LS_REMOTE_TIMEOUT).await.is_err(), "the fetch wrote its objects at once: nothing was caught part-way");
+            // The commit's archive, asked for now, isn't read from what the fetch has written so
+            // far: it comes once the fetch is done.
+            let mut reader = crate::rt::spawn({
+                let (hub, repo, sha) = (Arc::clone(&hub), repo.clone(), sha.clone());
+                async move {
+                    let rx = archive(&hub, &repo, &sha).await?;
+                    let mut out = Vec::new();
+                    while let Ok(b) = rx.recv().await {
+                        out.extend_from_slice(&b);
+                    }
+                    Ok::<Vec<u8>, anyhow::Error>(out)
+                }
+            });
+            let early = crate::rt::timeout(Duration::from_secs(2), &mut reader).await.ok();
+            std::fs::write(&go, b"")?;
+            let got = match early {
+                Some(r) => r,
+                None => reader.await,
+            }??;
+            fetching.await??;
+            anyhow::ensure!(got == whole, "{sha}'s archive, asked for while a fetch wrote it: {} bytes, not {}", got.len(), whole.len());
             Ok(())
         })
     }

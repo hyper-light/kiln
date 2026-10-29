@@ -235,6 +235,7 @@ fn volume_max() -> String {
 
 /// A workspace as it stands: the volume, its name and where it's mounted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Made {
     pub volume: String,
     pub name: String,

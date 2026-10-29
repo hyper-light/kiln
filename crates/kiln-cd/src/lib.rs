@@ -14,12 +14,16 @@
 //! - [`obj`]: object identity, parsing, structural hashes, compressed storage.
 //! - [`model`]: app configuration, sync options and policies (Argo CD's spellings).
 //! - [`health`]: resource health, rule for rule as Argo CD assesses it.
+//! - [`journey`]: where a commit stands on its way from landing to replanting (Ship's stand, line
+//!   and pips), from the records the server reads for it.
 //! - [`lua`]: Argo CD's Lua health checks for custom resources (its resource customizations).
 //! - [`providers`]: every platform beyond Kubernetes, as clusters of objects (docs/cd-targets.md).
 //! - [`diff`]: comparing desired and live objects by field ownership.
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
 //! - [`rollback`]: where a rollback goes (a deployment, a commit, a tag), and whether kiln goes
 //!   back on its own.
+//! - [`deploys`]: which deploys run at once, which wait and which a newer one supersedes
+//!   (docs/ci.md W28).
 //! - [`rollout`]: canary, linear and blue/green rollouts with checks, as a state machine.
 //! - [`engine`]: the controller.
 //! - [`tree`]: an app's resource tree: its objects and the live objects they own.
@@ -29,11 +33,13 @@
 
 pub mod apps;
 pub mod bench;
+pub mod deploys;
 pub mod diff;
 pub mod engine;
 pub mod git;
 pub mod harness;
 pub mod health;
+pub mod journey;
 pub mod jsonc;
 pub mod lua;
 pub mod kube;

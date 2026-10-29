@@ -216,3 +216,8 @@ html[data-motion="paused"] .st-out {
 html[data-motion="paused"] .st-in {
   animation: none;
 }
+
+/* A stand another page always shows (Ship's), at zero: there, but dimmed. */
+.st-item[data-zero] {
+  opacity: 0.38;
+}

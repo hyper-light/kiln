@@ -263,6 +263,12 @@ pub async fn kept(hub: &Hub, leg: &str, until: Option<i64>) -> anyhow::Result<()
     hub.store.call(move |c| Ok(c.execute("UPDATE jobs SET kept_until = ?2 WHERE id = ?1", params![leg, until]).map(|_| ())?)).await
 }
 
+/// Where a person's retry asked a leg to run (W05-R28), on its row for the API and the UI.
+pub async fn set_placement(hub: &Hub, leg: &str, p: &kiln_ci::sched::Placement) -> anyhow::Result<()> {
+    let (leg, json) = (leg.to_owned(), serde_json::to_string(p)?);
+    hub.store.call(move |c| Ok(c.execute("UPDATE jobs SET placement = ?2 WHERE id = ?1", params![leg, json]).map(|_| ())?)).await
+}
+
 /// When a leg was queued (Unix seconds).
 pub async fn queued_at(hub: &Hub, leg: &str) -> anyhow::Result<i64> {
     let leg = leg.to_owned();
@@ -289,6 +295,7 @@ pub async fn wait_reason(hub: &Hub, leg: &str, reason: &serde_json::Value) -> an
 
 /// A leg done for good.
 pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, outputs: Option<String>, error: Option<String>) -> anyhow::Result<()> {
+    let leg_id = leg.to_owned();
     let (leg, conclusion) = (leg.to_owned(), conclusion.to_owned());
     hub.store
         .call(move |c| {
@@ -304,6 +311,7 @@ pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, 
             Ok(())
         })
         .await?;
+    crate::observe::kiln::leg_finished(hub, &leg_id).await;
     // Its logs go into the search index (W19-R04).
     super::logsearch::kick();
     Ok(())
@@ -375,6 +383,7 @@ pub async fn summary(hub: &Hub, leg: &str, idx: u32, markdown: &str) -> anyhow::
 
 /// The run's end.
 pub async fn finish_run(hub: &Hub, run: &str, status: Status, conclusion: &str, error: Option<String>) -> anyhow::Result<()> {
+    let run_id = run.to_owned();
     let (run, conclusion) = (run.to_owned(), conclusion.to_owned());
     hub.store
         .call(move |c| {
@@ -386,7 +395,9 @@ pub async fn finish_run(hub: &Hub, run: &str, status: Status, conclusion: &str, 
             c.execute("UPDATE ci_plans SET done = 1 WHERE run_id = ?1", [&run])?;
             Ok(())
         })
-        .await
+        .await?;
+    crate::observe::kiln::run_ended(hub, &run_id).await;
+    Ok(())
 }
 
 /// One report the plan took (W05-R25), in the run's current attempt.

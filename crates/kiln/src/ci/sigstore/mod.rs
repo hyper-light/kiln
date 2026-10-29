@@ -718,6 +718,14 @@ fn identity_of(leaf: &X509Certificate<'_>) -> anyhow::Result<(String, String, BT
     Ok((issuer, subject, claims))
 }
 
+/// The OIDC issuer, the subject and Fulcio's claims by name that a certificate (DER) names, read
+/// as [`verify`] reads a bundle's: a CI leg's certificate from kiln's CA reads so too (docs/ci.md
+/// W27-R01).
+pub fn certificate_identity(der: &[u8]) -> anyhow::Result<(String, String, BTreeMap<&'static str, String>)> {
+    let (_, cert) = X509Certificate::from_der(der).map_err(|e| anyhow::anyhow!("not a certificate: {e}"))?;
+    identity_of(&cert)
+}
+
 // ------------------------------------------------------------------ GitHub's attestations
 
 /// A raw snappy block, decompressed: GitHub keeps attestations' bundles so (`bundle_url`). At
@@ -1156,6 +1164,45 @@ mod tests {
         let pre = precert_tbs(l.tbs_certificate.as_ref())?;
         assert!(pre.len() < l.tbs_certificate.as_ref().len());
         assert!(!pre.windows(SCT_LIST_OID.len()).any(|w| w == SCT_LIST_OID));
+        Ok(())
+    }
+
+    /// W27-R01: a CI leg's certificate from kiln's CA carries W10's claims for it in Fulcio's
+    /// extensions, which this verifier reads by Fulcio's names: kiln's issuer, the leg's kiln://
+    /// subject, its workflow's ref and digest, its repository, commit and ref, the event, the run.
+    #[test]
+    fn w27_r01_a_legs_certificate_reads_as_fulcios() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{Actor, Identity, fulcio};
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+        let github = json!({
+            "repository": "acme/app", "repository_id": 7, "repository_owner": "acme", "ref": "refs/heads/main", "sha": "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1",
+            "event_name": "push", "workflow_ref": "acme/app/.kiln/e2e.yaml@refs/heads/main", "workflow_sha": "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1",
+            "run_id": 812, "run_number": 812, "run_attempt": 1,
+        });
+        let f = kiln_ci::oidc::Facts { github: &github, trusted: true, executor: "host", runner: "fedora-2", job: "01a17a02", ..kiln_ci::oidc::Facts::default() };
+        let claims = kiln_ci::oidc::claims(&f, "https://kiln.example/oidc", "https://kiln.example/oidc", "j", 1_790_000_000, 300, None);
+        let facts = fulcio::from_claims(&claims, "https://kiln.example");
+        let leg = Identity::new(
+            pki.organization(),
+            Actor::Leg { enrolled_by: "ada".into(), machine: "fedora-2".into(), instance: "01a174ed".into(), run: 812, attempt: 1, leg: "e2e".into() },
+        );
+        let (csr, _key) = crate::pki::make_csr("leg")?;
+        let facts: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
+        let pem = pki.issue_identity(&csr, &leg, &facts, ::time::Duration::hours(1))?;
+        let (issuer, subject, claims) = certificate_identity(&crate::pki::der_of(&pem)?)?;
+        assert_eq!(issuer, "https://kiln.example/oidc");
+        assert_eq!(subject, "kiln://hyper-light/person/ada/machine/fedora-2/instance/01a174ed/run/812/attempt/1/leg/e2e");
+        let claim = |k: &str| claims.get(k).map(String::as_str);
+        assert_eq!(claim("build_signer_uri"), Some("https://kiln.example/acme/app/.kiln/e2e.yaml@refs/heads/main"));
+        assert_eq!(claim("build_signer_digest"), Some("4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"));
+        assert_eq!(claim("source_repository_uri"), Some("https://kiln.example/acme/app"));
+        assert_eq!(claim("source_repository_digest"), Some("4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"));
+        assert_eq!(claim("source_repository_ref"), Some("refs/heads/main"));
+        assert_eq!(claim("build_config_uri"), Some("https://kiln.example/acme/app/.kiln/e2e.yaml@refs/heads/main"));
+        assert_eq!(claim("build_trigger"), Some("push"));
+        assert_eq!(claim("runner_environment"), Some("self-hosted"));
+        assert_eq!(claim("run_invocation_uri"), Some("https://kiln.example/acme/app/actions/runs/812/attempts/1"));
         Ok(())
     }
 }

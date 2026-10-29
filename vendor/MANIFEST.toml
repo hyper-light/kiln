@@ -125,3 +125,43 @@ take = [
   "crates/hyper-transport",
 ]
 own = ["UPSTREAM.md"]
+
+# vorpal, the search across a change (docs/ci.md W26-R07): its pattern engine (ast-grep's, with the
+# regex literal analysis and the trigram primitive), its outline (the definition each hit sits in),
+# its trigram store, and the tree-sitter runtime and grammars they parse with. Its release v0.10.2;
+# the grammars of the languages kiln reads structurally, of the 48 vorpal carries.
+[projects.vorpal]
+kind = "git"
+repository = "https://github.com/hyper-light/vorpal"
+commit = "4420a4dfd7b96854784431ff899bbdd35510e07e"
+path = "vendor/vorpal"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "crates/canonical",
+  "crates/config",
+  "crates/core",
+  "crates/graph",
+  "crates/kg",
+  "crates/language",
+  "crates/mem",
+  "crates/outline",
+  "crates/segment",
+  "vendor/tree-sitter",
+  "grammars/tree-sitter-bash",
+  "grammars/tree-sitter-c",
+  "grammars/tree-sitter-cpp",
+  "grammars/tree-sitter-css",
+  "grammars/tree-sitter-go",
+  "grammars/tree-sitter-html",
+  "grammars/tree-sitter-java",
+  "grammars/tree-sitter-javascript",
+  "grammars/tree-sitter-json",
+  "grammars/tree-sitter-md",
+  "grammars/tree-sitter-python",
+  "grammars/tree-sitter-rust",
+  "grammars/tree-sitter-toml-ng",
+  "grammars/tree-sitter-typescript",
+  "grammars/tree-sitter-yaml",
+]
+own = ["UPSTREAM.md"]

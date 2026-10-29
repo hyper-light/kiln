@@ -3,6 +3,7 @@
  * derivation and the view alike.
  */
 import type { ToolCall } from "@/api/harness";
+import { answerOf, isKilnCall, type KilnCall } from "./page-of";
 
 /** A page streamed from the agent's machine, as its `show_live` call answered
  *  (`crate::harness::streams`). */
@@ -46,20 +47,22 @@ export function typedUrl(typed: string): string {
   return `https://duckduckgo.com/?q=${encodeURIComponent(t)}`;
 }
 
-/** Whether a tool call is an agent showing a live page (Claude Code's and Codex's names for kiln's tool). */
-export const isShowLive = (c: Pick<ToolCall, "name">): boolean => /^mcp__kiln(?:[-_]reach)?__show_live$/.test(c.name);
+/** Whether a tool call is an agent showing a live page (kiln's `show_live`). */
+export const isShowLive = (c: KilnCall): boolean => isKilnCall(c, "show_live", (x) => liveOf(x) !== null);
 
-/** The stream a `show_live` call opened, from its answer (one line of JSON, `crate::reach::shown`). */
+/** The stream a `show_live` call opened, from kiln's answer to it (`answerOf`). */
 export function liveOf(c: Pick<ToolCall, "output">): LiveStream | null {
-  if (!c.output) return null;
-  try {
-    const s = (JSON.parse(c.output) as { kiln_stream?: Partial<LiveStream> }).kiln_stream;
-    if (!s || typeof s.id !== "string" || !/^[0-9a-f]{32}$/.test(s.id) || typeof s.session !== "string") return null;
-    const str = (v: unknown) => (typeof v === "string" && v ? v : undefined);
-    return { id: s.id, session: s.session, url: typeof s.url === "string" ? s.url : "", title: typeof s.title === "string" && s.title ? s.title : (s.url ?? "A live page"), engine: str(s.engine), device: str(s.device) };
-  } catch {
-    return null;
-  }
+  const s = answerOf(c.output, "kiln_stream") as Partial<LiveStream> | null;
+  if (!s || typeof s.id !== "string" || !/^[0-9a-f]{32}$/.test(s.id) || typeof s.session !== "string") return null;
+  const str = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+  return {
+    id: s.id,
+    session: s.session,
+    url: typeof s.url === "string" ? s.url : "",
+    title: typeof s.title === "string" && s.title ? s.title : (s.url ?? "A live page"),
+    engine: str(s.engine),
+    device: str(s.device),
+  };
 }
 
 /** A chunk as the server relays it (`crate::browser::stream::frame`): kind, flags, timestamp (µs),

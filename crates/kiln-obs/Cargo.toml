@@ -1,0 +1,137 @@
+[package]
+name = "kiln-obs"
+description = "kiln's observability engine: columnar time series, logs and events, the query language, monitors' rules (docs/observe.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = "2.0.21"
+# std's own SwissTable, already in kiln's tree: its `HashTable` keeps every key in the store's
+# arenas, no allocation a key.
+hashbrown = { version = "0.17.1", default-features = false }
+# Series fingerprints (`batch::fingerprint`): stable across builds and nodes, already in kiln's tree.
+sha2 = "0.11.1"
+# Replication (`docs/observe.md` §5): the store is a hyper-durable state machine on a hyper-log
+# group: hyper-raft's crates as kiln vendors them (the root manifest's `[patch.crates-io]`).
+hyper-raft = "=0.1.0"
+hyper-durable = "=0.1.0"
+hyper-log = "=0.1.0"
+hyper-block = "=0.1.0"
+# Calendar rollups' and calendar_shift's timezones (`query::calendar`): the tz database bundled in
+# the binary, not the machine's, so every machine answers alike; kiln-ci's, already in kiln's tree.
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# LLM observability's price catalog (`llm::prices`): genai-prices' JSON read once as it starts, and
+# its models' patterns; kiln's, already in kiln's tree (the benches read NAB's labels and run
+# Loghub's preprocessing with them too).
+regex = "1"
+serde_json = "1.0.154"
+# The store's lock (`lock`): a waiting writer let in before readers that keep coming, on every
+# platform (std's lock does so on Linux alone); kiln's, already in kiln's tree.
+parking_lot = "0.12.5"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# Only to measure LZ4 against deflate (benches/lz4.rs); kiln has it already.
+flate2 = "1.1.10"
+hyper-measure = "=0.1.0"
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "errors"
+harness = false
+
+[[bench]]
+name = "store"
+harness = false
+
+[[bench]]
+name = "query"
+harness = false
+
+[[bench]]
+name = "lz4"
+harness = false
+
+[[bench]]
+name = "logs"
+harness = false
+
+[[bench]]
+name = "archive"
+harness = false
+
+[[bench]]
+name = "logmetrics"
+harness = false
+
+[[bench]]
+name = "wide"
+harness = false
+
+[[bench]]
+name = "beside"
+harness = false
+
+[[bench]]
+name = "statsd"
+harness = false
+
+[[bench]]
+name = "promwrite"
+harness = false
+
+[[bench]]
+name = "traces"
+harness = false
+
+[[bench]]
+name = "filters"
+harness = false
+
+[[bench]]
+name = "zstd"
+harness = false
+
+[[bench]]
+name = "hosts"
+harness = false
+
+[[bench]]
+name = "group"
+harness = false
+
+[[bench]]
+name = "otlp"
+harness = false
+
+[[bench]]
+name = "nab"
+harness = false
+
+[[bench]]
+name = "loghub"
+harness = false
+
+[[bench]]
+name = "tail"
+harness = false
+
+[[bench]]
+name = "m4"
+harness = false
+
+[[bench]]
+name = "flame"
+harness = false
+
+[[bench]]
+name = "jfr"
+harness = false
+
+[lints]
+workspace = true

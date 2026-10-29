@@ -141,6 +141,11 @@ async fn unknown_labels(hub: &Hub, repo: &Repo, w: &wf::Workflow) -> Vec<Diag> {
     let rules = super::routing::sources(hub).await.effective();
     let runners = hub.store.agents().await.unwrap_or_default();
     let pools = super::pools::specs(hub).await;
+    unknown_in(w, &repo.name, &rules, &runners, &pools)
+}
+
+/// [`unknown_labels`] against these rules, runners and pools.
+pub(crate) fn unknown_in(w: &wf::Workflow, repo: &str, rules: &[routing::Rule], runners: &[crate::store::AgentRow], pools: &[kiln_ci::sched::pools::PoolSpec]) -> Vec<Diag> {
     let carried = |label: &str, alone: bool| {
         runners.iter().any(|a| (alone && a.name.eq_ignore_ascii_case(label)) || carries(a).iter().any(|x| x.eq_ignore_ascii_case(label)))
             || pools.iter().any(|p| p.labels.iter().any(|x| x.eq_ignore_ascii_case(label)))
@@ -161,13 +166,13 @@ async fn unknown_labels(hub: &Hub, repo: &Repo, w: &wf::Workflow) -> Vec<Diag> {
                 job: j.id.clone(),
                 job_name: j.name.as_ref().map_or_else(|| j.id.clone(), |n| n.src.clone()),
                 workflow: w.path.clone(),
-                repo: repo.name.clone(),
+                repo: repo.to_owned(),
                 event: event.clone(),
                 labels: asked.clone(),
                 ..LegRoute::default()
             };
             // A rule that can't be read routes nothing: the leg's own explanation says why.
-            let Ok(req) = routing::resolve(&leg, &rules) else { continue };
+            let Ok(req) = routing::resolve(&leg, rules) else { continue };
             left = Some(left.map_or(req.labels.clone(), |l| l.into_iter().filter(|x| req.labels.contains(x)).collect()));
         }
         let Some(left) = left else { continue };
@@ -595,4 +600,46 @@ pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming, started_by: O
     let ask: NamedDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
     super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runner(name: &str, labels: &[&str], os: &str, arch: &str) -> crate::store::AgentRow {
+        crate::store::AgentRow {
+            name: name.into(),
+            labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+            slots: 1,
+            hostname: name.into(),
+            os: os.into(),
+            arch: arch.into(),
+            version: String::new(),
+            ephemeral: false,
+            connected: true,
+            last_seen: 0,
+            enrolled_at: 0,
+        }
+    }
+
+    /// The labels `KCI6007` finds no runner, rule or pool for, in `runs-on: [..labels]`.
+    fn unknown(labels: &str, runners: &[crate::store::AgentRow]) -> Vec<String> {
+        let text = format!("name: w\non:\n  push: {{ branches: [main] }}\njobs:\n  j:\n    runs-on: [{labels}]\n    steps:\n      - run: true\n");
+        let (w, _) = wf::parse_workflow(".kiln/w.yaml", &text, Dialect::Kiln);
+        w.map(|w| unknown_in(&w, "acme/app", &super::super::routing::defaults(false), runners, &[]).into_iter().map(|d| d.message).collect()).unwrap_or_else(|| vec!["no model".into()])
+    }
+
+    /// W05-R21 in `KCI6007`: `linux` is carried by a Linux runner whose only Linux label is
+    /// GitHub's implicit `Linux`, `Linux` by one labelled `linux`; a Mac carries neither.
+    #[test]
+    fn w05_r21_kci6007_matches_labels_in_any_case() {
+        let implicit = runner("adacachy", &["baremetal", "bench", "local"], "linux", "x86_64");
+        let labelled = runner("fedora", &["linux"], "linux", "x86_64");
+        let mac = runner("mac", &["baremetal"], "macos", "aarch64");
+        assert_eq!(unknown("baremetal, linux", std::slice::from_ref(&implicit)), Vec::<String>::new());
+        assert_eq!(unknown("Linux", std::slice::from_ref(&labelled)), Vec::<String>::new());
+        assert_eq!(unknown("BAREMETAL, LINUX", std::slice::from_ref(&implicit)), Vec::<String>::new());
+        let on_mac = unknown("baremetal, linux", std::slice::from_ref(&mac));
+        assert!(on_mac.len() == 1 && on_mac.iter().all(|m| m.contains("`linux`")), "{on_mac:?}");
+    }
 }

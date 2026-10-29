@@ -198,7 +198,7 @@ pub async fn on_build(hub: &Hub, machine: &str, caps: u32) {
     if caps & CAP_FRONT_DOOR != 0 {
         push(hub, machine, None, None).await;
     }
-    hub.emit(&json!({ "type": "front_door", "runner": machine }));
+    hub.emit(&crate::wire::events::ServerEvent::FrontDoor { runner: machine.to_string() });
 }
 
 /// What the process that runs a machine's front door can do, once that is known: unknown from
@@ -239,7 +239,7 @@ pub async fn on_status(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
         (changed, tailnet_changed)
     };
     if changed {
-        hub.emit(&json!({ "type": "front_door", "runner": machine }));
+        hub.emit(&crate::wire::events::ServerEvent::FrontDoor { runner: machine.to_string() });
     }
     if tailnet_changed {
         hub.tailnet.wake.notify();
@@ -374,7 +374,7 @@ pub async fn put(hub: &Hub, name: &str, req: Request) -> Answer {
     hub.store.audit("admin".into(), "front_door.update".into(), format!("{name}: {}", settings.summary())).await;
     push(hub, name, None, None).await;
     hub.tailnet.wake.notify();
-    hub.emit(&json!({ "type": "front_door", "runner": name }));
+    hub.emit(&crate::wire::events::ServerEvent::FrontDoor { runner: name.to_string() });
     Ok(srv::json(StatusCode::OK, &view(hub, name).await))
 }
 
@@ -421,7 +421,7 @@ pub async fn upload(hub: &Hub, name: &str, req: Request) -> Answer {
     hub.store
         .audit("admin".into(), "front_door.cert".into(), format!("{name}: uploaded a certificate for {} (sha256 {short}…, until {})", info.names.join(", "), date(info.not_after)))
         .await;
-    hub.emit(&json!({ "type": "front_door", "runner": name }));
+    hub.emit(&crate::wire::events::ServerEvent::FrontDoor { runner: name.to_string() });
     Ok(srv::json(StatusCode::OK, &json!({ "cert": info, "front_door": view(hub, name).await })))
 }
 
@@ -455,7 +455,7 @@ pub async fn renew(hub: &Hub, name: &str) -> Answer {
         return Err(fail(StatusCode::BAD_GATEWAY, format!("{name} could not be reached; try again")));
     }
     hub.store.audit("admin".into(), "front_door.renew".into(), format!("{name}: asked for a new key and self-signed certificate")).await;
-    hub.emit(&json!({ "type": "front_door", "runner": name }));
+    hub.emit(&crate::wire::events::ServerEvent::FrontDoor { runner: name.to_string() });
     Ok(srv::json(StatusCode::OK, &view(hub, name).await))
 }
 

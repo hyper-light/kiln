@@ -800,6 +800,13 @@ pub fn joinable(found: Vec<Instance>) -> Vec<Instance> {
 
 pub fn say_stderr(msg: &str) {
     use std::io::Write as _;
+    // While `kiln setup` shows what's said (`install::tell`), it shows this too.
+    if let Some(t) = crate::install::teller() {
+        for line in msg.lines() {
+            t(crate::install::Said::Line(line));
+        }
+        return;
+    }
     let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
@@ -1032,6 +1039,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             instance: None,
             config: None,
             reach: Some(true),
+            observe: true,
             outpost: false,
             declared: crate::runner::probe::Declared::default(),
         }));

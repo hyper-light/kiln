@@ -248,7 +248,7 @@ export default function Releases() {
     <div className="container-console page cd-page">
       <title>Releases · kiln</title>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases" }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases" }]} />
         <div className="rel-head-row">
           <h1 className="cd-title">Releases</h1>
           <div className="rel-head-actions">

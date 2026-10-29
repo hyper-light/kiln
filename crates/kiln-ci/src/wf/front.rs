@@ -269,6 +269,18 @@ impl Fe<'_> {
                 }
                 "secrets" => wf.secrets = self.secret_decls(v, "secrets"),
                 "supersede" => wf.supersede = Some(self.yval(v)),
+                "coalesce" | "cadence" => {
+                    let y = self.yval(v);
+                    let (c, d) = if k == "coalesce" { (Some(&y), None) } else { (None, Some(&y)) };
+                    if let Err(e) = crate::sched::admit::Spec::parse(c, d) {
+                        self.err("KCI1015", e, v.range, &k);
+                    }
+                    if k == "coalesce" {
+                        wf.coalesce = Some(y);
+                    } else {
+                        wf.cadence = Some(y);
+                    }
+                }
                 "routing" => wf.routing_infer = v.get("infer").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)),
                 "run-env" => wf.run_env = self.bool(v, "run-env").unwrap_or(false),
                 "kiln" => {

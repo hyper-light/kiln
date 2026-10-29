@@ -17,11 +17,12 @@ import { cn } from "@/lib/utils";
 import { attachedPreview, useAttachments, type Attachments } from "./controls";
 import type { ReplyTarget } from "./timeline";
 import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, slashAt, type Reply } from "./palette";
-import { commandNames, Marked } from "./marks";
+import { commandNames } from "./marks";
+import { ComposeField } from "./compose-field";
 import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
-import { useDrafts, useHeld, useSendMode, type Held } from "./state";
+import { useDraft, useHeld, useSendMode, type Held } from "./state";
 import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
 
 export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
@@ -404,9 +405,7 @@ export function Composer({
   replyTo?: ReplyTarget | null;
   onClearReply?: () => void;
 }) {
-  const text = useDrafts((s) => s.drafts[agent] ?? "");
-  const setDraft = useDrafts((s) => s.setDraft);
-  const setText = React.useCallback((t: string | ((was: string) => string)) => setDraft(agent, typeof t === "function" ? t(useDrafts.getState().drafts[agent] ?? "") : t), [agent, setDraft]);
+  const [text, setText] = useDraft(agent);
   const chosen = useSendMode((s) => s.mode);
   const setMode = useSendMode((s) => s.setMode);
   // The connection's down: what needs the server (the mic, commands' replies) waits for it.
@@ -431,8 +430,6 @@ export function Composer({
   const shownQueue = toSub ? (toSub.queue ?? NO_QUEUE) : queue;
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
   const ta = React.useRef<HTMLTextAreaElement | null>(null);
-  /** The marked copy of the text under the field (its own text is clear). */
-  const mirror = React.useRef<HTMLDivElement>(null);
   // Where the caret is, as the field last said; null: at the end (text put in, not typed).
   const [caret, setCaret] = React.useState<number | null>(null);
   const features = meta?.features ?? NO_FEATURES;
@@ -469,25 +466,6 @@ export function Composer({
       };
     },
     [store, agent],
-  );
-
-  // Grow with the text (measured as each change is shown) up to the stylesheet's most lines, ten,
-  // or four on a phone; past that it scrolls inside, so a long message never pushes the
-  // conversation off the screen. Words added can only make it taller, which its scroll height says
-  // as it is; only words taken away let it shrink, so only then is it set back to measure: typing
-  // never makes the whole page lay itself out again.
-  const lengthWas = React.useRef(0);
-  const grow = React.useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      ta.current = el;
-      if (!el) return;
-      if (text.length < lengthWas.current || !text) el.style.height = "auto";
-      lengthWas.current = text.length;
-      const h = `${el.scrollHeight}px`;
-      if (el.style.height !== h) el.style.height = h;
-      if (mirror.current) mirror.current.scrollTop = el.scrollTop;
-    },
-    [text],
   );
 
   // Commands, while a name is typed after "/" (at the start of the message or anywhere after a
@@ -786,45 +764,36 @@ export function Composer({
         {canOverride && (withOpen || override.model || override.effort) && (
           <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />
         )}
-        <div className="cp-field">
-          <div ref={mirror} className="hx-compose-input cp-mirror" aria-hidden="true">
-            <Marked text={text} names={names} />
-          </div>
-          <textarea
-            ref={grow}
-            className="hx-compose-input cp-input"
-            rows={1}
-            value={text}
-            placeholder={
-              !reachable
-                ? `${disabled ? "Not connected" : `${machine || "Its machine"} is offline`}: what you send waits here and goes once ${away}`
-                : paused
-                  ? `Queue a message: it goes once ${paused === "auto" ? "the limit resets" : "you resume it"}`
-                  : toSub
-                    ? subagentPlaceholder(running ? mode : null, toSub.via === "parent")
-                    : toMain
-                      ? "Message the main agent"
-                      : running
-                        ? mode === "steer"
-                          ? "Steer it — it reads this at its next step"
-                          : mode === "now"
-                            ? approvals > 0
-                              ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
-                              : "Stop and say…"
-                            : "Queue a message for when it finishes"
-                        : "Tell the agent what to do"
-            }
-            onChange={(e) => write(e.target.value, e.target.selectionStart)}
-            onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
-            onScroll={(e) => {
-              if (mirror.current) mirror.current.scrollTop = e.currentTarget.scrollTop;
-            }}
-            onKeyDown={onKeyDown}
-            aria-label={toSub ? "Message to the subagent" : "Message to the agent"}
-            enterKeyHint="send"
-            autoCapitalize="sentences"
-          />
-        </div>
+        <ComposeField
+          text={text}
+          names={names}
+          field={ta}
+          placeholder={
+            !reachable
+              ? `${disabled ? "Not connected" : `${machine || "Its machine"} is offline`}: what you send waits here and goes once ${away}`
+              : paused
+                ? `Queue a message: it goes once ${paused === "auto" ? "the limit resets" : "you resume it"}`
+                : toSub
+                  ? subagentPlaceholder(running ? mode : null, toSub.via === "parent")
+                  : toMain
+                    ? "Message the main agent"
+                    : running
+                      ? mode === "steer"
+                        ? "Steer it — it reads this at its next step"
+                        : mode === "now"
+                          ? approvals > 0
+                            ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                            : "Stop and say…"
+                          : "Queue a message for when it finishes"
+                      : "Tell the agent what to do"
+          }
+          onChange={(e) => write(e.target.value, e.target.selectionStart)}
+          onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
+          onKeyDown={onKeyDown}
+          aria-label={toSub ? "Message to the subagent" : "Message to the agent"}
+          enterKeyHint="send"
+          autoCapitalize="sentences"
+        />
         <div className="cp-bar">
           {canAttach && (
             <>

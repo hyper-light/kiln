@@ -24,5 +24,5 @@ export function SessionCrumbs({ session, more = [] }: { session?: string | null;
         },
       ]
     : [];
-  return <Crumbs index={6} items={[{ label: "Agents", to: "/agents" }, ...back, ...more]} />;
+  return <Crumbs index={5} items={[{ label: "Agents", to: "/agents" }, ...back, ...more]} />;
 }

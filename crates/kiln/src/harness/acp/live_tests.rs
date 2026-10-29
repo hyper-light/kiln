@@ -15,7 +15,7 @@ impl Drop for Running {
 
 fn open(spec: Spec, dir: &std::path::Path) -> anyhow::Result<Running> {
     let (tx, _rx) = async_channel::unbounded();
-    let files = Files { dir: dir.join("attachments"), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_: String| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_: String, _: bool| Box::pin(async { Ok(()) })), settle: Arc::new(|_: String, _: String, _: bool| Box::pin(async { Ok(None) })) };
+    let files = Files { dir: dir.join("attachments"), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_: String| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_: String, _: bool| Box::pin(async { Ok(()) })), settle: Arc::new(|_: String, _: String, _: bool| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}) };
     Ok(Running(session::start(crate::util::new_id(), spec, tx, Arc::new(|| {}), files)?))
 }
 
@@ -27,13 +27,14 @@ async fn until(s: &Session, label: &str, ready: impl Fn(&Core) -> bool + Send + 
                 if ready(&core) {
                     return Ok(());
                 }
-                anyhow::ensure!(core.state.status != Status::Exited, "Devin exited before {label}: {:?}", core.state.exit);
+                // A harness ended for a switch hasn't exited: the next one starts.
+                anyhow::ensure!(core.state.status != Status::Exited || core.state.switching.is_some(), "{} exited before {label}: {:?}", core.harness.as_deref().unwrap_or("the agent"), core.state.exit);
             }
             crate::rt::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Devin timed out before {label}"))?
+    .map_err(|_| anyhow::anyhow!("{} timed out before {label}", s.core.lock().harness.clone().unwrap_or_else(|| "the agent".into())))?
 }
 
 fn send(s: &Session, id: &str, text: &str) {
@@ -160,6 +161,85 @@ fn installed_devin_steers_running_and_queued_messages_into_one_turn() -> anyhow:
         s.close();
         until(s, "closing the steered session", |c| c.state.status == Status::Exited).await?;
         Ok(())
+    })
+}
+
+/// A conversation goes from Claude Code into Devin and back, carried over each way: Devin is given
+/// it in words with the first message it gets, and Claude Code a transcript kiln writes from its
+/// timeline (Devin's turn in it too); the permission mode at the same latitude.
+#[test]
+#[ignore = "requires installed, signed-in Claude Code and Devin CLIs"]
+fn installed_claude_and_devin_carry_one_conversation_both_ways() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config/devin");
+        std::fs::create_dir_all(&config)?;
+        // Imports could launch the user's configured MCP servers.
+        std::fs::write(config.join("config.json"), serde_json::json!({
+            "auto_update": false, "notify": "never",
+            "read_config_from": {"agents_standard": false, "cursor": false, "windsurf": false, "claude": false, "copilot": false, "opencode": false, "zed": false}
+        }).to_string())?;
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd)?;
+        let cwd = cwd.to_string_lossy().into_owned();
+        let spec = Spec {
+            kind: "claude".into(), model: Some("haiku".into()), mode: Some("default".into()), cwd: Some(cwd.clone()),
+            env: vec![("XDG_CONFIG_HOME".into(), dir.path().join("config").to_string_lossy().into_owned())],
+            reach: Some("off".into()), ..Spec::default()
+        };
+        // Claude Code's records of it (its own, and the one kiln writes going back) go with the test.
+        let projects = crate::harness::handoff::claude_project_dir(&crate::harness::transcript::config_dir(&spec.env), &cwd);
+        let last = |c: &Core| c.events().rev().find_map(|e| match &e.body {
+            Body::Assistant { text, streaming: false } => Some((e.by.clone().unwrap_or_default(), text.clone())),
+            _ => None,
+        });
+        let switched = |c: &Core, to: &str| c.events().any(|e| e.id.starts_with("harness-switch:") && matches!(&e.body, Body::Notice { text, .. } if text.starts_with("Now ") && text.contains(to)));
+        // Claude Code's process last started: it writes its last records as it ends.
+        let claude = parking_lot::Mutex::new(None::<u32>);
+        let result = async {
+            let running = open(spec, dir.path())?;
+            let s = &running.0;
+            until(s, "Claude Code starting", |c| c.state.status == Status::Idle).await?;
+            *claude.lock() = *s.pid.lock();
+            send(s, "remember", "Remember this word for later: PERIWINKLE-42. Reply with only OK. Do not use tools or access files.");
+            until(s, "Claude Code's reply", |c| c.state.delivery.get("remember") == Some(&Delivery::Completed) && c.state.status == Status::Idle).await?;
+            // Into Devin, with its own default model.
+            assert!(s.command(Command::SetModel { model: String::new(), kind: Some("devin".into()) }));
+            until(s, "going on in Devin", |c| c.harness.as_deref() == Some("Devin") && c.state.status == Status::Idle && c.state.harness_session.is_some()).await?;
+            {
+                let c = s.core.lock();
+                anyhow::ensure!(switched(&c, "Devin (its default model) — the conversation carried over, in words with the next message"), "no line between the two");
+                assert_eq!(c.state.mode, "ask", "Claude Code's default asks, and so does Devin's Ask");
+            }
+            send(s, "recall", "What word did I ask you to remember? Reply with only that word. Do not use tools or access files.");
+            until(s, "Devin's reply", |c| c.state.delivery.get("recall") == Some(&Delivery::Completed) && c.state.status == Status::Idle).await?;
+            let (by, text) = last(&s.core.lock()).unwrap_or_default();
+            anyhow::ensure!(by == "Devin" && text.contains("PERIWINKLE-42"), "Devin answered {text:?} (by {by:?})");
+            // And back into Claude Code, from kiln's timeline.
+            assert!(s.command(Command::SetModel { model: "haiku".into(), kind: Some("claude".into()) }));
+            until(s, "going on in Claude Code again", |c| c.harness.as_deref() == Some("Claude Code") && c.state.status == Status::Idle && switched(c, "(Claude Code) — the conversation carried over")).await?;
+            *claude.lock() = *s.pid.lock();
+            send(s, "again", "Say that word once more. Reply with only that word. Do not use tools or access files.");
+            until(s, "Claude Code's reply again", |c| c.state.delivery.get("again") == Some(&Delivery::Completed) && c.state.status == Status::Idle).await?;
+            let (by, text) = last(&s.core.lock()).unwrap_or_default();
+            anyhow::ensure!(by == "Claude Code" && text.contains("PERIWINKLE-42"), "Claude Code answered {text:?} (by {by:?})");
+            s.close();
+            until(s, "closing", |c| c.state.status == Status::Exited).await
+        }
+        .await;
+        let ending = *claude.lock();
+        if let Some(pid) = ending {
+            let _ = crate::rt::timeout(Duration::from_secs(10), async {
+                while crate::os::pid_alive(pid) {
+                    crate::rt::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+        }
+        if projects.file_name().is_some_and(|n| n.to_string_lossy().contains("work")) {
+            let _ = std::fs::remove_dir_all(&projects);
+        }
+        result
     })
 }
 

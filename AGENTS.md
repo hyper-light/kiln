@@ -84,6 +84,7 @@ web UI embedded. Read this before you change it, then the documents it points to
 | `crates/kiln-cd` | the deployments' engine (`docs/cd.md`) |
 | `crates/kiln-seams` | the seams to other products, with simulators and conformance suites |
 | `crates/kiln-http` | HTTP/1.1 and HTTP/2 on hyper-rt (`docs/http.md`) |
+| `crates/kiln-search` | the search across a change: kiln-seams' `Search` on vorpal (`vendor/vorpal`) |
 | `ui/` | the web UI (TanStack Start), embedded in the binary |
 | `docs/` | how each part works: start with `docs/architecture.md` |
 | `vendor/` | vendored projects (`vendor/MANIFEST.toml`, `docs/vendoring.md`) |

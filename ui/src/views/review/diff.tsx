@@ -1,6 +1,6 @@
 /**
  * One file of a diff under review (W14-R06): its header (where it is, how it changed, viewed), and
- * its hunks, unified or side by side, syntax-highlighted with the editor's grammars, the words that
+ * its hunks, unified or side by side, syntax-highlighted (tree-sitter, lib/syntax), the words that
  * changed in an edited line picked out, blocks that moved marked with where they went, unchanged
  * runs folded, and threads in place under the lines they're about. A line's number is where a
  * comment starts: click it, shift-click another to take a range.
@@ -10,14 +10,15 @@
  */
 import * as React from "react";
 import { ChevronRight, MessageSquarePlus } from "lucide-react";
-import type { Parser } from "@lezer/common";
 import type { Hunk } from "@/api/harness";
 import { reviewApi, whoSaid, type ChangedFile, type Thread } from "@/api/review";
 import { Button } from "@/components/ui/button";
 import { relativeTime } from "@/lib/format";
+import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
+import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { hunkOf, type Line, type Seg, type Span } from "@/views/harness/diff";
-import { highlightLines, parserFor, type Tok } from "./highlight";
-import { ignoringWhitespace, isImage, languageOf, placeOf, type MovedTo, type PatchFile, type Place } from "./patch";
+import { ignoringWhitespace, isImage, placeOf, type MovedTo, type PatchFile, type Place } from "./patch";
+import "@/components/code/syntax.css";
 
 /** Unchanged lines kept beside a change when a run folds; fewer hidden than MIN_FOLD aren't worth a control. */
 const KEEP = 3;
@@ -92,10 +93,15 @@ function pieces(text: string, toks: Tok[] | undefined, marks: Span[] | undefined
   return out;
 }
 
-function Code({ text, toks, marks }: { text: string; toks?: Tok[]; marks?: Span[] }) {
-  if (!text) return <code className="rv-code">{"​"}</code>;
+function Code({ text, toks, marks, onClick }: { text: string; toks?: Tok[]; marks?: Span[]; onClick?: React.MouseEventHandler<HTMLElement> }) {
+  if (!text)
+    return (
+      <code className="rv-code" onClick={onClick}>
+        {"​"}
+      </code>
+    );
   return (
-    <code className="rv-code">
+    <code className="rv-code" onClick={onClick}>
       {pieces(text, toks, marks).map((p) => {
         const s = text.slice(p.s, p.e);
         const cls = [p.cls, p.mark ? "rv-mark" : ""].filter(Boolean).join(" ");
@@ -111,11 +117,11 @@ function Code({ text, toks, marks }: { text: string; toks?: Tok[]; marks?: Span[
   );
 }
 
-/** Each side's tokens by line number, for one hunk. */
-function tokensOf(parser: Parser | null, h: Hunk): { old: Map<number, Tok[]>; neu: Map<number, Tok[]> } {
+/** Each side's tokens by line number, for one hunk: each side read as one piece of code, so strings and comments over lines read right. */
+function tokensOf(hl: Highlight | null, h: Hunk): { old: Map<number, Tok[]>; neu: Map<number, Tok[]> } {
   const old = new Map<number, Tok[]>();
   const neu = new Map<number, Tok[]>();
-  if (!parser) return { old, neu };
+  if (!hl) return { old, neu };
   const oldLines: string[] = [];
   const oldNums: number[] = [];
   const newLines: string[] = [];
@@ -135,8 +141,8 @@ function tokensOf(parser: Parser | null, h: Hunk): { old: Map<number, Tok[]>; ne
       newNums.push(n++);
     }
   }
-  highlightLines(parser, oldLines).forEach((toks, i) => old.set(oldNums[i] ?? -1, toks));
-  highlightLines(parser, newLines).forEach((toks, i) => neu.set(newNums[i] ?? -1, toks));
+  if (oldLines.length) hl(oldLines.join("\n"))?.forEach((toks, i) => old.set(oldNums[i] ?? -1, toks));
+  if (newLines.length) hl(newLines.join("\n"))?.forEach((toks, i) => neu.set(newNums[i] ?? -1, toks));
   return { old, neu };
 }
 
@@ -157,7 +163,6 @@ export function FileDiff(p: FileProps) {
   const { file, meta } = p;
   const [open, setOpen] = React.useState(!(meta?.generated ?? false) && !(meta?.viewed ?? false));
   const viewed = meta?.viewed ?? false;
-  const lang = languageOf(file.path);
   const added = meta?.added ?? file.hunks.reduce((a, h) => a + h.lines.filter((l) => l.startsWith("+")).length, 0);
   const deleted = meta?.deleted ?? file.hunks.reduce((a, h) => a + h.lines.filter((l) => l.startsWith("-")).length, 0);
   const outdated = p.threads.filter((t) => t.start_line != null && !anchorOf(t, p.version));
@@ -222,22 +227,13 @@ export function FileDiff(p: FileProps) {
             <BinaryBody p={p} />
           ) : file.hunks.length === 0 ? (
             <p className="rv-sub rv-pad">{file.modeChange ? "Only its mode changed." : file.status === "renamed" ? "Moved as it was." : "No line changes."}</p>
-          ) : lang ? (
-            <React.Suspense fallback={<Hunks p={p} parser={null} />}>
-              <Highlighted lang={lang} p={p} />
-            </React.Suspense>
           ) : (
-            <Hunks p={p} parser={null} />
+            <Hunks p={p} />
           )}
         </div>
       )}
     </section>
   );
-}
-
-function Highlighted({ lang, p }: { lang: string; p: FileProps }) {
-  const parser = React.use(parserFor(lang));
-  return <Hunks p={p} parser={parser} />;
 }
 
 function BinaryBody({ p }: { p: FileProps }) {
@@ -262,12 +258,13 @@ function BinaryBody({ p }: { p: FileProps }) {
   );
 }
 
-/** The file's hunks, with the lines picked for a comment and the threads under their lines. */
-function Hunks({ p, parser }: { p: FileProps; parser: Parser | null }) {
+/** The file's hunks, in their language's colours (once its grammar is here), with the lines picked for a comment and the threads under their lines. */
+function Hunks({ p }: { p: FileProps }) {
   const [pick, setPick] = React.useState<Pick | null>(null);
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(new Set());
+  const hl = useHighlighter(resolveLanguage(null, p.file.path));
   const hunks = React.useMemo(() => p.file.hunks.map((h) => (p.whitespace ? ignoringWhitespace(h) : h)), [p.file.hunks, p.whitespace]);
-  const models = React.useMemo(() => hunks.map((h) => ({ m: hunkOf(h), tok: tokensOf(parser, h) })), [hunks, parser]);
+  const models = React.useMemo(() => hunks.map((h) => ({ m: hunkOf(h), tok: tokensOf(hl, h) })), [hunks, hl]);
   // Threads by where they end: `old:12`, `new:40`.
   const byEnd = React.useMemo(() => {
     const m = new Map<string, Thread[]>();
@@ -284,7 +281,44 @@ function Hunks({ p, parser }: { p: FileProps; parser: Parser | null }) {
     else if (pick && pick.side === side && pick.start === line && pick.end === line) setPick(null);
     else setPick({ side, start: line, end: line });
   };
-  const ctx: RowCtx = { p, pick, choose, byEnd, close: () => setPick(null) };
+  // An agent's diff: a name or a line asked about opens a card under it (components/code/about.tsx).
+  const about = React.useContext(AboutContext);
+  const cards = useCards<AskedLines>();
+  const ask = about
+    ? (side: Side, line: number | null, text: string, e: React.MouseEvent<HTMLElement>) => {
+        if (line == null || selecting()) return;
+        const off = offsetAt(e.currentTarget, e.clientX, e.clientY);
+        const word = off === null ? null : wordAt(text, off);
+        const selection = word ? text.slice(word.start, word.end) : undefined;
+        cards.update((prev) => {
+          let [from, to] = [line, line];
+          // Another line, while lines of the same side are asked about: the lines between are taken in.
+          if (!selection && prev && !prev.ask.selection && prev.side === side && (line < prev.from || line > prev.to)) [from, to] = [Math.min(prev.from, line), Math.max(prev.to, line)];
+          else if (prev && prev.side === side && prev.from === line && prev.to === line && prev.ask.selection === selection) return null;
+          const label = selection ?? linesLabel(from, to);
+          const where = `${p.file.path.split("/").pop() ?? p.file.path} · ${side === "old" ? "old " : ""}${linesLabel(from, to)}`;
+          return {
+            key: cardKey(`${side}${from}-${to}`),
+            side,
+            from,
+            to,
+            ask: { path: p.file.path, line: from, end: to > from ? to : undefined, selection, code: around(hunks, side, from, to), label, where },
+          };
+        });
+      }
+    : undefined;
+  const ctx: RowCtx = {
+    p,
+    pick,
+    choose,
+    byEnd,
+    close: () => setPick(null),
+    ask,
+    asked: cards.open,
+    cards: [...cards.closing.map((c) => ({ c, closing: true })), ...(cards.open ? [{ c: cards.open, closing: false }] : [])],
+    closeAsk: () => cards.update(() => null),
+    goneAsk: cards.gone,
+  };
   return (
     <div className="rv-hunks" data-split={p.split || undefined}>
       {models.map(({ m, tok }, hi) => {
@@ -393,6 +427,44 @@ interface RowCtx {
   choose: (side: Side, line: number, extend: boolean) => void;
   byEnd: Map<string, Thread[]>;
   close: () => void;
+  /** Asking about a name or lines (an agent's diff only: components/code/about.tsx), what's asked about, and closing its card. */
+  ask?: (side: Side, line: number | null, text: string, e: React.MouseEvent<HTMLElement>) => void;
+  asked: AskedLines | null;
+  /** The open card and those sliding shut. */
+  cards: { c: AskedLines; closing: boolean }[];
+  closeAsk: () => void;
+  goneAsk: (key: string) => void;
+}
+
+/** What a card under a line asks about: lines `from` to `to` of one side. */
+interface AskedLines {
+  key: string;
+  side: Side;
+  from: number;
+  to: number;
+  ask: Asked;
+}
+
+/** A line's code, tapped: asking about the name there, or the line. */
+const tap = (c: RowCtx, side: Side, line: number | null, text: string) => (c.ask ? (e: React.MouseEvent<HTMLElement>) => c.ask?.(side, line, text, e) : undefined);
+const asking = (c: RowCtx, side: Side, line: number | null) => line != null && c.asked != null && c.asked.side === side && line >= c.asked.from && line <= c.asked.to;
+
+/** A hunk's lines as a diff's (`+`, `-`, ` `) from line `from` to `to` of `side`, with up to ten either side. */
+function around(hunks: Hunk[], side: Side, from: number, to: number): string {
+  for (const h of hunks) {
+    let [o, n] = [h.old_start, h.new_start];
+    const at: number[] = [];
+    h.lines.forEach((l, i) => {
+      const c = l.charAt(0);
+      if (c === "\\") return;
+      const old = c === "+" ? null : o++;
+      const neu = c === "-" ? null : n++;
+      const mine = side === "new" ? neu : old;
+      if (mine != null && mine >= from && mine <= to) at.push(i);
+    });
+    if (at.length) return h.lines.slice(Math.max(0, (at[0] ?? 0) - 10), (at[at.length - 1] ?? 0) + 11).join("\n");
+  }
+  return "";
 }
 
 type Toks = { old: Map<number, Tok[]>; neu: Map<number, Tok[]> };
@@ -415,19 +487,30 @@ function Num({ side, line, c }: { side: Side; line: number | null; c: RowCtx }) 
   );
 }
 
-/** What comes under a line: the composer of a comment picked to end there, and the threads that end there. */
+/**
+ * What comes under a line: a card asking about the lines ending there (a band of its own, sliding
+ * open and shut), the composer of a comment picked to end there, and the threads that end there.
+ */
 function Under({ side, line, c }: { side: Side; line: number | null; c: RowCtx }) {
   if (line == null) return null;
   const threads = c.byEnd.get(`${side}:${line}`) ?? [];
   const composing = c.pick != null && c.pick.side === side && c.pick.end === line;
-  if (!composing && threads.length === 0) return null;
+  const cards = c.cards.filter(({ c: k }) => k.side === side && k.to === line);
+  if (!composing && threads.length === 0 && cards.length === 0) return null;
   return (
-    <div className="rv-under">
-      {threads.map((t) => (
-        <ThreadView key={t.id} t={t} onReply={c.p.onReply} onResolve={c.p.onResolve} now={c.p.now} />
+    <>
+      {cards.map(({ c: k, closing }) => (
+        <AboutCard key={k.key} ask={k.ask} closing={closing} onClose={c.closeAsk} onGone={() => c.goneAsk(k.key)} />
       ))}
-      {composing && c.pick && <NewComment pick={c.pick} onDone={c.close} onSend={c.p.onComment} now={c.p.now} />}
-    </div>
+      {(composing || threads.length > 0) && (
+        <div className="rv-under">
+          {threads.map((t) => (
+            <ThreadView key={t.id} t={t} onReply={c.p.onReply} onResolve={c.p.onResolve} now={c.p.now} />
+          ))}
+          {composing && c.pick && <NewComment pick={c.pick} onDone={c.close} onSend={c.p.onComment} now={c.p.now} />}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -455,13 +538,13 @@ function CtxRow({ l, tok, c }: { l: Line; tok: Toks; c: RowCtx }) {
     return (
       <>
         <div className="rv-row" data-kind="ctx" data-sel={sel || undefined}>
-          <div className="rv-half" style={{ "--hang": l.hang } as React.CSSProperties}>
+          <div className="rv-half" data-asked={asking(c, "old", l.o) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
             <Num side="old" line={l.o} c={c} />
-            <Code text={l.text} toks={tok.old.get(l.o ?? -1)} />
+            <Code text={l.text} toks={tok.old.get(l.o ?? -1)} onClick={tap(c, "old", l.o, l.text)} />
           </div>
-          <div className="rv-half" style={{ "--hang": l.hang } as React.CSSProperties}>
+          <div className="rv-half" data-asked={asking(c, "new", l.n) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
             <Num side="new" line={l.n} c={c} />
-            <Code text={l.text} toks={tok.neu.get(l.n ?? -1)} />
+            <Code text={l.text} toks={tok.neu.get(l.n ?? -1)} onClick={tap(c, "new", l.n, l.text)} />
           </div>
         </div>
         <Under side="new" line={l.n} c={c} />
@@ -469,11 +552,11 @@ function CtxRow({ l, tok, c }: { l: Line; tok: Toks; c: RowCtx }) {
     );
   return (
     <>
-      <div className="rv-row" data-kind="ctx" data-sel={sel || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
+      <div className="rv-row" data-kind="ctx" data-sel={sel || undefined} data-asked={asking(c, "new", l.n) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
         <Num side="old" line={l.o} c={c} />
         <Num side="new" line={l.n} c={c} />
         <span className="rv-sign" />
-        <Code text={l.text} toks={tok.neu.get(l.n ?? -1)} />
+        <Code text={l.text} toks={tok.neu.get(l.n ?? -1)} onClick={tap(c, "new", l.n, l.text)} />
       </div>
       <Under side="new" line={l.n} c={c} />
     </>
@@ -487,11 +570,18 @@ function ChgRow({ l, tok, c }: { l: Line; tok: Toks; c: RowCtx }) {
   const moved = line == null ? undefined : (del ? c.p.moves.del : c.p.moves.add).get(placeOf(c.p.idx, del ? "o" : "n", line));
   return (
     <>
-      <div className="rv-row" data-kind={l.kind} data-sel={picked(c.pick, side, line) || undefined} data-moved={moved ? true : undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
+      <div
+        className="rv-row"
+        data-kind={l.kind}
+        data-sel={picked(c.pick, side, line) || undefined}
+        data-asked={asking(c, side, line) || undefined}
+        data-moved={moved ? true : undefined}
+        style={{ "--hang": l.hang } as React.CSSProperties}
+      >
         <Num side="old" line={del ? l.o : null} c={c} />
         <Num side="new" line={del ? null : l.n} c={c} />
         <span className="rv-sign">{del ? "−" : "+"}</span>
-        <Code text={l.text} toks={(del ? tok.old : tok.neu).get(line ?? -1)} marks={l.marks} />
+        <Code text={l.text} toks={(del ? tok.old : tok.neu).get(line ?? -1)} marks={l.marks} onClick={tap(c, side, line, l.text)} />
         <Moved to={moved} c={c} side={side} line={line} />
       </div>
       <Under side={side} line={line} c={c} />
@@ -509,22 +599,24 @@ function SplitRow({ d, a, tok, c }: { d: Line | undefined; a: Line | undefined; 
           className="rv-half"
           data-kind={d ? "del" : "none"}
           data-sel={picked(c.pick, "old", d?.o ?? null) || undefined}
+          data-asked={asking(c, "old", d?.o ?? null) || undefined}
           data-moved={dm ? true : undefined}
           style={{ "--hang": d?.hang ?? 0 } as React.CSSProperties}
         >
           <Num side="old" line={d?.o ?? null} c={c} />
-          {d && <Code text={d.text} toks={tok.old.get(d.o ?? -1)} marks={d.marks} />}
+          {d && <Code text={d.text} toks={tok.old.get(d.o ?? -1)} marks={d.marks} onClick={tap(c, "old", d.o, d.text)} />}
           <Moved to={dm} c={c} side="old" line={d?.o ?? null} />
         </div>
         <div
           className="rv-half"
           data-kind={a ? "add" : "none"}
           data-sel={picked(c.pick, "new", a?.n ?? null) || undefined}
+          data-asked={asking(c, "new", a?.n ?? null) || undefined}
           data-moved={am ? true : undefined}
           style={{ "--hang": a?.hang ?? 0 } as React.CSSProperties}
         >
           <Num side="new" line={a?.n ?? null} c={c} />
-          {a && <Code text={a.text} toks={tok.neu.get(a.n ?? -1)} marks={a.marks} />}
+          {a && <Code text={a.text} toks={tok.neu.get(a.n ?? -1)} marks={a.marks} onClick={tap(c, "new", a.n, a.text)} />}
           <Moved to={am} c={c} side="new" line={a?.n ?? null} />
         </div>
       </div>

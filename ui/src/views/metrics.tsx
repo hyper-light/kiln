@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Link } from "@/lib/router";
-import { ArrowUpRight, Settings } from "lucide-react";
+import { ArrowUpRight } from "lucide-react";
 import { queueHistory } from "@/api/events";
 import type { HostSample } from "@/api/types";
 import { Chart } from "@/components/charts/chart";
@@ -14,6 +14,7 @@ import { historyRes, overviewRes, useMetricsHistory, useOverview, warm } from "@
 import { formatDuration } from "@/lib/format";
 import { usePref } from "@/lib/prefs";
 import { HostCharts } from "./host-charts";
+import { ObserveNav } from "./observe/parts";
 
 const RANGES = { "5m": 300, "15m": 900, "30m": 1800, "1h": 3600 } as const;
 type Range = keyof typeof RANGES;
@@ -26,12 +27,20 @@ export default function Metrics() {
   const [source, setSource] = React.useState("server");
   return (
     <div className="container-console page">
-      <title>Metrics · kiln</title>
+      <title>Live · Observe · kiln</title>
       <PageIntro
-        index={8}
-        label="Metrics"
-        title="Metrics"
-        lead="Host samples read straight from /proc and cgroups — the last hour at 5 s resolution, streamed live. Long-term history belongs in Prometheus + Grafana."
+        index={7}
+        label="Observe"
+        title="Live"
+        lead={
+          <>
+            Host samples read straight from /proc and cgroups: the last hour at 5 s resolution, streamed as they are taken. Everything before it is in the{" "}
+            <Link to="/observe/dashboards/builtin:hosts" className="text-link">
+              Hosts dashboard
+            </Link>
+            .
+          </>
+        }
         actions={
           grafana ? (
             <Button asChild variant="secondary">
@@ -39,15 +48,10 @@ export default function Metrics() {
                 Open Grafana <ArrowUpRight />
               </a>
             </Button>
-          ) : (
-            <Button asChild variant="ghost">
-              <Link to="/settings#integrations.grafana">
-                <Settings /> Link Grafana
-              </Link>
-            </Button>
-          )
+          ) : undefined
         }
       />
+      <ObserveNav />
       <Loadable label="the metrics" fallback={<MetricsHold range={range} source={source} />}>
         <MetricsBody range={range} onRange={setRange} source={source} onSource={setSource} />
       </Loadable>

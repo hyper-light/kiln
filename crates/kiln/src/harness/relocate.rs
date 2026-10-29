@@ -35,16 +35,48 @@ fn join(path: &str, rel: &str) -> String {
     if rel.is_empty() { path.to_owned() } else { format!("{}/{rel}", path.trim_end_matches('/')) }
 }
 
+fn homed(path: &str, home: Option<&str>) -> String {
+    match home.and_then(|h| within(path, h)) {
+        Some(rel) if rel.is_empty() => "~".to_owned(),
+        Some(rel) => format!("~/{rel}"),
+        None => path.to_owned(),
+    }
+}
+
 /// Start moving session `id` to runner `to`: Ok once it is under way (what it does next shows in
 /// its timeline), or why it can't. `now`: the turn under way doesn't finish here; it is
 /// interrupted once the other runner is ready, and picked up there. `kind`: it goes on there in
 /// this other harness, its conversation carried over, with `model` (None: that one's default).
+///
+/// Its subagents (`Info::subagent`) on the machine it leaves go along, each in its own harness, so
+/// they stay on their agent's machine (docs/goals.md, "A plan's steps side by side"); one that
+/// can't says why in its timeline. A subagent doesn't move by itself while its agent is there.
 pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<serde_json::Value, String> {
+    let all = hub.harness.list();
+    if let Some(p) = all.iter().find(|i| i.id == id).filter(|i| i.subagent).and_then(|i| i.parent.as_deref()).and_then(|p| all.iter().find(|a| a.id == p)) {
+        return Err(format!("it's the subagent of {}, and it goes where its agent goes: move {} and it comes along", p.name, p.name));
+    }
+    let leaves = hub.harness.location(id);
+    let moved = start_one(hub, id, to, now, kind, model).await?;
+    let to = to.strip_prefix("agent:").unwrap_or(to);
+    for c in all.iter().filter(|c| c.subagent && c.parent.as_deref() == Some(id) && c.status != super::model::Status::Exited && hub.harness.location(&c.id) == leaves) {
+        if let Err(e) = start_one(hub, &c.id, to, now, None, None).await {
+            say(hub, &c.id, &format!("Couldn't go along with its agent to {to}: {e}")).await;
+        }
+    }
+    Ok(moved)
+}
+
+/// [`start`], for session `id` alone.
+async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<serde_json::Value, String> {
     let to = to.strip_prefix("agent:").unwrap_or(to).to_owned();
     let info = hub.harness.list().into_iter().find(|i| i.id == id).ok_or_else(|| "no such agent".to_owned())?;
-    let from = match hub.harness.location(id) {
+    let location = hub.harness.location(id);
+    let local = location == Some(Location::Local);
+    let from = match location {
         Some(Location::Machine(m)) => m,
-        _ => return Err("only an agent on a runner moves (this one runs on the kiln server)".into()),
+        Some(Location::Local) if hub.harness.never_started(id) => "the kiln server".to_owned(),
+        _ => return Err("the kiln server keeps the agents it runs once they've started: only one whose harness never started there moves".into()),
     };
     if from == to {
         return Err(format!("it runs on {to} already"));
@@ -70,6 +102,14 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     let installed = hub.harness.kinds().get(&format!("agent:{to}")).is_some_and(|ks| ks.iter().any(|k| k.id == goes_on_in && k.available));
     if !installed {
         return Err(format!("{named} is not installed on {to}"));
+    }
+    if local {
+        if kind.is_some() {
+            return Err(format!("from the kiln server it goes on in {} alone", info.kind_name));
+        }
+        let there = homed(&info.cwd, Some(&crate::os::home_dir().to_string_lossy()));
+        hub.harness.move_local(hub, id, &to, &there).await?;
+        return Ok(serde_json::json!({ "moving": to, "from_server": true }));
     }
     // Its machine is away: it can't hand the session over, so it goes on from the server's copy of
     // its conversation (`docs/conversations.md`, "Resuming on another machine").
@@ -118,7 +158,9 @@ pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec
         Some(Location::Machine(m)) => Some(m),
         _ => None,
     };
-    let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited).cloned().collect();
+    // A subagent whose agent is there goes along with it ([`start`]).
+    let theirs = |i: &super::session::Info| i.subagent && i.parent.as_deref().is_some_and(|p| all.iter().any(|a| a.id == p));
+    let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited && !theirs(i)).cloned().collect();
     let kinds = hub.harness.kinds();
     let runners: Vec<(String, String)> = hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral && !a.outpost && a.name != from).map(|a| (a.name.clone(), a.os.clone())).collect();
     let mut load: HashMap<String, usize> = HashMap::new();
@@ -169,11 +211,7 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away:
     let view = crate::sync::places::now(hub).await.map_err(|e| format!("{e:#}"))?;
     let home = hub.places.of(from).map(|h| h.home).filter(|h| !h.is_empty());
     // `~/…` for a path under `from`'s home: the same place under `to`'s.
-    let mapped = |path: &str| match home.as_deref().and_then(|h| within(path, h)) {
-        Some(rel) if rel.is_empty() => "~".to_owned(),
-        Some(rel) => format!("~/{rel}"),
-        None => path.to_owned(),
-    };
+    let mapped = |path: &str| homed(path, home.as_deref());
     let found: Option<(&Row, &Place)> = view.repos.iter().find_map(|r| r.places.iter().find(|p| p.machine == from && within(cwd, &p.path).is_some()).map(|p| (r, p)));
     let Some((row, place)) = found else {
         return Ok((mapped(cwd), Some(format!("Its folder isn't a git repository kiln knows, so its files stay on {from}."))));
@@ -244,5 +282,9 @@ mod tests {
         assert_eq!(within("/Users/ada/Projects/kiln-old", "/Users/ada/Projects/kiln"), None);
         assert_eq!(join("/home/ada/Projects/kiln", "crates/kiln"), "/home/ada/Projects/kiln/crates/kiln");
         assert_eq!(join("~/Projects/kiln", ""), "~/Projects/kiln");
+        assert_eq!(homed("/home/kiln/work/app", Some("/home/kiln")), "~/work/app");
+        assert_eq!(homed("/tmp", Some("/tmp")), "~");
+        assert_eq!(homed("/srv/app", Some("/home/kiln")), "/srv/app");
+        assert_eq!(homed("/srv/app", None), "/srv/app");
     }
 }

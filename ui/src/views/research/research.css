@@ -2,6 +2,7 @@
    sources; the sources, numbered. Quiet: the grade's chip is the one colour a finding has. */
 .rs {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
 .rs-head {
@@ -31,6 +32,7 @@
 .rs-cites,
 .rs-sources {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -40,6 +42,7 @@
 }
 .rs-finding {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   padding: 12px 0;
   border-top: 1px solid var(--color-line);
@@ -93,7 +96,7 @@
 }
 .rs-factors {
   display: grid;
-  grid-template-columns: max-content minmax(36px, 1fr) minmax(0, 15em);
+  grid-template-columns: minmax(0, max-content) minmax(36px, 1fr) minmax(0, 15em);
   align-items: center;
   gap: 3px 10px;
   color: #9a9ca3;
@@ -207,6 +210,7 @@ a.rs-loc:hover {
 /* In brief (research.tsx `ResearchBrief`): its first findings, a small chip of its grade each. */
 .rs-claims {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   margin: 0;
   padding: 0;
@@ -234,10 +238,12 @@ a.rs-loc:hover {
 /* As its agent reports it (its conversation, its Plan tab): a card, its links under it. */
 .rs-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 .rs-card {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   min-width: 0;
   padding: 12px;

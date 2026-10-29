@@ -21,7 +21,7 @@ import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource, type SuspenseResource } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
 import { cn } from "@/lib/utils";
-import { SpawnDialog } from "@/views/harness/spawn";
+import { startFrom } from "@/views/harness/new-agent-draft";
 import { PATIENCE_MS, readAgainSoon, setPending, settlePending, useUploadPicker, useUploading } from "./state";
 import { UpgradeLog } from "./upgrade-log";
 import {
@@ -89,7 +89,6 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
   // How long kiln waits, being changed: the field to start in.
   const [waitsEditing, setWaitsEditing] = React.useState<{ focus: Which } | null>(null);
   // The runner an agent is being started for, to find out why its upgrade failed.
-  const [diagnosing, setDiagnosing] = React.useState<{ r: RunnerUpdate; job: UpdateJob | undefined; findings?: RunnerFinding[] } | null>(null);
   const navigate = useNavigate();
   const uploads = useUploadPicker();
   const uploading = useUploading((s) => s.target);
@@ -337,25 +336,14 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
             onUpgrade={(way) => askRunner(e, way)}
             onOutput={() => toggleOutput(e.r.name)}
             onUpload={() => e.r.target && uploads.choose(e.r.target)}
-            onAskAgent={(findings) => setDiagnosing({ r: e.r, job: e.job, findings })}
+            onAskAgent={(findings) =>
+              startFrom(navigate, { from: `From System → Updates: ${e.r.name}`, target: `agent:${e.r.name}`, cwd: e.r.checkout ?? undefined, prompt: diagnosisPrompt(e.r, e.job, newest, findings) })
+            }
             onChangeWaits={(w) => setWaitsEditing({ focus: w ?? "upgrade" })}
           />
         ))}
       </table>
       {data.waits && <WaitsLine waits={data.waits} editing={waitsEditing} onEditing={setWaitsEditing} />}
-      {diagnosing && (
-        <SpawnDialog
-          open
-          onOpenChange={(o) => {
-            if (!o) setDiagnosing(null);
-          }}
-          defaults={{ target: `agent:${diagnosing.r.name}`, cwd: diagnosing.r.checkout ?? undefined, prompt: diagnosisPrompt(diagnosing.r, diagnosing.job, newest, diagnosing.findings) }}
-          onStarted={(agents) => {
-            setDiagnosing(null);
-            navigate(agents.length === 1 && agents[0] ? `/agents/${agents[0].id}` : "/agents");
-          }}
-        />
-      )}
     </section>
   );
 }

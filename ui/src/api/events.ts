@@ -172,7 +172,8 @@ export interface QueuePoint {
 }
 export const queueHistory: QueuePoint[] = [];
 events.on((ev) => {
-  if (ev.type !== "queue") return;
+  // `queue` also says where a land queue's entry is: the counts are the scheduler's.
+  if (ev.type !== "queue" || !("queued" in ev)) return;
   queueHistory.push({ ts: Date.now() / 1000, queued: ev.queued, running: ev.running });
   if (queueHistory.length > 2000) queueHistory.splice(0, queueHistory.length - 2000);
 });

@@ -38,12 +38,15 @@ const DEVIN_PASTE: &str = "Paste the code from the sign-in page";
 
 /// A way to sign in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AccountMethod"))]
 pub struct Method {
     pub id: &'static str,
     pub label: &'static str,
     /// What it asks to be given back: `"code"` (the sign-in page shows it; a browser on the same
     /// machine may finish without one) or `"api_key"`. Nothing: it finishes by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub asks: Option<&'static str>,
     #[serde(skip)]
     args: &'static str,
@@ -103,6 +106,7 @@ fn cli(kind: &str) -> anyhow::Result<&'static Cli> {
 
 /// A harness's account on a machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Account {
     pub kind: String,
     pub name: String,
@@ -110,16 +114,21 @@ pub struct Account {
     pub signed_in: Option<bool>,
     /// How it is signed in: "Claude subscription", "ChatGPT", "API key", …
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub org: Option<String>,
     /// The plan, where the harness says (Claude: "pro", "max", …).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub plan: Option<String>,
     pub methods: Vec<Method>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub error: Option<String>,
 }
 
@@ -178,6 +187,8 @@ fn read_devin(out: &str) -> Account {
 
 /// A sign-in or sign-out, as the console follows it.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AccountFlow"))]
 pub struct Flow {
     pub id: String,
     pub target: String,
@@ -185,27 +196,34 @@ pub struct Flow {
     /// "login" or "logout".
     pub action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub method: Option<String>,
     /// "running", "done", "failed" or "cancelled".
     pub state: &'static str,
     /// The sign-in page to open (on any device).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub url: Option<String>,
     /// A one-time code to enter on that page.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub code: Option<String>,
     /// What it waits to be given now: "code" (the one the page showed) or "api_key".
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub asks: Option<&'static str>,
     /// What the CLI printed, plain (never what was typed in).
     pub lines: Vec<String>,
     /// The account as it is once this ended.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub account: Option<Account>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub error: Option<String>,
     pub started_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub ended_at: Option<i64>,
 }
 
@@ -238,7 +256,7 @@ fn remember(e: Entry) {
 }
 
 fn emit(hub: &Hub, flow: &Flow) {
-    hub.emit(&serde_json::json!({ "type": "account_flow", "flow": flow }));
+    hub.emit(&crate::wire::events::ServerEvent::AccountFlow { flow: Box::new(flow.clone()) });
 }
 
 /// The harnesses' accounts on `target` ("local" or "agent:<machine>"): those installed there.

@@ -9,17 +9,6 @@
 }
 
 /* ---------------------------------------------------------------- finding apps */
-/* The filter field and the sort, side by side (Mission control's bar); stacked on a phone. */
-.cd-toolbar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 230px;
-  gap: 10px;
-}
-@container (max-width: 640px) {
-  .cd-toolbar {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
 /* What the fleet holds, before any filter: one quiet line of counts. */
 .cd-summary-line {
   display: flex;
@@ -545,21 +534,23 @@
 .cd-resources-section {
   margin-top: 30px;
 }
-/* The view, the filter, the sort or grouping, and whether children show: one row on a wide screen. */
+/* The view, the filter, the sort or grouping, and whether children show: one row on a wide screen,
+   every control one height (--field-h), each select beside the filter a FilterBar's width. */
 .cd-viewbar {
+  --companion-w: 200px;
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr) auto auto;
-  align-items: start;
+  grid-template-columns: var(--companion-w) minmax(0, 1fr) auto auto;
+  align-items: center;
   gap: 10px;
 }
 .cd-view-sort {
-  min-width: 190px;
+  width: var(--companion-w);
 }
 .cd-view-select {
   min-width: 0;
 }
 .cd-view-opt {
-  min-height: 40px;
+  min-height: var(--field-h);
   padding: 0 2px 0 4px;
   white-space: nowrap;
 }
@@ -604,6 +595,7 @@
   }
   .cd-view-sort {
     grid-area: sort;
+    width: auto;
     min-width: 0;
   }
   .cd-view-opt {

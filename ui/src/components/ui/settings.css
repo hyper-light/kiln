@@ -72,8 +72,15 @@
 
 /* ---------------------------- search ---------------------------- */
 
+/* Every search field's height (--field-h), not the controls' around it: it reads as kiln's other searches. */
 .st-search {
   margin-bottom: 18px;
+}
+.st .st-search {
+  min-height: var(--field-h);
+}
+.st .st-search input {
+  min-height: calc(var(--field-h) - 2px);
 }
 .st-search > svg {
   flex: none;
@@ -87,8 +94,8 @@
   display: inline-grid;
   flex: none;
   place-items: center;
-  width: var(--st-control);
-  height: calc(var(--st-control) - 2px);
+  width: 34px;
+  height: calc(var(--field-h) - 2px);
   color: #9499a5;
 }
 .st-search-clear:hover {

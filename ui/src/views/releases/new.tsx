@@ -43,7 +43,7 @@ export default function NewDeployApp() {
   return (
     <div className="container-console page cd-page cd-new">
       <title>New app · Releases · kiln</title>
-      <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: "New app" }]} />
+      <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: "New app" }]} />
       <h1 className="cd-new-title">A new app.</h1>
       <p className="lead">Its name and owners, what it's made from, where its source lives, where it runs, and its first releases: then its page follows them.</p>
       <Loadable label="the templates and environments" fallback={<Hold height={320} />}>

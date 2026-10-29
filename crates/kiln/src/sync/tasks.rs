@@ -283,7 +283,7 @@ impl Tasks {
         if found {
             self.save();
             self.changed.notify(usize::MAX);
-            hub.emit(&serde_json::json!({ "type": "places" }));
+            hub.emit(&crate::wire::events::ServerEvent::Places);
         }
     }
 
@@ -515,7 +515,7 @@ pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
         inner.tasks.extend(tasks.iter().cloned());
     }
     hub.tasks.save();
-    hub.emit(&serde_json::json!({ "type": "places" }));
+    hub.emit(&crate::wire::events::ServerEvent::Places);
     let b = Batch {
         id: batch,
         kind: ask.kind,

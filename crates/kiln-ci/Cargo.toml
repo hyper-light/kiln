@@ -5,7 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# TypeScript for the types kiln's UI reads (kiln's `wire::ts`).
+ts = ["dep:ts-rs"]
+
 [dependencies]
+# The UI's wire types (kiln's `wire::ts`, in its test builds alone).
+ts-rs = { version = "12.0.1", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
@@ -20,10 +26,15 @@ jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-
 fancy-regex = "0.19.2"
 # Lockfiles for SBOMs (W18-R03).
 toml = "1.1.8"
+# Identities' certificate chains, checked (W27-R01): parsing and signatures, the same crates and
+# backend the kiln crate's CA uses.
+x509-parser = { version = "0.18.1", features = ["verify-aws"] }
+aws-lc-rs = "1.18.2"
 
 [dev-dependencies]
 anyhow = "1.0.104"
 proptest = "1"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 
 [[bench]]
 name = "expr"

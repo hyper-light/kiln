@@ -1140,6 +1140,14 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
         }
     };
     let sent = texts.len();
+    // A plan made from a goal on this agent's stack, run again: its steps are that goal's parts
+    // again, before it, the goal back among the goals to go if it had ended, so it's met once they
+    // are and shows each step as it stands under it. On another agent, goals of their own, last.
+    let made_from = p.source.as_ref().and_then(|s| s.goal.as_ref()).filter(|g| g.agent == session);
+    let goal = match made_from {
+        Some(g) => crate::goals::reopen(hub, &session, &g.id).await.ok().map(|_| g.id.clone()),
+        None => None,
+    };
     // Each goal says the step it's made from: the agent splits one into its acceptance criteria and
     // tests (`crate::goals::split`).
     let goals = texts
@@ -1147,16 +1155,19 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
         .map(|(i, text)| crate::goals::NewGoal {
             text,
             step: Some(crate::goals::StepRef { plan: p.id.clone(), version: p.version, n: i + 1, run: Some(run.clone()) }),
+            part_of: goal.clone(),
+            kind: goal.as_ref().map(|_| "plan"),
             ..crate::goals::NewGoal::default()
         })
         .collect();
-    let stack = crate::goals::add_at(hub, &session, goals, true, &crate::goals::At::End).await.map_err(goals_error)?;
+    let at = goal.clone().map_or(crate::goals::At::End, crate::goals::At::Before);
+    let stack = crate::goals::add_at(hub, &session, goals, true, &at).await.map_err(goals_error)?;
     *acted = true;
     // Each step its goal stack: its acceptance criteria and tests, a goal each, before it (one
     // without either stays as it is).
     let mut split = 0;
     if pick.split {
-        let made: Vec<String> = stack.items.iter().filter(|i| i.step.as_ref().is_some_and(|s| s.run.as_deref() == Some(run.as_str())) && i.part_of.is_none()).map(|i| i.id.clone()).collect();
+        let made: Vec<String> = stack.items.iter().filter(|i| i.step.as_ref().is_some_and(|s| s.run.as_deref() == Some(run.as_str())) && i.part_of == goal).map(|i| i.id.clone()).collect();
         for id in made {
             if crate::goals::split(hub, &session, Some(&id), Vec::new()).await.is_ok() {
                 split += 1;
@@ -1226,7 +1237,8 @@ async fn split_of(hub: &Hub, session: &str, run: &str) -> usize {
     let Ok(stack) = crate::goals::get(hub, session).await else {
         return 0;
     };
-    let ours = |i: &crate::goals::Item| i.part_of.is_none() && i.step.as_ref().is_some_and(|s| s.run.as_deref() == Some(run));
+    // The run's steps: goals of their own, or its plan's goal's parts (`run_goals`), not their checks.
+    let ours = |i: &crate::goals::Item| i.part_kind.as_deref() != Some("checks") && i.step.as_ref().is_some_and(|s| s.run.as_deref() == Some(run));
     stack.items.iter().filter(|i| ours(i) && stack.items.iter().any(|j| j.part_of.as_deref() == Some(i.id.as_str()))).count()
 }
 

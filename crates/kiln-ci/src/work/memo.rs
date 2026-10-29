@@ -17,6 +17,15 @@
 //! leave in the workspace are not among its inputs unless git sees them (what `.gitignore` leaves
 //! out it doesn't), and the toolchains' identities wait for W24-R01's probes. A step that receives
 //! secrets isn't reused (W24-R05); the runner says why.
+//!
+//! **Portable steps** (docs/ci.md W28-R70, R71). A step that gives `memo.platform` (and its
+//! `inputs`) is keyed by what it declares and nothing else ([`portable_unit`]), so the same step
+//! keys alike in every workflow, job, executor and runner that runs it, and pipelines can share
+//! one execution of it (W28-R72): its definition, the values of its `memo.env` and of the per-run
+//! variables its text names, its inputs, the platform facets it lists, the toolchains it lists in
+//! `memo.tools` at the precision it gives ([`identity`]), the earlier memo steps whose outputs its
+//! inputs name ([`Earlier`], by their own key, never their place in the job), and its trust. Not
+//! its job's `needs`, the job's or workflow's other variables, or the runner's environment.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -71,6 +80,87 @@ pub struct Memo {
     /// `secrets: hmac` (W24-R05): a step that receives secrets keyed by their HMAC. Not built yet:
     /// such a step still runs.
     pub hmac: bool,
+    /// `platform:` (W28-R70): the platform facets a portable step's key keeps (`any`: none). Set,
+    /// the step keys by what it declares only ([`portable_unit`]).
+    pub platform: Option<Vec<Facet>>,
+    /// `tools:` (W28-R71): toolchains whose identity a portable step's key keeps, each at a
+    /// precision: `{ node: major, rustc: full }`.
+    pub tools: BTreeMap<String, Precision>,
+}
+
+/// A platform facet a portable step's key may keep (W28-R70).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Facet {
+    Os,
+    Arch,
+    Libc,
+    Executor,
+    Image,
+}
+
+impl Facet {
+    fn parse(s: &str) -> Result<Facet, String> {
+        match s.trim() {
+            "os" => Ok(Facet::Os),
+            "arch" => Ok(Facet::Arch),
+            "libc" => Ok(Facet::Libc),
+            "executor" => Ok(Facet::Executor),
+            "image" => Ok(Facet::Image),
+            other => Err(format!("`memo.platform`: `{other}` isn't a platform facet (os, arch, libc, executor, image), or `any` for none")),
+        }
+    }
+}
+
+/// How much of a toolchain's version a portable key keeps (W28-R71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Precision {
+    /// The first number of its version (`node` v24.21.0: `24`).
+    Major,
+    /// The first two (`24.21`).
+    Minor,
+    /// All it says of itself (`rustc -vV`'s every line), as a digest.
+    Full,
+}
+
+impl Precision {
+    fn parse(s: &str) -> Result<Precision, String> {
+        match s.trim() {
+            "major" => Ok(Precision::Major),
+            "minor" => Ok(Precision::Minor),
+            "full" => Ok(Precision::Full),
+            other => Err(format!("`memo.tools`: `{other}` isn't a precision (major, minor or full)")),
+        }
+    }
+}
+
+/// Whether `name` can be a tool `memo.tools` names: a program's name, run to ask its version.
+fn tool_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') && !name.starts_with(['.', '-'])
+}
+
+/// The arguments that make `tool` say its version: `rustc -vV` (its host, LLVM and commit too),
+/// else `--version`.
+pub fn version_args(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "rustc" | "cargo" => &["-vV"],
+        _ => &["--version"],
+    }
+}
+
+/// A toolchain's identity as a portable key keeps it (W28-R71): what `text` (its version output)
+/// says, to `precision`. `None` when it names no version.
+pub fn identity(precision: Precision, text: &str) -> Option<String> {
+    let text = text.trim();
+    let version: Option<Vec<&str>> = text
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|w| w.split('.').filter(|n| !n.is_empty()).collect());
+    match precision {
+        Precision::Full if !text.is_empty() => Some(format!("sha256:{}", hex(&Sha256::digest(text.as_bytes())))),
+        Precision::Full => None,
+        Precision::Major => version.and_then(|v| v.first().map(|m| (*m).to_owned())),
+        Precision::Minor => version.and_then(|v| Some(format!("{}.{}", v.first()?, v.get(1)?))),
+    }
 }
 
 impl Memo {
@@ -101,9 +191,40 @@ impl Memo {
                     Some(_) => return Err("`memo.secrets` is `hmac`".into()),
                 };
                 let env = list("env", |n| if n.is_empty() || n.contains('=') { Err(format!("`{n}` isn't a variable's name")) } else { Ok(n.to_owned()) })?;
-                Ok(Some(Memo { inputs: list("inputs", |p| path(p, true))?, outputs: list("outputs", |p| path(p, false))?, env, max_age, hmac }))
+                let platform = match v.get("platform") {
+                    None | Some(YVal::Null) => None,
+                    Some(p) if p.as_str().is_some_and(|s| s.trim() == "any") => Some(Vec::new()),
+                    Some(_) => {
+                        let mut facets = list("platform", |f| Ok(f.to_owned()))?.iter().map(|f| Facet::parse(f)).collect::<Result<Vec<_>, _>>()?;
+                        facets.sort();
+                        facets.dedup();
+                        Some(facets)
+                    }
+                };
+                let tools = match v.get("tools") {
+                    None | Some(YVal::Null) => BTreeMap::new(),
+                    Some(YVal::Map(m)) => m
+                        .iter()
+                        .map(|(name, p)| {
+                            if !tool_name_ok(name) {
+                                return Err(format!("`memo.tools`: `{name}` isn't a program's name"));
+                            }
+                            let p = p.as_str().ok_or_else(|| format!("`memo.tools.{name}` is a precision (major, minor or full)"))?;
+                            Ok((name.clone(), Precision::parse(p)?))
+                        })
+                        .collect::<Result<_, String>>()?,
+                    Some(_) => return Err("`memo.tools` maps toolchains to a precision: `{ node: major }`".into()),
+                };
+                let inputs = list("inputs", |p| path(p, true))?;
+                if platform.is_none() && !tools.is_empty() {
+                    return Err("`memo.tools` is for portable steps: give `memo.platform` too (`any`, or the facets the key keeps)".into());
+                }
+                if platform.is_some() && inputs.is_empty() {
+                    return Err("`memo.platform` makes the step's key what it declares only: name its `memo.inputs`".into());
+                }
+                Ok(Some(Memo { inputs, outputs: list("outputs", |p| path(p, false))?, env, max_age, hmac, platform, tools }))
             }
-            _ => Err("`memo` is `check` or `{ inputs, outputs, env, max-age }`".into()),
+            _ => Err("`memo` is `check` or `{ inputs, outputs, env, max-age, platform, tools }`".into()),
         }
     }
 }
@@ -175,7 +296,13 @@ pub struct Facts {
 /// A step's unit (W24-R01): its definition as canonical JSON, the environment
 /// [`key::relevant_env`] keeps of it, and the rest as found. Its weak key is the step's work key.
 pub fn unit(f: &Facts) -> Unit {
-    let definition = serde_json::to_string(&f.definition).unwrap_or_default();
+    // The rest of its definition on its first line, then its script's lines: the operations
+    // rewrite rules work on (W24-R30).
+    let head = serde_json::to_string(&Definition { run: None, ..f.definition.clone() }).unwrap_or_default();
+    let definition = match &f.definition.run {
+        Some(run) => format!("{head}\n{run}"),
+        None => head,
+    };
     let env = key::relevant_env(&f.env, &f.declared, TOOLCHAIN_ENV, &definition, &BTreeSet::new());
     Unit {
         kind: Kind::Step,
@@ -185,6 +312,51 @@ pub fn unit(f: &Facts) -> Unit {
         platform: f.platform.clone(),
         inputs: f.inputs.clone(),
         upstream: f.upstream.clone(),
+        trust: (if f.trusted { "trusted" } else { "untrusted" }).to_owned(),
+    }
+}
+
+/// An earlier memo step of the leg, as a portable step's key takes it (W28-R70): its own weak key,
+/// the outputs it declared and its result's digest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Earlier {
+    pub key: String,
+    pub outputs: Vec<String>,
+    pub digest: String,
+}
+
+/// Whether one of the step's input patterns names `output` or something in it (`ui/dist` names
+/// `ui/dist`, `ui/**` names `ui/dist`, `ui/dist/client` is in `ui/dist`).
+fn names_output(inputs: &[String], output: &str) -> bool {
+    inputs.iter().any(|p| Matcher::new(p).is_ok_and(|m| m.matches(output) || m.matches(&format!("{output}/x"))) || under(p, output))
+}
+
+/// A portable step's unit (W28-R70, R71): what it declares, and nothing of the job, workflow or
+/// runner around it. `f.platform.toolchains` holds the identities of `m.tools` as [`identity`]
+/// gave them; `earlier` the leg's memo steps before it.
+pub fn portable_unit(f: &Facts, m: &Memo, earlier: &[Earlier]) -> Unit {
+    let definition = serde_json::to_string(&f.definition).unwrap_or_default();
+    let declared: BTreeSet<String> = m.env.iter().chain(f.definition.env.keys()).cloned().collect();
+    let env = key::relevant_env(&f.env, &declared, &[], &definition, &BTreeSet::new());
+    let facets = m.platform.clone().unwrap_or_default();
+    let keep = |facet: Facet, v: &String| if facets.contains(&facet) { v.clone() } else { String::new() };
+    let platform = Platform {
+        os: keep(Facet::Os, &f.platform.os),
+        arch: keep(Facet::Arch, &f.platform.arch),
+        libc: keep(Facet::Libc, &f.platform.libc),
+        executor: keep(Facet::Executor, &f.platform.executor),
+        image: f.platform.image.clone().filter(|_| facets.contains(&Facet::Image)),
+        toolchains: f.platform.toolchains.iter().filter(|(t, _)| m.tools.contains_key(*t)).map(|(t, v)| (t.clone(), v.clone())).collect(),
+    };
+    let upstream = earlier.iter().filter(|e| e.outputs.iter().any(|o| names_output(&m.inputs, o))).map(|e| (format!("memo.{}", e.key), e.digest.clone())).collect();
+    Unit {
+        kind: Kind::Step,
+        definition,
+        secrets: BTreeSet::new(),
+        env,
+        platform,
+        inputs: f.inputs.clone(),
+        upstream,
         trust: (if f.trusted { "trusted" } else { "untrusted" }).to_owned(),
     }
 }
@@ -775,6 +947,169 @@ mod tests {
         let json = serde_json::to_string(&w.ok_or("a workflow")?).map_err(|e| e.to_string())?;
         assert!(!json.contains("memo"), "{json}");
         Ok(())
+    }
+
+    fn portable_memo() -> Memo {
+        Memo {
+            inputs: vec!["ui/**".into()],
+            outputs: vec!["ui/dist".into()],
+            env: vec!["MODE".into()],
+            max_age: MAX_AGE,
+            platform: Some(Vec::new()),
+            tools: BTreeMap::from([("node".to_owned(), Precision::Major)]),
+            ..Memo::default()
+        }
+    }
+
+    fn portable_facts() -> Facts {
+        let mut f = facts();
+        f.definition.outputs = vec!["ui/dist".into()];
+        f.platform.toolchains.insert("node".into(), "24".into());
+        f.inputs = BTreeMap::from([("ui/**".to_owned(), "t1".to_owned())]);
+        f
+    }
+
+    #[test]
+    fn w28_r70_memo_platform_and_tools() -> Result<(), String> {
+        let m = Memo::from_yval(&map(&[("inputs", YVal::Seq(vec![s("ui/**")])), ("outputs", s("ui/dist")), ("platform", s("any")), ("tools", map(&[("node", s("major")), ("rustc", s("full"))]))]))?.ok_or("opts in")?;
+        assert_eq!(m.platform, Some(vec![]));
+        assert_eq!(m.tools, BTreeMap::from([("node".to_owned(), Precision::Major), ("rustc".to_owned(), Precision::Full)]));
+        let m = Memo::from_yval(&map(&[("inputs", s("crates")), ("platform", YVal::Seq(vec![s("arch"), s("os"), s("os")]))]))?.ok_or("opts in")?;
+        assert_eq!(m.platform, Some(vec![Facet::Os, Facet::Arch]));
+        for bad in [
+            map(&[("inputs", s("ui")), ("platform", YVal::Seq(vec![s("os"), s("gpu")]))]),
+            map(&[("platform", s("any"))]),
+            map(&[("inputs", s("ui")), ("tools", map(&[("node", s("major"))]))]),
+            map(&[("inputs", s("ui")), ("platform", s("any")), ("tools", map(&[("node", s("minor-ish"))]))]),
+            map(&[("inputs", s("ui")), ("platform", s("any")), ("tools", map(&[("../node", s("major"))]))]),
+            map(&[("inputs", s("ui")), ("platform", s("any")), ("tools", s("node"))]),
+        ] {
+            assert!(Memo::from_yval(&bad).is_err(), "{bad:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn w28_r71_toolchain_identities() {
+        assert_eq!(identity(Precision::Major, "v24.21.0\n").as_deref(), Some("24"));
+        assert_eq!(identity(Precision::Major, "v24.11.1"), identity(Precision::Major, "v24.21.0"));
+        assert_ne!(identity(Precision::Major, "v22.1.0"), identity(Precision::Major, "v24.21.0"));
+        assert_eq!(identity(Precision::Minor, "rustc 1.99.1 (5f94df478 2026-08-27)").as_deref(), Some("1.99"));
+        let a = identity(Precision::Full, "rustc 1.99.1\nhost: x86_64-unknown-linux-gnu\nLLVM version: 21.1");
+        assert!(a.as_deref().is_some_and(|x| x.starts_with("sha256:")));
+        assert_ne!(a, identity(Precision::Full, "rustc 1.99.1\nhost: aarch64-apple-darwin\nLLVM version: 21.1"), "any line of `rustc -vV`");
+        assert_eq!(identity(Precision::Major, "no version here"), None);
+        assert_eq!(identity(Precision::Full, ""), None);
+        assert_eq!(version_args("rustc"), ["-vV"]);
+        assert_eq!(version_args("node"), ["--version"]);
+    }
+
+    /// W28-R70: a portable step keys alike in different workflows, jobs, executors, images, step
+    /// positions and runners, whatever its job's `needs`, its job's variables and the runner's
+    /// environment; each declared component changes it.
+    #[test]
+    fn w28_r70_portable_keys_take_only_what_the_step_declares() {
+        let (m, f) = (portable_memo(), portable_facts());
+        let base = key::weak(&portable_unit(&f, &m, &[]));
+        type Edit = (&'static str, fn(&mut Facts));
+        let same: [Edit; 7] = [
+            ("another executor", |f| f.platform.executor = "k8s".into()),
+            ("an image", |f| f.platform.image = Some("sha256:node24bookworm".into())),
+            ("another OS and libc", |f| {
+                f.platform.os = "macos".into();
+                f.platform.arch = "aarch64".into();
+                f.platform.libc = String::new();
+            }),
+            ("the job's needs", |f| {
+                f.upstream.insert("needs".into(), "other".into());
+            }),
+            ("a variable the job declares", |f| {
+                f.declared.insert("CARGO_PROFILE_DEV_DEBUG".into());
+                f.env.insert("CARGO_PROFILE_DEV_DEBUG".into(), "0".into());
+            }),
+            ("a toolchain variable of the runner", |f| {
+                f.env.insert("RUSTFLAGS".into(), "-Ctarget-cpu=native".into());
+            }),
+            ("a tool it doesn't list", |f| {
+                f.platform.toolchains.insert("rustc".into(), "sha256:x".into());
+            }),
+        ];
+        for (what, edit) in same {
+            let mut g = portable_facts();
+            edit(&mut g);
+            assert_eq!(base, key::weak(&portable_unit(&g, &m, &[])), "{what}");
+        }
+        let differ: [Edit; 6] = [
+            ("its script", |f| f.definition.run = Some("npm run build".into())),
+            ("its memo.env", |f| {
+                f.env.insert("MODE".into(), "slow".into());
+            }),
+            ("its inputs", |f| {
+                f.inputs.insert("ui/**".into(), "t2".into());
+            }),
+            ("node's major", |f| {
+                f.platform.toolchains.insert("node".into(), "22".into());
+            }),
+            ("its trust", |f| f.trusted = false),
+            ("a per-run variable its text names", |f| {
+                f.definition.run = Some("make $GITHUB_SHA".into());
+            }),
+        ];
+        for (what, edit) in differ {
+            let mut g = portable_facts();
+            edit(&mut g);
+            assert_ne!(base, key::weak(&portable_unit(&g, &m, &[])), "{what}");
+        }
+        // A facet it lists counts.
+        let m2 = Memo { platform: Some(vec![Facet::Os, Facet::Arch]), ..portable_memo() };
+        let mut g = portable_facts();
+        let k = key::weak(&portable_unit(&g, &m2, &[]));
+        g.platform.arch = "aarch64".into();
+        assert_ne!(k, key::weak(&portable_unit(&g, &m2, &[])));
+        // The default key is W24-R07's as it was.
+        assert_eq!(unit(&facts()), unit(&facts()));
+        assert_ne!(key::weak(&unit(&portable_facts())), base);
+    }
+
+    /// W28-R70: earlier memo steps count by their own key when the step's inputs name their
+    /// outputs, wherever they sit in the job.
+    #[test]
+    fn w28_r70_earlier_steps_by_key_when_inputs_name_their_outputs() {
+        let m = Memo { inputs: vec!["crates/**".into(), "ui/dist".into()], outputs: vec!["dist/kiln".into()], ..portable_memo() };
+        let f = portable_facts();
+        let ui = Earlier { key: "kui".into(), outputs: vec!["ui/dist".into()], digest: "d1".into() };
+        let other = Earlier { key: "kx".into(), outputs: vec!["target/x".into()], digest: "d2".into() };
+        let a = key::weak(&portable_unit(&f, &m, std::slice::from_ref(&ui)));
+        assert_eq!(a, key::weak(&portable_unit(&f, &m, &[other.clone(), ui.clone()])), "an earlier step whose outputs it doesn't read doesn't count");
+        assert_ne!(a, key::weak(&portable_unit(&f, &m, &[Earlier { digest: "d3".into(), ..ui.clone() }])), "the UI it builds on does");
+        assert_ne!(a, key::weak(&portable_unit(&f, &m, &[])));
+        assert!(names_output(&["ui/**".into()], "ui/dist") && names_output(&["ui/dist/client".into()], "ui/dist") && !names_output(&["crates/**".into()], "ui/dist"));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(100_000))]
+        /// W28-AC70: random single-component edits: an undeclared one never changes a portable
+        /// key, a declared one always does.
+        #[test]
+        fn w28_ac70_portable_key_sensitivity(which in 0u8..10, v in "[a-z0-9]{1,8}") {
+            let (m, f) = (portable_memo(), portable_facts());
+            let base = key::weak(&portable_unit(&f, &m, &[]));
+            let mut g = portable_facts();
+            let declared = match which {
+                0 => { g.platform.executor = format!("x{v}"); false }
+                1 => { g.platform.image = Some(format!("sha256:{v}")); false }
+                2 => { g.upstream.insert("needs".into(), v.clone()); false }
+                3 => { g.env.insert(format!("UNDECLARED_{v}"), v.clone()); g.declared.insert(format!("UNDECLARED_{v}")); false }
+                4 => { g.platform.os = format!("os{v}"); false }
+                5 => { g.definition.run = Some(format!("make {v}")); true }
+                6 => { g.env.insert("MODE".into(), format!("m{v}")); true }
+                7 => { g.inputs.insert("ui/**".into(), format!("x{v}")); true }
+                8 => { g.platform.toolchains.insert("node".into(), format!("n{v}")); true }
+                _ => { g.definition.outputs.push(format!("o{v}")); true }
+            };
+            let k = key::weak(&portable_unit(&g, &m, &[]));
+            proptest::prop_assert_eq!(declared, k != base, "edit {}", which);
+        }
     }
 
     #[test]

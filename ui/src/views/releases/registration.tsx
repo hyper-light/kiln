@@ -25,6 +25,7 @@ import { RelTime } from "@/views/shared";
 import { DEPLOY_EVENTS } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
+import { Highlighted } from "@/components/code/highlighted";
 
 type Tab = "resources" | "manifests" | "diff" | "logs" | "secrets" | "versions" | "linked";
 
@@ -159,7 +160,9 @@ function Manifests({ app, env, version }: { app: string; env: string; version: s
               <span className="cd-meta">{objectLabel(m.key)}</span>
               <CopyButton text={m.yaml} className="cd-copy" />
             </div>
-            <pre className="cd-yaml">{m.yaml}</pre>
+            <pre className="cd-yaml">
+              <Highlighted text={m.yaml} lang="yaml" />
+            </pre>
           </div>
         </details>
       ))}
@@ -178,7 +181,7 @@ function Diffs({ app, env, version }: { app: string; env: string; version: strin
         <div key={objectKey(d.key)}>
           {d.missing && <p className="rel-msg">{objectLabel(d.key)}: not there yet, made by a sync.</p>}
           {d.requires_pruning && <p className="rel-msg">{objectLabel(d.key)}: no longer in git, deleted by a sync that prunes.</p>}
-          {d.hunks.length > 0 && <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.hunks }} label={objectLabel(d.key)} />}
+          {d.hunks.length > 0 && <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.hunks }} label={objectLabel(d.key)} language="yaml" />}
         </div>
       ))}
     </div>
@@ -493,7 +496,9 @@ function Linked({ app, env }: { app: string; env: string }) {
             <span className="cd-meta">What it says</span>
             <CopyButton text={jwt} label="Copy the statement" className="cd-copy" />
           </div>
-          <pre className="cd-yaml">{JSON.stringify(claimsOf(jwt), null, 2)}</pre>
+          <pre className="cd-yaml">
+            <Highlighted text={JSON.stringify(claimsOf(jwt), null, 2)} lang="json" />
+          </pre>
         </div>
       )}
     </>
@@ -551,7 +556,7 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
   return (
     <>
       <header className="cd-head">
-        <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: app, to: releaseAppHref(app) }, { label: env }]} />
+        <Crumbs index={2} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: app, to: releaseAppHref(app) }, { label: env }]} />
         <div className="rel-head-row">
           <h1 className="cd-title">
             {app} <span className="rel-title-in">in</span> {env}
