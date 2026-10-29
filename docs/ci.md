@@ -8885,7 +8885,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
 
 **Scope.** The land queue, builds and deploys of a trunk many agents change at once (kiln plan
 `01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
-`01a1751638e773b98b5092662fc06bf5`), and step 5's, R50–R59 (kiln plan
+`01a1751638e773b98b5092662fc06bf5`) and its third step's, R100–R109, and step 5's, R50–R59 (kiln plan
 `01a17604e26a73e187efb3a2859aaacb`); the other steps take their ranges as they come. Commits
 before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`).
 
@@ -8981,6 +8981,91 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
   broken trunk (the last push to finish the job had failed it at the same step) fails only on a
   stack that holds the change that started its streak. *Replay* (`cargo test -p kiln-ci
   w28_ac33`); ci/sim/README.md keeps the report.
+
+**Requirements: the land queue by component** (step 9's third step, R100–R109: R30–R37 wired into
+`crates/kiln/src/ci/land.rs`, the decisions pure in `kiln_ci::land::queue`, with what Review needs of
+the queue)
+
+- **W28-R100 Components.** The entries queued and under test make a conflict graph (R30, R31) over
+  the repository's units: the trunk's package graph and each entry's own (its top pinned
+  revision's), each package a unit by its folder, its dependencies and its workspace's root files.
+  An entry's change is the files its pinned revisions change, and those of the diffs below it that
+  entries ahead of it land, so a stack split at its clear prefix stays one component, its later part
+  after the rest. Each component is a queue of its own: entries of different components never wait
+  for each other. Each entry keeps its standing: its component (by its head's id), its place there,
+  its component's window, and its decision against each entry ahead of it (R34).
+- **W28-R101 Candidates by component.** Each component without a candidate under test gets one,
+  tested beside every other component's: its first entries, as many as its window allows (R36's
+  AIMD window, starting at and never passing the trunk's `queue.batch`, or a bisection's bound),
+  applied in order onto the trunk's tip. A joint candidate holds only entries that meet, and says
+  where (their interaction units, files or targets); an entry that meets no other has a candidate
+  of its own, its own change's result. An entry that conflicts with one ahead of it in its
+  candidate waits for that one to land; the candidate ends before it. New candidates go in R35's
+  order. Each entry counts the candidates that held it (`tested`).
+- **W28-R102 Results stand; bisection stays inside.** A candidate that passed after the trunk moved
+  for another component lands as tested, its entries applied again onto the trunk's tip, when what
+  moved the trunk shares no file, unit or target with it (asked again just before the move); else it
+  is tested again on the trunk as it is, saying why. So when the trunk moves for one component, the
+  others aren't tested again. A failure is bisected inside its component: alone, its entry is the
+  culprit and is ejected, saying which check failed; else the component's window halves and its next
+  candidate ends at the middle suspect.
+- **W28-R103 One move at a time.** The trunk moves by compare-and-swap, each move taking every entry
+  of one ready candidate at once; a move the trunk raced builds the candidate again.
+- **W28-R104 Review's gate.** `review::readiness` is the single gate of `land`, `land_when_ready` and
+  the queue's re-check just before each move: ready means it lands; blockers (by the trunk's policy
+  on the diff's latest version) mean it holds, with them as the reason; a conflict with the trunk's
+  tip, each diff applied on top of those below it, sends it back to Review's conflict ladder (R107).
+  `GET /api/diffs/:id/land` shows the gate, and the entry that holds the diff. An entry the gate
+  holds (`held`, `hold: gate`) is asked again as reviews come and at least every 10 s, and joins the
+  queue once the gate clears it. Review holds an entry (`POST /api/queue/:entry/hold`, `hold:
+  review`) until it lets it go (`/release`), or withdraws it (`/withdraw`, `withdrawn`), each
+  saying who and why (`diffs.review`). Held, returned or withdrawn, an entry's diffs are Review's
+  again, in the state their reviews give them.
+- **W28-R105 Pinned revisions.** An entry pins each diff's approved revision: its version, commit,
+  the commit below it and its patch-id. A newer revision invalidates the pin unless it only rebased,
+  with the same patch-id: the entry holds (`it has v2 since v1 was approved, which changes its patch:
+  v2 lands once Review approves it`), and once Review approves the newer one it's pinned and the
+  entry joins the queue again. The candidate tested is the pinned revision onto the trunk, never a
+  newer one. The commit is the unit: entries name their commits.
+- **W28-R106 A stack's clear prefix.** A stack lands its clear prefix, in order; the rest holds in an
+  entry of its own, each diff saying why (`D3: 0 of 1 accepts`, `D4: D3, below it, holds`), and
+  follows once Review's gate clears it. With nothing clear, `land` lands nothing and says why. An
+  entry whose upper diffs stop being clear before its move lands its prefix, tested on its own.
+- **W28-R107 Conflicts go back to Review.** An entry that conflicts with the trunk isn't ejected: it's
+  `returned` to Review, saying where (`needs rebase: conflicts with the trunk in README.md`, the
+  files kept in `conflicts`), and the same entry joins the queue again once a version resolves it and
+  Review's gate clears that version.
+- **W28-R108 The land record.** Each land keeps (`land_records`, one row per entry; `record` in
+  `GET /api/repos/:repo/queue`): the change and its kind (`diff`, `stack`, `change_request`,
+  `host`), the strategy, the approved revisions with their patch-ids, the candidate tested and the
+  trunk it was built on, its checks' runs, whether it landed as tested onto a trunk that moved
+  since, the trunk's move, the commit carrying each change, the trunk's policy it landed under, who
+  asked, and which queue landed it.
+- **W28-R109 A host's own queue.** Which queue lands a repository's changes is the forge seam's
+  `abilities(repo).queue` (`kiln_seams::Forge`, docs/seams.md): none means W28's queue; one means
+  the host's (GitHub's merge queue, GitLab's merge trains), followed through the seam alone:
+  `enqueue` each change at the head Review cleared, `queued` read back after each call (a stacked
+  change takes those below it), `change` read conditionally until it merged (landed, recorded) or
+  left the queue unmerged (out), `dequeue` when Review holds or withdraws it. kiln never calls
+  githost directly for it; kiln's own git server has no forge, so its repositories land on W28's.
+
+**Acceptance criteria: the land queue by component**
+
+- **W28-AC100 Four diffs in two components, one culprit.** W14-AC03 with the diffs in packages `a`
+  and `b`: a candidate for each component under test at once; the clean component lands, none of its
+  entries tested again, before the culprit's bisection ends; only the culprit is ejected, with its
+  reason. *Integration test* (`cargo test -p kiln --test hosting w14_ac03`).
+- **W28-AC101 Independent diffs.** Two diffs that share nothing, side by side on one trunk: both
+  land, each tested once, the second as tested onto the trunk the first moved. *Integration test*
+  (`w28_r102_independent_diffs_land_without_testing_each_other_again`); the planner's
+  (`cargo test -p kiln-ci land::queue`).
+- **W28-AC102 Review's needs.** One test each: the gate holds a candidate whose diff was asked for
+  changes just before its move and lands it once accepted, and Review holds, lets go and withdraws
+  (`w28_r104_one_gate_for_land_and_the_move`); pins hold through a rebase-only revision and not
+  through one that changes the patch (`w28_r105_entries_pin_what_review_approved`); a stack lands
+  its clear prefix (`w28_r106_a_stack_lands_its_clear_prefix`); a conflict goes back to Review and
+  comes back (`w28_r107_a_conflict_goes_back_to_review_and_comes_back`); a host's queue through
+  the forge seam's simulator (`cargo test -p kiln w28_r109`).
 
 **Requirements: deploys by what they share**
 
@@ -9093,8 +9178,12 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
 batches with a 60 min hold land changes 73% sooner than today's serial queue (5.0 h to 1.3 h) at
 54% fewer runner-hours per landed change (0.453 to 0.208), more than half on every seed; no job
 waits for a runner and no window opens past 8. Per-change speculation lands faster (-88%) but
-saves 7%, its candidates waiting past the aging bound (ci/sim/README.md). The land queue uses none of this yet: that
-is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
+saves 7%, its candidates waiting past the aging bound (ci/sim/README.md). R100–R109 and AC100–AC102 built
+(2026-10-26): the land queue in `crates/kiln/src/ci/land.rs` carries out `kiln_ci::land::queue`'s plan by
+component, asks `review::readiness` before every move, pins approved revisions, lands a stack's clear
+prefix, returns conflicts to Review, keeps `land_records`, and routes on the forge seam (migration
+`20261026-1700_w28_land_wire`). Deploy targets aren't read into the conflict graph's changes yet, and
+R37's batch hold isn't applied by the server. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
 
 **Requirements: demands and adopt-on-supersede** (step 4's, R40–R49; kiln plan
 `01a17607cd1273c5836771efb9d377d7`)
