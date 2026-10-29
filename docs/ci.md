@@ -1691,15 +1691,20 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   gives way to live work unless it's within `finish-within` (300 s by default) of its end.
 - **W05-R09 Priorities.** Default by event: `workflow_dispatch`/manual 100, `land`/`merge_group`
   90, `diff`/`pull_request` 80, `push` 60, `agent` 60, `workflow_run` 50, `schedule` 20; a job's
-  `priority: high | normal | low | <0–100>` overrides. Strict between classes, with **aging**:
-  effective priority rises by `[ci.scheduler] aging_per_minute` (default 1) while waiting, so
-  nothing starves.
-- **W05-R10 Fair share.** Within a priority, start-time fair queuing across repositories (or
-  organizations, `[ci.scheduler] fair_by`), weighted by `[ci.fairness] weights`: each leg's virtual
-  start is `max(V, finish[repo])`, and `finish[repo] += expected_cost / weight`, with
-  `expected_cost` the leg's median runner-seconds from history (W19) or a default. Under
-  saturation, two equally weighted repositories each get within 10 % of half the capacity
-  (W05-AC04).
+  `priority: high | normal | low | <0–100>` overrides. Priority orders a tenant's own legs (W05-R32),
+  with **aging**: a waiting leg's priority rises by `[ci.scheduler] aging_per_minute` (default 1) a
+  minute, kept as a key that doesn't move with the clock (`aging × queued-at − priority ×
+  60,000,000`, least first, then arrival), so a tenant's own stream of high-priority legs never
+  starves its low-priority ones (W05-AC03). Between tenants only fair share counts (W05-R10), and
+  between classes W05-R30 (docs/needs.md E2.3).
+- **W05-R10 Fair share.** Within a class (W05-R30), start-time fair queuing across tenants:
+  repositories, weighted by `[ci.fairness] weights`, and inside them actors and lanes as
+  `[ci.scheduler] fair_by` lists (W05-R32). A leg's charge is its dominant share of the fleet × its
+  expected time over its node's weight (W05-R33), its expected time its job's median runner-seconds
+  from history (W19) or a default; charged at dispatch, and settled to the time it ran when its
+  attempt ends. Under saturation, two equally weighted repositories each get within 10 % of half
+  the capacity (W05-AC04), and tenants of any shape their weighted share of dominant-resource time
+  (W05-AC14).
 - **W05-R11 Quotas** (opt-in): per repository or organization, maximum legs in progress and
   runner-minutes per day, per pool.
 - **W05-R12 Reservations** (opt-in): a pool or runner reserved for matching legs during windows
@@ -1850,6 +1855,44 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `float_arithmetic` is denied everywhere else in `sched`. Whatever it walks while deciding it
   walks in one order: what it keeps is ordered, and its legs, looked up on every input, are kept in
   a table walked in key order; hash maps hold only settings looked up by key.
+- **W05-R30 Classes** (docs/needs.md §7, E2.3). Every leg has a class, set by kiln from what the
+  work is for, never by the job: by event (W05-R09) a manual run `interactive`, a land or merge
+  group `land`, a schedule `background`, the rest (pushes, pull requests, diffs, agents' runs,
+  `workflow_run`) `batch`; by intent (W28-R64) a gate `land`, someone waiting `interactive`, trunk
+  and work in progress `batch`. Classes go strictly in order (`critical`, `land`, `interactive`,
+  `batch`, `background`) but for W05-R31; in a class only fair share orders tenants (W05-R10), and
+  priority only a tenant's own legs (W05-R09). The routing explanation's `standing` names a leg's
+  class, the class it was promoted from, and its tenant.
+- **W05-R31 Floors and promotion** (docs/needs.md §7, E2.3). `[sched.classes.<class>] floor`
+  (percent of the fleet) and `bound` (`30m`, or `never`); by default `batch` 15 % and 30 minutes,
+  `background` 5 % and an hour, the rest neither. A class whose running legs hold less of the
+  fleet than its floor (their total at its largest dimension, as YARN measures a minimum share
+  under DRF) takes room ahead of the classes before it when room frees: with a leg that keeps it
+  within its floor, always; with one that would take it over (a floor smaller than a leg), once
+  its pace has passed, which moves on by `the leg's dominant share × its expected time / what was
+  left of the floor` and is settled to the time it ran, so on one slot a 15 % floor is the slot 15
+  % of the time. Nothing is preempted. A leg that has waited its class's bound while its class
+  started no leg at its signature goes up a class (`background` to `batch`, `batch` to
+  `interactive`, never higher), keeping its place in its tenant's order; if its class did start
+  one there, it's looked at again a bound after that start, so a class being served keeps fair
+  share's order, never the longest wait's. The engine asks for a timer for the next look; a
+  promoted leg preempts nothing.
+- **W05-R32 The tenant tree** (docs/needs.md E2.2). Fair share runs over a tree, one for each class:
+  repositories, then their actors, then their lanes, as far as `fair_by` goes, a repository
+  weighted by `[ci.fairness] weights` and the levels below it equally. Start-time fair queuing at
+  every node: a leg dispatched charges each node on its path from `max(its parent's virtual time,
+  its own finish)`, and the parent's virtual time moves up to that start; a free runner takes, of
+  the legs that fit it, the one whose path of standings is least, level by level. Tags are taken at
+  dispatch, so a tenant's own order never moves its place among tenants, and a tenant that was idle
+  comes back at the virtual time, with no credit or debt from before.
+- **W05-R33 Dominant-share cost** (docs/needs.md E2.1, E2.4). A leg's share of each dimension of the
+  fleet (slots, CPUs, memory, GPUs: what it holds of its runner, one slot and its request or all
+  of it, over what the connected runners that aren't draining offer, millionths rounded up). Fair
+  share keeps its tags for every set of dimensions a runner may offer, a leg charging each set its
+  largest share among them × its expected time (DRFQ's dominant charge), and a runner ranks tenants
+  by its own set's tags: a resource only some runners offer (GPUs) counts on those runners, not
+  against the same tenant's work on the others (H-DRF), and each tenant is ranked by its dominant
+  resource among what that runner has. In slots mode the only dimension is slots.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),
@@ -1873,8 +1916,10 @@ W20.
   the kiln `limit` and cross-repository groups. *Unit test.*
 - **W05-AC02 Supersede.** Pushes 1, 2, 3 to a branch with `supersede: { when: [branch], action:
   cancel }`: runs 1 and 2 cancelled with the reason, 3 runs; without it all three run. *Unit test.*
-- **W05-AC03 Priorities and aging.** A low-priority leg under a constant stream of high-priority
-  legs starts within the bound aging gives. *Simulation test.*
+- **W05-AC03 Priorities and aging.** A priority-20 leg under a constant stream of its own
+  repository's priority-100 legs starts within the bound aging gives, (100 − 20) / 1 a minute: at
+  79 to 82 minutes. In another repository than the stream it starts at its tenant's first turn,
+  within a minute (W05-R09, docs/needs.md E2.3). *Simulation test.*
 - **W05-AC04 Fairness.** Two repositories, equal weights, each queueing 1,000 one-minute legs on
   20 slots: each gets 50 % ± 10 % of slot-time over any 10-minute window. Weight 3:1 gives 75 % ±
   10 %. *Simulation test.*
@@ -1914,7 +1959,8 @@ W20.
   case that parts is cut down and printed with its seed (`KILN_SCHED_REFERENCE_SEED`). kiln-sim's
   scheduler model holds runners within their capacity and settles every leg under the network's
   nemesis (docs/sim.md). *Unit tests, simulation.*
-- **W05-AC14 Fair share whatever the shape** (docs/needs.md G7, grown from W05-AC04). Under
+- **W05-AC14 Fair share whatever the shape** (W05-R10, R32, R33; docs/needs.md G7, grown from
+  W05-AC04). Under
   saturation each tenant gets its weighted share of dominant-resource time (each leg's time × its
   largest share of what the fleet has, in slots, CPUs, memory or GPUs) within 10 points over every
   10-minute window while both are backlogged, whatever order its work came in and whatever its
@@ -1928,6 +1974,14 @@ W20.
   only through reservations (docs/needs.md E4). Where memory runs out before CPUs (CPUs
   overcommitted 1.5 times), the 1-GiB legs take each GiB as it frees, and the tenant of 8-GiB legs
   holds about a third, not half. *Simulation tests (`w05_ac14_…`).*
+- **W05-AC15 A class's bound** (W05-R31). A `background` leg under a steady stream of one-minute
+  `batch` legs on 20 slots starts when a runner next frees, through its 5 % floor (within 2
+  minutes); with every floor at zero, at its 60-minute bound, promoted to `batch`, and a leg's time
+  (60 to 61 minutes). Under a saturating `land` stream, `batch` holds 13 % to 17 % of 20 slots in
+  every 10-minute window, and on one slot 15 % of the time; `interactive` legs go first while
+  `batch` holds its floor; a work-in-progress leg behind gate work starts as the runner next frees;
+  a class served at one signature is still promoted where it's passed over. *Simulation tests
+  (`w05_ac15_…`, `w05_r31_…`, `w28_r65_…`).*
 
 **Scenarios**
 
@@ -8808,15 +8862,17 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
   change request with `fix_checks` waits on, a plan run's stack step, `ci.verdict.wait`'s once W25
   step 5 adds it), trunk 60 (the default branch), WIP 40 (other branches and diffs). Each leg's
   routing explanation (`ci.legs.routing`'s `standing`) names its class and why.
-- **W28-R65 Aging between classes, fair share within.** A signature keeps a queue per priority,
-  each ordered by fair-share start, then arrival; the next leg comes from the priority whose next
-  leg has the highest `priority + aging_per_minute × minutes waited`. Classes stay strict, a class
-  behind a saturated stream of gate work starts within `(90 − p) / aging` minutes and a leg's time,
-  and fair share holds inside a class however long its legs wait.
+- **W28-R65 Aging between classes, fair share within.** Grown into W05-R30 and W05-R31
+  (docs/needs.md E2.3): an intent sets a leg's class, classes go in order with floors and
+  promotion, and aging orders only a tenant's own legs (W05-R09). The aging between priority
+  levels it had (the next leg from the priority whose next leg had the highest `priority +
+  aging_per_minute × minutes waited`) is gone: a WIP leg behind a saturated stream of gate work
+  starts through `batch`'s floor as a runner frees, where it waited `(90 − 40) / aging` minutes.
 - **W28-R66 Fair share by actor and lane.** `[ci.scheduler] fair_by = ["repo", "actor", "lane"]`
   (`["repo"]` by default, W05-R10 as it was): inside a repository its active actors share its
   share equally, and inside an actor its active lanes, as far as the list goes (Buildbarn's nested
-  invocations). Two agents pushing at 10:1 each get half of what they saturate.
+  invocations). Two agents pushing at 10:1 each get half of what they saturate. Grown into W05-R32's
+  tenant tree (docs/needs.md E2.2), costed by W05-R33.
 - **W28-R67 Whose a commit is.** Agents push with their machine's git identity, so kiln's records
   say: the agent token a push came with (`agent:<id>`), else the agent change request whose last
   pushed commit it is (`agents/change/<agent>`), else a `Kiln-Agent: <name> (<harness>, <id>)`

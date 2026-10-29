@@ -2045,8 +2045,8 @@ proptest! {
 }
 }
 
-/// docs/needs.md E2.1: an item's share of each dimension of the fleet, in millionths rounded up,
-/// and what running charges its flow.
+/// W05-R33 (docs/needs.md E2.1): an item's share of each dimension of the fleet, in millionths
+/// rounded up, and what running charges its flow.
 #[test]
 fn e2_1_shares_and_charges() {
     use super::state::{charges, offers, shares};
@@ -2079,9 +2079,9 @@ fn e2_1_shares_and_charges() {
     assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 3000), [1_000_000_000, 0, 0, 0]);
 }
 
-/// docs/needs.md E2.1 (H-DRF's case): a repository whose GPU legs hold every GPU, which no one else
-/// asks for, still gets its share of the runners without GPUs for its other legs: a runner picking
-/// goes by the dimensions it offers, so GPU time doesn't count there.
+/// W05-R33 (docs/needs.md E2.1, H-DRF's case): a repository whose GPU legs hold every GPU, which no
+/// one else asks for, still gets its share of the runners without GPUs for its other legs: a runner
+/// picking goes by the dimensions it offers, so GPU time doesn't count there.
 #[test]
 fn e2_1_a_repository_holding_every_gpu_keeps_its_share_of_the_cpu_runners() {
     let gib = 1u64 << 30;
@@ -2124,8 +2124,9 @@ fn e2_1_a_repository_holding_every_gpu_keeps_its_share_of_the_cpu_runners() {
     assert!(gpus >= 8 * 29, "only {gpus} GPU legs ran in the first 30 minutes");
 }
 
-/// docs/needs.md E2.2: an actor that comes to a saturated repository gets its equal part of it from
-/// its first window: tags taken at dispatch give it no credit, and no debt, from before it came.
+/// W05-R32 (docs/needs.md E2.2): an actor that comes to a saturated repository gets its equal part
+/// of it from its first window: tags taken at dispatch give it no credit, and no debt, from before
+/// it came.
 #[test]
 fn e2_2_a_late_actor_gets_its_part_at_once() {
     use super::state::FairBy;
@@ -2149,9 +2150,9 @@ fn e2_2_a_late_actor_gets_its_part_at_once() {
     }
 }
 
-/// docs/needs.md E2.2 (H-DRF's example, inside the tenant tree): a repository whose GPU lane holds
-/// every GPU keeps its CPU lane's share of the runners without GPUs, against a repository with only
-/// CPU work.
+/// W05-R32, R33 (docs/needs.md E2.2, H-DRF's example inside the tenant tree): a repository whose
+/// GPU lane holds every GPU keeps its CPU lane's share of the runners without GPUs, against a
+/// repository with only CPU work.
 #[test]
 fn e2_2_a_gpu_lane_doesnt_cost_its_repositorys_cpu_lane() {
     use super::state::FairBy;
@@ -2192,8 +2193,8 @@ fn e2_2_a_gpu_lane_doesnt_cost_its_repositorys_cpu_lane() {
     }
 }
 
-/// docs/needs.md E2.2: a tenant whose legs run three times their estimate still gets its share,
-/// each charge settled to the time it ran (as DRFQ needs no time beforehand).
+/// W05-R10, R32 (docs/needs.md E2.2): a tenant whose legs run three times their estimate still
+/// gets its share, each charge settled to the time it ran (as DRFQ needs no time beforehand).
 #[test]
 fn e2_2_a_tenant_running_past_its_estimates_keeps_its_share() {
     let mut sim = Sim::new(Config::default());

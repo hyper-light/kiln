@@ -235,8 +235,8 @@ pub fn own_order(priority: u8, aging: PerMille, queued_at: i64) -> i128 {
 /// taken as legs are picked, for the runner picking (docs/needs.md E2.1, E2.2).
 type Key = (Class, i128, u64);
 
-/// The dimensions fair share counts (docs/needs.md E2.1): slots, milli-CPUs, memory bytes and
-/// GPUs, in that order.
+/// The dimensions fair share counts (W05-R33, docs/needs.md E2.1): slots, milli-CPUs, memory bytes
+/// and GPUs, in that order.
 pub const DIMS: usize = 4;
 
 /// A share of the fleet, in millionths.
@@ -270,15 +270,15 @@ fn held_share(held: &[u128; DIMS], fleet: &[u64; DIMS]) -> u128 {
     held.iter().zip(fleet).filter(|(_, f)| **f > 0).map(|(h, f)| h.saturating_mul(MILLION) / u128::from(*f)).max().unwrap_or(0)
 }
 
-/// What running costs a node of the tenant tree in each dimension (docs/needs.md E2.1, as DRFQ
+/// What running costs a node of the tenant tree in each dimension (W05-R33, as DRFQ
 /// charges): its share of it times its milliseconds, over the node's weight (thousandths), in
 /// fair share's virtual time.
 pub fn charges(shares: &[u128; DIMS], ms: Ms, weight: PerMille) -> [u128; DIMS] {
     shares.map(|s| s.saturating_mul(u128::from(ms)).saturating_mul(1000) / u128::from(weight.max(1)))
 }
 
-/// Fair share's tags are kept once for every set of dimensions a runner may offer (docs/needs.md
-/// E2.4): a set is a bitmask over [`DIMS`], bit `d` for dimension `d`.
+/// Fair share's tags are kept once for every set of dimensions a runner may offer (W05-R33,
+/// docs/needs.md E2.4): a set is a bitmask over [`DIMS`], bit `d` for dimension `d`.
 pub const PROFILES: usize = 1 << DIMS;
 
 /// The set of dimensions `dims` marks, as a bitmask ([`PROFILES`]).
@@ -308,7 +308,7 @@ fn nodes(leaf: &str) -> impl Iterator<Item = &str> {
     leaf.match_indices('\0').map(|(i, _)| i).chain(std::iter::once(leaf.len())).filter_map(|i| leaf.get(..i))
 }
 
-/// What a leg's dispatch charged fair share (docs/needs.md E2.2), settled when its attempt ends:
+/// What a leg's dispatch charged fair share (W05-R32), settled when its attempt ends:
 /// the leaf whose nodes it charged and their weights, top down; its shares of the fleet; the
 /// milliseconds it was charged for; when it started.
 #[derive(Debug, Clone, PartialEq)]
@@ -992,7 +992,7 @@ pub struct Scheduler {
     /// Runs by supersede key, oldest first.
     superseding: BTreeMap<String, Vec<String>>,
     run_groups: BTreeMap<String, String>,
-    /// Fair share over the tenant tree, one tree per class (docs/needs.md E2.1 to E2.4): each
+    /// Fair share over the tenant tree, one tree per class (W05-R32, R33): each
     /// node's virtual finish under its parent, and each parent's virtual time (the root's under
     /// `""`), for every set of dimensions a runner may offer ([`profile_costs`]): start-time fair
     /// queuing's tags at every node, as DRFQ keeps them.
@@ -1667,7 +1667,7 @@ impl Scheduler {
     }
 
     /// A leaf's standing for a runner offering the set of dimensions `set` ([`profile`];
-    /// docs/needs.md E2.1, E2.2, E2.4): at each node from its repository down, where it would start
+    /// W05-R32, R33): at each node from its repository down, where it would start
     /// under its parent in that set (start-time fair queuing's tag: the parent's virtual time, or
     /// the node's own finish when that's later). Leaves compare level by level, as hierarchical SFQ
     /// walks its tree from the root. Each level is DRF over time among the dimensions the runner
@@ -1951,8 +1951,8 @@ impl Scheduler {
 
     /// Gives a runner the best queued legs that fit it, until none does: from the first class in
     /// order with one, unless a class after it is short of its floor and may take room ahead of it
-    /// (W05-R31, [`Self::ahead_of`]); in a class, the least standing of its tenant in the dimensions
-    /// this runner offers, level by level (docs/needs.md E2.1, E2.2), then the tenant's own order
+    /// (W05-R31, [`Self::ahead_of`]); in a class, the least standing of its tenant in the
+    /// dimensions this runner offers, level by level (W05-R32, R33), then the tenant's own order
     /// (W05-R09's aged priority), then arrival.
     fn try_runner(&mut self, runner: &str, now: i64, out: &mut Vec<Command>) {
         loop {
@@ -1996,7 +1996,7 @@ impl Scheduler {
         best.map(|b| b.map(|(_, id)| id))
     }
 
-    /// Charges a leg's tenant for its dispatch to `runner` (docs/needs.md E2.1 to E2.4): in its
+    /// Charges a leg's tenant for its dispatch to `runner` (W05-R32, R33): in its
     /// class's tree, at every node from its repository down, in each set of dimensions, its
     /// largest share there of what the fleet has (of what it holds on that runner) times its
     /// expected milliseconds over the node's weight ([`profile_costs`]), from where start-time
@@ -2043,8 +2043,8 @@ impl Scheduler {
         }
     }
 
-    /// Settles what a leg's dispatch charged fair share to the time its attempt ran (docs/needs.md
-    /// E2.2; start-time fair queuing needn't know it beforehand, as DRFQ has it): each node's finish
+    /// Settles what a leg's dispatch charged fair share to the time its attempt ran (W05-R10, R32;
+    /// start-time fair queuing needn't know it beforehand, as DRFQ has it): each node's finish
     /// gives back what it was charged for the expected time and takes the time it ran instead. Its
     /// class holds what it held no more, and a floor's pace it moved is settled alike (W05-R31).
     fn settle_charge(&mut self, id: &str, now: i64) {
@@ -2314,8 +2314,8 @@ impl Scheduler {
         self.reprioritize(exec, priority);
     }
 
-    /// A queued leg takes another priority, keeping its class and arrival: its place in its tenant's
-    /// own order moves with it.
+    /// A queued leg takes another priority, keeping its class and arrival: its place in its
+    /// tenant's own order moves with it.
     fn reprioritize(&mut self, id: &str, priority: u8) {
         self.unqueue(id);
         let aging = self.config().aging_per_minute;

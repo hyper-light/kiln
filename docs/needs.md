@@ -192,13 +192,27 @@ tenant's own order.
 - **Cost is dominant share × duration:** an item's largest request as a share of the fleet's
   capacity in that dimension, times its expected duration. 32 CPUs for an hour costs 32 times one CPU
   for an hour, and a memory-heavy test costs by its memory.
+- **Tags are kept for every set of dimensions a runner may offer:** an item charges each set its
+  largest share among them × its time (DRFQ's dominant charge), and a runner ranks tenants by its
+  own set's tags. A GPU counts on the runners with GPUs, not against the same tenant's work on the
+  others (H-DRF), and each tenant is ranked by its dominant resource among what the runner has. One
+  tag for each dimension, ranked by the largest, doesn't hold: each dimension's virtual time moves
+  on its own, and a tenant coming back after another ran alone is ranked by whichever dimension's
+  virtual time is furthest ahead, not by its dominant one (E2.4 found it: 61 % where 75 % was due).
+- **Charged at dispatch, settled at the end:** an item is charged its expected time when it's
+  dispatched, so a burst registers at once (Kueue's entry penalty), and settled to the time it ran
+  when it ends, as start-time fair queuing needs no time beforehand (DRFQ). A tenant that was idle
+  comes back at the virtual time, with no credit or debt from before.
 - **Priority, aged, orders a tenant's own work,** never one tenant's against another's: W05-R09's
   priorities pick which of a tenant's items goes when its turn comes, and an item's priority rises
   as it waits (W05-R09's aging), so a tenant's own stream of high-priority work never starves its
   low-priority work (W05-AC03). Between tenants, only weights count.
-- **Aging also promotes across classes.** An item that has waited past its class's bound is
-  promoted a class, at most to `interactive`, and a promoted item never preempts (§7). With the
-  classes' floor shares, that bounds every item's wait twice over.
+- **A class passed over is promoted.** An item that has waited its class's bound while its class
+  started nothing where it would run is promoted a class, at most to `interactive`, and a promoted
+  item never preempts (§7). A class being served isn't: there the order stays fair share's and its
+  tenants' own, never the longest wait's (promoting every item that waited lifted a saturated
+  class's own backlog past other tenants). With the classes' floor shares, that bounds every
+  class's wait twice over.
 - **Aging never orders tenants against each other.** There it would only measure who came first:
   today's key does that, which is why its fair share holds only within a minute.
 
@@ -263,8 +277,11 @@ sessions' from what runners measured them using. They give work that asks for no
 | `background` | schedules, simulations, prewarming, reclaimed room | no | always |
 
 Classes go strictly in order, except that each has a **floor share** of capacity it gets whenever it
-has work (by default 5 % for `background`, 15 % for `batch`), and an item that waited past its
-class's bound is promoted (§5), so no class starves another and no item waits without bound.
+has work (by default 5 % for `background`, 15 % for `batch`), and a class passed over for its bound
+has its items promoted (§5), so no class starves another. A class short of its floor goes ahead
+with an item that keeps it within its floor, and with one that would take it over (a floor smaller
+than an item) as often as its floor of the fleet's time allows: on one slot, 15 % is the slot 15 %
+of the time.
 W05-R09's default priorities map onto classes (a manual run `interactive`, a land `land`, pushes,
 pull requests and agents' runs `batch`, schedules `background`) and keep ordering, with their aging,
 a tenant's own work within its class.
@@ -686,7 +703,7 @@ at once; A1 only measures.
 | Step | | Done when |
 | --- | --- | --- |
 | E1 (built) | The ground: integer amounts, no decision on hash-map order, the replay test, the reference engine, the kiln-sim model's skeleton | the same inputs give the same commands on x86-64 and arm64; the reference and real engines agree on 10,000 random small cases |
-| E2 | Fair share that holds: classes with floors and promotion, W05-R09's aging within a tenant, the tenant tree, dominant-share costs | G7 with staggered arrivals and mixed shapes; W05-AC03 within a tenant; a `background` item under a steady stream of `batch` starts within its bound |
+| E2 (built) | Fair share that holds: classes with floors and promotion, W05-R09's aging within a tenant, the tenant tree, dominant-share costs | G7 with staggered arrivals and mixed shapes; W05-AC03 within a tenant; a `background` item under a steady stream of `batch` starts within its bound |
 | E3 | Grants as fenced leases end to end: epoch and expiry, renewal, runners' loss and draining told to the engine, self-fencing, the store refusing stale writes, tokens that die with their grant, reconciling after failover | G2 and G10 in the simulator under the nemesis, a million seeds; live, a runner cut off past its lease: nothing it writes after the next attempt starts is taken, and its tokens no longer work |
 | E4 | Reservations and gangs | G6: a 12-CPU item among a stream of 1-CPU ones starts by its bound; a gang of 3 never half-starts |
 | E5 | Every kind on the engine: commands and sessions held, slices for local work, budgets, rooms measured, heavy units from Headroom | an agent's command with no room is queued, not refused; CI legs, commands and sessions on one runner never exceed its budget together (G1) |
@@ -713,3 +730,20 @@ model found three flaws in the engine, each fixed with its test: the legs a runn
 were given back one at a time, out of queue order; a leg lost with its runner waited for good for
 another runner too small to hold it (docs/sim.md's bug 10); and a leg refused by the only runner big
 enough to hold it said it waited for capacity.
+
+**E2 is built** (branch `needs-engine`, 2026-10-28; docs/ci.md W05-R30 to R33, W05-AC14 and AC15,
+W05-R09, R10 and AC03 amended). Every leg has a class, set from its event or intent; classes go in
+order with floors and promotion; fair share runs over a tree of tenants for each class, costed by
+dominant share × time, charged at dispatch and settled at the end; W05-R09's aging orders only a
+tenant's own work. Building it changed three of its rules, each for a test it failed:
+
+- **Promotion is for a class passed over:** promoting every item that waited its bound lifted a
+  saturated class's own backlog past other tenants (a late actor got 15 % of its repository, not
+  50 %).
+- **A floor smaller than an item is paced:** on one slot a 15 % floor took the slot every time it
+  freed; pacing every item a floor lets through starved it when items ended together (5 % of 20
+  slots, not 15 %), so only an item that takes its class over its floor is paced.
+- **Fair share's tags are kept per set of dimensions**, not per dimension (§5).
+
+Its limits are named in W05-AC14: small items refilling the room a big one needs (1-GiB legs
+against 8-GiB ones where memory runs out first) are E4's, measured at a third rather than half.
