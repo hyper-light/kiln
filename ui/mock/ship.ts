@@ -19,6 +19,13 @@ interface Ctx {
   push?: () => void;
 }
 
+/** A request's body, as text. */
+async function readBody(req: http.IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 /** kiln's own trunk, simulated (ship-sim.ts); `MOCK_SHIP=static` serves the fixed rows alone, for
  * tests that need the same page every time. `MOCK_SHIP_SPEED`: simulated seconds per second. */
 const trunk = process.env.MOCK_SHIP === "static" ? null : new Trunk("hyper-light/kiln", Number(process.env.MOCK_SHIP_SPEED ?? 12) || 12);
@@ -74,7 +81,7 @@ function commits(): ShipCommit[] {
       change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 7, latest: 7 },
       runs: [{ id: "run-41", pipeline: "ci" }],
       actions: [
-        { name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, diff: "D41" } },
+        { name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: REPO, sha: sha("4") } },
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
       ],
     }),
@@ -193,8 +200,8 @@ function commits(): ShipCommit[] {
       pips: pips("none", "passed", "failed"),
       runs: [{ id: "run-3", pipeline: "ci" }],
       actions: [
+        { name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: REPO, sha: sha("3") } },
         { name: "retry", method: "POST", path: "/api/ci/runs/run-3/rerun", body: { mode: "failed" } },
-        { name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, run: "run-3" } },
       ],
     }),
     row({
@@ -222,6 +229,24 @@ function commits(): ShipCommit[] {
 const PI = "pi-kitchen";
 /** Retried, by browser (its User-Agent), so the e2e projects running side by side each have their own Pi. */
 const piRetried = new Set<string>();
+
+/** The fixed rows each browser handed off (`POST /api/ship/hand-off`), by its user agent as Pi's
+ * retry is, so a desktop's and a phone's tests don't see each other's. */
+const handedBy = new Map<string, Set<string>>();
+
+/** Who takes a fixed row's Hand off, as the server decides (W26-R18): its author's agent when an
+ * agent wrote it, else ci-doctor, the agent the mock's repository has attached. */
+const takerOf = (row: ShipCommit) => (row.author.startsWith("agent:") ? row.author.slice("agent:".length) : "ci-doctor");
+
+/** A fixed row once this browser handed it off, as the server reads it: a change at work under
+ * its agent (no Hand off and Review pair), or a failure on whoever took it (Retry alone). */
+function handedRow(row: ShipCommit, ua: string): ShipCommit {
+  if (!handedBy.get(ua)?.has(row.sha)) return row;
+  const by = takerOf(row);
+  if (row.change) return { ...row, stand: "checking", line: `${by} fixing · kim's thread`, pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "fixing" } : p)), actions: [] };
+  const why = row.line.split(" · ").slice(1).join(" · ") || "checks failed";
+  return { ...row, stand: "failing", line: `${by} fixing · ${why}`, actions: (row.actions ?? []).filter((a) => a.name !== "hand_off") };
+}
 const replantOf = (row: ShipCommit, ua: string) =>
   row.short === "6666666"
     ? [
@@ -301,7 +326,7 @@ const agentCommit = (k: number): ShipCommit => {
       stand: "needs_you",
       line: `agent:fix-${k} asks: retry the flaky leg?`,
       pips: pips("none", "passed", "failed"),
-      actions: [{ name: "hand_off", method: "POST", path: "/api/attachments", body: { repo: REPO, run: `ship-run-burst-${k}` } }],
+      actions: [{ name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: REPO, sha: id } }],
     };
   return {
     ...base,
@@ -457,14 +482,15 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const list = all().filter(
       (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
     );
-    const page: ShipPage = { commits: list, next_cursor: null, pace: paceOf(all().filter((c) => !repo || c.repo === repo)) };
+    const page: ShipPage = { commits: list.map((c) => handedRow(c, ua)), next_cursor: null, pace: paceOf(all().filter((c) => !repo || c.repo === repo)) };
     ctx.json(res, 200, page);
     return true;
   }
   const one = m === "GET" ? p.match(/^\/api\/ship\/commits\/(.+)\/([0-9a-f]{7,40})$/) : null;
   if (one) {
     const [, repo, sha] = one;
-    const row = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
+    const found = all().find((c) => c.repo === repo && c.sha.startsWith(sha ?? ""));
+    const row = found ? handedRow(found, ua) : undefined;
     const live = ctx.liveJob?.();
     const fixed: ShipDetail | null = row
       ? {
@@ -529,6 +555,41 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const detail: ShipDetail | null = trunk?.detail(sha ?? "") ?? fixed;
     if (!detail || detail.repo !== repo) ctx.json(res, 404, { error: "no such commit" });
     else ctx.json(res, 200, detail);
+    return true;
+  }
+  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did.
+  if (p === "/api/ship/hand-off" && m === "POST") {
+    let body: { repo?: unknown; sha?: unknown } = {};
+    try {
+      body = JSON.parse((await readBody(req)) || "{}") as typeof body;
+    } catch {
+      body = {};
+    }
+    const sha = typeof body.sha === "string" ? body.sha : "";
+    if (typeof body.repo !== "string" || !sha) {
+      ctx.json(res, 400, { error: "`repo` and `sha`: the commit to hand off" });
+      return true;
+    }
+    const taken = trunk?.handOff(sha);
+    if (taken != null) {
+      if (taken) ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] } });
+      else ctx.json(res, 409, { error: `${sha.slice(0, 7)} has nothing open to hand off` });
+      return true;
+    }
+    const row = all().find((c) => c.repo === body.repo && c.sha === sha);
+    const mine = handedBy.get(ua) ?? new Set<string>();
+    if (!row || mine.has(sha) || !(row.actions ?? []).some((a) => a.name === "hand_off")) {
+      ctx.json(res, row ? 409 : 404, { error: row ? `${row.short} has nothing open to hand off` : "no such commit" });
+      return true;
+    }
+    handedBy.set(ua, mine.add(sha));
+    const to = takerOf(row);
+    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] } });
+    return true;
+  }
+  if (p === "/api/mock/ship/hand-off" && m === "POST") {
+    if (q.get("reset")) handedBy.delete(ua);
+    ctx.json(res, 200, { ok: true });
     return true;
   }
   if (p === "/api/mock/ship/agents" && m === "POST") {
@@ -604,26 +665,6 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
   if (p === "/api/mock/ship/burst") {
     trunk.burst(Math.min(Number(q.get("n") ?? 14) || 14, 100));
     return ok(true);
-  }
-  if (p === "/api/attachments") {
-    // Peek: a hand-off of one of the trunk's runs is ours; anything else goes on to the mock's
-    // agents, the same bytes replayed for whoever reads the body next.
-    const chunks: Buffer[] = [];
-    for await (const c of req) chunks.push(c as Buffer);
-    const raw = Buffer.concat(chunks);
-    Object.defineProperty(req, Symbol.asyncIterator, {
-      configurable: true,
-      value: async function* () {
-        yield raw;
-      },
-    });
-    let run: unknown;
-    try {
-      run = (JSON.parse(raw.toString("utf8") || "{}") as { run?: unknown }).run;
-    } catch {
-      run = undefined;
-    }
-    if (typeof run === "string" && run.startsWith("ship-run-")) return ok(trunk.handOff(run));
   }
   return false;
 }
