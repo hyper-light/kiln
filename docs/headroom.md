@@ -135,12 +135,16 @@ decides.
 | CUSUM's reference | half the distance from the calm mean to the tolerance (the shift that matters) |
 | The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
 | Harm | a sample, or a probe still out, at the tolerance |
-| A new regime | a fall below the calm the lower CUSUM detects with the same calibration, or trouble that lasts with kiln's own work quiet (never begun, or stopped by its cuts) longer than any cut of kiln's took to show (the tolerance before one has): kiln isn't the cause, and its work runs again |
+| A new regime | a fall below the calm the lower CUSUM detects with the same calibration |
 | The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), never under the probe's own measured cost, and for a served target never under its service time / load share |
 | The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut; each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
 | A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains |
 | A bound tried | once the bisection's gap is finer than the pacer applies (a share is whole percent: what's wanted / 100), the bound itself; held calm there, it was wrong and the next bound up (any higher level trouble began at) takes its place |
-| Cutting again | only on evidence: a probe of the same target sent after the first answer since the cut, itself rising (past CUSUM's reference), and no faster. Probes already out at a cut can't show it |
+| Cutting again | only on evidence: a probe of the same target sent after the first answer since the cut, itself rising (past CUSUM's reference), and no faster, while kiln still writes. Probes already out at a cut can't show it |
+| Undoing a cut | the same evidence with kiln's writes already stopped: what's queued isn't kiln's. Its budgets go back to what they were before the trouble began, nothing is learned from the cuts, and nothing more is cut until the trouble clears. The first answer after a cut is only the mark: that probe still waited behind what was queued before the cut |
+| Not cutting | trouble that begins while kiln writes no more than it did when a cut was last undone, in bytes a second and as a share of what the disks deliver (forgotten in a new regime) |
+| The CPU budget's ceiling | the machine's cores (std::thread::available_parallelism, which counts a container's CPU limit where it can read it) |
+| Any demand's ceiling | the machine's cores for CPU, and the disks' capacity for writes: for each running group, and for each kind of work learned, what an earlier build learned included |
 | The disks' capacity | the most the machine delivered while trouble showed (a queue built up), on systems that say what they write: the trouble under way's while it lasts, else the last |
 | A cut, with the capacity known | to what drains what's queued within the tolerance: capacity x (1 - latency / tolerance) - what others write (Little: what's queued is the latency times the capacity) |
 | Calm to calibrate on | an excursion that ended with no alarm, with kiln quiet, or within the longest a cut takes to show (so it ended on its own); one kiln's cut may have ended isn't noise |
@@ -171,8 +175,14 @@ trace and seeds 1-3: v2 does as much work as AIMD by the time the first of them 
 lower mean wait, less time over the tolerance and a lower peak, and none at all once it has
 detected trouble.
 
+The 10-28 night is a trace of its own, since there the trouble isn't kiln's: 60 sessions all
+night (0.3 cores and 0.2 MB/s each, 1.2% of what the disk takes) and two gates while the disk is
+otherwise quiet, beside programs kiln can't pace that hold the disk near its capacity in 20-minute
+stretches, 30 s at 104% of it and 30 s at 92%. `headroom::sim::the_night_of_10_28` asserts on
+seeds 1-3 that v2 does at least 99% of the work no control does and stops no job longer than 2 s
+at a time.
+
 | trace | control | done | mean wait s | p99 wait s | mean flow s | makespan s | peak sync s | s over 1 s |
-|---|---|---|---|---|---|---|---|---|
 |---|---|---|---|---|---|---|---|---|
 | 10-26 crash | none | 52/52 | 0 | 0 | 2568 | 3410 | 10.00 | 3108 |
 | 10-26 crash | AIMD+FCFS | 52/52 | 1148 | 2709 | 1424 | 3459 | 10.00 | 2958 |
@@ -185,7 +195,9 @@ detected trouble.
 | bursts | v2 | 72/72 | 1 | 4 | 250 | 4083 | 0.20 | 0 |
 | disk halves at 30 min | none | 350/350 | 0 | 0 | 1401 | 10238 | 20.00 | 9204 |
 | disk halves at 30 min | AIMD+FCFS | 350/350 | 1238 | 3073 | 1355 | 10360 | 20.00 | 8898 |
-| disk halves at 30 min | v2 | 350/350 | 205 | 2017 | 628 | 10324 | 0.75 | 0 |
+| disk halves at 30 min | v2 | 350/350 | 205 | 2018 | 628 | 10325 | 0.75 | 0 |
+| 10-28 night | none | 62/62 | 0 | 0 | 6973 | 7200 | 1.56 | 1540 |
+| 10-28 night | v2 | 62/62 | 7 | 15 | 6981 | 7216 | 1.56 | 1536 |
 
 Over seeds 1-3:
 
@@ -196,6 +208,12 @@ Over seeds 1-3:
   v2 finishes first on every trace but steady seed 2 (the same second).
 - **Waits.** Mean wait to start, v2 against AIMD: the crash 849 against 1,148 s, steady 0 against
   42-89 s, bursts 1 against 248 s, the disk halving 205-369 against 1,238-1,811 s.
+- **The 10-28 night.** v2 does 99.88% of the work no control does and stops no job longer than
+  1.5 s at a time. The disk is over the tolerance as long with v2 as without (1,536 against
+  1,540 s): the trouble is the other programs', stopping kiln can't end it, so v2 lets kiln work.
+  Where kiln's own gates write heavily while other programs hold the disk at its capacity,
+  stopping them doesn't speed the next probe up either, and v2 lets them run too, as no control
+  would.
 - **Time to finish.** v2's mean is lower on every trace but the crash (1,729 against 1,424 s):
   there every job is the same size, where first come first served is best on that measure and
   sharing (v2 holds work only for memory) is not; with jobs of different sizes, as kiln's are,
@@ -217,6 +235,13 @@ The simulation found, and these changes fixed, faults in the engine the unit tes
   alarm later;
 - work started in a step running unpaced until the next;
 - a probe still out not counted as evidence until it answered.
+
+The live run on adacachy on 10-28 found what the simulation then had no trace for: with programs
+kiln can't pace filling the disk, every cut stopped kiln's writers and nothing let them go. The
+check meant to (all of kiln's work idle for longer than the slowest recovery, 221 s that night)
+never holds with hundreds of sessions, so about 290 sessions and every gate stayed stopped for two
+hours, until the runner was rolled back. Now a cut that doesn't speed the probes up is undone and
+not repeated while kiln writes no more, and the night is a trace.
 
 ## Debug builds
 

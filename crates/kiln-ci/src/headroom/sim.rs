@@ -31,6 +31,8 @@ struct Kind {
 const GATE: Kind = Kind { key: "gate", write_bps: 400e6, cpu: 4.0, mem: 8e9, secs: 150.0 };
 /// An agent's turn: a little CPU, a few writes.
 const TURN: Kind = Kind { key: "turn", write_bps: 5e6, cpu: 1.0, mem: 1e9, secs: 60.0 };
+/// An agent's session through a night: mostly CPU, a few writes, for hours.
+const SESSION: Kind = Kind { key: "session", write_bps: 0.2e6, cpu: 0.3, mem: 1e9, secs: 7200.0 };
 
 struct Rng(u64);
 
@@ -60,13 +62,16 @@ struct Trace {
     arrivals: Vec<(f64, Kind)>,
     /// (when, the disk's capacity from then).
     disk: Vec<(f64, f64)>,
+    /// (from, until, bytes a second) written by programs kiln can't pace: they queue at the disk
+    /// with kiln's work and count in what it delivers.
+    others: Vec<(f64, f64, f64)>,
 }
 
 fn crash() -> Trace {
     // Five gates at once; then the runner, restarted, resumes 47 sessions and their gates at once.
     let mut arrivals = vec![(0.0, GATE); 5];
     arrivals.extend(vec![(600.0, GATE); 47]);
-    Trace { name: "10-26 crash", arrivals, disk: vec![(0.0, 1e9)] }
+    Trace { name: "10-26 crash", arrivals, disk: vec![(0.0, 1e9)], others: Vec::new() }
 }
 
 fn steady(seed: u64, name: &'static str, disk: Vec<(f64, f64)>) -> Trace {
@@ -81,7 +86,7 @@ fn steady(seed: u64, name: &'static str, disk: Vec<(f64, f64)>) -> Trace {
         }
     }
     arrivals.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Trace { name, arrivals, disk }
+    Trace { name, arrivals, disk, others: Vec::new() }
 }
 
 fn bursts() -> Trace {
@@ -91,7 +96,27 @@ fn bursts() -> Trace {
         arrivals.extend(vec![(t, GATE); 8]);
         arrivals.extend(vec![(t, TURN); 10]);
     }
-    Trace { name: "bursts", arrivals, disk: vec![(0.0, 1e9)] }
+    Trace { name: "bursts", arrivals, disk: vec![(0.0, 1e9)], others: Vec::new() }
+}
+
+fn night() -> Trace {
+    // 10-28 on adacachy: kiln runs 60 sessions all night (1.2% of what the disk takes) and two
+    // gates while the disk is otherwise quiet. Other programs (Docker containers, a thrashing
+    // Kubernetes node) hold the disk near its capacity in 20-minute stretches, swinging every 30 s
+    // between 104% and 92% of it: the queue builds past the 1 s tolerance and drains, as that
+    // night's probes did.
+    let mut arrivals = vec![(0.0, SESSION); 60];
+    arrivals.extend([(1300.0, GATE), (4950.0, GATE)]);
+    let mut others = Vec::new();
+    for stretch in 0..4 {
+        let from = f64::from(stretch) * 1800.0;
+        for k in 0..20 {
+            let at = from + f64::from(k) * 60.0;
+            others.push((at, at + 30.0, 1.04e9));
+            others.push((at + 30.0, at + 60.0, 0.92e9));
+        }
+    }
+    Trace { name: "10-28 night", arrivals, disk: vec![(0.0, 1e9)], others }
 }
 
 #[derive(Clone, Debug)]
@@ -131,12 +156,13 @@ impl Machine {
         0.002 + self.backlog / self.disk_bps
     }
 
-    /// One step of the running jobs at their shares; returns the disk's delivered rate.
-    fn step(&mut self, jobs: &mut [Job]) -> f64 {
+    /// One step of the running jobs at their shares, beside `others` bytes a second kiln can't
+    /// pace; returns the disk's delivered rate.
+    fn step(&mut self, jobs: &mut [Job], others: f64) -> f64 {
         let running: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| j.start.is_some() && j.done.is_none()).map(|(i, _)| i).collect();
         let want_cpu: f64 = running.iter().filter_map(|i| jobs.get(*i)).map(|j| j.kind.cpu * j.share).sum();
         let cpu_scale = if want_cpu > self.cores { self.cores / want_cpu } else { 1.0 };
-        let incoming: f64 = running.iter().filter_map(|i| jobs.get(*i)).map(|j| j.kind.write_bps * j.share * cpu_scale).sum::<f64>() * DT;
+        let incoming: f64 = (running.iter().filter_map(|i| jobs.get(*i)).map(|j| j.kind.write_bps * j.share * cpu_scale).sum::<f64>() + others) * DT;
         // Writers are throttled once the backlog reaches its limit: what fits is what drains.
         let room = (self.dirty_limit - self.backlog).max(0.0) + self.disk_bps * DT;
         let disk_scale = if incoming > room { room / incoming } else { 1.0 };
@@ -192,6 +218,8 @@ struct Report {
     /// While work remained: the disk's mean utilization, and the mean number of jobs running.
     busy: f64,
     running: f64,
+    /// The longest any running job was stopped at once (its share 0).
+    longest_pause_s: f64,
 }
 
 impl Report {
@@ -217,6 +245,9 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
     let (mut busy, mut ran, mut steps) = (0.0, 0.0, 0.0);
     let (mut over_detected, mut detected) = (0.0, false);
     let mut work = Vec::new();
+    // Since when each job has been stopped, and the longest any was.
+    let mut stopped: Vec<Option<f64>> = vec![None; jobs.len()];
+    let mut longest_pause = 0.0f64;
     let mut t = -HISTORY_S;
     let cap = 6.0 * 3600.0;
     while t < cap && jobs.iter().any(|j| j.done.is_none()) {
@@ -323,7 +354,19 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
             }
         }
 
-        delivered = m.step(&mut jobs);
+        for (j, since) in jobs.iter().zip(stopped.iter_mut()) {
+            let paused = j.start.is_some() && j.done.is_none() && j.share <= 0.0;
+            match (paused, *since) {
+                (true, None) => *since = Some(t),
+                (false, Some(s)) => {
+                    longest_pause = longest_pause.max(t - s);
+                    *since = None;
+                }
+                _ => {}
+            }
+        }
+        let others: f64 = trace.others.iter().filter(|(from, until, _)| t >= *from && t < *until).map(|(_, _, bps)| bps).sum();
+        delivered = m.step(&mut jobs, others);
         for j in &mut jobs {
             if j.start.is_some() && j.done.is_none() && j.left <= 0.0 {
                 j.done = Some(t + DT);
@@ -346,6 +389,9 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
         t += DT;
     }
     work.push(total_work - jobs.iter().map(|j| j.left.max(0.0)).sum::<f64>());
+    for s in stopped.into_iter().flatten() {
+        longest_pause = longest_pause.max(t - s);
+    }
 
     let mut waits: Vec<f64> = jobs.iter().filter_map(|j| j.start.map(|s| s - j.arrive)).collect();
     waits.sort_by(f64::total_cmp);
@@ -366,6 +412,7 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
         work,
         busy: busy / f64::max(steps, 1.0),
         running: ran / f64::max(steps, 1.0),
+        longest_pause_s: longest_pause,
     }
 }
 
@@ -409,6 +456,28 @@ fn every_control_finishes_the_steady_trace() {
 /// (`cargo test -p kiln-ci headroom::sim::compare -- --nocapture`). On every trace and seed, v2
 /// does as much work as AIMD+FCFS by the time the first of them finishes, with a lower mean wait,
 /// less time over the tolerance and a lower peak, and none at all once it has detected trouble.
+/// The 10-28 night: other programs hold the disk near its capacity while kiln writes 1.2% of it.
+/// Headroom keeps kiln working: at least 99% of the work it does with no control, and no job is
+/// stopped longer than 2 s at a time.
+#[test]
+fn the_night_of_10_28() {
+    let mut failures = Vec::new();
+    for seed in [1u64, 2, 3] {
+        let trace = night();
+        let none = run(&trace, Control::None, seed);
+        let new = run(&trace, v2(), seed);
+        let ratio = new.work_by(7200.0) / none.work_by(7200.0).max(f64::MIN_POSITIVE);
+        eprintln!("seed {seed}:\n{}\n{}\nwork with v2 / without: {ratio:.4}, longest pause {:.1} s", row(&none), row(&new), new.longest_pause_s);
+        if ratio < 0.99 {
+            failures.push(format!("seed {seed}: v2 did {ratio:.4} of the work no control did"));
+        }
+        if new.longest_pause_s > 2.0 {
+            failures.push(format!("seed {seed}: a job stopped {:.1} s at once", new.longest_pause_s));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
 #[test]
 fn compare() {
     let mut table = vec![
