@@ -613,8 +613,16 @@ fn observe() -> Result<&'static Observe, Fail> {
     get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"))
 }
 
+/// The store a query reads, once it has replayed its log: after a start it holds part of what it
+/// held until then, so a query is refused (503, asked again in a moment) rather than answered short.
 pub(super) fn shared() -> Result<kiln_obs::machine::Shared, Fail> {
-    observe()?.store().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe's store is not open yet"))
+    let o = observe()?;
+    let store = o.store().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe's store is not open yet"))?;
+    if !o.replayed() {
+        let v = o.view();
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, format!("observe's store is replaying its log after a start ({} of {} entries applied): ask again in a moment", v.applied, v.replay_to)));
+    }
+    Ok(store)
 }
 
 pub(super) async fn read_json<T: serde::de::DeserializeOwned>(body: Incoming, limit: usize) -> Result<T, Fail> {
