@@ -870,6 +870,11 @@ impl Hub {
         }
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
+            // A runner too old to report its own figures (`crate::observe::host`): its samples, as
+            // metrics. The server's own machine reports itself.
+            if self.instances.lock().newest_with(agent, proto::CAP_OBSERVE).is_none() {
+                crate::observe::hub::host_sample(agent, &s);
+            }
         }
         self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
     }
@@ -1462,6 +1467,7 @@ impl Hub {
                     // Sync moves to another runner process of the machine that syncs, if any.
                     let syncing = self.instances.lock().newest_with(&name, proto::CAP_SYNC).is_some();
                     self.sync.machine(&name, syncing);
+                    crate::observe::hub::lost(self, &name);
                     if self.instances.lock().of(&name).is_empty() {
                         self.agent_lost(&name, &reason).await;
                     } else {
@@ -1814,6 +1820,9 @@ impl Hub {
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
                 }
+                if caps & proto::CAP_OBSERVE != 0 {
+                    crate::observe::hub::announced(self, &agent).await;
+                }
                 if caps & proto::CAP_CLUSTER != 0 {
                     self.cluster_announced(&agent).await;
                 }
@@ -1835,6 +1844,7 @@ impl Hub {
                 self.emit(&ServerEvent::Updates);
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
+            AgentMsg::Observe { json, bytes } => crate::observe::hub::heard(&agent, json, bytes),
             AgentMsg::Cluster { json, raft } => match (self.store.group(), crate::store::learner::decode(&json)) {
                 // Where kiln.db stands, for a read the runner answers once its replica holds it.
                 (Some(g), Some(crate::store::learner::Msg::Ask { id })) => {
@@ -2417,6 +2427,10 @@ impl Hub {
         // (ranked oldest), and nothing else tells it to hold it now (until 2026-10-25 a machine
         // upgraded so held no replica until its runner next connected).
         self.cluster_announced(name).await;
+        // And observe's: the newest replicates it (the group's messages go to it), and the build it
+        // took over from lets its own go. Until then that one held it, hearing nothing, until it
+        // ended (its jobs finished), and the new build waited for its folder.
+        crate::observe::hub::announced(self, name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.
@@ -2531,6 +2545,13 @@ impl Hub {
             #[allow(clippy::cast_precision_loss)]
             m.job_duration.observe((crate::util::now_unix() - started) as f64);
         }
+        if let Some(j) = &job {
+            let mut j = j.clone();
+            j.peak_rss = r.peak_rss.or(j.peak_rss);
+            j.cpu_seconds = r.cpu_seconds.or(j.cpu_seconds);
+            j.error = r.error.clone().or(j.error);
+            crate::observe::kiln::job_finished(&j, run.as_ref(), r.status, crate::util::now_unix());
+        }
         tracing::info!(job = %r.job, agent, status = r.status.as_str(), "job finished");
         let snapshot = self.agents.lock().get(agent).cloned();
         if let Some(a) = snapshot {
@@ -2547,6 +2568,7 @@ impl Hub {
             self.adopt_release(&r.job, run).await;
         }
         if let (Some(status), Some(run)) = (settled, run) {
+            crate::observe::kiln::run_finished(&run, status, crate::util::now_unix());
             crate::gitops::report_status(self, &run, status).await;
         }
         self.update_slot_gauges();

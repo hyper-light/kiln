@@ -18,6 +18,20 @@ fn git(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One look of a loop that waits until its own deadline: a request that failed (common::http's
+/// 30 s read timeout, the server slow mid-burst on a loaded machine) is "not yet" until then, not
+/// the test's end.
+fn polled<T>(look: anyhow::Result<T>, deadline: Instant, what: &str) -> anyhow::Result<Option<T>> {
+    match look {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if Instant::now() < deadline => {
+            eprintln!("{what}: {e:#}; again");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The pool now: (starting, idle, busy), and its executors' ids.
 fn pool(port: u16, admin: &str) -> anyhow::Result<((u64, u64, u64), Vec<String>, Value)> {
     let (_, body) = common::http(port, "GET", "/api/ci/pools/burst", admin, None)?;
@@ -70,7 +84,10 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
         // min_idle ready before anything asks.
         let deadline = Instant::now() + Duration::from_secs(300);
         loop {
-            let (c, ids, v) = pool(port, &admin)?;
+            let Some((c, ids, v)) = polled(pool(port, &admin), deadline, "the pool")? else {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            };
             seen.extend(ids);
             if c == (0, 2, 0) {
                 break;
@@ -97,12 +114,18 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
         // The burst: executors to max, never past it, the queue drained.
         let (mut peak, deadline) = (0u64, Instant::now() + Duration::from_secs(1200));
         let run = loop {
-            let (c, ids, v) = pool(port, &admin)?;
+            let Some((c, ids, v)) = polled(pool(port, &admin), deadline, "the pool")? else {
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            };
             seen.extend(ids);
             let total = c.0 + c.1 + c.2;
             anyhow::ensure!(total <= 32, "past max: {v}");
             peak = peak.max(total);
-            let (_, body) = common::http(port, "GET", "/api/ci/runs?repo=acme/burst&limit=5", &admin, None)?;
+            let Some((_, body)) = polled(common::http(port, "GET", "/api/ci/runs?repo=acme/burst&limit=5", &admin, None), deadline, "the runs")? else {
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            };
             let runs: Value = serde_json::from_str(&body).unwrap_or_default();
             if let Some(r) = runs.get("runs").and_then(Value::as_array).and_then(|r| r.first()).filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).cloned() {
                 break r;
@@ -131,7 +154,10 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
         // Back to min_idle within idle_timeout (20 s), with a little slack for the loaded machine.
         let deadline = drained + Duration::from_secs(20 + 25);
         loop {
-            let (c, ids, v) = pool(port, &admin)?;
+            let Some((c, ids, v)) = polled(pool(port, &admin), deadline, "the pool")? else {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            };
             seen.extend(ids);
             if c == (0, 2, 0) {
                 break;

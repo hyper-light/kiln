@@ -43,6 +43,7 @@ pub mod logs;
 pub mod mcp;
 pub mod metrics;
 pub mod net;
+pub mod observe;
 pub mod ops;
 pub mod os;
 pub mod password;

@@ -222,6 +222,160 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             child!("webrtc", h => crate::harness::webrtc::run(h));
         }
     }
+    // Observe (docs/observe.md): not in `kiln workflow run`'s own server, which runs CI alone.
+    if cfg.observe.enabled && !cfg.ci.local {
+        let days = |d: u32| std::time::Duration::from_secs(u64::from(d.max(1)) * 86_400);
+        let obs = crate::observe::Observe::start(crate::observe::Settings {
+            dir: cfg.data("observe"),
+            role: crate::observe::Role::Server { key: hub.admin_token.clone() },
+            metrics_retention: days(cfg.observe.metrics_retention_days),
+            logs_retention: days(cfg.observe.logs_retention_days),
+            spans_retention: days(cfg.observe.spans_retention_days),
+            max_series: cfg.observe.max_series,
+        });
+        crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
+        crate::observe::containers::start(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
+        crate::observe::indexes::start_usage(obs.clone(), crate::os::hostname(), crate::observe::indexes::USAGE_EVERY);
+        crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)), Some(hub.net.clone()));
+        if let Some(n) = cfg.observe.query_helpers {
+            kiln_obs::query::eval::set_helpers(n as usize);
+        }
+        // A query's helpers yield to the writes the server takes (§12.19).
+        kiln_obs::query::eval::on_helper_start(crate::os::lower_thread_priority);
+        crate::observe::api::set_global(obs);
+        crate::observe::api::set_dashboards(std::sync::Arc::new(crate::observe::dashboards::Dashboards::open(&cfg.data("observe"))));
+        crate::observe::api::set_slos(std::sync::Arc::new(crate::observe::slos::Slos::open(&cfg.data("observe"))));
+        let log_metrics = crate::observe::logmetrics::LogMetrics::open(&cfg.data("observe"));
+        crate::observe::api::set_log_metrics(log_metrics.clone());
+        // Its loop holds nothing that panics (the crate's lints): run, not supervised.
+        crate::rt::spawn(log_metrics.run(shutdown.clone()));
+        // Metrics from spans, kiln's trace metrics among them (`kiln_obs::apm`): alike.
+        let span_metrics = crate::observe::logmetrics::LogMetrics::open_spans(&cfg.data("observe"));
+        crate::observe::api::set_span_metrics(span_metrics.clone());
+        crate::rt::spawn(span_metrics.run(shutdown.clone()));
+        // Error Tracking's issues, from the errors those count (`crate::observe::errors`).
+        let issues = crate::observe::errors::Issues::open(&cfg.data("observe"));
+        crate::observe::api::set_issues(issues.clone());
+        crate::rt::spawn(issues.run(shutdown.clone()));
+        child!("observe", h => crate::observe::hub::send_loop(h));
+        // Profilers' uploads (`crate::observe::profiles`), kept here alone: opened on a thread of their
+        // own (their headers read), taken once it has.
+        crate::observe::profiles::start(
+            cfg.data("observe").join("profiles"),
+            i64::from(cfg.observe.profiles_retention_days.max(1)) * 86_400_000,
+            cfg.observe.profiles_max_gb.map(|g| u64::from(g) << 30),
+        );
+        // Incidents (`crate::observe::incidents`), told to their handles through the monitors'
+        // integrations.
+        let incidents = crate::observe::incidents::Incidents::open(&cfg.data("observe"));
+        crate::observe::incidents::set(incidents.clone());
+        // Notebooks (`crate::observe::notebooks`), postmortems among them, linked at the server's
+        // public URL.
+        crate::observe::notebooks::set(crate::observe::notebooks::Notebooks::open(&cfg.data("observe"), &cfg.server.public_url));
+        match crate::http::client::Client::public() {
+            Ok(http) => {
+                let ms = crate::observe::monitors::Monitors::open(&cfg.data("observe"), std::sync::Arc::new(http), &cfg.server.public_url);
+                crate::observe::api::set_monitors(ms.clone());
+                let told = ms.clone();
+                incidents.on_change(move |t| told.tell_incident(&t));
+                // Its loop holds nothing that panics (the crate's lints): run, not supervised.
+                crate::rt::spawn(ms.run(shutdown.clone()));
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "monitors did not start: no HTTPS client"),
+        }
+        match crate::http::client::Client::public() {
+            Ok(http) => {
+                let http = std::sync::Arc::new(http);
+                let clouds = crate::observe::cloud::Clouds::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key"), http.clone(), shutdown.clone());
+                crate::observe::api::set_clouds(clouds.clone());
+                clouds.start();
+                // Log archives, written with the cloud integrations' credentials. Its loop holds
+                // nothing that panics (the crate's lints): run, not supervised.
+                let archives = crate::observe::archives::Archives::open(&cfg.data("observe"), clouds, http);
+                crate::observe::api::set_archives(archives.clone());
+                crate::rt::spawn(archives.clone().run(shutdown.clone()));
+                // Rehydrations from the archives, each read into a view of its own.
+                let rehydrations = crate::observe::rehydrate::Rehydrations::open(&cfg.data("observe"), archives);
+                crate::observe::api::set_rehydrations(rehydrations.clone());
+                crate::rt::spawn(rehydrations.run(shutdown.clone()));
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "cloud integrations did not start: no HTTPS client"),
+        }
+        // Prometheus's scrapes: the targets kept here, the server's own read here, each runner told
+        // its own.
+        match crate::http::client::Client::public() {
+            Ok(http) => {
+                let targets = std::sync::Arc::new(crate::observe::scrape::Targets::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key")));
+                let all = targets.list();
+                crate::observe::scrape::start(crate::observe::scrape::SERVER, &crate::os::hostname(), std::sync::Arc::new(http), shutdown.clone()).set(&all);
+                if let Some(o) = crate::observe::api::get() {
+                    o.set_scrapes(all);
+                }
+                crate::observe::api::set_scrape_targets(targets);
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "scrapes did not start: no HTTPS client"),
+        }
+        // Synthetic tests: kept here, the server's own run here, each runner told its own.
+        let tests = std::sync::Arc::new(crate::observe::synthetics::Tests::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key")));
+        let all = tests.list();
+        crate::observe::synthetics::start(crate::observe::synthetics::SERVER, shutdown.clone()).set(&all);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_synthetics(all);
+        }
+        crate::observe::api::set_synthetics(tests);
+        // DogStatsD listeners: kept here, the server's own opened here, each runner told its own.
+        let listeners = std::sync::Arc::new(crate::observe::statsd::Listeners::open(&cfg.data("observe")));
+        let all = listeners.list();
+        crate::observe::statsd::start(crate::observe::statsd::SERVER, &crate::os::hostname(), shutdown.clone()).set(&all);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_statsd(all);
+        }
+        crate::observe::api::set_statsd(listeners);
+        // Log pipelines: kept here, applied here and by every runner.
+        let pipelines = std::sync::Arc::new(crate::observe::pipeline::kept::Pipelines::open(&cfg.data("observe")));
+        crate::observe::pipeline::kept::activate(&pipelines.defs());
+        if let Some(o) = crate::observe::api::get() {
+            o.set_pipelines(pipelines.defs());
+        }
+        crate::observe::api::set_pipelines(pipelines);
+        // Log indexes: kept here, routed by here and by every runner; their quotas counted here.
+        let indexes = std::sync::Arc::new(crate::observe::indexes::Indexes::open(&cfg.data("observe")));
+        crate::observe::indexes::activate(&indexes.defs());
+        if let Some(o) = crate::observe::api::get() {
+            o.set_indexes(indexes.defs(), indexes.removed_parts());
+        }
+        crate::observe::indexes::http::set(indexes);
+        // The sensitive data scanner's groups and key: kept here, run here and by every runner.
+        let scanning = std::sync::Arc::new(crate::observe::scanner::kept::Groups::open(&cfg.data("observe")));
+        let (groups, key) = scanning.defs();
+        crate::observe::scanner::kept::activate(&groups, &key);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_scanner(groups, key);
+        }
+        crate::observe::api::set_scanner(scanning);
+        // DORA's ledger: kiln CD's deployments and those Datadog's API is sent, and failures.
+        crate::observe::dora::set(crate::observe::dora::Dora::open(&cfg.data("observe"), Some(hub.clone())));
+        // The Service Catalog: definitions kept here, the repositories' read every five minutes.
+        let catalog = crate::observe::catalog::Catalog::open(&cfg.data("observe"), Some(hub.clone()));
+        crate::observe::catalog::set(catalog.clone());
+        crate::rt::spawn(catalog.run(shutdown.clone()));
+        let infra = crate::observe::infra::Infra::open(&cfg.data("observe"), Some(hub.clone()));
+        crate::observe::infra::set(infra.clone());
+        crate::rt::spawn(infra.run(shutdown.clone()));
+        // Logs collected: the sources kept here, the server's own read here, each runner told its
+        // own.
+        let sources = std::sync::Arc::new(crate::observe::collect::Sources::open(&cfg.data("observe")));
+        let all = sources.list();
+        crate::observe::collect::start(crate::observe::collect::SERVER, &crate::os::hostname(), &cfg.data("observe"), shutdown.clone()).set(&all);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_log_sources(all);
+        }
+        crate::observe::api::set_log_sources(sources);
+        match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {
+            Ok(t) => crate::observe::api::set_ingest_token(t),
+            Err(e) => tracing::warn!(error = %e, "observe's ingest token could not be made: OTLP takes the admin token alone"),
+        }
+    }
     // Home-network discovery (multicast DNS): announce this server, list the kiln instances nearby.
     if cfg.discovery.enabled && (cfg.discovery.announce || cfg.discovery.browse) {
         child!("discovery", h => crate::discovery::Discovery::serve(h));
@@ -406,6 +560,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             instance: None,
             config: None,
             reach: None,
+            // The server holds the group's store itself.
+            observe: false,
             outpost: false,
             declared: cfg.agent.clone(),
         };
@@ -424,6 +580,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     shutdown.cancelled().await;
     tracing::info!("shutting down");
+    // Log sources write their places down once their last records are written (a moment).
+    if let Some(c) = crate::observe::collect::get().cloned() {
+        let _ = crate::rt::blocking(move || c.stop_within(Duration::from_secs(3))).await;
+    }
     hub.disconnect_all().await;
     // Sync's activity of the last few seconds, which it saves now and then.
     hub.sync.flush().await;

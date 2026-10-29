@@ -357,6 +357,10 @@ struct AgentArgs {
     /// Take no commands from other runners (reach); this runner can still send them.
     #[arg(long, env = "KILN_NO_REACH")]
     no_reach: bool,
+    /// Keep no replica of the observe group here (docs/observe.md): queries from this machine go
+    /// to the server; its writes still go through it.
+    #[arg(long, env = "KILN_NO_OBSERVE")]
+    no_observe: bool,
     #[arg(long, env = "KILN_SHELL")]
     shell: Option<String>,
     /// Fault injection, a test build's (docs/ci.md W22-AC04): `drop=2s,delay=300ms,oom=1s,disk=8,corrupt`.
@@ -365,11 +369,18 @@ struct AgentArgs {
     chaos: Option<String>,
 }
 
+/// The log's lines, as `filter` says; and kiln's own spans that observe keeps (its own filter: what
+/// the log shows does not decide what observe sees).
 fn init_tracing(filter: &str, json: bool) {
+    use tracing_subscriber::prelude::*;
     let filter = tracing_subscriber::EnvFilter::try_new(filter)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
-    let _ = if json { builder.json().try_init() } else { builder.try_init() };
+    let registry = tracing_subscriber::registry().with(kiln::observe::spans::layer());
+    let _ = if json {
+        registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_filter(filter)).try_init()
+    } else {
+        registry.with(tracing_subscriber::fmt::layer().with_target(false).with_filter(filter)).try_init()
+    };
 }
 
 /// Panics are contained at task boundaries; the hook makes sure each one is logged loudly.
@@ -413,8 +424,20 @@ async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Resul
         return r;
     }
     let reg = kiln::sup::Registry::default();
+    // The agent sees shutdown itself and returns once it has wound down (its log sources' last
+    // writes answered, their places written down: a stop then repeats no record); the supervisor
+    // is told a moment later, to drop an agent that does not.
+    let held = Shutdown::new();
+    {
+        let (sd, held) = (shutdown.clone(), held.clone());
+        kiln::rt::spawn(async move {
+            sd.cancelled().await;
+            kiln::rt::sleep(std::time::Duration::from_secs(5)).await;
+            held.cancel();
+        });
+    }
     let sd = shutdown.clone();
-    let h = kiln::sup::spawn(&reg, "agent", shutdown, move || kiln::agent::run(opts.clone(), sd.clone()));
+    let h = kiln::sup::spawn(&reg, "agent", held, move || kiln::agent::run(opts.clone(), sd.clone()));
     let _ = h.await;
     // The supervisor drops the runner's loop as it stops (that loop's own shutdown never runs):
     // the other engines' browsers it drove (Firefox, a WebDriver) stop here, or they'd outlive it.
@@ -646,6 +669,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 config: Some(config_path.clone()),
                 // Commands from other runners are a terminal's worth of access: not without one.
                 reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
+                observe: !a.ephemeral && !a.no_observe,
                 outpost: false,
                 // `[agent.facts]` and `[agent.probes]` of its config file (docs/ci.md W13-R02).
                 declared: kiln::runner::probe::Declared::from_file(&config_path),
@@ -690,6 +714,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 config: None,
                 // It runs no other machine's commands (reach), and for now sends none.
                 reach: None,
+                // Not of the fleet: no replica of the observe group.
+                observe: false,
                 outpost: true,
                 declared: kiln::runner::probe::Declared::default(),
             };

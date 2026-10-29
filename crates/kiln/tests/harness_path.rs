@@ -22,13 +22,14 @@ fn a_harness_on_its_users_path_alone_is_offered_and_runs() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options::default())?;
     // The user's login shell has the folder the stand-in Claude Code is in on its PATH; the
-    // runner's own PATH, a service's, hasn't it.
+    // runner's own PATH, a service's, hasn't it. Neither has a harness installed system-wide.
+    let system = agents::path_without_harnesses(dir.path())?;
     let shell = dir.path().join("login-shell");
-    let script = format!("#!/bin/sh\nPATH='{}:/usr/bin:/bin'\nexport PATH\nwhile [ $# -gt 1 ]; do shift; done\nexec /bin/sh -c \"$1\"\n", dir.path().join("bin").display());
+    let script = format!("#!/bin/sh\nPATH='{}:{system}'\nexport PATH\nwhile [ $# -gt 1 ]; do shift; done\nexec /bin/sh -c \"$1\"\n", dir.path().join("bin").display());
     std::fs::write(&shell, script)?;
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))?;
     let shell = shell.to_string_lossy().into_owned();
-    let (_runner, log) = agents::runner_env(dir.path(), s.port, "box", None, Talk { lines: 3, every_ms: 20 }, &[("PATH", "/usr/bin:/bin"), ("SHELL", &shell)])?;
+    let (_runner, log) = agents::runner_env(dir.path(), s.port, "box", None, Talk { lines: 3, every_ms: 20 }, &[("PATH", &system), ("SHELL", &shell)])?;
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
     let said = || std::fs::read_to_string(&log).unwrap_or_default();
 

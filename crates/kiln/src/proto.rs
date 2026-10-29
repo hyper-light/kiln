@@ -23,6 +23,9 @@ pub const LANE_SYNC: u32 = 3;
 /// Reach's lane (`crate::reach`): links between runners, relayed by the server. Interactive class:
 /// a remote command's output must not queue behind job logs.
 pub const LANE_REACH: u32 = 4;
+/// Observe's lane (`crate::observe`): the observe group's messages and writes, a queue of their own
+/// so replication never sheds a job's, a terminal's or sync's frames, nor waits behind them.
+pub const LANE_OBSERVE: u32 = 5;
 /// The conversation feed's lane (`crate::convo::feed`): a runner's store sent to the server's, in
 /// bulk frames, never in the way of a job's or a terminal's (lane 5 is observe's).
 pub const LANE_CONVO: u32 = 6;
@@ -249,6 +252,11 @@ pub enum AgentMsg {
     /// runs); the server answers with [`ServerMsg::Identity`]. Only to a server announcing
     /// [`CAP_IDENTITY`]. Appended last: postcard encodes variants by index.
     Identity { json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
+    /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
+    /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
+    /// encodes variants by index.
+    Observe { json: String, bytes: Vec<u8> },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -273,6 +281,9 @@ pub const CAP_DIRS: u32 = 4;
 pub const CAP_TAKEOVER_STOP: u32 = 8;
 /// [`AgentMsg::Build`] capability: the runner syncs repos ([`ServerMsg::Sync`], `crate::sync`).
 pub const CAP_SYNC: u32 = 64;
+/// [`AgentMsg::Build`] capability: the runner replicates the observe group and writes into it
+/// ([`ServerMsg::Observe`], `crate::observe`).
+pub const CAP_OBSERVE: u32 = 128;
 /// [`AgentMsg::Build`] capability: the runner runs a front door ([`ServerMsg::FrontDoor`]: DNS for
 /// a domain, HTTPS in front of the server, a `.local` name) and reports it with
 /// [`AgentMsg::FrontDoorStatus`].
@@ -675,6 +686,10 @@ pub enum ServerMsg {
     /// docs/ci.md W27-R01). Only to runners announcing [`CAP_IDENTITY`]. Appended last: postcard
     /// encodes variants by index.
     Identity { json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
+    /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
+    /// variants by index.
+    Observe { json: String, bytes: Vec<u8> },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1315,6 +1330,57 @@ mod tests {
         assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Undeployed comes right after Executor");
         assert_eq!(decode::<AgentMsg>(&b)?, said);
         assert!(CAP_UNDEPLOY.is_power_of_two() && CAP_UNDEPLOY > CAP_RECEIVED);
+        Ok(())
+    }
+
+    #[test]
+    fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // Right after main's last (deployed first): a machine's limit on agents at work, each way.
+        let last_server = encode(&ServerMsg::Identity { json: "{}".into() })?;
+        let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
+        let b = encode(&s)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after Identity");
+        assert_eq!(decode::<ServerMsg>(&b)?, s);
+        let last_agent = encode(&AgentMsg::Identity { json: "{}".into() })?;
+        let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
+        let b = encode(&a)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after Identity");
+        assert_eq!(decode::<AgentMsg>(&b)?, a);
+        let every = [
+            CAP_UPGRADE,
+            CAP_TAKEOVER,
+            CAP_DIRS,
+            CAP_TAKEOVER_STOP,
+            CAP_SYNC,
+            CAP_FRONT_DOOR,
+            CAP_OUTPOST,
+            CAP_REPOS,
+            CAP_UPDATES,
+            CAP_BLUE_GREEN,
+            CAP_CI2,
+            CAP_ACTIONS,
+            CAP_DOCKER,
+            CAP_FIRECRACKER,
+            CAP_SHARDS,
+            CAP_FACTS,
+            CAP_JOB_TTY,
+            CAP_DOCKER_ROOTLESS,
+            CAP_REACH,
+            CAP_CONVO,
+            CAP_DOCTOR,
+            CAP_FILES,
+            CAP_STREAM,
+            CAP_PREVIEW,
+            CAP_PORTS,
+            CAP_ENGINES,
+            CAP_WORKSPACE,
+            CAP_POOLS,
+            CAP_RECEIVED,
+            CAP_UNDEPLOY,
+            CAP_CLUSTER,
+        ];
+        assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
+        const { assert!(LANE_OBSERVE != LANE_CONVO && LANE_OBSERVE != LANE_FILES && LANE_OBSERVE != LANE_STREAM && LANE_OBSERVE != LANE_PORTS) };
         Ok(())
     }
 

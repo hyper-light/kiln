@@ -30,7 +30,7 @@ export const NAV: { to: string; label: string; end?: boolean; also?: readonly st
   { to: "/runners", label: "Runners" },
   { to: "/agents", label: "Agents" },
   { to: "/terminal", label: "Terminal" },
-  { to: "/telemetry", label: "Metrics" },
+  { to: "/observe", label: "Observe" },
   { to: "/system", label: "System" },
 ];
 
