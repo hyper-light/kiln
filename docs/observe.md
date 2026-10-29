@@ -5086,6 +5086,23 @@ was WebKit's on a phone, the notebooks' first navigation interrupted by the inci
 cleanup's, which that scenario had let go on unawaited (each scenario now starts from a blank
 page, de722eb4: with it, all 180 pass against the same server).
 
+Then, with main merged in as observe lands (2026-10-29, at b62672456d, adacachy shared with others'
+gates and production), the loads in a release build, with what they cost: the points' flood took
+393.9 M points in 20 s (19.7 M a second), none refused, a request's p50 0.24 ms and p99 0.54 ms,
+readable 73 ms after, the server 4.4 cores and 400 MiB at its peak, the runner 3.4 and 213 MiB,
+0.000 minor faults a point; the logs' 257 k records a second (1.5% of requests refused and sent
+again), its monitors finding every record 10.5 s after and its metrics from logs counting each once,
+the server 2.5 cores, 562 MiB, 0.016 faults a record; the traces' 641 k spans a second (0.6%
+refused), trace metrics counted 4.0 s after, the server 0.9 cores, 516 MiB, 0.005 faults a span; a
+runner whose server went away refusing 0.51 s after it (its target: 1 s), every point it took stored
+once. Each one's replicas agreed. A 20-minute soak held its level (the server's highest 266 MiB in
+the second third, 274 in the last; the runner's 107 and 98). And every live file passes: on adacachy
+at b62672456d, then, once the host's Docker daemon had stalled production's container for a while
+and Docker's tests moved off it, on fedora at 56247dcf6d: 65 scenarios, Docker's among them and kiln
+CD's (its own minikube profile, removed after). The containers' check had taken a container Docker
+was restarting (no process, so no cgroup to read) for one it runs; it asks for those running now
+(56247dcf6d).
+
 **On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own
 `core.autocrlf`): 42 of the scenarios below pass there, at 7f607f14, ef10dc30 and 4747aca3 (the same
 kiln): `observe_live` (17: CI through a Windows runner, every integration a monitor names, the group
