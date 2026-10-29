@@ -58,6 +58,45 @@ pub struct Learned {
     /// what others write. Unknown where the system doesn't say what it writes.
     #[serde(default)]
     pub capacity_bps: Option<f64>,
+    /// What kiln wrote the last time stopping its writers didn't speed the probes up: the slowdown
+    /// wasn't kiln's, and later trouble doesn't cut kiln while it writes no more than this.
+    #[serde(default)]
+    pub not_kiln: Option<NotKiln>,
+}
+
+/// What kiln wrote when stopping its writers didn't speed the probes up: bytes a second, and its
+/// share of what the disks delivered where that's known.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NotKiln {
+    pub write_bps: f64,
+    pub share: Option<f64>,
+}
+
+impl NotKiln {
+    /// Whether kiln writing `write_bps` (`share` of what the disks deliver) writes no more than
+    /// this, both ways it is measured.
+    fn covers(&self, write_bps: f64, share: Option<f64>) -> bool {
+        write_bps <= self.write_bps && share.zip(self.share).is_none_or(|(s, t)| s <= t)
+    }
+}
+
+/// The trouble under way: the budgets before it began, what kiln wrote then, and whether cutting
+/// is held off (kiln shown not to be the cause, or not cut at all for that).
+struct Episode {
+    before: (knee::Knee, knee::Knee),
+    write_bps: f64,
+    share: Option<f64>,
+    held: bool,
+}
+
+/// A write budget as said: its rate, or no limit.
+fn level(b: Option<f64>) -> String {
+    b.map_or_else(|| "no limit".to_owned(), |b| knee::Unit::Writes.fmt(b))
+}
+
+/// ", n% of what the disks wrote", where that's known.
+fn of_disks(share: Option<f64>) -> String {
+    share.map(|s| format!(", {:.0}% of what the disks wrote", s * 100.0)).unwrap_or_default()
 }
 
 /// A running group of work, as measured.
@@ -170,8 +209,8 @@ pub struct Engine {
     decided_from: Option<(Option<u64>, Option<u64>, Vec<String>)>,
     /// The most delivered during the trouble under way.
     trouble_bps: Option<f64>,
-    /// Since when kiln's own work has been quiet (none running, or all stopped).
-    quiet_since: Option<u64>,
+    /// The trouble under way, from when it began.
+    episode: Option<Episode>,
     /// The last cut: when, and the first answer to a probe sent after it (its target, when it
     /// came, how long it took), which later probes of that target are measured against.
     cut: Option<(u64, Option<(String, u64, f64)>)>,
@@ -187,7 +226,7 @@ impl Engine {
             detectors.insert(t.name.clone(), d);
         }
         learned.detectors = detectors;
-        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, quiet_since: None, cut: None }
+        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, episode: None, cut: None }
     }
 
     fn alarmed(&self) -> bool {
@@ -276,6 +315,7 @@ impl Engine {
                     events.push(format!("{name}: {why}"));
                     self.learned.knee.regime();
                     self.learned.cpu_knee.regime();
+                    self.learned.not_kiln = None;
                 }
                 detect::Event::Same => {}
             }
@@ -287,37 +327,6 @@ impl Engine {
                 events.push(format!("{name}: {why}"));
             }
         }
-        // Trouble with kiln's own work quiet (never begun, or stopped by its cuts) for longer than
-        // any cut of kiln's took to show: kiln isn't the cause, and holding its work back can't
-        // help; the machine changed. A new regime learns it (bounds forgotten, kiln's work runs
-        // again; harm still alarms at the tolerance). Before any cut has shown, the tolerance is
-        // the longest the target was asked to wait.
-        if quiet {
-            self.quiet_since.get_or_insert(now);
-        } else {
-            self.quiet_since = None;
-        }
-        let waited = self.learned.knee.lag_us.unwrap_or_else(|| self.targets.iter().map(|t| t.tolerance_us).fold(0.0, f64::max));
-        if let Some(q) = self.quiet_since
-            && self.alarmed()
-            && now.saturating_sub(q) as f64 > waited
-        {
-            let mut any = false;
-            for (name, d) in &mut self.learned.detectors {
-                if d.alarm.as_ref().is_some_and(|a| now.saturating_sub(a.since_us) as f64 > waited) {
-                    d.restart(now);
-                    any = true;
-                    events.push(format!("{name}: in trouble with kiln's work quiet, longer than any cut took to show: not kiln's; the machine changed, a new regime"));
-                }
-            }
-            if any {
-                self.learned.knee.regime();
-                self.learned.cpu_knee.regime();
-                self.cut = None;
-                self.quiet_since = None;
-            }
-        }
-
         // The budgets: both cut when trouble begins (either may be the cause), each raised again on
         // its own as it holds calm where it limits.
         let hold = self.hold_us();
@@ -384,11 +393,43 @@ impl Engine {
         let disks_full = matches!((o.delivered_bps, self.learned.capacity_bps), (Some(d), Some(c)) if d + wanted / pace::SHARE_STEPS >= c);
         use knee::Unit;
         if now_alarmed && !was {
-            events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes));
-            if !disks_full {
-                events.push(self.learned.cpu_knee.alarm(now, ours_c, None, Unit::Cpu));
+            // Trouble begins. If stopping kiln's writers didn't speed the probes up before, and kiln
+            // writes no more now (in bytes a second and as a share of what the disks deliver),
+            // cutting it again can't help either: it isn't cut.
+            let share = o.delivered_bps.filter(|d| *d > 0.0).map(|d| (ours_w / d).min(1.0));
+            let held = self.learned.not_kiln.as_ref().is_some_and(|n| n.covers(ours_w, share));
+            self.episode = Some(Episode { before: (self.learned.knee.clone(), self.learned.cpu_knee.clone()), write_bps: ours_w, share, held });
+            if held {
+                events.push(format!("kiln's writes not cut: it writes {}{}, no more than when stopping its writers last didn't speed the probes up", Unit::Writes.fmt(ours_w), of_disks(share)));
+            } else {
+                events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes));
+                if !disks_full {
+                    events.push(self.learned.cpu_knee.alarm(now, ours_c, None, Unit::Cpu));
+                }
+                self.cut = Some((now, None));
             }
-            self.cut = Some((now, None));
+        } else if now_alarmed && self.episode.as_ref().is_some_and(|e| e.held) {
+            // Shown not to be kiln's, or not cut for that: nothing more is cut until it clears.
+        } else if now_alarmed
+            && worse
+            && self.learned.knee.budget == Some(0.0)
+            && let Some(ep) = self.episode.as_mut()
+        {
+            // kiln's writers are stopped, and a probe sent since is no faster than the one before
+            // it: what's queued isn't kiln's. Its budgets go back to what they were before this
+            // trouble, nothing is learned from the cuts, and what it wrote then is kept.
+            let (writes, cpu) = ep.before.clone();
+            self.learned.knee = writes;
+            self.learned.cpu_knee = cpu;
+            self.learned.not_kiln = Some(NotKiln { write_bps: ep.write_bps, share: ep.share });
+            ep.held = true;
+            events.push(format!(
+                "kiln's writes back to {}: stopping them didn't speed the probes up, so the slowdown isn't kiln's (it wrote {}{})",
+                level(self.learned.knee.budget),
+                Unit::Writes.fmt(ep.write_bps),
+                of_disks(ep.share)
+            ));
+            self.cut = None;
         } else if now_alarmed {
             let cut_w = self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes);
             let cut_c = if disks_full { None } else { self.learned.cpu_knee.persisting(now, ours_c, None, worse, Unit::Cpu) };
@@ -399,6 +440,7 @@ impl Engine {
             events.extend(cut_c);
         } else {
             self.cut = None;
+            self.episode = None;
             if was {
                 self.learned.knee.clear(now);
                 self.learned.cpu_knee.clear(now);
@@ -560,11 +602,110 @@ mod tests {
             let p = e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(2e6))], delivered_bps: Some(300e6), mem_free: 1e11, running: vec![Group { cpu_cores: 0.0, ..group("a", 0.0, 0.0) }], ..Observation::default() });
             if p.status.budget_bps.is_none() {
                 freed = true;
-                assert!(p.events.iter().any(|e| e.contains("not kiln's")), "{:?}", p.events);
+                assert!(p.events.iter().any(|e| e.contains("isn't kiln's")), "{:?}", p.events);
                 break;
             }
         }
         assert!(freed, "kiln's work was held back for good by trouble it can't cause");
+    }
+
+    /// The 10-28 night on adacachy: other writers fill the disk while kiln writes 1% of it.
+    /// Stopping kiln's writers doesn't speed the probes up, so they run again within 2 s with
+    /// nothing learned, none of 50 later slowdowns with kiln writing no more cuts it, and once kiln
+    /// writes half of what the disks take a cut is tried again.
+    #[test]
+    fn a_cut_that_does_not_help_is_undone_and_not_repeated() -> anyhow::Result<()> {
+        let mut e = engine();
+        let at = |t: u64, us: f64, kiln: f64, share: f64| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            delivered_bps: Some(500e6),
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: if share > 0.0 { 1.0 } else { 0.0 }, ..group("a", kiln, share) }],
+            ..Observation::default()
+        };
+        let mut t = 0;
+        for _ in 0..100 {
+            t += 1_000_000;
+            e.step(&at(t, 4_000.0, 5e6, 1.0));
+        }
+        let before = e.learned.knee.clone();
+        // Probes every second, at the 1 s tolerance.
+        t += 1_000_000;
+        let cut_at = t;
+        let p = e.step(&at(t, 1e6, 5e6, 1.0));
+        anyhow::ensure!(p.status.budget_bps == Some(0.0), "harm stops kiln's writers: {:?}", p.events);
+        let mut back = None;
+        for _ in 0..5 {
+            t += 1_000_000;
+            let p = e.step(&at(t, 1e6, 0.0, 0.0));
+            if p.status.budget_bps.is_none() {
+                anyhow::ensure!(p.events.iter().any(|e| e.contains("isn't kiln's")), "{:?}", p.events);
+                back = Some(t);
+                break;
+            }
+        }
+        let back = back.ok_or_else(|| anyhow::anyhow!("kiln's writers never ran again"))?;
+        anyhow::ensure!(back - cut_at <= 2_000_000, "restored {} s after the cut", (back - cut_at) as f64 / 1e6);
+        let k = &e.learned.knee;
+        anyhow::ensure!(k.safe == before.safe && k.unsafe_at == before.unsafe_at && k.lag_us == before.lag_us, "learned from a cut that didn't help: {k:?} (was {before:?})");
+        // 50 more slowdowns, kiln writing no more: none cuts it.
+        for n in 0..50 {
+            let mut calm = 0;
+            while e.alarmed() {
+                t += 1_000_000;
+                e.step(&at(t, 4_000.0, 5e6, 1.0));
+                calm += 1;
+                anyhow::ensure!(calm < 1_000, "slowdown {n} never cleared");
+            }
+            t += 1_000_000;
+            let p = e.step(&at(t, 1e6, 5e6, 1.0));
+            anyhow::ensure!(p.status.budget_bps.is_none() && p.events.iter().any(|e| e.contains("not cut")), "slowdown {n}: {:?}", p.events);
+        }
+        // kiln now writes half of what the disks take: a cut is tried again.
+        let mut calm = 0;
+        while e.alarmed() {
+            t += 1_000_000;
+            e.step(&at(t, 4_000.0, 250e6, 1.0));
+            calm += 1;
+            anyhow::ensure!(calm < 1_000, "never cleared");
+        }
+        t += 1_000_000;
+        let p = e.step(&at(t, 1e6, 250e6, 1.0));
+        anyhow::ensure!(p.status.budget_bps.is_some(), "kiln writing half the disks' load is cut: {:?}", p.events);
+        Ok(())
+    }
+
+    /// The 10-26 crash's shape: kiln writes 90% of what the disks take. After the cut each probe
+    /// comes back faster than the one before, so the cut stays and the rate trouble began at is
+    /// learned, as before.
+    #[test]
+    fn a_cut_that_helps_stays() -> anyhow::Result<()> {
+        let mut e = engine();
+        let at = |t: u64, us: f64, kiln: f64, share: f64| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            delivered_bps: Some(500e6),
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: if share > 0.0 { 1.0 } else { 0.0 }, ..group("a", kiln, share) }],
+            ..Observation::default()
+        };
+        let mut t = 0;
+        for _ in 0..100 {
+            t += 1_000_000;
+            e.step(&at(t, 4_000.0, 450e6, 1.0));
+        }
+        t += 1_000_000;
+        let p = e.step(&at(t, 1e6, 450e6, 1.0));
+        anyhow::ensure!(p.status.budget_bps == Some(0.0), "{:?}", p.events);
+        for us in [0.9e6, 0.6e6, 0.3e6, 0.1e6] {
+            t += 1_000_000;
+            let p = e.step(&at(t, us, 0.0, 0.0));
+            anyhow::ensure!(p.status.budget_bps == Some(0.0) && !p.events.iter().any(|e| e.contains("isn't kiln's")), "{:?}", p.events);
+        }
+        anyhow::ensure!(e.learned.knee.unsafe_at == Some(450e6), "the rate trouble began at is learned: {:?}", e.learned.knee);
+        anyhow::ensure!(e.learned.not_kiln.is_none(), "{:?}", e.learned.not_kiln);
+        Ok(())
     }
 
     #[test]
