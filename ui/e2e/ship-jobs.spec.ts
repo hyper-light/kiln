@@ -115,27 +115,40 @@ test("each stage's card lists its jobs as f-ship does: Checks each leg with its 
   await expect(row.locator(".ship-jobs__track > .ship-stn").first()).toHaveAttribute("data-stage", "review");
   await expect(row.locator('.ship-stn[data-stage="staging"] .ship-part__name')).toHaveText(["sync", "soak"]);
   await expect(row.locator('.ship-stn[data-stage="production"] .ship-part__name')).toHaveText(["approval", "deploy", "guard"]);
-  // Checks: each leg the read model has, as "pipeline · leg", its state's glyph and its time.
-  const detail = (await (await page.request.get(`/api/ship/commits/hyper-light/kiln/${sha?.trim() ?? ""}`)).json()) as {
-    checks: { pipeline: string; legs: { name: string; state: string; job?: string; start?: number; end?: number }[] }[];
-  };
-  const legs = detail.checks.flatMap((c) => c.legs.map((l) => ({ ...l, shown: `${c.pipeline} · ${l.name}` })));
-  expect(legs.length).toBeGreaterThan(1);
-  const drawn = await checks
-    .locator(".ship-part")
-    .evaluateAll((els) =>
-      els.map((b) => ({
-        name: b.querySelector(".ship-part__name")?.textContent ?? "",
-        state: b.querySelector("svg.sg")?.getAttribute("data-state") ?? "",
-        v: b.querySelector(".ship-part__v")?.textContent ?? "",
-      })),
+  // Checks: each leg the read model has, as "pipeline · leg", its state's glyph and its time. The
+  // mock's live run moves on as it's read: the page and the read model are compared until they agree.
+  type Legs = { checks: { pipeline: string; legs: { name: string; state: string; job?: string; start?: number; end?: number }[] }[] };
+  const read = async () =>
+    ((await (await page.request.get(`/api/ship/commits/hyper-light/kiln/${sha?.trim() ?? ""}`)).json()) as Legs).checks.flatMap((c) =>
+      c.legs.map((l) => ({ ...l, shown: `${c.pipeline} · ${l.name}` })),
     );
-  expect(drawn.map((d) => d.name)).toEqual(legs.map((l) => l.shown));
-  for (const [i, l] of legs.entries()) {
-    expect(drawn[i]?.state, l.shown).toBe(l.state);
-    const t = timeOf(l.start, l.end);
-    if (t) expect(drawn[i]?.v, l.shown).toBe(t);
-  }
+  const draw = () =>
+    checks
+      .locator(".ship-part")
+      .evaluateAll((els) =>
+        els.map((b) => ({
+          name: b.querySelector(".ship-part__name")?.textContent ?? "",
+          state: b.querySelector("svg.sg")?.getAttribute("data-state") ?? "",
+          v: b.querySelector(".ship-part__v")?.textContent ?? "",
+        })),
+      );
+  let legs = await read();
+  expect(legs.length).toBeGreaterThan(1);
+  await expect
+    .poll(
+      async () => {
+        legs = await read();
+        const drawn = await draw();
+        if (drawn.length !== legs.length) return [`${drawn.length} drawn of ${legs.length}`];
+        return legs.flatMap((l, i) => {
+          const d = drawn[i];
+          const t = timeOf(l.start, l.end);
+          return d?.name === l.shown && d.state === l.state && (!t || d.v === t) ? [] : [`${l.shown}: ${l.state} ${t ?? ""}, drawn ${JSON.stringify(d)}`];
+        });
+      },
+      { timeout: 30_000 },
+    )
+    .toEqual([]);
   await expect(checks.locator(".ship-stn__n")).toHaveText(`${legs.filter((l) => l.state === "passed").length}/${legs.length}`);
   // Each job that ran, picked, is the one Output shows.
   for (const l of legs.filter((x) => x.job)) {

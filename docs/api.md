@@ -93,6 +93,7 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | POST | `/api/ci/legs/:id/retry` | `{ runner?, elsewhere? }`: a finished job again, on any runner that can run it, on any but the one it ran on, or on `runner` → 201 (a pipeline's job: its next attempt in its run, with the jobs that need it) |
 | GET | `/api/jobs/:id` | `Job` with `spec` (and `placement`, `{ runner }` or `{ avoid }`, while a retry placed it) |
 | GET | `/api/jobs/:id/logs?step=N` | raw bytes (ANSI) of that step |
+| GET | `/api/jobs/:id/logs/times?step=N` | `{ times: [[offset, unix_ms], ...], size }`: when each piece of that step's log arrived, by its byte offset, oldest first (none for a log written before kiln noted them), and how long the log was as they were read |
 | GET | `/api/jobs/:id/tools` | `{ job, missing: { tools, on, why, no_agent, runners: [{ runner, unmet, tools, fixable, no_agent }] }, fix }`: what the job lacks to run, from its failed step's log (`tools`, `on` the runner, `why` the line) or, waiting on its `requires`, from each runner's facts; why no agent can install it there (`no_agent`: a pod, a runner away or without terminals); and the agent installing it (see [pipelines.md](pipelines.md#runners)) |
 | POST | `/api/jobs/:id/tools/fix` | `{ runner?, kind?, mode? }` → `{ fix }`: an agent, as the caller, installs what the job lacks on that runner; then kiln probes the runner's facts and runs the run's failed jobs again (`runs.rerun` on its repository, and `agents.run` as for any agent) |
 | GET | `/api/agents` | `Agent[]` |

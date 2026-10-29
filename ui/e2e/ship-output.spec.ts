@@ -131,3 +131,69 @@ test("a refused copy says so", async ({ page, isMobile }) => {
   await out.getByRole("button", { name: "Copy the output" }).click();
   await expect(page.getByText("Couldn't copy the output")).toBeVisible();
 });
+
+/** formatDuration's words (src/lib/format.ts): "12s", "4m 20s", "1h 05m". */
+const said = (seconds: number) => {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+};
+
+test("Output as f-ship draws it: the job's glyph and Stage · job, stdout · stderr and copy, each line opening with its time since the job began", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the desktop projects run it");
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/ship");
+  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  const sha = ((await row.locator(".ship-sha").first().textContent()) ?? "").trim();
+  await row.getByRole("button", { name: /^Open / }).click();
+  const checks = row.getByRole("list", { name: "Checks jobs" });
+  await expect(checks.getByRole("button").first()).toBeVisible({ timeout: 15_000 });
+  // A job that ran, from the read model: picked, the card is its.
+  const detail = (await (await page.request.get(`/api/ship/commits/hyper-light/kiln/${sha}`)).json()) as {
+    checks: { pipeline: string; legs: { name: string; state: string; job?: string }[] }[];
+  };
+  const ran = detail.checks.flatMap((c) => c.legs.filter((l) => l.job).map((l) => ({ ...l, shown: `${c.pipeline} · ${l.name}` })));
+  const leg = ran[0];
+  if (!leg?.job) throw new Error("no job that ran");
+  await checks.getByRole("button", { name: leg.shown }).click();
+  const out = row.locator(`.ship-output[data-job="${leg.job}"]`);
+  await expect(out).toBeVisible({ timeout: 15_000 });
+  const bar = out.locator(".ship-output__bar");
+  await expect(bar.locator("svg.sg")).toHaveAttribute("data-state", leg.state);
+  await expect(bar.locator(".ship-output__name")).toHaveText(`Checks · ${leg.shown}`);
+  await expect(bar.locator(".ship-output__streams")).toHaveText("stdout · stderr");
+  await expect(bar.getByRole("button", { name: /^Cop(y|ied) the output$/ })).toBeVisible();
+  // No bar of the log's own: the card's head is f-ship's.
+  await expect(out.getByRole("button", { name: "Search log" })).toBeHidden();
+  // Its first line opens with its time since the job began: kiln's note of when that piece came.
+  const step = Number((await out.getAttribute("data-step")) ?? "0");
+  const job = (await (await page.request.get(`/api/jobs/${encodeURIComponent(leg.job)}`)).json()) as { started_at: number | null };
+  const noted = (await (await page.request.get(`/api/jobs/${encodeURIComponent(leg.job)}/logs/times?step=${step}`)).json()) as { times: [number, number][] };
+  const first = noted.times[0];
+  if (!first || job.started_at == null) throw new Error("no times noted");
+  const rows = out.locator(".xterm-rows > div");
+  // The card follows the end: up at the top, its first line is the step's first.
+  await expect(rows.first()).not.toBeEmpty({ timeout: 15_000 });
+  await out.locator(".xterm-viewport").evaluate((v) => v.scrollTo({ top: 0 }));
+  // A time kiln noted (a progress line drawn again takes its time again).
+  const begun = job.started_at;
+  const times = new Set(noted.times.map(([, ms]) => said(ms / 1000 - begun)));
+  expect(times.has(said(first[1] / 1000 - begun))).toBe(true);
+  await expect.poll(async () => times.has(((((await rows.first().textContent()) ?? "").trim().match(/^(\d+s|\d+m \d{2}s|\d+h \d{2}m)/) ?? [""]) as string[])[0] ?? ""), { timeout: 15_000 }).toBe(true);
+  const texts = (await rows.allTextContents()).filter((t) => t.trim());
+  expect(texts.length).toBeGreaterThan(0);
+  for (const t of texts.slice(0, 3)) expect(t, "a line with its time").toMatch(/^ *(\d+s|\d+m \d{2}s|\d+h \d{2}m) {2}/);
+  // A running job's lines arrive in place: the card holds its box.
+  const live = ran.find((l) => l.state === "running");
+  if (live) {
+    await checks.getByRole("button", { name: live.shown }).click();
+    const card = row.locator(`.ship-output[data-job="${live.job}"]`);
+    await expect(card).toBeVisible({ timeout: 15_000 });
+    const before = await card.boundingBox();
+    await page.waitForTimeout(3_000);
+    expect(await card.boundingBox()).toEqual(before);
+  }
+});

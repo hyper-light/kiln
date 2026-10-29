@@ -651,27 +651,45 @@
   border: 1px solid var(--k-line, #2a2c31);
   border-radius: 10px;
 }
+/* A job with no output yet: the same card, its head, and the word under it. */
 .ship-output--none {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.ship-output--none > p {
+  display: grid;
   place-items: center;
-  border: 1px dashed rgb(255 255 255 / 0.1);
+  margin: 0;
+  color: #6d7078;
 }
 
 /* Output's bar: the job's name, and at its right the copy icon (its step 4). */
 .ship-output__bar {
   display: flex;
-  height: 2rem;
+  height: 2.25rem;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
-  padding: 0 0.25rem 0 0.5rem;
+  padding: 0 0.25rem 0 0.75rem;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
   color: #a3a5ad;
   font-size: 0.8125rem;
 }
 .ship-output__name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* f-ship's word for what the card holds, on the right before copy. */
+.ship-output__streams {
+  flex: none;
+  color: #6d7078;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 /* A row's age, one width as it ticks ("9m ago" to "10m ago"), so the line beside it never moves. */
