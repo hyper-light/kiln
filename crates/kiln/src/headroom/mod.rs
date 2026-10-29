@@ -393,7 +393,8 @@ fn run(ctx: Ctx, mut settings: Settings) {
             .collect();
         // Sessions whose turn ended, or that ended (with processes or without): by the same id
         // they waited and run under.
-        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended };
+        let cores = std::thread::available_parallelism().ok().map(|n| n.get() as f64);
+        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended, cores };
         let plan = engine.step(&obs);
         for (name, every) in &plan.probe_every_us {
             probes.set_interval(name, *every);

@@ -139,6 +139,17 @@ impl Knee {
         Some(format!("{} raised to {}: {} held calm{}", unit.what(), unit.fmt(to), unit.fmt(safe), self.unsafe_at.map(|u| format!(", trouble at {}", unit.fmt(u))).unwrap_or_default()))
     }
 
+    /// Held to what the machine has: no level kept here is above `cap` (its cores, or what its
+    /// disks take).
+    pub fn within(&mut self, cap: f64) {
+        for v in [&mut self.safe, &mut self.unsafe_at, &mut self.budget].into_iter().flatten() {
+            *v = v.min(cap);
+        }
+        for v in &mut self.above {
+            *v = v.min(cap);
+        }
+    }
+
     /// A new regime: what was learned about this machine's rates no longer holds.
     pub fn regime(&mut self) {
         let lag = self.lag_us;

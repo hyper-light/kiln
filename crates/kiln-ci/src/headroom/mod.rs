@@ -141,6 +141,10 @@ pub struct Observation {
     /// Groups whose run ended though the group goes on (a session's turn): learned from, and
     /// their next run starts from nothing.
     pub ended: Vec<String>,
+    /// The machine's cores, where the system says: the CPU budget and any one group's CPU demand
+    /// are held to them.
+    #[serde(default)]
+    pub cores: Option<f64>,
 }
 
 /// What to do now.
@@ -229,6 +233,29 @@ impl Engine {
         Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, episode: None, cut: None }
     }
 
+    /// Holds what's learned and estimated to what the machine has: its `cores`, and what its disks
+    /// were measured to take.
+    fn within_machine(&mut self, cores: Option<f64>) {
+        let disks = self.learned.capacity_bps;
+        self.learned.demand.within(cores, disks);
+        if let Some(c) = cores {
+            self.learned.cpu_knee.within(c);
+        }
+        if let Some(d) = disks {
+            self.learned.knee.within(d);
+        }
+        for r in self.runs.values_mut() {
+            if let Some(c) = cores {
+                r.demand_cpu = r.demand_cpu.min(c);
+                r.peak_cpu = r.peak_cpu.min(c);
+            }
+            if let Some(d) = disks {
+                r.demand = r.demand.min(d);
+                r.peak_write = r.peak_write.min(d);
+            }
+        }
+    }
+
     fn alarmed(&self) -> bool {
         self.learned.detectors.values().any(|d| d.alarm.is_some())
     }
@@ -252,21 +279,27 @@ impl Engine {
         let now = o.now_us;
         let budget_per_day = self.policy.false_alarms_per_day;
         let mut events = Vec::new();
+        // What the machine has: no budget, and no demand of any one group or kind of work, is held
+        // above its cores or above what its disks take.
+        let cores = o.cores.filter(|c| *c > 0.0);
+        self.within_machine(cores);
+        let disks = self.learned.capacity_bps;
+        let held = |v: f64, cap: Option<f64>| cap.map_or(v, |c| v.min(c));
 
         // Unslowed demand of what runs: measured at full speed, or scaled up from its share.
         for g in &o.running {
             // Until it's measured, what its kind was learned to want.
             let prior = self.learned.demand.demand(&g.key).unwrap_or_default();
-            let r = self.runs.entry(g.id.clone()).or_insert_with(|| Run { key: g.key.clone(), since_us: now, peak_write: 0.0, peak_cpu: 0.0, peak_mem: 0.0, demand: prior.write_bps, demand_cpu: prior.cpu_cores });
+            let r = self.runs.entry(g.id.clone()).or_insert_with(|| Run { key: g.key.clone(), since_us: now, peak_write: 0.0, peak_cpu: 0.0, peak_mem: 0.0, demand: held(prior.write_bps, disks), demand_cpu: held(prior.cpu_cores, cores) });
             let measured = g.write_bps > 0.0 || g.cpu_cores > 0.0;
             if !measured {
                 // Not yet running anything measurable: the prior stands.
             } else if g.share >= 1.0 {
-                r.demand = g.write_bps;
-                r.demand_cpu = g.cpu_cores;
+                r.demand = held(g.write_bps, disks);
+                r.demand_cpu = held(g.cpu_cores, cores);
             } else if g.share > 0.0 {
-                r.demand = g.write_bps / g.share;
-                r.demand_cpu = g.cpu_cores / g.share;
+                r.demand = held(g.write_bps / g.share, disks);
+                r.demand_cpu = held(g.cpu_cores / g.share, cores);
             }
             r.peak_write = r.peak_write.max(r.demand);
             r.peak_cpu = r.peak_cpu.max(r.demand_cpu);
@@ -368,6 +401,7 @@ impl Engine {
             self.trouble_bps = Some(self.trouble_bps.map_or(d, |t| t.max(d)));
         } else if !now_alarmed && let Some(t) = self.trouble_bps.take() {
             self.learned.capacity_bps = Some(t);
+            self.within_machine(cores);
         }
         let tolerance = |name: &str| self.targets.iter().find(|t| t.name == name).map_or(f64::INFINITY, |t| t.tolerance_us);
         let others = o.delivered_bps.map_or(0.0, |d| (d - ours_w).max(0.0));
@@ -450,7 +484,7 @@ impl Engine {
             let limited = self.learned.knee.budget.is_some_and(|b| wanted > b || next.iter().any(|d| wanted + d.write_bps > b));
             events.extend(self.learned.knee.calm(now, knee::Calm { delivered: ours_w, limited, hold_us: hold, resolution: wanted / pace::SHARE_STEPS, cap: cap_w }, Unit::Writes));
             let limited_cpu = self.learned.cpu_knee.budget.is_some_and(|b| wanted_cpu > b || next.iter().any(|d| wanted_cpu + d.cpu_cores > b));
-            events.extend(self.learned.cpu_knee.calm(now, knee::Calm { delivered: ours_c, limited: limited_cpu, hold_us: hold, resolution: wanted_cpu / pace::SHARE_STEPS, cap: None }, Unit::Cpu));
+            events.extend(self.learned.cpu_knee.calm(now, knee::Calm { delivered: ours_c, limited: limited_cpu, hold_us: hold, resolution: wanted_cpu / pace::SHARE_STEPS, cap: cores }, Unit::Cpu));
         }
         let budget = self.learned.knee.budget;
         let cpu_budget = self.learned.cpu_knee.budget;
@@ -706,6 +740,47 @@ mod tests {
         anyhow::ensure!(e.learned.knee.unsafe_at == Some(450e6), "the rate trouble began at is learned: {:?}", e.learned.knee);
         anyhow::ensure!(e.learned.not_kiln.is_none(), "{:?}", e.learned.not_kiln);
         Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+        /// However kiln's groups are paced, and whatever an earlier build learned, the CPU budget
+        /// never exceeds the machine's cores, and no group's or kind of work's demand exceeds what
+        /// the machine has (10-28: the CPU budget reached 4e13 cores on a 32-core machine).
+        #[test]
+        fn budgets_and_demands_stay_within_the_machine(
+            cores in 1u32..=64,
+            groups in prop::collection::vec((0.0f64..4.0, 1u32..=100), 1..300),
+            inflated in 1e3f64..1e13,
+        ) {
+            let cores = f64::from(cores);
+            let mut e = engine();
+            // As an earlier build left it: demand learned from work measured at a tiny share, and a
+            // CPU budget far past the machine.
+            e.learned.demand.record("past", admit::Demand { write_bps: inflated * 1e6, mem_bytes: 1e6, duration_us: 1e6, cpu_cores: inflated });
+            e.learned.cpu_knee.budget = Some(inflated);
+            let running: Vec<Group> = groups
+                .iter()
+                .enumerate()
+                .map(|(i, (cpu, steps))| {
+                    let share = f64::from(*steps) / pace::SHARE_STEPS;
+                    Group { id: format!("g{i}"), key: "past".into(), class: Class::Agent, protected: false, write_bps: 1e6 * share, cpu_cores: cpu * share, mem_bytes: 1e6, share }
+                })
+                .collect();
+            let waiting = vec![Waiting { id: "w".into(), key: "past".into(), class: Class::Agent, since_us: 0 }];
+            for i in 0..120u64 {
+                // Two slowdowns: the budgets are cut, then raised again as they hold calm.
+                let us = if i == 40 || i == 80 { 2e6 } else { 4_000.0 };
+                let p = e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(us))], delivered_bps: Some(100e6), mem_free: 1e11, running: running.clone(), waiting: waiting.clone(), cores: Some(cores), ..Observation::default() });
+                prop_assert!(p.status.cpu_budget.is_none_or(|b| b <= cores), "CPU budget {:?} over {} cores", p.status.cpu_budget, cores);
+                prop_assert!(e.runs.values().all(|r| r.demand_cpu <= cores && r.peak_cpu <= cores), "a group's CPU demand over the cores");
+                prop_assert!(e.learned.demand.demand("past").is_some_and(|d| d.cpu_cores <= cores), "learned CPU demand over the cores");
+                if let Some(c) = e.learned.capacity_bps {
+                    prop_assert!(e.runs.values().all(|r| r.demand <= c && r.peak_write <= c), "a group's write demand over what the disks take");
+                    prop_assert!(e.learned.demand.demand("past").is_some_and(|d| d.write_bps <= c), "learned write demand over what the disks take");
+                }
+            }
+        }
     }
 
     #[test]

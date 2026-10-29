@@ -283,6 +283,7 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
                         .collect(),
                     waiting: queued.iter().filter_map(|i| jobs.get(*i)).map(|j| Waiting { id: j.id.clone(), key: j.kind.key.into(), class: Class::Agent, since_us: us(j.arrive) }).collect(),
                     ended: Vec::new(),
+                    cores: Some(m.cores),
                 };
                 let plan = e.step(&obs);
                 // Trouble known from this step on (counted from the next).

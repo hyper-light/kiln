@@ -67,6 +67,21 @@ impl Learned {
 
     /// What `key` is expected to need: its own mean, else the mean over everything, else
     /// unknown (nothing learned yet).
+    /// Held to what the machine has: no kind of work is learned to want more than its `cores` or
+    /// to write more a second than its `disks` take (work measured at a tiny share could be
+    /// learned to want more than the whole machine).
+    pub fn within(&mut self, cores: Option<f64>, disks: Option<f64>) {
+        for s in self.by_key.values_mut().chain(std::iter::once(&mut self.all)) {
+            let n = s.runs as f64;
+            if let Some(c) = cores {
+                s.cpu_cores = s.cpu_cores.min(c * n);
+            }
+            if let Some(d) = disks {
+                s.write_bps = s.write_bps.min(d * n);
+            }
+        }
+    }
+
     pub fn demand(&self, key: &str) -> Option<Demand> {
         let s = self.by_key.get(key).filter(|s| s.runs > 0).copied().or_else(|| (self.all.runs > 0).then_some(self.all))?;
         let n = s.runs as f64;
