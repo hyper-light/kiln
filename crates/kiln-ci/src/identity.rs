@@ -10,9 +10,11 @@
 //! keeps the change for the half most like it and makes the other a change split from it; a
 //! squash keeps one change and absorbs the rest; and kiln asks only when it can't tell.
 //!
-//! Actors' identities, and the chain of whom each acts for, are [`chain`] (W27-R01).
+//! Actors' identities, and the chain of whom each acts for, are [`chain`] (W27-R01); what they sign,
+//! and how kiln checks it as of the time it took it, [`statement`] (W27-R03 to R08's base).
 
 pub mod chain;
+pub mod statement;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
