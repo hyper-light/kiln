@@ -50,6 +50,7 @@ pub mod previews;
 pub mod providers;
 pub mod registry;
 pub mod replies;
+pub mod signed;
 pub mod signing;
 pub mod sigstore;
 pub mod smtp;

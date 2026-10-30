@@ -57,6 +57,14 @@ struct Held {
     keys: HashMap<String, Key>,
     /// Certificates (PEM), by what they're for, with where each was written.
     certs: HashMap<String, (String, PathBuf)>,
+    /// What kiln said of each slot as it certified it: its identity's URI and, a leg's, the
+    /// server's delegation of the leg by its digest, which its records act under.
+    given: HashMap<String, Given>,
+}
+
+struct Given {
+    uri: String,
+    under: Option<String>,
 }
 
 impl Held {
@@ -69,6 +77,7 @@ impl Held {
     fn forget(&mut self, which: impl Fn(&str) -> bool) {
         let legs = self.holds_a_leg();
         self.keys.retain(|s, _| !which(s));
+        self.given.retain(|s, _| !which(s));
         let gone: Vec<String> = self.certs.keys().filter(|s| which(s)).cloned().collect();
         for s in gone {
             if let Some((_, file)) = self.certs.remove(&s) {
@@ -119,7 +128,9 @@ pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<S
         let key = held.keys.get(&slot).ok_or_else(|| anyhow::anyhow!("no key for {slot}"))?;
         rcgen::CertificateParams::new(vec!["kiln-identity".to_owned()])?.serialize_request(key)?.pem()?
     };
-    Ok(serde_json::to_string(&IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch })?)
+    // A leg this runner runs signs its records, and the provenance kiln writes when asked
+    // (docs/ci.md W27-R05, R06).
+    Ok(serde_json::to_string(&IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch, signs: kind == LEG })?)
 }
 
 /// The server's answer: the certificate kept for its slot (and written, public, under
@@ -143,6 +154,7 @@ pub fn given(json: &str, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     let path = dir.join(format!("{file}.pem"));
     crate::util::write_secret(&path, pem.as_bytes(), 0o644)?;
     tracing::info!(identity = %g.uri, "identity certified");
+    held.given.insert(slot.clone(), Given { uri: g.uri, under: g.delegation });
     held.certs.insert(slot, (pem, path));
     Ok(())
 }
@@ -194,6 +206,17 @@ pub fn cert(slot: &str) -> Option<String> {
     HELD.lock().certs.get(slot).map(|(pem, _)| pem.clone())
 }
 
+/// The URI of the identity certified for a slot.
+pub fn uri(slot: &str) -> Option<String> {
+    HELD.lock().given.get(slot).map(|g| g.uri.clone())
+}
+
+/// The delegation a slot's identity acts under, by its digest: a leg's, the server's delegation of
+/// the leg, given with its certificate.
+pub fn under(slot: &str) -> Option<String> {
+    HELD.lock().given.get(slot).and_then(|g| g.under.clone())
+}
+
 /// Signs `message` with the slot's key (ECDSA P-256, SHA-256, ASN.1): the signature, and the
 /// certificate it verifies under. The key stays here.
 pub fn sign(slot: &str, message: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
@@ -223,7 +246,7 @@ mod tests {
     fn answer(pki: &crate::pki::Pki, asked: &str, identity: &Identity) -> anyhow::Result<String> {
         let a: IdentityAsk = serde_json::from_str(asked)?;
         let pem = pki.issue_identity(&a.csr, identity, &[], time::Duration::hours(1))?;
-        Ok(serde_json::to_string(&IdentityGiven { kind: a.kind, of: a.of, epoch: a.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None })?)
+        Ok(serde_json::to_string(&IdentityGiven { kind: a.kind, of: a.of, epoch: a.epoch, uri: identity.uri()?, cert_pem: Some(pem), ..IdentityGiven::default() })?)
     }
 
     /// W27-R02: a slot's key is made here and only a CSR leaves; what it signs verifies under the

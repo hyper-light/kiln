@@ -1082,8 +1082,14 @@ struct LegRun {
 }
 
 fn leg_on_a_test_runner(dir: &Path, workflow: &str, env: &[(&str, &str)]) -> anyhow::Result<LegRun> {
+    leg_on_a_test_runner_with(dir, workflow, env, None)
+}
+
+/// [`leg_on_a_test_runner`], the runner a test build with `chaos`'s faults (`old`: a runner from
+/// before what it can do past `Build`'s 32 bits).
+fn leg_on_a_test_runner_with(dir: &Path, workflow: &str, env: &[(&str, &str)], chaos: Option<&str>) -> anyhow::Result<LegRun> {
     let s = start(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" })?;
-    let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", None, TALK, env)?;
+    let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", chaos, TALK, env)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
@@ -1504,3 +1510,151 @@ fn w27_ac02_keys() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// A leg's workflow for the test runner alone, its steps as written (YAML, under `steps:`).
+fn legs_steps_workflow(steps: &str) -> String {
+    format!("on: push\njobs:\n  e2e:\n    runs-on: self-hosted\n    steps:\n{steps}")
+}
+
+/// The test run's leg: its id.
+fn the_leg(dir: &Path) -> anyhow::Result<String> {
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    Ok(db.query_row("SELECT id FROM jobs WHERE key = 'e2e' ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))?)
+}
+
+/// The test runner's leg of run 1, as its certificate names it.
+fn e2e_leg() -> kiln_ci::identity::chain::Identity {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    Identity::new("hyper-light", Actor::Leg { enrolled_by: "admin".into(), machine: "fedora-2".into(), instance: "main".into(), run: 1, attempt: 1, leg: "e2e".into() })
+}
+
+/// W27-R05: a leg's logs, its steps' ends, its test report and its conclusion are signed as the
+/// leg, on its runner, at its end. They verify so at the time kiln took them, and what kiln keeps
+/// holds to them; a byte of its log changed afterwards is found.
+#[test]
+fn w27_r05_a_legs_results_verify_as_the_leg() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let steps = "      - run: echo building\n      - test-results: { path: report.xml }\n        run: |\n          printf '%s' '<?xml version=\"1.0\"?><testsuite name=\"calc\" tests=\"1\"><testcase classname=\"calc\" name=\"adds\"/></testsuite>' > report.xml\n          echo tested\n";
+    let run = leg_on_a_test_runner(dir.path(), &legs_steps_workflow(steps), &[])?;
+    let leg = the_leg(dir.path())?;
+    let signed = || -> anyhow::Result<Value> {
+        let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+        Ok(serde_json::from_str(&body)?)
+    };
+    let v = signed()?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    assert_eq!(field(&v, "uri"), "kiln://hyper-light/person/admin/machine/fedora-2/instance/main/run/1/attempt/1/leg/e2e");
+    let short = run.sha.get(..7).unwrap_or_default();
+    assert!(field(&v, "signer").starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner fedora-2")), "{v:#}");
+    let ends = v.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(ends.len() >= 2 && ends.iter().all(|s| field(s, "status") == "succeeded"), "{v:#}");
+    let reports = v.get("reports").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert_eq!(reports.iter().map(|r| field(r, "path")).collect::<Vec<_>>(), ["report.xml"], "{v:#}");
+    let logs = v.get("logs").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(!logs.is_empty() && logs.iter().all(|l| l.pointer("/verdict/state").and_then(Value::as_str) == Some("verified")), "{v:#}");
+    assert_eq!(v.pointer("/conclusion/status").and_then(Value::as_str), Some("succeeded"), "{v:#}");
+    // Under the server's delegation of the leg, signed as the server, naming what it handed it.
+    assert_eq!(v.pointer("/under/uri").and_then(Value::as_str), Some("kiln://hyper-light/server"), "{v:#}");
+    let (delegation, delegated_at) = (v.pointer("/under/bundle").cloned().unwrap_or_default(), v.pointer("/under/taken_at").and_then(Value::as_i64).unwrap_or_default());
+    let under = v.pointer("/under/digest").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no delegation: {v:#}"))?;
+    // Each record verifies on its own, at the time kiln took it: the leg's as the leg on its runner
+    // under that delegation, kiln's receipt as the server.
+    let (root, revocations) = (root(&run.s)?, revocations_now(&run.s)?);
+    let server = kiln_ci::identity::chain::Identity::new("hyper-light", kiln_ci::identity::chain::Actor::Server);
+    let mut said = Vec::new();
+    for r in v.get("records").and_then(Value::as_array).into_iter().flatten() {
+        let (bundle, at) = (r.get("bundle").cloned().unwrap_or_default(), r.get("taken_at").and_then(Value::as_i64).unwrap_or_default());
+        let u = kiln_ci::identity::statement::verify_under(&bundle, &root, &revocations, at, |d| (d == under).then(|| (delegation.clone(), delegated_at)))?;
+        let by = &u.statement.signer.identity;
+        assert!((*by == e2e_leg() && u.through.len() == 1) || (*by == server && u.through.is_empty()), "{by} under {} delegations", u.through.len());
+        let first = u.statement.statement.subject.first().map(|s| s.name.clone()).unwrap_or_default();
+        said.push((u.statement.payload_type.clone(), kiln_ci::attest::leg::kind(&u.statement).to_owned(), first, *by == server));
+    }
+    let has = |payload: &str, kind: &str, first: &str, kilns: bool| said.iter().any(|(p, k, f, s)| p == payload && k == kind && f.starts_with(first) && *s == kilns);
+    let custody = kiln_ci::identity::statement::PAYLOAD_CUSTODY;
+    assert!(has(kiln_ci::attest::leg::PAYLOAD_RESULTS, "", "log/", false), "its results: {said:?}");
+    assert!(has(custody, "received", "assignment", false) && has(custody, "received", "checkout", false), "its receipts: {said:?}");
+    assert!(has(custody, "handed-on", "log/", false) && has(custody, "received", "log/", true), "its hand-on, and kiln's receipt of it: {said:?}");
+    // A byte of the log changed since: found.
+    let shard = leg.get(leg.len().saturating_sub(2)..).unwrap_or("00");
+    let logs_dir = dir.path().join("data/logs").join(shard).join(&leg);
+    let built = std::fs::read_dir(&logs_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "log") && std::fs::read(p).is_ok_and(|b| b.windows(8).any(|w| w == b"building")))
+        .ok_or_else(|| anyhow::anyhow!("no log says building in {}", logs_dir.display()))?;
+    let mut bytes = std::fs::read(&built)?;
+    let at = bytes.windows(8).position(|w| w == b"building");
+    if let Some(b) = at.and_then(|at| bytes.get_mut(at)) {
+        *b = b'B';
+    }
+    std::fs::write(&built, &bytes)?;
+    let v = signed()?;
+    assert_eq!(field(&v, "state"), "broken", "{v:#}");
+    let breaks: Vec<String> = v.get("breaks").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    assert!(breaks.iter().any(|b| b.contains("isn't what the leg sent")), "{breaks:#?}");
+    Ok(())
+}
+
+/// W27-R05: a leg on a runner from before legs signed (a test build's `old`) sends no signed
+/// records. The API says the leg's are unsigned and why, never verified.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let run = leg_on_a_test_runner_with(dir.path(), &legs_steps_workflow("      - run: echo built\n"), &[], Some("old"))?;
+    let leg = the_leg(dir.path())?;
+    let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(field(&v, "state"), "unsigned", "{v:#}");
+    assert_eq!(field(&v, "why"), "kiln gave it no identity: its runner fedora-2 asked for none (a kiln from before them), or it isn't a leg of a run kiln planned", "{v:#}");
+    Ok(())
+}
+
+/// W27-R06: an artifact's provenance, written by kiln from its own records, is signed as the leg
+/// that built it, on its runner. Kept beside kiln's own, it verifies as the leg over the very
+/// statement kiln wrote, naming its runner.
+#[test]
+fn w27_r06_provenance_verifies_as_the_leg_that_built_it() -> anyhow::Result<()> {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir()?;
+    let steps = "      - run: printf 'the artifact\\n' > artifact.txt\n      - uses: kiln/attest@v1\n        with: { subject-path: artifact.txt }\n      - run: sleep 1\n";
+    let run = leg_on_a_test_runner(dir.path(), &legs_steps_workflow(steps), &[])?;
+    let leg = the_leg(dir.path())?;
+    let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (kilns, legs) = loop {
+        let mut st = db.prepare("SELECT origin, bundle FROM ci_attestations WHERE leg_id = ?1 AND predicate_type = ?2 ORDER BY id")?;
+        let rows: Vec<(String, String)> = st.query_map(rusqlite::params![leg, kiln_ci::attest::PROVENANCE], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        let of = |origin: &str| rows.iter().find(|(o, _)| o == origin).map(|(_, b)| b.clone());
+        if let (Some(k), Some(l)) = (of("kiln"), of("leg")) {
+            break (k, l);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no provenance signed as the leg: {rows:?}\n{}", run.s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let (kilns, legs): (Value, Value) = (serde_json::from_str(&kilns)?, serde_json::from_str(&legs)?);
+    let payload = |b: &Value| b.pointer("/dsseEnvelope/payload").and_then(Value::as_str).map(str::to_owned);
+    assert_eq!(payload(&legs), payload(&kilns), "the leg signs the very statement kiln wrote");
+    let b64 = |p: &str| base64::engine::general_purpose::STANDARD.decode(legs.pointer(p).and_then(Value::as_str).unwrap_or_default());
+    let (leaf, body, sig) = (b64("/verificationMaterial/certificate/rawBytes")?, b64("/dsseEnvelope/payload")?, b64("/dsseEnvelope/signatures/0/sig")?);
+    let v = kiln_ci::identity::chain::verify_signed(&[&leaf], &root(&run.s)?, &revocations_now(&run.s)?, unix_now()?, &kiln_ci::attest::pae(kiln_ci::attest::PAYLOAD_TYPE, &body), &sig)?;
+    assert_eq!(v.identity, e2e_leg());
+    // Its words are still kiln's: SLSA provenance of the artifact the leg built, naming its runner.
+    let st: Value = serde_json::from_slice(&body)?;
+    assert_eq!(st.get("predicateType").and_then(Value::as_str), Some(kiln_ci::attest::PROVENANCE));
+    assert!(st.pointer("/subject/0/name").and_then(Value::as_str).is_some_and(|n| n.ends_with("artifact.txt")), "{st}");
+    assert_eq!(st.pointer("/predicate/runDetails/byproducts/0/annotations/runner").and_then(Value::as_str), Some("fedora-2"), "{st}");
+    // Its one material is the commit the leg checked out, which is the one pushed.
+    let materials = st.pointer("/predicate/buildDefinition/resolvedDependencies").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert_eq!(materials.iter().map(|m| m.pointer("/digest/gitCommit").and_then(Value::as_str).unwrap_or_default()).collect::<Vec<_>>(), [run.sha.as_str()], "{st}");
+    let signed: Value = {
+        let (code, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+        anyhow::ensure!(code == 200, "{code} {body}");
+        serde_json::from_str(&body)?
+    };
+    let short = run.sha.get(..7).unwrap_or_default();
+    assert!(field(&signed, "signer").starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner fedora-2")), "{signed:#}");
+    Ok(())
+}

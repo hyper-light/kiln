@@ -9007,11 +9007,107 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   agent or a person through kiln reads "unverified" on them. For a host's pull request, kiln
   records what the host says it verified of each commit and marks what it couldn't (step 3's host
   half, through the forge seam).
-- *Not yet.* What hosts verified of a pull request's commits (above); verdicts (R04); legs'
-  results and provenance (R05, R06); lands (R07). A remote naming kiln's server by another name
+- *Not yet.* What hosts verified of a pull request's commits (above); verdicts (R04); lands
+  (R07). A remote naming kiln's server by another name
   than those (another host name for it) keeps the person's credential. A job's push (its
   `GITHUB_TOKEN`) can't sign its commits, so it's refused where signatures are required. Agents
   the server runs itself hold no key of theirs, so what they commit is unsigned.
+
+**Built: a leg's results and provenance, signed as the leg (R05, R06).** Plan
+`01a17856b1b273268adf6ce8c4f78410` step 5, planned as `01a18b12f931749d83a2acdfbf55e67a` (research
+`01a18b12f9487223be9926cdb890fe22`), on step 1's statement (`kiln_ci::identity::statement`). A leg
+is a custodian. It signs a receipt of each thing it's given and a hand-on of what it makes, as the
+Transfers plan's custody records (`application/vnd.kiln.custody+json`), under the server's
+delegation of it.
+
+- *The server signs as itself* (`identities::sign_own`, with `server-signing.key`). As it certifies
+  a leg it signs its delegation of the leg (`application/vnd.kiln.delegation+json`,
+  `kiln_ci::attest::leg::delegation`).
+  - The delegation names the leg's identity as its delegate, what the leg may do, and until when
+    (its certificate's end).
+  - It's about what kiln handed the leg: the run's commit (`checkout`, `gitCommit`) and its
+    assignment (`assignment`, by the digest the leg's receipt of it names).
+  - It's kept in `ci_leg_delegations`. Its digest goes back with the certificate
+    (`IdentityGiven.delegation`), and each of the leg's records names it in `under`.
+- *Its logs by digest* (`kiln_ci::logs`): a step's log is the chain of the chunks its leg sent,
+  `h₀ = SHA-256("kiln/log/v1")`, `hᵢ = SHA-256(hᵢ₋₁ ‖ SHA-256(chunkᵢ))`, with their count and bytes.
+  The server keeps each chunk it takes by its length and digest in `<step>.digests`, beside the log,
+  past the log's size cap too (its offset `-`), with a retry's mark between attempts.
+  - A capped log still checks: what kiln kept by its bytes, the rest by digest.
+  - A changed byte is found and placed, and a lost chunk is counted.
+  - A log that isn't the one the leg sent says so (`Logs::check`).
+- *What it received* (`runner::signed`): a `received` record of each thing, numbered on its
+  `custody` stream, following the delegation. Each record names its signer (`by`), since a
+  statement's digest is the same whoever signs it, as the Transfers plan's records do.
+  - Its assignment: the SHA-256 of the fields that say what it's to do, as canonical JSON
+    (`leg::assignment`). Its secrets are named, never by a digest of their value. No mask, token or
+    integration's token is in it.
+  - Its checkout: git's commit and tree, from the server or from what its runner already held. Or
+    the server's tarball by its SHA-256, with the commit it was of.
+  - Its inputs: artifacts and caches by their SHA-256; actions by their pin, and by their tarball's
+    SHA-256 once its runner kept that; images by their content-addressed id; reused steps by their
+    replay's digest (`kiln-replay-v1`).
+- *What it made*: one `handed-on` record to the server, following every receipt. It names each
+  step's log by its chain (`log/<step>`, `kiln-log-v1`, with its bytes and chunks), each report it
+  uploaded (`report/<step>/<path>`), its artifacts and caches, and its results by their digest.
+- *Its results* (`application/vnd.kiln.ci.results+json`): one statement, numbered 1 on its
+  `results` stream. Its body is each step's end and the leg's conclusion; its subjects are its logs
+  and reports.
+- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it.
+  `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and again with it until
+  it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg signs too: its runner
+  says nothing of itself past `Build`'s caps, so it says so of the leg as it asks for the leg's
+  identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
+- *Taken*: the server checks each record as it takes it, at that time, through its records
+  (`verify_under`).
+  - Each must be the leg's, signed by the leg it gave that job on that runner, under its delegation
+    and no other.
+  - It keeps them in `ci_leg_records` (by job and attempt), and refused ones with why.
+  - It signs its own receipt of the leg's hand-on as the server, following it (`leg::receipt`).
+  - As it sends a leg its assignment, it keeps the digest the leg's receipt will name
+    (`ci_leg_assignments`).
+- *Judged when read*: `GET /api/ci/legs/:id/signed` holds the records against what kiln keeps.
+  - The results: each step's end, each log's verdict, each report by its CAS digest, and the leg's
+    end.
+  - The custody (`leg::judge_custody`): its stream whole, and its hand-on naming its results and
+    received by kiln. Its receipts of its assignment and commit must be of what kiln handed, and a
+    checkout by tarball of the tarball kiln served it, by the bytes kiln sent (`ci_leg_served`).
+  - It says each break, or `verified`. It gives each record's bundle, and the delegation's, to check
+    apart from kiln.
+- *Provenance*: kiln still writes it from its own records (W18-R01's words). Then it asks the leg's
+  runner to sign the very statement (`ServerMsg::SignAsLeg`).
+  - The runner signs only when the statement's subjects are what the leg's attest step reported
+    (its hand-ons) and its materials are among what the leg received (`AgentMsg::LegSignature`).
+  - The server keeps the leg's bundle beside its own (origin `leg`) once it verifies as that leg,
+    over those bytes.
+  - CD's check (W15-R03) and the attest step's own bundles stay kiln's.
+- *Tests*:
+  - kiln-ci's `w27_r05_*` (the chain, the sidecar, the statement read back, each break said, the
+    delegation, the assignment's receipt) and `w27_r06_*` (the subjects, the materials);
+  - `logs`'s `w27_r05_the_server_keeps_each_chunk_by_digest_past_its_cap`;
+  - `identities`'s `w27_r01_the_server_and_cd_sign_as_themselves` (`identities::sign_own`) and
+    `w27_r05_a_legs_records_verify_under_the_servers_delegation`;
+  - `runner::signed`'s `w27_r05_a_legs_results_are_signed_as_the_leg`,
+    `w27_r05_a_legs_receipts_and_hand_ons_are_signed_as_the_leg`,
+    `w27_r05_a_legs_custody_is_judged_whole` and
+    `w27_r06_provenance_is_signed_as_the_leg_only_when_its_subjects_are_the_legs`;
+  - `proto`'s `w27_r05_leg_signing_is_appended_after_every_older_variant`;
+  - integration: `identities`'s `w27_r05_a_legs_results_verify_as_the_leg`,
+    `w27_r06_provenance_verifies_as_the_leg_that_built_it` and (with `chaos`)
+    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why`; `k8s_pool`'s
+    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`.
+- *Not yet*:
+  - v1 jobs have no leg identity (W27-R01 issues one only to the legs of runs kiln planned), nor do
+    legs on runners from before identities. Their records stay unsigned, and the API says why.
+  - kiln signs no hand-on of what it gives a leg. The delegation names its assignment and commit,
+    but a leg's inputs (artifacts, caches, actions, images) are received with no hand-on of kiln's
+    to follow. Only the assignment, the commit and the tarball are judged against what kiln
+    handed.
+  - kiln's receipt takes the leg's digests as handed on. Whether what kiln keeps still is them is
+    judged when read.
+  - kiln's provenance names every action the job resolved. A leg asked to sign it before a later
+    step fetches one refuses, saying which; kiln's own bundle is kept either way.
+  - Ship shows none of this yet (the CI/CD Integration plan's).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

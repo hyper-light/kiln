@@ -706,7 +706,7 @@ mod tests {
         let asked: crate::proto::IdentityAsk = serde_json::from_str(&crate::runner::identity::ask("agent", Some(&session), Some(2))?)?;
         let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: session.clone(), epoch: 2, held_by: None });
         let pem = pki.issue_identity(&asked.csr, &identity, &[], time::Duration::hours(1))?;
-        let given = crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None };
+        let given = crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None, delegation: None };
         crate::runner::identity::given(&serde_json::to_string(&given)?, keys.path(), "main")?;
         let slot = crate::runner::identity::slot("agent", Some(&session), Some(2));
         let here = top.clone();

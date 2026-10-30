@@ -18,6 +18,9 @@ use sha2::{Digest as _, Sha256};
 
 /// What the chain starts from, naming it: a chain of another scheme never equals one of this.
 pub const SCHEME: &str = "kiln/log/v1";
+/// A chain's head as a digest in a subject's digest set (in-toto's): never filed as `sha256`,
+/// which it isn't.
+pub const DIGEST: &str = "kiln-log-v1";
 
 /// A step's log as its chunks' chain: its head, and how many chunks and bytes it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -68,6 +71,11 @@ impl Chain {
     /// Its head, as hex.
     pub fn head_hex(&self) -> String {
         hex(&self.head)
+    }
+
+    /// A chain known by its head (hex, as [`Chain::head_hex`] writes it) and its counts.
+    pub fn from_hex(head: &str, chunks: u64, bytes: u64) -> Option<Self> {
+        Some(Self { head: unhex(head)?, chunks, bytes })
     }
 }
 

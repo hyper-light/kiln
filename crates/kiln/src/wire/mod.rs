@@ -201,6 +201,8 @@ classes! {
         AgentMsg::AgentLimit { .. } => Class::State,
         AgentMsg::Identity { .. } => Class::Ask,
         AgentMsg::Observe { .. } => OBSERVE,
+        AgentMsg::LegResults { .. } => Class::Stream,
+        AgentMsg::LegSignature { .. } => Class::Answer,
     }
 }
 
@@ -269,6 +271,7 @@ classes! {
         ServerMsg::AgentLimit { .. } => Class::State,
         ServerMsg::Identity { .. } => Class::Answer,
         ServerMsg::Observe { .. } => OBSERVE,
+        ServerMsg::SignAsLeg { .. } => Class::Ask,
     }
 }
 
