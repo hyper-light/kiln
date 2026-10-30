@@ -29,7 +29,7 @@ import { Shimmer } from "@/views/harness/signals";
 import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
-import { JobCards } from "./jobs";
+import { JobsPane } from "./jobs";
 import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { SectionHead } from "./head";
@@ -435,10 +435,8 @@ function showFiles(open: HTMLElement): (() => void) | undefined {
   return stop;
 }
 
-/** An item's dropdown, in its order: Files (with the Conversation), Output, Jobs, Lanes. */
+/** An item's dropdown, in its order: Files (with the Conversation), Jobs (with the picked job's output), Lanes. */
 function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
-  // The picked job (its stage and lane): yours once you click one, else the cards' rule; Output shows it.
-  const [picked, setPicked] = React.useState<string | null>(null);
   // A Diff press (reveal counts them) brings Files into view; opening the row any other way doesn't.
   const root = React.useRef<HTMLDivElement | null>(null);
   const files = React.useCallback(
@@ -455,14 +453,16 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
           section waits for Files' review, so none is drawn first and then pushed down (2026-10-28). */}
       <Loadable label="Loading its review">
         <ReviewFiles item={commit} />
-        <section aria-label="Output" className="ship-sec">
-          <SectionHead label="Output" />
-          <Loadable label="Loading the output" className="ship-output-slot">
-            <ShipOutput commit={commit} picked={picked} />
-          </Loadable>
-        </section>
+        {/* Output and Jobs as one pane (docs/ci.md W26-R23): the strip, the jobs by stage, the picked one's output. */}
         <section aria-label="Jobs" className="ship-sec">
-          <JobCards commit={commit} picked={picked} onPick={setPicked} />
+          <JobsPane
+            commit={commit}
+            output={(picked) => (
+              <Loadable label="Loading the output" className="ship-output-slot">
+                <ShipOutput commit={commit} picked={picked} />
+              </Loadable>
+            )}
+          />
         </section>
         <section aria-label="Lanes" className="ship-sec">
           <Loadable

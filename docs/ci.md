@@ -8609,6 +8609,21 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     (`runs.rerun`, `runs.pause`, `runs.cancel`), and each job answers. The commit's detail lists
     its `jobs`: each one's id, run, pipeline and name, runner, `paused_at`, the `verbs` that apply
     now and why each other doesn't (`why_not`), Pause where its runner can't freeze it included.
+- **W26-R23 The jobs pane.** An opened commit's Output and Jobs are one pane, as Ada approved it
+  (2026-10-30). Flat throughout: no box round any of it, hairlines between.
+  - A strip on top says what's picked and what each action would do: Retry, Pause (Resume when
+    what's picked is paused) and Cancel, one width each, dimmed where they don't apply and never
+    hidden. The words "failed · running · waiting · all" pick those jobs. Cancel asks again in the
+    strip (Keep, Cancel them), and what an action did, or why it couldn't, is said there.
+  - Under it, the jobs by stage, no buttons on a line: a line picks its job alone, its glyph adds it
+    to the pick or takes it out. The picked line is a square tint, the one shown with a straight
+    2px edge. A paused job says "paused".
+  - The picked job's output is beside the list on a desktop, and under its line on a phone, where
+    the strip comes again.
+  - Each action goes to `POST /api/ship/jobs`: a word's jobs as its `scope`, a pick's as its
+    `jobs`, those the action applies to.
+  - Its heights are held: nothing moves as jobs are picked, acted on and go on, and nothing scrolls
+    sideways from 320 px up.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8672,6 +8687,12 @@ repository):
   `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
   `w26_r22_freeze_is_appended_after_every_older_variant`; contain
   `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC14 The jobs pane.** In Chromium and WebKit, at a desktop's width and a phone's: the pane
+  as approved (the strip, the jobs by stage, the output beside them or under the line with the strip
+  again), a line and its glyph picking, each word and each action reaching `POST /api/ship/jobs`
+  with what's picked (a word's scope, a pick's jobs), Cancel asking again and Keep sending nothing,
+  a refusal's why in the strip; no layout shift through picking, acting and 30 s of updates; nothing
+  sideways at 320, 390 and 1280. *`ui/e2e/ship-jobs-pane.spec.ts`; every Ship e2e.*
 
 **Progress.** In progress. R06 to R15, each Ship item's dropdown owning its review, are built
 (Review plan step 3, kiln plan `01a17856b1aa77df93c0ef014cda0a71`, with the CI/CD Integration

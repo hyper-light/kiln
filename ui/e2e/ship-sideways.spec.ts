@@ -5,7 +5,7 @@
  * + landing over the disk, landing bench · pod kiln-52d46c91d9-0: …"), which on a phone stood its
  * row's line 2,072 px wide. So the failing row here says as much, in its name, its line and a tag:
  * at the project's width and at 320 the page doesn't move sideways and nothing reaches past the
- * screen's right edge unclipped, with the row closed and open (its Output and Jobs), and its line
+ * screen's right edge unclipped, with the row closed and open (its Jobs, with the picked job's output), and its line
  * ends in an ellipsis inside its row.
  */
 import { expect, test, type Page } from "@playwright/test";
@@ -69,9 +69,8 @@ for (const at of ["its own width", "320"]) {
     expect(fit).toEqual({ cut: true, inside: true, ellipsis: "ellipsis" });
 
     await row.getByRole("button", { name: /^Open / }).click();
-    await expect(row.getByRole("region", { name: "Output" })).toBeVisible();
     await expect(row.getByRole("region", { name: "Jobs" })).toBeVisible();
-    await expect(row.getByRole("list", { name: "Stages" })).toBeVisible();
+    await expect(row.getByRole("list", { name: "Jobs by stage" })).toBeVisible();
     await expect.poll(() => sideways(page), { timeout: 10_000 }).toEqual({ page: 0, over: [] });
   });
 }

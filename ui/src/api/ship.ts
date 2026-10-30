@@ -120,6 +120,32 @@ export interface ShipDetail extends ShipCommit {
   deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
   releases?: { state: string; message: string | null; rolled_back: boolean }[];
   replant?: { name: string; state: string; why: string }[];
+  /** Every job of the commit, either engine's, as the jobs pane acts on them (docs/ci.md W26-R21, R22). */
+  jobs?: ShipJob[];
+}
+
+/** What can be done to a commit's jobs together (`POST /api/ship/jobs`). */
+export type ShipVerb = "retry" | "pause" | "resume" | "cancel";
+
+/** A commit's job: its run, its lane's pipeline and name, where it runs, whether it's paused, and
+ * the verbs that apply now (and why each other doesn't). */
+export interface ShipJob {
+  id: string;
+  run: string;
+  pipeline: string;
+  name: string;
+  runner?: string;
+  paused_at?: number;
+  verbs: ShipVerb[];
+  why_not: Partial<Record<ShipVerb, string>>;
+}
+
+/** What one job said to a verb: done, or why not. */
+export interface ShipJobDone {
+  job: string;
+  run?: string;
+  done: boolean;
+  why?: string;
 }
 
 /** What a list asks for: a repository, the facets (W26-R02), a page. */
@@ -147,4 +173,9 @@ export const shipApi = {
     request<ShipDetail>("GET", apiPath(`/api/ship/commits/${repo.split("/").map(encodeURIComponent).join("/")}/${encodeURIComponent(sha)}`), undefined, { signal }),
   /** A row's action, through the endpoint it names. */
   act: (a: ShipAction) => request<unknown>(a.method, apiPath(a.path), a.method === "GET" ? undefined : (a.body ?? {})),
+  /** A commit's jobs run again, paused, resumed or cancelled together: those named, or those a word picks. */
+  jobs: (body: { repo: string; sha: string; verb: ShipVerb; jobs?: string[]; scope?: ShipScope }) => request<{ verb: ShipVerb; jobs: ShipJobDone[] }>("POST", apiPath("/api/ship/jobs"), body),
 };
+
+/** The words the jobs pane picks by. */
+export type ShipScope = "failed" | "running" | "waiting" | "all";

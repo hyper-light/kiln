@@ -464,135 +464,215 @@
   color: #bfdccf;
 }
 
-/* An opened commit's job cards (opened-commit plan, step 1): as many to a view as fit, the cards and
-   their gaps together exactly the lanes card's width, a view at a time. The view's cards alone are
-   drawn (jobs.tsx), so nothing scrolls sideways (W21-AC01). */
-.ship-jobs {
-  container-type: inline-size;
-}
-.ship-jobs__track {
-  --n: 1;
-  --gap: 0.75rem;
+/* An opened commit's jobs as one pane (docs/ci.md W26-R23, Ada's approved stills of 2026-10-30): the
+   strip, the jobs by stage, the picked job's output beside them (under its line on a phone). Flat:
+   no box around any of it, hairlines between; a picked line a square tint, the one shown with a
+   straight 2px edge. Every height is held, so nothing moves as you pick, act or the jobs go on. */
+.jp {
   display: grid;
-  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
-  gap: var(--gap);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+  gap: 10px;
 }
-@container (min-width: 420px) {
-  .ship-jobs__track {
-    --n: 2;
-  }
-}
-@container (min-width: 620px) {
-  .ship-jobs__track {
-    --n: 3;
-  }
-}
-@container (min-width: 820px) {
-  .ship-jobs__track {
-    --n: 4;
-  }
-}
-@container (min-width: 1100px) {
-  .ship-jobs__track {
-    --n: 6;
-  }
-}
-/* A stage's card in an opened commit, f-ship's station (plan 01a1856fe81375b1bd1d1d86f270a45b,
-   step 8): its head (glyph, name, how many done or how it stands) over every job it has, each its
-   glyph, name and time. One height whatever it holds, so nothing grows as jobs begin; a long list
-   scrolls inside it. Its edge takes its stage's tone. */
-.ship-stn {
+.jp-strip {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  height: 15rem;
-  min-width: 0;
-  border: 1px solid var(--k-line, #2a2c31);
-  border-radius: 10px;
-  background: #0d0e11;
-}
-.ship-stn[data-state="needs"] {
-  border-color: rgb(226 207 174 / 0.45);
-}
-.ship-stn[data-state="failed"],
-.ship-stn[data-state="partial"],
-.ship-stn[data-state="rolledback"] {
-  border-color: rgb(226 185 189 / 0.4);
-}
-.ship-stn[data-state="running"],
-.ship-stn[data-state="guard"],
-.ship-stn[data-state="replanting"],
-.ship-stn[data-state="soaking"] {
-  border-color: rgb(205 198 234 / 0.35);
-}
-.ship-stn__head {
-  display: flex;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 7px;
-  padding: 9px 10px;
+  gap: 8px 16px;
+  padding: 10px;
+  border-top: 1px solid var(--k-line-2, #1f2125);
   border-bottom: 1px solid var(--k-line-2, #1f2125);
-  color: #e4e5e7;
-  font-size: 12.5px;
 }
-.ship-stn__name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ship-stn__n {
-  margin-left: auto;
-  color: #8b8e96;
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 10.5px;
-  white-space: nowrap;
-}
-.ship-stn__parts {
+.jp-say {
   display: grid;
-  align-content: start;
+  min-width: 0;
   gap: 2px;
-  margin: 0;
-  padding: 6px 4px 8px;
-  overflow-y: auto;
-  list-style: none;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  line-height: 18px;
 }
-/* A job: picks what Output shows; the picked one lit. */
-.ship-part {
-  all: unset;
-  box-sizing: border-box;
-  display: grid;
-  width: 100%;
-  grid-template-columns: 14px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 7px;
-  padding: 3px 6px;
-  border-radius: 6px;
-  color: #b9bbc2;
+/* Two lines at the most, always two lines high: what an action did never pushes the jobs down. */
+.jp-said {
+  display: -webkit-box;
+  height: 36px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  align-content: center;
+}
+.jp-said b {
+  color: #e4e5e7;
+  font-weight: 400;
+}
+.jp-say[data-tone="warn"] .jp-said {
+  color: #e2b9bd;
+}
+.jp-q {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: #6d7078;
   font-size: 12px;
+}
+.jp-q button {
+  all: unset;
+  color: #8b8e96;
   cursor: pointer;
 }
-.ship-part:hover {
-  background: rgb(255 255 255 / 0.04);
+.jp-q button[aria-pressed="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
-.ship-part[aria-pressed="true"] {
+.jp-q button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.jp-verbs {
+  display: grid;
+  grid-template-columns: repeat(3, 80px);
+  gap: 6px;
+}
+.jp-verbs button {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-grid;
+  height: 32px;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 999px;
+  color: #e4e5e9;
+  font-size: 13px;
+  cursor: pointer;
+}
+.jp-verbs button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.jp-verbs button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.jp-verbs button[data-keep] {
+  border-color: transparent;
+  background: rgb(255 255 255 / 0.9);
+  color: #0b0c0e;
+}
+.jp-verbs button[data-go] {
+  grid-column: span 2;
+  border-color: #e2b9bd;
+  background: #e2b9bd;
+  color: #16090b;
+  font-weight: 500;
+}
+.jp-body {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr);
+  align-items: start;
+}
+.jp-side {
+  min-height: 100%;
+  padding-left: 14px;
+  border-left: 1px solid var(--k-line-2, #1f2125);
+}
+.jp-list {
+  margin: 0;
+  padding: 0 0 8px;
+  list-style: none;
+}
+.jp-g {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 8px 4px;
+  color: #97999f;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.jp-g span:last-child {
+  color: #8b8e96;
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
+}
+/* A job's line: its glyph adds it to the pick or takes it out; the rest picks it alone. */
+.jp-j {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  height: 30px;
+  color: #b9bbc2;
+  font-size: 12.5px;
+}
+.jp-j[data-sel] {
   background: rgb(205 198 234 / 0.1);
   color: #e4e5e7;
 }
-.ship-part:focus-visible {
+.jp-j[data-at] {
+  box-shadow: inset 2px 0 0 #cdc6ea;
+}
+.jp-glyph,
+.jp-line {
+  all: unset;
+  box-sizing: border-box;
+  height: 100%;
+  cursor: pointer;
+}
+.jp-glyph {
+  display: grid;
+  place-items: center;
+  padding-left: 4px;
+}
+.jp-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 4px;
+}
+.jp-glyph:focus-visible,
+.jp-line:focus-visible {
   outline: 2px solid #a6c4ed;
   outline-offset: -2px;
 }
-.ship-part__name {
+.jp-j:not([data-sel]):hover {
+  background: rgb(255 255 255 / 0.03);
+}
+.jp-j .n {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ship-part__v {
+.jp-j .v {
   color: #8b8e96;
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 10.5px;
   white-space: nowrap;
+}
+/* On a phone: under the picked line, the strip again and the job's output. */
+.jp-detail {
+  display: grid;
+  gap: 8px;
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+}
+/* The output in the pane: flat, its own dark ground. */
+.jp .ship-output {
+  border: 0;
+  border-radius: 0;
+  background: #08090a;
+}
+@media (max-width: 700px) {
+  .jp-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .jp-verbs {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .jp-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .ship-job {
   display: flex;
@@ -614,40 +694,6 @@
 .ship-job__state {
   color: #a3a5ad;
   font-size: 0.8125rem;
-}
-.ship-jobs__page {
-  display: inline-grid;
-  width: 2rem;
-  height: 2rem;
-  place-items: center;
-  border: 1px solid rgb(255 255 255 / 0.12);
-  border-radius: 999px;
-  color: #e4e5e9;
-}
-.ship-jobs__page:disabled {
-  opacity: 0.35;
-}
-
-/* A card picks its job (opened commit's Output, step 2): the whole card is the button; the picked
-   one is lit. */
-.ship-job__pick {
-  display: flex;
-  width: 100%;
-  height: 100%;
-  flex-direction: column;
-  gap: 0.35rem;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-align: start;
-  cursor: pointer;
-}
-.ship-job__pick:focus-visible {
-  outline: 2px solid #a6c4ed;
-  outline-offset: 6px;
-  border-radius: 0.5rem;
 }
 .ship-job[data-picked] {
   border-color: rgb(255 255 255 / 0.42);
