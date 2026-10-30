@@ -16,6 +16,12 @@
  *   /agents/sub-done   "Release notes" (Claude Code), its subagents done: finished
  *   /agents/sub-codex  "Scheduler audit" (Codex), a subagent kiln can't stop
  *
+ * And subagents kiln started for an agent's goal asking you something, each answered from its
+ * agent's row in Mission control:
+ *
+ *   /agents/ask-lead   "Gate order" (Claude Code), its step 2's subagent asks which gate goes first
+ *   /agents/ask-perm   "Figure audit" (Claude Code), its step 1's subagent asks to run a command
+ *
  * The `agents.*` routes answer as the server's do, from these and nothing else.
  */
 import type http from "node:http";
@@ -23,6 +29,7 @@ import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
 import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
+import { forgetMarks } from "./push.ts";
 import { agentRefused, note, unreadUpdate } from "./refused.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -628,6 +635,112 @@ for (const [m, tasks] of [
   family.set(m.info.id, m);
 }
 
+// Subagents kiln started for an agent's goal (`subagent`), each asking you something from its
+// agent's row in Mission control, where what's answered goes to the one that asks:
+//   /agents/ask-lead   "Gate order" (Claude Code): its step 2's subagent, "Step 2: Exec through
+//                      a seed", asks you which gate goes first
+//   /agents/ask-perm   "Figure audit" (Claude Code): its step 1's subagent asks to run a command
+const GATE_ORDER = "Which goes first, observe's gate or mine?";
+const askS2: Approval = {
+  id: "ask-s2-q1",
+  tool_id: "toolu_gate_order",
+  tool_name: "AskUserQuestion",
+  tool: "question",
+  title: GATE_ORDER,
+  input: { questions: [{ question: GATE_ORDER, header: "Gate order" }] },
+  cwd: CWD,
+  questions: [
+    {
+      question: GATE_ORDER,
+      header: "Gate order",
+      multi: false,
+      other: true,
+      secret: false,
+      options: [
+        { label: "Observe's first", description: "About 45 minutes: it's prebuilt" },
+        { label: "Mine first", description: "About 90 minutes, for step 5 of the headroom plan" },
+      ],
+    },
+  ],
+  at: Date.now() - 4 * 60_000,
+};
+const askFigures: Approval = {
+  id: "ask-perm-s1-ap1",
+  tool_id: "toolu_audit_check",
+  tool_name: "Bash",
+  tool: "shell",
+  title: "npm run figures -- --check",
+  command: "npm run figures -- --check",
+  input: { command: "npm run figures -- --check" },
+  cwd: CWD,
+  at: Date.now() - 2 * 60_000,
+};
+const step = (id: string, parent: string, name: string, prompt: string, reply: string, approval: Approval): Member => ({
+  ...member(id, "claude", "local", name, "waiting", "auto", prompt, reply, { parent, subagent: true }),
+  approval,
+});
+for (const m of [
+  member(
+    "ask-lead",
+    "claude",
+    "local",
+    "Gate order",
+    "idle",
+    "auto",
+    "Run the headroom plan's steps, step 2 on a subagent of its own.",
+    "Step 2 is out on its subagent; I'll merge it when it reports.",
+  ),
+  step(
+    "ask-s2",
+    "ask-lead",
+    "Step 2: Exec through a seed",
+    'Step 2 of 4 of the plan "Headroom": Exec through a seed, no shared state',
+    "Two gates wait for adacachy; which goes first is yours to say.",
+    askS2,
+  ),
+  member("ask-perm", "claude", "local", "Figure audit", "idle", "auto", "Check every figure on the System page against its data, step 1 on a subagent of its own.", "Step 1 is out on its subagent."),
+  step("ask-perm-s1", "ask-perm", "Step 1: Check the figures", 'Step 1 of 2 of the plan "Figures": Check every figure against its data', "Checking the figures.", askFigures),
+] as Member[]) {
+  family.set(m.info.id, m);
+}
+/** What each of them asks, and what it does meanwhile: asked again by `POST /api/mock/asks` (so each browser test starts from it). */
+const ASKS: [string, Approval, string][] = [
+  ["ask-s2", askS2, "Asking you a question"],
+  ["ask-perm-s1", askFigures, "Waiting for your approval"],
+];
+function askAll(told = true) {
+  forgetMarks(ASKS.map(([, ap]) => ap.id));
+  for (const [id, ap, doing] of ASKS) {
+    const m = family.get(id);
+    if (!m) continue;
+    m.approval = ap;
+    m.info.approvals = [{ id: ap.id, tool: ap.tool, tool_name: ap.tool_name, title: ap.title, at: ap.at }];
+    m.info.status = "waiting";
+    m.info.doing = doing;
+    if (told) tell(m);
+  }
+}
+// Asked from the start (no page is open yet to tell).
+askAll(false);
+
+/** One of them changed: its open pages and every list hear of it. */
+function tell(m: Member) {
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+  emitEvent({ type: "harness", info: m.info });
+}
+
+/** What a person answered one of them (`approve`), as its harness takes it: the request goes, and it works on. */
+function takeAnswer(m: Member, c: { type?: string; id?: string; decision?: string }) {
+  if (c.type !== "approve" || !m.approval || m.approval.id !== c.id) return;
+  m.approval = undefined;
+  m.info.approvals = [];
+  m.info.status = "running";
+  m.info.doing = c.decision === "deny" ? "Trying another way" : "Going ahead";
+  m.info.last_activity = Date.now();
+  tell(m);
+}
+
 /** A shell's output so far: a line a second while it runs, as a server's log grows. */
 function shellOutput(t: Task): string {
   const lines = ["> kiln-ui@0.2.0 mock", "> tsx mock/server.ts", "", "mock kiln on http://localhost:7070 (MOCK_NO_AUTH)"];
@@ -960,6 +1073,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   ws.on("message", (raw) => {
     try {
       const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
+      if (c.type === "approve") takeAnswer(m, c);
       if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
       if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
       if (c.type?.startsWith("queue_")) subagentQueue(m, c);
@@ -1284,8 +1398,14 @@ function aboutAnswer(q: AboutQ): [string, string][] {
   return [
     ["What it is", `${what}, in \`${q.path}\`${q.line ? ` at line ${q.line}` : ""}: the retry delay for the next attempt, from 100 ms doubling with each one, with full jitter, at most 30 s.`],
     ["What it does here", "It picks how long this loop sleeps before trying again; `.min(deadline - now)` keeps the last sleep from running past the request's deadline."],
-    ["Used elsewhere", "- `crates/kiln/src/http/retry.rs:31` `pub fn next(&mut self, now: Instant) -> Duration {`\n- `crates/kiln/src/rt/timer.rs:88` `let wait = reconnect.next(now);`\n- `crates/kiln/tests/retry.rs:24` `assert!(b.next(t0) <= Duration::from_millis(200));`"],
-    ["Worth knowing", "It counts attempts, so calling it twice in one pass skips a step. **The test at `tests/retry.rs:24` is the flaky one**: it compares against wall-clock time the jitter can overshoot."],
+    [
+      "Used elsewhere",
+      "- `crates/kiln/src/http/retry.rs:31` `pub fn next(&mut self, now: Instant) -> Duration {`\n- `crates/kiln/src/rt/timer.rs:88` `let wait = reconnect.next(now);`\n- `crates/kiln/tests/retry.rs:24` `assert!(b.next(t0) <= Duration::from_millis(200));`",
+    ],
+    [
+      "Worth knowing",
+      "It counts attempts, so calling it twice in one pass skips a step. **The test at `tests/retry.rs:24` is the flaky one**: it compares against wall-clock time the jitter can overshoot.",
+    ],
   ];
 }
 
@@ -1295,6 +1415,19 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
+  if (p === "/api/mock/asks" && m === "POST") {
+    askAll();
+    json(res, 200, {});
+    return true;
+  }
+  // A command without its socket (a request answered from Mission control's row or a card): taken as its harness would.
+  const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
+  const told = cm ? family.get(decodeURIComponent(cm[1] ?? "")) : undefined;
+  if (cm && told && m === "POST") {
+    takeAnswer(told, await body<{ type?: string; id?: string; decision?: string }>(req));
+    json(res, 200, {});
+    return true;
+  }
   const om = p.match(/^\/api\/harness\/sessions\/([^/]+)\/tasks\/([^/]+)\/output$/);
   const owner = om ? family.get(decodeURIComponent(om[1] ?? "")) : undefined;
   if (om && owner && m === "GET") {

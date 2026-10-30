@@ -94,13 +94,13 @@ function lineOf(a: AgentInfo, stand: Stand): string {
   }
 }
 
-/** Answered at once (answered.ts): the row moves on now; if the answer doesn't go, it's back. */
-function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
+/** Answered at once (answered.ts): the row moves on now; if the answer doesn't go, it's back. `to`: where what `a` asks is answered. */
+function Decide({ a, ap, to }: { a: AgentInfo; ap: ApprovalBrief; to: string }) {
   const decide = (decision: "allow" | "deny") => void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => toast.error("Couldn't answer", errorMessage(e)));
   if (ap.tool === "question")
     return (
       <Button size="xs" asChild>
-        <Link to={`/agents/${a.id}`}>Answer</Link>
+        <Link to={to}>Answer</Link>
       </Button>
     );
   // A plan it proposes is approved here; to keep it planning (with what to change), review it on its page.
@@ -114,7 +114,7 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
           Deny
         </Button>
       )}
-      <Link to={`/agents/${a.id}`} className="ms-link">
+      <Link to={to} className="ms-link">
         Review
       </Link>
     </>
@@ -173,6 +173,8 @@ const Row = React.memo(function Row({
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
   const who = asking ?? a;
   const ap = who.approvals[0];
+  // A subagent's thread straight, not by its own address: that one's redirect into its agent's chat never lands.
+  const answerAt = asking ? `/agents/${a.id}?task=${encodeURIComponent(asking.id)}` : `/agents/${a.id}`;
   const actions = useAgentActions(a);
   const label = agentLabel(a);
   // The harness, said under a label that isn't its own name.
@@ -225,7 +227,7 @@ const Row = React.memo(function Row({
       <span className="ms-actions">
         {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
         <span className="ms-decide">
-          {stand === "needs" && ap && <Decide a={who} ap={ap} />}
+          {stand === "needs" && ap && <Decide a={who} ap={ap} to={answerAt} />}
           {stand === "needs" && !ap && who.held && <HeldDecide a={who} />}
           {stand === "paused" && (
             <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>

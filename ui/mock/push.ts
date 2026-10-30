@@ -42,6 +42,10 @@ const devices = new Map<string, Device>();
 const muted = new Set<string>();
 /** Your marks (`/api/push/notices`): what you put away, acted on or saw, by key. */
 const marks = new Map<string, { key: string; how: "away" | "done" | "seen"; at: number }>();
+/** These requests asked again (`POST /api/mock/asks`): their cards show again, whatever was done with them before. */
+export function forgetMarks(keys: string[]) {
+  for (const key of keys) marks.delete(key);
+}
 interface Sent {
   at: number;
   to: string[];
@@ -187,7 +191,10 @@ for (let i = 0; i < BUSY; i++) {
  * those ways, for a fleet the size of a real one in Mission control's head.
  */
 const TASKS = ["Port the scheduler", "Trim the release notes", "Docs for reach", "Fix the flaky retry test", "Phone layout for Runs", "Benchmark the codec"];
-for (const [stand, n] of (process.env.MOCK_STANDS ?? "").split(",").filter(Boolean).map((s) => s.split(":"))) {
+for (const [stand, n] of (process.env.MOCK_STANDS ?? "")
+  .split(",")
+  .filter(Boolean)
+  .map((s) => s.split(":"))) {
   for (let i = 0; i < Number(n); i++) {
     const a = base(`${stand}-${i}`, TASKS[i % TASKS.length]!, `agent:metal-ryzen-0${(i % 3) + 1}`, i % 2 ? "codex" : "claude", 50 + i);
     if (stand === "paused") fleet.push({ ...a, pause: { reason: "limit", label: "Session", said: "", since: t0, auto: true, by: "harness", tries: 0 } });
@@ -223,7 +230,13 @@ export function fleetCommand(id: string, c: { type?: string; id?: string; decisi
   if (!was) return false;
   if (c.type === "approve") {
     const approvals = was.approvals.filter((p) => p.id !== c.id);
-    const changed: AgentInfo = { ...was, approvals, status: approvals.length > 0 ? "waiting" : "running", doing: approvals.length > 0 ? was.doing : c.decision === "deny" ? "Trying another way" : "Going ahead", last_activity: Date.now() };
+    const changed: AgentInfo = {
+      ...was,
+      approvals,
+      status: approvals.length > 0 ? "waiting" : "running",
+      doing: approvals.length > 0 ? was.doing : c.decision === "deny" ? "Trying another way" : "Going ahead",
+      last_activity: Date.now(),
+    };
     fleet[i] = changed;
     emitFleet(changed);
   }
