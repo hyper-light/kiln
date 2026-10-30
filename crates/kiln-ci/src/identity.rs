@@ -11,9 +11,11 @@
 //! squash keeps one change and absorbs the rest; and kiln asks only when it can't tell.
 //!
 //! Actors' identities, and the chain of whom each acts for, are [`chain`] (W27-R01); what they sign,
-//! and how kiln checks it as of the time it took it, [`statement`] (W27-R03 to R08's base).
+//! and how kiln checks it as of the time it took it, [`statement`] (W27-R03 to R08's base); and the
+//! chain of custody of what changes hands, hop by hop, [`custody`] (W27-R08).
 
 pub mod chain;
+pub mod custody;
 pub mod statement;
 
 use std::cmp::Reverse;
