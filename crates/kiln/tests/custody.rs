@@ -6,7 +6,10 @@
 //! handed on breaks its chain, and the break is recorded; a record sam signs once their
 //! certificate is revoked is refused, and recorded naming them.
 //!
-//! `cargo test -p kiln --test custody`
+//! `cargo test -p kiln --test custody`; the blue/green hand-over needs a release build (an upgrade
+//! downloads the server's own kiln, and a debug one is larger than kiln serves), and the runners
+//! from before a test build's faults: `cargo test --release -p kiln --features chaos --test
+//! custody` runs every one (.kiln/custody-lab.yaml, nightly).
 
 #![cfg(unix)]
 
@@ -262,10 +265,19 @@ const TALK: Talk = Talk { lines: 1, every_ms: 10 };
 /// A newer runner process `id` of machine `name` (its first one's state folder): a session is
 /// handed to it, an epoch up.
 fn instance(dir: &Path, port: u16, name: &str, id: &str) -> anyhow::Result<agents::Runner> {
+    instance_with(dir, port, name, id, None, &[])
+}
+
+/// [`instance`], with a test build's faults (`chaos`) and `env` in its environment.
+fn instance_with(dir: &Path, port: u16, name: &str, id: &str, chaos: Option<&str>, env: &[(&str, &str)]) -> anyhow::Result<agents::Runner> {
     let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{name}-{id}.log")))?;
-    let child = common::kiln()
-        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--instance", id])
+    let mut cmd = common::kiln();
+    cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--instance", id]);
+    if let Some(c) = chaos {
+        cmd.args(["--chaos", c]);
+    }
+    let child = cmd
         .arg("--work-dir")
         .arg(dir.join(format!("{name}-{id}-work")))
         .arg("--state-dir")
@@ -275,6 +287,7 @@ fn instance(dir: &Path, port: u16, name: &str, id: &str) -> anyhow::Result<agent
         .env("PATH", format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
         .env("FAKE_CLAUDE_LINES", TALK.lines.to_string())
         .env("FAKE_CLAUDE_EVERY_MS", TALK.every_ms.to_string())
+        .envs(env.iter().copied())
         .stdout(std::process::Stdio::from(log.try_clone()?))
         .stderr(std::process::Stdio::from(log))
         .spawn()?;
@@ -301,8 +314,7 @@ fn first_epoch(port: u16, admin: &str, id: &str) -> anyhow::Result<u64> {
 /// have found the record (`convo::record` looks for one every 15 s) and the runner said so (every
 /// 5 s).
 fn record_kept(dir: &Path, port: u16, admin: &str, machine: &str) -> anyhow::Result<()> {
-    let records = dir.join("home").join(".claude").join("projects").join("-fake");
-    until(Duration::from_secs(60), || Ok(std::fs::read_dir(&records).ok().and_then(|d| d.flatten().find(|e| e.metadata().is_ok_and(|m| m.len() > 0))).map(|_| ())))?;
+    record_written(dir)?;
     let after = kiln::util::now_ms() + 25_000;
     until(Duration::from_secs(120), || {
         let (st, body) = http(port, "GET", "/api/conversations/status", admin, None)?;
@@ -313,12 +325,53 @@ fn record_kept(dir: &Path, port: u16, admin: &str, machine: &str) -> anyhow::Res
     })
 }
 
+/// Once the stand-in harness has written its own record of a session (Claude Code's, in a project
+/// folder under `<dir>/home/.claude/projects`: its own, or the one a move installed it in).
+fn record_written(dir: &Path) -> anyhow::Result<()> {
+    let projects = dir.join("home").join(".claude").join("projects");
+    let written = |p: &Path| std::fs::read_dir(p).ok().is_some_and(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "jsonl") && e.metadata().is_ok_and(|m| m.len() > 0)));
+    until(Duration::from_secs(60), || Ok(std::fs::read_dir(&projects).ok().and_then(|d| d.flatten().find(|e| written(&e.path()))).map(|_| ())))
+}
+
 /// Whether runner `name` is connected, as the server says.
 fn connected(port: u16, admin: &str, name: &str) -> anyhow::Result<bool> {
     let (_, body) = http(port, "GET", "/api/agents", admin, None)?;
     let v: Value = serde_json::from_str(&body).unwrap_or_default();
     let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
     Ok(list.iter().any(|a| field(a, "name") == name && a.get("connected") == Some(&json!(true))))
+}
+
+/// The stand-in harnesses the sessions a test opens in `cwd` run in, stopped when it's dropped:
+/// kiln keeps a harness running when its runner goes, as a real machine's does, so a test's
+/// machine that goes away for good leaves its harness behind. Each says its pid in `cwd`'s
+/// `.fake-claude-messages` as it's sent a message; only one whose home is the test's `home` is
+/// stopped (its pid may be another process's since).
+struct Harnesses {
+    cwd: std::path::PathBuf,
+    home: std::path::PathBuf,
+}
+
+impl Harnesses {
+    fn new(cwd: &Path, home: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(cwd)?;
+        std::fs::write(cwd.join(".fake-claude-messages"), "")?;
+        Ok(Self { cwd: cwd.to_path_buf(), home: home.to_path_buf() })
+    }
+}
+
+impl Drop for Harnesses {
+    fn drop(&mut self) {
+        let said = std::fs::read_to_string(self.cwd.join(".fake-claude-messages")).unwrap_or_default();
+        let ours = format!("HOME={}", self.home.display());
+        for pid in said.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()?.get("pid")?.as_i64()) {
+            let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            if env.split(|b| *b == 0).any(|v| v == ours.as_bytes())
+                && let Ok(pid) = i32::try_from(pid)
+            {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
 }
 
 /// Polls `f` every 250 ms for up to `within`, until it gives something.
@@ -345,18 +398,24 @@ fn session_chain(dir: &Path, port: u16, admin: &str, id: &str, hops: usize) -> a
         let n = v.get("hops").and_then(Value::as_array).map_or(0, Vec::len);
         Ok((v.get("unbroken") == Some(&json!(true)) && n >= hops).then_some(v))
     });
-    chain.map_err(|e| {
-        let (_, now) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None).unwrap_or_default();
-        let logs: Vec<String> = ["server", "box-a", "box-a-z1", "box-a-z2"]
-            .iter()
-            .map(|n| {
-                let text = std::fs::read_to_string(dir.join(format!("{n}.log"))).unwrap_or_default();
-                let lines: Vec<&str> = text.lines().filter(|l| l.contains("custody") || l.contains("took over") || l.contains("taking over") || l.contains("hand")).collect();
-                format!("{n}.log:\n{}", lines.get(lines.len().saturating_sub(40)..).unwrap_or(&[]).join("\n"))
-            })
-            .collect();
-        anyhow::anyhow!("{e}: its chain now {now}\n{}", logs.join("\n"))
-    })
+    chain.map_err(|e| anyhow::anyhow!("{e}: {}", said_of(dir, port, admin, id)))
+}
+
+/// Session `id`'s chain as it stands, and what the server and the runner processes in `dir` logged
+/// of it and of custody: why a test of it didn't go through.
+fn said_of(dir: &Path, port: u16, admin: &str, id: &str) -> String {
+    let (_, now) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None).unwrap_or_default();
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect()).unwrap_or_default();
+    names.sort();
+    let logs: Vec<String> = names
+        .iter()
+        .map(|n| {
+            let text = std::fs::read_to_string(n).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().filter(|l| l.contains(id) || ["custody", "took over", "taking over", "hand", "mov", "newest", "upgrad", "promot", "WARN", "ERROR"].iter().any(|w| l.contains(w))).collect();
+            format!("{}:\n{}", n.display(), lines.get(lines.len().saturating_sub(60)..).unwrap_or(&[]).join("\n"))
+        })
+        .collect();
+    format!("its chain now {now}\n{}", logs.join("\n"))
 }
 
 /// W27-R08 (the Transfers plan's step 3): an agent session handed to its machine's newer runner
@@ -368,6 +427,7 @@ fn w27_r08_session_hand_overs_signed_by_both_processes() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options::default())?;
     let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
     let (_main, log) = agents::runner(dir.path(), port, "box-a", None, TALK)?;
     agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
@@ -409,6 +469,7 @@ fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options::default())?;
     let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
     // The stand-in keeps Claude Code's own record of the session, which a resume carries.
     let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
     let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
@@ -434,5 +495,287 @@ fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<(
     assert!(field(&took, "kind") == "taken" && field(&took, "custodian") == server, "{v}");
     assert!(field(&took, "why").contains("box-a was last heard from at"), "{v}");
     assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
+    Ok(())
+}
+
+/// W27-R08 (the Transfers plan's step 3): a session moved from one machine to another, both
+/// online, is signed for by both processes: box-a's at the epoch it leaves, box-b's at the next.
+#[test]
+fn w27_r08_session_hand_overs_a_move_signed_by_both_machines() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    // The stand-in keeps Claude Code's own record of the session, which a move carries.
+    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
+    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
+    let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &env)?;
+    agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::connected(port, admin, "box-b", &log_b, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let e0 = first_epoch(port, admin, &id)?;
+    record_written(dir.path())?;
+    let moved = until(Duration::from_secs(60), || {
+        let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+        Ok((200..300).contains(&st).then_some(body))
+    })?;
+    anyhow::ensure!(!moved.contains("from_store"), "a move between two machines online, not a resume: {moved}");
+    let v = session_chain(dir.path(), port, admin, &id, 2)?;
+    let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (got, gave) = (hops.first().cloned().unwrap_or_default(), hops.get(1).cloned().unwrap_or_default());
+    assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&format!("/agent/{id}/epoch/{}/machine/box-b/", e0 + 1)), "{v}");
+    assert!(field(&gave, "kind") == "handed-on" && field(&gave, "custodian").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/box-a/instance/main")), "{v}");
+    assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
+    Ok(())
+}
+
+/// A runner kept by `kiln supervise`, as `kiln install --agent` runs one (so it upgrades
+/// blue/green), in a process group of its own: dropped, the group goes, the supervisor with the
+/// runner and the new build it started beside it.
+struct Supervised(std::process::Child);
+
+impl Drop for Supervised {
+    fn drop(&mut self) {
+        if let Ok(pid) = i32::try_from(self.0.id()) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Runner `name` under `kiln supervise`, as [`agents::runner`] starts one otherwise, writing to
+/// `<dir>/<name>.log` (the new build an upgrade starts beside it too). It runs `exe`, a build other
+/// than the server's, so the server has one to upgrade it to.
+fn supervised(dir: &Path, port: u16, name: &str, exe: &Path, env: &[(&str, &str)]) -> anyhow::Result<(Supervised, std::path::PathBuf)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude/claude"), bin.join("claude"))?;
+    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))?;
+    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home)?;
+    let log_path = dir.join(format!("{name}.log"));
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let mut cmd = common::kiln();
+    cmd.arg("supervise")
+        .arg("--exe")
+        .arg(exe)
+        .args(["--", "agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name])
+        .arg("--work-dir")
+        .arg(dir.join(format!("{name}-work")))
+        .arg("--state-dir")
+        .arg(dir.join(format!("{name}-state")))
+        .env("HOME", &home)
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env("NO_COLOR", "1")
+        .env("FAKE_CLAUDE_LINES", TALK.lines.to_string())
+        .env("FAKE_CLAUDE_EVERY_MS", TALK.every_ms.to_string())
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+        .envs(env.iter().copied())
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log));
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    Ok((Supervised(cmd.spawn()?), log_path))
+}
+
+/// What the server took again from runner `machine`'s store as it had it already, and what it left
+/// out as a former writer's (rows sent twice, or lost to an epoch that rose too soon), since it
+/// started: the board's feed intake.
+fn sent_again(port: u16, admin: &str, machine: &str) -> anyhow::Result<(u64, u64)> {
+    let (st, body) = http(port, "GET", "/api/conversations/status", admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    let stores = v.get("stores").and_then(Value::as_array).cloned().unwrap_or_default();
+    let n = |k: &str| stores.iter().filter(|s| field(s, "machine") == machine && field(s, "role") == "runner").filter_map(|s| s.pointer(&format!("/feed/intake/{k}")).and_then(Value::as_u64)).sum();
+    Ok((n("same"), n("fenced")))
+}
+
+/// W27-R08 (the Transfers plan's step 3): a blue/green upgrade hands its machine's session to the
+/// new build signed for, an epoch up: the runner upgraded signs its hand-on at the epoch the
+/// session had, the new build its receipt at the next once it's promoted, and it goes on at that
+/// epoch, with nothing the server's copy has sent to it again.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+fn w27_r08_session_hand_overs_blue_green_sends_nothing_again() -> anyhow::Result<()> {
+    // The new build is this one, downloaded from the server: hundreds of MB for a debug build, so
+    // under the build's own temporary folder, on disk.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    // box-a runs a build of its own (this one, a byte longer), so the server's is newer to it.
+    let before_build = dir.path().join("kiln-before");
+    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_kiln"))?;
+    bytes.push(0);
+    std::fs::write(&before_build, bytes)?;
+    std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &[])?;
+    agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let e0 = first_epoch(port, admin, &id)?;
+    let before = sent_again(port, admin, "box-a")?;
+    let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
+    anyhow::ensure!(st == 202, "{st} {body}");
+    let job = serde_json::from_str::<Value>(&body)?.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    // What the upgrade, the runner and the server said of it, when it doesn't go through.
+    let said = |e: anyhow::Error| {
+        let (_, j) = http(port, "GET", &format!("/api/updates/jobs/{job}"), admin, None).unwrap_or_default();
+        let lines = |f: &str| {
+            let text = std::fs::read_to_string(dir.path().join(f)).unwrap_or_default();
+            let hits: Vec<&str> = text.lines().filter(|l| ["upgrad", "build", "green", "hand", "custody", "promot", "take", "ready", "WARN", "ERROR"].iter().any(|w| l.contains(w))).collect();
+            hits.get(hits.len().saturating_sub(60)..).unwrap_or(&[]).join("\n")
+        };
+        anyhow::anyhow!("{e}\njob: {j}\nbox-a:\n{}\nserver:\n{}", lines("box-a.log"), lines("server.log"))
+    };
+    let v = until(Duration::from_secs(300), || {
+        let (st, body) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None)?;
+        let v: Value = if st == 200 { serde_json::from_str(&body)? } else { Value::Null };
+        let n = v.get("hops").and_then(Value::as_array).map_or(0, Vec::len);
+        Ok((v.get("unbroken") == Some(&json!(true)) && n >= 2).then_some(v))
+    })
+    .map_err(said)?;
+    let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (got, gave) = (hops.first().cloned().unwrap_or_default(), hops.get(1).cloned().unwrap_or_default());
+    let green = format!("/agent/{id}/epoch/{}/machine/box-a/instance/", e0 + 1);
+    assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&green) && !field(&got, "custodian").ends_with("/instance/main"), "{v}");
+    assert!(field(&gave, "kind") == "handed-on" && field(&gave, "custodian").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/box-a/instance/main")), "{v}");
+    assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
+    // It goes on at the next epoch, its state saying so, with nothing sent again.
+    until(Duration::from_secs(60), || {
+        let (_, body) = http(port, "GET", &format!("/api/harness/sessions/{id}"), admin, None)?;
+        let i: Value = serde_json::from_str(&body).unwrap_or_default();
+        let epoch = i.get("epoch").or_else(|| i.pointer("/info/epoch")).and_then(Value::as_u64);
+        Ok((epoch == Some(e0 + 1)).then_some(()))
+    })?;
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(sent_again(port, admin, "box-a")?, before, "rows the server had already, or left out as a former writer's, across the hand-over");
+    Ok(())
+}
+
+/// Of session `id`'s chain of custody, the transfers: each receipt and the hand-on or take it
+/// follows, both signed (the chain walks unbroken), as (epoch received at, its receiver).
+fn transfers(v: &Value) -> Vec<(u64, String)> {
+    let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+    let epoch = |c: &str| c.split_once("/epoch/").and_then(|(_, r)| r.split('/').next()).and_then(|e| e.parse().ok()).unwrap_or(u64::MAX);
+    hops.windows(2)
+        .filter(|w| matches!(w, [got, gave] if field(got, "kind") == "received" && matches!(field(gave, "kind"), "handed-on" | "taken") && !field(got, "signer").is_empty() && !field(gave, "signer").is_empty()))
+        .filter_map(|w| w.first().map(|got| (epoch(field(got, "custodian")), field(got, "custodian").to_owned())))
+        .collect()
+}
+
+/// W27-R08 (the Transfers plan's step 3, its test): one session moved to another machine, upgraded
+/// there blue/green, taken over by a newer process of that machine, and resumed from kiln's copy
+/// once that machine is away: four hand-overs, epochs e0 to e0 + 4, each a verified transfer.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
+    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
+    let before_build = dir.path().join("kiln-before");
+    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_kiln"))?;
+    bytes.push(0);
+    std::fs::write(&before_build, bytes)?;
+    std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let (box_b, log_b) = supervised(dir.path(), port, "box-b", &before_build, &env)?;
+    agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::connected(port, admin, "box-b", &log_b, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let e0 = first_epoch(port, admin, &id)?;
+    let chain_through = |n: usize, after: &str| -> anyhow::Result<Value> {
+        until(Duration::from_secs(300), || {
+            let (st, body) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None)?;
+            let v: Value = if st == 200 { serde_json::from_str(&body)? } else { Value::Null };
+            Ok((v.get("unbroken") == Some(&json!(true)) && transfers(&v).len() >= n).then_some(v))
+        })
+        .map_err(|e| anyhow::anyhow!("{after}: {n} transfers {e}: {}", said_of(dir.path(), port, admin, &id)))
+    };
+    // Moved to box-b, both online.
+    record_written(dir.path())?;
+    until(Duration::from_secs(60), || {
+        let (st, _) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+        Ok((200..300).contains(&st).then_some(()))
+    })?;
+    chain_through(1, "moved")?;
+    // box-b upgraded blue/green.
+    let (st, body) = http(port, "POST", "/api/updates/runners/box-b", admin, None)?;
+    anyhow::ensure!(st == 202, "{st} {body}");
+    chain_through(2, "upgraded blue/green")?;
+    // Taken over by a newer process of box-b: newer than the build the upgrade started, as its
+    // instance record says (an instance started without one ranks oldest).
+    let z1_dir = kiln::upgrade::instance_dir(&dir.path().join("box-b-state"), "z1");
+    std::fs::create_dir_all(&z1_dir)?;
+    std::fs::write(z1_dir.join("instance.json"), serde_json::to_vec(&kiln::upgrade::InstanceRecord { id: "z1".into(), created_at: kiln::util::now_unix() + 1 })?)?;
+    let z1 = instance_with(dir.path(), port, "box-b", "z1", None, &env)?;
+    chain_through(3, "taken over")?;
+    // box-b away: it goes on on box-a, from kiln's copy.
+    record_kept(dir.path(), port, admin, "box-b").map_err(|e| anyhow::anyhow!("box-b's copy of the record: {e}: {}", said_of(dir.path(), port, admin, &id)))?;
+    drop((z1, box_b));
+    until(Duration::from_secs(120), || Ok((!connected(port, admin, "box-b")?).then_some(()))).map_err(|e| {
+        let (_, agents) = http(port, "GET", "/api/agents", admin, None).unwrap_or_default();
+        anyhow::anyhow!("box-b away: {e}: {agents}")
+    })?;
+    let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-a"})))?;
+    anyhow::ensure!((200..300).contains(&st) && body.contains("from_store"), "{st} {body}");
+    let v = chain_through(4, "resumed")?;
+    let got = transfers(&v);
+    assert_eq!(got.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![e0 + 4, e0 + 3, e0 + 2, e0 + 1], "verified transfers, newest first: {v}");
+    assert!(got.first().is_some_and(|(_, c)| c.contains("/machine/box-a/")) && got.get(1).is_some_and(|(_, c)| c.ends_with("/instance/z1")), "{v}");
+    assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
+    Ok(())
+}
+
+/// The hand-overs kiln recorded as unsigned, for session `id`, once there are `n`.
+#[cfg(feature = "chaos")]
+fn unsigned_of(port: u16, admin: &str, id: &str, n: usize) -> anyhow::Result<Vec<Value>> {
+    until(Duration::from_secs(120), || {
+        let (st, body) = http(port, "GET", "/api/transfers/unsigned", admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let mine: Vec<Value> = v.get("unsigned").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|u| field(u, "session") == id).collect();
+        Ok((mine.len() >= n).then_some(mine))
+    })
+}
+
+/// W27-R08 (the Transfers plan's step 3): a runner from before signed hand-overs (a test build's
+/// `unsigned` fault) hands a session to a newer one, which hands it on to another from before:
+/// both hand it over as they did, each hand-over recorded as unsigned, saying which side is from
+/// before. `cargo test -p kiln --features chaos --test custody`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_session_hand_overs_with_runners_from_before_go_unsigned() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    let (_main, log) = agents::runner(dir.path(), port, "box-a", Some("unsigned"), TALK)?;
+    agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let e0 = first_epoch(port, admin, &id)?;
+    // To a newer runner, from one from before: it signed no hand-on.
+    let _z1 = instance(dir.path(), port, "box-a", "z1")?;
+    let one = unsigned_of(port, admin, &id, 1)?;
+    let first = one.iter().find(|u| u.get("epoch") == Some(&json!(e0 + 1))).cloned().unwrap_or_default();
+    assert!(field(&first, "gave").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/box-a/instance/main")) && field(&first, "why").contains("signed no hand-on"), "{one:?}");
+    // From the newer runner to another from before: it signed no receipt.
+    let _z2 = instance_with(dir.path(), port, "box-a", "z2", Some("unsigned"), &[])?;
+    let two = unsigned_of(port, admin, &id, 2)?;
+    let second = two.iter().find(|u| u.get("epoch") == Some(&json!(e0 + 2))).cloned().unwrap_or_default();
+    assert!(field(&second, "gave").ends_with(&format!("/agent/{id}/epoch/{}/machine/box-a/instance/z1", e0 + 1)) && field(&second, "why").contains("signed no receipt"), "{two:?}");
     Ok(())
 }

@@ -1423,6 +1423,13 @@ impl Host {
     /// it couldn't be handed over, was stopped, and starts again there from its spec). They are no
     /// longer this runner's.
     pub async fn move_out(&self) -> Vec<(Saved, Option<Box<session::Handed>>)> {
+        self.move_out_signing(false).await.into_iter().map(|(rec, handed, _)| (rec, handed)).collect()
+    }
+
+    /// [`Host::move_out`], each session signed for as it goes when `sign` (the new build takes
+    /// sessions so, docs/ci.md W27-R08): its hand-on, at the epoch it has, of its timeline as it's
+    /// handed over, if this process holds its key at that epoch.
+    pub async fn move_out_signing(&self, sign: bool) -> Vec<(Saved, Option<Box<session::Handed>>, Option<serde_json::Value>)> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
         // They take no messages as they're handed over: sent again, those go where they went.
         for s in &sessions {
@@ -1470,7 +1477,12 @@ impl Host {
             // A handover's fence: started again with its session (the handover never finished),
             // this runner goes on with it.
             self.end_lane(&s.id, Lane::Fence { epoch: s.epoch(), handover: true });
-            out.push((rec, h));
+            let signed = sign.then(|| {
+                let core = s.core.lock();
+                (core.state.epoch, core.events().cloned().collect::<Vec<_>>())
+            });
+            let hand_on = signed.and_then(|(epoch, events)| crate::runner::custody::hand_on(&s.id, epoch, &events, "handed to this machine's new build (blue/green)"));
+            out.push((rec, h, hand_on));
         }
         self.mark_dirty();
         out

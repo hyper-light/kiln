@@ -90,6 +90,13 @@ replaced while it runs. The new build comes up beside it, and takes over only on
    runner finishes the jobs it's running (jobs aren't moved yet), then exits. The supervisor keeps
    the new build, and starts it again after a restart or reboot.
 
+Each agent session handed over running is signed for (docs/ci.md W27-R08): the runner upgraded
+signs its hand-on at the session's epoch, and the new build, once it's promoted, asks for the
+session's identity at the next epoch with its receipt, then goes on at that epoch. The session's
+copy on the server goes on where it was, nothing sent again. Before the new build is promoted, a
+rollback leaves the session with the runner it came from. A session started again from its record
+goes over as before.
+
 If the new build doesn't come up, the runner goes on with everything, as it was, and the machine
 never goes offline. That covers a build that can't connect, crashes, or can't take over in time.
 The new build is killed, and the upgrade's log says why it failed. A new build that ends soon after

@@ -185,9 +185,10 @@ mod tests {
     /// W27-R01: the identities and revocations tables keep each certificate issued (serial, kind,
     /// subject, key, validity, issued at) and each revocation (serial or key, at, reason, by); a
     /// revocation naming neither is refused; applying again changes nothing; no epoch is raised.
-    /// W27-R08: custody's tables (the Transfers plan's step 2): every record and delegation once by
-    /// its digest, what each follows, the things each is about by every digest, breaks and
-    /// refusals; no epoch raised, so older builds still open the database.
+    /// W27-R08: custody's tables (the Transfers plan's steps 2 and 3): every record and delegation
+    /// once by its digest, what each follows, the things each is about by every digest, breaks,
+    /// refusals, and hand-overs that went unsigned, one per session and epoch; no epoch raised, so
+    /// older builds still open the database.
     #[test]
     fn w27_r08_custody_tables() -> anyhow::Result<()> {
         const MINE: &str = "20261030-0100_w27_custody";
@@ -210,6 +211,10 @@ mod tests {
         c.execute("INSERT INTO custody_follows (record, follows) VALUES ('sha256:aa', 'sha256:bb')", [])?;
         assert!(c.execute("INSERT INTO custody_follows (record, follows) VALUES ('sha256:aa', 'sha256:bb')", []).is_err(), "a record follows another once");
         assert!(c.execute("INSERT INTO transfer_refusals (digest, act, at) VALUES ('sha256:cc', 'goals.done', 1)", []).is_err(), "a refusal says why");
+        assert_eq!(columns("transfers_unsigned")?, ["id", "session", "epoch", "gave", "took", "why", "at"]);
+        let unsigned = "INSERT INTO transfers_unsigned (session, epoch, why, at) VALUES ('s1', 2, 'a runner from before', 1)";
+        c.execute(unsigned, [])?;
+        assert!(c.execute(unsigned, []).is_err(), "one per session and epoch");
         assert_eq!(read_min_reader(&c)?, 0, "no epoch raised: older builds still open it");
         Ok(())
     }

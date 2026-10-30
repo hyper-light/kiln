@@ -32,11 +32,25 @@ pub const READY_WITHIN: Duration = Duration::from_secs(180);
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// green → blue: connected to the server and welcomed; it takes over now.
-    Ready { pid: u32, instance: String },
+    /// green → blue: connected to the server and welcomed; it takes over now. `custody`: it takes
+    /// a session signed for (docs/ci.md W27-R08), so blue signs a hand-on of each it hands it
+    /// running; a new build from before says nothing, and takes them unsigned, as before.
+    Ready {
+        pid: u32,
+        instance: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        custody: bool,
+    },
     /// blue → green: an agent session, its harness process still running (descriptors: its stdin,
-    /// stdout and stderr), or (`handed` none) to start again from its record.
-    Session { id: String, record: Box<crate::harness::host::Saved>, handed: Option<Box<crate::harness::session::Handed>> },
+    /// stdout and stderr), or (`handed` none) to start again from its record. `hand_on`: blue's
+    /// hand-on of it to its next epoch (a bundle, as JSON), when green takes one.
+    Session {
+        id: String,
+        record: Box<crate::harness::host::Saved>,
+        handed: Option<Box<crate::harness::session::Handed>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hand_on: Option<String>,
+    },
     /// blue → green: a terminal, its shell still running. Descriptor: its PTY master.
     Terminal { session: String, command: Option<String>, cols: u16, rows: u16, replay: String, pid: u32 },
     /// blue → green: that's everything. Green serves the machine's local sockets (`kiln spawn`,
@@ -172,9 +186,9 @@ mod unix {
         }
 
         /// Wait (blocking) for green (process `pid`) to connect and say it's ready, until
-        /// `deadline`, as long as it runs. The connection to hand it everything over, and the
-        /// instance it runs as.
-        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String)> {
+        /// `deadline`, as long as it runs. The connection to hand it everything over, the
+        /// instance it runs as, and whether it takes sessions signed for.
+        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool)> {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -182,7 +196,7 @@ mod unix {
                         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
                         let conn = Conn { stream };
                         match conn.recv() {
-                            Ok((Frame::Ready { pid: said, instance }, _)) if said == pid => return Ok((conn, instance)),
+                            Ok((Frame::Ready { pid: said, instance, custody }, _)) if said == pid => return Ok((conn, instance, custody)),
                             // Not the process started for this: not listened to.
                             Ok((Frame::Ready { pid: said, .. }, _)) => tracing::warn!(said, expected = pid, "a runner that isn't the new build tried to take over; ignored"),
                             Ok(_) => tracing::warn!("a connection to the handover socket didn't open by saying it's ready; ignored"),

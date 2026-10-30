@@ -224,6 +224,42 @@ async fn receipt_of(store: &Store, custodian: &str) -> anyhow::Result<Option<Str
     store.call(move |conn| Ok(conn.query_row("SELECT digest FROM custody WHERE custodian = ?1 AND kind = 'received' ORDER BY taken_at DESC, rowid DESC LIMIT 1", [&c], |r| r.get(0)).optional()?)).await
 }
 
+/// Agent session `session`'s hand-over to epoch `epoch` went unsigned (docs/ci.md W27-R08): from
+/// `gave` to `took`, as kiln knows them, because `why`. Kept once per session and epoch, and
+/// audited; whether it's new.
+pub async fn unsigned(store: &Store, session: &str, epoch: u64, gave: &str, took: &str, why: &str, at: i64) -> anyhow::Result<bool> {
+    let (s, g, t, w) = (session.to_owned(), gave.to_owned(), took.to_owned(), why.to_owned());
+    let e = i64::try_from(epoch).unwrap_or(i64::MAX);
+    let new = store
+        .call(move |c| Ok(c.execute("INSERT OR IGNORE INTO transfers_unsigned (session, epoch, gave, took, why, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![s, e, g, t, w, at])? > 0))
+        .await?;
+    if new {
+        tracing::info!(target: "kiln.custody", %session, epoch, %gave, %took, %why, "an agent session's hand-over went unsigned");
+        store.audit("kiln".into(), "custody.unsigned".into(), format!("session {session} to epoch {epoch}, from {} to {}: {why}", or_unknown(gave), or_unknown(took))).await;
+    }
+    Ok(new)
+}
+
+fn or_unknown(s: &str) -> &str {
+    if s.is_empty() { "a process kiln never certified" } else { s }
+}
+
+/// The hand-overs that went unsigned, newest first, at most `limit`.
+pub async fn unsigned_list(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>> {
+    let n = i64::try_from(limit).unwrap_or(i64::MAX);
+    store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT session, epoch, gave, took, why, at FROM transfers_unsigned ORDER BY id DESC LIMIT ?1")?;
+            let rows = q
+                .query_map([n], |r| {
+                    Ok(json!({ "session": r.get::<_, String>(0)?, "epoch": r.get::<_, i64>(1)?, "gave": r.get::<_, String>(2)?, "took": r.get::<_, String>(3)?, "why": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)? }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+}
+
 /// Whether kiln keeps record `digest`.
 async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
     let d = digest.to_owned();
@@ -612,7 +648,8 @@ enum CustodyCmd {
     Breaks,
 }
 
-/// `kiln transfers`: what kiln refused because its signer no longer held what it acted on.
+/// `kiln transfers`: what kiln refused because its signer no longer held what it acted on, and the
+/// hand-overs that went unsigned.
 #[derive(clap::Args)]
 pub struct TransfersArgs {
     #[arg(long, env = "KILN_URL", global = true)]
@@ -628,6 +665,9 @@ pub struct TransfersArgs {
 enum TransfersCmd {
     /// What kiln refused, newest first: when, what, who signed it, and why.
     Refused,
+    /// Agent sessions' hand-overs that went unsigned, newest first: when, the session and the
+    /// epoch it went on at, from whom to whom, and why.
+    Unsigned,
 }
 
 /// `kiln custody`.
@@ -673,6 +713,13 @@ pub async fn transfers_cli(args: TransfersArgs, cfg: &crate::config::Config) -> 
             for r in v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default() {
                 let signer = s(&r, "signer");
                 println!("{}  {}  {}  {}", when(r.get("at").and_then(Value::as_i64)), s(&r, "act"), if signer.is_empty() { "unknown signer".to_owned() } else { signer }, s(&r, "why"));
+            }
+        }
+        TransfersCmd::Unsigned => {
+            let v = api.call_api(Method::Get, "/api/transfers/unsigned", None).await?;
+            for u in v.get("unsigned").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let epoch = u.get("epoch").and_then(Value::as_i64).unwrap_or_default();
+                println!("{}  session {} to epoch {epoch}  from {} to {}  {}", when(u.get("at").and_then(Value::as_i64)), s(&u, "session"), or_unknown(&s(&u, "gave")), or_unknown(&s(&u, "took")), s(&u, "why"));
             }
         }
     }

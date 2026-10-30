@@ -630,6 +630,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/custody/breaks", "audit.read", At::Server),
     r("GET", "/api/custody", "audit.read", At::Server),
     r("GET", "/api/transfers/refused", "audit.read", At::Server),
+    r("GET", "/api/transfers/unsigned", "audit.read", At::Server),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),

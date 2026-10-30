@@ -330,7 +330,8 @@ enum Bg {
     Fetched { job: String, exe: PathBuf, build: String },
     /// The new build's runner is connected and ready: hand it everything.
     #[cfg(unix)]
-    Ready { job: String, conn: Arc<crate::bluegreen::Conn> },
+    /// `custody`: the new build takes sessions signed for (docs/ci.md W27-R08).
+    Ready { job: String, conn: Arc<crate::bluegreen::Conn>, custody: bool },
     /// Everything was sent: what the new build said of each, in order (`broke`: the connection
     /// failed part-way).
     #[cfg(unix)]
@@ -842,7 +843,8 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
     use base64::Engine as _;
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
     let c = Arc::clone(&conn);
-    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me }, &[])).await??;
+    let custody = crate::runner::custody::signs();
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me, custody }, &[])).await??;
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
@@ -871,8 +873,8 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
             }
         };
         let (id, r) = match frame {
-            Frame::Session { id, record, handed } => {
-                let r = take_session(harness.as_ref(), &id, *record, handed, fds).await;
+            Frame::Session { id, record, handed, hand_on } => {
+                let r = take_session(harness.as_ref(), &id, *record, handed, hand_on, fds).await;
                 if r.is_ok() {
                     sessions += 1;
                 }
@@ -927,20 +929,35 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
 /// came as `fds` (stdin, stdout, stderr); else started again from its record. When its process
 /// can't go on here it is stopped and the session starts again from its record (an error, saying so).
 #[cfg(unix)]
-async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
+async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, hand_on: Option<String>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
     use std::os::fd::IntoRawFd as _;
     let Some(h) = h else { return Err("this runner runs no agent sessions".to_owned()) };
     if h.get(id).is_some() {
         return Ok(());
     }
+    // Signed for by the runner it came from, or by none (one from before): it goes on at its epoch
+    // until this runner is promoted, its receipt waiting till then (docs/ci.md W27-R08).
+    let given = hand_on.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok());
+    let taken = |r: Result<(), String>| {
+        if r.is_ok()
+            && let Some(s) = h.get(id)
+        {
+            let (epoch, events) = {
+                let core = s.core.lock();
+                (core.state.epoch, core.events().cloned().collect::<Vec<_>>())
+            };
+            crate::runner::custody::took_blue_green(id, epoch, &events, given.as_ref());
+        }
+        r
+    };
     let Some(mut hd) = handed else {
-        return h.move_in(rec, None).map_err(|e| format!("{e:#}"));
+        return taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
     };
     let pid = hd.process.pid;
     let mut fds = fds.into_iter();
     let (Some(i), Some(o), Some(e)) = (fds.next(), fds.next(), fds.next()) else {
         let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-        let again = h.move_in(rec, None).map_err(|e| format!("{e:#}"));
+        let again = taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
         return Err(format!("its pipes didn't come with it, so its process was stopped{}", again.err().map_or_else(|| ": it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))));
     };
     hd.process.stdin = i.into_raw_fd();
@@ -949,14 +966,14 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec
     hd.process.foreign = true;
     let raw = [hd.process.stdin, hd.process.stdout, hd.process.stderr];
     match h.move_in(rec.clone(), Some(hd)) {
-        Ok(()) => Ok(()),
+        Ok(()) => taken(Ok(())),
         // Refused before its pipes were taken: they close, its process is stopped.
         Err(e) => {
             for r in raw {
                 drop(crate::os::reclaim_fd(r));
             }
             let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-            let again = h.move_in(rec, None).map_err(|e| format!("{e:#}"));
+            let again = taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
             Err(format!("{e:#}; its process was stopped{}", again.err().map_or_else(|| ", and it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))))
         }
     }
@@ -1631,7 +1648,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let (tx, j) = (bg_tx.clone(), job.clone());
                                 let waited = std::thread::Builder::new().name("kiln-upgrade".into()).spawn(move || {
                                     let _ = match listener.ready(green.pid, Instant::now() + crate::bluegreen::READY_WITHIN) {
-                                        Ok((conn, _)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn) }),
+                                        Ok((conn, _, custody)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn), custody }),
                                         Err(e) => tx.send_blocking(Bg::Failed { job: j, why: format!("{e:#}") }),
                                     };
                                 });
@@ -1652,7 +1669,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Bg::Ready { job, conn } => {
+                    Bg::Ready { job, conn, custody } => {
                         let Some(mv) = moving.as_mut() else { continue };
                         if let Some(h) = mv.healthy.take() {
                             h.record("result", "ok");
@@ -1681,7 +1698,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         if let Some(h) = &harness {
-                            for (rec, handed) in h.move_out().await {
+                            for (rec, handed, hand_on) in h.move_out_signing(custody).await {
                                 let id = rec.id().to_owned();
                                 let mut handed = handed;
                                 let kept = match handed.as_ref() {
@@ -1699,7 +1716,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
                                 }
                                 let fds = kept.as_ref().map(|(_, p)| p.iter().map(|f| f.as_raw_fd()).collect()).unwrap_or_default();
-                                frames.push((Frame::Session { id: id.clone(), record: Box::new(rec.clone()), handed }, fds));
+                                // Signed for as it goes, to a new build that takes it so (docs/ci.md W27-R08).
+                                let hand_on = hand_on.map(|b| b.to_string());
+                                frames.push((Frame::Session { id: id.clone(), record: Box::new(rec.clone()), handed, hand_on }, fds));
                                 moved.insert(crate::instances::Owned::Agent(id));
                                 mv.items.push(Item::Session { record: Box::new(rec), kept });
                             }
@@ -1900,9 +1919,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Bg::Promoted => {
                         // Joined ranked oldest (new work stayed with the old runner): the newest now.
                         tracing::info!("promoted: this runner is the machine's newest; new work comes here");
-                        // Its sessions are its own for good: it takes their messages.
+                        // Its sessions are its own for good: it takes their messages, and each it
+                        // was handed signed for asks for its next epoch now (docs/ci.md W27-R08).
                         if let Some(h) = &harness {
                             h.hold(false);
+                        }
+                        if server_identity && connected {
+                            for (session, epoch) in crate::runner::custody::promoted() {
+                                ask_agent_identity(&uplink, &mut identity_asked, &session, epoch).await;
+                            }
                         }
                         instance_hello.created_at = real_created_at;
                         draining = false;
@@ -2125,7 +2150,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_CUSTODY }) {
+                    let custody = if crate::runner::custody::signs() { proto::CAP_CUSTODY } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | custody }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2749,13 +2775,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
                         // A session's identity at an epoch it was taken over at: its receipt went
-                        // with the ask, and kiln recorded it.
+                        // with the ask, and kiln recorded it. Taken over blue/green, it goes on at
+                        // that epoch now.
                         if let Ok(g) = serde_json::from_str::<proto::IdentityGiven>(&json)
                             && g.kind == "agent"
                             && g.cert_pem.is_some()
                             && let (Some(session), Some(epoch)) = (g.of.as_deref(), g.epoch)
+                            && crate::runner::custody::certified(session, epoch)
+                            && let Some(s) = harness.as_ref().and_then(|h| h.get(session))
                         {
-                            crate::runner::custody::certified(session, epoch);
+                            s.go_on_at(epoch);
                         }
                         if server_custody {
                             for json in crate::runner::custody::drain() {
@@ -3529,6 +3558,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     crate::harness::core::Update::Open { info, .. } => {
                         session_epochs.insert(session.clone(), info.epoch);
                     }
+                    // It went on at a later epoch (a blue/green take-over, once recorded).
+                    crate::harness::core::Update::State { state } => {
+                        if let Some(e) = session_epochs.get_mut(&session) {
+                            *e = (*e).max(state.epoch);
+                        }
+                    }
                     crate::harness::core::Update::Closed => {
                         session_epochs.remove(&session);
                         crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
@@ -3604,6 +3639,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if server_custody && connected {
                     for json in crate::runner::custody::drain() {
                         uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                    }
+                }
+                // Each session it holds without its epoch's identity asks again: its ask may have
+                // come before the server knew it runs here (a move's, ahead of its Open).
+                if server_identity && connected {
+                    for (session, epoch) in &session_epochs {
+                        ask_agent_identity(&uplink, &mut identity_asked, session, *epoch).await;
                     }
                 }
                 // Counts of jobs long done (a kept leg is let go well within a day).
@@ -3973,6 +4015,8 @@ fn note_announced(announced: &mut std::collections::HashSet<String>, session: &s
 /// process holds one or asked in the last 5 s: a session kiln hasn't heard of yet is refused, and
 /// asked for again as it goes on.
 async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, Instant>, session: &str, epoch: u64) {
+    // Taken over blue/green: its next epoch's, once this runner is promoted (docs/ci.md W27-R08).
+    let Some(epoch) = crate::runner::custody::to_ask(session, epoch) else { return };
     let slot = crate::runner::identity::slot("agent", Some(session), Some(epoch));
     if crate::runner::identity::cert(&slot).is_some() || asked.get(&slot).is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
         return;

@@ -29,6 +29,7 @@ const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const WORKFLOWS: &[(&str, &str, &str)] = &[
     ("bench.yaml", "push", "main"),
     ("ci.yaml", "push", "main"),
+    ("custody-lab.yaml", "workflow_dispatch", "main"),
     ("e2e.yaml", "push", "e2e/check"),
     ("image.yaml", "push", "main"),
     ("release.yaml", "push", "main"),

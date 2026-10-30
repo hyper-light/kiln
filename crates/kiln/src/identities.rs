@@ -596,6 +596,22 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         if let Err(why) = crate::custody::transfer(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &came_from, &uri, epoch, hand_on, ask.receipt.as_ref(), &pem, now).await? {
             anyhow::bail!("its hand-over wasn't recorded, so kiln certifies no key at epoch {epoch}: {why}");
         }
+    } else if let (Actor::Agent { epoch, .. }, Some(session)) = (&identity.actor, ask.of.as_deref())
+        && *epoch > 0
+        && holder_at(&hub.store, session, *epoch).await?.is_none()
+    {
+        // None came with it, to an epoch kiln certifies the session at for the first time: its
+        // hand-over went unsigned, recorded saying which side is from before signed hand-overs.
+        let gave = holder_at(&hub.store, session, epoch - 1).await?.unwrap_or_default();
+        let takes = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+        let why = if !takes {
+            format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt")
+        } else if gave.is_empty() {
+            "the process it came from was never certified: it runs a kiln from before identities, or the session went on before kiln had them".to_owned()
+        } else {
+            format!("{gave} signed no hand-on: it runs a kiln from before signed hand-overs")
+        };
+        crate::custody::unsigned(&hub.store, session, *epoch, &gave, &uri, &why, now).await?;
     }
     revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
     if let Actor::Agent { epoch, held_by, .. } = &identity.actor
@@ -608,10 +624,8 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         for (subject, left) in epochs_of(&hub.store, session).await?.into_iter().filter(|(_, e)| e < epoch) {
             revoke(&hub.store, Target::Subject(subject), &format!("epoch {left} left: moved on to epoch {epoch}{to}"), "kiln", now).await?;
         }
-        // The epoch rises with its transfer recorded (W27-R08).
-        if ask.hand_on.is_some() {
-            hub.harness.raise_epoch(session, *epoch);
-        }
+        // The epoch rises with its transfer recorded, signed or said to be unsigned (W27-R08).
+        hub.harness.raise_epoch(session, *epoch);
     }
     record(&hub.store, &ask.kind, &uri, &pem).await?;
     tracing::info!(agent = %machine, identity = %identity, "issued an identity");

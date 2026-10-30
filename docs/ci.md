@@ -8900,6 +8900,76 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   CLI signs in with a passkey only through a personal access token (no approving a device from the
   browser yet).
 
+**Built: custody, and agent sessions handed over signed (R08, in part).** Plan
+`01a17856b1b477eda14a574ae312a123`, its steps 1 to 3; research `01a18abf2d28762d92104dca2fbfbf89`.
+
+- *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
+  things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
+  server for a giver that can't sign (`kiln_ci::identity::custody`). Each names its signer (`by`:
+  a statement's digest is the same whoever signs it), whom it went to or came from, and why; a
+  thing is a set of digests, and two records of one hop agree on every algorithm they share.
+  `walk` goes back from where a thing is used, through what each record follows, to where each
+  thing began, and names the first break (`Break::code`: a digest changed or none shared, a receipt
+  of what wasn't handed on or of less, the wrong taker, giver or holder, a receipt without its
+  hand-on, records out of order, a take not signed by the server, a record kiln lacks, a gap in a
+  custodian's stream). Delegations only narrow (`entitled`); `fence` takes an agent session's act
+  only at its current epoch from the process holding it. All pure, the time and the revocations
+  passed in.
+- *Kept* (migration `w27_custody`; `crate::custody`): each record once, by its digest, its envelope
+  as signed, judged as of when kiln took it (a revocation made later doesn't undo it); one kiln
+  has already is answered as such before it's judged, so a record sent again after its signer
+  moved on isn't refused. Its own hop is checked as it's taken (a receipt that comes before its
+  hand-on waits for it); a break is recorded with the records around it, and a statement kiln
+  can't take (its signer's identity revoked, as a copy left behind's is) is refused and recorded
+  with its signer and envelope; both are audited. `POST /api/custody`, `GET /api/custody?digest=`
+  or `?name=` (a thing's newest chain: who holds it, an offer no one took lapsing after 10
+  minutes), `/api/custody/breaks`, `/api/transfers/refused` and `/api/transfers/unsigned`;
+  `kiln custody show|breaks`, `kiln transfers refused|unsigned`.
+- *Sessions handed over.* What a session's hand-over is about is its timeline at the epoch it
+  leaves ("session <id> at epoch <n>", `kiln-timeline-v1`: its id, the epoch and each event's
+  digest), which both sides work out alike. The runner process handing it on (to another
+  machine, or its machine's newer process) signs a hand-on with the session's identity at that
+  epoch, to the session at the next, following its own receipt of it: its package carries it, and
+  it sends it too (`AgentMsg::Custody`, `CAP_CUSTODY`). The process taking it signs its receipt
+  with the key it asks to have certified at the next epoch, and both go in that ask
+  (`IdentityAsk::hand_on`, `::receipt`): kiln keeps the hand-on, then the receipt (bundled with the
+  certificate it issues), and only then revokes the epoch left and raises the session's epoch, so
+  anything signed at the epoch left that reaches kiln afterwards is refused, the same second
+  included. A hand-on kiln refuses, or one to another epoch, or one without its receipt, gets no
+  certificate; a receipt of other than what was handed on is kept and its break recorded. A runner
+  re-asks, every heartbeat, for any session it holds that has no certificate yet (a move's ask can
+  reach kiln before its Open).
+- *Blue/green.* The new build says it takes sessions signed for (`Frame::Ready::custody`), and the
+  runner upgraded signs a hand-on of each it hands it running (`Frame::Session::hand_on`). The new
+  build goes on with each at its epoch until it's promoted (a rollback before then leaves the
+  session where it was, the hand-on lapsing), then asks for the next epoch with its receipt, and
+  once that's certified goes on at it in place: its state says so, and nothing the server's copy
+  has is sent again.
+- *A resume from the server's store* is kiln's take: signed with the server's own key for the
+  identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
+  saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
+  the receipt follows it as it follows a hand-on.
+- *Unsigned.* A hand-over in which a side is from before signed hand-overs goes as before, and
+  kiln records it (`transfers_unsigned`, once per session and epoch), naming the side from before:
+  a certificate asked for at a new epoch with no hand-on ("… signed no hand-on"), a session
+  announced at a later epoch by a runner without `CAP_CUSTODY`, or resumed to one ("… signed no
+  receipt"). A test build's `unsigned` fault stands in for such a runner.
+- *Tests.* `kiln-ci` `w27_r08_*` (bodies, chains and each break, relays, takes, gaps, delegations,
+  a session's next epoch whoever holds it, the fence); `custody::w27_r08_*` (records kept, breaks
+  and refusals; a transfer kept before its epoch rises; the timeline);
+  `store::migrations::w27_r08_custody_tables`; `proto::w27_r08_custody_is_appended_after_headroom`;
+  `crates/kiln/tests/custody.rs`: records through the API and the CLI, two take-overs, a move, a
+  resume from kiln's copy, each walking unbroken with both sides signed; in a release build (an
+  upgrade downloads the server's own kiln, and a debug one is larger than kiln serves) a blue/green
+  upgrade sending nothing again and `w27_r08_session_hand_overs` (moved, upgraded, taken over,
+  resumed: four verified transfers); with `chaos`, runners from before going unsigned. Nightly:
+  `.kiln/custody-lab.yaml`.
+- *Not yet.* The server's words about a hand-over aren't addressed to one process (step 4); acts
+  aren't yet refused on every channel when signed at an epoch left, and a runner's Open at a later
+  epoch still raises it before its transfer is recorded (step 5); work handed between agents,
+  changes, review requests, carried approvals, promotions, replant, artifacts, machines and
+  intermediaries (steps 6 to 16).
+
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 
 **Scope.** The land queue, builds and deploys of a trunk many agents change at once (kiln plan

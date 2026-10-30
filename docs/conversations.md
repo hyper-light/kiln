@@ -165,8 +165,11 @@ the server's store (`convo/resume.rs`):
      (`handoff::as_words`): the harness there starts a new conversation and is given it, once, with
      the first message it gets. The timeline shows that message as the person wrote it.
 2. It raises the session's epoch, here and in its store.
-3. It sends the package to the target runner in pieces on the feed's lane (`HarnessPackage`).
-4. That runner installs the record where its harness looks for it, and takes the session over under
+3. It takes the session for the process that held it, which can't hand it on: a take signed by the
+   server, saying when it last heard from that machine, which the package carries (docs/ci.md
+   W27-R08). The runner taking the session signs its receipt of it.
+4. It sends the package to the target runner in pieces on the feed's lane (`HarnessPackage`).
+5. That runner installs the record where its harness looks for it, and takes the session over under
    the same id, as it does a moved one.
 
 The agent's folder is mapped as a move maps it: a copy of its repository kept in step there, else

@@ -1408,7 +1408,18 @@ impl Registry {
             other => other,
         };
         match &u {
-            Update::Open { info, .. } if info.epoch > 0 => self.raise_epoch(id, info.epoch),
+            Update::Open { info, .. } if info.epoch > 0 => {
+                // Gone on at a later epoch on a runner from before signed hand-overs: unsigned,
+                // recorded saying so (docs/ci.md W27-R08).
+                if let Location::Machine(machine) = from
+                    && info.epoch > self.epoch_of(id)
+                    && hub.runner_wide_caps(machine) & crate::proto::CAP_CUSTODY == 0
+                {
+                    let why = format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt");
+                    unsigned(hub, id, info.epoch, &format!("runner {machine}"), why);
+                }
+                self.raise_epoch(id, info.epoch);
+            }
             Update::Open { .. } => {}
             // Only the machine a session runs on speaks for it: a copy left behind where it went
             // on from says nothing more of it.
@@ -2426,6 +2437,10 @@ impl Registry {
             Ok(take) => pkg.hand_on = take,
             Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
         }
+        if hub.runner_wide_caps(to) & crate::proto::CAP_CUSTODY == 0 {
+            let why = format!("{to} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take");
+            unsigned(hub, id, pkg.state.epoch.saturating_add(1), &format!("runner {to}"), why);
+        }
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
         // Its copy where it was doesn't count from now on: not here, not in the store (rows that
         // machine still sends are left out).
@@ -2587,6 +2602,18 @@ fn proposed_in(e: &super::model::Event) -> Option<String> {
     call.input.get("plan").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned)
 }
 
+
+/// Session `id`'s hand-over to `epoch`, taken by `took`, went unsigned because `why`: recorded,
+/// with the process kiln last certified it as before then (docs/ci.md W27-R08).
+fn unsigned(hub: &Hub, id: &str, epoch: u64, took: &str, why: String) {
+    let (store, session, took) = (hub.store.clone(), id.to_owned(), took.to_owned());
+    crate::rt::spawn(async move {
+        let gave = crate::identities::holder_at(&store, &session, epoch.saturating_sub(1)).await.ok().flatten().unwrap_or_default();
+        if let Err(e) = crate::custody::unsigned(&store, &session, epoch, &gave, &took, &why, crate::util::now_unix()).await {
+            tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "an unsigned hand-over couldn't be recorded");
+        }
+    });
+}
 #[cfg(test)]
 mod tests {
     use super::*;

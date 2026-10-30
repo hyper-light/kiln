@@ -1,0 +1,16 @@
+# Custody's hand-overs that need more than a gate's build (crates/kiln/tests/custody.rs; docs/ci.md
+# W27-R08): a blue/green upgrade's (a release build: the upgrade downloads the server's own kiln,
+# and a debug one is larger than kiln serves), and those with runners from before signed hand-overs
+# (a test build's `unsigned` fault). A gate runs the rest of custody.rs; this runs all of it nightly.
+name: custody-lab
+on:
+  schedule: ["41 3 * * *"]
+  manual: true
+jobs:
+  custody:
+    name: custody's hand-overs (release, faults)
+    runs-on: [baremetal, linux]
+    timeout-minutes: 60
+    steps:
+      - name: custody.rs (release, chaos)
+        run: cargo test --release --locked -p kiln --features chaos --test custody -- --nocapture

@@ -2,7 +2,8 @@
 -- every signed custody record and delegation kiln took (kiln_ci::identity::custody), by its
 -- statement's digest (sha256: over its PAE), its envelope kept as it was signed; what each record
 -- follows; the things each is about, by every digest of theirs; the breaks found in a chain, with
--- the records around them; and the statements and acts kiln refused, with why.
+-- the records around them; the statements and acts kiln refused, with why; and the hand-overs
+-- that went unsigned, with why.
 CREATE TABLE IF NOT EXISTS custody (
     digest TEXT PRIMARY KEY,
     payload_type TEXT NOT NULL,
@@ -66,4 +67,18 @@ CREATE TABLE IF NOT EXISTS transfer_refusals (
     envelope TEXT NOT NULL DEFAULT '',
     came_from TEXT NOT NULL DEFAULT '',
     at INTEGER NOT NULL
+);
+
+-- An agent session's hand-over that went unsigned (a side from before signed hand-overs, or one
+-- kiln never certified): the epoch it went on at, whom kiln saw it go from and to (their identities
+-- when kiln certified them, else their runner processes), and why. One per session and epoch.
+CREATE TABLE IF NOT EXISTS transfers_unsigned (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    gave TEXT NOT NULL DEFAULT '',
+    took TEXT NOT NULL DEFAULT '',
+    why TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    UNIQUE (session, epoch)
 );

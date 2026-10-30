@@ -725,6 +725,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             Ok(srv::json(StatusCode::OK, &json!({ "refused": refused })))
         })
         .await,
+        // Agent sessions' hand-overs that went unsigned, newest first (docs/ci.md W27-R08).
+        (&Method::GET, ["api", "transfers", "unsigned"]) => boxed(|| async {
+            let unsigned = crate::custody::unsigned_list(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "unsigned": unsigned })))
+        })
+        .await,
         (&Method::POST, ["api", "identities", "revoke"]) => {
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| identity_revoke(&hub, req, &by)).await

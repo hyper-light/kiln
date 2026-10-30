@@ -28,10 +28,21 @@ use crate::runner::identity;
 /// How many records sent are kept, to send again after a reconnect.
 const KEEP: usize = 512;
 
-/// A receipt waiting for its epoch's certificate.
+/// A session taken over here, waiting for its identity at the epoch it goes on at.
 struct Waiting {
+    /// What the receipt follows, when the process it came from signed a hand-on (none: one from
+    /// before signed hand-overs, and it goes on unsigned, kiln saying so).
+    signed: Option<Receipt>,
+    /// Taken over blue/green: it goes on at the epoch it had until this process is promoted, its
+    /// ask held till then, and it goes on at the next once that's certified ([`certified`]).
+    held: bool,
+    blue_green: bool,
+}
+
+/// A receipt to sign, of the hand-on it follows.
+struct Receipt {
     subject: Subject,
-    /// The hand-on it follows (its bundle, as JSON), and that hand-on's digest.
+    /// The hand-on (its bundle, as JSON), and its digest.
     hand_on: String,
     follows: String,
     from: String,
@@ -40,9 +51,20 @@ struct Waiting {
     by: String,
 }
 
-impl Waiting {
+impl Receipt {
+    /// Of session `session`'s `hand_on`, taken at `epoch` with `events`: none if it isn't an agent
+    /// session's.
+    fn of(session: &str, epoch: u64, events: &[Event], hand_on: &Value) -> Option<Self> {
+        let from = giver_of(hand_on).unwrap_or_default();
+        let Some(by) = at_epoch(&from, epoch) else {
+            tracing::warn!(target: "kiln.custody", %session, epoch, from = %from, "a hand-on from no agent session: no receipt signed");
+            return None;
+        };
+        Some(Self { subject: timeline(session, epoch.saturating_sub(1), events), hand_on: hand_on.to_string(), follows: digest_of(hand_on), from, by })
+    }
+
     /// The receipt, at `epoch`.
-    fn receipt(&self, epoch: u64) -> Statement {
+    fn statement(&self, epoch: u64) -> Statement {
         let body = Body { from: Some(self.from.clone()), why: "taken over".into(), epoch: Some(epoch), ..Body::new(Kind::Received, &self.by) };
         Statement { subject: vec![self.subject.clone()], follows: vec![self.follows.clone()], ..Statement::new(to_value(&body)) }
     }
@@ -102,10 +124,19 @@ fn giver_of(hand_on: &Value) -> Option<String> {
     if s("kind").as_deref() == Some("taken") { s("taken_for") } else { s("by") }
 }
 
+/// Whether this process signs its sessions' hand-overs: not a test build's `unsigned` fault, which
+/// stands in for a runner from before them.
+pub fn signs() -> bool {
+    !crate::runner::chaos::get().is_some_and(|c| c.unsigned)
+}
+
 /// The hand-on of session `session` as it leaves epoch `epoch` with `events`, for `why`: signed by
 /// its identity at that epoch, if this process holds it, and sent to the server; none if not (it
 /// goes unsigned, as before).
 pub fn hand_on(session: &str, epoch: u64, events: &[Event], why: &str) -> Option<Value> {
+    if !signs() {
+        return None;
+    }
     let slot = identity::slot("agent", Some(session), Some(epoch));
     let by = identity::uri(&slot)?;
     let to = at_epoch(&by, epoch.saturating_add(1))?;
@@ -130,12 +161,45 @@ pub fn hand_on(session: &str, epoch: u64, events: &[Event], why: &str) -> Option
 /// carrying `events` and the giver's `hand_on`: this process's receipt waits to go with the ask
 /// for its identity at `epoch` ([`carrying`]).
 pub fn took(session: &str, epoch: u64, events: &[Event], hand_on: &Value) {
-    let from = giver_of(hand_on).unwrap_or_default();
-    let Some(by) = at_epoch(&from, epoch) else {
-        return tracing::warn!(target: "kiln.custody", %session, epoch, from = %from, "a hand-on from no agent session: no receipt signed");
-    };
-    let waiting = Waiting { subject: timeline(session, epoch.saturating_sub(1), events), hand_on: hand_on.to_string(), follows: digest_of(hand_on), from, by };
-    STATE.lock().waiting.insert((session.to_owned(), epoch), waiting);
+    if !signs() {
+        return;
+    }
+    let Some(signed) = Receipt::of(session, epoch, events, hand_on) else { return };
+    STATE.lock().waiting.insert((session.to_owned(), epoch), Waiting { signed: Some(signed), held: false, blue_green: false });
+}
+
+/// Session `session` taken over blue/green from this machine's runner process being upgraded, at
+/// epoch `epoch` with `events`, its `hand_on` to the next if that process signed one (none: it's
+/// from before signed hand-overs): it goes on at `epoch` as before, and its ask for the next waits
+/// for this process to be promoted ([`promoted`]), with the receipt of a hand-on; a rollback before
+/// then leaves it to the process it came from, the hand-on lapsing.
+pub fn took_blue_green(session: &str, epoch: u64, events: &[Event], hand_on: Option<&Value>) {
+    if !signs() {
+        return;
+    }
+    let next = epoch.saturating_add(1);
+    let signed = hand_on.and_then(|h| Receipt::of(session, next, events, h));
+    STATE.lock().waiting.insert((session.to_owned(), next), Waiting { signed, held: true, blue_green: true });
+}
+
+/// This process was promoted (blue/green): the sessions it took over, each at the epoch it goes
+/// on at, whose asks for the next epoch go now.
+pub fn promoted() -> Vec<(String, u64)> {
+    let mut st = STATE.lock();
+    st.waiting.iter_mut().filter(|(_, w)| w.held).map(|((s, e), w)| {
+        w.held = false;
+        (s.clone(), e.saturating_sub(1))
+    }).collect()
+}
+
+/// The epoch to ask for session `session`'s identity at, which goes on at `epoch`: the next, once
+/// its blue/green take-over's ask may go; none while it's held (until this process is promoted).
+pub fn to_ask(session: &str, epoch: u64) -> Option<u64> {
+    match STATE.lock().waiting.get(&(session.to_owned(), epoch.saturating_add(1))) {
+        Some(w) if w.held => None,
+        Some(_) => Some(epoch.saturating_add(1)),
+        None => Some(epoch),
+    }
 }
 
 /// The ask for session `session`'s identity at `epoch`, carrying the hand-on it was taken over
@@ -144,7 +208,7 @@ pub fn took(session: &str, epoch: u64, events: &[Event], hand_on: &Value) {
 /// or its giver signed nothing) or the receipt can't be signed.
 pub fn carrying(session: &str, epoch: u64, mut ask: IdentityAsk) -> IdentityAsk {
     let key = (session.to_owned(), epoch);
-    let Some((hand_on, receipt)) = STATE.lock().waiting.get(&key).map(|w| (w.hand_on.clone(), w.receipt(epoch))) else { return ask };
+    let Some((hand_on, receipt)) = STATE.lock().waiting.get(&key).filter(|w| !w.held).and_then(|w| w.signed.as_ref()).map(|r| (r.hand_on.clone(), r.statement(epoch))) else { return ask };
     let slot = identity::slot("agent", Some(session), Some(epoch));
     match sign_uncertified(&slot, &receipt) {
         Ok((payload, signature)) => {
@@ -168,9 +232,10 @@ fn sign_uncertified(slot: &str, s: &Statement) -> anyhow::Result<(Vec<u8>, Vec<u
 }
 
 /// This process's identity at `epoch` of session `session` was certified: its receipt went with
-/// the ask, and kiln recorded it.
-pub fn certified(session: &str, epoch: u64) {
-    STATE.lock().waiting.remove(&(session.to_owned(), epoch));
+/// the ask, and kiln recorded it. Whether the session goes on at `epoch` now (a blue/green
+/// take-over's: it went on at the one before until then).
+pub fn certified(session: &str, epoch: u64) -> bool {
+    STATE.lock().waiting.remove(&(session.to_owned(), epoch)).is_some_and(|w| w.blue_green)
 }
 
 /// The records to send now, oldest first: each kept, to send again after a reconnect.
@@ -190,3 +255,25 @@ pub fn drain() -> Vec<String> {
 pub fn sent() -> Vec<String> {
     STATE.lock().sent.iter().cloned().collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W27-R08: a session taken over blue/green from a runner that signed nothing (one from before
+    /// signed hand-overs) asks for its next epoch only once this runner is promoted, carrying
+    /// nothing, and goes on at it once that's certified.
+    #[test]
+    fn w27_r08_a_blue_green_take_over_asks_once_promoted() {
+        took_blue_green("bg-unsigned", 3, &[], None);
+        assert_eq!(to_ask("bg-unsigned", 3), None, "held until this runner is promoted");
+        assert!(promoted().contains(&("bg-unsigned".to_owned(), 3)));
+        assert_eq!(to_ask("bg-unsigned", 3), Some(4), "then its next epoch's");
+        let ask = carrying("bg-unsigned", 4, IdentityAsk::default());
+        assert!(ask.hand_on.is_none() && ask.receipt.is_none(), "nothing signed to carry: kiln records it unsigned");
+        assert!(certified("bg-unsigned", 4), "certified, it goes on at epoch 4");
+        assert_eq!(to_ask("bg-unsigned", 4), Some(4));
+        assert!(!certified("bg-unsigned", 4), "once");
+    }
+}
+
