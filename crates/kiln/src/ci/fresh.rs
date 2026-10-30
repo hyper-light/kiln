@@ -210,7 +210,16 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
                     }
                 };
                 let why = Some(if clean { plan::WHY } else { plan::WHY_CONFLICTED }.to_owned());
-                made.push((o.diff.clone(), NewVersion { commit: sha, parent: onto, base: tip.to_owned(), patch_id, message, note, rebase_only: clean, pushed_by: "kiln".into(), parent_diff: below, why, keeps }));
+                // Whether its diff is the replayed revision's exactly (context and whitespace too):
+                // a diff's, compared by verbatim patch-id; a change request's merge has no one patch.
+                let same_patch = match (clean, o.diff.kind.as_str()) {
+                    (true, "diff") => {
+                        let (now, was) = (verbatim(hub, &path, &sha).await, verbatim(hub, &path, &o.source.commit).await);
+                        Some(now.is_some() && now == was)
+                    }
+                    _ => None,
+                };
+                made.push((o.diff.clone(), NewVersion { commit: sha, parent: onto, base: tip.to_owned(), patch_id, message, note, rebase_only: clean, pushed_by: "kiln".into(), parent_diff: below, why, keeps, same_patch }));
             }
             Err(e) => {
                 tracing::warn!(repo = %repo.name, diff = %o.diff.name, error = %e, "a change's replay couldn't be committed");
@@ -317,7 +326,7 @@ async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::R
         if contains(hub, &path, tip, &p.head).await || replayed_pull(hub, repo, p, tip).await? {
             continue;
         }
-        let v = Version { n: 0, commit: p.head.clone(), parent: String::new(), base: String::new(), rebase_only: false, pushed_by: String::new(), note: None, created_at: 0, git_ref: String::new(), started_by: None, why: None, thread: None, checks_from: None };
+        let v = Version { n: 0, commit: p.head.clone(), parent: String::new(), base: String::new(), rebase_only: false, pushed_by: String::new(), note: None, created_at: 0, git_ref: String::new(), started_by: None, why: None, thread: None, checks_from: None, same_patch: None };
         let (clean, merged) = match conflicts::merge_tree(hub, &path, tip, &v, true).await {
             Ok(x) => x,
             Err((_, why)) => {
@@ -607,4 +616,12 @@ pub async fn state(hub: &Hub, d: &Diff, versions: &[Version]) -> serde_json::Val
         "update": { "can": why_not.is_none(), "why_not": why_not },
         "checks_from": latest.checks_from,
     })
+}
+
+/// `commit`'s verbatim patch-id (`git patch-id --verbatim`): its diff with context and whitespace as
+/// they are, so two commits share one only where the change reads exactly the same.
+async fn verbatim(hub: &Hub, path: &str, commit: &str) -> Option<String> {
+    let patch = diffs::git_run(hub, &["-C", path, "show", "--no-color", "--format=", commit], &[], Vec::new()).await.ok()?.out;
+    let out = diffs::git_with_input(hub, &["-C", path, "patch-id", "--verbatim"], patch).await.ok()?;
+    String::from_utf8_lossy(&out).split_whitespace().next().map(str::to_owned)
 }

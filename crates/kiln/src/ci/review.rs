@@ -947,6 +947,7 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
                 parent_diff: below,
                 why: None,
                 keeps: None,
+                same_patch: None,
             };
             let n = super::diffs::add_version(hub, &repo, &path, &d, nv).await.map_err(fail)?;
             (made, n)

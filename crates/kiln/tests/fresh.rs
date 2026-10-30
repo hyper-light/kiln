@@ -207,6 +207,7 @@ fn w26_ac07_main_moves_under_stacks_and_a_change_request() -> anyhow::Result<()>
         assert_eq!((text(&v, "why"), v.get("rebase_only"), text(&v, "pushed_by"), text(&v, "base")), ("replayed", Some(&json!(true)), "kiln", tip.as_str()), "{d}: {v}");
         assert_eq!(text(&v, "parent"), below, "{d} goes onto the one below's replay: {v}");
         assert_eq!(v.get("checks_from"), Some(&json!(1)), "{d}'s checks are v1's, not its own: {v}");
+        assert_eq!(v.get("same_patch"), Some(&json!(true)), "{d}'s diff is v1's exactly: {v}");
         let commit = text(&v, "commit").to_owned();
         assert_eq!(rev(&x.bare, &["rev-parse", &format!("refs/kiln/diffs/{d}/v2")])?, commit, "{d}'s replay is kept at its ref");
         let who = rev(&x.bare, &["log", "-1", "--format=%an <%ae>|%cn|%s", &commit])?;
@@ -458,5 +459,26 @@ fn w26_r16_collision_radar_names_both_changes() -> anyhow::Result<()> {
         let one = listed("D1")?;
         Ok((!one.is_empty()).then(|| format!("{one:?}")))
     })?;
+    Ok(())
+}
+
+/// W26-R16 with Gerrit's trivial rebase (research f13): a clean replay is rebase-only, so approvals
+/// carry by the sticky policy, and it records whether its diff is the replayed revision's exactly
+/// (verbatim patch-id, context lines included). Main changing a line inside D1's context makes the replay
+/// clean but not the same patch; a signed verdict (W27-R04) carries only where it is.
+#[test]
+fn w26_r16_a_replay_records_whether_its_patch_is_the_same() -> anyhow::Result<()> {
+    // D1 changes line 5; main then changes line 2, apart enough to merge cleanly yet inside D1's
+    // three lines of context.
+    let x = setup(&[("f.txt", b"1\n2\n3\n4\n5\n6\n7\n8\n")])?;
+    x.commit(&[("f.txt", b"1\n2\n3\n4\nFIVE\n6\n7\n8\n")], "D1: five")?;
+    must(git(&x.home, &x.work, &["push", "origin", "HEAD:refs/for/main"]), "D1")?;
+    x.main_moves(&[("f.txt", b"1\nTWO\n3\n4\n5\n6\n7\n8\n")], "main: a line in D1's context")?;
+    let mut v2 = Value::Null;
+    until(60, "D1 replayed", || {
+        v2 = versions(&x.s, &x.kim, "/api/diffs/D1")?.into_iter().find(|v| v.get("n") == Some(&json!(2))).unwrap_or(Value::Null);
+        Ok(v2.is_null().then(|| "no v2".to_owned()))
+    })?;
+    assert_eq!((text(&v2, "why"), v2.get("rebase_only"), v2.get("same_patch")), ("replayed", Some(&json!(true)), Some(&json!(false))), "{v2}");
     Ok(())
 }

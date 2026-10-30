@@ -886,8 +886,8 @@ pub(crate) async fn add_versions(hub: &Arc<Hub>, repo: &Repo, path: &str, made: 
                 // The same commits, rebased: whom the version before came from (W10-R02's `secrets.use`).
                 let by: Option<String> = tx.query_row("SELECT started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [id], |r| r.get(0)).optional()?.flatten();
                 tx.execute(
-                    "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by, why) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now, by, nv.why],
+                    "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by, why, same_patch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now, by, nv.why, nv.same_patch],
                 )?;
                 tx.execute("UPDATE diffs SET parent_diff = ?2, updated_at = ?3 WHERE id = ?1", params![id, nv.parent_diff, now])?;
                 if let Some(replay) = &nv.keeps {
@@ -936,6 +936,8 @@ pub(crate) struct NewVersion {
     /// The conflicted replay it keeps as a revision (W26-R16), named in the same transaction so the
     /// gate never sees it without its conflicts.
     pub keeps: Option<String>,
+    /// A replay's verbatim patch-id is the replayed revision's (W26-R16); none: not a replay.
+    pub same_patch: Option<bool>,
 }
 
 /// `pull_request` `closed` for a diff that landed (`merged`) or was abandoned (W03-R09's table).
@@ -1048,6 +1050,9 @@ pub struct Version {
     /// A revision kiln replayed as the trunk moved (W26-R16) runs no checks of its own: the version
     /// whose checks it shows, the latest before it that isn't a replay.
     pub checks_from: Option<u32>,
+    /// A replay's diff is the replayed revision's exactly, context and whitespace included (its
+    /// verbatim patch-id): where a signed verdict carries (W27-R04). None: not a replay.
+    pub same_patch: Option<bool>,
 }
 
 const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for, d.kiln_change,
@@ -1108,7 +1113,7 @@ pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>
     let (id, name) = (d.id.clone(), d.name.clone());
     hub.store
         .call(move |c| {
-            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at, started_by, why, thread FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+            let mut st = c.prepare("SELECT n, commit_sha, parent, base, rebase_only, pushed_by, note, created_at, started_by, why, thread, same_patch FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
             let rows = st.query_map([&id], |r| {
                 let n: u32 = r.get(0)?;
                 let started_by = r.get::<_, Option<String>>(8)?.and_then(|t| serde_json::from_str(&t).ok());
@@ -1126,6 +1131,7 @@ pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>
                     why: r.get(9)?,
                     thread: r.get(10)?,
                     checks_from: None,
+                    same_patch: r.get(11)?,
                 })
             })?;
             let mut out = rows.collect::<Result<Vec<_>, _>>()?;

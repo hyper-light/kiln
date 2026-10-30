@@ -866,7 +866,7 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
             let made = revision::commit(hub, &path, &revision::Commit { tree: &tree, parents: &[onto.commit.as_str()], author: (author, Some(date)), by: &caller.name, co_authors: &agents, message: &message }).await.map_err(internal)?;
             let patch = diffs::git_run(hub, &["-C", &path, "show", "--no-color", &made.sha], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
             let patch_id = diffs::git_with_input(hub, &["-C", &path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
-            let nv = diffs::NewVersion { commit: made.sha.clone(), parent: onto.commit.clone(), base: onto.base.clone(), patch_id, message: made.message.clone(), note: None, rebase_only: false, pushed_by: caller.name.clone(), parent_diff: onto.below.clone(), why: None, keeps: None };
+            let nv = diffs::NewVersion { commit: made.sha.clone(), parent: onto.commit.clone(), base: onto.base.clone(), patch_id, message: made.message.clone(), note: None, rebase_only: false, pushed_by: caller.name.clone(), parent_diff: onto.below.clone(), why: None, keeps: None, same_patch: None };
             (diffs::add_version(hub, &repo, &path, d, nv).await.map_err(fail)?, made)
         }
     };
