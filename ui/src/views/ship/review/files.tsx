@@ -20,10 +20,12 @@ import {
   pullSearchRes,
   reviewApi,
   searchRes,
+  whoSaid,
   type HostPullDetail,
   type Thread,
 } from "@/api/review";
 import type { ShipCommit } from "@/api/ship";
+import { AboutContext, type AboutAgent } from "@/components/code/about";
 import { toast } from "@/components/ui/toast";
 import { useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
@@ -115,6 +117,13 @@ const refresh = () => {
 
 /** Shared empties and a no-op, so stable references stay stable (W26-R15). */
 const EMPTY_THREADS: Thread[] = [];
+
+/** Who asking about code goes to (components/code/about.tsx): its author, where an agent wrote it
+ * (`agent:<id>`, as its agent token pushed it); none for a person's, as on the review page. */
+function aboutOf(author: string): AboutAgent | null {
+  const id = author.startsWith("agent:") ? (author.slice("agent:".length).split(" ")[0] ?? "") : "";
+  return id ? { id, name: whoSaid(author), subagents: true, busy: false } : null;
+}
 const noop = () => {};
 
 interface FrameP {
@@ -298,6 +307,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       ),
     [key],
   );
+  const about = React.useMemo(() => aboutOf(d.author), [d.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf, viewed }),
     [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf, viewed],
@@ -330,11 +340,13 @@ function KilnFiles({ item }: { item: ShipCommit }) {
         </Conversation>
       }
     >
-      {whole ? (
-        <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={blobTextRes(key, version, whole, "new")} />
-      ) : (
-        list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={meta.get(f.path)} />)
-      )}
+      <AboutContext.Provider value={about}>
+        {whole ? (
+          <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={blobTextRes(key, version, whole, "new")} />
+        ) : (
+          list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={meta.get(f.path)} />)
+        )}
+      </AboutContext.Provider>
     </Frame>
   );
 }
@@ -491,6 +503,7 @@ function CommitFiles({ item }: { item: ShipCommit }) {
     }),
     [ops],
   );
+  const about = React.useMemo(() => aboutOf(item.author), [item.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: EMPTY_THREADS, conflicts: [], rowsByFile, version: 1, draft, setDraft, open: setWhole, q: "", linesOf }),
     [fullOps, rowsByFile, draft, linesOf],
@@ -506,11 +519,13 @@ function CommitFiles({ item }: { item: ShipCommit }) {
         </ul>
       }
     >
-      {whole ? (
-        <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
-      ) : (
-        list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
-      )}
+      <AboutContext.Provider value={about}>
+        {whole ? (
+          <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
+        ) : (
+          list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
+        )}
+      </AboutContext.Provider>
     </Frame>
   );
 }
