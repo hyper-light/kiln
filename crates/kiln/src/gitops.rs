@@ -292,6 +292,13 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
     if t.event == "push" && repo.name == u.release_repo && t.branch == u.release_branch {
         hub.updates.wake_in_step();
     }
+    // A branch moved: its open changes, if it's their trunk, are replayed onto it (W26-R16), whoever
+    // runs the repository's CI.
+    if t.event == "push"
+        && let Some(before) = t.before.as_deref()
+    {
+        crate::ci::fresh::moved(hub, repo, &t.branch, before, &t.sha);
+    }
     // The CI engine's GitHub workflows (docs/ci.md W03), when it is on; v1 keeps `.kiln/`.
     let github = match crate::ci::events::on_trigger(hub, repo, &t).await {
         Ok(ran) => ran,

@@ -428,24 +428,30 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         ch.pushes.push((v, rebase_only, at));
         (ch.latest, ch.latest_sha) = (v, commit);
         // A revision is the lane's push, the fix answering a thread (an agent's fix, a suggestion
-        // applied) or the resolution of a replay's conflicts, by which `why` it was made (W26-R14).
+        // applied), the resolution of a replay's conflicts, or kiln's replay as its trunk moved
+        // (W26-R16), by which `why` it was made (W26-R14). A replay kept with its conflicts is its
+        // replay's mark, below.
         let kind = match why.as_deref() {
             Some("conflict resolved") => "resolution",
+            Some(w) if w == kiln_ci::fresh::WHY => "replay",
+            Some(w) if w == kiln_ci::fresh::WHY_CONFLICTED => "",
             Some(_) => "fix",
             None if thread.is_some() => "fix",
             None => "push",
         };
-        marks.push(MarkRec {
-            id: format!("{id}:v{v}"),
-            kind,
-            at,
-            end: Some(at),
-            by: pushed_by,
-            revision: Some(v),
-            state: "passed",
-            thread,
-            note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
-        });
+        if !kind.is_empty() {
+            marks.push(MarkRec {
+                id: format!("{id}:v{v}"),
+                kind,
+                at,
+                end: Some(at),
+                by: pushed_by,
+                revision: Some(v),
+                state: "passed",
+                thread,
+                note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
+            });
+        }
     }
     let mut st = c.prepare("SELECT reviewer, added_at FROM diff_reviewers WHERE diff_id = ?1 ORDER BY added_at, reviewer")?;
     ch.reviewers = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;

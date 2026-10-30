@@ -1109,65 +1109,10 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
             tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "a landed diff's closing event didn't start");
         }
     }
-    restack(hub, repo, path, trunk, &all, tip).await;
+    // The open diffs above the landed ones, and every other open change of the trunk, are replayed
+    // onto it (W26-R16).
+    super::fresh::moved(hub, repo, trunk, "", tip);
     Ok(())
-}
-
-/// The open diffs standing on `landed` ones, onto `tip` as rebase-only versions, each on the one
-/// below it; a chain that conflicts stays as it was (its author syncs it).
-async fn restack(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, landed: &[String], tip: &str) {
-    let children = |parents: Vec<String>| {
-        let hub = hub.clone();
-        async move {
-            hub.store
-                .call(move |c| {
-                    let mut out = Vec::new();
-                    let mut st = c.prepare("SELECT id FROM diffs WHERE parent_diff = ?1 AND state NOT IN ('landed', 'abandoned', 'landing')")?;
-                    for p in &parents {
-                        out.extend(st.query_map([p], |r| r.get::<_, String>(0))?.filter_map(Result::ok));
-                    }
-                    Ok(out)
-                })
-                .await
-                .unwrap_or_default()
-        }
-    };
-    // (diff, the commit it goes on, the diff below it now).
-    let mut work: Vec<(String, String, Option<String>)> = children(landed.to_vec()).await.into_iter().map(|id| (id, tip.to_owned(), None)).collect();
-    let mut seen = 0usize;
-    while let Some((id, onto, below)) = work.pop() {
-        seen += 1;
-        if seen > 500 {
-            break;
-        }
-        let Ok(Some(d)) = diffs::find(hub, &id).await else { continue };
-        let Some(v) = diffs::versions(hub, &d).await.ok().and_then(|mut v| v.pop()) else { continue };
-        let tree = match pick_tree(hub, path, &onto, &v.commit, &v.parent).await {
-            Ok(t) => t,
-            Err(_) => {
-                tracing::info!(diff = %d.name, "a diff above a landed one doesn't restack cleanly; its author syncs it");
-                continue;
-            }
-        };
-        let Ok(who) = author(hub, path, &v.commit).await else { continue };
-        let message = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%B", &v.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
-        // The commit kiln makes carries its change's `Kiln-Change` (W26-R03).
-        let message = kiln_ci::identity::with_kiln_changes(&message, &changes_of(&[&d]));
-        let Ok(c) = commit_tree(hub, path, &tree, &[&onto], &who, &message).await else { continue };
-        let patch = diffs::git_run(hub, &["-C", path, "show", "--no-color", &c], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
-        let patch_id = diffs::git_with_input(hub, &["-C", path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
-        let nv = diffs::NewVersion { commit: c.clone(), parent: onto.clone(), base: tip.to_owned(), patch_id, message, note: Some(format!("restacked onto {trunk} after a land")), rebase_only: true, pushed_by: "kiln".into(), parent_diff: below.clone() };
-        match diffs::add_version(hub, repo, path, &d, nv).await {
-            Ok(n) => tracing::info!(diff = %d.name, version = n, "restacked onto the trunk"),
-            Err(e) => {
-                tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "a restack's version couldn't be kept");
-                continue;
-            }
-        }
-        for child in children(vec![d.id.clone()]).await {
-            work.push((child, c.clone(), Some(d.id.clone())));
-        }
-    }
 }
 
 #[cfg(test)]

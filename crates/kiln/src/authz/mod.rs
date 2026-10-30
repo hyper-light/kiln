@@ -387,6 +387,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
     // The conflict ladder (W26-R17): accepting what it offers changes the code, as Commit resolution does.
     r("POST", "/api/diffs/*/conflicts/accept", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
@@ -412,6 +413,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/accept", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
@@ -482,6 +484,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/repos/*/pulls/*/comments", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/reviews", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/merge", "diffs.land", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/update", "diffs.submit", At::Repo(3)),
     r("POST", "/api/ci/repos/*/hooks", "secrets.manage", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),

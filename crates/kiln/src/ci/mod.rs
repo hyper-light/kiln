@@ -14,6 +14,7 @@ pub mod broker;
 pub mod cli;
 pub mod compare;
 pub mod conflicts;
+pub mod fresh;
 pub mod cr;
 pub mod deploy_step;
 pub mod diffs;

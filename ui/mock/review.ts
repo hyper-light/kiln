@@ -670,6 +670,20 @@ const queue: {
   },
 ];
 
+/** Change requests whose branch Update moved to their replay (W26-R16). */
+const updated = new Set<string>();
+
+/** How fresh a change is on main (W26-R16), as the server says it: D41 a diff kiln replayed (its checks v1's), CR7 a change request whose replay Update can push. */
+function freshOf(d: MockDiff) {
+  const tip = sha("main");
+  const words = `replays clean on main@${tip.slice(0, 6)}`;
+  if (d.kind === "change_request") {
+    const done = updated.has(d.name);
+    return { words, tip, update: { can: !done, why_not: done ? "its branch is at its replay already" : null }, checks_from: d.versions - 1 || null };
+  }
+  return { words, tip, update: { can: false, why_not: "a diff has no branch: its replay is its latest revision" }, checks_from: d.name === "D41" ? 1 : null };
+}
+
 function view(d: MockDiff) {
   const { versions: n, ...rest } = d;
   const vs = Array.from({ length: n }, (_, i) => ({
@@ -685,6 +699,7 @@ function view(d: MockDiff) {
   }));
   return {
     ...rest,
+    fresh: d.state === "landed" || d.state === "abandoned" ? null : freshOf(d),
     versions: vs,
     reviewers:
       d.name === "D41"
@@ -1145,6 +1160,12 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { q, hits: hits.slice(0, 50), total: hits.length, truncated: hits.length > 50, index: "ready" }), true);
   }
   if (c === "conflicts" && m === "GET") return (ctx.json(res, 200, conflictsOf(d)), true);
+  if (c === "update" && m === "POST") {
+    if (d.kind !== "change_request" || !d.branch) return (ctx.err(res, 409, `${d.name} is a diff: its replay is its latest revision already, and it has no branch to move`), true);
+    if (updated.has(d.name)) return (ctx.err(res, 409, `${d.branch} is at ${d.name}'s replay already`), true);
+    updated.add(d.name);
+    return (ctx.json(res, 200, { change: d.name, version: d.versions, branch: d.branch, head: sha(`${d.name}v${d.versions}`), by: ME }), true);
+  }
   if (c === "conflicts" && d2 === "commit" && m === "POST") {
     const cf = conflictsOf(d);
     if (cf.unresolved > 0) return (ctx.err(res, 409, "conflicts remain"), true);
