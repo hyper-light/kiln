@@ -1761,6 +1761,123 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
     transition: none;
   }
 }
+/* A subagent waiting on you, said on the line in Mission control's needs colours. */
+.al-needs {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #e2cfae;
+}
+.al-needs > i,
+.sa-word > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #d8bb95;
+  transform: translateY(-1px);
+}
+
+/* ---------------------------------------------------------------- a subagent waiting on you, over the composer
+   Mission control's row that needs you (mission.css), not a card: the tan bar inset at its left and
+   a rule above and below; its name, then the word and what it asks in mono, then its answer. On a
+   phone it stacks as Mission control's row does there. */
+.sa-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "main acts";
+  align-items: center;
+  gap: 10px 16px;
+  padding: 12px 4px 12px 14px;
+  border-top: 1px solid #25272c;
+  border-bottom: 1px solid #25272c;
+  box-shadow: inset 2px 0 0 #c6b08e;
+}
+.sa-row + .sa-row {
+  border-top: 0;
+}
+.sa-main {
+  grid-area: main;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+}
+.sa-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 16px;
+  line-height: 22px;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sa-main:hover .sa-name {
+  color: #ffffff;
+}
+.sa-line {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 12px;
+}
+.sa-word {
+  display: inline-flex;
+  min-width: 86px;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  color: #e2cfae;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.sa-text {
+  min-width: 0;
+  overflow: hidden;
+  color: #ece0ca;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sa-acts {
+  grid-area: acts;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sa-link {
+  margin: 0 4px;
+  color: #c9c3d8;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.sa-link:hover {
+  color: #ededee;
+}
+@media (max-width: 640px) {
+  .sa-row {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "main"
+      "acts";
+  }
+  .sa-line {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
+  }
+  .sa-word {
+    min-width: 0;
+  }
+  /* The row itself opens its thread; one less word beside Allow and Deny, as Mission control's. */
+  .sa-link {
+    display: none;
+  }
+}
 
 /* ---------------------------------------------------------------- new agents: continue a past session */
 .ps {

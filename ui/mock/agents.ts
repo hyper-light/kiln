@@ -16,11 +16,12 @@
  *   /agents/sub-done   "Release notes" (Claude Code), its subagents done: finished
  *   /agents/sub-codex  "Scheduler audit" (Codex), a subagent kiln can't stop
  *
- * And subagents kiln started for an agent's goal asking you something, each answered from its
- * agent's row in Mission control:
+ * And subagents asking you something, each answered from its agent's row in Mission control and
+ * over its agent's composer (two that kiln started for an agent's goal, one its harness's own):
  *
  *   /agents/ask-lead   "Gate order" (Claude Code), its step 2's subagent asks which gate goes first
  *   /agents/ask-perm   "Figure audit" (Claude Code), its step 1's subagent asks to run a command
+ *   /agents/ask-own    "Docs check" (Claude Code), its harness's own subagent asks to run a command
  *
  * The `agents.*` routes answer as the server's do, from these and nothing else.
  */
@@ -675,6 +676,20 @@ const askFigures: Approval = {
   cwd: CWD,
   at: Date.now() - 2 * 60_000,
 };
+// One of its harness's own subagents asking: the request is its agent's, naming it (`agent`).
+const DOCS = "a5d1c3e5f7a9b1c3d";
+const askDocs: Approval = {
+  id: "ask-own-ap1",
+  tool_id: "toolu_docs_check",
+  tool_name: "Bash",
+  tool: "shell",
+  title: "npm run docs -- --check",
+  command: "npm run docs -- --check",
+  input: { command: "npm run docs -- --check" },
+  cwd: CWD,
+  agent: DOCS,
+  at: Date.now() - 3 * 60_000,
+};
 const step = (id: string, parent: string, name: string, prompt: string, reply: string, approval: Approval): Member => ({
   ...member(id, "claude", "local", name, "waiting", "auto", prompt, reply, { parent, subagent: true }),
   approval,
@@ -700,13 +715,33 @@ for (const m of [
   ),
   member("ask-perm", "claude", "local", "Figure audit", "idle", "auto", "Check every figure on the System page against its data, step 1 on a subagent of its own.", "Step 1 is out on its subagent."),
   step("ask-perm-s1", "ask-perm", "Step 1: Check the figures", 'Step 1 of 2 of the plan "Figures": Check every figure against its data', "Checking the figures.", askFigures),
+  {
+    ...member("ask-own", "claude", "local", "Docs check", "waiting", "auto", "Check the docs against the code; send a subagent through them.", "Its subagent is checking the docs."),
+    approval: askDocs,
+    tasks: [
+      {
+        id: DOCS,
+        tool_id: "toolu_docs",
+        description: "Check the docs against the code",
+        class: "agent",
+        kind: "local_agent",
+        status: "running",
+        background: true,
+        started: Date.now() - 5 * 60_000,
+        last_tool: "Bash",
+        stoppable: true,
+      },
+    ],
+  },
 ] as Member[]) {
+  if (m.tasks) leaves(m);
   family.set(m.info.id, m);
 }
 /** What each of them asks, and what it does meanwhile: asked again by `POST /api/mock/asks` (so each browser test starts from it). */
 const ASKS: [string, Approval, string][] = [
   ["ask-s2", askS2, "Asking you a question"],
   ["ask-perm-s1", askFigures, "Waiting for your approval"],
+  ["ask-own", askDocs, "Waiting for your approval"],
 ];
 function askAll(told = true) {
   forgetMarks(ASKS.map(([, ap]) => ap.id));

@@ -39,7 +39,9 @@ export const notable = (a: AgentInfo) => a.approvals.length > 0 || !!a.held || s
 export function cardsOf(agents: readonly AgentInfo[], path: string, away: { has(key: string): boolean }, answered: { has(id: string): boolean }): Card[] {
   const cards = agents.flatMap((a): Card[] => {
     if (showsItsOwn(path, a.id)) return [];
-    const open = a.approvals.filter((p) => !away.has(p.id) && !answered.has(p.id));
+    // A subagent kiln started for an agent: its agent's page has its requests over the composer.
+    const shownThere = a.subagent === true && !!a.parent && showsItsOwn(path, a.parent);
+    const open = shownThere ? [] : a.approvals.filter((p) => !away.has(p.id) && !answered.has(p.id));
     if (open[0]) return [{ kind: "request", a, key: open[0].id, since: open[0].at || a.last_activity, ap: open[0], more: open.length - 1 }];
     const card = (kind: CardKind, since: number): Card[] => {
       const key = `${kind}:${a.id}:${since}`;

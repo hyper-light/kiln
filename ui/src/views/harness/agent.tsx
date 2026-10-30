@@ -606,7 +606,7 @@ function Dock({
   const [moving, setMoving] = React.useState(false);
   return (
     <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
-      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} />
+      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}
