@@ -8576,8 +8576,18 @@ a time. The design was agreed on a live mock built on Ship's own prototype
       mirror and kept at `refs/kiln/pulls/<host>/<n>/replays/<k>` (`review_pull_replays`).
     - **Update.** `POST /api/change-requests/:id/update` moves a change request's branch to its
       replay with a lease, refusing, with the reason, when the branch moved since. A diff has no
-      branch. A host's pull request goes through the forge seam's `update` (GitHub's update-branch
-      against the expected head, GitLab's rebase, else the replay pushed with a lease).
+      branch. A host's pull request (`POST /api/ci/repos/:repo/pulls/:n/update`) goes through the
+      forge seam's `update`, by `githost::forge::for_repo`: GitHub's update-branch against the head
+      the replay was made from (kiln never pushes its own commit to GitHub), GitLab's rebase, else
+      the replay pushed with a lease. GitHub has no REST call for Rebase stack (its cascading rebase
+      is the page's or `gh stack`'s, and unsigned), so a GitHub stack updates pull request by pull
+      request. Automatic pushes to a host go a second apart and stop, saying so, below a fifth of
+      its hourly limit left or on a rate refusal.
+    - **Not yet.** A host's pull request whose base is another pull request's branch (a GitHub
+      stack's upper ones) isn't replayed: only those on the trunk are.
+    - **The same patch?** Each clean replay of a diff records `same_patch`: whether its verbatim
+      patch-id (context lines and whitespace included) is the replayed revision's. That's Gerrit's
+      trivial rebase, and where a signed verdict (W27-R04) carries.
     - **`.kiln/review.yaml`'s `fresh:`.** `replay` (on by default: a repository can keep its
       changes where their authors put them), `push: manual | auto` and `conflict-agents` (both
       off). A change turning `push: auto` on warns on approval, through R11's gate, in the words
