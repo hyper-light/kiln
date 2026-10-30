@@ -43,6 +43,7 @@ pub mod graphql;
 pub mod headroom;
 pub mod identity;
 pub mod insights;
+pub mod ladder;
 pub mod land;
 pub mod mirror;
 pub mod oidc;
