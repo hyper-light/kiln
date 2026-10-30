@@ -10,6 +10,8 @@ docs/ci.md §0.3 names. docs/headroom.md has the design and where every number c
   headroom before this train.
 - **Deployed:** not yet. Production first, then the runners take the release.
 - **Checked, not fully gated** (2026-10-29, on adacachy):
+  - On the final merge with main 70663064ec (7d2fa79243): clippy for kiln and kiln-ci (libraries
+    and tests), clean; the UI's typecheck and lint, clean.
   - On the landing tree (346c3568b7, main 9598c1e546 merged in): ci/gate.sh's clippy for the
     workspace with all targets, clean, and its build of every library's tests.
   - On the merge with main f7f2588be6 (065cb57f0f): clippy for kiln and kiln-ci (libraries and
