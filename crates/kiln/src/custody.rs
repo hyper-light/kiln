@@ -27,6 +27,35 @@ pub const LIST_MAX: usize = 500;
 /// what it offered (seconds).
 pub const LAPSE_AFTER: i64 = 600;
 
+/// The digest algorithm a session's timeline is named by ([`timeline`]).
+pub const TIMELINE: &str = "kiln-timeline-v1";
+
+/// Session `session`'s timeline as it leaves epoch `epoch` with `events`: the thing a hand-over of
+/// it is about ("session <id> at epoch <n>"), its digest over its id, that epoch and each event's
+/// digest (`crate::wire::sums::event`), which both sides work out alike from the events its
+/// package carries. A timeline grows while it's held, so each epoch's is a thing of its own.
+pub fn timeline(session: &str, epoch: u64, events: &[crate::harness::model::Event]) -> statement::Subject {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(session.as_bytes());
+    h.update([0]);
+    h.update(epoch.to_be_bytes());
+    h.update(u64::try_from(events.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for e in events {
+        h.update(serde_json::to_value(e).map(|v| crate::wire::sums::event(&v)).unwrap_or_default().to_be_bytes());
+    }
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let annotations = BTreeMap::from([("epoch".to_owned(), Value::from(epoch)), ("events".to_owned(), Value::from(events.len()))]);
+    statement::Subject { name: format!("session {session} at epoch {epoch}"), digest: BTreeMap::from([(TIMELINE.to_owned(), hex)]), size: None, annotations }
+}
+
+/// The agent identity at `epoch` of the session whose identity at some epoch is `uri`, without the
+/// runner process holding its key: whom a hand-on goes to, or a receipt comes from.
+pub fn at_epoch(uri: &str, epoch: u64) -> Option<String> {
+    let (head, _) = uri.split_once("/epoch/")?;
+    head.contains("/agent/").then(|| format!("{head}/epoch/{epoch}"))
+}
+
 /// kiln's server's identity in organization `org`: the only signer of takes.
 pub fn server_uri(org: &str) -> String {
     Identity::new(org, Actor::Server).uri().unwrap_or_default()
@@ -149,6 +178,50 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
         Ok(Err(why)) => tracing::info!(target: "kiln.custody", %machine, %instance, %why, "refused a custody record"),
         Err(e) => tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "couldn't keep a custody record"),
     }
+}
+
+/// `s` signed by kiln's server with its own signing key (`<data>/pki/server-signing.key`, which
+/// `identities::own_identities` keeps certified), its body naming it: its bundle. Only kiln's
+/// server signs takes.
+pub fn server_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow::Result<Value> {
+    use anyhow::Context as _;
+    use rcgen::SigningKey as _;
+    let read = |f: &str| std::fs::read_to_string(pki.dir().join(f)).with_context(|| format!("kiln's server's {f}"));
+    let key = rcgen::KeyPair::from_pem(&read("server-signing.key")?)?;
+    let cert = read("server-signing.pem")?;
+    let mut s = s.clone();
+    if let Some(o) = s.body.as_object_mut() {
+        o.insert("by".into(), Value::String(server_uri(&pki.organization())));
+    }
+    let payload = statement::payload(&s)?;
+    let signature = key.sign(&statement::to_sign(PAYLOAD_CUSTODY, &payload))?;
+    Ok(statement::bundle(PAYLOAD_CUSTODY, &payload, &signature, &crate::pki::der_of(&cert)?))
+}
+
+/// kiln's take of agent session `session` as it leaves epoch `epoch` (its timeline `events`), for
+/// the process that held it there, which can't hand it on (`why`: its machine is away, and since
+/// when): to the session at the next epoch, whichever process takes it, following that process's
+/// receipt of it if kiln has one. Kept here at once, and carried in the session's package: its
+/// receipt follows it as a hand-on's does (docs/ci.md W27-R08). None if kiln never certified the
+/// session at that epoch: it goes on unsigned, as before.
+pub async fn take_for(store: &Store, pki: &crate::pki::Pki, session: &str, epoch: u64, events: &[crate::harness::model::Event], why: &str) -> anyhow::Result<Option<Value>> {
+    let Some(holder) = crate::identities::holder_at(store, session, epoch).await? else { return Ok(None) };
+    let org = pki.organization();
+    let to = at_epoch(&holder, epoch.saturating_add(1)).ok_or_else(|| anyhow::anyhow!("{holder} isn't an agent session's identity"))?;
+    let body = custody::Body { taken_for: Some(holder.clone()), to: Some(to), why: why.to_owned(), epoch: Some(epoch.saturating_add(1)), ..custody::Body::new(Kind::Taken, &server_uri(&org)) };
+    let follows = receipt_of(store, &holder).await?.into_iter().collect();
+    let s = statement::Statement { subject: vec![timeline(session, epoch, events)], follows, ..statement::Statement::new(custody::to_value(&body)) };
+    let bundle = server_signed(pki, &s)?;
+    match take(store, &pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
+        Ok(_) => Ok(Some(bundle)),
+        Err(why) => anyhow::bail!("kiln refused its own take: {why}"),
+    }
+}
+
+/// The newest receipt custodian `custodian` signed: how it came to hold what it holds.
+async fn receipt_of(store: &Store, custodian: &str) -> anyhow::Result<Option<String>> {
+    let c = custodian.to_owned();
+    store.call(move |conn| Ok(conn.query_row("SELECT digest FROM custody WHERE custodian = ?1 AND kind = 'received' ORDER BY taken_at DESC, rowid DESC LIMIT 1", [&c], |r| r.get(0)).optional()?)).await
 }
 
 /// Whether kiln keeps record `digest`.
@@ -745,6 +818,21 @@ mod tests {
             assert_eq!(v.get("unbroken"), Some(&json!(true)), "{v}");
             Ok(())
         })
+    }
+
+    /// W27-R08: both sides of a hand-over name a session's timeline alike from the same events,
+    /// and differently once an event differs or the epoch does.
+    #[test]
+    fn w27_r08_a_timeline_is_named_alike_by_both_sides() -> anyhow::Result<()> {
+        let events: Vec<crate::harness::model::Event> = serde_json::from_value(json!([]))?;
+        let a = timeline("s1", 3, &events);
+        assert_eq!(a, timeline("s1", 3, &events));
+        assert_ne!(a.digest, timeline("s1", 4, &events).digest);
+        assert_ne!(a.digest, timeline("s2", 3, &events).digest);
+        assert_eq!(a.digest.get(TIMELINE).map(String::len), Some(64));
+        assert_eq!(at_epoch("kiln://o/person/p/agent/s1/epoch/3/machine/m/instance/i", 4).as_deref(), Some("kiln://o/person/p/agent/s1/epoch/4"));
+        assert_eq!(at_epoch("kiln://o/person/p/machine/m/instance/i", 4), None);
+        Ok(())
     }
 
     /// A taken statement, or the refusal as an error.

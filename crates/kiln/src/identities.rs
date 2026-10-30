@@ -697,6 +697,21 @@ async fn epochs_of(store: &Store, session: &str) -> anyhow::Result<Vec<(String, 
         .collect())
 }
 
+/// The identity agent session `session` was last certified as at `epoch`, naming the runner
+/// process that held it then: whom kiln takes it for when that process can't hand it on
+/// (docs/ci.md W27-R08). None if kiln never certified it at that epoch.
+pub async fn holder_at(store: &Store, session: &str, epoch: u64) -> anyhow::Result<Option<String>> {
+    let pattern = format!("%/agent/{session}/epoch/{epoch}/%");
+    let subjects: Vec<String> = store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC")?;
+            let rows = q.query_map([pattern], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(subjects.into_iter().find(|s| Identity::parse(s).is_ok_and(|i| matches!(i.actor, Actor::Agent { ref agent, epoch: e, .. } if agent == session && e == epoch))))
+}
+
 /// Agent session `session` ended: every certificate of every epoch it had is revoked from now.
 pub async fn agent_ended(store: &Store, session: &str) -> anyhow::Result<()> {
     let now = crate::util::now_unix();

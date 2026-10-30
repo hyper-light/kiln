@@ -8,11 +8,9 @@
 //! session whose epoch's key this process doesn't hold (a server from before identities) goes as
 //! before, unsigned.
 //!
-//! The thing handed on is the session's timeline at the epoch it leaves ("session <id> at epoch
-//! <n>"): its id, that epoch and each of its events' digests (`crate::wire::sums::event`), which
-//! both sides work out alike from the events the package carries. A timeline grows while it's
-//! held, so each epoch's is a thing of its own: the next hand-on is of a timeline made from the one
-//! received, and follows that receipt, and the chain runs on from hand-over to hand-over.
+//! The thing handed on is the session's timeline at the epoch it leaves ([`timeline`]): the next
+//! hand-on is of a timeline made from the one received, and follows that receipt, so the chain
+//! runs on from hand-over to hand-over.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::LazyLock;
@@ -21,14 +19,12 @@ use kiln_ci::identity::custody::{Body, Kind, to_value};
 use kiln_ci::identity::statement::{self, PAYLOAD_CUSTODY, Statement, Subject};
 use parking_lot::Mutex;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
+use crate::custody::{at_epoch, timeline};
 use crate::harness::model::Event;
 use crate::proto::{IdentityAsk, Unbundled};
 use crate::runner::identity;
 
-/// The digest algorithm a session's timeline is named by.
-pub const TIMELINE: &str = "kiln-timeline-v1";
 /// How many records sent are kept, to send again after a reconnect.
 const KEEP: usize = 512;
 
@@ -62,29 +58,6 @@ struct State {
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
-
-/// Session `session`'s timeline as it leaves epoch `epoch` with `events`: the thing its hand-over
-/// is about, named alike by both sides.
-pub fn timeline(session: &str, epoch: u64, events: &[Event]) -> Subject {
-    let mut h = Sha256::new();
-    h.update(session.as_bytes());
-    h.update([0]);
-    h.update(epoch.to_be_bytes());
-    h.update(u64::try_from(events.len()).unwrap_or(u64::MAX).to_be_bytes());
-    for e in events {
-        h.update(serde_json::to_value(e).map(|v| crate::wire::sums::event(&v)).unwrap_or_default().to_be_bytes());
-    }
-    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    let annotations = BTreeMap::from([("epoch".to_owned(), Value::from(epoch)), ("events".to_owned(), Value::from(events.len()))]);
-    Subject { name: format!("session {session} at epoch {epoch}"), digest: BTreeMap::from([(TIMELINE.to_owned(), hex)]), size: None, annotations }
-}
-
-/// The agent identity at `epoch` of the session whose identity at some epoch is `uri`, without the
-/// runner process holding its key: whom a hand-on goes to, or a receipt comes from.
-pub fn at_epoch(uri: &str, epoch: u64) -> Option<String> {
-    let (head, _) = uri.split_once("/epoch/")?;
-    head.contains("/agent/").then(|| format!("{head}/epoch/{epoch}"))
-}
 
 /// `s` signed with slot `slot`'s key, its body naming that identity: its bundle.
 fn sign(slot: &str, by: &str, s: &Statement) -> anyhow::Result<Value> {
@@ -216,24 +189,4 @@ pub fn drain() -> Vec<String> {
 /// What was sent, to send again after a reconnect (the server takes each once).
 pub fn sent() -> Vec<String> {
     STATE.lock().sent.iter().cloned().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// W27-R08: both sides of a hand-over name a session's timeline alike from the same events,
-    /// and differently once an event differs or the epoch does.
-    #[test]
-    fn w27_r08_a_timeline_is_named_alike_by_both_sides() -> anyhow::Result<()> {
-        let events: Vec<Event> = serde_json::from_value(serde_json::json!([]))?;
-        let a = timeline("s1", 3, &events);
-        assert_eq!(a, timeline("s1", 3, &events));
-        assert_ne!(a.digest, timeline("s1", 4, &events).digest);
-        assert_ne!(a.digest, timeline("s2", 3, &events).digest);
-        assert_eq!(a.digest.get(TIMELINE).map(String::len), Some(64));
-        assert_eq!(at_epoch("kiln://o/person/p/agent/s1/epoch/3/machine/m/instance/i", 4).as_deref(), Some("kiln://o/person/p/agent/s1/epoch/4"));
-        assert_eq!(at_epoch("kiln://o/person/p/machine/m/instance/i", 4), None);
-        Ok(())
-    }
 }

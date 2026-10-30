@@ -281,6 +281,46 @@ fn instance(dir: &Path, port: u16, name: &str, id: &str) -> anyhow::Result<agent
     Ok(agents::Runner(child))
 }
 
+/// The epoch session `id` was first certified at: once it is, the process holding it can sign it
+/// on.
+fn first_epoch(port: u16, admin: &str, id: &str) -> anyhow::Result<u64> {
+    until(Duration::from_secs(60), || {
+        let (st, body) = http(port, "GET", "/api/identities?kind=agent", admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let mark = format!("/agent/{id}/epoch/");
+        Ok(v.get("identities").and_then(Value::as_array).and_then(|l| {
+            l.iter().filter(|i| !field(i, "verified").is_empty()).find_map(|i| field(i, "subject").split_once(&mark).and_then(|(_, r)| r.split('/').next()).and_then(|e| e.parse().ok()))
+        }))
+    })
+}
+
+/// Once kiln keeps runner `machine`'s copy of the stand-in harness's own record of a session
+/// (Claude Code's, under `<dir>/home/.claude`), which a resume from kiln's copy carries: the record
+/// written, then the runner's store said to be in step with the server's after its follower can
+/// have found the record (`convo::record` looks for one every 15 s) and the runner said so (every
+/// 5 s).
+fn record_kept(dir: &Path, port: u16, admin: &str, machine: &str) -> anyhow::Result<()> {
+    let records = dir.join("home").join(".claude").join("projects").join("-fake");
+    until(Duration::from_secs(60), || Ok(std::fs::read_dir(&records).ok().and_then(|d| d.flatten().find(|e| e.metadata().is_ok_and(|m| m.len() > 0))).map(|_| ())))?;
+    let after = kiln::util::now_ms() + 25_000;
+    until(Duration::from_secs(120), || {
+        let (st, body) = http(port, "GET", "/api/conversations/status", admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let stores = v.get("stores").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(stores.iter().any(|s| field(s, "machine") == machine && field(s, "role") == "runner" && field(s, "state") == "in_sync" && s.get("heard").and_then(Value::as_i64).is_some_and(|h| h >= after)).then_some(()))
+    })
+}
+
+/// Whether runner `name` is connected, as the server says.
+fn connected(port: u16, admin: &str, name: &str) -> anyhow::Result<bool> {
+    let (_, body) = http(port, "GET", "/api/agents", admin, None)?;
+    let v: Value = serde_json::from_str(&body).unwrap_or_default();
+    let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
+    Ok(list.iter().any(|a| field(a, "name") == name && a.get("connected") == Some(&json!(true))))
+}
+
 /// Polls `f` every 250 ms for up to `within`, until it gives something.
 fn until<T>(within: Duration, mut f: impl FnMut() -> anyhow::Result<Option<T>>) -> anyhow::Result<T> {
     let deadline = std::time::Instant::now() + within;
@@ -333,16 +373,7 @@ fn w27_r08_session_hand_overs_signed_by_both_processes() -> anyhow::Result<()> {
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
-    // Its identity at its first epoch certified, so the process holding it can sign it on.
-    let e0: u64 = until(Duration::from_secs(60), || {
-        let (st, body) = http(port, "GET", "/api/identities?kind=agent", admin, None)?;
-        anyhow::ensure!(st == 200, "{st} {body}");
-        let v: Value = serde_json::from_str(&body)?;
-        let mark = format!("/agent/{id}/epoch/");
-        Ok(v.get("identities").and_then(Value::as_array).and_then(|l| {
-            l.iter().filter(|i| !field(i, "verified").is_empty()).find_map(|i| field(i, "subject").split_once(&mark).and_then(|(_, r)| r.split('/').next()).and_then(|e| e.parse().ok()))
-        }))
-    })?;
+    let e0 = first_epoch(port, admin, &id)?;
     let mut keep = Vec::new();
     keep.push(instance(dir.path(), port, "box-a", "z1")?);
     let one = session_chain(dir.path(), port, admin, &id, 2)?;
@@ -366,5 +397,42 @@ fn w27_r08_session_hand_overs_signed_by_both_processes() -> anyhow::Result<()> {
     let (st, body) = http(port, "GET", "/api/custody/breaks", admin, None)?;
     anyhow::ensure!(st == 200, "{st} {body}");
     assert_eq!(serde_json::from_str::<Value>(&body)?.get("breaks"), Some(&json!([])), "{body}");
+    Ok(())
+}
+
+/// W27-R08 (the Transfers plan's step 3): a session whose machine is away, so can't hand it on,
+/// goes on on another from kiln's copy as kiln's take: signed by kiln's server for the process
+/// that held it, saying when kiln last heard from that machine, and received by the process it
+/// goes to. The chain walks unbroken from that receipt to the take.
+#[test]
+fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    // The stand-in keeps Claude Code's own record of the session, which a resume carries.
+    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
+    let (a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
+    let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &env)?;
+    agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::connected(port, admin, "box-b", &log_b, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let e0 = first_epoch(port, admin, &id)?;
+    record_kept(dir.path(), port, admin, "box-a")?;
+    // box-a goes away: the session goes on on box-b, from kiln's copy.
+    drop(a);
+    until(Duration::from_secs(60), || Ok((!connected(port, admin, "box-a")?).then_some(())))?;
+    let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+    anyhow::ensure!((200..300).contains(&st) && body.contains("from_store"), "{st} {body}");
+    let v = session_chain(dir.path(), port, admin, &id, 2)?;
+    let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (got, took) = (hops.first().cloned().unwrap_or_default(), hops.get(1).cloned().unwrap_or_default());
+    assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&format!("/agent/{id}/epoch/{}/machine/box-b/", e0 + 1)), "{v}");
+    let server = format!("kiln://{}/server", field(&got, "custodian").trim_start_matches("kiln://").split('/').next().unwrap_or_default());
+    assert!(field(&took, "kind") == "taken" && field(&took, "custodian") == server, "{v}");
+    assert!(field(&took, "why").contains("box-a was last heard from at"), "{v}");
+    assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
     Ok(())
 }

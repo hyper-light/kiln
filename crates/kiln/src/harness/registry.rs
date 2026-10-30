@@ -2413,10 +2413,19 @@ impl Registry {
             return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
         }
         let (st, i, f, t) = (store.clone(), id.to_owned(), from_name.clone(), to.to_owned());
-        let pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, &t, cwd.as_deref()))
+        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, &t, cwd.as_deref()))
             .await
             .map_err(|e| format!("{e:#}"))?
             .map_err(|e| format!("{e:#}"))?;
+        // kiln takes it for the process that held it, which can't hand it on: the package carries
+        // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
+        let heard = hub.agents.lock().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
+        let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
+        let why = format!("resumed from kiln's copy: {from_name} was last heard from at {when}");
+        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
+            Ok(take) => pkg.hand_on = take,
+            Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
+        }
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
         // Its copy where it was doesn't count from now on: not here, not in the store (rows that
         // machine still sends are left out).
