@@ -1310,10 +1310,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut server_work = false;
     let mut work_said: Option<(u64, Instant)> = None;
     // The server issues identities (docs/ci.md W27-R01): this process's sessions' epochs, and
-    // when each identity was last asked for.
+    // when each identity was last asked for and how long until it's asked for again.
     let mut server_identity = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
-    let mut identity_asked: HashMap<String, Instant> = HashMap::new();
+    let mut identity_asked: HashMap<String, (Instant, Duration)> = HashMap::new();
     // The server takes word that a frame of its couldn't be read here (`AgentMsg::Unread`): of each
     // kind its newer build sends once an hour on a connection, the rest folded into the next word
     // (`wire::unread::Told`).
@@ -3660,6 +3660,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
+                // Each agent session it holds and has no identity for yet, asked for again: a quiet
+                // one's first ask may have come before the server had its Open, and was refused.
+                if server_identity && connected {
+                    for (session, epoch) in &session_epochs {
+                        ask_agent_identity(&uplink, &mut identity_asked, session, *epoch).await;
+                    }
+                }
                 // What it folded of the server's it couldn't read, and no word carried for a
                 // minute: told now (`wire::unread::Told::flush`).
                 if server_unread && let Some((f, folded)) = told.flush(Instant::now()) {
@@ -4028,15 +4035,22 @@ fn note_announced(announced: &mut std::collections::HashSet<String>, session: &s
 }
 
 /// Sends what the channel has to send now.
+/// How long after asking for an agent session's identity it's asked for again, at first; each time
+/// after, twice as long, up to [`AGENT_IDENTITY_MOST`].
+const AGENT_IDENTITY_AGAIN: Duration = Duration::from_secs(5);
+const AGENT_IDENTITY_MOST: Duration = Duration::from_secs(600);
+
 /// Asks for agent session `session`'s identity at `epoch` (docs/ci.md W27-R01), unless this
-/// process holds one or asked in the last 5 s: a session kiln hasn't heard of yet is refused, and
-/// asked for again as it goes on.
-async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, Instant>, session: &str, epoch: u64) {
+/// process holds one or asked lately ([`AGENT_IDENTITY_AGAIN`], doubling each time). A session kiln
+/// hasn't heard of yet is refused (the ask can come before its Open, which rides the channel), and
+/// asked for again as it goes on and on the heartbeat, so one that goes quiet gets it too.
+async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, (Instant, Duration)>, session: &str, epoch: u64) {
     let slot = crate::runner::identity::slot("agent", Some(session), Some(epoch));
-    if crate::runner::identity::cert(&slot).is_some() || asked.get(&slot).is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+    if crate::runner::identity::cert(&slot).is_some() || asked.get(&slot).is_some_and(|(at, wait)| at.elapsed() < *wait) {
         return;
     }
-    asked.insert(slot, Instant::now());
+    let wait = asked.get(&slot).map_or(AGENT_IDENTITY_AGAIN, |(_, wait)| wait.saturating_mul(2).min(AGENT_IDENTITY_MOST));
+    asked.insert(slot, (Instant::now(), wait));
     match crate::runner::identity::ask("agent", Some(session), Some(epoch)) {
         Ok(json) => {
             uplink.0.send(Up::Term(AgentMsg::Identity { json })).await.ok();
