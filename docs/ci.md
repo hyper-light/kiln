@@ -8781,7 +8781,10 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
 
   Not yet: signatures. The resolutions' revisions go through `revision::commit` and the person's
   acceptance is kept on the ladder's record (`review_ladders.accepted_statement`, a statement's
-  JSON bundle), so W27-R03 and R04 sign them where they're made; until then they read unsigned.
+  JSON bundle), so W27-R03 and R04 sign them where they're made: W27-R03 (built, not yet on main)
+  signs `revision::commit`'s commits as kiln's server, so kiln's structural merge and a remembered
+  resolution verify as the server, and an agent's work as the agent; W27-R04 (verdicts) will sign
+  the acceptance. On main they read unsigned (`signer` null).
 - *R18*, Hand off (`crates/kiln/src/ship.rs`'s `hand_off`, `POST /api/ship/hand-off`, migration
   `20261029-0100_w26_handoffs`). A row's Hand off names one endpoint, and the server decides
   where it goes. While the change's author's agent runs, it gets the conflicts, open threads and
@@ -8825,7 +8828,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     history; the whole replay is the ignored `w26_r17_structural_against_real_merges`, reading
     `KILN_MERGE_CASES`); kiln `tests/ladder.rs` on real git (a remembered resolution offered again,
     one whose tests fail handing on, the goal's D42 with one hunk merged structurally) and
-    `tests/ladder_agents.rs` with the fake harness acting (`FAKE_CLAUDE_ACT`): the author's agent
+    `tests/ladder_agents.rs` with the fake harness acting (`FAKE_CLAUDE_ACT`): no agent while
+    `fresh.conflict-agents` is unset, saying why, and one on a runner once it's on
+    (`w26_r16_conflict_agent_only_when_on`); the author's agent
     resolving in its own workspace and waiting for a person (Ship's row reading fixing), a sent
     agent with automatic resolution on, and the land queue holding a conflict until it's accepted;
     `tests/ladder.rs`' `w26_r17_a_conflicted_replay_keeps_the_stack_moving` (with W26-R16's
