@@ -317,6 +317,7 @@ async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::R
     let tip_name = format!("{trunk}@{}", tip.get(..7).unwrap_or(tip));
     let mut out = Round::default();
     let mut refs = String::from("start\n");
+    let mut clean_pulls: Vec<i64> = Vec::new();
     for p in &found {
         if gitops::ensure_commit(hub, repo, &p.head).await.is_err() {
             tracing::warn!(repo = %repo.name, host = %p.host, number = p.number, head = %p.head, "a pull request's head isn't in the mirror: it isn't replayed");
@@ -349,6 +350,9 @@ async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::R
             None
         };
         let k = keep_pull_replay(hub, repo, p, tip, &tip_name, &merged.tree, commit.as_deref()).await?;
+        if commit.is_some() {
+            clean_pulls.push(p.number);
+        }
         if let Some(c) = &commit {
             refs.push_str(&format!("update refs/kiln/pulls/{}/{}/replays/{k} {c}\n", p.host, p.number));
             out.replayed += 1;
@@ -359,6 +363,11 @@ async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::R
     if out.replayed > 0 {
         refs.push_str("prepare\ncommit\n");
         diffs::git_with_input(hub, &["-C", &path, "update-ref", "--stdin"], refs.into_bytes()).await?;
+    }
+    // Pushed to the host now only where the repository turned automatic pushes on.
+    if policy.fresh.push == plan::Push::Auto && !clean_pulls.is_empty() {
+        let (hub2, repo2) = (Arc::clone(hub), repo.clone());
+        crate::rt::spawn(async move { auto_push_pulls(&hub2, &repo2, &clean_pulls).await });
     }
     if out.replayed + out.conflicted > 0 {
         hub.store.audit("kiln".into(), "review.fresh".into(), format!("{} {tip_name}: {} pull requests replayed, {} conflicted", repo.name, out.replayed, out.conflicted)).await;
@@ -624,4 +633,101 @@ async fn verbatim(hub: &Hub, path: &str, commit: &str) -> Option<String> {
     let patch = diffs::git_run(hub, &["-C", path, "show", "--no-color", "--format=", commit], &[], Vec::new()).await.ok()?.out;
     let out = diffs::git_with_input(hub, &["-C", path, "patch-id", "--verbatim"], patch).await.ok()?;
     String::from_utf8_lossy(&out).split_whitespace().next().map(str::to_owned)
+}
+
+/// A host's pull request's latest replay onto its base, as Update pushes it: its host, the head it
+/// was made from, and its commit (none: it conflicted).
+struct PullReplay {
+    host: String,
+    head: String,
+    commit: Option<String>,
+}
+
+/// Pull request `number` of `repo`: its latest replay of its latest head, if it has one.
+async fn pull_replay(hub: &Hub, repo: &Repo, number: i64) -> anyhow::Result<Option<PullReplay>> {
+    let rid = repo.id.clone();
+    hub.store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row(
+                "SELECT r.host, r.head_sha, r.commit_sha FROM review_pull_replays r
+                  WHERE r.repo_id = ?1 AND r.number = ?2
+                    AND r.head_sha = (SELECT h.sha FROM host_pull_heads h WHERE h.repo_id = r.repo_id AND h.host = r.host AND h.number = r.number ORDER BY h.n DESC LIMIT 1)
+                  ORDER BY r.k DESC LIMIT 1",
+                rusqlite::params![rid, number],
+                |r| Ok(PullReplay { host: r.get(0)?, head: r.get(1)?, commit: r.get(2)? }),
+            )
+            .optional()?)
+        })
+        .await
+}
+
+/// Pushes pull request `number`'s replay to its host through the forge seam (W26-R20): GitHub's
+/// update-branch against the head it was made from (the base merged in by GitHub itself; kiln never
+/// pushes its own commit there), GitLab's rebase, or elsewhere the replay pushed with a lease. What
+/// happened, in words; or why not.
+async fn push_pull(hub: &Arc<Hub>, repo: &Repo, number: i64, by: &str) -> Result<serde_json::Value, (http::StatusCode, String)> {
+    use http::StatusCode;
+    use kiln_seams::forge::{Forge as _, Refusal, Update, Updated};
+    let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    let r = pull_replay(hub, repo, number).await.map_err(fail)?.ok_or((StatusCode::CONFLICT, format!("#{number} hasn't been replayed onto its base: nothing to update")))?;
+    let Some(commit) = r.commit else { return Err((StatusCode::CONFLICT, format!("#{number} conflicts with its base: resolve its conflicts first"))) };
+    let (forge, name) = crate::githost::forge::for_repo(hub, repo).await.ok_or((StatusCode::CONFLICT, format!("{} isn't on a host kiln reaches", repo.name)))?;
+    let n = u64::try_from(number).unwrap_or_default();
+    // GitHub and GitLab update a branch themselves; elsewhere kiln's replay is pushed with a lease.
+    let replayed = (!matches!(r.host.as_str(), "github" | "gitlab")).then(|| commit.clone());
+    match forge.update(&name, n, Update { expected: r.head.clone(), replayed }).await {
+        Ok(Updated::Done { head }) => {
+            hub.store.audit(by.to_owned(), "review.fresh.update".into(), format!("{} #{number}: updated on {} to {head}", repo.name, r.host)).await;
+            Ok(serde_json::json!({ "change": format!("#{number}"), "host": r.host, "head": head, "state": "updated" }))
+        }
+        Ok(Updated::Started) => {
+            hub.store.audit(by.to_owned(), "review.fresh.update".into(), format!("{} #{number}: updating on {}, from {}", repo.name, r.host, r.head)).await;
+            Ok(serde_json::json!({ "change": format!("#{number}"), "host": r.host, "head": r.head, "state": "updating" }))
+        }
+        Err(Refusal::Moved { head }) => Err((StatusCode::CONFLICT, format!("#{number}'s head moved since its replay (now {}): it replays again first", head.get(..7).unwrap_or(&head)))),
+        Err(Refusal::RateLimited { resets_at }) => Err((StatusCode::TOO_MANY_REQUESTS, format!("{} is past its rate limit until {resets_at}: Update waits", r.host))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, format!("{} didn't update #{number}: {e}", r.host))),
+    }
+}
+
+/// `POST /api/ci/repos/:repo/pulls/:n/update` (W26-R16): someone pressed Update on a host's pull
+/// request.
+pub async fn update_pull(hub: &Arc<Hub>, repo: &str, n: &str, caller: Option<&crate::authz::Caller>) -> Result<serde_json::Value, (http::StatusCode, String)> {
+    use http::StatusCode;
+    let number: i64 = n.trim_start_matches('#').parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("`{n}` isn't a pull request's number")))?;
+    let r = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.name == repo).ok_or((StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
+    push_pull(hub, &r, number, caller.map_or("admin", |c| c.name.as_str())).await
+}
+
+/// The most of a host's hourly requests automatic pushes leave untouched: they stop below a fifth
+/// left, saying so (the GitHub-in-Ship agent's advice: the limit is shared with everything else the
+/// connection does, and GitHub has secondary limits on content-creating calls).
+const AUTO_PUSH_FLOOR: u32 = 5;
+
+/// Pushes each of `numbers`' replays automatically (`fresh.push: auto`), at least a second apart,
+/// stopping below a fifth of the host's hourly limit left or on any rate refusal.
+async fn auto_push_pulls(hub: &Arc<Hub>, repo: &Repo, numbers: &[i64]) {
+    use kiln_seams::forge::Forge as _;
+    let Some((forge, name)) = crate::githost::forge::for_repo(hub, repo).await else { return };
+    for (i, n) in numbers.iter().enumerate() {
+        if i > 0 {
+            crate::rt::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if let Ok(rate) = forge.rate(&name).await
+            && rate.remaining.saturating_mul(AUTO_PUSH_FLOOR) < rate.limit
+        {
+            tracing::warn!(repo = %repo.name, remaining = rate.remaining, limit = rate.limit, "automatic pushes stop: under a fifth of the host's hourly limit is left");
+            hub.store.audit("kiln".into(), "review.fresh.push".into(), format!("{}: automatic pushes held, {} of {} requests left this hour", repo.name, rate.remaining, rate.limit)).await;
+            return;
+        }
+        match push_pull(hub, repo, *n, "kiln").await {
+            Ok(_) => {}
+            Err((http::StatusCode::TOO_MANY_REQUESTS, why)) => {
+                tracing::warn!(repo = %repo.name, %why, "automatic pushes stop: the host's rate limit");
+                return;
+            }
+            Err((_, why)) => tracing::info!(repo = %repo.name, pull = n, %why, "a pull request's replay wasn't pushed automatically"),
+        }
+    }
 }

@@ -55,6 +55,8 @@ struct Sim {
     /// A bare repository it serves as `/<name>.git` over git's dumb HTTP (its files as they are,
     /// after `git update-server-info`), for a test with real git behind it.
     git: Mutex<Option<std::path::PathBuf>>,
+    /// GitHub's update-branch calls it took: the pull request and its `expected_head_sha`.
+    updates: Mutex<Vec<(u64, String)>>,
 }
 
 fn stamp(t: i64) -> String {
@@ -64,7 +66,7 @@ fn stamp(t: i64) -> String {
 impl Sim {
     fn start(host: Host, name: &str) -> anyhow::Result<Arc<Sim>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
-        let sim = Arc::new(Sim { host, name: name.into(), port: listener.local_addr()?.port(), pulls: Mutex::default(), counted: AtomicUsize::new(0), free: AtomicUsize::new(0), git: Mutex::default() });
+        let sim = Arc::new(Sim { host, name: name.into(), port: listener.local_addr()?.port(), pulls: Mutex::default(), counted: AtomicUsize::new(0), free: AtomicUsize::new(0), git: Mutex::default(), updates: Mutex::default() });
         let s = Arc::clone(&sim);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -122,6 +124,19 @@ impl Sim {
                 }
                 Err(_) => write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?,
             }
+            return Ok(());
+        }
+        // GitHub's update-branch (W26-R16's Update): taken, its base merged in the background.
+        if method == "PUT"
+            && let Some(n) = path.strip_prefix(&format!("/repos/{}/pulls/", self.name)).and_then(|r| r.strip_suffix("/update-branch")).and_then(|n| n.parse::<u64>().ok())
+        {
+            let expected = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v.get("expected_head_sha").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+            if let Ok(mut u) = self.updates.lock() {
+                u.push((n, expected));
+            }
+            self.counted.fetch_add(1, Ordering::Relaxed);
+            let mut s = stream;
+            write!(s, "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}")?;
             return Ok(());
         }
         let (status, reply) = self.answer(&method, &path, &auth);
@@ -439,11 +454,11 @@ fn find_dir(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// W26-R16 on a host's pull request, real git behind GitHub's simulator: when the base branch moves,
-/// kiln replays pull request #7 onto it in its own mirror (its base merged into its head, kiln the
-/// committer) and keeps it at `refs/kiln/pulls/github/7/replays/1`; nothing moves on the host.
-#[test]
-fn w26_r16_a_pull_request_is_replayed_in_kilns_mirror() -> anyhow::Result<()> {
+/// GitHub's simulator with real git behind it: `acme/gh`, its main, and pull request #7's head at
+/// refs/pull/7/head, `review` as main's `.kiln/review.yaml` when given; a kiln server mirroring it,
+/// once #7 is in Ship. (The temp dir, the server, the simulator, #7's head, the host's work tree
+/// and bare repository.)
+fn pull_on_github(review: Option<&str>) -> anyhow::Result<(tempfile::TempDir, common::Server, Arc<Sim>, String, std::path::PathBuf, std::path::PathBuf)> {
     let dir = tempfile::tempdir()?;
     let d = dir.path().display().to_string();
     let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow::anyhow!("keygen"))?;
@@ -459,6 +474,10 @@ fn w26_r16_a_pull_request_is_replayed_in_kilns_mirror() -> anyhow::Result<()> {
     let work = host_git.join("work");
     std::fs::write(work.join("README.md"), "app\n")?;
     std::fs::write(work.join("f.txt"), "one\n")?;
+    if let Some(r) = review {
+        std::fs::create_dir_all(work.join(".kiln"))?;
+        std::fs::write(work.join(".kiln/review.yaml"), r)?;
+    }
     git(&work, &["add", "-A"])?;
     git(&work, &["commit", "-qm", "first"])?;
     git(&work, &["push", "-q", "origin", "HEAD:main"])?;
@@ -478,12 +497,21 @@ fn w26_r16_a_pull_request_is_replayed_in_kilns_mirror() -> anyhow::Result<()> {
     let ci = format!("github = {{ app_id = 99, private_key_file = \"{d}/app.pem\", api_url = \"http://127.0.0.1:{0}\", web_url = \"http://127.0.0.1:{0}\" }}", gh.port);
     let extra = format!("[[repos]]\nname = \"acme/gh\"\nclone_url = \"http://127.0.0.1:{}/acme/gh.git\"\npoll_seconds = 1\n", gh.port);
     let srv = start(dir.path(), &Options { ci: &ci, extra: &extra, ..Options::default() })?;
-    let (port, admin) = (srv.port, srv.admin.as_str());
     until(60, "#7 mirrored into Ship", || {
-        let (_, body) = http(port, "GET", "/api/ship/commits?repo=acme/gh", admin, None)?;
+        let (_, body) = http(srv.port, "GET", "/api/ship/commits?repo=acme/gh", &srv.admin, None)?;
         Ok((!body.contains(&head)).then(|| format!("{body}\n{}", srv.log())))
     })?;
     std::thread::sleep(Duration::from_secs(2));
+    Ok((dir, srv, gh, head, work, bare))
+}
+
+/// W26-R16 on a host's pull request, real git behind GitHub's simulator: when the base branch moves,
+/// kiln replays pull request #7 onto it in its own mirror (its base merged into its head, kiln the
+/// committer) and keeps it at `refs/kiln/pulls/github/7/replays/1`; nothing moves on the host.
+#[test]
+fn w26_r16_a_pull_request_is_replayed_in_kilns_mirror() -> anyhow::Result<()> {
+    let (dir, srv, gh, head, work, bare) = pull_on_github(None)?;
+    let (port, admin) = (srv.port, srv.admin.as_str());
 
     // main moves on the host.
     git(&work, &["checkout", "-q", "main"])?;
@@ -512,5 +540,31 @@ fn w26_r16_a_pull_request_is_replayed_in_kilns_mirror() -> anyhow::Result<()> {
     assert_eq!(git(&mirror, &["show", &format!("{replay}:f.txt")])?, "one, in #7");
     assert_eq!(git(&mirror, &["show", &format!("{replay}:z.txt")])?, "elsewhere");
     assert_eq!(git(&bare, &["for-each-ref", "--format=%(refname) %(objectname)"])?, host_refs, "nothing moved on the host");
+    assert!(gh.updates.lock().map(|u| u.is_empty()).unwrap_or(false), "nothing asked of GitHub until Update");
+
+    // Update: GitHub's update-branch, against the head the replay was made from.
+    let (st, body) = http(port, "POST", "/api/ci/repos/acme%2Fgh/pulls/7/update", admin, Some(&json!({})))?;
+    assert_eq!(st, 200, "{body}");
+    let r: Value = serde_json::from_str(&body)?;
+    assert_eq!((s(&r, "/host"), s(&r, "/state")), ("github", "updating"), "{r}");
+    assert_eq!(gh.updates.lock().map(|u| u.clone()).unwrap_or_default(), vec![(7, head.clone())]);
+    Ok(())
+}
+
+/// W26-R16 on a host's pull request with `fresh.push: auto`: as main moves, kiln pushes #7's replay
+/// to GitHub by itself (update-branch against the head it was made from), nobody pressing Update.
+#[test]
+fn w26_r16_a_pull_request_is_pushed_automatically_when_declared() -> anyhow::Result<()> {
+    let (_dir, _srv, gh, head, work, bare) = pull_on_github(Some("fresh:\n  push: auto\n"))?;
+    git(&work, &["checkout", "-q", "main"])?;
+    std::fs::write(work.join("z.txt"), "elsewhere\n")?;
+    git(&work, &["add", "z.txt"])?;
+    git(&work, &["commit", "-qm", "main moves"])?;
+    git(&work, &["push", "-q", "origin", "HEAD:main"])?;
+    git(&bare, &["update-server-info"])?;
+    until(60, "#7 pushed to GitHub by itself", || {
+        let u = gh.updates.lock().map(|u| u.clone()).unwrap_or_default();
+        Ok((u != vec![(7, head.clone())]).then(|| format!("{u:?}")))
+    })?;
     Ok(())
 }
