@@ -107,11 +107,39 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
     }
     for id in ids {
         let Some(d) = diffs::find(hub, &id).await? else { continue };
-        if let Err((_, why)) = climb(hub, &d).await {
-            tracing::info!(diff = %d.name, %why, "the conflict ladder couldn't move this change");
+        match climb(hub, &d).await {
+            Ok(()) => {
+                retries().lock().remove(&id);
+            }
+            // Tried again on the next tick, a while: a replay kiln is still keeping as a revision
+            // (W26-R16) reads as moved until its version is in.
+            Err((_, why)) => {
+                let n = {
+                    let mut r = retries().lock();
+                    let n = r.entry(id.clone()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if n <= RETRIES {
+                    kicked().lock().insert(id);
+                    tracing::info!(diff = %d.name, %why, try = n, "the conflict ladder couldn't move this change yet");
+                } else {
+                    retries().lock().remove(&id);
+                    tracing::warn!(diff = %d.name, %why, "the conflict ladder couldn't move this change; it moves again when it's kicked");
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// How many ticks in a row a change's climb is tried again after failing.
+const RETRIES: u32 = 20;
+
+/// Each change's climbs failed in a row.
+fn retries() -> &'static parking_lot::Mutex<HashMap<String, u32>> {
+    static R: OnceLock<parking_lot::Mutex<HashMap<String, u32>>> = OnceLock::new();
+    R.get_or_init(Default::default)
 }
 
 /// How the workflows `started` on `sha` have done: none started is none to run.
