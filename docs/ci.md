@@ -1898,8 +1898,13 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   fence: the epoch it was made in, then its number among that epoch's grants. A later grant's fence
   is greater, and no two grants share one, not even an attempt granted again after a refusal
   (W05-R02 keeps the attempt). A grant expires a lease after it's made (`[sched] lease`, 60 s by
-  default, at least 20 s) unless its runner renews it: a runner's heartbeat, every 10 s, renews
-  the grants of the legs it names, each that's its own by its fence, for a lease from then. A grant
+  default, at least 20 s) unless its runner renews it, every 10 s, for a lease from then: a runner
+  that says `CAP_LEASES` (docs/wire.md) names each grant it holds by its fence (`Renew`), and is
+  answered with those that aren't its own any more (`Renewed`); an older runner's heartbeat names
+  the legs it runs, each renewed by the fence of the grant it was sent. A lease runner's leg comes
+  with its grant (`AssignV2`'s `fence`, `lease_ms`, `on_lease_loss`), and what the runner sends
+  about the leg names it: its steps, events and result (`Fenced`), a refusal (`Refused`), its
+  output (the `fenced-logs` lane); the server stops one by its grant (`Stop`). A grant
   not renewed by its expiry is lost before anything else is decided at that time (the scheduler
   asks for a timer at the next expiry), and the scheduler says so (`Lost`); its attempt ends
   `runner-lost`, "its lease ran out", and is retried as W05-R16 says. An item that stops on losing

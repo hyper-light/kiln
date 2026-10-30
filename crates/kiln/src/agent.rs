@@ -281,6 +281,40 @@ pub(crate) fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>,
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
 const CANCEL_GRACE: Duration = Duration::from_secs(120);
 
+/// A frame as the server takes it (docs/ci.md W05-R34): to a server that takes leases, what this
+/// runner sends about a leg it holds a grant for goes fenced by that grant (its steps, events and
+/// result carried whole, a refusal naming it, its output on [`proto::LANE_FENCED_LOGS`]); the rest,
+/// and everything to an older server, as it is. What's kept to send again after a reconnect is kept
+/// as it is, and goes this way then, to whichever server that is.
+fn wire_form(lane: u32, kind: Kind, data: Vec<u8>, grants: &HashMap<String, proto::Grant>, leases: bool) -> (u32, Kind, Vec<u8>) {
+    if !leases || grants.is_empty() {
+        return (lane, kind, data);
+    }
+    if lane == LANE_LOGS
+        && let Ok(c) = proto::decode::<proto::LogChunk>(&data)
+        && let Some(grant) = grants.get(&c.job)
+        && let Ok(b) = proto::encode(&proto::FencedLog { grant: grant.clone(), idx: c.idx, data: c.data })
+    {
+        return (proto::LANE_FENCED_LOGS, kind, b);
+    }
+    if lane == LANE_CONTROL
+        && let Ok(m) = proto::decode::<AgentMsg>(&data)
+        && let Some(f) = proto::fenced(m, grants)
+        && let Ok(b) = proto::encode(&f)
+    {
+        return (lane, kind, b);
+    }
+    (lane, kind, data)
+}
+
+/// The grants this runner holds (docs/ci.md W05-R34): each leg it runs, or whose result the server
+/// hasn't said it has, that its assignment gave a grant; in the order of their legs.
+fn held_grants(grants: &HashMap<String, proto::Grant>, jobs: &HashMap<String, Running>, unreceived: &HashMap<String, (Instant, Vec<u8>)>) -> Vec<proto::Grant> {
+    let mut held: Vec<proto::Grant> = grants.iter().filter(|(job, _)| jobs.contains_key(*job) || unreceived.contains_key(*job)).map(|(_, g)| g.clone()).collect();
+    held.sort_by(|a, b| a.leg.cmp(&b.leg));
+    held
+}
+
 /// One turn of the agent's event loop (computed inside `select!`, handled after it).
 enum Ev {
     Shutdown,
@@ -1279,6 +1313,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server was told this machine holds, on this connection; and whether it takes that.
     let mut limit_said: Option<crate::harness::limit::Held> = None;
     let mut server_limit = false;
+    // The server takes leases (docs/ci.md W05-R34), said on this connection: this runner renews its
+    // grants (`Renew`, numbered) and fences what it sends about their legs by them. Each leg's grant,
+    // as its assignment named it, is kept while the leg runs and until the server has its result.
+    let mut server_leases = false;
+    let mut grants: HashMap<String, proto::Grant> = HashMap::new();
+    let mut renew_seq = 0u64;
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
@@ -1994,7 +2034,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_LEASES }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2071,6 +2111,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 work_said = None;
                 server_limit = false;
                 limit_said = None;
+                server_leases = false;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -2160,6 +2201,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
                         server_limit = caps & proto::CAP_AGENT_LIMIT != 0;
+                        server_leases = caps & proto::CAP_LEASES != 0;
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
@@ -2194,19 +2236,29 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // What waited for the connection, in order: what was held while it was
                         // down, the jobs' events again, then their results not yet received.
                         welcomed = true;
+                        // Its grants first, renewed before anything else (W05-R34).
+                        if server_leases {
+                            renew_seq += 1;
+                            if let Ok(b) = proto::encode(&AgentMsg::Renew { seq: renew_seq, held: held_grants(&grants, &jobs, &unreceived) }) {
+                                net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                            }
+                        }
                         while let Some((lane, kind, data)) = buffer.pop_front() {
                             buffered = buffered.saturating_sub(data.len());
+                            let (lane, kind, data) = wire_form(lane, kind, data, &grants, server_leases);
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
                         if receipts {
                             for (_, _, events) in journal.values() {
                                 for data in events {
-                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                                    let (lane, kind, data) = wire_form(LANE_CONTROL, Kind::Control, data.clone(), &grants, server_leases);
+                                    net.send(SERVER_PEER, lane, kind, data).await;
                                 }
                             }
                         }
                         for (_, data) in unreceived.values() {
-                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                            let (lane, kind, data) = wire_form(LANE_CONTROL, Kind::Control, data.clone(), &grants, server_leases);
+                            net.send(SERVER_PEER, lane, kind, data).await;
                         }
                         // Drained or not is the server's to say again on each connection (it sends
                         // Drain next when this one isn't the machine's newest).
@@ -2368,6 +2420,27 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             });
                         } else {
                             refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
+                        }
+                    }
+                    // Its grant to stop (W05-R34): another of the leg's grants it runs since is let be.
+                    ServerMsg::Stop { grant, reason } => match jobs.get(&grant.leg).filter(|_| grants.get(&grant.leg) == Some(&grant)) {
+                        Some(r) => {
+                            tracing::info!(job = %grant.leg, attempt = grant.attempt, %reason, "stopping job");
+                            r.cancel.cancel();
+                            let (tx, j) = (done_tx.clone(), grant.leg.clone());
+                            crate::rt::spawn(async move {
+                                crate::rt::sleep(CANCEL_GRACE).await;
+                                let error = format!("stopped; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
+                                let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                            });
+                        }
+                        None => refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no grant {}.{} of {} runs here", grant.epoch, grant.n, grant.leg)),
+                    },
+                    // What the server renewed (W05-R34); a grant it says isn't this runner's any more
+                    // is the server's to stop.
+                    ServerMsg::Renewed { lost, .. } => {
+                        for g in lost {
+                            tracing::warn!(job = %g.leg, attempt = g.attempt, "the server says this runner's grant for the leg isn't its own any more");
                         }
                     }
                     ServerMsg::Drain => draining = true,
@@ -2979,7 +3052,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
-                            uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
+                            // To a server that takes leases, naming the grant refused (W05-R34).
+                            let refusal = match a.fence {
+                                Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: reason.into() },
+                                _ => AgentMsg::Reject { job: id, reason: reason.into() },
+                            };
+                            uplink.msg(refusal).await;
                             continue;
                         }
                         // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
@@ -2987,9 +3065,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if o.ephemeral {
                             served_dedicated = true;
                         }
-                        // A new attempt: its events count from one.
+                        // A new attempt: its events count from one, and it runs under its own grant
+                        // (W05-R34), none from an older server.
                         journal.remove(&id);
                         unreceived.remove(&id);
+                        match a.fence {
+                            Some(fence) => grants.insert(id.clone(), proto::Grant::of(&id, a.attempt, fence)),
+                            None => grants.remove(&id),
+                        };
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
@@ -3170,6 +3253,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Received { job } if job.is_empty() => receipts = true,
                     ServerMsg::Received { job } => {
                         unreceived.remove(&job);
+                        if !jobs.contains_key(&job) {
+                            grants.remove(&job);
+                        }
                         if let Some((_, _, events)) = journal.get_mut(&job) {
                             events.clear();
                         }
@@ -3268,6 +3354,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some());
                 // Logs and jobs' messages wait for the Welcome too, and come after what waited.
                 if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    let (lane, kind, data) = wire_form(lane, kind, data, &grants, server_leases);
                     match &delay_line {
                         Some(d) => d.send(lane, kind, data, again),
                         None => {
@@ -3358,9 +3445,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
                     }
                 }
-                if connected {
+                grants.retain(|job, _| jobs.contains_key(job) || unreceived.contains_key(job));
+                if connected && server_leases {
+                    // A lease runner's heartbeat renews the grants it holds (W05-R34).
+                    renew_seq += 1;
+                    uplink.msg(AgentMsg::Renew { seq: renew_seq, held: held_grants(&grants, &jobs, &unreceived) }).await;
+                } else if connected {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
+                }
+                if connected {
                     // Its machine's say on upgrades, read again: a change goes to the server at once.
                     if !o.ephemeral && !o.outpost {
                         let accept = takes_updates(&o);

@@ -25,7 +25,7 @@ use rusqlite::OptionalExtension as _;
 
 use super::runs;
 use crate::hub::Hub;
-use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, JobResult, LANE_CONTROL, ServerMsg};
+use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, CAP_LEASES, JobResult, LANE_CONTROL, ServerMsg};
 use crate::store::{Repo, Status};
 
 /// A run to start: a workflow that matched an event.
@@ -69,6 +69,9 @@ pub enum Msg {
     RunnerLost { agent: String },
     /// A runner's heartbeat named the legs it runs: it renews their grants (W05-R34).
     Renew { agent: String, running: Vec<String> },
+    /// A lease runner's process `peer` renews the grants it names (W05-R34): it's answered which of
+    /// them aren't its own any more (`Renewed`, under `seq`).
+    Leased { agent: String, peer: hyper_transport::PeerId, seq: u64, held: Vec<crate::proto::Grant> },
     /// A runner's probes reported (W13-R01): it is routed by what they found.
     RunnerFacts { agent: String },
     Event { agent: String, leg: String, json: String },
@@ -81,6 +84,8 @@ pub enum Msg {
     Rejected {
         agent: String,
         leg: String,
+        /// The grant it refused, as a lease runner names it (W05-R34); else the leg's now.
+        fence: Option<Fence>,
     },
     Cancel {
         run: String,
@@ -135,6 +140,8 @@ struct Placement {
     docker: Option<String>,
     /// The pool's executor it runs in (W13-R09).
     slot: Option<String>,
+    /// Its grant (W05-R34): its fence, and what its runner does once its lease is lost.
+    grant: Option<(Fence, kiln_ci::sched::LeaseLoss)>,
 }
 
 pub use kiln_ci::plan::rerun::Mode as RerunMode;
@@ -1146,6 +1153,19 @@ impl Dispatch {
                 self.commands(cmds).await;
                 Ok(())
             }
+            // Each grant it names that's its own: renewed by the scheduler, then this runner process
+            // told which aren't its own any more.
+            Msg::Leased { agent, peer, seq, held } => {
+                let named: Vec<(String, Fence)> = held.iter().filter_map(|g| self.held_by(&agent, g).map(|f| (g.leg.clone(), f))).collect();
+                if !named.is_empty() {
+                    let cmds = self.sched.handle(Input::Renewed { runner: agent.clone(), held: named }, now_ms());
+                    self.commands(cmds).await;
+                }
+                let lost: Vec<crate::proto::Grant> = held.into_iter().filter(|g| self.held_by(&agent, g).is_none()).collect();
+                let lease_ms = self.sched.lease().unwrap_or(0);
+                self.hub.send_peer(peer, &ServerMsg::Renewed { seq, lease_ms, epoch: self.sched.epoch(), lost }).await;
+                Ok(())
+            }
             // The legs it names that are its own now, each by the fence of the grant it was sent.
             Msg::Renew { agent, running } => {
                 let held: Vec<(String, Fence)> = running.into_iter().filter_map(|id| self.legs.get(&id).filter(|l| l.agent.as_deref() == Some(agent.as_str())).map(|l| (id, l.fence))).collect();
@@ -1161,12 +1181,16 @@ impl Dispatch {
                 self.repo_deleted(&repo).await;
                 Ok(())
             }
-            Msg::Rejected { agent, leg } => {
-                self.hub.release_slot(&agent, &leg);
-                let mut fence = Fence::default();
-                if let Some(l) = self.legs.get_mut(&leg) {
-                    l.agent = None;
-                    fence = l.fence;
+            Msg::Rejected { agent, leg, fence: named } => {
+                // A lease runner's refusal of a grant that isn't the leg's now (one sent late)
+                // changes nothing (W05-R34): the scheduler sees it's not, and the leg's runner stays.
+                let now = self.legs.get(&leg).map(|l| l.fence).unwrap_or_default();
+                let fence = named.unwrap_or(now);
+                if fence == now {
+                    self.hub.release_slot(&agent, &leg);
+                    if let Some(l) = self.legs.get_mut(&leg) {
+                        l.agent = None;
+                    }
                 }
                 let cmds = self.sched.handle(Input::Rejected { leg, fence }, now_ms());
                 self.commands(cmds).await;
@@ -1365,6 +1389,14 @@ impl Dispatch {
         tracing::warn!(legs = gone.len(), "legs' runners didn't come back after the restart: the legs were lost with them");
         let cmds = self.lose(gone, "its runner didn't come back after the server restarted").await;
         self.commands(cmds).await;
+    }
+
+    /// The fence `agent`'s grant `g` is renewed by, if it's the agent's own now (W05-R34): by its
+    /// fence; or, adopted after a restart with no fence kept (the store keeps one from E3.7), by its
+    /// leg, as an older runner's are.
+    fn held_by(&self, agent: &str, g: &crate::proto::Grant) -> Option<Fence> {
+        let l = self.legs.get(&g.leg).filter(|l| l.agent.as_deref() == Some(agent))?;
+        (l.fence == g.fence() || l.fence == Fence::default()).then_some(l.fence)
     }
 
     /// `gone`'s legs (each with its attempt) lost with their runner: each attempt fails so, for the
@@ -2193,11 +2225,11 @@ impl Dispatch {
                     self.actions(&run, held).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
-                Command::Assign { leg, runner, attempt, executor, image, docker, slot, fence, .. } => {
+                Command::Assign { leg, runner, attempt, executor, image, docker, slot, fence, lease_loss, .. } => {
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.fence = fence;
                     }
-                    self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await
+                    self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot, grant: Some((fence, lease_loss)) }).await
                 }
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
                 // its containers in it when it has them.
@@ -2235,8 +2267,15 @@ impl Dispatch {
                     Ok(())
                 }
                 Command::Cancel { leg, reason, .. } => {
-                    if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
-                        self.hub.command_start(&agent, &ServerMsg::Cancel { job: leg, reason }).await.log_when_answered(crate::hub::LOG_WITHIN);
+                    if let Some((agent, attempt, fence)) = self.legs.get(&leg).and_then(|l| l.agent.clone().map(|a| (a, l.attempt, l.fence))) {
+                        // A lease runner is told which grant to stop (W05-R34): another of the leg's
+                        // it runs since is let be.
+                        let msg = if self.hub.runner_wide_caps(&agent) & CAP_LEASES != 0 && fence != Fence::default() {
+                            ServerMsg::Stop { grant: crate::proto::Grant::of(&leg, attempt, fence), reason }
+                        } else {
+                            ServerMsg::Cancel { job: leg, reason }
+                        };
+                        self.hub.command_start(&agent, &msg).await.log_when_answered(crate::hub::LOG_WITHIN);
                     }
                     Ok(())
                 }
@@ -2375,7 +2414,7 @@ impl Dispatch {
     }
 
     async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, placed: Placement) -> anyhow::Result<()> {
-        let Placement { executor, image, docker, slot } = placed;
+        let Placement { executor, image, docker, slot, grant } = placed;
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
         let (cache_mode, cache) = cache_access(&l.spec, r);
@@ -2412,6 +2451,10 @@ impl Dispatch {
         }
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // Its grant (W05-R34): what its runner names what it sends about the leg by, and its lease.
+        if let Some((fence, loss)) = grant {
+            (a.fence, a.lease_ms, a.on_lease_loss) = (Some(fence), self.sched.lease(), loss);
+        }
         // Its environment's kind: a `container` or `microvm` one's deployment is the runner's to make
         // (W15-R02).
         if let Some(b) = a.environment.as_mut() {
@@ -2752,6 +2795,10 @@ impl Dispatch {
             // Exclusive, it has its runner to itself: the share it asked for, or the whole runner.
             exclusive: job.is_some_and(|j| j.kiln.exclusive),
             holds: job.filter(|j| j.kiln.exclusive).and_then(|j| asked_of(Some(j))).filter(|q| !q.cpu.is_zero()),
+            // Its grant, as its assignment gives it (W05-R34).
+            fence: None,
+            lease_ms: None,
+            on_lease_loss: kiln_ci::sched::LeaseLoss::default(),
         }
     }
 

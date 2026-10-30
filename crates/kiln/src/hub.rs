@@ -1439,6 +1439,13 @@ impl Hub {
                     }
                 }
             }
+            // A leg's output fenced by its grant (docs/ci.md W05-R34), on a lane of its own.
+            NetEvent::Frame { peer, kind: Kind::Log, lane: proto::LANE_FENCED_LOGS, data } => {
+                let chunk: proto::FencedLog = proto::decode(&data)?;
+                if self.owns_job(peer, &chunk.grant.leg) {
+                    self.logs.append(&chunk.grant.leg, chunk.idx, &chunk.data);
+                }
+            }
             // Bulk frames are job output, but on the conversation feed's and the files' lanes
             // (messages, in bulk).
             NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => {
@@ -1691,7 +1698,27 @@ impl Hub {
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
                 if self.owns_job(peer, &job) {
-                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job });
+                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job, fence: None });
+                }
+            }
+            // A lease runner's refusal, naming the grant it refuses (W05-R34).
+            AgentMsg::Refused { grant, .. } if self.ci.is_leg(&grant.leg) => {
+                if self.owns_job(peer, &grant.leg) {
+                    let fence = Some(grant.fence());
+                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: grant.leg, fence });
+                }
+            }
+            AgentMsg::Refused { .. } => {}
+            // A lease runner's grants renewed (W05-R34): the scheduler judges them, and the
+            // dispatcher answers this runner process (`Renewed`).
+            AgentMsg::Renew { seq, held } => {
+                self.ci.send(crate::ci::dispatch::Msg::Leased { agent: agent.clone(), peer, seq, held });
+            }
+            // What a lease runner sends about a leg, fenced by the grant it runs under (W05-R34):
+            // taken as what it carries. A fenced message carries no other.
+            AgentMsg::Fenced { msg, .. } => {
+                if !matches!(*msg, AgentMsg::Fenced { .. }) {
+                    Box::pin(self.on_agent_msg(peer, *msg)).await?;
                 }
             }
             AgentMsg::Reject { job, reason } => {
@@ -2284,7 +2311,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_LEASES }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {

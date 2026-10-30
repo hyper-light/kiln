@@ -40,6 +40,10 @@ pub const LANE_STREAM: u32 = 8;
 /// A lane of its own, so a page's files never wait behind a stream's picture or a terminal; only to
 /// runners announcing [`CAP_PORTS`].
 pub const LANE_PORTS: u32 = 9;
+/// A leg's output fenced by the grant it runs under ([`FencedLog`], docs/ci.md W05-R34): bulk
+/// frames as [`LANE_LOGS`]' are, on a lane of their own so a server tells them from a [`LogChunk`].
+/// Only to a server announcing [`CAP_LEASES`].
+pub const LANE_FENCED_LOGS: u32 = 10;
 
 /// A lane's name, as metrics and runner pages say it.
 pub fn lane_name(lane: u32) -> &'static str {
@@ -54,6 +58,7 @@ pub fn lane_name(lane: u32) -> &'static str {
         LANE_FILES => "files",
         LANE_STREAM => "stream",
         LANE_PORTS => "ports",
+        LANE_FENCED_LOGS => "fenced-logs",
         _ => "other",
     }
 }
@@ -243,6 +248,66 @@ pub enum AgentMsg {
     /// default). Sent as it's welcomed and whenever it changes, each superseding the last; only to
     /// a server announcing [`CAP_AGENT_LIMIT`]. Appended last: postcard encodes variants by index.
     AgentLimit { json: String },
+    /// CI (docs/ci.md W05-R34): the grants this runner holds (each leg it runs or whose result the
+    /// server hasn't said it has), renewed for a lease from when the server takes this, which
+    /// answers [`ServerMsg::Renewed`] under `seq`. A lease runner's heartbeat, every 10 s, and sent
+    /// as the server welcomes it; only to a server announcing [`CAP_LEASES`]. Appended last:
+    /// postcard encodes variants by index.
+    Renew { seq: u64, held: Vec<Grant> },
+    /// CI: [`AgentMsg::Reject`] naming the grant it refuses (W05-R34): one refused before that
+    /// leg's grant now refuses nothing. Only to a server announcing [`CAP_LEASES`]. Appended last:
+    /// postcard encodes variants by index.
+    Refused { grant: Grant, reason: String },
+    /// CI: what this runner sends about a leg it holds a grant for (its steps and events, its
+    /// result), fenced by that grant (W05-R34): what a grant that isn't the leg's now sends is
+    /// told from what its grant sends. Only to a server announcing [`CAP_LEASES`]. Appended last:
+    /// postcard encodes variants by index.
+    Fenced { grant: Grant, msg: Box<AgentMsg> },
+}
+
+/// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
+/// epoch it was made in and its number there, `kiln_ci::sched::Fence`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Grant {
+    pub leg: String,
+    pub attempt: u32,
+    pub epoch: u64,
+    pub n: u64,
+}
+
+impl Grant {
+    /// The grant of `attempt` of `leg` under `fence`.
+    pub fn of(leg: &str, attempt: u32, fence: kiln_ci::sched::Fence) -> Grant {
+        Grant { leg: leg.to_owned(), attempt, epoch: fence.epoch, n: fence.n }
+    }
+
+    /// Its fence, as the scheduler keeps it.
+    pub fn fence(&self) -> kiln_ci::sched::Fence {
+        kiln_ci::sched::Fence { epoch: self.epoch, n: self.n }
+    }
+}
+
+/// One chunk of output for a leg's step, fenced by the grant it runs under (docs/ci.md W05-R34), on
+/// [`LANE_FENCED_LOGS`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FencedLog {
+    pub grant: Grant,
+    pub idx: u32,
+    pub data: Vec<u8>,
+}
+
+/// What a runner sends about a leg it holds a grant for, fenced by that grant (docs/ci.md
+/// W05-R34): its steps, events and result wrapped ([`AgentMsg::Fenced`]), a refusal naming it
+/// ([`AgentMsg::Refused`]). `None` for anything else, and for a leg it holds no grant for.
+pub fn fenced(m: AgentMsg, grants: &std::collections::HashMap<String, Grant>) -> Option<AgentMsg> {
+    let job = match &m {
+        AgentMsg::StepStarted { job, .. } | AgentMsg::StepFinished { job, .. } | AgentMsg::JobEvent { job, .. } => job,
+        AgentMsg::JobFinished(r) => &r.job,
+        AgentMsg::Reject { job, reason } => return grants.get(job).map(|g| AgentMsg::Refused { grant: g.clone(), reason: reason.clone() }),
+        _ => return None,
+    };
+    let grant = grants.get(job)?.clone();
+    Some(AgentMsg::Fenced { grant, msg: Box::new(m) })
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -384,6 +449,12 @@ pub const CAP_WORK: u64 = 1 << 36;
 /// says it takes [`ServerMsg::AgentLimit`] and says what it holds ([`AgentMsg::AgentLimit`]); a
 /// server that says it takes that.
 pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
+/// Grants are leases (docs/ci.md W05-R34): a runner saying so renews the grants it holds
+/// ([`AgentMsg::Renew`]) and names them in what it sends about their legs ([`AgentMsg::Fenced`],
+/// [`AgentMsg::Refused`], [`LANE_FENCED_LOGS`]); a server saying so takes those, answers renewals
+/// ([`ServerMsg::Renewed`]) and stops a leg by its grant ([`ServerMsg::Stop`]). Each side uses them
+/// only once the other said it, in [`AgentMsg::Caps`] and [`ServerMsg::Caps`].
+pub const CAP_LEASES: u64 = 1 << 38;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -633,6 +704,15 @@ pub enum ServerMsg {
     /// kiln's default) holds. Sent as the runner says [`CAP_AGENT_LIMIT`] and whenever it changes;
     /// the runner keeps it for its restarts. Appended last: postcard encodes variants by index.
     AgentLimit { json: String },
+    /// CI (docs/ci.md W05-R34): the answer to [`AgentMsg::Renew`] `seq`: each grant it named lives
+    /// `lease_ms` from when the server took it, but those in `lost`, which aren't the runner's any
+    /// more (lost, or granted again); `epoch` is the server's. Only to runners announcing
+    /// [`CAP_LEASES`]. Appended last: postcard encodes variants by index.
+    Renewed { seq: u64, lease_ms: u64, epoch: u64, lost: Vec<Grant> },
+    /// CI: [`ServerMsg::Cancel`] naming the grant to stop (W05-R34): a runner running another of
+    /// the leg's grants (a later attempt, or one granted again) lets that one be. Only to runners
+    /// announcing [`CAP_LEASES`]. Appended last: postcard encodes variants by index.
+    Stop { grant: Grant, reason: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -897,6 +977,63 @@ mod tests {
         assert_eq!(decode::<ServerMsg>(&b)?, asked);
         assert!(CAP_AGENT_LIMIT.is_power_of_two() && CAP_AGENT_LIMIT == 1 << 37 && CAP_AGENT_LIMIT & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK) == 0);
         Ok(())
+    }
+
+    /// W05-R34: leases come after every older variant both ways (AgentMsg ended with AgentLimit,
+    /// 52; ServerMsg with AgentLimit, 58), so a peer from before reads every older frame as it did;
+    /// a fenced message carries the one it fences whole, and the bit is a new one.
+    #[test]
+    fn w05_r34_leases_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let grant = Grant { leg: "leg".into(), attempt: 2, epoch: 7, n: 41 };
+        let event = AgentMsg::JobEvent { job: "leg".into(), json: r#"{"seq":3}"#.into() };
+        let agent = [
+            (AgentMsg::Renew { seq: 9, held: vec![grant.clone()] }, 53u8),
+            (AgentMsg::Refused { grant: grant.clone(), reason: "no free slot".into() }, 54),
+            (AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(event.clone()) }, 55),
+        ];
+        for (m, idx) in agent {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is AgentMsg variant {idx} on the wire");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+            assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
+        }
+        let server = [
+            (ServerMsg::Renewed { seq: 9, lease_ms: 60_000, epoch: 7, lost: vec![grant.clone()] }, 59u8),
+            (ServerMsg::Stop { grant: grant.clone(), reason: "its grant was lost".into() }, 60),
+        ];
+        for (m, idx) in server {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is ServerMsg variant {idx} on the wire");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let log = FencedLog { grant: grant.clone(), idx: 4, data: b"ok\n".to_vec() };
+        assert_eq!(decode::<FencedLog>(&encode(&log)?)?, log);
+        assert_eq!(grant.fence(), kiln_ci::sched::Fence { epoch: 7, n: 41 });
+        assert_eq!(Grant::of("leg", 2, grant.fence()), grant);
+        assert_eq!(lane_name(LANE_FENCED_LOGS), "fenced-logs");
+        assert!(CAP_LEASES.is_power_of_two() && CAP_LEASES == 1 << 38 && CAP_LEASES & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT) == 0);
+        Ok(())
+    }
+
+    /// W05-R34: what a runner sends about a leg it holds a grant for goes fenced by it (its steps,
+    /// events and result wrapped, a refusal naming it); anything else, and a leg it holds no grant
+    /// for, as it is.
+    #[test]
+    fn w05_r34_a_legs_messages_are_fenced_by_its_grant() {
+        let grant = Grant { leg: "leg".into(), attempt: 1, epoch: 0, n: 3 };
+        let grants = std::collections::HashMap::from([("leg".to_owned(), grant.clone())]);
+        let result = JobResult { job: "leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+        for m in [
+            AgentMsg::StepStarted { job: "leg".into(), idx: 1 },
+            AgentMsg::StepFinished { job: "leg".into(), idx: 1, status: Status::Succeeded, exit_code: Some(0) },
+            AgentMsg::JobEvent { job: "leg".into(), json: "{}".into() },
+            AgentMsg::JobFinished(result),
+        ] {
+            assert_eq!(fenced(m.clone(), &grants), Some(AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(m) }));
+        }
+        assert_eq!(fenced(AgentMsg::Reject { job: "leg".into(), reason: "draining".into() }, &grants), Some(AgentMsg::Refused { grant, reason: "draining".into() }));
+        assert_eq!(fenced(AgentMsg::JobEvent { job: "other".into(), json: "{}".into() }, &grants), None, "a leg it holds no grant for");
+        assert_eq!(fenced(AgentMsg::Heartbeat { free_slots: 1, running: Vec::new() }, &grants), None);
     }
 
     #[test]

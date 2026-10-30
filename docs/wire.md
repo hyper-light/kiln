@@ -372,8 +372,9 @@ takes a new bit, never one that means something already, even in the other direc
 | 35 | `CAP_HANDOVER` | `AgentMsg::Caps`, `ServerMsg::Caps` | hand-overs between a machine's runner processes: an older one hands its sessions to the newest (`HarnessHandOver`, `HarnessAdopted`, `HandedOver`; releases.md, "One runner a machine") |
 | 36 | `CAP_WORK` | `AgentMsg::Caps`, `ServerMsg::Caps` | warm workspaces for placement: the runner says what it holds warm, the server takes it (`WorkState`; ci.md W24-R18) |
 | 37 | `CAP_AGENT_LIMIT` | `AgentMsg::Caps`, `ServerMsg::Caps` | the most agent sessions a machine has at work at once, set from the server: the runner takes it and says what it holds, the server takes that (`AgentLimit`; agents.md, "How many agents a machine runs") |
+| 38 | `CAP_LEASES` | `AgentMsg::Caps`, `ServerMsg::Caps` | grants are leases (ci.md W05-R34): the runner renews the grants it holds (`Renew`) and names a leg's grant in what it sends about the leg (`Fenced`, `Refused`, and its output on the `fenced-logs` lane, 10); the server answers renewals (`Renewed`) and stops a leg by its grant (`Stop`) |
 
-Bits from 38 are free. Take the next one, and add its row here in the same change.
+Bits from 39 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 
@@ -474,6 +475,9 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
 | `WorkState` | state | What the runner holds warm: each lane's workspaces and how long its legs took there, for placement (ci.md W24-R18). Each supersedes the last. | New: with its samples once it changed, and every 10 minutes, to a server announcing `CAP_WORK`. |
 | `AgentLimit` | state | The most agent sessions the machine has at work at once, and where that comes from: set from the server, its config, or kiln's default (agents.md, "How many agents a machine runs"). Each supersedes the last. | New: as it's welcomed and whenever it changes, to a server announcing `CAP_AGENT_LIMIT`. |
+| `Renew` | telemetry | The grants the runner holds, each named by its leg, attempt and fence (ci.md W05-R34): every leg it runs, or whose result the server hasn't said it has. Each lives a lease from when the server takes this; the next stands in for a lost one. | New: as it's welcomed and every 10 s in place of `Heartbeat`, to a server announcing `CAP_LEASES`; answered by `Renewed`. |
+| `Refused` | answer | `Reject` naming the grant it refuses (W05-R34): a refusal that comes late, after the leg was granted again, refuses nothing. | New: to a server announcing `CAP_LEASES`. |
+| `Fenced` | stream | What the runner sends about a leg it holds a grant for (its steps, events and result), carried whole and named by its grant (W05-R34), so what a grant that isn't the leg's sends is told from what its grant sends. | New: to a server announcing `CAP_LEASES`, kept and sent again after a reconnect as what it carries is. |
 
 ## Server to runner: `ServerMsg`
 
@@ -538,6 +542,8 @@ Four edges are left, and the lab steers clear of each:
 | `Kept` | state | What the server's copy of each of the runner's sessions has, said in digests, so a stream the runner starts sends only what the copy lacks ("Restarts", above). | Sent before `Welcome` to a runner that keeps the channel, 32 sessions a frame. |
 | `HarnessSend` | command, parked | A message (or a skill run) for an agent session, for the epoch the server last heard it's at: its id made once, its inbox takes it once, refuses it typed (a stale epoch named), and answers either way (CP-T3.2, docs/sends.md). To runners that say `CAP_INBOX` in their `Caps`. | T3: answered (`Update::Inbox`); while its runner is away it's refused at once, until CP-T3.3 parks it. |
 | `AgentLimit` | state | What a person set from the server for the most agent sessions the machine has at work at once, over its config's; none set, its config's (or kiln's default) holds (agents.md, "How many agents a machine runs"). | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent as the runner says `CAP_AGENT_LIMIT` and whenever it changes; the runner keeps it for its restarts. |
+| `Renewed` | telemetry | The answer to a `Renew` (ci.md W05-R34): the lease each grant it named lives from when the server took it, the server's epoch, and the grants it named that aren't the runner's any more (lost, or granted again). The next stands in for a lost one. | New: to runners announcing `CAP_LEASES`. |
+| `Stop` | command, parked | `Cancel` naming the grant to stop (W05-R34): a runner running another of the leg's grants lets that one be. | New: to runners announcing `CAP_LEASES`, on the channel ("Commands"): answered once applied. |
 
 ## Commands to a session: `Command`
 

@@ -113,6 +113,19 @@ pub struct AssignmentV2 {
     /// From an older server, neither: a leg like any other.
     pub exclusive: bool,
     pub holds: Option<crate::sched::state::Resources>,
+    /// Its grant's fence (docs/ci.md W05-R34): the epoch it was made in and its number there, which
+    /// what the runner sends about the leg names. An older server sends none: the leg's messages
+    /// go as they always have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::sched::state::Fence>,
+    /// How long its grant lives unless the runner renews it, in milliseconds (W05-R34); none from
+    /// an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// What the runner does with it once its lease is lost (W05-R34): a CI leg runs to its end
+    /// (`finish`, the default), a `stop` item is stopped.
+    #[serde(default)]
+    pub on_lease_loss: crate::sched::state::LeaseLoss,
 }
 
 /// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
@@ -500,6 +513,32 @@ mod tests {
         assert!(!old.exclusive && old.holds.is_none(), "from an older server: a leg like any other");
         let v: serde_json::Value = serde_json::to_value(&a)?;
         assert_eq!(v.get("holds").and_then(|h| h.get("cpu")).and_then(serde_json::Value::as_f64), Some(16.0));
+        Ok(())
+    }
+
+    /// W05-R34: a leg's grant travels with it (its fence, its lease, what's done once it's lost),
+    /// and an assignment from an older server, without them, reads as before: no fence, no lease,
+    /// a leg that runs to its end. A runner from before them reads the rest and passes them over.
+    #[test]
+    fn w05_r34_an_assignment_carries_its_grant_and_reads_without_it() -> Result<(), serde_json::Error> {
+        use crate::sched::state::{Fence, LeaseLoss};
+        let fence = Fence { epoch: 7, n: 41 };
+        let a = AssignmentV2 { job_id: "leg".into(), attempt: 2, fence: Some(fence), lease_ms: Some(60_000), on_lease_loss: LeaseLoss::Stop, ..AssignmentV2::default() };
+        let json = serde_json::to_string(&a)?;
+        let back: AssignmentV2 = serde_json::from_str(&json)?;
+        assert_eq!((back.fence, back.lease_ms, back.on_lease_loss), (Some(fence), Some(60_000), LeaseLoss::Stop));
+        let v: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(v.get("fence"), Some(&serde_json::json!({ "epoch": 7, "n": 41 })));
+        assert_eq!(v.get("on_lease_loss").and_then(serde_json::Value::as_str), Some("stop"));
+        let old: AssignmentV2 = serde_json::from_str(r#"{"job_id":"leg","attempt":1}"#)?;
+        assert_eq!((old.fence, old.lease_ms, old.on_lease_loss), (None, None, LeaseLoss::Finish), "from an older server");
+        #[derive(Deserialize)]
+        struct Older {
+            job_id: String,
+            attempt: u32,
+        }
+        let older: Older = serde_json::from_str(&json)?;
+        assert_eq!((older.job_id.as_str(), older.attempt), ("leg", 2), "a runner from before reads the rest");
         Ok(())
     }
 

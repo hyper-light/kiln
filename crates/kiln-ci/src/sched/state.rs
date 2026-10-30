@@ -1149,6 +1149,16 @@ impl Scheduler {
         &self.cfg
     }
 
+    /// The epoch its grants are made in (W05-R34).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// How long its grants live unrenewed (W05-R34), if they're leases.
+    pub fn lease(&self) -> Option<Ms> {
+        self.cfg.lease
+    }
+
     /// Handles one input at `now` (unix milliseconds).
     pub fn handle(&mut self, input: Input, now: i64) -> Vec<Command> {
         let mut out = Vec::new();
