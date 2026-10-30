@@ -1552,8 +1552,8 @@ impl Store {
     /// Runner `from`'s rows, kept under `to` from now on (docs/machines.md: a machine known by its
     /// name moving to its machine id), shown as `label` unless `to` has a label of its own: its
     /// agent row, the jobs it ran and the ones a retry asked to run on it or anywhere but it, its
-    /// attempts, its insights, its preview removals, its reap policy, its grants, and what kiln keeps
-    /// for it under `prefixes` and its name (`front_door/`, …). What `to` has already wins over
+    /// attempts, its insights, its preview removals, its reap policy, its grants, who enrolled it,
+    /// and what kiln keeps for it under `prefixes` and its name (`front_door/`, …). What `to` has already wins over
     /// `from`'s; `to` ends with a row, one of its own (with `hostname`) when neither had one.
     pub async fn move_runner(&self, from: String, to: String, label: String, hostname: String, prefixes: Vec<&'static str>) -> anyhow::Result<()> {
         self.call(move |c| {
@@ -1578,6 +1578,9 @@ impl Store {
             t.execute("UPDATE OR IGNORE work_reap_policies SET target = ?2 WHERE scope = 'runner' AND target = ?1", params![from, to])?;
             t.execute("DELETE FROM work_reap_policies WHERE scope = 'runner' AND target = ?1", [&from])?;
             t.execute("UPDATE grants SET scope = 'runner:' || ?2 WHERE scope = 'runner:' || ?1", params![from, to])?;
+            // Who enrolled it (W27-R01), which its runner processes' certificates name.
+            t.execute("UPDATE OR IGNORE enrollments SET machine = ?2 WHERE machine = ?1", params![from, to])?;
+            t.execute("DELETE FROM enrollments WHERE machine = ?1", [&from])?;
             for prefix in &prefixes {
                 let (was, now) = (format!("{prefix}{from}"), format!("{prefix}{to}"));
                 t.execute("UPDATE OR IGNORE kv SET k = ?2 WHERE k = ?1", params![was, now])?;
@@ -2024,6 +2027,7 @@ mod tests {
                      INSERT INTO ci_preview_removals (runner, kind, repo, environment, created_at) VALUES ('adas-macbook-pro.local', 'container', 'acme/app', 'pr-1', 1);
                      INSERT INTO work_reap_policies (scope, target, policy, updated_at, updated_by) VALUES ('runner', 'adas-macbook-pro.local', '{}', 1, 'ada');
                      INSERT INTO grants (principal, what, scope, created_at, created_by) VALUES ('user:1', 'viewer', 'runner:adas-macbook-pro.local', 1, 'ada');
+                     INSERT INTO enrollments (machine, enrolled_by, at) VALUES ('adas-macbook-pro.local', 'ada', 1);
                      INSERT INTO kv (k, v) VALUES ('front_door/adas-macbook-pro.local', '{}'), ('front_door/box', '{}');",
                 )?;
                 Ok(())
@@ -2042,6 +2046,9 @@ mod tests {
                 anyhow::ensure!(count(format!("SELECT COUNT(*) FROM {table} = 'adas-macbook-pro.local'")).await? == 0, "{table}: none left");
             }
             anyhow::ensure!(count(format!("SELECT COUNT(*) FROM grants WHERE scope = 'runner:{id}'")).await? == 1);
+            // Who enrolled it (W27-R01) goes with it.
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM enrollments WHERE machine = '{id}' AND enrolled_by = 'ada'")).await? == 1);
+            anyhow::ensure!(count("SELECT COUNT(*) FROM enrollments WHERE machine = 'adas-macbook-pro.local'".to_owned()).await? == 0);
             anyhow::ensure!(count("SELECT COUNT(*) FROM ci_runner_time WHERE runner = 'box'".into()).await? == 1, "another runner's stay");
             anyhow::ensure!(s.kv_get(format!("front_door/{id}")).await?.is_some() && s.kv_get("front_door/adas-macbook-pro.local".into()).await?.is_none());
             // Moved again (its runner asked twice): nothing more to move, and its label stays its own.

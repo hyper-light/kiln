@@ -417,9 +417,11 @@ impl Pki {
     /// had and the new certificate.
     pub fn sign_moved(&self, cert_pem: &str, csr_pem: &str, to: &str) -> anyhow::Result<(String, String)> {
         let (name, csr) = self.proven(cert_pem, csr_pem)?;
-        let signed = CertificateSigningRequestParams { params: machine_params(sanitize_name(to), LEAF_DAYS)?, public_key: csr.public_key }
-            .signed_by(&self.issuer)
-            .context("sign CSR")?;
+        let mut params = machine_params(sanitize_name(to), LEAF_DAYS)?;
+        // A certificate of its own, for the same key: its serial too, which a serial left to rcgen
+        // (made from the key) wouldn't be, so kiln's record of what it issued (W27-R01) has both.
+        params.serial_number = Some(random_serial());
+        let signed = CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer).context("sign CSR")?;
         Ok((name, signed.pem()))
     }
 
@@ -777,6 +779,11 @@ mod tests {
         let (other_csr, _) = make_csr("adas-macbook-pro.local")?;
         assert!(pki.sign_moved(&cert, &other_csr, "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b").is_err(), "another key");
         assert!(pki.sign_moved(&cert, &again, SERVER_NAME).is_err(), "the server's name is no machine's");
+        // Its own certificate, for the same key: a serial of its own too (W27-R01's records keep both).
+        let moved = pki.sign_moved(&cert, &again, "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b")?.1;
+        let (was, now) = (fingerprints(&cert)?, fingerprints(&moved)?);
+        assert_eq!(was.key, now.key, "the same key");
+        assert_ne!(was.serial, now.serial, "another certificate");
         Ok(())
     }
 }

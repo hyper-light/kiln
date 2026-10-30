@@ -3202,6 +3202,13 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
     if from == to {
         return Err(err(StatusCode::CONFLICT, format!("{to} is known by its machine id already")));
     }
+    // A revoked key moves nowhere (W27-R01): its certificate is still signed, but kiln refuses it.
+    let key = crate::pki::fingerprints(&r.cert_pem).map(|f| f.key).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let revoked = crate::identities::revoked_keys(&hub.store).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if let Some((_, why)) = revoked.iter().find(|(k, _)| *k == key) {
+        crate::rt::sleep(Duration::from_millis(500)).await;
+        return Err(err(StatusCode::FORBIDDEN, format!("{from}'s key was {why}")));
+    }
     let agents = hub.agent_list().await;
     let Some(me) = agents.iter().find(|a| a.name == from) else {
         return Err(err(StatusCode::FORBIDDEN, format!("{from} is not enrolled here any more; enroll it again")));
@@ -3212,11 +3219,16 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
     if agents.iter().any(|a| a.name == to) {
         return Err(err(StatusCode::CONFLICT, format!("a runner is known by {to} already")));
     }
+    // Its certificate for the id, recorded first as every one kiln issues is (W27-R01): forgetting
+    // the runner then revokes its key, its certificate for its name with it.
+    crate::identities::record(&hub.store, "machine", &to, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     // Its name, as its label, unless another machine shows by it.
     let label = free_agent_name(hub, &from, &me.hostname, Some(&to)).await;
     if let Err(e) = hub.move_runner(&from, &to, &label, &me.hostname).await {
         return Err(err(StatusCode::CONFLICT, format!("{e:#}")));
     }
+    // The id may connect, as a machine enrolled under it may: a revoked key stays refused.
+    hub.net.command(crate::net::Out::Unrevoke { name: to.clone() }).await;
     hub.store.audit("kiln".into(), "agent.moved".into(), format!("{from} is known by its machine id {to}, shown as {label}")).await;
     tracing::info!(from = %from, to = %to, label = %label, "a runner moved to its machine id");
     Ok(srv::json(

@@ -144,6 +144,17 @@ fn a_runner_from_before_moves_to_its_machine_id_with_what_was_kept_under_its_nam
     anyhow::ensure!((200..300).contains(&st), "granting by its name: {st} {body}");
     let (_, body) = http(s.port, "GET", "/api/users", &s.admin, None)?;
     assert!(body.contains(&format!("runners.read@runner:{id}")) && !body.contains("runners.read@runner:build-box"), "{body}");
+
+    // Forgotten, it stays out (W27-R01): its certificate for the id was recorded as it moved, so
+    // forgetting it revokes its key, its certificate for its old name's with it.
+    let key = kiln::pki::fingerprints(&std::fs::read_to_string(state.join("agent.pem"))?)?.key;
+    let (st, body) = http(s.port, "DELETE", &format!("/api/agents/{id}"), &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "forgetting it: {st} {body}");
+    let (_, body) = http(s.port, "GET", "/api/identities/revocations", &s.admin, None)?;
+    let (_, issued) = http(s.port, "GET", "/api/identities?kind=machine", &s.admin, None)?;
+    assert!(body.contains(&key), "its key is revoked: {body}\nwhat kiln issued: {issued}");
+    std::thread::sleep(Duration::from_secs(6));
+    until(s.port, &s.admin, "it stayed forgotten", &log, |l| !l.iter().any(|a| text(a, "name") == id))?;
     Ok(())
 }
 
