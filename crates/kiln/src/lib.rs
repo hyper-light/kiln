@@ -20,6 +20,7 @@ pub mod kubeapi;
 pub mod config;
 pub mod config_cli;
 pub mod convo;
+pub mod custody;
 pub mod dirs;
 pub mod doctor;
 pub mod discovery;

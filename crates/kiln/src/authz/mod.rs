@@ -624,6 +624,12 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/identities/revocations", "runners.read", At::Server),
     r("GET", "/api/identities", "runners.read", At::Server),
     r("POST", "/api/identities/revoke", "settings.manage", At::Server),
+    // Custody of what changes hands (W27-R08): a signed record taken from anyone signed in (its
+    // signature says who it's from); chains, breaks and refusals read by those who read the audit.
+    r("POST", "/api/custody", SIGNED_IN, At::Server),
+    r("GET", "/api/custody/breaks", "audit.read", At::Server),
+    r("GET", "/api/custody", "audit.read", At::Server),
+    r("GET", "/api/transfers/refused", "audit.read", At::Server),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),

@@ -252,6 +252,10 @@ enum Cmd {
     /// The certificates kiln's CA issued (machines, runner processes, agents, legs, people, the
     /// server and CD): list, revocations, revoke.
     Identities(kiln::identities::IdentitiesArgs),
+    /// A thing's chain of custody, walked now, and the breaks kiln found (W27-R08).
+    Custody(kiln::custody::CustodyArgs),
+    /// What kiln refused because its signer no longer held what it acted on (W27-R08).
+    Transfers(kiln::custody::TransfersArgs),
     /// Forget a runner: it's removed and its certificates revoked from now on; enrolling the
     /// machine again brings a new certificate.
     Forget(kiln::identities::ForgetArgs),
@@ -1065,6 +1069,14 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Tokens(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::authz::cli::tokens(a, &cfg)).await
+        }
+        Cmd::Custody(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::custody::cli(a, &cfg)).await
+        }
+        Cmd::Transfers(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::custody::transfers_cli(a, &cfg)).await
         }
         Cmd::Identities(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

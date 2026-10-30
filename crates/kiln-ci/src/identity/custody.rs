@@ -82,6 +82,11 @@ pub struct Body {
     /// [`VERSION`].
     pub v: u32,
     pub kind: Kind,
+    /// Its signer (an identity's URI), as its certificate names it. A statement's digest is the
+    /// same whoever signs it, so a record names its signer itself: two custodians' records of
+    /// one hop are two records.
+    #[serde(default)]
+    pub by: String,
     /// Whom they go to (an identity's URI): handed on, passed on, taken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
@@ -110,9 +115,9 @@ pub struct Body {
 }
 
 impl Body {
-    /// A record of `kind`, between no one yet.
-    pub fn new(kind: Kind) -> Self {
-        Self { v: VERSION, kind, to: None, from: None, held_for: None, why: String::new(), component: None, taken_for: None, epoch: None, said_at: None }
+    /// A record of `kind` signed `by` (an identity's URI), between no one yet.
+    pub fn new(kind: Kind, by: &str) -> Self {
+        Self { v: VERSION, kind, by: by.to_owned(), to: None, from: None, held_for: None, why: String::new(), component: None, taken_for: None, epoch: None, said_at: None }
     }
 
     /// Whether it's well formed, or why not.
@@ -144,6 +149,9 @@ pub fn body(c: &Checked) -> Result<Body, Break> {
     let unreadable = |why: String| Break::Unreadable { record: c.digest.clone(), why };
     let b: Body = serde_json::from_value(c.statement.body.clone()).map_err(|e| unreadable(e.to_string()))?;
     b.check().map_err(unreadable)?;
+    if b.by != c.custodian {
+        return Err(unreadable(format!("it says it's by {}, but {} signed it", if b.by.is_empty() { "no one" } else { &b.by }, c.custodian)));
+    }
     if c.statement.subject.is_empty() {
         return Err(unreadable("it's about nothing: a custody record names what it's about".into()));
     }
@@ -155,6 +163,9 @@ pub fn body(c: &Checked) -> Result<Body, Break> {
 pub struct Grant {
     /// [`VERSION`].
     pub v: u32,
+    /// Its signer, the delegator, as its certificate names it (as [`Body::by`]).
+    #[serde(default)]
+    pub by: String,
     /// Whom it entitles (an identity's URI): the signer of what acts under it.
     pub delegate: String,
     /// What it entitles them to: scopes such as `receive:workspace` or `act:goals.done`;
@@ -179,6 +190,20 @@ impl Grant {
         }
         Ok(())
     }
+}
+
+/// A delegation's body, from a statement kiln took: refused if it isn't a delegation, or isn't one
+/// kiln reads.
+pub fn grant(c: &Checked) -> Result<Grant, String> {
+    if c.payload_type != PAYLOAD_DELEGATION {
+        return Err(format!("it's a {} statement, not a delegation", c.payload_type));
+    }
+    let g: Grant = serde_json::from_value(c.statement.body.clone()).map_err(|e| e.to_string())?;
+    g.check()?;
+    if g.by != c.custodian {
+        return Err(format!("it says it's by {}, but {} signed it", if g.by.is_empty() { "no one" } else { &g.by }, c.custodian));
+    }
+    Ok(g)
 }
 
 /// Whether scope `granted` covers `wanted`: the same scope, `kind:*` for every scope of its kind,
@@ -214,12 +239,7 @@ pub fn entitled(under: &Under, wanted: &str, at: i64, revoked: &[Revoked]) -> Re
     let mut grants: Vec<(&Checked, Grant)> = Vec::new();
     for (i, link) in under.through.iter().enumerate() {
         let n = i + 1;
-        let unreadable = |why: String| Refusal::Unreadable { n, link: link.digest.clone(), why };
-        if link.payload_type != PAYLOAD_DELEGATION {
-            return Err(unreadable(format!("it's a {} statement", link.payload_type)));
-        }
-        let g: Grant = serde_json::from_value(link.statement.body.clone()).map_err(|e| unreadable(e.to_string()))?;
-        g.check().map_err(unreadable)?;
+        let g = grant(link).map_err(|why| Refusal::Unreadable { n, link: link.digest.clone(), why })?;
         if let Some(r) = revoked.iter().find(|r| r.digest == link.digest && r.at <= at) {
             return Err(Refusal::Revoked { n, link: link.digest.clone(), at: chain::when(r.at), why: r.why.clone() });
         }
@@ -278,6 +298,8 @@ pub struct Hop {
     pub subject: Vec<Subject>,
     /// For things made here: the receipts, by the same custodian, of what they were made from.
     pub made_from: Vec<String>,
+    /// A thing began here: a hand-on or a take that follows no record of its things.
+    pub began: bool,
 }
 
 /// A chain of custody that holds: each hop from where the walk began back to where each thing
@@ -321,6 +343,28 @@ pub enum Break {
     TakenNotByServer { record: String, signer: String, server: String },
     #[error("{0}")]
     Gap(Gap),
+}
+
+impl Break {
+    /// Its kind, as kiln's records name it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoRecord { .. } => "no-record",
+            Self::NotCustody { .. } => "not-custody",
+            Self::Unreadable { .. } => "unreadable",
+            Self::Changed { .. } => "changed",
+            Self::NoCommonDigest { .. } => "no-common-digest",
+            Self::NotHandedOn { .. } => "not-handed-on",
+            Self::NotAll { .. } => "not-all",
+            Self::NotTheTaker { .. } => "not-the-taker",
+            Self::NotTheGiver { .. } => "not-the-giver",
+            Self::NotTheHolder { .. } => "not-the-holder",
+            Self::NoHandOn { .. } => "no-hand-on",
+            Self::OutOfOrder { .. } => "out-of-order",
+            Self::TakenNotByServer { .. } => "taken-not-by-server",
+            Self::Gap(_) => "gap",
+        }
+    }
 }
 
 /// A digest that changed across a hop: its algorithm, what it was, and what it is.
@@ -428,6 +472,29 @@ fn edge(r: &Checked, rb: &Body, p: &Checked, pb: &Body, server: &str) -> Result<
     Ok(if same.0 > 0 { Edge::Holding } else { Edge::MadeFrom })
 }
 
+/// Checks record `record`'s own hop: each record it follows, which `records` must hold, followed as
+/// [`walk`] says it may be, and a receipt or a pass following a hand-on. Not the records before
+/// those, nor its custodian's numbering: that's [`walk`]'s. What kiln checks as it takes a record.
+pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> Result<Hop, Break> {
+    let r = records.get(record).ok_or_else(|| Break::NoRecord { record: record.to_owned(), followed_by: None })?;
+    let rb = body(r)?;
+    let (mut gave, mut held, mut made_from) = (false, false, Vec::new());
+    for f in &r.statement.follows {
+        let p = records.get(f).ok_or_else(|| Break::NoRecord { record: f.clone(), followed_by: Some(record.to_owned()) })?;
+        let pb = body(p)?;
+        match edge(r, &rb, p, &pb, server)? {
+            Edge::Transfer => gave = true,
+            Edge::Holding => held = true,
+            Edge::MadeFrom => made_from.push(f.clone()),
+        }
+    }
+    if rb.kind.takes() && !gave {
+        return Err(Break::NoHandOn { record: record.to_owned(), kind: rb.kind });
+    }
+    let began = !rb.kind.takes() && !held;
+    Ok(Hop { record: record.to_owned(), kind: rb.kind, custodian: r.custodian.clone(), at: r.at, subject: r.statement.subject.clone(), made_from, began })
+}
+
 /// Walks a thing's chain of custody back from record `from` (by its digest), where it's used,
 /// through what each record follows, to where each thing began. `records` are the custody records
 /// kiln took, by digest: every record the chain follows, and every record kiln has on the streams
@@ -441,26 +508,14 @@ pub fn walk(from: &str, records: &BTreeMap<String, Checked>, server: &str) -> Re
         if !seen.insert(d.clone()) {
             continue;
         }
-        let r = records.get(&d).ok_or_else(|| Break::NoRecord { record: d.clone(), followed_by: None })?;
-        let rb = body(r)?;
-        let (mut gave, mut held, mut made_from) = (false, false, Vec::new());
-        for f in &r.statement.follows {
-            let p = records.get(f).ok_or_else(|| Break::NoRecord { record: f.clone(), followed_by: Some(d.clone()) })?;
-            let pb = body(p)?;
-            match edge(r, &rb, p, &pb, server)? {
-                Edge::Transfer => gave = true,
-                Edge::Holding => held = true,
-                Edge::MadeFrom => made_from.push(f.clone()),
-            }
-            next.push(f.clone());
+        let h = hop(&d, records, server)?;
+        if let Some(r) = records.get(&d) {
+            next.extend(r.statement.follows.iter().cloned());
         }
-        if rb.kind.takes() && !gave {
-            return Err(Break::NoHandOn { record: d.clone(), kind: rb.kind });
+        if h.began {
+            walked.began.push(d);
         }
-        if !rb.kind.takes() && !held {
-            walked.began.push(d.clone());
-        }
-        walked.hops.push(Hop { record: d, kind: rb.kind, custodian: r.custodian.clone(), at: r.at, subject: r.statement.subject.clone(), made_from });
+        walked.hops.push(h);
     }
     let streams: BTreeSet<(&str, &str)> = walked
         .hops
@@ -582,8 +637,9 @@ mod tests {
         Ok(Ca { der: cert.der().to_vec(), issuer: Issuer::new(p, key) })
     }
 
-    /// A custodian: its certificate and key, and kiln's records of what it signed.
+    /// A custodian: its certificate and key.
     struct Signer {
+        uri: String,
         der: Vec<u8>,
         key: KeyPair,
     }
@@ -599,13 +655,29 @@ mod tests {
             let key = KeyPair::generate()?;
             let serial: Vec<u8> = std::iter::once(0x42).chain(Sha256::digest(key.der_bytes()).iter().take(8).copied()).collect();
             p.serial_number = Some(SerialNumber::from_slice(&serial));
-            Ok(Self { der: p.signed_by(&key, &ca.issuer)?.der().to_vec(), key })
+            Ok(Self { uri: uri.to_owned(), der: p.signed_by(&key, &ca.issuer)?.der().to_vec(), key })
+        }
+
+        /// `s` as its signer says it: a body naming no signer names this one.
+        fn says(&self, s: &Statement) -> Statement {
+            let mut s = s.clone();
+            if let Some(o) = s.body.as_object_mut()
+                && o.get("by").and_then(Value::as_str).is_none_or(str::is_empty)
+            {
+                o.insert("by".into(), Value::String(self.uri.clone()));
+            }
+            s
+        }
+
+        /// `s` as `payload_type`, signed: its bundle and its digest.
+        fn signed(&self, payload_type: &str, s: &Statement) -> anyhow::Result<(Value, String)> {
+            let p = payload(&self.says(s))?;
+            Ok((bundle(payload_type, &p, &self.key.sign(&to_sign(payload_type, &p))?, &self.der), digest(payload_type, &p)))
         }
 
         /// `s` as `payload_type`, signed: its bundle.
         fn sign(&self, payload_type: &str, s: &Statement) -> anyhow::Result<Value> {
-            let p = payload(s)?;
-            Ok(bundle(payload_type, &p, &self.key.sign(&to_sign(payload_type, &p))?, &self.der))
+            Ok(self.signed(payload_type, s)?.0)
         }
     }
 
@@ -620,7 +692,7 @@ mod tests {
     /// A custody record of `kind` about `things`, `to` or `from` someone, following `follows`,
     /// numbered `seq` on its signer's stream `stream`.
     fn record(kind: Kind, things: &[Subject], to: Option<&str>, from: Option<&str>, follows: &[&str], stream: &str, seq: u64) -> Statement {
-        let b = Body { to: to.map(str::to_owned), from: from.map(str::to_owned), why: "a test".into(), ..Body::new(kind) };
+        let b = Body { to: to.map(str::to_owned), from: from.map(str::to_owned), why: "a test".into(), ..Body::new(kind, "") };
         Statement {
             subject: things.to_vec(),
             follows: follows.iter().map(|d| (*d).to_owned()).collect(),
@@ -684,7 +756,7 @@ mod tests {
         assert_eq!(to_value(&b).get("kind"), Some(&json!("received")));
         assert!(matches!(take(&good, PAYLOAD_DELEGATION)?, Err(Break::NotCustody { .. })));
         let refused = |kind: Kind, edit: &dyn Fn(&mut Body), things: &[Subject]| -> anyhow::Result<String> {
-            let mut b = Body { to: Some(JUPITER.into()), from: Some(JUPITER.into()), ..Body::new(kind) };
+            let mut b = Body { to: Some(JUPITER.into()), from: Some(JUPITER.into()), ..Body::new(kind, "") };
             edit(&mut b);
             let s = Statement { subject: things.to_vec(), ..Statement::new(to_value(&b)) };
             match take(&s, PAYLOAD_CUSTODY)? {
@@ -699,6 +771,8 @@ mod tests {
         assert!(refused(Kind::Taken, &|_| {}, &ws)?.contains("names no giver"));
         assert!(refused(Kind::Received, &|b| b.taken_for = Some(FEDORA.into()), &ws)?.contains("only a take"));
         assert!(refused(Kind::Received, &|_| {}, &[])?.contains("about nothing"));
+        // A record saying it's by another than its signer: two custodians' records are never one.
+        assert!(refused(Kind::Received, &|b| b.by = JUPITER.into(), &ws)?.contains(&format!("it says it's by {JUPITER}, but {FEDORA} signed it")));
         Ok(())
     }
 
@@ -725,6 +799,12 @@ mod tests {
         assert_eq!(walk(&l.checkout, &l.kept.records, SERVER)?.hops.len(), 2);
         // Every hand-on here was answered.
         assert_eq!(unanswered(&l.kept.records), Vec::<String>::new());
+        // One hop alone, as kiln checks a record it takes: only the records it follows need be there.
+        let alone: BTreeMap<String, Checked> = [&l.stored, &l.built].into_iter().filter_map(|d| l.kept.records.get(d).map(|c| (d.clone(), c.clone()))).collect();
+        let h = hop(&l.stored, &alone, SERVER)?;
+        assert_eq!((h.kind, h.began, h.custodian.as_str()), (Kind::Received, false, SERVER));
+        assert!(matches!(walk(&l.stored, &alone, SERVER), Err(Break::NoRecord { .. })), "the walk needs every record before them");
+        assert!(hop(&l.built, &alone, SERVER).is_err_and(|e| matches!(e, Break::NoRecord { ref record, .. } if record == &l.checkout)));
         Ok(())
     }
 
@@ -819,7 +899,7 @@ mod tests {
         kept.records.remove(&held);
         let held = kept.take(&ca, &left, &record(Kind::Received, std::slice::from_ref(&state), None, Some(SERVER), &[&began], "sessions", 1), AT - 100)?;
         let take = |by: &Signer, kept: &mut Kept, seq: u64| -> anyhow::Result<String> {
-            let b = Body { to: Some(MOVED.into()), taken_for: Some(LEFT.into()), why: "fedora away since 22:52:19Z".into(), epoch: Some(1), ..Body::new(Kind::Taken) };
+            let b = Body { to: Some(MOVED.into()), taken_for: Some(LEFT.into()), why: "fedora away since 22:52:19Z".into(), epoch: Some(1), ..Body::new(Kind::Taken, "") };
             let s = Statement { subject: vec![state.clone()], follows: vec![held.clone()], stream: Some("sessions".into()), seq: Some(seq), ..Statement::new(to_value(&b)) };
             kept.take(&ca, by, &s, AT - 10)
         };
@@ -859,8 +939,7 @@ mod tests {
         };
         let mut kept: BTreeMap<String, (Value, i64)> = BTreeMap::new();
         let mut keep = |by: &Signer, s: &Statement, at: i64| -> anyhow::Result<String> {
-            let b = by.sign(PAYLOAD_DELEGATION, s)?;
-            let d = digest(PAYLOAD_DELEGATION, &payload(s)?);
+            let (b, d) = by.signed(PAYLOAD_DELEGATION, s)?;
             kept.insert(d.clone(), (b, at));
             Ok(d)
         };

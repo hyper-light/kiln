@@ -695,6 +695,30 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             })
             .await
         }
+        // Custody of what changes hands (W27-R08): a signed record taken, a thing's chain walked
+        // now, the breaks kiln found and what it refused.
+        (&Method::POST, ["api", "custody"]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| custody_take(&hub, req, &by)).await
+        }
+        (&Method::GET, ["api", "custody", "breaks"]) => boxed(|| async {
+            let breaks = crate::custody::breaks(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "breaks": breaks })))
+        })
+        .await,
+        (&Method::GET, ["api", "custody"]) => {
+            let digest = srv::query(&req).remove("digest").unwrap_or_default();
+            boxed(|| async {
+                let chain = crate::custody::chain(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &digest, crate::util::now_unix()).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                chain.map(|v| srv::json(StatusCode::OK, &v)).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no custody record of {digest:?}")))
+            })
+            .await
+        }
+        (&Method::GET, ["api", "transfers", "refused"]) => boxed(|| async {
+            let refused = crate::custody::refusals(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "refused": refused })))
+        })
+        .await,
         (&Method::POST, ["api", "identities", "revoke"]) => {
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| identity_revoke(&hub, req, &by)).await
@@ -3002,6 +3026,19 @@ async fn me_identity(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R
         }
         Err(crate::identities::PersonRefused::Failed(e)) => Err(e.into()),
         Err(r) => Ok(srv::json(r.status(), &json!({ "error": r.to_string(), "code": r.code() }))),
+    }
+}
+
+/// `POST /api/custody`: a signed custody record or delegation (its Sigstore bundle), taken from
+/// `by` (W27-R08): kept and its hop checked, or refused and recorded, saying why.
+async fn custody_take(hub: &Hub, req: Request, by: &str) -> R {
+    let bundle: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let taken = crate::custody::take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &bundle, &format!("api:{by}"), crate::util::now_unix())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    match taken {
+        Ok(t) => Ok(srv::json(if t.again { StatusCode::OK } else { StatusCode::CREATED }, &json!({ "digest": t.digest, "again": t.again, "broke": t.broke }))),
+        Err(refused) => Err(err(StatusCode::UNPROCESSABLE_ENTITY, refused.to_string())),
     }
 }
 
