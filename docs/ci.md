@@ -3395,6 +3395,22 @@ elsewhere (G-24, G-33).
   the agent lives), job tokens `kiln_job_<id>_<secret>` (one per attempt, random, revoked when the
   attempt ends; replacing today's HMAC of the admin token and job id), registry tokens (W12). The
   prefixes let masking (W06-R08) and secret scanners recognize them.
+  - A job token (GITHUB_TOKEN) is its attempt's grant's (W05-R34): stored with its attempt and the
+    grant's fence, taken only while that grant is the leg's live one, and revoked at every end of
+    the grant: the attempt finished (or cancelled), refused, lost (its lease ran out, its runner was
+    lost, or a runner that came back no longer had it), the leg settled or gone with its
+    repository, or the grant superseded by the leg's next.
+  - A leg's runtime token (`ACTIONS_RUNTIME_TOKEN`, which is its `ACTIONS_ID_TOKEN_REQUEST_TOKEN`
+    too), a JWT the server signs, names its attempt and grant the same way. Each use (an
+    artifact's, a cache entry's or test results' upload, at its start and at its commit; an ID
+    token's request; the other runtime services) is taken only while that grant is the leg's live
+    one, or while the leg is kept to look into under it (W17-R02): one lookup in memory, so a
+    grant's tokens are refused once its end is recorded. After a restart such a request waits (up
+    to 30 s) for the dispatcher to rebuild its grants (W05-R25). A token an older build minted names
+    no grant and is taken as before.
+  - An ID token minted while its grant was live lives out its own TTL (5 minutes by default, an hour
+    at most, W10-R08): clouds check it offline against the issuer's keys, so kiln can't take it
+    back.
 - **W10-R04 Job permissions.** A job token carries the job's resolved `permissions` (W04-R06) and
   kiln's additions (`permissions: { binaries: publish, environments: deploy, registry: push }`).
   The facade (W14), the registry (W12), the API and runtime services check it.

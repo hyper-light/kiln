@@ -264,12 +264,20 @@ pub async fn requeue(hub: &Hub, leg: &str, attempt: u32, note: Option<String>) -
         .await
 }
 
-/// The legs kept now: each with its runner and until when.
-pub async fn kept_legs(hub: &Hub) -> anyhow::Result<Vec<(String, String, i64)>> {
+/// A kept leg: its id, its runner, until when, and the grant it was kept under (its attempt and
+/// fence; none from an older build).
+pub type Kept = (String, String, i64, Option<(u32, kiln_ci::sched::Fence)>);
+
+/// The legs kept now (W17-R02), each with the grant its tokens live on under (W10-R03).
+pub async fn kept_legs(hub: &Hub) -> anyhow::Result<Vec<Kept>> {
     hub.store
         .call(|c| {
-            let mut st = c.prepare("SELECT id, agent, kept_until FROM jobs WHERE kept_until > ?1 AND agent IS NOT NULL")?;
-            let rows = st.query_map([crate::util::now_unix()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let mut st = c.prepare("SELECT id, agent, kept_until, attempt, grant_epoch, grant_n FROM jobs WHERE kept_until > ?1 AND agent IS NOT NULL")?;
+            let rows = st.query_map([crate::util::now_unix()], |r| {
+                let (attempt, epoch, n): (Option<u32>, Option<i64>, Option<i64>) = (r.get(3)?, r.get(4)?, r.get(5)?);
+                let fence = epoch.and_then(|e| u64::try_from(e).ok()).zip(n.and_then(|n| u64::try_from(n).ok())).map(|(epoch, n)| kiln_ci::sched::Fence { epoch, n });
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, attempt.zip(fence)))
+            })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await

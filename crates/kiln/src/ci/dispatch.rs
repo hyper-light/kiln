@@ -556,8 +556,9 @@ pub struct Handle {
     grants: Arc<Mutex<HashMap<String, (String, u32, Fence)>>>,
     /// Grants a write was refused under, each said once (W05-R36).
     refused: Mutex<HashSet<(String, Fence)>>,
-    /// Failed legs kept to look into: the runner keeping each, and until when (W17-R02).
-    kept: Mutex<HashMap<String, (String, i64)>>,
+    /// Failed legs kept to look into: the runner keeping each, until when (W17-R02), and the grant
+    /// (its attempt and fence) it was kept under, whose tokens live on while it's kept (W10-R03).
+    kept: Mutex<HashMap<String, (String, i64, Option<(u32, Fence)>)>>,
     /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09).
     restored: Mutex<Option<Restored>>,
 }
@@ -611,18 +612,22 @@ impl Handle {
         self.grants.lock().get(leg).is_some_and(|(_, _, fence)| *fence != Fence::default())
     }
 
+    /// Whether `leg`'s live grant is `attempt`'s, under `fence` (W10-R03): a token minted for that
+    /// grant is taken only then. One lookup in memory.
+    pub fn holds(&self, leg: &str, attempt: u32, fence: Fence) -> bool {
+        self.grants.lock().get(leg).is_some_and(|(_, a, f)| *a == attempt && *f == fence)
+    }
+
     /// `leg`'s live grant from now: `agent`'s, at an attempt, under a fence; or none (it ended, was
-    /// lost or refused, or waits for its next).
-    fn grant(&self, leg: &str, now: Option<(String, u32, Fence)>) {
+    /// lost or refused, or waits for its next). The grant this ends, or replaces with another: its
+    /// tokens die with it (W10-R03).
+    pub(crate) fn grant(&self, leg: &str, now: Option<(String, u32, Fence)>) -> Option<(String, u32, Fence)> {
         let mut g = self.grants.lock();
-        match now {
-            Some(x) => {
-                g.insert(leg.to_owned(), x);
-            }
-            None => {
-                g.remove(leg);
-            }
-        }
+        let was = match now.clone() {
+            Some(x) => g.insert(leg.to_owned(), x),
+            None => g.remove(leg),
+        };
+        was.filter(|w| Some(w) != now.as_ref())
     }
 
     /// Whether a write under `grant` is the first refused (W05-R36): it's said, and its runner told,
@@ -636,12 +641,21 @@ impl Handle {
     }
 
     /// A failed leg kept on `agent` until `until` (W17-R02): its events and logs (a step rerun in
-    /// place) are taken from that runner; `None` lets it go.
+    /// place) are taken from that runner, and the tokens of the grant it's kept under (W10-R03):
+    /// its live grant as it's kept, else the one it was kept under before. `None` lets it go.
     pub fn keep(&self, job: &str, kept: Option<(String, i64)>) {
+        let grant = self.grants.lock().get(job).map(|(_, a, f)| (*a, *f));
+        self.keep_under(job, kept, grant);
+    }
+
+    /// [`Handle::keep`], under `grant` (its attempt and fence) when it's said: the store's, as the
+    /// dispatcher starts.
+    pub fn keep_under(&self, job: &str, kept: Option<(String, i64)>, grant: Option<(u32, Fence)>) {
         let mut g = self.kept.lock();
         match kept {
-            Some(k) => {
-                g.insert(job.to_owned(), k);
+            Some((agent, until)) => {
+                let grant = grant.or_else(|| g.get(job).and_then(|k| k.2));
+                g.insert(job.to_owned(), (agent, until, grant));
             }
             None => {
                 g.remove(job);
@@ -651,7 +665,13 @@ impl Handle {
 
     /// Whether `agent` keeps `job` now.
     pub fn kept_by(&self, job: &str, agent: &str) -> bool {
-        self.kept.lock().get(job).is_some_and(|(a, until)| a == agent && *until > crate::util::now_unix())
+        self.kept.lock().get(job).is_some_and(|(a, until, _)| a == agent && *until > crate::util::now_unix())
+    }
+
+    /// Whether `leg` is kept now under `attempt`'s grant, `fence` (W17-R02, W10-R03): that grant's
+    /// tokens live on while it is, for its steps rerun in place.
+    pub fn kept_under(&self, leg: &str, attempt: u32, fence: Fence) -> bool {
+        self.kept.lock().get(leg).is_some_and(|(_, until, g)| *until > crate::util::now_unix() && *g == Some((attempt, fence)))
     }
 
     /// Whether `run` is one of the engine's live runs.
@@ -1106,8 +1126,8 @@ pub fn spawn(hub: Arc<Hub>) {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {
             Ok(kept) => {
-                for (leg, agent, until) in kept {
-                    hub.ci.keep(&leg, Some((agent, until)));
+                for (leg, agent, until, grant) in kept {
+                    hub.ci.keep_under(&leg, Some((agent, until)), grant);
                 }
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "kept legs could not be read"),
@@ -1243,7 +1263,7 @@ impl Dispatch {
                 let fence = named.unwrap_or(now);
                 if fence == now {
                     self.hub.release_slot(&agent, &leg);
-                    self.hub.ci.grant(&leg, None);
+                    self.regrant(&leg, None).await;
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.agent = None;
                     }
@@ -1447,6 +1467,18 @@ impl Dispatch {
         self.commands(cmds).await;
     }
 
+    /// `leg`'s live grant from now, `now` or none (W05-R36). The one this ends or replaces dies
+    /// with its tokens (W10-R03): they're taken only under the live grant, and the leg's job tokens
+    /// (GITHUB_TOKEN) are revoked in the store. Every grant's end comes here: finished (cancelled
+    /// too), refused, lost (its lease ran out, its runner lost, or reconciled), settled, gone, or
+    /// superseded by the leg's next.
+    async fn regrant(&self, leg: &str, now: Option<(String, u32, Fence)>) {
+        let Some((_, attempt, _)) = self.hub.ci.grant(leg, now) else { return };
+        if let Err(e) = super::token::revoke_leg(&self.hub, leg).await {
+            tracing::warn!(leg, attempt, error = %format!("{e:#}"), "the job token could not be revoked");
+        }
+    }
+
     /// Whether `g` is the live grant of its leg, `agent`'s, as the dispatcher has it (W05-R36).
     fn live(&self, agent: &str, g: &crate::proto::Grant) -> bool {
         self.legs.get(&g.leg).is_some_and(|l| l.agent.as_deref() == Some(agent) && l.attempt == g.attempt && l.fence == g.fence())
@@ -1469,6 +1501,8 @@ impl Dispatch {
                 self.forget_gone(&leg, attempt).await;
                 continue;
             }
+            // Its grant is over now, its tokens with it (W10-R03), before its loss is recorded.
+            self.regrant(&leg, None).await;
             let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.to_owned()), peak_rss: None, cpu_seconds: None };
             if let Err(e) = runs::attempt_finished(&self.hub, &leg, attempt, None, end).await {
                 tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the attempt could not be recorded");
@@ -2290,7 +2324,7 @@ impl Dispatch {
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.fence = fence;
                     }
-                    self.hub.ci.grant(&leg, Some((runner.clone(), attempt, fence)));
+                    self.regrant(&leg, Some((runner.clone(), attempt, fence))).await;
                     self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot, grant: Some((fence, lease_loss)) }).await
                 }
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
@@ -2342,7 +2376,7 @@ impl Dispatch {
                     Ok(())
                 }
                 Command::Retry { leg, attempt, at } => {
-                    self.hub.ci.grant(&leg, None);
+                    self.regrant(&leg, None).await;
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.attempt = attempt;
                         l.seq = 0;
@@ -2378,7 +2412,7 @@ impl Dispatch {
                 // holds it no more; the `Retry` or `Settled` that follows does the rest.
                 Command::Lost { leg, attempt, runner, fence, why } => {
                     self.hub.release_slot(&runner, &leg);
-                    self.hub.ci.grant(&leg, None);
+                    self.regrant(&leg, None).await;
                     let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.why().to_owned()), peak_rss: None, cpu_seconds: None };
                     runs::attempt_finished(&self.hub, &leg, attempt, Some(fence), end).await.map(|_| ())
                 }
@@ -2483,10 +2517,13 @@ impl Dispatch {
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
         let (cache_mode, cache) = cache_access(&l.spec, r);
         let ttl = (i64::from(l.spec.timeout_minutes) + 60) * 60;
-        let token = super::token::mint(&self.hub, &super::token::Leg { leg, run: &l.run, repo: &r.repo.id, cache, cache_mode: cache_mode.as_str(), ttl });
-        // GITHUB_TOKEN: a job token with the job's permissions, revoked when the attempt ends
+        // Both tokens are this attempt's, under its grant: taken only while that's the leg's live
+        // grant, they die with it (W10-R03).
+        let held = grant.map(|(fence, _)| (attempt, fence));
+        let token = super::token::mint(&self.hub, &super::token::Leg { leg, run: &l.run, repo: &r.repo.id, cache, cache_mode: cache_mode.as_str(), ttl, grant: held });
+        // GITHUB_TOKEN: a job token with the job's permissions, revoked when its grant ends
         // (W10-R03, R04).
-        let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl).await?;
+        let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl, held).await?;
         // `github_api: github` (W14-R12): the jobs of a repository on GitHub that act on GitHub
         // itself get an installation token of the App, limited to the job's permissions and the
         // repository, as GITHUB_TOKEN, and GitHub's URLs.
@@ -2611,7 +2648,7 @@ impl Dispatch {
         match pending.at_once().filter(|a| **a != crate::wire::commands::Answer::Sent).cloned() {
             Some(a) => {
                 self.hub.release_slot(runner, leg);
-                self.hub.ci.grant(leg, None);
+                self.regrant(leg, None).await;
                 if let Some(l) = self.legs.get_mut(leg) {
                     l.agent = None;
                 }
@@ -2985,10 +3022,8 @@ impl Dispatch {
             return Ok(());
         }
         self.hub.logs.finish(&r.job);
-        // The attempt's GITHUB_TOKEN dies with it (W10-R03).
-        if let Err(e) = super::token::revoke_leg(&self.hub, &r.job).await {
-            tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the job token could not be revoked");
-        }
+        // Its grant ends with its result, and its tokens with it (W10-R03).
+        self.regrant(&r.job, None).await;
         let Some(l) = self.legs.get(&r.job) else { return Ok(()) };
         let attempt = grant.as_ref().map_or(l.attempt, |g| g.attempt);
         let gate = l.spec.def().and_then(|j| j.kiln.bench_gate.clone());
@@ -3019,7 +3054,6 @@ impl Dispatch {
                 Err(e) => super::results::annotate(&self.hub, &r.job, "warning", "bench-gate", &e).await,
             }
         }
-        self.hub.ci.grant(&r.job, None);
         if let Some(l) = self.legs.get_mut(&r.job) {
             l.agent = None;
             if let Some(e) = &r.error {
@@ -3053,7 +3087,7 @@ impl Dispatch {
     /// A leg gone with its repository that ended (or was lost with its runner): out of the
     /// dispatcher, and its slot the scheduler's to give.
     async fn forget_gone(&mut self, leg: &str, attempt: u32) {
-        self.hub.ci.grant(leg, None);
+        self.regrant(leg, None).await;
         self.legs.remove(leg);
         self.hub.ci.legs.lock().remove(leg);
         self.hub.logs.finish(leg);
@@ -3092,7 +3126,7 @@ impl Dispatch {
     /// The leg is done for good: its row, then its plan (W04-R02).
     async fn settled(&mut self, leg: &str, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
         // Done for good: it holds no grant (W05-R36).
-        self.hub.ci.grant(leg, None);
+        self.regrant(leg, None).await;
         let c = match &outcome {
             Outcome::Success => PlanC::Success,
             Outcome::Cancelled => PlanC::Cancelled,
@@ -3727,6 +3761,110 @@ mod tests {
         h.grant("M", Some(("a".into(), 1, Fence::default())));
         assert!(!h.fenced("M"), "a grant an older build made has no fence");
         assert!(h.first_refusal(&grant(1, 4)) && !h.first_refusal(&grant(1, 4)) && h.first_refusal(&grant(2, 5)), "said once a grant");
+    }
+
+    /// A dispatcher on `hub`, with no runs yet: what a test drives a grant's ends through.
+    fn dispatcher(hub: &std::sync::Arc<crate::hub::Hub>) -> super::Dispatch {
+        super::Dispatch {
+            hub: std::sync::Arc::clone(hub),
+            sched: kiln_ci::sched::Scheduler::new(kiln_ci::sched::Config::default()),
+            routing: crate::ci::routing::Sources::default(),
+            held: std::collections::HashMap::new(),
+            runs: std::collections::HashMap::new(),
+            legs: std::collections::HashMap::new(),
+            timers: std::collections::BTreeSet::new(),
+            next: Vec::new(),
+            in_commands: false,
+            pods: std::collections::HashSet::new(),
+            absent_after: None,
+            decisions: std::collections::HashMap::new(),
+            warm: std::collections::HashMap::new(),
+            warm_seq: 0,
+        }
+    }
+
+    /// `leg` running attempt 1 on runner `a` under grant `n`, granted as `Assign` grants it, and
+    /// its job token (GITHUB_TOKEN) minted for that grant as `assign` mints it: the token.
+    async fn running(d: &mut super::Dispatch, leg: &str, n: u64) -> anyhow::Result<String> {
+        let fence = kiln_ci::sched::Fence { epoch: 0, n };
+        let spec = super::placeholder_spec(&std::sync::Arc::new(kiln_ci::wf::Workflow::default()), "build");
+        let l = super::LegSt { run: "R".into(), key: "build".into(), spec, attempt: 1, agent: Some("a".into()), report: kiln_ci::plan::LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false, fence };
+        d.legs.insert(leg.to_owned(), l);
+        d.regrant(leg, Some(("a".into(), 1, fence))).await;
+        crate::ci::token::mint_job(&d.hub, leg, "R", "repo", &kiln_ci::plan::perms::Resolved::default(), 3600, Some((1, fence))).await
+    }
+
+    /// Whether `token` is revoked in the store, and refused.
+    async fn revoked(hub: &crate::hub::Hub, token: &str) -> anyhow::Result<bool> {
+        let hash = crate::util::sha256_hex(token.as_bytes());
+        let at: Option<i64> = hub.store.call(move |c| Ok(c.query_row("SELECT revoked_at FROM tokens WHERE hash = ?1", [hash], |r| r.get(0))?)).await?;
+        Ok(at.is_some() && crate::ci::token::job_of(hub, token).await.is_none())
+    }
+
+    /// W10-R03: a job token (GITHUB_TOKEN) is its attempt's grant's, revoked in the store at every
+    /// end of that grant: its result (finished, or cancelled), a refusal, a loss (the scheduler's
+    /// `Lost`, for a lease run out or a runner lost; or reconciled, a runner that no longer has
+    /// it), the leg settled or gone with its repository, and the leg's next grant superseding it.
+    /// Taken until then, and the next grant's is taken.
+    #[test]
+    fn w10_r03_every_end_revokes_the_job_token() -> anyhow::Result<()> {
+        use crate::proto::{Grant, JobResult};
+        use crate::store::Status;
+        use kiln_ci::sched::{Command, Fence, LeaseLoss, Loss, Outcome};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut d = dispatcher(&hub);
+            let grant = |leg: &str, n| Grant { leg: leg.into(), attempt: 1, epoch: 0, n };
+            let result = |leg: &str, status| JobResult { job: leg.into(), status, exit_code: None, error: None, peak_rss: None, cpu_seconds: None };
+            let mut ends = Vec::new();
+
+            let t = running(&mut d, "finished", 1).await?;
+            assert!(crate::ci::token::job_of(&hub, &t).await.is_some(), "taken while its grant is live");
+            d.finished("a", result("finished", Status::Succeeded), Some(grant("finished", 1))).await?;
+            ends.push(("finished", t));
+
+            let t = running(&mut d, "cancelled", 2).await?;
+            d.finished("a", result("cancelled", Status::Cancelled), Some(grant("cancelled", 2))).await?;
+            ends.push(("cancelled", t));
+
+            let t = running(&mut d, "refused", 3).await?;
+            d.handle(super::Msg::Rejected { agent: "a".into(), leg: "refused".into(), fence: Some(Fence { epoch: 0, n: 3 }) }).await;
+            ends.push(("refused", t));
+
+            let t = running(&mut d, "expired", 4).await?;
+            d.commands(vec![Command::Lost { leg: "expired".into(), attempt: 1, runner: "a".into(), fence: Fence { epoch: 0, n: 4 }, why: Loss::Expired }]).await;
+            ends.push(("lost, its lease run out", t));
+
+            let t = running(&mut d, "runner-lost", 5).await?;
+            d.commands(vec![Command::Lost { leg: "runner-lost".into(), attempt: 1, runner: "a".into(), fence: Fence { epoch: 0, n: 5 }, why: Loss::RunnerLost }]).await;
+            ends.push(("lost with its runner", t));
+
+            let t = running(&mut d, "reconciled", 6).await?;
+            let cmds = d.lose(vec![("reconciled".into(), 1)], "the runner lost it").await;
+            d.commands(cmds).await;
+            ends.push(("reconciled", t));
+
+            let t = running(&mut d, "settled", 7).await?;
+            d.settled("settled", Outcome::Cancelled, None).await?;
+            ends.push(("settled", t));
+
+            let t = running(&mut d, "gone", 8).await?;
+            d.forget_gone("gone", 1).await;
+            ends.push(("gone with its repository", t));
+
+            let t = running(&mut d, "superseded", 9).await?;
+            let next = Fence { epoch: 0, n: 10 };
+            d.commands(vec![Command::Assign { leg: "superseded".into(), runner: "b".into(), attempt: 2, executor: None, image: None, docker: None, slot: None, fence: next, expires: None, lease_loss: LeaseLoss::default() }]).await;
+            ends.push(("superseded", t));
+            let second = crate::ci::token::mint_job(&hub, "superseded", "R", "repo", &kiln_ci::plan::perms::Resolved::default(), 3600, Some((2, next))).await?;
+            assert!(crate::ci::token::job_of(&hub, &second).await.is_some(), "the next grant's is taken");
+
+            for (end, t) in &ends {
+                assert!(revoked(&hub, t).await?, "{end}: its job token is revoked");
+            }
+            assert_eq!(ends.len(), 9);
+            Ok(())
+        })
     }
 
     /// W05-R34: `[sched] lease` and `lock_delay` are read as durations, kiln's 60 s and 15 s when
