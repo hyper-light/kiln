@@ -51,6 +51,12 @@ impl Uplink {
         let _ = self.0.send(Up::Msg(m)).await;
     }
 
+    /// A message that's only said along the way (an upgrade's progress): sent without waiting, so
+    /// what's doing it never waits on the connection; dropped when the uplink is full.
+    pub fn say(&self, m: AgentMsg) {
+        let _ = self.0.try_send(Up::Msg(m));
+    }
+
     pub async fn log(&self, job: &str, idx: u32, data: Vec<u8>) {
         let _ = self.0.send(Up::Log(LogChunk { job: job.to_owned(), idx, data })).await;
     }
