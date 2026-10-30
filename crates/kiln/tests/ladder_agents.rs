@@ -360,3 +360,49 @@ fn w26_r17_the_queue_holds_a_conflict_until_its_accepted() -> anyhow::Result<()>
     assert_eq!(show(&w.bare, "main", "plan/expand.rs")?, expand("110"));
     Ok(())
 }
+
+/// Goal 14's W26-R16 step 4, the dispatch the ladder carries out: with `fresh.conflict-agents` unset
+/// (the default), a person's conflicting change starts no agent, and the ladder says why, naming the
+/// setting; with it on, an agent starts on a runner with the harness (r1). (The on case resolving all
+/// the way is w26_r17_a_sent_agent_resolves_in_its_own_workspace.)
+#[test]
+fn w26_r16_conflict_agent_only_when_on() -> anyhow::Result<()> {
+    let started = |w: &World| -> anyhow::Result<Vec<Value>> {
+        let sessions: Value = serde_json::from_str(&http(w.s.port, "GET", "/api/harness/sessions", &w.s.admin, None)?.1).unwrap_or_default();
+        Ok(sessions.as_array().cloned().unwrap_or_default().into_iter().filter(|s| text(s, "name") == "Resolve D1's conflicts").collect())
+    };
+
+    // Off: the ladder holds the conflict for a person, saying the trunk sends no agent; none starts.
+    let off = tempfile::tempdir()?;
+    let w = world(off.path())?;
+    let dev = person(&w.s, "dev")?;
+    w.conflict(off.path(), &dev)?;
+    ok(&w.s, &w.kim, "GET", "/api/diffs/D1/conflicts", None)?;
+    until(240, "D1 held for a person", || {
+        let l = w.ladder()?;
+        Ok((text(&l, "state") != "held").then(|| l.to_string()))
+    })?;
+    let l = w.ladder()?;
+    let why = l.get("why").map(Value::to_string).unwrap_or_default();
+    assert!(why.contains("sends no agent (.kiln/review.yaml: fresh: conflict-agents)"), "{l}");
+    assert_eq!(l.pointer("/switches/conflict_agents"), Some(&json!(false)), "{l}");
+    assert!(w.agent_try()?.is_null(), "no agent tried: {l}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(started(&w)?.is_empty(), "no agent started");
+    drop(w);
+
+    // On: an agent starts, on r1, the runner with the harness.
+    let on = tempfile::tempdir()?;
+    let w = world_with(on.path(), "fresh:\n  conflict-agents: true\n")?;
+    let dev = person(&w.s, "dev")?;
+    std::fs::write(&w.token_file, token(&w.s, json!({ "kind": "agent", "agent": "resolver", "user": "dev", "grants": ["developer@repo:acme/app"] }))?)?;
+    w.conflict(on.path(), &dev)?;
+    ok(&w.s, &w.kim, "GET", "/api/diffs/D1/conflicts", None)?;
+    until(240, "an agent started for D1's conflict", || {
+        let s = started(&w)?;
+        Ok(s.is_empty().then(|| w.ladder().map(|l| l.to_string()).unwrap_or_default()))
+    })?;
+    let s = started(&w)?;
+    assert!(s.iter().any(|x| x.to_string().contains("r1")), "on r1: {s:?}");
+    Ok(())
+}

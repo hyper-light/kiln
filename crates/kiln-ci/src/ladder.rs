@@ -218,8 +218,8 @@ fn reaches(rung: Rung, c: &Conflict, author: Author, sw: Switches, can: &[Rung])
         Rung::Agent => match author {
             Author::Agent { live: true } => Ok(()),
             _ if sw.send_agent => Ok(()),
-            Author::Agent { live: false } => Err(format!("{}: the change's agent is gone, and the repository sends no agent", c.place)),
-            Author::Person => Err(format!("{}: the change is a person's, and the repository sends no agent", c.place)),
+            Author::Agent { live: false } => Err(format!("{}: the change's agent is gone, and its trunk sends no agent (.kiln/review.yaml: fresh: conflict-agents)", c.place)),
+            Author::Person => Err(format!("{}: the change is a person's, and its trunk sends no agent (.kiln/review.yaml: fresh: conflict-agents)", c.place)),
         },
         _ => Ok(()),
     }
