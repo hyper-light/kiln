@@ -17,6 +17,9 @@
 //!   labels they give), a stand-in for a runner of another platform (W04-AC07);
 //! - `rebuild=<duration>`: the server's, not its runner's: the CI engine rebuilds its runs that
 //!   long after the server starts, so its runners say hello before it knows their legs (W05-R05).
+//! - `claim=<duration>`: the server's: the CI engine's first claim of a grant (written before its
+//!   Assign is sent) is held back that long and then fails, as a store that can't write would
+//!   (W05-R05).
 //! - `shed=<lane>[/<variant>]:<every>`: this process's QUIC layer drops about one frame in `every`
 //!   of `lane` (`control`, `term` ... or its number; of those whose first byte, a message's
 //!   variant index, is `variant`, when given), picked by a seeded draw, as a frame lost below the
@@ -60,6 +63,7 @@ pub struct Chaos {
     pub fetch: bool,
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
+    pub claim_fails: Option<Duration>,
     /// What goes wrong below the channel: `shed`, `twice`, `late`, in the order given, drawn from
     /// `seed`.
     pub faults: Vec<crate::net::Shed>,
@@ -111,6 +115,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 c.platform = Some(v.to_owned());
             }
             "rebuild" => c.rebuild_after = Some(d()?),
+            "claim" => c.claim_fails = Some(d()?),
             "shed" | "twice" | "late" => {
                 let act = match k {
                     "shed" => crate::net::Act::Drop,
@@ -122,7 +127,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
             "old" => c.old = true,
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout or old"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, claim, shed, twice, late, seed, fanout or old"),
         }
     }
     Ok(c)
@@ -153,6 +158,14 @@ pub fn get() -> Option<&'static Chaos> {
 /// A leg's faults: its first attempt's.
 pub fn for_leg(attempt: u32) -> Option<&'static Chaos> {
     get().filter(|_| attempt <= 1)
+}
+
+/// Whether this is the first claim `claim=` fails (once a process).
+static CLAIM_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The hold before a claim fails (`claim=`), for the first claim only.
+pub fn claim_fails() -> Option<Duration> {
+    get().and_then(|c| c.claim_fails).filter(|_| !CLAIM_FAILED.swap(true, Ordering::Relaxed))
 }
 
 /// Kills chaos made as the OOM killer would, added to the kernel's count.
@@ -331,6 +344,7 @@ mod tests {
                 fetch: false,
                 platform: None,
                 rebuild_after: None,
+                claim_fails: None,
                 faults: Vec::new(),
                 seed: 0,
                 fanout: None,
@@ -341,6 +355,7 @@ mod tests {
         assert!(parse("drop=6s,old")?.old);
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
+        assert_eq!(parse("claim=3s")?.claim_fails, Some(Duration::from_secs(3)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));

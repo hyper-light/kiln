@@ -287,3 +287,33 @@ fn w10_r03_a_lost_attempts_tokens_stop_working() -> anyhow::Result<()> {
     assert_eq!(uses(&s, &second, "a2-after")?, [401, 401, 401], "attempt 2's, its grant ended");
     Ok(())
 }
+
+/// W05-R05, G10, docs/needs.md E3.3: a grant is written before its Assign is sent. The server's
+/// first claim is held back 3 s and then fails (KILN_CHAOS claim=3s): no Assign goes, so the leg's
+/// step doesn't start while the claim is held, nor after it failed. The leg goes back to its queue
+/// and runs 15 s later on its next grant, the same attempt, its only one, on the only runner there
+/// is (kept off none).
+#[cfg(feature = "chaos")]
+#[test]
+fn w05_r05_a_grant_is_in_the_store_before_assign_is_sent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mark = dir.path().join("started");
+    let script = format!("date +%s > \"{}\"\necho started", mark.display());
+    let s = push_leg(dir.path(), &[("KILN_CHAOS", "claim=3s")], "", &script)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !s.log().contains("the grant couldn't be written") {
+        anyhow::ensure!(!mark.exists(), "the step started while its grant's claim was held back\n{}", s.log());
+        anyhow::ensure!(Instant::now() < deadline, "the claim never failed\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let failed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    anyhow::ensure!(!mark.exists(), "the step started under the grant that wasn't written\n{}", s.log());
+    let (about, log) = ended(&s, 180)?;
+    let attempts = about.get("attempts").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert_eq!(attempts.len(), 1, "the same attempt, its only one: {attempts:?}\n{}", s.log());
+    assert_eq!(attempts.first().and_then(|a| a.get("conclusion")), Some(&json!("success")), "{attempts:?}");
+    assert!(log.contains("started"), "{log}");
+    let started: u64 = std::fs::read_to_string(&mark)?.trim().parse()?;
+    assert!(started >= failed + 14, "queued again 15 s after its claim failed: started at {started}, failed at {failed}");
+    Ok(())
+}

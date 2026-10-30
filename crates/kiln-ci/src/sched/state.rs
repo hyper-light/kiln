@@ -634,6 +634,11 @@ pub enum Input {
     /// queue, the same attempt, and not to that runner. A refusal of a grant that isn't the leg's
     /// now changes nothing (W05-R34).
     Rejected { leg: String, fence: Fence },
+    /// A grant the server couldn't make durable before its Assign (W05-R05, G10): its Assign never
+    /// went, so the leg goes back to its queue, the same attempt, [`REFUSED_AGAIN_MS`] later, and
+    /// is kept off no runner: it says nothing of the leg or the runner. One that isn't the leg's
+    /// grant now changes nothing.
+    Ungranted { leg: String, fence: Fence },
     /// A runner renews the grants it holds (its heartbeat, W05-R34): each it names by its fence
     /// that's its own lives a lease from now. A grant it doesn't name isn't renewed.
     Renewed { runner: String, held: Vec<(String, Fence)> },
@@ -1232,6 +1237,21 @@ impl Scheduler {
                         }
                         self.enqueue(&leg, now, &mut out);
                     }
+                    self.try_runner(&runner, now, &mut out);
+                }
+            }
+            Input::Ungranted { leg, fence } => {
+                if self.live(&leg, fence)
+                    && let Some(runner) = self.release(&leg, now)
+                {
+                    self.stopped(&leg);
+                    self.discard_used(&leg, &mut out);
+                    let at = now + REFUSED_AGAIN_MS;
+                    if let Some(l) = self.legs.get_mut(&leg) {
+                        l.state = State::Retrying { at };
+                    }
+                    self.timers.entry(at).or_default().push(leg.clone());
+                    out.push(Command::Timer { at });
                     self.try_runner(&runner, now, &mut out);
                 }
             }

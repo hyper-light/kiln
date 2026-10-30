@@ -542,6 +542,16 @@ pub(crate) async fn refuse_write(hub: &Hub, agent: &str, g: &crate::proto::Grant
     }
 }
 
+/// [`runs::claim`]; in a test build with `claim=<duration>` (`KILN_CHAOS`), the first held back
+/// that long and then failed, as a store that can't write would (W05-R05).
+async fn claim(hub: &Hub, leg: &str, runner: &str, executor: &str, attempt: u32, fence: Fence) -> anyhow::Result<()> {
+    if let Some(hold) = crate::runner::chaos::claim_fails() {
+        crate::rt::sleep(hold).await;
+        anyhow::bail!("the store couldn't write it (KILN_CHAOS claim)");
+    }
+    runs::claim(hub, leg, runner, executor, attempt, fence).await
+}
+
 /// The hub's handle on the dispatcher.
 pub struct Handle {
     tx: async_channel::Sender<Msg>,
@@ -2616,7 +2626,16 @@ impl Dispatch {
         // In a `k8s` pool's pod it runs in the pod's own container (W13-R07): a terminal into it is
         // an exec into the pod, not a shell on a machine (W17-R01).
         let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
-        runs::claim(&self.hub, leg, runner, recorded, attempt, grant.map(|(f, _)| f).unwrap_or_default()).await?;
+        // The grant is written before its Assign goes (W05-R05, G10). One that couldn't be sends
+        // none: it ends here, and the leg goes back to its queue, the same attempt, a while later.
+        let fence = grant.map(|(f, _)| f).unwrap_or_default();
+        if let Err(e) = claim(&self.hub, leg, runner, recorded, attempt, fence).await {
+            tracing::warn!(leg, runner, attempt, error = %format!("{e:#}"), "the grant couldn't be written: its Assign isn't sent, and the leg goes back to its queue");
+            self.regrant(leg, None).await;
+            let cmds = self.sched.handle(Input::Ungranted { leg: leg.to_owned(), fence }, now_ms());
+            self.next.extend(cmds);
+            return Ok(());
+        }
         // The run's first leg to start: `workflow_run` `in_progress`.
         if let Some(run) = self.legs.get(leg).map(|l| l.run.clone()) {
             let first = self.runs.get_mut(&run).is_some_and(|r| !std::mem::replace(&mut r.in_progress, true));

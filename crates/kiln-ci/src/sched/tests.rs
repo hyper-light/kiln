@@ -2670,3 +2670,29 @@ fn w05_r35_a_draining_runners_refusal_doesnt_keep_the_leg_off_it() {
     assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "x" && runner == "a")), "back, it takes the leg again: {c:?}");
     assert_eq!(s.check_grants(), Ok(()));
 }
+
+/// W05-R05, G10: a grant the server couldn't write before its Assign goes back to its queue, the
+/// same attempt, after REFUSED_AGAIN_MS, kept off no runner: the only runner there is takes it
+/// again under a new grant. A late word about the grant that wasn't changes nothing.
+#[test]
+fn w05_r05_a_grant_not_written_goes_back_to_its_queue() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let first = fence(&s, "x");
+    let c = s.handle(Input::Ungranted { leg: "x".into(), fence: first }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "not at once: {c:?}");
+    assert!(c.iter().any(|x| matches!(x, Command::Timer { at } if *at == 1 + super::state::REFUSED_AGAIN_MS)), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::Tick, super::state::REFUSED_AGAIN_MS);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "nor before its time: {c:?}");
+    let c = s.handle(Input::Tick, 1 + super::state::REFUSED_AGAIN_MS);
+    let again = c.iter().find_map(|x| match x {
+        Command::Assign { leg, runner, attempt: 1, fence, .. } if leg == "x" && runner == "a" => Some(*fence),
+        _ => None,
+    });
+    assert!(again.is_some_and(|f| f != first), "the same attempt, to the same runner, under a new grant: {c:?}");
+    let c = s.handle(Input::Ungranted { leg: "x".into(), fence: first }, 2 + super::state::REFUSED_AGAIN_MS);
+    assert!(c.is_empty() && again == Some(fence(&s, "x")), "a late word about the grant that wasn't changes nothing: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}

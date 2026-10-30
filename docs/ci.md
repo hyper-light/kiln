@@ -1666,7 +1666,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   flushed at most every 5 ms) before it sends `Assign`, so a crash never runs a leg twice
   unknowingly; runners re-announce running legs on reconnect (today's `Hello.running`), which
   re-adopts them. The record is the grant (W05-R34): its runner, its attempt and its fence, on the
-  leg and on the attempt; a restart takes each running leg's grant back with its fence.
+  leg and on the attempt; a restart takes each running leg's grant back with its fence. A grant
+  that couldn't be written sends no `Assign`: it ends, and the leg goes back to its queue, the
+  same attempt, 15 s later, kept off no runner.
 
 **Requirements: concurrency, priorities, fairness**
 
