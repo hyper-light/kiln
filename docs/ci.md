@@ -8602,6 +8602,13 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     left frozen as they ended, as a dead runner's jobs always ran on.
   - A job that has ended can't be paused, and one that isn't paused can't be resumed: each says so.
     Pausing a paused job changes nothing.
+  - Ship acts on a commit's jobs through one endpoint, across its runs and either engine's:
+    `POST /api/ship/jobs { repo, sha, verb, jobs?, scope? }`, `verb` one of retry, pause, resume
+    and cancel, the jobs named or those `scope` picks (failed, running, waiting, all). Each run gets
+    its own call underneath, as the caller, who needs the verb's right on the repository
+    (`runs.rerun`, `runs.pause`, `runs.cancel`), and each job answers. The commit's detail lists
+    its `jobs`: each one's id, run, pipeline and name, runner, `paused_at`, the `verbs` that apply
+    now and why each other doesn't (`why_not`), Pause where its runner can't freeze it included.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):

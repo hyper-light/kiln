@@ -47,6 +47,8 @@ pub struct RunnerSeen {
     pub connected: bool,
     pub commit: Option<String>,
     pub failed: Option<String>,
+    /// It freezes a job in place (`CAP_FREEZE`, docs/ci.md W26-R22): Pause applies to its jobs.
+    pub freeze: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +82,9 @@ struct LegRec {
     reused: bool,
     error: Option<String>,
     attempts: Vec<AttemptRec>,
+    /// Paused since then (W26-R22), and the runner it runs on.
+    paused_at: Option<i64>,
+    agent: Option<String>,
 }
 
 /// A KilnCD deployment of a commit, as Ship reads it: kiln deploys itself through KilnCD, not CI's
@@ -853,12 +858,28 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     // The engine's legs are its run's latest attempt's; v1's jobs (no `job_id`, no `run_attempt`:
     // production's runs, 2026-10-28) are their run's, retried in place.
     let mut st = c.prepare(
-        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at
+        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at, j.paused_at, j.agent
          FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND (j.job_id IS NULL OR j.run_attempt = r.attempt) ORDER BY j.rowid",
     )?;
     let legs: Vec<(String, LegRec)> = st
         .query_map(params![repo_id, sha], |r| {
-            Ok((r.get::<_, String>(0)?, LegRec { job: r.get(0)?, run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, started: r.get(7)?, finished: r.get(8)?, attempts: Vec::new() }))
+            Ok((
+                r.get::<_, String>(0)?,
+                LegRec {
+                    job: r.get(0)?,
+                    run_id: r.get(1)?,
+                    name: r.get(2)?,
+                    status: r.get(3)?,
+                    conclusion: r.get(4)?,
+                    reused: r.get(5)?,
+                    error: r.get(6)?,
+                    started: r.get(7)?,
+                    finished: r.get(8)?,
+                    attempts: Vec::new(),
+                    paused_at: r.get(9)?,
+                    agent: r.get::<_, Option<String>>(10)?.filter(|a| !a.is_empty() && a != "-"),
+                },
+            ))
         })?
         .collect::<Result<_, _>>()?;
     let mut at = c.prepare("SELECT status, conclusion, failure_class FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
@@ -1281,6 +1302,63 @@ fn leg_json(l: &journey::Leg) -> Value {
     v
 }
 
+/// What a person can do to one of a commit's jobs from its row (docs/ci.md W26-R21, R22), through
+/// `POST /api/ship/jobs`: each verb that applies now, and why each other doesn't, as that endpoint
+/// would answer.
+fn job_verbs(leg: &LegRec, runners: &[RunnerSeen]) -> (Vec<&'static str>, serde_json::Map<String, Value>) {
+    let status = crate::store::Status::parse(&leg.status);
+    let paused = leg.paused_at.is_some();
+    let ended = status.is_terminal() || matches!(leg.status.as_str(), "completed");
+    let running = status == crate::store::Status::Running && !ended;
+    let freezes = leg.agent.as_deref().is_none_or(|a| runners.iter().any(|r| r.name == a && r.freeze));
+    let mut can = Vec::new();
+    let mut why = serde_json::Map::new();
+    let mut say = |verb: &'static str, no: Option<String>| match no {
+        None => can.push(verb),
+        Some(w) => {
+            why.insert(verb.to_owned(), Value::String(w));
+        }
+    };
+    let finished = || Some("it has finished".to_owned());
+    say("retry", if !ended { Some("it hasn't finished".to_owned()) } else if leg.status == "skipped" { Some("it was skipped: retry what it needs".to_owned()) } else { None });
+    say("cancel", if ended { finished() } else { None });
+    let pause = if ended {
+        finished()
+    } else if paused {
+        Some("it's paused".to_owned())
+    } else if running && !freezes {
+        Some(format!("its runner {} can't freeze a job in place", leg.agent.as_deref().unwrap_or_default()))
+    } else {
+        None
+    };
+    say("pause", pause);
+    say("resume", if ended { finished() } else if !paused { Some("it isn't paused".to_owned()) } else { None });
+    (can, why)
+}
+
+/// Every job of a commit, either engine's, as the jobs pane acts on them (W26-R21, R22): its id
+/// and run, its pipeline and name (a lane's), the runner it runs on, whether it's paused, and the
+/// verbs that apply.
+fn jobs_json(rec: &Records, runners: &[RunnerSeen]) -> Vec<Value> {
+    let pipeline: HashMap<&str, &str> = rec.runs.iter().map(|r| (r.id.as_str(), r.pipeline.as_str())).collect();
+    rec.legs
+        .iter()
+        .map(|l| {
+            let (can, why) = job_verbs(l, runners);
+            let mut v = json!({ "id": l.job, "run": l.run_id, "pipeline": pipeline.get(l.run_id.as_str()).copied().unwrap_or_default(), "name": l.name, "verbs": can, "why_not": why });
+            if let Some(o) = v.as_object_mut() {
+                if let Some(a) = &l.agent {
+                    o.insert("runner".into(), json!(a));
+                }
+                if let Some(at) = l.paused_at {
+                    o.insert("paused_at".into(), json!(at));
+                }
+            }
+            v
+        })
+        .collect()
+}
+
 /// A commit with every record its stand came from, as `viewer` sees it.
 fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Value {
     let j = journey_of(rec, runners, now);
@@ -1318,6 +1396,7 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
         o.insert("deployments".into(), json!(deployments));
         o.insert("releases".into(), json!(rec.releases.iter().map(|r| json!({ "state": r.state, "message": r.message, "rolled_back": r.rolled_back })).collect::<Vec<_>>()));
         o.insert("replant".into(), json!(replant));
+        o.insert("jobs".into(), json!(jobs_json(rec, runners)));
     }
     v
 }
@@ -1725,7 +1804,8 @@ async fn runners_seen(hub: &std::sync::Arc<Hub>) -> Vec<RunnerSeen> {
                 .find(|j| j.kind == "runner" && j.target == r.name)
                 .filter(|j| matches!(j.state, crate::updates::JobState::Failed))
                 .map(|j| j.error.clone().unwrap_or_else(|| "the upgrade failed".to_string()));
-            RunnerSeen { name: r.name, connected: r.connected, commit: r.commit, failed }
+            let freeze = hub.instances.lock().newest_wide_caps(&r.name) & crate::proto::CAP_FREEZE != 0;
+            RunnerSeen { name: r.name, connected: r.connected, commit: r.commit, failed, freeze }
         })
         .collect()
 }
@@ -1827,6 +1907,92 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
         return Err((StatusCode::NOT_FOUND, "no such commit".to_string()));
     }
     Ok(srv::json(StatusCode::OK, &v))
+}
+
+/// `POST /api/ship/jobs` `{repo, sha, verb, jobs?, scope?}` (docs/ci.md W26-R21, R22): a commit's
+/// jobs acted on together, across its runs: run again (`retry`), paused, resumed or cancelled.
+/// Those named (`jobs`), or those a word picks (`scope`): `failed`, `running`, `waiting` or `all`.
+/// Each run they belong to gets its own call underneath (`runs/:id/retry`, `cancel`, `pause`,
+/// `resume`, as the caller), and each job answers: done, or why not. As the caller, who needs
+/// `runs.rerun` (retry), `runs.cancel` (cancel) or `runs.pause` (pause, resume) on the repository.
+pub async fn jobs(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    jobs_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+}
+
+async fn jobs_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (Some(repo), Some(sha), Some(verb)) = (field("repo"), field("sha"), field("verb")) else {
+        return Err((StatusCode::BAD_REQUEST, "`repo`, `sha` and `verb`: the commit, and what to do to its jobs".to_string()));
+    };
+    let (cap, word) = match verb.as_str() {
+        "retry" => ("runs.rerun", "again"),
+        "cancel" => ("runs.cancel", "cancelled"),
+        "pause" => ("runs.pause", "paused"),
+        "resume" => ("runs.pause", "resumed"),
+        _ => return Err((StatusCode::BAD_REQUEST, format!("`verb` {verb}: retry, pause, resume or cancel"))),
+    };
+    if !caller.can(cap, &crate::authz::Scope::Repo { repo: repo.clone() }) {
+        return Err((StatusCode::FORBIDDEN, format!("{verb} needs `{cap}` on {repo}")));
+    }
+    let named: Option<Vec<String>> = body.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect());
+    let scope = field("scope");
+    if named.as_ref().is_none_or(Vec::is_empty) && scope.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "name the `jobs`, or a `scope`: failed, running, waiting or all".to_string()));
+    }
+    let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
+    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let mut out: Vec<Value> = Vec::new();
+    // The jobs it's for, by run, in the commit's order.
+    let picked: Vec<&LegRec> = match (named.filter(|n| !n.is_empty()), scope.as_deref()) {
+        (Some(ids), _) => {
+            for id in ids.iter().filter(|id| !rec.legs.iter().any(|l| &l.job == *id)) {
+                out.push(json!({ "job": id, "done": false, "why": "not a job of this commit" }));
+            }
+            rec.legs.iter().filter(|l| ids.contains(&l.job)).collect()
+        }
+        (None, Some(scope)) => {
+            let status = |l: &LegRec| crate::store::Status::parse(&l.status);
+            let ended = |l: &LegRec| status(l).is_terminal() || l.status == "completed";
+            let pick = |l: &LegRec| match scope {
+                "failed" => part_of(&l.status, l.conclusion.as_deref()) == Part::Failed,
+                "running" => !ended(l) && status(l) == crate::store::Status::Running,
+                "waiting" => !ended(l) && status(l) != crate::store::Status::Running,
+                _ => true,
+            };
+            if !matches!(scope, "failed" | "running" | "waiting" | "all") {
+                return Err((StatusCode::BAD_REQUEST, format!("`scope` {scope}: failed, running, waiting or all")));
+            }
+            rec.legs.iter().filter(|l| pick(l)).collect()
+        }
+        (None, None) => Vec::new(),
+    };
+    let mut runs: Vec<(String, Vec<String>)> = Vec::new();
+    for l in picked {
+        match runs.iter_mut().find(|(r, _)| *r == l.run_id) {
+            Some((_, ids)) => ids.push(l.job.clone()),
+            None => runs.push((l.run_id.clone(), vec![l.job.clone()])),
+        }
+    }
+    for (run, ids) in runs {
+        let said = match verb.as_str() {
+            "retry" => crate::ci::retry::retry_set(hub, &run, &ids, &caller.name).await,
+            "cancel" => crate::ci::retry::cancel_set(hub, &run, ids.clone(), &caller.name).await,
+            _ => crate::ci::retry::pause_set(hub, &run, ids.clone(), verb == "pause", &caller.name).await,
+        };
+        match said {
+            Ok(v) => {
+                for j in v.get("jobs").and_then(Value::as_array).into_iter().flatten() {
+                    let mut one = json!({ "job": j.get("job"), "run": run, "done": j.get(word).and_then(Value::as_bool).unwrap_or(false) });
+                    if let (Some(why), Some(o)) = (j.get("why"), one.as_object_mut()) {
+                        o.insert("why".into(), why.clone());
+                    }
+                    out.push(one);
+                }
+            }
+            Err((_, why)) => out.extend(ids.iter().map(|id| json!({ "job": id, "run": run, "done": false, "why": why }))),
+        }
+    }
+    Ok(json!({ "repo": repo, "sha": rec.sha, "verb": verb, "jobs": out }))
 }
 
 /// Failure lines the agent a failure is handed to gets with it.
@@ -2021,8 +2187,8 @@ mod tests {
 
     fn runners() -> Vec<RunnerSeen> {
         vec![
-            RunnerSeen { name: "metal-ryzen-01".into(), connected: true, commit: Some(short(C1)), failed: None },
-            RunnerSeen { name: "metal-epyc-01".into(), connected: true, commit: Some(C1.into()), failed: None },
+            RunnerSeen { name: "metal-ryzen-01".into(), connected: true, commit: Some(short(C1)), failed: None, freeze: true },
+            RunnerSeen { name: "metal-epyc-01".into(), connected: true, commit: Some(C1.into()), failed: None, freeze: false },
         ]
     }
 
@@ -3034,6 +3200,107 @@ mod tests {
     }
 
     /// A future run to its end on a thread of its own, within two minutes.
+    /// W26-R21, R22: a commit's jobs acted on together across its two runs (`POST /api/ship/jobs`):
+    /// paused by a word (`waiting`) and resumed by name, cancelled by a word (`running`), run again
+    /// (`failed`). A running job whose runner can't freeze it says why, as do a job that isn't the
+    /// commit's, a verb or scope that isn't one, a caller without the verb's right, and a commit
+    /// that isn't. The commit's `jobs` say what each can do, and why not.
+    #[test]
+    fn w26_r21_r22_one_endpoint_acts_on_a_commits_jobs_across_its_runs() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let repo = hub
+                .store
+                .upsert_repo(crate::store::Repo { id: "r-two".into(), name: "acme/two".into(), clone_url: "https://example/two".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                .await?;
+            let sha = "abcabcabcabcabcabcabcabcabcabcabcabcabca";
+            // Two v1 runs of the commit: ci (a fails, b needs it) and lint (c runs on ag1, d waits).
+            let mut ids: HashMap<String, String> = HashMap::new();
+            for (n, (id, yaml)) in [("r1", "name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {needs: [a], steps: [{run: y}]}\n"), ("r2", "name: lint\njobs:\n  c: {steps: [{run: z}]}\n  d: {steps: [{run: w}]}\n")].into_iter().enumerate() {
+                let p = crate::pipeline::parse(yaml)?;
+                let planned = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+                let run = crate::store::Run {
+                    id: id.into(),
+                    repo_id: repo.id.clone(),
+                    repo_name: repo.name.clone(),
+                    number: i64::try_from(n)? + 1,
+                    pipeline: p.name.clone(),
+                    event: "push".into(),
+                    branch: "main".into(),
+                    sha: sha.into(),
+                    message: "two runs".into(),
+                    author: "ada".into(),
+                    status: crate::store::Status::Queued,
+                    created_at: NOW_S,
+                    started_at: None,
+                    finished_at: None,
+                    error: None,
+                    concurrency_group: None,
+                };
+                hub.store.create_run(run, planned).await?;
+                ids.extend(hub.store.jobs(id.into(), false).await?.into_iter().map(|j| (j.key, j.id)));
+            }
+            let id = |k: &str| ids.get(k).cloned().unwrap_or_default();
+            let (a, b, c, d) = (id("a"), id("b"), id("c"), id("d"));
+            anyhow::ensure!(hub.store.claim_job(a.clone(), "ag1".into(), "baremetal".into()).await?);
+            hub.store.finish_job(a.clone(), crate::store::Status::Failed, Some(1), None, None, None).await?;
+            anyhow::ensure!(hub.store.claim_job(c.clone(), "ag1".into(), "baremetal".into()).await?);
+            let owner = crate::authz::Caller::owner();
+            let act = |body: Value| {
+                let (hub, owner) = (std::sync::Arc::clone(&hub), owner.clone());
+                async move { jobs_in(&hub, &owner, &body).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}")) }
+            };
+            let each = |v: &Value| -> HashMap<String, (bool, String)> {
+                v.get("jobs").and_then(Value::as_array).into_iter().flatten().map(|j| (j.get("job").and_then(Value::as_str).unwrap_or_default().to_owned(), (j.get("done").and_then(Value::as_bool).unwrap_or(false), j.get("why").and_then(Value::as_str).unwrap_or_default().to_owned()))).collect()
+            };
+            let ask = |verb: &str, extra: Value| {
+                let mut body = json!({ "repo": "acme/two", "sha": sha, "verb": verb });
+                if let (Some(o), Some(x)) = (body.as_object_mut(), extra.as_object()) {
+                    o.extend(x.clone());
+                }
+                body
+            };
+
+            // Paused by a word: the one waiting, d (b, skipped, has ended).
+            let v = act(ask("pause", json!({ "scope": "waiting" }))).await?;
+            anyhow::ensure!(each(&v) == HashMap::from([(d.clone(), (true, String::new()))]), "{v}");
+            // c runs on ag1, which can't freeze it: refused, saying so; nothing was sent to stop it.
+            let v = act(ask("pause", json!({ "jobs": [c] }))).await?;
+            anyhow::ensure!(each(&v).get(&c).is_some_and(|(done, why)| !done && why.contains("its runner ag1 can't freeze a job in place")), "{v}");
+            // What the commit says each can do.
+            let seen = vec![RunnerSeen { name: "ag1".into(), connected: true, ..RunnerSeen::default() }];
+            let detail = get_in(&hub.store, "acme/two", sha, None, seen, &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let job = |id: &str| detail.get("jobs").and_then(Value::as_array).and_then(|a| a.iter().find(|j| j.get("id").and_then(Value::as_str) == Some(id))).cloned().unwrap_or_default();
+            let verbs = |j: &Value| j.get("verbs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+            let (jd, jc, ja) = (job(&d), job(&c), job(&a));
+            anyhow::ensure!(jd.get("paused_at").is_some() && verbs(&jd) == ["cancel", "resume"] && jd.pointer("/why_not/pause") == Some(&json!("it's paused")), "d: {jd}");
+            anyhow::ensure!(verbs(&jc) == ["cancel"] && jc.pointer("/why_not/pause").and_then(Value::as_str).is_some_and(|w| w.contains("can't freeze")) && jc.get("runner") == Some(&json!("ag1")), "c: {jc}");
+            anyhow::ensure!(verbs(&ja) == ["retry"] && ja.get("pipeline") == Some(&json!("ci")) && ja.get("run") == Some(&json!("r1")), "a: {ja}");
+            // Resumed by name.
+            let v = act(ask("resume", json!({ "jobs": [d] }))).await?;
+            anyhow::ensure!(each(&v).get(&d) == Some(&(true, String::new())), "{v}");
+            anyhow::ensure!(hub.store.job(d.clone()).await?.and_then(|j| j.paused_at).is_none(), "d goes on");
+            // Cancelled by a word: what runs, c; d waits on.
+            let v = act(ask("cancel", json!({ "scope": "running" }))).await?;
+            anyhow::ensure!(each(&v) == HashMap::from([(c.clone(), (true, String::new()))]), "{v}");
+            anyhow::ensure!(hub.store.job(c.clone()).await?.map(|j| j.status) == Some(crate::store::Status::Cancelled), "c stopped");
+            // Run again by a word: what failed, a, with b back to wait on it.
+            let v = act(ask("retry", json!({ "scope": "failed" }))).await?;
+            anyhow::ensure!(each(&v).get(&a).is_some_and(|(done, _)| *done) && each(&v).len() == 1, "{v}");
+            anyhow::ensure!(hub.store.job(b.clone()).await?.map(|j| j.status) == Some(crate::store::Status::Pending), "b waits on a again");
+            // Not the commit's, not a verb, not a scope, nothing named, no right, no commit.
+            let v = act(ask("cancel", json!({ "jobs": ["nope"] }))).await?;
+            anyhow::ensure!(each(&v).get("nope") == Some(&(false, "not a job of this commit".to_owned())), "{v}");
+            let code = |r: Result<Value, Fail>| r.err().map(|(c, _)| c.as_u16()).unwrap_or(200);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("explode", json!({ "scope": "all" }))).await) == 400);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("retry", json!({ "scope": "everything" }))).await) == 400);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("retry", json!({}))).await) == 400);
+            anyhow::ensure!(code(jobs_in(&hub, &crate::authz::Caller::peer("user:ro", "viewer"), &ask("pause", json!({ "scope": "all" }))).await) == 403);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &json!({ "repo": "acme/two", "sha": "f00d", "verb": "retry", "scope": "all" })).await) == 404);
+            Ok(())
+        })
+    }
+
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

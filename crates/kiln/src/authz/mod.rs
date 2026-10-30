@@ -587,6 +587,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ship/**", "runs.read", At::Anywhere),
     // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
+    // Each verb's own right on the repository is asked inside (`ship::jobs`): retry, cancel, pause.
+    r("POST", "/api/ship/jobs", "runs.read", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),

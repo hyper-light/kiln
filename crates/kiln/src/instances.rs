@@ -239,6 +239,12 @@ impl Instances {
         self.newest_of(name)
     }
 
+    /// What machine `name`'s newest runner process can do, in 64 bits: `Build`'s 32 and what it
+    /// said past them; 0 when none is connected.
+    pub fn newest_wide_caps(&self, name: &str) -> u64 {
+        self.newest(name).and_then(|p| self.get(p)).map_or(0, |i| u64::from(i.caps) | i.wide)
+    }
+
     /// The machine's newest instance if it announced every capability in `caps`
     /// ([`crate::proto::CAP_DIRS`] ...), so it is never sent a message it can't read. An older
     /// instance that could is not asked instead: new work goes to the newest.

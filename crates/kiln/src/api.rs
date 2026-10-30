@@ -543,6 +543,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let repo = format!("{owner}/{name}");
             boxed(|| crate::ci::diffs::ship_commit_blob(&hub, &repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m))
         }
+        // A commit's jobs run again, paused, resumed or cancelled together (W26-R21, R22).
+        (&Method::POST, ["api", "ship", "jobs"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::jobs(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         // A row's Hand off: what the commit has open, to the agent that takes it (W26-R18).
         (&Method::POST, ["api", "ship", "hand-off"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
