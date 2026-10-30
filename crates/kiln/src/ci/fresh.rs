@@ -811,3 +811,41 @@ async fn auto_push_pulls(hub: &Arc<Hub>, repo: &Repo, numbers: &[i64]) {
         }
     }
 }
+
+/// `GET /api/ci/repos/:repo/pulls/:n/fresh` (W26-R16): how fresh a host's pull request is, as its
+/// page says it: its latest head's latest replay onto its base, in words, and whether Update can
+/// go (a clean replay) or why not. `null` before kiln has replayed it.
+pub async fn pull_state(hub: &Arc<Hub>, repo: &str, n: &str) -> Result<serde_json::Value, (http::StatusCode, String)> {
+    use http::StatusCode;
+    use serde_json::json;
+    let number: i64 = n.trim_start_matches('#').parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("`{n}` isn't a pull request's number")))?;
+    let r = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.name == repo).ok_or((StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
+    let rid = r.id.clone();
+    let found: Option<(String, String, String, String)> = hub
+        .store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row(
+                "SELECT r.state, r.onto, r.onto_name, p.base FROM review_pull_replays r JOIN host_pulls p ON p.repo_id = r.repo_id AND p.host = r.host AND p.number = r.number
+                  WHERE r.repo_id = ?1 AND r.number = ?2
+                    AND r.head_sha = (SELECT h.sha FROM host_pull_heads h WHERE h.repo_id = r.repo_id AND h.host = r.host AND h.number = r.number ORDER BY h.n DESC LIMIT 1)
+                  ORDER BY r.k DESC LIMIT 1",
+                rusqlite::params![rid, number],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let Some((state, onto, onto_name, base)) = found else { return Ok(serde_json::Value::Null) };
+    let clean = state == "clean";
+    // On the trunk, the planner's words; on another's branch (a stack), that one's replay.
+    let words = match (onto_name.starts_with('#'), clean) {
+        (true, true) => format!("replays clean on {onto_name}'s replay"),
+        (true, false) => format!("conflicts on {onto_name}'s replay"),
+        (false, true) => plan::Freshness::Clean { tip: onto.clone() }.words(&base),
+        (false, false) => plan::Freshness::Conflicted { tip: onto.clone() }.words(&base),
+    };
+    let why_not = (!clean).then(|| "resolve its conflicts first".to_owned());
+    Ok(json!({ "words": words, "tip": onto, "update": { "can": clean, "why_not": why_not }, "checks_from": null }))
+}

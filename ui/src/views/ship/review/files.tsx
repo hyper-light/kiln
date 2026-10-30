@@ -14,6 +14,9 @@ import {
   conflictsRes,
   diffRes,
   filesRes,
+  freshApi,
+  HOST_WORD,
+  hostPullFreshRes,
   hostPullRes,
   hostPullsApi,
   inboxRes,
@@ -69,7 +72,7 @@ const pullNumber = (name: string) => Number(name.replace(/\D/g, ""));
 export function warmReview(item: ShipCommit) {
   const ch = item.change;
   if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name));
-  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)));
+  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)), hostPullFreshRes(item.repo, pullNumber(ch.name)));
   else warm(inboxRes, commitFilesRes(item.repo, item.sha));
 }
 
@@ -330,7 +333,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       bar={
         <>
           <GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} />
-          {d.fresh && <FreshRow fresh={d.fresh} diffKey={key} />}
+          {d.fresh && <FreshRow fresh={d.fresh} update={() => freshApi.update(key).then((r) => `${r.branch} moved to v${r.version}`)} />}
         </>
       }
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
@@ -372,6 +375,7 @@ function HostFiles({ item }: { item: ShipCommit }) {
   const n = pullNumber(ch.name);
   const { me, ops } = useOps(item);
   const pull = useRes(hostPullRes(item.repo, n)).data;
+  const fresh = useRes(hostPullFreshRes(item.repo, n)).data;
   const [q, setQ] = React.useState("");
   const [draft, setDraft] = React.useState<DraftPlace | null>(null);
   const list = React.useMemo(() => pull.files.map((f) => hostFile(f)).filter((f): f is PatchFile => f != null), [pull.files]);
@@ -420,7 +424,12 @@ function HostFiles({ item }: { item: ShipCommit }) {
   return (
     <Frame
       sum={`${pull.files.length} file${pull.files.length === 1 ? "" : "s"} · +${adds} −${dels} · ${ch.name}`}
-      bar={<HostGateRow approved={approved} onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})} />}
+      bar={
+        <>
+          <HostGateRow approved={approved} onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})} />
+          {fresh && <FreshRow fresh={fresh} update={() => hostPullsApi.update(item.repo, n).then((r) => `${r.state} on ${HOST_WORD[r.host]}`)} />}
+        </>
+      }
       search={{ res: q.trim() ? pullSearchRes(item.repo, n, q) : null, q, onQ: setQ }}
       convo={
         <Conversation

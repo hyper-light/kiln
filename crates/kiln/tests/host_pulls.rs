@@ -552,6 +552,11 @@ fn w26_r16_a_pull_request_is_replayed_in_kilns_mirror() -> anyhow::Result<()> {
     assert_eq!(git(&mirror, &["show", &format!("{replay}:z.txt")])?, "elsewhere");
     assert_eq!(git(&bare, &["for-each-ref", "--format=%(refname) %(objectname)"])?, host_refs, "nothing moved on the host");
     assert!(gh.updates.lock().map(|u| u.is_empty()).unwrap_or(false), "nothing asked of GitHub until Update");
+    // How fresh #7 is, as its page says it, and Update ready to go.
+    let (st, body) = http(port, "GET", "/api/ci/repos/acme%2Fgh/pulls/7/fresh", admin, None)?;
+    assert_eq!(st, 200, "{body}");
+    let f: Value = serde_json::from_str(&body)?;
+    assert_eq!((s(&f, "/words"), f.pointer("/update/can")), (format!("replays clean on main@{}", tip.get(..6).unwrap_or_default()).as_str(), Some(&json!(true))), "{f}");
 
     // Update: GitHub's update-branch, against the head the replay was made from.
     let (st, body) = http(port, "POST", "/api/ci/repos/acme%2Fgh/pulls/7/update", admin, Some(&json!({})))?;
