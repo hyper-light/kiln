@@ -1041,9 +1041,14 @@ timestamp within the past 20 minutes"); they are stored and searched as any.
 (a batch a write's records, however many of its items hold them), the 99th percentile over the last
 five minutes, a quarter more, 2 to 30 s (learned as records come, so a fleet whose records take
 longer waits longer, and in the steady state each window is counted once). A window
-counted and then given more waits half as long as it has been since it ended before it is counted
-again, so however records trickle in, one is counted some fifteen times at the most; counting takes
-a quarter of each second at the most, never-counted windows first. A window a retention has cut
+counted and then given more waits half as long as it has been since it ended, or half as long as it
+has left of its twenty minutes if that is less, before it is counted again: however records trickle
+in, one is counted 25 times at the most (18 with a settle of 30 s), the last within a second of its
+twenty minutes' end, never left past them with records uncounted. (Half its age alone took a window first counted over 13⅓ minutes after it ended,
+as every window of the horizon is when the server starts, past its twenty minutes: records that
+came for it in time were never counted. The ClickHouse comparison found it, 2026-10-30.) Counting
+takes a quarter of each second at the most: a window within a minute of leaving the horizon first,
+then never-counted windows, oldest first. A window a retention has cut
 into (some of its records let go) is not counted, so no count is short: judged by the indexes still
 kept, an index's own retention and the logs'. Not by an index removed: its part's cutoff is stated
 now, and each minute while it holds rows, to let its records go at once, and judged by that, every
