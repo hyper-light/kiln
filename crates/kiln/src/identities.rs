@@ -6,6 +6,8 @@
 //! name gets a new key the revocation doesn't touch), and [`revocations`] feeds the chain checker
 //! (`kiln_ci::identity::chain`).
 
+use std::sync::Arc;
+
 use base64::Engine as _;
 use kiln_ci::identity::chain::{Actor, Holder, Identity, Revocation};
 use rusqlite::{OptionalExtension as _, params};
@@ -662,16 +664,41 @@ pub async fn runner_identity(hub: &Hub, machine: &str, instance: &str) -> anyhow
     Ok(Identity::new(hub.pki.organization(), Actor::Runner { enrolled_by, machine: machine.to_owned(), instance: instance.to_owned() }))
 }
 
+/// How long an agent's ask waits for its session to open on kiln. The runner asks as the session
+/// opens, and the ask can reach kiln before the session's Open does (the Open goes over the
+/// channel, kept until acknowledged): refused then, the session had no identity until its next
+/// update, and one done in a moment never had one (docs/ci.md W27-R01).
+const OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A runner process asked for an identity ([`crate::proto::AgentMsg::Identity`]): the certificate,
 /// recorded, or why not, back to it. Its earlier certificates for the same subject are revoked by
-/// serial (the key goes on in the same process).
-pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
+/// serial (the key goes on in the same process). An agent's ask for a session kiln hasn't heard of
+/// yet waits for the session's Open, [`OPEN_WAIT`] at most, in a task of its own, so this runner's
+/// messages (the Open among them) go on being taken meanwhile; every other ask is answered at once.
+pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, json: &str) {
     let ask: IdentityAsk = match serde_json::from_str(json) {
         Ok(a) => a,
         Err(e) => return tracing::debug!(agent = %machine, error = %e, "an unreadable identity request"),
     };
+    let unopened = |hub: &Hub, ask: &IdentityAsk| ask.kind == "agent" && ask.of.as_deref().is_some_and(|s| hub.harness.info(s).is_none());
+    if unopened(hub, &ask) {
+        let (hub, machine) = (Arc::clone(hub), machine.to_owned());
+        crate::rt::spawn(async move {
+            let until = std::time::Instant::now() + OPEN_WAIT;
+            while unopened(&hub, &ask) && std::time::Instant::now() < until {
+                crate::rt::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            answer(&hub, peer, &machine, &ask).await;
+        });
+        return;
+    }
+    answer(hub, peer, machine, &ask).await;
+}
+
+/// The certificate `ask` is for, recorded, or why not, back to the runner process that asked.
+async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     let mut given = IdentityGiven { kind: ask.kind.clone(), of: ask.of.clone(), epoch: ask.epoch, ..IdentityGiven::default() };
-    match issue(hub, peer, machine, &ask).await {
+    match issue(hub, peer, machine, ask).await {
         Ok((uri, pem)) => {
             given.uri = uri;
             given.cert_pem = Some(pem);

@@ -3968,8 +3968,9 @@ fn note_announced(announced: &mut std::collections::HashSet<String>, session: &s
 
 /// Sends what the channel has to send now.
 /// Asks for agent session `session`'s identity at `epoch` (docs/ci.md W27-R01), unless this
-/// process holds one or asked in the last 5 s: a session kiln hasn't heard of yet is refused, and
-/// asked for again as it goes on.
+/// process holds one or asked in the last 5 s. Asked as the session opens, the ask can reach kiln
+/// before the Open: kiln waits for it (`identities::OPEN_WAIT`), and what's refused is asked for
+/// again as the session goes on.
 async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, Instant>, session: &str, epoch: u64) {
     let slot = crate::runner::identity::slot("agent", Some(session), Some(epoch));
     if crate::runner::identity::cert(&slot).is_some() || asked.get(&slot).is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
