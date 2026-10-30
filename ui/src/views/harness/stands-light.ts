@@ -564,10 +564,10 @@ function lots(stand: Shown, layer: number, n: number) {
 
 /** A line particle's light: its colour from its ring where it is, leaning its own way and in its own tone; how bright (it twinkles as it does; a glint or a flash lifts it); how big. Dust (`layer` 3) is finest and faintest. */
 const lit = { c: 0, r: 0, a: 0, flash: 0, star: false };
-function light(p: Part, l: Lot, x: number, t: number, b: number, fade: number, pulse: number, layer: number, sh: Shine) {
+function light(p: Part, l: Lot, x: number, t: number, b: number, fade: number, pulse: number, layer: number, sh: Shine, shift = 0) {
   const m = MOTION[p.stand];
   const R = RIM[p.stand];
-  const s = x - p.x0 + offsetOf(p.stand);
+  const s = x - p.x0 + offsetOf(p.stand) + shift;
   const g = glintAt(sh, s);
   const flash = b === 0 && l.sparkle < m.sparkle ? Math.max(0, Math.sin(TAU * (t * l.flashF + l.flashP))) ** 28 : 0;
   const twinkle = 1 - l.twinkle * (0.5 + 0.5 * Math.sin(TAU * (t * l.twinkleF + l.twinkleP)));
@@ -615,8 +615,8 @@ const wrap = (p: Part, v: number) => {
 /** The string a particle follows: the core most of it on the string itself, the soft layer and the out-of-focus discs a moment behind it, the dust the furthest behind. */
 const followed = (S: Strung, layer: number, l: Lot) => (layer === 0 ? (l.later < 0.6 ? S.at : (S.later[0] ?? S.at)) : layer === 1 ? (S.later[1] ?? S.at) : (S.later[2] ?? S.at));
 
-/** A line state's stretch: its core on the ribbon, its soft, out-of-focus and dust layers floating about the string, and the sheen where each glint is. */
-function line(f: Frame, p: Part, t: number, S: Strung) {
+/** A line state's stretch: its core on the ribbon (the rule's, or `rb`), its soft, out-of-focus and dust layers floating about the string, and the sheen where each glint is. */
+function line(f: Frame, p: Part, t: number, S: Strung, rb?: Ribbon) {
   const m = MOTION[p.stand];
   const pulse = m.pulse ? calling(t) : 1;
   const L = p.x1 - p.x0;
@@ -640,22 +640,25 @@ function line(f: Frame, p: Part, t: number, S: Strung) {
       let size = 1;
       let glow = 1;
       let b = 0;
+      let shift = 0;
       if (layer === 0) {
-        // On the ribbon: across it, as it turns about the string (about a turn in 8 s, unevenly,
-        // all along the rule), its near side larger and brighter.
-        const th = x * 0.05 - (t * TAU) / 8 - S.twist(x);
+        // On the ribbon: across it, as it turns about the string (the rule's about a turn in 8 s,
+        // unevenly, all along it; a compaction's turning on and on, each turn running along it),
+        // its near side larger and brighter, and a compaction's face changing colour as it turns.
+        const th = rb ? x * rb.along - (t * TAU) / rb.turn - S.twist(x) : x * 0.05 - (t * TAU) / 8 - S.twist(x);
         const depth = l.across * Math.sin(th);
-        y = Y + sy + (l.across * S.half(x) * Math.cos(th) + stir * 0.75) * tp;
-        size = 1 + 0.35 * Math.max(0, depth);
-        glow = 0.72 + 0.28 * depth;
+        y = Y + sy + (l.across * (rb ? rb.half : S.half(x)) * Math.cos(th) + stir * 0.75) * tp;
+        size = 1 + (rb ? 0.45 : 0.35) * Math.max(0, depth);
+        glow = rb ? 0.66 + 0.34 * depth : 0.72 + 0.28 * depth;
+        shift = rb ? rb.iris * depth : 0;
       } else {
         // Floating about the string, following it: most of the soft layer near it, the
         // out-of-focus discs anywhere within its spread, the dust further out.
-        const off = layer === 1 ? l.lane * m.spread * 0.5 : l.spread * m.spread * (layer === 2 ? 1 : 1.5);
+        const off = (layer === 1 ? l.lane * m.spread * 0.5 : l.spread * m.spread * (layer === 2 ? 1 : 1.5)) * (rb ? rb.spread : 1);
         y = Y + sy * (layer === 3 ? 0.6 : 0.85) + (off + stir * (1 + Math.min(layer, 2))) * tp;
         b = layer === 1 ? 0.25 + 0.4 * l.blur : layer === 2 ? 0.65 + 0.35 * l.blur : 0;
       }
-      const lt = light(p, l, x, t, b, fade, pulse, layer, sh);
+      const lt = light(p, l, x, t, b, fade, pulse, layer, sh, shift);
       particle(f, x, y, lt.r * size * (layer === 2 ? 1.4 : 1), lt.a * glow, lt.c, b);
       if (lt.flash > 0.05) f.soft.push(x, y, 7 * lt.r, 0.5 * lt.flash, lt.c, 1);
       if (lt.star) f.soft.push(x, y, 5 * lt.r, 0.35 * lt.a, lt.c, 1);
@@ -751,8 +754,19 @@ function across(f: Frame, parts: readonly Part[], t: number, S: Strung) {
   });
 }
 
-/** The rule across `w` at `t` (seconds) into `f`, as `paint` draws it. */
-export function frame(parts: readonly Part[], w: number, t: number, f: Frame = newFrame()): Frame {
+/**
+ * A ribbon other than the rule's own, for a compaction (signals.tsx `Condense`): the rule's light on
+ * a wider ribbon turning without end. Its half width (points), the seconds a turn takes and its
+ * turning along each point (radians), how far its soft layers spread (a share of the state's own),
+ * and how far round the ring a face's colour shifts as it turns to you (points: holographic). Every
+ * layer keeps the rule's particles per point: the rule's light, at the rule's cost.
+ */
+export type Ribbon = { half: number; turn: number; along: number; spread: number; iris: number };
+/** A compaction's: 9 points either side of the string, a turn every 2.8 s, about one every 140 points along. */
+export const COMPACTING: Ribbon = { half: 9, turn: 2.8, along: 0.045, spread: 1.3, iris: 8 };
+
+/** The rule across `w` at `t` (seconds) into `f`, as `paint` draws it; its line states on `ribbon` where one is given (a compaction's). */
+export function frame(parts: readonly Part[], w: number, t: number, f: Frame = newFrame(), ribbon?: Ribbon): Frame {
   f.dots.length = 0;
   f.soft.length = 0;
   const S = stringOf(parts, w, t, f.scratch);
@@ -762,7 +776,7 @@ export function frame(parts: readonly Part[], w: number, t: number, f: Frame = n
     if (m.beads) beads(f, p, t, S);
     else if (m.dashes) dashes(f, p, t, S);
     else if (m.every) points(f, p, t, S);
-    else line(f, p, t, S);
+    else line(f, p, t, S, ribbon);
   }
   across(f, parts, t, S);
   return f;

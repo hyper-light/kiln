@@ -884,8 +884,10 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* Room for the ribbon about the line while it compacts, kept by the marker it settles into, so
+   nothing moves as it does. */
 .hx-compaction .sg-condense {
-  margin-top: 7px;
+  margin: 18px 0 12px;
 }
 .hx-compaction[data-tone="warn"] .sg-label {
   color: var(--color-warn);
