@@ -585,9 +585,8 @@ mod tests {
         let marked_sessions = vec![("s-marked".to_owned(), Some(harness.id()))];
         let (marked, strict) = (session_of(outsider.id(), &marked_sessions), session_by_process(outsider.id(), &marked_sessions));
         // This test's process plays another session's harness: what it starts is under it.
-        let mut child = std::process::Command::new("sleep").arg("30").spawn()?;
-        let mine = session_by_process(child.id(), &[("s-mine".to_owned(), Some(std::process::id()))]);
-        for p in [&mut harness, &mut outsider, &mut child] {
+        let mine = session_by_process(outsider.id(), &[("s-mine".to_owned(), Some(std::process::id()))]);
+        for p in [&mut harness, &mut outsider] {
             let _ = p.kill();
             let _ = p.wait();
         }

@@ -13,6 +13,11 @@
 //!   their device (`<config>/kiln/identity.key`, 0600), under the certificate kiln issued for it.
 //!
 //! Checking a signature is kiln's: asked to verify, it says git can't check it here.
+//!
+//! It's an agent session's credential helper for kiln's server too (`kiln-git-sign credential
+//! get`, as [`git_env`] sets it): the agent's own token, which the runner asks the server for, for
+//! that session, told apart as it is for signing; so the agent's push goes as the agent, never as
+//! its person.
 
 use std::io::{Read as _, Write as _};
 
@@ -42,7 +47,10 @@ pub fn main(args: &[String]) -> std::process::ExitCode {
 }
 
 fn run(args: &[String]) -> anyhow::Result<()> {
-    let fd = args.iter().find_map(|a| a.strip_prefix("--status-fd=").map(str::to_owned)).or_else(|| args.iter().position(|a| a == "--status-fd").and_then(|i| args.get(i + 1).cloned()));
+    if args.first().is_some_and(|a| a == "credential") {
+        return credential(args.get(1).map_or("", String::as_str));
+    }
+    let fd =args.iter().find_map(|a| a.strip_prefix("--status-fd=").map(str::to_owned)).or_else(|| args.iter().position(|a| a == "--status-fd").and_then(|i| args.get(i + 1).cloned()));
     if args.iter().any(|a| a == "--verify") {
         // 9: no public key, as gpgsm says it; git shows "can't check".
         status(fd.as_deref(), "[GNUPG:] NEWSIG\n[GNUPG:] ERRSIG 0000000000000000 19 8 00 0 9\n")?;
@@ -108,6 +116,44 @@ fn with_device_key(message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     Ok((signature, crate::pki::der_of(&cert)?))
 }
 
+/// git's credential helper for an agent session (`credential <op>`, [`git_env`]): for `get`, the
+/// agent's own token for kiln ([`agent_credential`]); for `erase` (kiln refused it), the runner
+/// asks for another next time. Nothing else answers for kiln's server in the session, so short of
+/// the agent's own, git stops (`quit`) rather than push as anyone else.
+fn credential(op: &str) -> anyhow::Result<()> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).context("read git's question")?;
+    match op {
+        "get" => match agent_credential() {
+            Some(Ok(token)) => std::io::stdout().write_all(format!("username=kiln\npassword={token}\n").as_bytes()).context("write the credential"),
+            failed => {
+                std::io::stdout().write_all(b"quit=1\n").context("write the answer")?;
+                match failed {
+                    Some(Err(e)) => Err(e),
+                    _ => anyhow::bail!("only an agent session kiln runs here takes a credential for kiln from its runner"),
+                }
+            }
+        },
+        "erase" => {
+            let _ = crate::harness::cli::request(&crate::harness::socket::Request::Credential { forget: true });
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The token of the agent session this process runs in, for kiln's server: asked of the runner
+/// that runs it (`harness::socket`), which tells the session by this process's group of processes
+/// or its ancestry, and asks the server for the agent's own. `None`: the runner says this process
+/// is no agent's; an error: no token, so it pushes as no one rather than as anyone else.
+fn agent_credential() -> Option<anyhow::Result<String>> {
+    match crate::harness::cli::request(&crate::harness::socket::Request::Credential { forget: false }) {
+        Ok(a) if a.get("agent").and_then(serde_json::Value::as_bool) == Some(false) => None,
+        Ok(a) => Some(a.get("password").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("the runner's answer has no token"))),
+        Err(e) => Some(Err(e.context("this agent's runner gave it no credential for kiln"))),
+    }
+}
+
 /// git's signing program in `dir`: kiln's own binary by [`NAME`] (a hard link, else a copy), made
 /// or made again when the binary changed. Its path, for `gpg.x509.program`.
 pub fn program(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
@@ -146,14 +192,24 @@ pub fn git_config(program: &std::path::Path, key: &str) -> Vec<(&'static str, St
     ]
 }
 
-/// [`git_config`] as git's environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
-/// `GIT_CONFIG_VALUE_<n>`), after the `count` entries an inherited environment has already: so an
-/// agent session's git signs as the agent, whatever the person's own configuration says.
-pub fn git_env(program: &std::path::Path, key: &str, count: usize) -> Vec<(String, String)> {
-    let config = git_config(program, key);
+/// An agent session's git as its environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
+/// `GIT_CONFIG_VALUE_<n>`), after the `count` entries an inherited environment has already:
+/// signing every commit as `key` ([`git_config`]), and taking its credential for the kiln server
+/// at each of `kiln`'s URLs from [`NAME`] alone (`credential`, the agent's own: an empty helper
+/// first drops every one the person's configuration names there). So its git signs and pushes as
+/// the agent, whatever the person's own configuration says.
+pub fn git_env(program: &std::path::Path, key: Option<&str>, kiln: &[String], count: usize) -> Vec<(String, String)> {
+    let mut config: Vec<(String, String)> = key.map(|k| git_config(program, k)).unwrap_or_default().into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+    // git runs a `!` helper with the shell.
+    let ours = format!("!'{}' credential", program.to_string_lossy().replace('\'', r"'\''"));
+    for url in kiln {
+        let helper = format!("credential.{url}.helper");
+        config.push((helper.clone(), String::new()));
+        config.push((helper, ours.clone()));
+    }
     let mut env = vec![("GIT_CONFIG_COUNT".to_owned(), (count + config.len()).to_string())];
     for (i, (k, v)) in config.into_iter().enumerate() {
-        env.push((format!("GIT_CONFIG_KEY_{}", count + i), k.to_owned()));
+        env.push((format!("GIT_CONFIG_KEY_{}", count + i), k));
         env.push((format!("GIT_CONFIG_VALUE_{}", count + i), v));
     }
     env
@@ -177,12 +233,29 @@ mod tests {
 
     #[test]
     fn w27_r03_an_agents_git_signs_as_the_agent_whatever_came_before() {
-        let env = git_env(std::path::Path::new("/s/kiln-git-sign"), AGENT_KEY, 2);
+        let env = git_env(std::path::Path::new("/s/kiln-git-sign"), Some(AGENT_KEY), &[], 2);
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("GIT_CONFIG_COUNT"), Some("7"), "after the two the session had");
         assert_eq!((get("GIT_CONFIG_KEY_2"), get("GIT_CONFIG_VALUE_2")), (Some("gpg.format"), Some("x509")));
         assert_eq!((get("GIT_CONFIG_KEY_3"), get("GIT_CONFIG_VALUE_3")), (Some("gpg.x509.program"), Some("/s/kiln-git-sign")));
         assert_eq!((get("GIT_CONFIG_KEY_4"), get("GIT_CONFIG_VALUE_4")), (Some("user.signingkey"), Some(AGENT_KEY)));
         assert_eq!((get("GIT_CONFIG_KEY_5"), get("GIT_CONFIG_VALUE_5")), (Some("commit.gpgsign"), Some("true")));
+    }
+
+    #[test]
+    fn w27_r03_an_agents_git_takes_its_own_credential_for_kiln_alone() {
+        let kiln = ["http://10.0.0.7:7070".to_owned(), "https://kiln.example.com".to_owned()];
+        let env = git_env(std::path::Path::new("/s/it's/kiln-git-sign"), Some(AGENT_KEY), &kiln, 0);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("9"));
+        // At each of kiln's URLs, the person's helpers dropped first, then the agent's own.
+        assert_eq!((get("GIT_CONFIG_KEY_5"), get("GIT_CONFIG_VALUE_5")), (Some("credential.http://10.0.0.7:7070.helper"), Some("")));
+        assert_eq!((get("GIT_CONFIG_KEY_6"), get("GIT_CONFIG_VALUE_6")), (Some("credential.http://10.0.0.7:7070.helper"), Some(r"!'/s/it'\''s/kiln-git-sign' credential")));
+        assert_eq!((get("GIT_CONFIG_KEY_7"), get("GIT_CONFIG_VALUE_7")), (Some("credential.https://kiln.example.com.helper"), Some("")));
+        assert_eq!((get("GIT_CONFIG_KEY_8"), get("GIT_CONFIG_VALUE_8")), (Some("credential.https://kiln.example.com.helper"), Some(r"!'/s/it'\''s/kiln-git-sign' credential")));
+        // A server that gives none: signing alone; one that issues no identities: the credential alone.
+        assert_eq!(git_env(std::path::Path::new("/s/kiln-git-sign"), Some(AGENT_KEY), &[], 0).len(), 11);
+        let only = git_env(std::path::Path::new("/s/kiln-git-sign"), None, &kiln[..1], 0);
+        assert_eq!(only.first().map(|(_, v)| v.as_str()), Some("2"), "{only:?}");
     }
 }

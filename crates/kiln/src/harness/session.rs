@@ -3011,16 +3011,19 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         .map(|mut p| {
                             p.env(super::survivors::MARK, &s.id);
                             // Its git signs as the agent, through this runner (W27-R03), where the
-                            // server issues identities; the person's own configuration and key never.
-                            if crate::runner::identity::enabled() {
+                            // server issues identities, and pushes to kiln as the agent where the
+                            // server gives it a credential of its own; the person's own
+                            // configuration, key and credential never.
+                            let (sign, kiln) = (crate::runner::identity::enabled(), crate::runner::identity::kiln_git());
+                            if sign || !kiln.is_empty() {
                                 match crate::gitsign::installed() {
                                     Ok(program) => {
                                         let had = std::env::var("GIT_CONFIG_COUNT").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
-                                        for (k, v) in crate::gitsign::git_env(&program, crate::gitsign::AGENT_KEY, had) {
+                                        for (k, v) in crate::gitsign::git_env(&program, sign.then_some(crate::gitsign::AGENT_KEY), &kiln, had) {
                                             p.env(k, v);
                                         }
                                     }
-                                    Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign as the agent"),
+                                    Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign or push as the agent"),
                                 }
                             }
                             p

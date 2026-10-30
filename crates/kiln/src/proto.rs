@@ -423,6 +423,12 @@ pub const CAP_HEADROOM: u64 = 1 << 39;
 /// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
 pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 
+/// [`ServerMsg::Caps`] capability: the server gives an agent session its own git credential for
+/// kiln's repositories (the operation `agents.credential`, docs/ci.md W27-R03), so a runner sets its
+/// sessions' git to push as the agent. Without it, a runner leaves their pushes as they were.
+/// (Bit 41 is main's `CAP_UNREAD`.)
+pub const CAP_AGENT_GIT: u64 = 1 << 42;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]

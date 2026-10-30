@@ -573,6 +573,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
+| `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
 
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,

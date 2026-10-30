@@ -2305,6 +2305,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
                         server_identity = caps & proto::CAP_IDENTITY != 0;
                         crate::runner::identity::set_enabled(server_identity);
+                        // Its sessions' git pushes to kiln as their agents (W27-R03), where the
+                        // server gives them a credential of their own: at the URL this runner
+                        // reaches it at, and where it says it's reached (`/api/me`).
+                        let git = caps & proto::CAP_AGENT_GIT != 0;
+                        crate::runner::identity::set_kiln_git(if git { vec![o.server_url.clone()] } else { Vec::new() });
+                        if git {
+                            let (http, base) = (Arc::clone(&http), o.server_url.trim_end_matches('/').to_owned());
+                            crate::rt::spawn(async move {
+                                let me = async {
+                                    let v: serde_json::Value = http.get(&format!("{base}/api/me")).timeout(std::time::Duration::from_secs(10)).send().await?.json(1 << 20).await?;
+                                    anyhow::Ok(v)
+                                };
+                                match me.await {
+                                    Ok(v) => {
+                                        let public = v.get("public_url").and_then(serde_json::Value::as_str).map(str::to_owned);
+                                        let doors = v.get("origins").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|o| o.as_str().map(str::to_owned));
+                                        crate::runner::identity::also_kiln_git(public.into_iter().chain(doors).collect());
+                                    }
+                                    Err(e) => tracing::debug!(error = %format!("{e:#}"), "where the server is reached wasn't said: agents' git takes their credential at this runner's URL alone"),
+                                }
+                            });
+                        }
                         if server_identity {
                             match crate::runner::identity::ask("runner", None, None) {
                                 Ok(json) => {

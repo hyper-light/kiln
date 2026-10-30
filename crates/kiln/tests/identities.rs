@@ -533,10 +533,12 @@ fn nowhere(paths: &[std::path::PathBuf], key_pem: &str) -> anyhow::Result<()> {
 }
 
 /// W27-R03, AC03: an agent's commit is signed as the agent, for its person, never with the
-/// person's key: git in the agent's session (the fake harness acting on a message, as an agent's
-/// tool would) commits with the git the runner set up for it; the runner holding the session's key
-/// signs through `kiln-git-sign`, and the commit verifies to kiln's root as the agent at its epoch,
-/// on its runner.
+/// person's key, and its push goes as the agent: git in the agent's session (the fake harness
+/// acting on a message, as an agent's tool would) commits with the git the runner set up for it;
+/// the runner holding the session's key signs through `kiln-git-sign`, and the commit verifies to
+/// kiln's root as the agent at its epoch, on its runner. Its push to a repository kiln hosts takes
+/// the agent's own credential (the runner asks for it as that session), so kiln records it as the
+/// agent's, for its person; and the person's credential helper for kiln is never asked.
 #[test]
 fn w27_ac03_an_agents_commit_verifies_as_the_agent() -> anyhow::Result<()> {
     use kiln_ci::identity::chain::{Actor, Identity};
@@ -545,11 +547,25 @@ fn w27_ac03_an_agents_commit_verifies_as_the_agent() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options::default())?;
     let root = root(&s)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": "acme/agents", "mode": "native"})))?;
+    anyhow::ensure!(st == 200, "a repository kiln hosts: {st} {body}");
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
-    // What the agent does with the message: a commit in its folder, its git as the runner set it.
+    // The person's own credential for kiln, in the agent's folder: a helper that says it was asked.
+    let theirs = dir.path().join("persons-helper.sh");
+    std::fs::write(&theirs, format!("#!/bin/sh\necho asked >> '{}'\necho username=person\necho password=the-persons\n", dir.path().join("persons-helper.out").display()))?;
+    std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o755))?;
+    // What the agent does with the message: a commit in its folder and a push of it to kiln, its
+    // git as the runner set it.
     let act = dir.path().join("act.sh");
-    std::fs::write(&act, "#!/bin/sh\ngit init -q -b main 2>/dev/null\ngit -c user.name=agent -c user.email=agent@kiln commit -q --allow-empty -m \"the agent's\" >> act.out 2>&1\necho \"exit $?\" >> act.out\n")?;
+    let push = format!("http://127.0.0.1:{}/git/acme/agents.git", s.port);
+    std::fs::write(
+        &act,
+        format!(
+            "#!/bin/sh\ngit init -q -b main 2>/dev/null\ngit config --local credential.helper '!{}'\ngit -c user.name=agent -c user.email=agent@kiln commit -q --allow-empty -m \"the agent's\" >> act.out 2>&1\necho \"commit $?\" >> act.out\nGIT_TERMINAL_PROMPT=0 git push -q {push} HEAD:refs/heads/agent/work >> act.out 2>&1\necho \"push $?\" >> act.out\necho \"exit\" >> act.out\n",
+            theirs.display()
+        ),
+    )?;
     std::fs::set_permissions(&act, std::fs::Permissions::from_mode(0o755))?;
     let act_path = act.to_string_lossy().into_owned();
     let (_main, log) = agents::runner_with(dir.path(), s.port, "box-a", None, TALK, &[("FAKE_CLAUDE_ACT", &act_path)])?;
@@ -561,17 +577,25 @@ fn w27_ac03_an_agents_commit_verifies_as_the_agent() -> anyhow::Result<()> {
     anyhow::ensure!((200..300).contains(&st), "send: {st} {said}");
     let done = || std::fs::read_to_string(cwd.join("act.out")).unwrap_or_default();
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !done().contains("exit ") {
+    while !done().contains("exit") {
         anyhow::ensure!(Instant::now() < deadline, "the agent never committed: {}", std::fs::read_to_string(&log).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(200));
     }
-    anyhow::ensure!(done().contains("exit 0"), "the agent's commit failed: {}", done());
+    anyhow::ensure!(done().contains("commit 0"), "the agent's commit failed: {}", done());
+    anyhow::ensure!(done().contains("push 0"), "the agent's push failed: {}", done());
     let out = std::process::Command::new("git").arg("-C").arg(&cwd).args(["cat-file", "commit", "HEAD"]).output()?;
     let sig = gitsig::signature_of(&out.stdout).ok_or_else(|| anyhow::anyhow!("the agent's commit isn't signed: {}", String::from_utf8_lossy(&out.stdout)))?;
     let v = gitsig::verify(&gitsig::payload(&out.stdout), &sig, &root, &revocations_now(&s)?, unix_now()?)?;
     assert!(matches!(&v.identity.actor, Actor::Agent { agent, held_by: Some(h), .. } if *agent == id && h.machine == "box-a"), "as the agent, on its runner: {v}");
     assert!(!v.identity.is_person("admin"), "never as its person: {v}");
     assert_eq!(v.acts_for(), vec![Identity::new("hyper-light", Actor::Person { name: "admin".into() })], "for its person");
+    // Its push went as the agent, for its person; the person's own credential was never asked for.
+    let (_, audit) = http(s.port, "GET", "/api/audit?limit=200", &s.admin, None)?;
+    let audit: serde_json::Value = serde_json::from_str(&audit)?;
+    let pushes: Vec<&serde_json::Value> = audit.as_array().into_iter().flatten().filter(|e| field(e, "action") == "repo.push").collect();
+    assert!(pushes.iter().any(|e| field(e, "actor") == format!("agent:{id} for admin")), "pushed as the agent, for its person: {pushes:?}");
+    assert!(pushes.iter().all(|e| field(e, "principal").starts_with("agent:")), "never as its person: {pushes:?}");
+    assert!(!dir.path().join("persons-helper.out").exists(), "the person's credential helper was asked");
     Ok(())
 }
 

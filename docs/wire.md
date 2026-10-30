@@ -381,8 +381,9 @@ takes a new bit, never one that means something already, even in the other direc
 | 36 | `CAP_WORK` | `AgentMsg::Caps`, `ServerMsg::Caps` | warm workspaces for placement: the runner says what it holds warm, the server takes it (`WorkState`; ci.md W24-R18) |
 | 37 | `CAP_AGENT_LIMIT` | `AgentMsg::Caps`, `ServerMsg::Caps` | the most agent sessions a machine has at work at once, set from the server: the runner takes it and says what it holds, the server takes that (`AgentLimit`; agents.md, "How many agents a machine runs") |
 | 38 | `CAP_IDENTITY` | `AgentMsg::Caps`, `ServerMsg::Caps` | identities: the runner asks for certificates for keys it makes and keeps, the server issues them (`Identity`; ci.md W27-R01) |
+| 42 | `CAP_AGENT_GIT` | `ServerMsg::Caps` | the server gives an agent session its own git credential for kiln's repositories (`agents.credential`), so the runner sets its sessions' git to push as the agent (ci.md W27-R03) |
 
-Bits from 38 are free. Take the next one, and add its row here in the same change.
+Bits from 43 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 

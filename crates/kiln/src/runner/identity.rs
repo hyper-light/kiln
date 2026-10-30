@@ -161,6 +161,34 @@ pub fn enabled() -> bool {
     ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The kiln server this runner works for, by the URLs it's reached at (the one this runner uses,
+/// then those it says it's at), when that server gives agents their own git credential
+/// (`CAP_AGENT_GIT`): its sessions' git pushes there as the agent (W27-R03,
+/// [`crate::gitsign::git_env`]).
+static KILN_GIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Says where the server is (none: it gives agents no git credential of their own), as it said on
+/// connecting.
+pub fn set_kiln_git(urls: Vec<String>) {
+    KILN_GIT.lock().clear();
+    also_kiln_git(urls);
+}
+
+/// Where else the server says it's reached (its public URL, its front doors).
+pub fn also_kiln_git(urls: Vec<String>) {
+    let mut held = KILN_GIT.lock();
+    for u in urls.into_iter().map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| u.contains("://")) {
+        if !held.contains(&u) {
+            held.push(u);
+        }
+    }
+}
+
+/// The URLs of the server whose git credential an agent session takes from it ([`set_kiln_git`]).
+pub fn kiln_git() -> Vec<String> {
+    KILN_GIT.lock().clone()
+}
+
 /// The certificate held for a slot.
 pub fn cert(slot: &str) -> Option<String> {
     HELD.lock().certs.get(slot).map(|(pem, _)| pem.clone())

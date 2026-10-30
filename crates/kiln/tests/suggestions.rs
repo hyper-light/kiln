@@ -189,7 +189,15 @@ fn w26_ac03_a_diffs_suggestion_is_a_revision_of_whoever_applies_it() -> anyhow::
     assert_eq!((author.as_str(), committer.as_str()), ("Sam <sam@example.com>", "ada <ada@kiln>"));
     assert_eq!(message, format!("pipeline: dynamic matrices\n\nChange-Id: {change_id}\nCo-authored-by: agent:review <agent-review@kiln>"));
     assert_eq!(text(&out, "commit"), r.g(&["rev-parse", "FETCH_HEAD"])?.trim());
-    assert!(r.g(&["cat-file", "commit", "FETCH_HEAD"])?.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"), "signed in git's x509 form (W27-R03)");
+    let raw = r.g(&["cat-file", "commit", "FETCH_HEAD"])?;
+    assert!(raw.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"), "signed in git's x509 form (W27-R03)");
+    // It verifies to kiln's root as its server, at the time kiln made it (W27-AC03).
+    let (st, ca) = http(r.s.port, "GET", "/ca.pem", "", None)?;
+    anyhow::ensure!(st == 200, "{st} {ca}");
+    let sig = kiln_ci::identity::gitsig::signature_of(raw.as_bytes()).ok_or_else(|| anyhow::anyhow!("no signature: {raw}"))?;
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    let v = kiln_ci::identity::gitsig::verify(&kiln_ci::identity::gitsig::payload(raw.as_bytes()), &sig, &kiln::pki::der_of(&ca)?, &[], now)?;
+    assert_eq!(v.identity.actor, kiln_ci::identity::chain::Actor::Server, "as kiln's server: {v}");
     assert_eq!(r.file("refs/kiln/diffs/D1/v3")?, matrix(&[(20, &["let r20 = 2 * 10;"]), (42, &[empty])]));
     // The diff shows it; the revision says why, the block and the thread which revision applied it.
     let files = get(&r.s, &r.ada, "/api/diffs/D1/versions/3/files")?;

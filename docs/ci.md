@@ -8898,10 +8898,72 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   body or DER); the migration's `w27_r01_identities_and_revocations_tables`; `identities.rs`'s
   `w27_r02_*`; `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's
   client passes the Sigstore suite).
-- *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; nothing
-  signs with these identities yet (commits, reviews, CI output, lands and deploys: R03 to R11); the
-  CLI signs in with a passkey only through a personal access token (no approving a device from the
-  browser yet).
+- *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; reviews, CI
+  output, lands and deploys don't sign with these identities yet (R04 to R11; commits do: *Built:
+  signatures*, below); the CLI signs in with a passkey only through a personal access token (no
+  approving a device from the browser yet).
+
+**Built: signatures (R03: commits; AC03 but receive-pack's check).** Plan
+`01a17856b1b273268adf6ce8c4f78410`, research `01a18abcef987683938692b8832c1831`.
+
+- *A signed statement.* `kiln_ci::identity::statement`, the record every signature here takes: a
+  DSSE envelope (payload type, payload, one signature over its PAE) in a Sigstore bundle with the
+  signer's certificate; its digest SHA-256 over the PAE, so a reference doesn't depend on its
+  signatures. It's checked at the time kiln took it, never a time the signer claims; it names its
+  subjects by digest, the statements it follows, its number on its signer's stream (`gaps` names
+  each one missing and each number used twice) and the delegation it acts `under`, walked through
+  kiln's records back to one under none (`verify_under`).
+- *Commits.* A commit's signature is git's x509 kind: CMS SignedData (RFC 5652) in its `gpgsig`
+  header, armored as gpgsm armors it, over the commit without its signature headers, signed
+  attributes and ECDSA P-256 with the signer's certificate in it (`kiln_ci::identity::gitsig`;
+  stock git with gpgsm reads it as a good signature). It's checked against kiln's root at the time
+  kiln took the commit. git signs through `kiln-git-sign`, kiln's binary by that name, which
+  speaks gpgsm's interface (`--status-fd=2 -bsau <key>`), as `gpg.format=x509`,
+  `gpg.x509.program`, `user.signingkey` and `commit.gpgsign` say; each kiln keeps its own link to
+  it, under `<state>/kiln/git-sign/`. It signs where the key is:
+  - a person's commit with `kiln login`'s key on their device (`kiln clone` sets the repository's
+    git so);
+  - an agent's as the agent, for its person: the program asks the runner holding the session's key
+    over its socket, which tells the session by the asking process's group of processes or its
+    ancestry alone, never by `KILN_AGENT`, which any process can set (one outside the session gets
+    nothing). The runner sets the session's git through `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`
+    and `GIT_CONFIG_VALUE_<n>`, after any the session inherited, so the person's own configuration
+    and key are never used;
+  - kiln's own as the server (`identities::sign_own`): revisions (suggestions applied, conflicts
+    resolved) and the land queue's commits and restacks (`[ci.land_signing]`'s key file, when
+    given, signs those instead); CD's as CD. A commit kiln can't sign is kept unsigned, with a
+    warning.
+- *Pushes.* An agent's push to kiln goes as the agent. Where the server gives agents a credential
+  of their own (`CAP_AGENT_GIT`), the runner sets each session's git to take its credential for
+  kiln's server from `kiln-git-sign credential` alone, at the URL the runner reaches the server at
+  and at those `/api/me` names (its public URL, its front doors), an empty helper first dropping
+  every one the person's configuration names there. Asked, the runner tells the session as it does
+  for signing and asks the server for the agent's own token (`agents.credential`, which only that
+  very session is given): `agent:<session>` for its person, for a day, to fetch, push and submit
+  (`git.read`, `diffs.submit`, `diffs.land`; an agent kiln started for an attachment, its
+  capabilities), and never more than its person may. The runner keeps it until an hour before it
+  ends and hands it only to the session's own processes; kiln refusing it, the next ask gets
+  another. Short of it, git stops rather than push as anyone else. kiln's audit names the agent,
+  for its person, as the pusher.
+- *Where the person's key stops.* `identity.key` is a 0600 file of the OS user that agents run as
+  too. kiln's own paths never use it for an agent (its git signs and pushes through its runner),
+  but past them the boundary is the OS's: a separate user, a container or a sandbox.
+- *Tests.* `kiln-ci`'s `identity::statement` (`w27_r03_a_statement_verifies_as_its_signer` for each
+  kind, backdated, changed and malformed ones; `w27_r08_*`) and `identity::gitsig`
+  (`w27_r03_a_commit_verifies_as_its_maker`, `w27_r03_the_gpgsig_header_is_where_git_keeps_it`,
+  `w27_r03_a_changed_or_foreign_commit_signature_is_refused`); `identities.rs`'s
+  `w27_r03_kilns_own_commits_sign_as_kiln` (the server's and CD's commits, made and verified with
+  git); `crates/kiln/tests/identities.rs`: `w27_ac03_a_persons_commit_verifies_as_them` (the key
+  nowhere on the server), `w27_ac03_an_agents_commit_verifies_as_the_agent` (as the agent at its
+  epoch, on its runner, never as its person; its push recorded as the agent's, the person's
+  credential helper never asked); `suggestions.rs` (an applied suggestion's commit verifies as the
+  server) and `deploy_github.rs` (a release's commit verifies as CD); `survivors`'
+  `w27_r03_only_a_sessions_own_process_signs_as_its_agent` (a process outside the session with
+  `KILN_AGENT` set gets no signature); `gitsign`'s `w27_r03_*`.
+- *Not yet.* A push's commits checked on receive-pack, and repositories' policy of who may push
+  where (R03's next step); verdicts (R04); legs' results and provenance (R05, R06); lands (R07). A
+  remote naming kiln's server by another name than those (another host name for it) keeps the
+  person's credential. Hosts don't trust kiln's CA, so kiln-signed commits read unverified there.
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 
