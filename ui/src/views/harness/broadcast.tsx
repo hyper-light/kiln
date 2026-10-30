@@ -457,7 +457,7 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
           void attachments.add(e.dataTransfer.files);
         }}
       >
-        <div className={cn("hx-compose-box", working > 0 && "hx-compose-live")}>
+        <div className="hx-compose-box">
           {/* Who it goes to: those picked (each put back with its ×), or everyone the list shows. */}
           <div className="ms-to">
             <span className="ms-to-label">To</span>

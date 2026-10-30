@@ -793,8 +793,30 @@ const patched = (was: State | null, u: { set: Partial<State>; gone?: string[] })
   return now as unknown as State;
 };
 
-/** The socket's query: a snapshot packed when it can be unpacked here, and a state as what changed in it. */
-const TAKES = GUNZIP ? "?z=gzip&patch=state" : "?patch=state";
+/** A changeset's file's key: its path, and the top of its working tree when it's in one. */
+const fileKey = (f: { path: string; tree?: string | null }) => `${f.tree ?? ""}\u0000${f.path}`;
+
+/**
+ * `was` with a changeset's patch taken in as the server's copy takes it (`merge_changes`): each file
+ * set in place of the one with its key, or after the rest when new; each gone, out. The list keeps the
+ * server's order, and its files that didn't change stay the same objects.
+ */
+export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]; gone?: { path: string; tree?: string }[] }): FileChange[] => {
+  const out = new Set((u.gone ?? []).map(fileKey));
+  const now = (was ?? []).filter((f) => !out.has(fileKey(f)));
+  const at = new Map(now.map((f, i) => [fileKey(f), i]));
+  for (const f of u.set ?? []) {
+    const i = at.get(fileKey(f));
+    if (i === undefined) {
+      at.set(fileKey(f), now.length);
+      now.push(f);
+    } else now[i] = f;
+  }
+  return now;
+};
+
+/** The socket's query: a snapshot packed when it can be unpacked here, and a state and a changeset as what changed in them. */
+const TAKES = GUNZIP ? "?z=gzip&patch=state&patch=changes" : "?patch=state&patch=changes";
 
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
 interface Incoming {
@@ -1290,6 +1312,9 @@ export class SessionStore {
       case "changes":
         inc.changes = u.files;
         break;
+      case "changes_patch":
+        inc.changes = changesPatched(inc.changes, u);
+        break;
       case "files":
         inc.files = withFiles(inc.files ?? [], u.files);
         break;
@@ -1373,6 +1398,9 @@ export class SessionStore {
     switch (u.t) {
       case "changes":
         this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
+        break;
+      case "changes_patch":
+        this.snap = { ...this.snap, changes: changesPatched(this.snap.changes, u) };
         break;
       case "files":
         this.snap = { ...this.snap, files: withFiles(this.snap.files, u.files) };

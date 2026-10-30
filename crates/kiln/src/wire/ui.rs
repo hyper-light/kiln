@@ -82,6 +82,16 @@ pub enum SessionFrame {
         #[cfg_attr(test, ts(as = "Vec<crate::harness::model::FileChange>"))]
         files: Value,
     },
+    /// What changed in the changeset since the last one (asked for with `?patch=changes`): the files
+    /// set, each in place of the one with its key or after the rest when new, and those gone.
+    ChangesPatch {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(test, ts(as = "Vec<crate::harness::model::FileChange>"))]
+        set: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(test, ts(as = "Vec<crate::harness::model::FileKey>"))]
+        gone: Vec<Value>,
+    },
     /// Files finished messages mention, kept by the server (ahead of the events in a snapshot).
     Files { files: Vec<crate::harness::kept::Kept> },
     /// Upserts by id.

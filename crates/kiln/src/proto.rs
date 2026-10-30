@@ -418,6 +418,11 @@ pub const CAP_IDENTITY: u64 = 1 << 38;
 /// takes that.
 pub const CAP_HEADROOM: u64 = 1 << 39;
 
+/// [`ServerMsg::Caps`] capability: the server takes a session's changeset as what changed in it
+/// (`crate::harness::core::Update::ChangesPatch`), merged into its copy, so a runner sends the files
+/// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
+pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1049,6 +1054,14 @@ mod tests {
         assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
         assert!(CAP_HEADROOM.is_power_of_two() && CAP_HEADROOM == 1 << 39 && CAP_HEADROOM & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY) == 0);
         Ok(())
+    }
+
+    /// A server that takes changesets as patches says so with a bit of its own: a runner never
+    /// takes another capability for it and sends a server patches it can't read.
+    #[test]
+    fn the_changes_patch_bit_is_a_new_one() {
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM;
+        assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
     }
 
     #[test]

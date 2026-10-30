@@ -163,6 +163,9 @@ pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
         Update::Reset { from } => vec![Row::Reset { session: s(), from: *from, at: now }],
         Update::Closed => vec![Row::Closed { session: s(), at: now }],
         Update::Stream { .. } | Update::Reply { .. } | Update::Inbox { .. } => Vec::new(),
+        // Only what changed: whoever takes it in stores the whole changeset it makes (the server's
+        // copy, `harness::registry`). A session's own core never makes one.
+        Update::ChangesPatch { .. } => Vec::new(),
     }
 }
 
