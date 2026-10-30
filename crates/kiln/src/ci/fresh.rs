@@ -564,3 +564,47 @@ pub async fn collisions_of(hub: &Hub, d: &Diff) -> anyhow::Result<serde_json::Va
         .await?;
     Ok(serde_json::json!({ "collisions": rows }))
 }
+
+/// How fresh change `d` is (W26-R16), as its page and its row say it: the words
+/// (`replays clean on main@4c1e2a`), whether Update can go and, when it can't, why (in words, for a
+/// button that stays in place, disabled), and which version a replay's checks come from (`checks
+/// from v4`: a replay runs none of its own). `null` for a change that's closed.
+pub async fn state(hub: &Hub, d: &Diff, versions: &[Version]) -> serde_json::Value {
+    use serde_json::json;
+    let (Some(latest), true) = (versions.last(), State::parse(&d.state).is_some_and(|s| s.is_open() && s != State::Landing)) else { return serde_json::Value::Null };
+    let Ok((_, path)) = diffs::home(hub, d).await else { return serde_json::Value::Null };
+    let tip = gitops::run_git(hub, &["-C", &path, "rev-parse", "--verify", "--quiet", &format!("refs/heads/{}^{{commit}}", d.trunk)], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
+    let below_conflicted = match diffs::find(hub, d.parent.as_deref().unwrap_or_default()).await {
+        Ok(Some(b)) if d.parent.is_some() => diffs::versions(hub, &b).await.ok().and_then(|mut v| v.pop()).filter(|v| v.why.as_deref() == Some(plan::WHY_CONFLICTED)).map(|_| b.name),
+        _ => None,
+    };
+    let on_tip = !tip.is_empty() && contains(hub, &path, &tip, &latest.commit).await;
+    let fresh = match (latest.why.as_deref(), on_tip, below_conflicted) {
+        (Some(w), true, _) if w == plan::WHY_CONFLICTED => plan::Freshness::Conflicted { tip: tip.clone() },
+        (_, true, Some(below)) => plan::Freshness::AboveConflict { below, tip: tip.clone() },
+        (Some(w), true, None) if w == plan::WHY => plan::Freshness::Clean { tip: tip.clone() },
+        (_, true, None) => plan::Freshness::Current { tip: tip.clone() },
+        (_, false, _) => plan::Freshness::Replaying { tip: tip.clone() },
+    };
+    let branch_at = match d.branch.as_deref() {
+        Some(b) => gitops::run_git(hub, &["-C", &path, "rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).ok(),
+        None => None,
+    };
+    let why_not = if d.kind != "change_request" || d.branch.is_none() {
+        Some("a diff has no branch: its replay is its latest revision".to_owned())
+    } else if latest.why.as_deref() == Some(plan::WHY_CONFLICTED) {
+        Some("resolve its conflicts first".to_owned())
+    } else if latest.why.as_deref() != Some(plan::WHY) {
+        Some("nothing to update: its branch is its latest revision".to_owned())
+    } else if branch_at.as_deref() == Some(latest.commit.as_str()) {
+        Some("its branch is at its replay already".to_owned())
+    } else {
+        None
+    };
+    json!({
+        "words": fresh.words(&d.trunk),
+        "tip": tip,
+        "update": { "can": why_not.is_none(), "why_not": why_not },
+        "checks_from": latest.checks_from,
+    })
+}

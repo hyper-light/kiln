@@ -1549,11 +1549,14 @@ async fn get(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
         ("change_request", Some(l), Ok((_, path))) => json!(super::cr::commits(hub, &path, &l.base, &l.commit).await),
         _ => Value::Null,
     };
+    // How fresh it is on its trunk (W26-R16).
+    let fresh = super::fresh::state(hub, d, &vs).await;
     let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
         if !commits.is_null() {
             o.insert("commits".into(), commits);
         }
+        o.insert("fresh".into(), fresh);
         o.insert("versions".into(), json!(vs));
         o.insert("reviewers".into(), json!(rs));
         o.insert("runs".into(), json!(runs));

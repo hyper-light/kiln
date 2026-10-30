@@ -235,6 +235,17 @@ fn w26_ac07_main_moves_under_stacks_and_a_change_request() -> anyhow::Result<()>
     let gate = ok(s, &x.kim, "GET", "/api/diffs/D5/comments", None)?;
     assert_eq!(gate.pointer("/gate/verdict"), Some(&json!("hold")), "{gate}");
 
+    // How fresh each is, in words, as the page and row say it; Update's state and why not.
+    let short = tip.get(..6).unwrap_or_default();
+    let fresh = |c: &str| -> anyhow::Result<Value> { Ok(ok(s, &x.kim, "GET", c, None)?.get("fresh").cloned().unwrap_or_default()) };
+    let d1 = fresh("/api/diffs/D1")?;
+    assert_eq!((text(&d1, "words"), d1.pointer("/update/can"), d1.pointer("/checks_from")), (format!("replays clean on main@{short}").as_str(), Some(&json!(false)), Some(&json!(1))), "{d1}");
+    assert_eq!(d1.pointer("/update/why_not"), Some(&json!("a diff has no branch: its replay is its latest revision")), "{d1}");
+    assert_eq!(text(&fresh("/api/diffs/D5")?, "words"), format!("conflicts on main@{short}"));
+    assert_eq!(text(&fresh("/api/diffs/D6")?, "words"), format!("replays clean on D5's conflicts on main@{short}"));
+    let cr4 = fresh("/api/change-requests/CR4")?;
+    assert_eq!((cr4.pointer("/update/can"), text(&cr4, "words")), (Some(&json!(true)), format!("replays clean on main@{short}").as_str()), "{cr4}");
+
     // D5's conflict resolved and committed: D6 is replayed onto the resolution.
     let got = ok(s, &x.dev, "GET", "/api/diffs/D5/conflicts", None)?;
     let id = got.pointer("/conflicts/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
