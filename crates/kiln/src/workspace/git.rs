@@ -194,10 +194,10 @@ impl Drop for Scratch {
 }
 
 /// Commits `paths` (relative to `top`; `None`: every change git sees, as `git add -A` takes it) as
-/// they are in the working tree, on `parent` (`None`: a first commit), by `who`, saying `message`.
-/// `Ok(None)` when that changes nothing. Ignored files among `paths` are left out, as git would
-/// leave them out; files that are gone are deleted.
-pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, message: &str, who: &Ident) -> anyhow::Result<Option<Made>> {
+/// they are in the working tree, on `parent` (`None`: a first commit), by `who`, saying `message`;
+/// signed as [`commit_tree`] signs. `Ok(None)` when that changes nothing. Ignored files among
+/// `paths` are left out, as git would leave them out; files that are gone are deleted.
+pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, message: &str, who: &Ident, sign: Option<&str>) -> anyhow::Result<Option<Made>> {
     let scratch = Scratch(std::env::temp_dir().join(format!("kiln-change-{}.index", crate::util::new_id())));
     let with_index = |c: &mut Command| {
         c.env("GIT_INDEX_FILE", &scratch.0);
@@ -242,16 +242,18 @@ pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, 
     if before.as_deref() == Some(tree.as_str()) {
         return Ok(None);
     }
-    let sha = commit_tree(top, &tree, parent, message, (who, None), who).await?;
+    let sha = commit_tree(top, &tree, parent, message, (who, None), who, sign).await?;
     let files = changed(top, parent, &sha).await?;
     Ok(Some(Made { sha, parent: parent.map(str::to_owned), files }))
 }
 
 /// Writes the commit of `tree` on `parent`, saying `message`, by `author` (at the time given, else
-/// now), committed by `who`.
-async fn commit_tree(top: &Path, tree: &str, parent: Option<&str>, message: &str, author: (&Ident, Option<&str>), who: &Ident) -> anyhow::Result<String> {
+/// now), committed by `who`: an agent's work, so signed as the agent with the key this runner holds
+/// in slot `sign` (its session's at its epoch, W27-R03), and never with a key the person's git
+/// configuration names. A commit that can't be signed so is kept unsigned.
+async fn commit_tree(top: &Path, tree: &str, parent: Option<&str>, message: &str, author: (&Ident, Option<&str>), who: &Ident, sign: Option<&str>) -> anyhow::Result<String> {
     let mut c = git(top);
-    c.args(["commit-tree", tree, "-F", "-"]);
+    c.args(["commit-tree", "--no-gpg-sign", tree, "-F", "-"]);
     if let Some(p) = parent {
         c.args(["-p", p]);
     }
@@ -259,7 +261,31 @@ async fn commit_tree(top: &Path, tree: &str, parent: Option<&str>, message: &str
     if let Some(at) = author.1 {
         c.env("GIT_AUTHOR_DATE", at);
     }
-    with_stdin(c, message.as_bytes()).await
+    let sha = with_stdin(c, message.as_bytes()).await?;
+    let Some(slot) = sign else { return Ok(sha) };
+    match signed_as(top, &sha, slot).await {
+        Ok(signed) => Ok(signed),
+        Err(e) => {
+            tracing::warn!(commit = %sha, error = %format!("{e:#}"), "an agent's commit is kept unsigned");
+            Ok(sha)
+        }
+    }
+}
+
+/// Commit `sha` signed with the key this runner holds in `slot`, git's x509 way
+/// (`crate::identities::signed_commit`): the signed commit, written beside it.
+async fn signed_as(top: &Path, sha: &str, slot: &str) -> anyhow::Result<String> {
+    let mut c = git(top);
+    c.args(["cat-file", "commit", sha]);
+    let out = crate::proc::output(c, GIT_TIMEOUT).await?;
+    anyhow::ensure!(out.status.success(), "git cat-file: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let signed = crate::identities::signed_commit(&out.stdout, |m| {
+        let (signature, pem) = crate::runner::identity::sign(slot, m)?;
+        Ok((signature, crate::pki::der_of(&pem)?))
+    })?;
+    let mut c = git(top);
+    c.args(["hash-object", "-t", "commit", "-w", "--stdin"]);
+    with_stdin(c, &signed).await
 }
 
 /// The files commit `sha` changes over `parent` (`None`: all of them, a first commit).
@@ -326,9 +352,10 @@ async fn tree_of(top: &Path, sha: &str) -> anyhow::Result<String> {
 /// on the new one below. `message` replaces the first's. Refused, saying why, when a change
 /// doesn't go where it must (it changes what a commit above changed too), or when the new top
 /// wouldn't be what the folder has.
-pub async fn restack(top: &Path, commits: &[String], paths: &[String], message: Option<&str>, who: &Ident) -> anyhow::Result<Vec<Made>> {
+pub async fn restack(top: &Path, commits: &[String], paths: &[String], message: Option<&str>, who: &Ident, sign: Option<&str>) -> anyhow::Result<Vec<Made>> {
     let (Some(first), Some(last)) = (commits.first(), commits.last()) else { anyhow::bail!("no commits to make again") };
-    let Some(change) = commit(top, Some(last), Some(paths), "kiln: an agent's change, before it is restacked", who).await? else {
+    // A scratch commit to take the change from, never pushed: unsigned.
+    let Some(change) = commit(top, Some(last), Some(paths), "kiln: an agent's change, before it is restacked", who, None).await? else {
         anyhow::bail!("nothing to add: its files are as the stack has them")
     };
     let mut c = git(top);
@@ -349,7 +376,7 @@ pub async fn restack(top: &Path, commits: &[String], paths: &[String], message: 
         })?;
         let (said, author, date) = authored(top, old).await?;
         let message = if i == 0 { message.map_or(said, str::to_owned) } else { said };
-        let sha = commit_tree(top, &tree, Some(&new_below), &message, (&author, Some(&date)), who).await?;
+        let sha = commit_tree(top, &tree, Some(&new_below), &message, (&author, Some(&date)), who, sign).await?;
         let files = changed(top, Some(&new_below), &sha).await?;
         made.push(Made { sha: sha.clone(), parent: Some(new_below.clone()), files });
         old_below.clone_from(old);
@@ -367,6 +394,7 @@ fn short_sha(sha: &str) -> &str {
 async fn with_stdin(mut c: Command, input: &[u8]) -> anyhow::Result<String> {
     use std::io::Write as _;
     use std::process::Stdio;
+    let what = c.get_args().nth(2).map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
     let input = input.to_vec();
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = crate::rt::blocking(move || -> anyhow::Result<std::process::Output> {
@@ -378,14 +406,14 @@ async fn with_stdin(mut c: Command, input: &[u8]) -> anyhow::Result<String> {
     })
     .await??;
     if !out.status.success() {
-        anyhow::bail!("git commit-tree: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!("git {what}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 /// Commits `paths` as the working tree has them on `on` (`None`: the folder's last commit), as
 /// [`commit`] does: one step of a plan run's stack. `Ok(None)` when that changes nothing.
-pub async fn commit_on(cwd: &Path, on: Option<&str>, paths: &[String], message: &str, fallback: &Ident) -> anyhow::Result<Option<Made>> {
+pub async fn commit_on(cwd: &Path, on: Option<&str>, paths: &[String], message: &str, fallback: &Ident, sign: Option<&str>) -> anyhow::Result<Option<Made>> {
     let facts = facts(cwd).await?;
     let top = Path::new(&facts.top);
     let who = identity(top, fallback).await;
@@ -395,7 +423,7 @@ pub async fn commit_on(cwd: &Path, on: Option<&str>, paths: &[String], message: 
         c.args(["cat-file", "-e", &format!("{p}^{{commit}}")]);
         run(c, GIT_TIMEOUT).await.map_err(|_| anyhow::anyhow!("the commit of the step before ({}) isn't in {} any more", short_sha(p), facts.top))?;
     }
-    commit(top, parent, Some(paths), message, &who).await
+    commit(top, parent, Some(paths), message, &who, sign).await
 }
 
 /// Of `paths`, those a commit takes: inside the repository, and not ignored (unless git tracks them).
@@ -521,20 +549,20 @@ mod tests {
             let head = f.head.clone().unwrap_or_default();
             let paths: Vec<String> = vec![top.join("a").to_string_lossy().into_owned(), "src/new.rs".into(), top.join("src/s.rs").to_string_lossy().into_owned(), "target/out".into(), "x.log".into()];
             let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
-            let made = commit(Path::new(&f.top), Some(&head), Some(&paths), "The agent's work\n\nKiln-Agent: test", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let made = commit(Path::new(&f.top), Some(&head), Some(&paths), "The agent's work\n\nKiln-Agent: test", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             let mut files = made.files.clone();
             files.sort();
             assert_eq!(files, vec!["a".to_owned(), "src/new.rs".into(), "src/s.rs".into()], "the person's b, the build output and the ignored log stay out");
             assert_eq!(made.parent.as_deref(), Some(head.as_str()));
             // The same again changes nothing.
-            assert!(commit(Path::new(&f.top), Some(&made.sha), Some(&paths), "again", &who).await?.is_none(), "nothing more to commit");
+            assert!(commit(Path::new(&f.top), Some(&made.sha), Some(&paths), "again", &who, None).await?.is_none(), "nothing more to commit");
             // Everything git sees, as `add -A` takes it (the person's b too; never the ignored).
-            let all = commit(Path::new(&f.top), Some(&head), None, "all", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let all = commit(Path::new(&f.top), Some(&head), None, "all", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             let mut files = all.files;
             files.sort();
             assert_eq!(files, vec!["a".to_owned(), "b".into(), "src/new.rs".into(), "src/s.rs".into()]);
             // A path outside the repository is refused.
-            assert!(commit(Path::new(&f.top), Some(&head), Some(&["/etc/hostname".to_owned()]), "x", &who).await.is_err());
+            assert!(commit(Path::new(&f.top), Some(&head), Some(&["/etc/hostname".to_owned()]), "x", &who, None).await.is_err());
             anyhow::Ok(())
         })?;
         assert_eq!(status_before, out(&top, &["status", "--porcelain"])?, "the folder's index and working tree are as they were");
@@ -552,7 +580,7 @@ mod tests {
         crate::rt::block_on(async move {
             let f = facts(&work).await?;
             let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
-            let made = commit(&work, f.head.as_deref(), Some(&["z".to_owned()]), "z", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let made = commit(&work, f.head.as_deref(), Some(&["z".to_owned()]), "z", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             let url = bare.to_string_lossy().into_owned();
             push(&work, &url, &format!("+{}:refs/heads/agents/one", made.sha), None).await?;
             assert_eq!(out(&bare, &["rev-parse", "refs/heads/agents/one"])?, made.sha);
@@ -621,19 +649,19 @@ mod tests {
             let one = |s: &str| std::fs::write(top.join("one.txt"), s);
             // Step 1 writes one.txt, step 2 two.txt, step 3 changes one.txt's last line.
             one("1\n2\n3\n4\n5\n6\n7\n8\n")?;
-            let s1 = commit_on(&top, None, &["one.txt".into()], "Step one\n\nChange-Id: I1111111111111111111111111111111111111111\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let s1 = commit_on(&top, None, &["one.txt".into()], "Step one\n\nChange-Id: I1111111111111111111111111111111111111111\n", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             std::fs::write(top.join("two.txt"), "two\n")?;
-            let s2 = commit_on(&top, Some(&s1.sha), &["two.txt".into()], "Step two\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let s2 = commit_on(&top, Some(&s1.sha), &["two.txt".into()], "Step two\n", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             one("1\n2\n3\n4\n5\n6\n7\nEIGHT\n")?;
-            let s3 = commit_on(&top, Some(&s2.sha), &[top.join("one.txt").to_string_lossy().into_owned()], "Step three\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let s3 = commit_on(&top, Some(&s2.sha), &[top.join("one.txt").to_string_lossy().into_owned()], "Step three\n", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             assert_eq!((s2.parent.as_deref(), s3.parent.as_deref(), s3.files.clone()), (Some(s1.sha.as_str()), Some(s2.sha.as_str()), vec!["one.txt".to_owned()]));
-            assert!(commit_on(&top, Some(&s3.sha), &["one.txt".into()], "again", &who).await?.is_none(), "nothing new: no commit");
-            assert!(commit_on(&top, Some("0123456789012345678901234567890123456789"), &["one.txt".into()], "x", &who).await.is_err(), "a step before that isn't there");
+            assert!(commit_on(&top, Some(&s3.sha), &["one.txt".into()], "again", &who, None).await?.is_none(), "nothing new: no commit");
+            assert!(commit_on(&top, Some("0123456789012345678901234567890123456789"), &["one.txt".into()], "x", &who, None).await.is_err(), "a step before that isn't there");
             look(&top)?;
             // Step 1's agent fixes its first line in the folder, which has the whole stack's work.
             one("ONE\n2\n3\n4\n5\n6\n7\nEIGHT\n")?;
             let stack = [s1.sha.clone(), s2.sha.clone(), s3.sha.clone()];
-            let made = restack(&top, &stack, &["one.txt".into()], None, &who).await?;
+            let made = restack(&top, &stack, &["one.txt".into()], None, &who, None).await?;
             let [m1, m2, m3] = made.as_slice() else { anyhow::bail!("{made:?}") };
             assert_eq!(show(&m1.sha, "one.txt")?, "ONE\n2\n3\n4\n5\n6\n7\n8", "the fix, in step 1's own commit");
             assert_eq!(m1.parent, s1.parent, "on what step 1 was on");
@@ -642,14 +670,14 @@ mod tests {
             assert_eq!(show(&m3.sha, "one.txt")?, "ONE\n2\n3\n4\n5\n6\n7\nEIGHT", "step 3 on it, the fix kept");
             assert_eq!(out(&top, &["log", "-1", "--format=%s", &m3.sha])?, "Step three");
             // A new message for it.
-            let titled = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, renamed\n"), &who).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            let titled = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, renamed\n"), &who, None).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
             assert!(titled.contains("nothing to add"), "{titled}");
             // A fix to what a later step changed can't go into step 1 alone: refused, saying so.
             one("ONE\n2\n3\n4\n5\n6\n7\nEIGHT!\n")?;
-            let e = restack(&top, &[m1.sha.clone(), m2.sha.clone(), m3.sha.clone()], &["one.txt".into()], None, &who).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            let e = restack(&top, &[m1.sha.clone(), m2.sha.clone(), m3.sha.clone()], &["one.txt".into()], None, &who, None).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
             assert!(e.contains("changes what a later one changed too"), "{e}");
             // At the top, it goes.
-            let top_only = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, again\n"), &who).await?;
+            let top_only = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, again\n"), &who, None).await?;
             assert_eq!(top_only.first().map(|m| show(&m.sha, "one.txt")).transpose()?.as_deref(), Some("ONE\n2\n3\n4\n5\n6\n7\nEIGHT!"));
             look(&top)?;
             anyhow::Ok(())
@@ -657,6 +685,45 @@ mod tests {
         let seen = status.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
         assert!(seen.len() == 2 && seen.first() == seen.last(), "the folder's branch and index didn't move: {seen:?}");
         assert_eq!(out(&top, &["log", "--format=%s", "-1"])?, "init");
+        Ok(())
+    }
+
+    /// W27-R03: what a runner commits of an agent's work (its change request, a plan step's
+    /// commit, a restack) is signed as the agent, with the key the runner holds for its session at
+    /// its epoch; never with a key the person's git names (here a signing program that fails, so
+    /// a commit it signed couldn't be made). With no key here (the server's own sessions), it's
+    /// unsigned.
+    #[test]
+    fn w27_r03_an_agents_commit_the_runner_makes_is_signed_as_the_agent() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{Actor, Identity};
+        use kiln_ci::identity::gitsig;
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "git config commit.gpgsign true && git config gpg.program false && echo a2 > a")?;
+        let keys = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&keys.path().join("pki"))?;
+        let session = format!("w27-r03-runner-commit-{}", std::process::id());
+        let asked: crate::proto::IdentityAsk = serde_json::from_str(&crate::runner::identity::ask("agent", Some(&session), Some(2))?)?;
+        let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: session.clone(), epoch: 2, held_by: None });
+        let pem = pki.issue_identity(&asked.csr, &identity, &[], time::Duration::hours(1))?;
+        let given = crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None };
+        crate::runner::identity::given(&serde_json::to_string(&given)?, keys.path(), "main")?;
+        let slot = crate::runner::identity::slot("agent", Some(&session), Some(2));
+        let here = top.clone();
+        let (signed, plain) = crate::rt::block_on(async move {
+            let f = facts(&here).await?;
+            let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
+            let signed = commit(Path::new(&f.top), f.head.as_deref(), Some(&["a".to_owned()]), "The agent's", &who, Some(&slot)).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let plain = commit(Path::new(&f.top), f.head.as_deref(), None, "All of it", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            crate::runner::identity::forget(&slot);
+            anyhow::Ok((signed, plain))
+        })?;
+        let raw = Command::new("git").args(["cat-file", "commit", &signed.sha]).current_dir(&top).output()?.stdout;
+        let sig = gitsig::signature_of(&raw).ok_or_else(|| anyhow::anyhow!("not signed: {}", String::from_utf8_lossy(&raw)))?;
+        let v = gitsig::verify(&gitsig::payload(&raw), &sig, &pki.ca_der, &[], crate::util::now_unix())?;
+        assert_eq!(v.identity, identity, "as the agent, at its epoch");
+        let raw = Command::new("git").args(["cat-file", "commit", &plain.sha]).current_dir(&top).output()?.stdout;
+        assert!(gitsig::signature_of(&raw).is_none(), "no key here: unsigned, and not with the person's");
         Ok(())
     }
 }

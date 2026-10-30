@@ -3129,15 +3129,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // About one of this machine's agents' folders: the session says which, so
                         // a question can only be about a folder an agent here works in.
                         let up = uplink.0.clone();
+                        // What it commits of the agent's work is signed as the agent, with the
+                        // key this process holds for its session at its epoch (W27-R03).
                         let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
                             let ws = s.spec.lock().workspace.clone();
                             let info = s.info();
-                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws)
+                            let sign = crate::runner::identity::enabled().then(|| crate::runner::identity::slot("agent", Some(&session), Some(info.epoch)));
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, sign)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, work, ws)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), &json).await,
+                                Some((cwd, work, ws, sign)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), &json, sign.as_deref()).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });

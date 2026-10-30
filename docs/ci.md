@@ -8928,7 +8928,9 @@ research `01a17947fdad71e5a4f15866e3541c41`.
     ancestry alone, never by `KILN_AGENT`, which any process can set (one outside the session gets
     nothing). The runner sets the session's git through `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`
     and `GIT_CONFIG_VALUE_<n>`, after any the session inherited, so the person's own configuration
-    and key are never used;
+    and key are never used. What the runner commits of the agent's work itself (its change request,
+    a plan step's commit, a restack) it signs as the agent with the same key (never with the key
+    the person's git names: the server's own sessions, whose keys it doesn't hold, stay unsigned);
   - kiln's own as the server (`identities::sign_own`): revisions (suggestions applied, conflicts
     resolved) and the land queue's commits and restacks (`[ci.land_signing]`'s key file, when
     given, signs those instead); CD's as CD. A commit kiln can't sign is kept unsigned, with a
@@ -8959,7 +8961,8 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   credential helper never asked); `suggestions.rs` (an applied suggestion's commit verifies as the
   server) and `deploy_github.rs` (a release's commit verifies as CD); `survivors`'
   `w27_r03_only_a_sessions_own_process_signs_as_its_agent` (a process outside the session with
-  `KILN_AGENT` set gets no signature); `gitsign`'s `w27_r03_*`.
+  `KILN_AGENT` set gets no signature); `workspace::git`'s
+  `w27_r03_an_agents_commit_the_runner_makes_is_signed_as_the_agent`; `gitsign`'s `w27_r03_*`.
 - *Not yet.* A push's commits checked on receive-pack, and repositories' policy of who may push
   where (R03's next step); verdicts (R04); legs' results and provenance (R05, R06); lands (R07). A
   remote naming kiln's server by another name than those (another host name for it) keeps the

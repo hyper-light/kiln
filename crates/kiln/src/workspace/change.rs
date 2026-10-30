@@ -129,7 +129,8 @@ pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Val
     let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     let answer = if machine == "local" {
-        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), &json).await
+        // The server holds no agent's key: what it commits of one here stays unsigned.
+        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), &json, None).await
     } else {
         let id = info.id.clone();
         let got = hub
