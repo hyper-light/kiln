@@ -2531,6 +2531,8 @@ where
         _ => Carry::Nothing,
     };
     let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "taken over by this machine's newer runner process");
     // Its harness's own record is here already: it goes on from it, nothing started anew.
     if matches!(pkg.carry, Carry::Nothing) {
         pkg.spec.resume = resume;
@@ -2727,6 +2729,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "moved to another machine");
     if let Some(home) = home {
         pkg = pkg.with_home(home);
     }

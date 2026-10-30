@@ -57,6 +57,9 @@ struct Held {
     keys: HashMap<String, Key>,
     /// Certificates (PEM), by what they're for, with where each was written.
     certs: HashMap<String, (String, PathBuf)>,
+    /// The kiln:// URI each certificate names, as the server said it: what a custody record names
+    /// as its signer (docs/ci.md W27-R08).
+    uris: HashMap<String, String>,
 }
 
 impl Held {
@@ -69,6 +72,7 @@ impl Held {
     fn forget(&mut self, which: impl Fn(&str) -> bool) {
         let legs = self.holds_a_leg();
         self.keys.retain(|s, _| !which(s));
+        self.uris.retain(|s, _| !which(s));
         let gone: Vec<String> = self.certs.keys().filter(|s| which(s)).cloned().collect();
         for s in gone {
             if let Some((_, file)) = self.certs.remove(&s) {
@@ -103,6 +107,12 @@ pub fn slot(kind: &str, of: Option<&str>, epoch: Option<u64>) -> String {
 /// A leg's key is kept only once the process's memory is out of its steps' reach (they haven't
 /// started: a leg's key is made as the leg is given to this runner).
 pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&request(kind, of, epoch)?)?)
+}
+
+/// [`ask`], before it's sent: what an agent session's ask carries beside its CSR is added to it
+/// (`crate::runner::custody::carrying`).
+pub fn request(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<IdentityAsk> {
     let slot = slot(kind, of, epoch);
     let csr = {
         let mut held = HELD.lock();
@@ -119,7 +129,7 @@ pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<S
         let key = held.keys.get(&slot).ok_or_else(|| anyhow::anyhow!("no key for {slot}"))?;
         rcgen::CertificateParams::new(vec!["kiln-identity".to_owned()])?.serialize_request(key)?.pem()?
     };
-    Ok(serde_json::to_string(&IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch })?)
+    Ok(IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch, ..IdentityAsk::default() })
 }
 
 /// The server's answer: the certificate kept for its slot (and written, public, under
@@ -143,13 +153,28 @@ pub fn given(json: &str, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     let path = dir.join(format!("{file}.pem"));
     crate::util::write_secret(&path, pem.as_bytes(), 0o644)?;
     tracing::info!(identity = %g.uri, "identity certified");
+    held.uris.insert(slot.clone(), g.uri.clone());
     held.certs.insert(slot, (pem, path));
     Ok(())
+}
+
+/// The kiln:// URI the certificate held for a slot names.
+pub fn uri(slot: &str) -> Option<String> {
+    HELD.lock().uris.get(slot).cloned()
 }
 
 /// The certificate held for a slot.
 pub fn cert(slot: &str) -> Option<String> {
     HELD.lock().certs.get(slot).map(|(pem, _)| pem.clone())
+}
+
+/// Signs `message` with the slot's key before kiln has certified it (a receipt that goes with
+/// the ask for its certificate): the signature. The key stays here.
+pub fn sign_uncertified(slot: &str, message: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use rcgen::SigningKey as _;
+    let held = HELD.lock();
+    let key = held.keys.get(slot).ok_or_else(|| anyhow::anyhow!("no key for {slot}"))?;
+    Ok(key.sign(message)?)
 }
 
 /// Signs `message` with the slot's key (ECDSA P-256, SHA-256, ASN.1): the signature, and the

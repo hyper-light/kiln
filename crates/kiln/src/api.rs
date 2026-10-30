@@ -707,8 +707,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         })
         .await,
         (&Method::GET, ["api", "custody"]) => {
-            let digest = srv::query(&req).remove("digest").unwrap_or_default();
+            let mut q = srv::query(&req);
+            let (digest, name) = (q.remove("digest").unwrap_or_default(), q.remove("name"));
             boxed(|| async {
+                // By a thing's name: the head of its newest chain.
+                let digest = match name {
+                    Some(n) => crate::custody::head_named(&hub.store, &n).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.unwrap_or(n),
+                    None => digest,
+                };
                 let chain = crate::custody::chain(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &digest, crate::util::now_unix()).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
                 chain.map(|v| srv::json(StatusCode::OK, &v)).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no custody record of {digest:?}")))
             })

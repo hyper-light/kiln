@@ -970,6 +970,11 @@ impl Host {
         // One this machine ran already (its older runner process handed it over) isn't new here:
         // it's never refused for the machine's limits.
         let new = !pkg.handover;
+        // Its giver's signed hand-on goes on to the server, and this process's receipt waits for
+        // its identity at the epoch it goes on at (docs/ci.md W27-R08).
+        if let Some(h) = &pkg.hand_on {
+            crate::runner::custody::took(&pkg.id, epoch, &pkg.events, h);
+        }
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         // Taken over, written so before anything of it runs here: no other process of the machine
         // takes this try over, and the one that handed it over doesn't go on with it.

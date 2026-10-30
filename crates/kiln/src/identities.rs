@@ -587,6 +587,16 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
     let facts: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
     let pem = hub.pki.issue_identity(&ask.csr, &identity, &facts, lifetime)?;
     let now = crate::util::now_unix();
+    // A hand-over's (docs/ci.md W27-R08): its hand-on and the receipt for it kept first, so the
+    // epoch rises with them; the key isn't certified without them.
+    if let (Actor::Agent { .. }, Some(hand_on)) = (&identity.actor, ask.hand_on.as_deref()) {
+        let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+        let came_from = format!("runner {machine} (instance {instance})");
+        let epoch = ask.epoch.unwrap_or_default();
+        if let Err(why) = crate::custody::transfer(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &came_from, &uri, epoch, hand_on, ask.receipt.as_ref(), &pem, now).await? {
+            anyhow::bail!("its hand-over wasn't recorded, so kiln certifies no key at epoch {epoch}: {why}");
+        }
+    }
     revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
     if let Actor::Agent { epoch, held_by, .. } = &identity.actor
         && let Some(session) = ask.of.as_deref()
@@ -597,6 +607,10 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         let to = held_by.as_ref().map(|h| format!(", on runner {} (instance {})", h.machine, h.instance)).unwrap_or_default();
         for (subject, left) in epochs_of(&hub.store, session).await?.into_iter().filter(|(_, e)| e < epoch) {
             revoke(&hub.store, Target::Subject(subject), &format!("epoch {left} left: moved on to epoch {epoch}{to}"), "kiln", now).await?;
+        }
+        // The epoch rises with its transfer recorded (W27-R08).
+        if ask.hand_on.is_some() {
+            hub.harness.raise_epoch(session, *epoch);
         }
     }
     record(&hub.store, &ask.kind, &uri, &pem).await?;

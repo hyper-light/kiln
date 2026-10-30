@@ -126,6 +126,12 @@ pub struct Package {
     /// (`super::host::Decided`). None from a runner before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<String>,
+    /// Its giver's signed hand-on (docs/ci.md W27-R08, `crate::runner::custody`): its identity at
+    /// the epoch it leaves hands its timeline on to the next. The process taking it signs its
+    /// receipt once its identity at that epoch is certified. None from a runner before it, or one
+    /// holding no identity: it goes unsigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hand_on: Option<serde_json::Value>,
 }
 
 impl Package {
@@ -250,6 +256,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         inbox_digests: Vec::new(),
         handover: false,
         attempt: None,
+        hand_on: None,
     }
 }
 

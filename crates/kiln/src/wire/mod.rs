@@ -201,6 +201,7 @@ classes! {
         AgentMsg::AgentLimit { .. } => Class::State,
         AgentMsg::Identity { .. } => Class::Ask,
         AgentMsg::Observe { .. } => OBSERVE,
+        AgentMsg::Custody { .. } => Class::Stream,
     }
 }
 

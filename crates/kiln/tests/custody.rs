@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use common::agents::{self, Talk};
 use common::{Options, http, start};
 use kiln_ci::identity::chain::Identity;
 use kiln_ci::identity::custody::{Body, Kind, to_value};
@@ -253,5 +254,117 @@ fn w27_r08_records_through_the_api_and_the_cli() -> anyhow::Result<()> {
     assert!(shown.contains(&sam.uri) || shown.contains("sam of"), "{shown}");
     assert!(cli(port, admin, &["custody", "breaks"])?.contains("changed"));
     assert!(cli(port, admin, &["transfers", "refused"])?.contains(&sam.uri));
+    Ok(())
+}
+
+const TALK: Talk = Talk { lines: 1, every_ms: 10 };
+
+/// A newer runner process `id` of machine `name` (its first one's state folder): a session is
+/// handed to it, an epoch up.
+fn instance(dir: &Path, port: u16, name: &str, id: &str) -> anyhow::Result<agents::Runner> {
+    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{name}-{id}.log")))?;
+    let child = common::kiln()
+        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--instance", id])
+        .arg("--work-dir")
+        .arg(dir.join(format!("{name}-{id}-work")))
+        .arg("--state-dir")
+        .arg(dir.join(format!("{name}-state")))
+        .env("HOME", dir.join("home"))
+        .env("NO_COLOR", "1")
+        .env("PATH", format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
+        .env("FAKE_CLAUDE_LINES", TALK.lines.to_string())
+        .env("FAKE_CLAUDE_EVERY_MS", TALK.every_ms.to_string())
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()?;
+    Ok(agents::Runner(child))
+}
+
+/// Polls `f` every 250 ms for up to `within`, until it gives something.
+fn until<T>(within: Duration, mut f: impl FnMut() -> anyhow::Result<Option<T>>) -> anyhow::Result<T> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Some(v) = f()? {
+            return Ok(v);
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "not within {within:?}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The session's chain of custody, by its timelines' name, once it walks unbroken through `hops`;
+/// if it doesn't, what the server and the runner processes in `dir` logged about custody.
+fn session_chain(dir: &Path, port: u16, admin: &str, id: &str, hops: usize) -> anyhow::Result<Value> {
+    let chain = until(Duration::from_secs(120), || {
+        let (st, body) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None)?;
+        if st != 200 {
+            return Ok(None);
+        }
+        let v: Value = serde_json::from_str(&body)?;
+        let n = v.get("hops").and_then(Value::as_array).map_or(0, Vec::len);
+        Ok((v.get("unbroken") == Some(&json!(true)) && n >= hops).then_some(v))
+    });
+    chain.map_err(|e| {
+        let (_, now) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None).unwrap_or_default();
+        let logs: Vec<String> = ["server", "box-a", "box-a-z1", "box-a-z2"]
+            .iter()
+            .map(|n| {
+                let text = std::fs::read_to_string(dir.join(format!("{n}.log"))).unwrap_or_default();
+                let lines: Vec<&str> = text.lines().filter(|l| l.contains("custody") || l.contains("took over") || l.contains("taking over") || l.contains("hand")).collect();
+                format!("{n}.log:\n{}", lines.get(lines.len().saturating_sub(40)..).unwrap_or(&[]).join("\n"))
+            })
+            .collect();
+        anyhow::anyhow!("{e}: its chain now {now}\n{}", logs.join("\n"))
+    })
+}
+
+/// W27-R08 (the Transfers plan's step 3): an agent session handed to its machine's newer runner
+/// process, twice, is signed for by both processes each time: the one it leaves signs its hand-on,
+/// at the epoch it leaves; the one taking it signs its receipt, at the next. The chain walks
+/// unbroken through both hand-overs, each hop naming the process that signed it.
+#[test]
+fn w27_r08_session_hand_overs_signed_by_both_processes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let (_main, log) = agents::runner(dir.path(), port, "box-a", None, TALK)?;
+    agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+    // Its identity at its first epoch certified, so the process holding it can sign it on.
+    let e0: u64 = until(Duration::from_secs(60), || {
+        let (st, body) = http(port, "GET", "/api/identities?kind=agent", admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let mark = format!("/agent/{id}/epoch/");
+        Ok(v.get("identities").and_then(Value::as_array).and_then(|l| {
+            l.iter().filter(|i| !field(i, "verified").is_empty()).find_map(|i| field(i, "subject").split_once(&mark).and_then(|(_, r)| r.split('/').next()).and_then(|e| e.parse().ok()))
+        }))
+    })?;
+    let mut keep = Vec::new();
+    keep.push(instance(dir.path(), port, "box-a", "z1")?);
+    let one = session_chain(dir.path(), port, admin, &id, 2)?;
+    let held = |v: &Value| -> Vec<(String, String)> {
+        v.get("hops").and_then(Value::as_array).map(|h| h.iter().map(|h| (field(h, "kind").to_owned(), field(h, "custodian").to_owned())).collect()).unwrap_or_default()
+    };
+    let at = |e: u64, inst: &str| format!("/agent/{id}/epoch/{e}/machine/box-a/instance/{inst}");
+    let first = held(&one);
+    assert!(first.first().is_some_and(|(k, c)| k == "received" && c.ends_with(&at(e0 + 1, "z1"))), "{one}");
+    assert!(first.get(1).is_some_and(|(k, c)| k == "handed-on" && c.ends_with(&at(e0, "main"))), "{one}");
+    // Again, to a third process: the chain runs on through both hand-overs.
+    keep.push(instance(dir.path(), port, "box-a", "z2")?);
+    let two = session_chain(dir.path(), port, admin, &id, 4)?;
+    let kinds: Vec<(String, String)> = held(&two);
+    let expect = [("received", at(e0 + 2, "z2")), ("handed-on", at(e0 + 1, "z1")), ("received", at(e0 + 1, "z1")), ("handed-on", at(e0, "main"))];
+    assert_eq!(kinds.len(), expect.len(), "{two}");
+    for ((k, c), (want_k, want_c)) in kinds.iter().zip(expect.iter()) {
+        assert!(k == want_k && c.ends_with(want_c.as_str()), "{k} {c}, wanted {want_k} {want_c}: {two}");
+    }
+    assert_eq!(half_named(&two), 0, "every hop names both its sides and who signed it");
+    let (st, body) = http(port, "GET", "/api/custody/breaks", admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    assert_eq!(serde_json::from_str::<Value>(&body)?.get("breaks"), Some(&json!([])), "{body}");
     Ok(())
 }

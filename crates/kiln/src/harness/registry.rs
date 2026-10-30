@@ -1352,7 +1352,7 @@ impl Registry {
     }
 
     /// Session `id` is at `epoch` now (epochs only rise), kept when it changes.
-    fn raise_epoch(&self, id: &str, epoch: u64) {
+    pub(crate) fn raise_epoch(&self, id: &str, epoch: u64) {
         let snapshot = {
             let mut g = self.epochs.lock();
             let e = g.entry(id.to_owned()).or_insert(0);

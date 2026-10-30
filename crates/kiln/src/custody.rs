@@ -83,8 +83,14 @@ struct Refusal {
 /// Takes the signed custody record or delegation `bundle`, which came over `came_from` (a runner
 /// process, an API caller), at `at`: checked as of then against kiln's root `root` and the
 /// revocations kiln has; kept by its digest; its own hop checked, and the hops of records that
-/// waited for it. Refused, and recorded, when kiln can't take it.
+/// waited for it. Refused, and recorded, when kiln can't take it. One kiln has already (sent again
+/// after a reconnect, or carried by another) is answered as such, as it was judged when taken: its
+/// signer may have moved on since.
 pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_from: &str, at: i64) -> anyhow::Result<Result<Taken, Refused>> {
+    let digest = digest_of(bundle);
+    if !digest.is_empty() && kept(store, &digest).await? {
+        return Ok(Ok(Taken { digest, again: true, broke: None }));
+    }
     let revocations = crate::identities::revocations(store).await?;
     let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest_of(bundle), act: act.to_owned(), signer, why, envelope: bundle.to_string(), came_from: came_from.to_owned(), at };
     let c = match statement::verify(bundle, root, &revocations, at) {
@@ -128,6 +134,69 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
         }
     }
     Ok(Ok(Taken { digest: c.digest, again, broke }))
+}
+
+/// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
+/// come over that process's connection, and logged either way.
+pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, json: &str) {
+    let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+    let Ok(bundle) = serde_json::from_str::<Value>(json) else {
+        return tracing::debug!(%machine, "an unreadable custody record");
+    };
+    let came_from = format!("runner {machine} (instance {instance})");
+    match take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &bundle, &came_from, crate::util::now_unix()).await {
+        Ok(Ok(t)) => tracing::info!(target: "kiln.custody", %machine, %instance, digest = %t.digest, again = t.again, broke = t.broke.as_deref().unwrap_or(""), "took a custody record"),
+        Ok(Err(why)) => tracing::info!(target: "kiln.custody", %machine, %instance, %why, "refused a custody record"),
+        Err(e) => tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "couldn't keep a custody record"),
+    }
+}
+
+/// Whether kiln keeps record `digest`.
+async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
+    let d = digest.to_owned();
+    store.call(move |c| Ok(c.query_row("SELECT 1 FROM custody WHERE digest = ?1", [&d], |_| Ok(())).optional()?.is_some())).await
+}
+
+/// A hand-over's records, taken as the session's process at its new epoch `epoch` asks for its
+/// certificate (docs/ci.md W27-R08; the Transfers plan's step 3), at `at`: the hand-on its
+/// package carried (`hand_on`, a bundle as JSON), then its receipt, signed with the key being
+/// certified and bundled here with the certificate `pem` kiln issued it for identity `issued`.
+/// Both are kept before the epoch rises: the caller revokes the epoch left, and records the
+/// certificate, only then. The receipt's digest, or why not (each refusal recorded as [`take`]
+/// records them): the hand-on refused (a copy left behind's, its epoch revoked), or not to
+/// `issued` at `epoch`; the receipt missing, refused, or not following it. Then kiln doesn't
+/// certify the key. A receipt of other than what was handed on is kept, its break recorded.
+#[allow(clippy::too_many_arguments)]
+pub async fn transfer(store: &Store, root: &[u8], org: &str, came_from: &str, issued: &str, epoch: u64, hand_on: &str, receipt: Option<&crate::proto::Unbundled>, pem: &str, at: i64) -> anyhow::Result<Result<String, String>> {
+    let Ok(given) = serde_json::from_str::<Value>(hand_on) else { return Ok(Err("its hand-on can't be read".into())) };
+    let handed = match take(store, root, org, &given, came_from, at).await? {
+        Ok(t) => t.digest,
+        Err(why) => return Ok(Err(format!("its hand-on was refused: {why}"))),
+    };
+    // Kept, so checked when kiln took it: read again, revocations aside.
+    let b = statement::verify(&given, root, &[], at).map_err(|e| anyhow::anyhow!("{e}")).and_then(|c| custody::body(&c).map_err(|e| anyhow::anyhow!("{e}")))?;
+    if !b.kind.gives() || b.epoch != Some(epoch) || !b.to.as_deref().is_some_and(|to| custody::names(to, issued)) {
+        let to = b.to.as_deref().unwrap_or("no one");
+        return Ok(Err(format!("its hand-on ({}) is to {to} at epoch {}, not to {issued}", kind_name(b.kind), b.epoch.map_or_else(|| "none".to_owned(), |e| e.to_string()))));
+    }
+    let Some(r) = receipt else { return Ok(Err("no receipt came with its hand-on".into())) };
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (Ok(payload), Ok(signature)) = (b64.decode(&r.payload), b64.decode(&r.signature)) else { return Ok(Err("its receipt can't be read".into())) };
+    let bundle = statement::bundle(&r.payload_type, &payload, &signature, &crate::pki::der_of(pem)?);
+    let got = match take(store, root, org, &bundle, came_from, at).await? {
+        Ok(t) => t,
+        Err(why) => return Ok(Err(format!("its receipt was refused: {why}"))),
+    };
+    // A receipt of other than what was handed on breaks the chain there, recorded (`take`): the
+    // session still goes on where it's held, as the chain says.
+    if let Some(broke) = &got.broke {
+        tracing::warn!(target: "kiln.custody", record = %got.digest, %broke, "a hand-over's receipt breaks its chain");
+    }
+    let follows = statement::verify(&bundle, root, &[], at).map(|c| c.statement.follows).unwrap_or_default();
+    if !follows.contains(&handed) {
+        return Ok(Err(format!("its receipt doesn't follow its hand-on {handed}")));
+    }
+    Ok(Ok(got.digest))
 }
 
 /// Keeps `c`: whether it's new (false: kiln had it).
@@ -294,6 +363,27 @@ async fn start(store: &Store, digest: &str) -> anyhow::Result<Option<String>> {
                    AND NOT EXISTS (SELECT 1 FROM custody_follows f JOIN custody_things n ON n.record = f.record WHERE f.follows = t.record AND n.algorithm = t.algorithm AND n.hex = t.hex)
                  ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1",
                 params![alg, hex.to_ascii_lowercase()],
+                |x| x.get(0),
+            )
+            .optional()?)
+        })
+        .await
+}
+
+/// The head of the chain of the newest thing named `name` ("session 01a1751c at epoch 3"; a name
+/// ending in `*` matches every name it begins: "session 01a1751c at epoch *"): the record a walk of
+/// it starts from, none if kiln has no record of it.
+pub async fn head_named(store: &Store, name: &str) -> anyhow::Result<Option<String>> {
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = name.strip_suffix('*').map_or_else(|| escape(name), |p| format!("{}%", escape(p)));
+    store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT t.record FROM custody_things t JOIN custody c ON c.digest = t.record
+                 WHERE t.name LIKE ?1 ESCAPE '\\' AND c.kind IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM custody_follows f WHERE f.follows = t.record)
+                 ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1",
+                [pattern],
                 |x| x.get(0),
             )
             .optional()?)
@@ -660,5 +750,76 @@ mod tests {
     /// A taken statement, or the refusal as an error.
     fn kiln_or(r: Result<Taken, Refused>) -> anyhow::Result<Taken> {
         r.map_err(|e| anyhow::anyhow!("refused: {e}"))
+    }
+
+    /// W27-R08 (the Transfers plan's step 3): a session's hand-over, as its process at the next
+    /// epoch asks for its certificate. Its hand-on and its receipt, signed with the key being
+    /// certified before kiln certified it, are kept, and walk as one transfer; asked again, the
+    /// same. Not certified: a hand-on to another epoch, one without its receipt, and a copy left
+    /// behind's (its epoch revoked), which is refused and recorded. A receipt of other than what
+    /// was handed on is kept, its break recorded: the session goes on where it's held.
+    #[test]
+    fn w27_r08_a_transfer_is_kept_before_its_epoch_rises() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            let (root, org) = (pki.ca_der.clone(), pki.organization());
+            let at = crate::util::now_unix();
+            let left_uri = LEFT.replace(ORG, &org);
+            let left = Signer::new(&pki, &left_uri)?;
+            let (next, issued) = (format!("kiln://{org}/person/ada/agent/01a1751c/epoch/1"), format!("kiln://{org}/person/ada/agent/01a1751c/epoch/1/machine/adacachy/instance/01a14794"));
+            // The receiver's key, its receipt signed with it before kiln certifies it.
+            let key = crate::pki::new_key_pem()?;
+            let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
+            let pem = pki.issue_identity(&csr, &Identity::parse(&issued)?, &[], time::Duration::hours(1))?;
+            let signing = rcgen::KeyPair::from_pem(&key)?;
+            let timeline = thing("session 01a1751c at epoch 0", 'e');
+            let hand_on = |to: &str, epoch: u64, what: &Subject| -> anyhow::Result<Value> {
+                let b = Body { to: Some(to.to_owned()), why: "taken over".into(), epoch: Some(epoch), ..Body::new(Kind::HandedOn, "") };
+                left.sign(&Statement { subject: vec![what.clone()], ..Statement::new(to_value(&b)) })
+            };
+            let receipt = |follows: &str, what: &Subject| -> anyhow::Result<crate::proto::Unbundled> {
+                let b = Body { from: Some(left_uri.clone()), why: "taken over".into(), epoch: Some(1), ..Body::new(Kind::Received, &next) };
+                let p = payload(&Statement { subject: vec![what.clone()], follows: vec![follows.to_owned()], ..Statement::new(to_value(&b)) })?;
+                let b64 = base64::engine::general_purpose::STANDARD;
+                Ok(crate::proto::Unbundled { payload_type: PAYLOAD_CUSTODY.into(), payload: b64.encode(&p), signature: b64.encode(signing.sign(&to_sign(PAYLOAD_CUSTODY, &p))?) })
+            };
+            let transfer = |h: Value, r: Option<crate::proto::Unbundled>| {
+                let (store, root, org, issued, pem) = (store.clone(), root.clone(), org.clone(), issued.clone(), pem.clone());
+                async move { super::transfer(&store, &root, &org, "runner adacachy (instance 01a14794)", &issued, 1, &h.to_string(), r.as_ref(), &pem, at).await }
+            };
+            let handed = hand_on(&next, 1, &timeline)?;
+            let handed_digest = digest_of(&handed);
+            let got = transfer(handed.clone(), Some(receipt(&handed_digest, &timeline)?)).await?.map_err(|why| anyhow::anyhow!("{why}"))?;
+            let v = chain(&store, &root, &org, &got, at).await?.ok_or_else(|| anyhow::anyhow!("no chain"))?;
+            assert_eq!(v.get("unbroken"), Some(&json!(true)), "{v}");
+            let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+            let custodians: Vec<&str> = hops.iter().filter_map(|h| h.get("custodian").and_then(Value::as_str)).collect();
+            assert_eq!(custodians, vec![issued.as_str(), left_uri.as_str()], "{v}");
+            // Asked again (its answer lost): the same transfer, kept once.
+            assert_eq!(transfer(handed.clone(), Some(receipt(&handed_digest, &timeline)?)).await?, Ok(got.clone()));
+            assert_eq!(count(&store, "custody").await?, 2);
+            // A hand-on to another epoch, or without its receipt: no certificate.
+            let other = hand_on(&format!("kiln://{org}/person/ada/agent/01a1751c/epoch/2"), 2, &thing("session 01a1751c at epoch 0", 'f'))?;
+            assert!(transfer(other, None).await?.is_err_and(|why| why.contains("not to")));
+            let lone = hand_on(&next, 1, &thing("session 01a1751c at epoch 0", '7'))?;
+            assert!(transfer(lone, None).await?.is_err_and(|why| why.contains("no receipt")));
+            // A receipt of other than what was handed on: kept, its break recorded.
+            let more = hand_on(&next, 1, &thing("session 01a1751c at epoch 0", '8'))?;
+            let more_digest = digest_of(&more);
+            assert!(transfer(more, Some(receipt(&more_digest, &thing("session 01a1751c at epoch 0", '9'))?)).await?.is_ok());
+            assert_eq!(breaks(&store, LIST_MAX).await?.len(), 1);
+            // The copy left behind, its epoch revoked as it moved on, hands it on again: refused,
+            // recorded, never certified.
+            crate::identities::record(&store, "agent", &left_uri, &left.pem).await?;
+            crate::identities::revoke(&store, crate::identities::Target::Subject(left_uri.clone()), "epoch 0 left: moved on to epoch 1, on runner adacachy (instance 01a14794)", "kiln", at - 10).await?;
+            let stale = hand_on(&next, 1, &thing("session 01a1751c at epoch 0", 'a'))?;
+            let stale_digest = digest_of(&stale);
+            assert!(transfer(stale, Some(receipt(&stale_digest, &thing("session 01a1751c at epoch 0", 'a'))?)).await?.is_err_and(|why| why.contains("refused") && why.contains("epoch 0 left")));
+            let r = refusals(&store, LIST_MAX).await?;
+            assert!(r.iter().any(|x| x.get("signer") == Some(&json!(left_uri))), "{r:?}");
+            Ok(())
+        })
     }
 }

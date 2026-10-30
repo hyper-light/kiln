@@ -1311,6 +1311,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The server issues identities (docs/ci.md W27-R01): this process's sessions' epochs, and
     // when each identity was last asked for.
     let mut server_identity = false;
+    // The server takes custody records (docs/ci.md W27-R08).
+    let mut server_custody = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
     let mut identity_asked: HashMap<String, Instant> = HashMap::new();
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
@@ -2123,7 +2125,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_CUSTODY }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2303,6 +2305,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // An identity of this process's own, for a key it made and keeps, certified
                         // on each connection (docs/ci.md W27-R01).
                         server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
+                        // Custody records sent before go again: the server takes each once.
+                        server_custody = caps & proto::CAP_CUSTODY != 0 && !o.ephemeral;
+                        if server_custody {
+                            for json in crate::runner::custody::sent() {
+                                uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                            }
+                        }
                         if server_identity {
                             match crate::runner::identity::ask("runner", None, None) {
                                 Ok(json) => {
@@ -2738,6 +2747,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
                         if let Err(e) = crate::runner::identity::given(&json, &o.state_dir, &label) {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
+                        }
+                        // A session's identity at an epoch it was taken over at: its receipt went
+                        // with the ask, and kiln recorded it.
+                        if let Ok(g) = serde_json::from_str::<proto::IdentityGiven>(&json)
+                            && g.kind == "agent"
+                            && g.cert_pem.is_some()
+                            && let (Some(session), Some(epoch)) = (g.of.as_deref(), g.epoch)
+                        {
+                            crate::runner::custody::certified(session, epoch);
+                        }
+                        if server_custody {
+                            for json in crate::runner::custody::drain() {
+                                uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                            }
                         }
                     }
                     // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
@@ -3577,6 +3600,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
+                // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08).
+                if server_custody && connected {
+                    for json in crate::runner::custody::drain() {
+                        uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                    }
+                }
                 // Counts of jobs long done (a kept leg is let go well within a day).
                 journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
                 // Its config's agent limit, read again: a change holds at once, nothing restarting.
@@ -3949,7 +3978,9 @@ async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, Instant
         return;
     }
     asked.insert(slot, Instant::now());
-    match crate::runner::identity::ask("agent", Some(session), Some(epoch)) {
+    // With the hand-on it was taken over with, and this process's receipt (docs/ci.md W27-R08).
+    let ask = crate::runner::identity::request("agent", Some(session), Some(epoch)).and_then(|a| Ok(serde_json::to_string(&crate::runner::custody::carrying(session, epoch, a))?));
+    match ask {
         Ok(json) => {
             uplink.0.send(Up::Term(AgentMsg::Identity { json })).await.ok();
         }

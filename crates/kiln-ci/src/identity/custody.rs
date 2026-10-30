@@ -54,12 +54,12 @@ pub enum Kind {
 
 impl Kind {
     /// It hands its things to someone.
-    fn gives(self) -> bool {
+    pub fn gives(self) -> bool {
         matches!(self, Self::HandedOn | Self::PassedOn | Self::Taken)
     }
 
     /// It takes its things from someone, following a giver's record.
-    fn takes(self) -> bool {
+    pub fn takes(self) -> bool {
         matches!(self, Self::Received | Self::PassedOn)
     }
 }
@@ -84,7 +84,10 @@ pub struct Body {
     pub kind: Kind,
     /// Its signer (an identity's URI), as its certificate names it. A statement's digest is the
     /// same whoever signs it, so a record names its signer itself: two custodians' records of
-    /// one hop are two records.
+    /// one hop are two records. An agent session's receipt, signed as it asks for its epoch's
+    /// certificate, names it at that epoch without the process holding its key
+    /// (`…/agent/<s>/epoch/<n>`): only one process holds an epoch's key, which its certificate
+    /// names.
     #[serde(default)]
     pub by: String,
     /// Whom they go to (an identity's URI): handed on, passed on, taken.
@@ -149,7 +152,7 @@ pub fn body(c: &Checked) -> Result<Body, Break> {
     let unreadable = |why: String| Break::Unreadable { record: c.digest.clone(), why };
     let b: Body = serde_json::from_value(c.statement.body.clone()).map_err(|e| unreadable(e.to_string()))?;
     b.check().map_err(unreadable)?;
-    if b.by != c.custodian {
+    if !names(&b.by, &c.custodian) {
         return Err(unreadable(format!("it says it's by {}, but {} signed it", if b.by.is_empty() { "no one" } else { &b.by }, c.custodian)));
     }
     if c.statement.subject.is_empty() {
@@ -416,6 +419,18 @@ fn compare(here: &[Subject], there: &[Subject]) -> Compared {
     Compared::Matched { same: matched.len(), only_here, only_there }
 }
 
+/// Whether `named`, a record's word for a custodian, names `signer`: the same identity, or an agent
+/// session at an epoch named without the runner process holding its key (`…/agent/<s>/epoch/<n>`),
+/// which whichever process holds that epoch's key signs for (`…/epoch/<n>/machine/<m>/instance/<i>`).
+/// A giver hands a session on to its next epoch before knowing the process that will hold it.
+pub fn names(named: &str, signer: &str) -> bool {
+    if named == signer {
+        return true;
+    }
+    let agent_epoch = named.split('/').collect::<Vec<_>>().windows(2).any(|w| matches!(w, ["epoch", n] if n.parse::<u64>().is_ok())) && named.contains("/agent/");
+    agent_epoch && signer.strip_prefix(named).is_some_and(|rest| rest.starts_with("/machine/"))
+}
+
 /// How a record follows another.
 enum Edge {
     /// It takes what the other gave it.
@@ -451,12 +466,12 @@ fn edge(r: &Checked, rb: &Body, p: &Checked, pb: &Body, server: &str) -> Result<
             return Err(Break::TakenNotByServer { record: from, signer: p.custodian.clone(), server: server.to_owned() });
         }
         let to = pb.to.clone().unwrap_or_default();
-        if to != r.custodian {
+        if !names(&to, &r.custodian) {
             return Err(Break::NotTheTaker { record, from, to, signer: r.custodian.clone() });
         }
         let giver = if pb.kind == Kind::Taken { pb.taken_for.clone().unwrap_or_default() } else { p.custodian.clone() };
         let says = rb.from.clone().unwrap_or_default();
-        if says != giver {
+        if !names(&says, &giver) && !names(&giver, &says) {
             return Err(Break::NotTheGiver { record, from, says, giver });
         }
         return Ok(Edge::Transfer);
@@ -466,7 +481,7 @@ fn edge(r: &Checked, rb: &Body, p: &Checked, pb: &Body, server: &str) -> Result<
         return Err(out_of_order());
     }
     let holder = if rb.kind == Kind::Taken { rb.taken_for.clone().unwrap_or_default() } else { r.custodian.clone() };
-    if p.custodian != holder {
+    if !names(&holder, &p.custodian) {
         return Err(Break::NotTheHolder { record, from, holder: p.custodian.clone(), signer: holder });
     }
     Ok(if same.0 > 0 { Edge::Holding } else { Edge::MadeFrom })
@@ -968,6 +983,41 @@ mod tests {
         let own = verify_under(&jupiter.sign(PAYLOAD_CUSTODY, &record(Kind::Received, &[thing("workspace", 'a')], None, Some(AGENT), &[], "sync", 1))?, &ca.der, &[], AT, |_| None)?;
         assert_eq!(entitled(&own, "anything", AT, &[]), Ok(Entitled::Own));
         assert!(covers("receive:*", "receive:blob") && !covers("receive:*", "act:run") && !covers("receive:workspace", "receive:*"));
+        Ok(())
+    }
+
+    /// A session handed on to its next epoch, before the giver knows which process will hold it:
+    /// whichever holds that epoch's key takes it; another epoch's doesn't.
+    #[test]
+    fn w27_r08_a_session_goes_to_its_next_epoch_whoever_holds_it() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (left, moved) = (Signer::new(&ca, LEFT)?, Signer::new(&ca, MOVED)?);
+        let state = thing("session 01a1751c", '5');
+        let next = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/1";
+        let mut kept = Kept::default();
+        let handed = kept.take(&ca, &left, &record(Kind::HandedOn, std::slice::from_ref(&state), Some(next), None, &[], "s", 1), AT - 5)?;
+        let from = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/0";
+        let got = kept.take(&ca, &moved, &record(Kind::Received, std::slice::from_ref(&state), None, Some(from), &[&handed], "s", 1), AT)?;
+        assert_eq!(walk(&got, &kept.records, SERVER)?.hops.len(), 2);
+        // Epoch 2's holder isn't epoch 1's.
+        let two = Signer::new(&ca, "kiln://hyper-light/person/ada/agent/01a1751c/epoch/2/machine/adacachy/instance/01a14794")?;
+        let wrong = kept.take(&ca, &two, &record(Kind::Received, std::slice::from_ref(&state), None, Some(from), &[&handed], "s", 1), AT)?;
+        assert!(matches!(walk(&wrong, &kept.records, SERVER), Err(Break::NotTheTaker { .. })));
+        assert!(names(next, MOVED) && !names(next, "kiln://hyper-light/person/ada/agent/01a1751c/epoch/10/machine/a/instance/b") && !names(FEDORA, &format!("{FEDORA}/machine/x")));
+        // Its receipt, signed as it asks for epoch 1's certificate, says it's by the session at
+        // epoch 1, without the process: read as its signer's. At another epoch, or another
+        // session's, it isn't.
+        let receipt = record(Kind::Received, std::slice::from_ref(&state), None, Some(from), &[&handed], "s", 1);
+        let by = |by: &str| -> anyhow::Result<Result<Body, Break>> {
+            let mut s = receipt.clone();
+            if let Some(o) = s.body.as_object_mut() {
+                o.insert("by".into(), Value::String(by.to_owned()));
+            }
+            Ok(body(&verify(&moved.sign(PAYLOAD_CUSTODY, &s)?, &ca.der, &[], AT)?))
+        };
+        assert!(matches!(by(next)?, Ok(b) if b.by == next));
+        assert!(matches!(by("kiln://hyper-light/person/ada/agent/01a1751c/epoch/2")?, Err(Break::Unreadable { .. })));
+        assert!(matches!(by("kiln://hyper-light/person/ada/agent/01a1751d/epoch/1")?, Err(Break::Unreadable { .. })));
         Ok(())
     }
 

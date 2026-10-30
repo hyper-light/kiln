@@ -262,6 +262,11 @@ pub enum AgentMsg {
     /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
     /// encodes variants by index.
     HeadroomStatus { json: String },
+    /// Custody (docs/ci.md W27-R08, `crate::custody`): a signed custody record or delegation, its
+    /// Sigstore bundle as JSON, that this runner process or a session it holds signed, or carried
+    /// (a giver's hand-on, from the package it took). Only to a server announcing [`CAP_CUSTODY`].
+    /// Appended last: postcard encodes variants by index.
+    Custody { json: String },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -423,6 +428,12 @@ pub const CAP_HEADROOM: u64 = 1 << 39;
 /// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
 pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: custody (docs/ci.md W27-R08). A runner
+/// that says it signs its agent sessions' hand-overs (a hand-on as it lets one go, a receipt as it
+/// takes one) and sends them ([`AgentMsg::Custody`]); a server that says it takes them
+/// (`crate::custody::take`).
+pub const CAP_CUSTODY: u64 = 1 << 41;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -434,6 +445,26 @@ pub struct IdentityAsk {
     pub of: Option<String>,
     /// `agent`: the epoch the key is for.
     pub epoch: Option<u64>,
+    /// `agent`, at the epoch a hand-over raised it to (docs/ci.md W27-R08): the hand-on its package
+    /// carried (a Sigstore bundle, as JSON), signed by the session at the epoch it left. kiln
+    /// records it before the epoch rises, and certifies the key only then. None: no hand-on
+    /// signed (a runner from before custody), or not a hand-over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_on: Option<String>,
+    /// With `hand_on`: this process's receipt for it, signed with the key of `csr`, which kiln
+    /// bundles with the certificate it issues and records with the hand-on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Unbundled>,
+}
+
+/// A statement signed with a key kiln hasn't certified yet ([`IdentityAsk::receipt`]): its DSSE
+/// payload type, payload and signature (base64), bundled once kiln has certified the key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Unbundled {
+    pub payload_type: String,
+    pub payload: String,
+    pub signature: String,
 }
 
 /// The answer to an [`IdentityAsk`]: its kind and subject, and the certificate (PEM) or why not.
@@ -1062,6 +1093,19 @@ mod tests {
     fn the_changes_patch_bit_is_a_new_one() {
         let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM;
         assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
+    }
+
+    /// W27-R08: custody records come after every older variant, and their bit is a new one.
+    #[test]
+    fn w27_r08_custody_is_appended_after_headroom() -> anyhow::Result<()> {
+        let headroom = encode(&AgentMsg::HeadroomStatus { json: "{}".into() })?;
+        let custody = AgentMsg::Custody { json: "{}".into() };
+        let b = encode(&custody)?;
+        assert_eq!(b.first().copied(), headroom.first().map(|i| i + 1), "AgentMsg::Custody comes right after HeadroomStatus");
+        assert_eq!(decode::<AgentMsg>(&b)?, custody);
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH;
+        assert!(CAP_CUSTODY.is_power_of_two() && CAP_CUSTODY == 1 << 41 && CAP_CUSTODY & before == 0);
+        Ok(())
     }
 
     #[test]
