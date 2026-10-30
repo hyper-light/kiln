@@ -447,6 +447,8 @@ pub struct Hub {
     /// How many agent sessions each machine runs at once, as set here, and what each said it
     /// holds (`crate::harness::limit`).
     pub agent_limits: crate::harness::limit::AgentLimits,
+    /// Each runner's headroom settings and what it reports (docs/headroom.md).
+    pub headrooms: crate::headroom::control::Headrooms,
     /// Peered clusters (`crate::peers`).
     pub peered: crate::peers::Peers,
     /// The tailnet's split DNS for the front doors' names (`crate::frontdoor::tailnet`).
@@ -579,6 +581,7 @@ impl Hub {
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
             agent_limits: crate::harness::limit::AgentLimits::default(),
+            headrooms: crate::headroom::control::Headrooms::default(),
             peered: crate::peers::Peers::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
@@ -1377,6 +1380,7 @@ impl Hub {
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
         self.agent_limits.forget(&self.store, agent).await;
+        self.headrooms.forget(&self.store, agent).await;
         self.places.forget(agent);
         self.tailnet.wake.notify();
         self.update_slot_gauges();
@@ -1883,6 +1887,7 @@ impl Hub {
                 }
             }
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
+            AgentMsg::HeadroomStatus { json } => crate::headroom::control::on_status(self, peer, &agent, &json),
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             AgentMsg::JobEvent { job, json } => {
                 if self.owns_job(peer, &job) {
@@ -1897,6 +1902,7 @@ impl Hub {
             // server has of its streams, and sends from there (docs/wire.md).
             AgentMsg::Caps { caps } => {
                 self.instances.lock().set_wide(peer, caps);
+                crate::headroom::control::on_caps(self, &agent, caps).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
                 if caps & proto::CAP_HANDOVER != 0 {
                     self.check_handover().await;
@@ -2328,7 +2334,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {

@@ -128,6 +128,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // it connects, and the server's own agents held to theirs from the start.
     hub.agent_limits.load(&hub.store).await?;
     crate::harness::limit::hold_local(&hub);
+    hub.headrooms.load(&hub.store).await?;
     // Peered clusters (docs/peers.md): forwarded to, and their ports open, from the start.
     crate::peers::start(&hub).await;
     // The tailnet's DNS for them: the Tailscale credential given in the UI, the routes kiln set.

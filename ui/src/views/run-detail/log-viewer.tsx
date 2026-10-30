@@ -5,6 +5,7 @@ import type { LogControlFrame, Status } from "@/api/types";
 import { createTerminal, ensureFont, safeFit, SEARCH_DECORATIONS, type KilnTerminal } from "@/components/terminal/xterm-setup";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { formatDuration } from "@/lib/format";
 
 const MAX_ROWS = 38;
 const MIN_ROWS = 4;
@@ -19,6 +20,8 @@ export default function LogViewer({
   live,
   onStepStatus,
   rows: fixedRows,
+  timed,
+  bare,
 }: {
   jobId: string;
   step: number;
@@ -26,8 +29,15 @@ export default function LogViewer({
   onStepStatus?: (idx: number, status: Status) => void;
   /** A fixed height of this many rows (Ship's Output card): the box holds still as lines arrive. */
   rows?: number;
+  /** Ship's Output (plan 01a1856fe81375b1bd1d1d86f270a45b, step 9): each line opens with its time
+   * since the job began (`begun`, unix seconds), from when kiln noted its piece arrived; a line newer
+   * than kiln's note, from when it arrives. */
+  timed?: { begun: number };
+  /** Without its own bar: Ship's Output draws its header. */
+  bare?: boolean;
 }) {
   const kRef = React.useRef<KilnTerminal | null>(null);
+  const begun = timed?.begun;
   const [follow, setFollow] = React.useState(true);
   const followRef = React.useRef(true);
   followRef.current = follow;
@@ -93,12 +103,74 @@ export default function LogViewer({
           k.search.onDidChangeResults((r) => setMatches(r ? { idx: r.resultIndex, count: r.resultCount } : null)),
         );
 
-        const write = (data: Uint8Array | string) => {
+        const put = (data: Uint8Array | string) => {
           total += typeof data === "string" ? data.length : data.byteLength;
           gotAny = true;
           k.term.write(data, () => grow(k));
           setBytes(total);
         };
+        // Timed: each line opens with its time, dim, in a gutter of one width. A piece kiln noted
+        // has its time; one it hadn't yet (newer than its note) has now's. Until kiln's note is
+        // read, what comes waits, so every line has its time.
+        let noted: { times: [number, number][]; size: number } | null = null;
+        const waiting: Uint8Array[] = [];
+        let at = 0;
+        let fresh = true;
+        const gutter = (offset: number) => {
+          if (begun === undefined) return "";
+          let ms = Date.now();
+          if (noted && offset < noted.size) {
+            let found: number | null = null;
+            for (const [o, t] of noted.times) if (o <= offset) found = t;
+            if (found === null) return " ".repeat(9);
+            ms = found;
+          }
+          return `\x1b[38;2;109;112;120m${formatDuration(ms / 1000 - begun).padStart(7)}\x1b[39m  `;
+        };
+        const lines = (data: Uint8Array) => {
+          let i = 0;
+          while (i < data.length) {
+            // The gutter isn't the log's: drawn, not counted.
+            if (fresh) {
+              k.term.write(gutter(at + i));
+              fresh = false;
+            }
+            // A line ends at a newline; a carriage return alone (a progress line drawn again)
+            // starts it over, so it takes its time again rather than drawing over it.
+            let end = data.length;
+            for (let j = i; j < data.length; j++) {
+              const b = data[j];
+              if (b === 0x0a) {
+                end = j + 1;
+                break;
+              }
+              if (b === 0x0d) {
+                end = data[j + 1] === 0x0a ? j + 2 : j + 1;
+                break;
+              }
+            }
+            put(data.subarray(i, end));
+            if (end < data.length || data[end - 1] === 0x0a || data[end - 1] === 0x0d) fresh = true;
+            i = end;
+          }
+          at += data.length;
+        };
+        const write = (data: Uint8Array | string) => {
+          if (begun === undefined) return put(data);
+          const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+          if (!noted) waiting.push(bytes);
+          else lines(bytes);
+        };
+        if (begun !== undefined)
+          void api
+            .jobLogTimes(jobId, step)
+            // Unread, no line is given a time it may not have: every gutter blank.
+            .catch(() => ({ times: [] as [number, number][], size: Number.MAX_SAFE_INTEGER }))
+            .then((n) => {
+              if (disposed) return;
+              noted = n;
+              for (const b of waiting.splice(0)) lines(b);
+            });
 
         const fallback = () => {
           api
@@ -160,7 +232,7 @@ export default function LogViewer({
         kRef.current = null;
       };
     },
-    [jobId, step],
+    [jobId, step, begun],
   );
 
   const runSearch = (dir: "next" | "prev", q = query) => {
@@ -179,8 +251,8 @@ export default function LogViewer({
   const height = rows * lineH + 20;
 
   return (
-    <div className="border-t border-[#1d2128]">
-      <div className="flex flex-wrap items-center gap-1 px-3 py-1.5">
+    <div className={cn(!bare && "border-t border-[#1d2128]")}>
+      <div className={cn("flex flex-wrap items-center gap-1 px-3 py-1.5", bare && "hidden")}>
         <span className="label mr-auto flex items-center gap-2">
           {live && !ended ? (
             <>

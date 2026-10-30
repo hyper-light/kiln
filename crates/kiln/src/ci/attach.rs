@@ -768,8 +768,8 @@ fn error_line(f: &Value) -> String {
 }
 
 /// What a failed run is: its failed jobs, each one's failing step and excerpt, and the last green
-/// run of its workflow on its branch.
-async fn failure_of(hub: &Hub, v: &Value, wake: &'static str) -> Trigger {
+/// run of its workflow on its branch (also what Ship's Hand off gives, W26-R18).
+pub(crate) async fn failure_of(hub: &Hub, v: &Value, wake: &'static str) -> Trigger {
     let repo = s(v, "/repo/name").or_else(|| s(v, "/run/repo")).unwrap_or_default().to_owned();
     let run = s(v, "/run/id").unwrap_or_default().to_owned();
     let workflow = s(v, "/run/workflow").unwrap_or_default().to_owned();

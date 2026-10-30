@@ -1,6 +1,8 @@
 //! Job logs: one append-only file per step at `<data>/logs/<id[..2]>/<job>/<step>.log`, plus a
 //! broadcast channel per live job so any number of UI viewers can tail without touching disk.
-//! A per-job byte cap protects the disk from runaway output.
+//! A per-job byte cap protects the disk from runaway output. Beside each step's log, `<step>.times`
+//! notes when each piece of it arrived (its byte offset and unix ms, a line each), for the times
+//! Ship's Output puts beside its lines (plan 01a1856fe81375b1bd1d1d86f270a45b, step 9).
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -22,6 +24,8 @@ struct Live {
     /// Keeps the channel open while nobody is watching.
     _idle: async_broadcast::InactiveReceiver<LogEvent>,
     files: HashMap<u32, std::fs::File>,
+    /// Each step's `<step>.times`, open while it's written.
+    times: HashMap<u32, std::fs::File>,
     bytes: u64,
     truncated: bool,
 }
@@ -52,6 +56,10 @@ impl Logs {
         self.job_dir(job).join(format!("{idx}.log"))
     }
 
+    fn times_path(&self, job: &str, idx: u32) -> PathBuf {
+        self.job_dir(job).join(format!("{idx}.times"))
+    }
+
     fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Live) -> R) -> R {
         let mut g = self.live.lock();
         let live = g.entry(job.to_owned()).or_insert_with(|| {
@@ -60,7 +68,7 @@ impl Logs {
             tx.set_overflow(true);
             tx.set_await_active(false);
             let idle = rx.deactivate();
-            Live { tx, _idle: idle, files: HashMap::new(), bytes: 0, truncated: false }
+            Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), bytes: 0, truncated: false }
         });
         f(live)
     }
@@ -70,6 +78,7 @@ impl Logs {
     pub fn append(&self, job: &str, idx: u32, data: &[u8]) {
         crate::metrics::global().log_bytes.add(data.len() as u64);
         let path = self.step_path(job, idx);
+        let times_path = self.times_path(job, idx);
         let max = self.max_bytes;
         let notice: &[u8] = b"\r\n\x1b[33m[kiln] log size limit reached; further output discarded\x1b[0m\r\n";
         self.with_live(job, |live| {
@@ -101,10 +110,37 @@ impl Logs {
                     }
                 }
             };
-            if let Some(f) = file
-                && let Err(e) = f.write_all(chunk) {
-                    tracing::warn!(error = %e, "log write failed");
+            // Where this piece starts in the step's log (whatever else wrote to it, a retry's
+            // mark), noted with when it came once it's written.
+            let at = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len());
+            let wrote = match file {
+                Some(f) => match f.write_all(chunk) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "log write failed");
+                        false
+                    }
+                },
+                None => false,
+            };
+            // A piece that holds no bytes holds no line: nothing to note.
+            if let (true, Some(at), false) = (wrote, at, chunk.is_empty()) {
+                let times = match live.times.entry(idx) {
+                    std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
+                    std::collections::hash_map::Entry::Vacant(v) => match std::fs::OpenOptions::new().create(true).append(true).open(&times_path) {
+                        Ok(f) => Some(v.insert(f)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, path = %times_path.display(), "cannot open log times");
+                            None
+                        }
+                    },
+                };
+                if let Some(t) = times
+                    && let Err(e) = writeln!(t, "{at} {}", crate::util::now_ms())
+                {
+                    tracing::warn!(error = %e, "log times write failed");
                 }
+            }
             let _ = live.tx.try_broadcast(LogEvent::Data { idx, data: Bytes::copy_from_slice(chunk) });
         });
     }
@@ -113,6 +149,7 @@ impl Logs {
         self.with_live(job, |live| {
             if status != "running" {
                 live.files.remove(&idx);
+                live.times.remove(&idx);
             }
             let _ = live.tx.try_broadcast(LogEvent::Step { idx, status });
         });
@@ -138,6 +175,13 @@ impl Logs {
     pub async fn read(&self, job: &str, idx: u32) -> Vec<u8> {
         let p = self.step_path(job, idx);
         crate::rt::blocking(move || std::fs::read(p).unwrap_or_default()).await.unwrap_or_default()
+    }
+
+    /// When each piece of a step's log arrived, oldest first: its byte offset in the log and unix
+    /// ms. A log written before kiln noted them has none.
+    pub async fn times(&self, job: &str, idx: u32) -> Vec<(u64, i64)> {
+        let p = self.times_path(job, idx);
+        crate::rt::blocking(move || std::fs::read_to_string(p).map(|s| times_of(&s)).unwrap_or_default()).await.unwrap_or_default()
     }
 
     /// The last `max` bytes of a step's log on disk (all of it when it's shorter).
@@ -188,6 +232,16 @@ impl Logs {
     }
 }
 
+/// `<step>.times` read: a line each, its offset and its ms; a line torn by a crash is left out.
+fn times_of(s: &str) -> Vec<(u64, i64)> {
+    s.lines()
+        .filter_map(|l| {
+            let (at, ms) = l.split_once(' ')?;
+            Some((at.parse().ok()?, ms.parse().ok()?))
+        })
+        .collect()
+}
+
 /// [`Logs::tail`]'s read, from where the last `max` bytes start.
 fn tail_of(p: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
@@ -231,5 +285,33 @@ mod tests {
         assert_eq!(n, 4);
         Ok(())
     })
+    }
+
+    /// Plan 01a1856fe81375b1bd1d1d86f270a45b, step 9: each piece of a step's log is noted with
+    /// where it starts and when it came, as written, in order; a retry's mark between pieces
+    /// moves the next one's offset, and a torn line in the file is left out.
+    #[test]
+    fn each_piece_of_a_log_is_noted_with_where_it_starts_and_when() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 20);
+            let before = crate::util::now_ms();
+            logs.append("job1", 0, b"$ cargo clippy\n");
+            logs.append("job1", 0, b"    Checking kiln\n");
+            logs.mark("job1", 0, "attempt 2").await;
+            logs.append("job1", 0, b"done\n");
+            logs.append("job1", 1, b"step two\n");
+            logs.finish("job1");
+            let log = logs.read("job1", 0).await;
+            let times = logs.times("job1", 0).await;
+            let offsets: Vec<u64> = times.iter().map(|(at, _)| *at).collect();
+            let done = log.windows(5).position(|w| w == b"done\n").and_then(|i| u64::try_from(i).ok());
+            assert_eq!(offsets, vec![0, 15, done.unwrap_or(u64::MAX)]);
+            assert!(times.iter().all(|(_, ms)| *ms >= before) && times.windows(2).all(|w| w.first().map(|a| a.1) <= w.get(1).map(|b| b.1)), "{times:?}");
+            assert_eq!(logs.times("job1", 1).await.iter().map(|(at, _)| *at).collect::<Vec<_>>(), vec![0]);
+            assert!(logs.times("job2", 0).await.is_empty());
+            assert_eq!(times_of("0 1700000000000\n12 17000000\nnot a line\n40"), vec![(0, 1_700_000_000_000), (12, 17_000_000)]);
+            Ok(())
+        })
     }
 }

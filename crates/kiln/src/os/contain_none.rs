@@ -35,6 +35,11 @@ impl Group {
 
 pub fn hold_agents() {}
 
+/// The sessions with processes held now: none here.
+pub fn sessions() -> Vec<String> {
+    Vec::new()
+}
+
 pub fn session_of(_pid: u32) -> Option<String> {
     None
 }

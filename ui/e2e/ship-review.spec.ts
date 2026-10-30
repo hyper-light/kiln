@@ -31,15 +31,16 @@ test("Files and the Conversation are the dropdown's first sections", async ({ pa
   await expect(row.locator(".rv-thread .rv-m", { hasText: "can fail on a bad expression" })).toBeVisible();
 });
 
-test("nothing in Files or the Conversation scrolls sideways, at every width (W21-AC01)", async ({ page }) => {
+test("nothing in Files or the Conversation scrolls sideways but a comment's code, which keeps each line on one line, at every width (W21-AC01)", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   await expect(row.locator(".md-code-body").first()).toBeVisible();
   // As ci/ui/layout.mjs asks of every page: no element whose content scrolls left and right. A
-  // table too wide to fit at all is the agent chat's one exception (harness.css's .hx-table).
+  // table too wide to fit at all is the agent chat's exception (harness.css's .hx-table), and a
+  // comment's code the mockup's (Ship's mockups plan, step 12): its lines don't wrap, its box scrolls.
   const sideways = await row.locator(".rv-s").evaluateAll((sections) =>
     sections.flatMap((s) =>
       [s, ...s.querySelectorAll("*")]
-        .filter((el) => !el.closest(".hx-table"))
+        .filter((el) => !el.closest(".hx-table, [data-code-scroll]"))
         .filter((el) => {
           const cs = getComputedStyle(el);
           return (cs.overflowX === "auto" || cs.overflowX === "scroll") && el.clientWidth > 0 && el.scrollWidth > el.clientWidth + 1;
@@ -48,6 +49,10 @@ test("nothing in Files or the Conversation scrolls sideways, at every width (W21
     ),
   );
   expect(sideways).toEqual([]);
+  // Each line of a comment's code on one line: no line taller than the shortest.
+  const heights = await row.locator(".rv-s .md-ln").evaluateAll((ls) => ls.map((l) => l.getBoundingClientRect().height));
+  expect(heights.length).toBeGreaterThan(0);
+  expect(Math.max(...heights) - Math.min(...heights)).toBeLessThanOrEqual(1);
 });
 
 test("reply, resolve, change a kind, delete", async ({ page }) => {

@@ -581,6 +581,8 @@ pub static ROUTES: &[Rule] = &[
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
     r("GET", "/api/ship/**", "runs.read", At::Anywhere),
+    // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
+    r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),
@@ -609,6 +611,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
     // How many agent sessions it runs at once: read with the runner, set by those who manage it.
     r("GET", "/api/runners/*/agent-limit", "runners.read", At::Runner(2)),
+    r("GET", "/api/headroom", "runners.read", At::Server),
+    r("GET", "/api/runners/*/headroom", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
     r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
     r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),

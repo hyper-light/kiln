@@ -1053,6 +1053,14 @@ async fn release_up_to_date(hub: &Arc<Hub>, id: i64, events: &[&'static str]) {
     }
 }
 
+/// Run `run`'s `run.failed`, as the events socket sends it: what Ship's Hand off gives the agent
+/// attached to it, as the failure itself would (docs/ci.md W26-R18, W20-R08).
+pub(crate) async fn failed_notice(hub: &Hub, run: &str) -> Option<Value> {
+    use crate::wire::events::{NoticeKind, RepoRef, RunNotice};
+    let (repo, s) = subject(hub, run).await.ok().flatten()?;
+    serde_json::to_value(RunNotice { kind: NoticeKind::RunFailed, repo: RepoRef { id: repo.id.clone(), name: repo.name.clone() }, run: s.run_ref(), environments: s.environments.clone() }).ok()
+}
+
 async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>> {
     let r = run.to_owned();
     let row: Option<(String, i64, String, String, String, String, String, String, Option<String>, Option<String>)> = hub

@@ -102,6 +102,12 @@ test("every harness's show_page call is a page, from the moment it's called wher
     opencode: [acp("kiln_show_page"), acp("other", ANSWER)],
     // Amp (amp-acp): the tool's name and its first argument.
     Amp: [acp("mcp__kiln__show_page: Try it"), acp("mcp__kiln__show_page: Try it", ANSWER)],
+    // Antigravity: named as Codex's (`crate::harness::antigravity`); from a runner before that, agy's `call_mcp_tool`, its
+    // answer's text and where agy put its picture.
+    Antigravity: [
+      { name: "mcp__kiln__show_page", tool: "mcp", title: "Try it", server: "kiln", tool_short: "show_page" },
+      { name: "call_mcp_tool", tool: "mcp", title: "call_mcp_tool", output: `${ANSWER}\n[Resource offloaded to file:///Users/ada/.gemini/antigravity-cli/brain/c1/media_0.png]` },
+    ],
   };
   for (const [harness, shown] of Object.entries(calls)) for (const c of shown) assert.ok(isShowPage(c), `${harness}: ${c.title}`);
   assert.equal(pageOf(calls["Gemini CLI"][0]!), null, "Gemini CLI: its input isn't kiln's answer");

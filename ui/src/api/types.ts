@@ -1968,3 +1968,90 @@ export interface JobTools {
   };
   fix: ToolFix | null;
 }
+
+/* ---------------------------- headroom (Runners → Headroom, docs/headroom.md) ---------------------------- */
+
+export type HeadroomProbe = { kind: "fsync"; path: string } | { kind: "http"; url: string } | { kind: "tcp"; addr: string };
+
+export interface HeadroomTarget {
+  name: string;
+  probe: HeadroomProbe;
+  /** Slower than this harms it; null: the platform's default (1 s). */
+  tolerance_ms: number | null;
+}
+
+/** Only what a person decides: everything else headroom measures. */
+export interface HeadroomSettings {
+  enabled: boolean;
+  targets: HeadroomTarget[];
+  automatic: boolean;
+  false_alarms_per_day: number;
+  probe_load_share: number;
+  escapes: boolean;
+}
+
+export interface HeadroomAlarm {
+  since_us: number;
+  harm: boolean;
+  quiet: boolean;
+}
+
+export interface HeadroomTargetStatus {
+  name: string;
+  tolerance_us: number;
+  calm_us: number | null;
+  level: number;
+  threshold: number;
+  alarm: HeadroomAlarm | null;
+  regime_since_us: number;
+}
+
+export interface HeadroomGroup {
+  label: string;
+  session?: string;
+  cpu_pct: number;
+  write_mb_s: number;
+  mem_mb: number;
+  share: number;
+  why: string;
+}
+
+export interface HeadroomHeld {
+  session: string;
+  since_ms: number;
+  why: string;
+  at_ms: number | null;
+}
+
+export interface HeadroomStatus {
+  settings: string;
+  enabled: boolean;
+  pacing: "cgroup" | "none";
+  targets: HeadroomTargetStatus[];
+  budget_bps: number | null;
+  safe_bps: number | null;
+  unsafe_bps: number | null;
+  cpu_budget: number | null;
+  cpu_safe: number | null;
+  cpu_unsafe: number | null;
+  lag_us: number | null;
+  delivered_bps: number | null;
+  wanted_bps: number;
+  wanted_cpu: number;
+  probe_every_ms: Record<string, number>;
+  groups: HeadroomGroup[];
+  held: HeadroomHeld[];
+  events: string[];
+}
+
+export interface HeadroomView {
+  runner: string;
+  connected: boolean;
+  /** null until the runner has said what it can do. */
+  supported: boolean | null;
+  settings: HeadroomSettings;
+  customized: boolean;
+  applied: boolean | null;
+  status: HeadroomStatus | null;
+  status_at: number | null;
+}

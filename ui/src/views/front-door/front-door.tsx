@@ -427,7 +427,7 @@ function CopyIcon({ text, label }: { text: string; label: string }) {
 
 type GroupProps = { d: Draft; set: (p: Partial<Draft>) => void };
 
-function Field({ label, hint, children, wide }: { label: string; hint?: React.ReactNode; children: (id: string) => React.ReactNode; wide?: boolean }) {
+export function Field({ label, hint, children, wide }: { label: string; hint?: React.ReactNode; children: (id: string) => React.ReactNode; wide?: boolean }) {
   const id = React.useId();
   return (
     <div className={cn("fd-field", wide && "fd-wide")}>
@@ -441,7 +441,7 @@ function Field({ label, hint, children, wide }: { label: string; hint?: React.Re
 }
 
 /** A feature turned on or off: a checkbox and what it does. */
-function Toggle({ checked, onChange, label, children }: { checked: boolean; onChange: (v: boolean) => void; label: string; children: React.ReactNode }) {
+export function Toggle({ checked, onChange, label, children }: { checked: boolean; onChange: (v: boolean) => void; label: string; children: React.ReactNode }) {
   return (
     <label className="fd-toggle">
       <input type="checkbox" className="check" checked={checked} onChange={(e) => onChange(e.target.checked)} aria-label={label} />

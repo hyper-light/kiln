@@ -1,10 +1,13 @@
 /**
  * Ship (docs/ci.md W26-R01, R02), in the production build against the mock's commits: D41 sits
  * in Ship's list as Needs you · kim: empty matrix meant? · 1 thread, first, with Ship's Hand off
- * and Review pair; the change request's other commit folds under its head; the Review lens and the
- * host facet narrow the list; an item opens to Files, Output, Jobs and Lanes, in that order.
+ * and Review pair; the change request's other commit folds under its head; the kind and host facets
+ * narrow the list; an item opens to Files, Output, Jobs and Lanes, in that order. The list bar is the
+ * filter and the sort, nothing between them, at every width; the pace line under it says what's
+ * moving in one line (plan 01a1856fe81375b1bd1d1d86f270a45b, steps 1 and 5).
  */
 import { expect, test } from "@playwright/test";
+import type { ShipPage } from "../src/api/ship";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
@@ -35,12 +38,12 @@ test("changes are Ship items, drawn by Ship's own row, needs you first", async (
 
   // Review opens the item at its files; the dropdown's order.
   await rows.first().getByRole("button", { name: "Review" }).click();
-  const sections = rows.first().locator(".rv-s > h3, .ship-sec > h3");
+  const sections = rows.first().locator(".rv-s > h3, .ship-sech > h3");
   await expect(sections).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"]);
 
-  // The Review lens: changes only. The host facet: GitHub's.
-  await page.getByRole("group", { name: "Lens" }).getByRole("button", { name: "Review" }).click();
-  await expect(page).toHaveURL(/lens=review/);
+  // Changes only, by their kind (no toggle of their own). The host facet: GitHub's.
+  await page.goto("/ship?kind=diff,request");
+  await expect(list.locator(":scope > li").first()).toBeVisible();
   await expect(list).not.toContainText("deploy: a rollback holds");
   await page.goto("/ship?host=github");
   await expect(page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li")).toHaveCount(1);
@@ -55,7 +58,7 @@ test("each host's pull requests and kiln's diffs are Ship items, Review first on
     ["bitbucket", "ci: cache keys by lockfile", "Review: approved"],
     ["kiln", "pipeline: dynamic matrices", "Review: requested"],
   ] as const) {
-    await page.goto(`/ship?host=${host}&lens=review`);
+    await page.goto(`/ship?host=${host}&kind=diff,request`);
     await expect(rows.filter({ hasText: title })).toHaveCount(1);
     await expect(rows.filter({ hasText: title }).getByRole("img", { name: new RegExp(`^${review}, Land: `) })).toBeVisible();
   }
@@ -68,6 +71,81 @@ test("each host's pull requests and kiln's diffs are Ship items, Review first on
   await expect(rows.first()).toContainText("D41");
   await page.goto("/ship?kind=request,diff&host=kiln");
   await expect(rows).toHaveCount(2);
+});
+
+test("the list bar is the filter and the sort, nothing between them, from 320 to 1440 px", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the widths are set here; the desktop projects run them");
+  test.setTimeout(90_000);
+  for (const width of [320, 390, 430, 640, 641, 800, 1280, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/ship");
+    const list = page.getByRole("list", { name: "Commits", exact: true });
+    await expect(list.locator(":scope > li").first()).toBeVisible({ timeout: 15_000 });
+    const tools = page.locator(".ship-tools");
+    // The filter and the sort: no toggle beside them (Ada, 2026-10-28).
+    await expect(tools.locator(":scope > *")).toHaveCount(2);
+    await expect(tools.getByRole("group")).toHaveCount(0);
+    const box = async (sel: string) => (await page.locator(sel).first().boundingBox()) ?? { x: 0, y: 0, width: 0, height: 0 };
+    const [bar, filter, field, sort, rows] = [
+      await box(".ship-tools"),
+      await box(".ship-tools .ship-facet"),
+      await box(".ship-tools .ship-facet .field"),
+      await box(".ship-tools .ship-sort"),
+      await box(".ship-list"),
+    ];
+    const at = `at ${width}: filter ${JSON.stringify(filter)}, its field ${JSON.stringify(field)}, sort ${JSON.stringify(sort)}`;
+    // The filter is its field's height: no room held under it.
+    expect(Math.abs(filter.height - field.height), at).toBeLessThanOrEqual(1);
+    if (width <= 640) {
+      // On a phone the filter takes the width and the sort sits right under it.
+      expect(Math.abs(sort.y - (filter.y + filter.height) - 8), at).toBeLessThanOrEqual(1);
+      expect(Math.abs(filter.width - bar.width), at).toBeLessThanOrEqual(1);
+      expect(Math.abs(sort.width - bar.width), at).toBeLessThanOrEqual(1);
+    } else {
+      // Wider, they share a line: the filter on the left, the sort on the right.
+      expect(Math.abs(sort.y - filter.y), at).toBeLessThanOrEqual(1);
+      expect(sort.x, at).toBeGreaterThan(filter.x + filter.width);
+    }
+    // And the pace line comes right after the bar, the list right after it.
+    const pace = await box(".ship-pace");
+    expect(pace.y - (bar.y + bar.height), at).toBeLessThanOrEqual(13);
+    expect(rows.y - (pace.y + pace.height), at).toBeLessThanOrEqual(11);
+  }
+});
+
+test("the pace line says what's moving, in the server's numbers, on one line from 320 to 1440 px", async ({ page, isMobile }) => {
+  test.skip(isMobile, "the widths are set here; the desktop projects run them");
+  test.setTimeout(90_000);
+  const pace = ((await (await page.request.get("/api/ship/commits")).json()) as ShipPage).pace;
+  if (!pace) throw new Error("the list came with no pace");
+  const words = [
+    `${pace.in_flight} in flight · ${pace.agents} agent${pace.agents === 1 ? "" : "s"}`,
+    ...pace.envs.map((e) => `${e.environment} ${e.short}${e.behind === null ? "" : ` · ${e.behind} behind`}`),
+    ...(pace.runners ? [`runners ${pace.runners.on}/${pace.runners.of}`] : []),
+  ];
+  expect(words.length).toBeGreaterThan(1);
+  for (const width of [320, 390, 640, 641, 1280, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/ship");
+    const line = page.getByLabel("Pace", { exact: true });
+    await expect(line).toBeVisible({ timeout: 15_000 });
+    await expect(line.locator(":scope > span")).toHaveText(words);
+    // One line however narrow: it scrolls sideways rather than wrap.
+    expect((await line.boundingBox())?.height ?? 0, `at ${width}`).toBeLessThanOrEqual(19);
+  }
+  // Commits arriving leave it one line where it is.
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto("/ship");
+  const line = page.getByLabel("Pace", { exact: true });
+  await expect(line).toBeVisible({ timeout: 15_000 });
+  const before = await line.boundingBox();
+  try {
+    await page.request.post("/api/mock/ship/agents?n=6&over=2");
+    await page.waitForTimeout(3_000);
+    expect(await line.boundingBox()).toEqual(before);
+  } finally {
+    await page.request.post("/api/mock/ship/arrive?clear=1");
+  }
 });
 
 test("Ship's list holds still as it loads and as a row opens", async ({ page, browserName }) => {
@@ -95,7 +173,7 @@ test("Ship's list holds still as it loads and as a row opens", async ({ page, br
   const shifts = () => page.evaluate(() => (window as unknown as { shifts: string[] }).shifts);
   expect(await shifts()).toEqual([]);
   await rows.first().getByRole("button", { name: "pipeline: dynamic matrices" }).click();
-  await expect(rows.first().locator(".rv-s > h3, .ship-sec > h3")).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"]);
+  await expect(rows.first().locator(".rv-s > h3, .ship-sech > h3")).toHaveText([/^Files/, "Conversation", "Output", "Jobs", "Lanes"]);
   await page.waitForTimeout(600);
   expect(await shifts()).toEqual([]);
 });
