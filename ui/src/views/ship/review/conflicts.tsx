@@ -102,7 +102,8 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
   const offered = cf.offered;
   const useIt: { ok: boolean; why: string; go?: () => void } = usable(offered)
     ? { ok: true, why: `${whoOf(offered)}'s resolution, its tests passed`, go: () => run(() => conflictsApi.resolve(diffKey, cf.id, { take: "edit", lines: offered.lines ?? [] })) }
-    : cf.takes.includes("agent")
+    : // While the ladder has a try, its tests decide; an agent's own resolution without one, as W26-R12 keeps it.
+      !offered && cf.agent?.lines && cf.takes.includes("agent")
       ? { ok: true, why: "the agent's resolution — a person takes it", go: () => take("agent") }
       : { ok: false, why: offered ? rung.t : "no resolution of the ladder's has passed its tests yet" };
 

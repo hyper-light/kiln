@@ -181,6 +181,9 @@ test("the conflict ladder: a rung's line at one height, its tested resolution, U
   await expect(line).toContainText("testing…");
   const use = text.getByRole("button", { name: "Use the agent's" });
   await expect(use).toBeVisible();
+  // Disabled, not hidden, until its tests pass; its title says why (the rung line).
+  await expect(use).toBeDisabled();
+  await expect(use).toHaveAttribute("title", /testing…/);
   const before = await line.boundingBox();
   const buttonsBefore = await text.locator(".rv-cfb").boundingBox();
   // Its tests pass: the same line, the same height, now passed; the resolution shows with its explanation.
