@@ -87,6 +87,15 @@ fn w26_r17_structural_keeps_a_file_without_a_grammar() {
     assert_eq!(merge_files("notes.xyz", "a\n", "b\n", "c\n"), Outcome::Kept(Kept::NoGrammar));
 }
 
+// From kiln's own history (merge 1ca1825843, crates/kiln-seams/Cargo.toml): each side added a
+// seam to the description. A TOML string's content is no child of it: kept, not one side's taken.
+#[test]
+fn w26_r17_structural_keeps_text_no_child_holds() {
+    let line = |seams: &str| format!("[package]\nname = \"kiln-seams\"\ndescription = \"The seams ({seams})\"\n\n[dependencies]\nserde = \"1\"\n");
+    let main = line("HarnessPort, Search").replace("serde = \"1\"\n", "serde = \"1\"\nregex = \"1\"\n");
+    assert_eq!(merge_files("Cargo.toml", &line("HarnessPort"), &main, &line("HarnessPort, Forge")), Outcome::Kept(Kept::SameNode));
+}
+
 #[test]
 fn w26_r17_structural_json_different_keys_merge() {
     let base = "{\n  \"a\": 1,\n  \"b\": 2\n}\n";
@@ -177,4 +186,58 @@ proptest! {
         }
         prop_assert_eq!(merge_files("p.rs", &rust_file(&base), &rust_file(&main), &rust_file(&this)), Outcome::Kept(Kept::SameNode));
     }
+}
+
+// Real files from kiln's own history: merges git left conflicted. Two merge as their merge
+// commits did; the third (each side added a seam to a TOML string) is kept.
+macro_rules! real {
+    ($case:literal) => {
+        (
+            include_str!(concat!("fixtures/", $case, "/path")).trim(),
+            include_str!(concat!("fixtures/", $case, "/base")),
+            include_str!(concat!("fixtures/", $case, "/main")),
+            include_str!(concat!("fixtures/", $case, "/this")),
+            include_str!(concat!("fixtures/", $case, "/want")),
+        )
+    };
+}
+
+#[test]
+fn w26_r17_structural_real_merges_as_their_commits() {
+    for (path, base, main, this, want) in [real!("a1b9ad5023-head"), real!("a5ad334fed-kiln-cargo")] {
+        assert_eq!(merge_files(path, base, main, this), Outcome::Resolved(want.to_owned()), "{path}");
+    }
+    let (path, base, main, this, _) = real!("1ca1825843-seams-cargo");
+    assert_eq!(merge_files(path, base, main, this), Outcome::Kept(Kept::SameNode), "{path}");
+}
+
+// The structural merge against real merges: `KILN_MERGE_CASES` names a folder of cases, each a
+// folder with `path` (the file's path) and base, main, this and want (the merge commit's file),
+// as `git merge-tree` finds conflicts in a repository's merges. Says, per case, whether the merge
+// resolved it as the merge commit did, otherwise, or kept it. Run by hand: it reads a folder.
+#[test]
+#[ignore = "reads KILN_MERGE_CASES"]
+fn w26_r17_structural_against_real_merges() {
+    let Ok(dir) = std::env::var("KILN_MERGE_CASES") else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let (mut same, mut other, mut kept) = (Vec::new(), Vec::new(), std::collections::BTreeMap::<&str, usize>::new());
+    let mut names: Vec<std::path::PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    names.sort();
+    for case in names {
+        let Ok(path) = std::fs::read_to_string(case.join("path")) else { continue };
+        let ext = std::path::Path::new(path.trim()).extension().and_then(|e| e.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+        let read = |n: &str| std::fs::read_to_string(case.join(format!("{n}{ext}"))).unwrap_or_default();
+        match merge_files(path.trim(), &read("base"), &read("main"), &read("this")) {
+            Outcome::Resolved(t) if t == read("want") => same.push(case.display().to_string()),
+            Outcome::Resolved(t) => {
+                // What it made, beside the case, to compare.
+                let _ = std::fs::write(case.join(format!("got{ext}")), t);
+                other.push(case.display().to_string());
+            }
+            Outcome::Kept(k) => *kept.entry(k.as_str()).or_default() += 1,
+        }
+    }
+    println!("as the merge commit: {}\n{}", same.len(), same.join("\n"));
+    println!("otherwise: {}\n{}", other.len(), other.join("\n"));
+    println!("kept: {kept:?}");
 }

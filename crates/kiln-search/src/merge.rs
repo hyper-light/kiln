@@ -190,6 +190,20 @@ impl<'r> Kids<'r> {
     }
 }
 
+/// The text of `n` no child of it holds, without its white space.
+fn outside(n: &N<'_>, k: &Kids<'_>) -> String {
+    let r = n.range();
+    let mut at = r.start;
+    let mut out = String::new();
+    for c in &k.nodes {
+        let cr = c.range();
+        out.extend(k.src.get(at..cr.start).unwrap_or_default().chars().filter(|ch| !ch.is_whitespace()));
+        at = cr.end;
+    }
+    out.extend(k.src.get(at..r.end).unwrap_or_default().chars().filter(|ch| !ch.is_whitespace()));
+    out
+}
+
 /// The name a node defines: its `name` field's text, or its `key` field's (a JSON, YAML or TOML
 /// pair's).
 fn name_of(n: &N<'_>) -> Option<String> {
@@ -227,6 +241,12 @@ impl Merger {
         }
         if kb.ambiguous() || km.ambiguous() || kt.ambiguous() {
             return Err(Kept::Ambiguous);
+        }
+        // Text no child holds (a string's content between its quotes) merges only where no side
+        // changed it: the merge is of children.
+        let (ob, om, ot) = (outside(b, &kb), outside(m, &km), outside(t, &kt));
+        if ob != om || ob != ot {
+            return Err(Kept::SameNode);
         }
         let to_main = matched(&kb.keys, &km.keys)?;
         let to_this = matched(&kb.keys, &kt.keys)?;
