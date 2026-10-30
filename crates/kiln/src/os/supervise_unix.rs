@@ -251,6 +251,30 @@ fn from_our_supervisor(var: &str) -> Option<String> {
     std::env::var(var).ok()
 }
 
+/// Whether this process is the one its supervisor started (the machine's installed runner): its
+/// parent is the supervisor it was told of. What it starts inherits what it was told, not its
+/// parent, so a test's runner started from an agent's shell isn't it.
+pub fn started_by_supervisor() -> bool {
+    static SUPERVISOR: OnceLock<Option<u32>> = OnceLock::new();
+    SUPERVISOR.get_or_init(supervisor_pid).is_some_and(|pid| pid == std::os::unix::process::parent_id())
+}
+
+/// The supervisor this process was told of: as it names itself, or (a supervisor from before it
+/// did) the process serving the control socket it was given.
+fn supervisor_pid() -> Option<u32> {
+    if let Some(pid) = std::env::var(SUPERVISOR_PID).ok().and_then(|p| p.parse().ok()) {
+        return Some(pid);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let s = UnixStream::connect(std::env::var_os(crate::bluegreen::SUPERVISOR_ENV)?).ok()?;
+        let cred = nix::sys::socket::getsockopt(&s, nix::sys::socket::sockopt::PeerCredentials).ok()?;
+        u32::try_from(cred.pid()).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 /// This process's end of the handover channel, when the supervisor that started it offers one.
 /// Taken once (the first call, early at start-up) and closed at exec from then on, so nothing
 /// this process starts inherits it.

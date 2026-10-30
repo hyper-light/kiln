@@ -71,8 +71,7 @@ pub fn write_secret(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
 }
 
 /// As [`write_secret`], without waiting for the disk: scratch files a crash may lose (a test's
-/// throwaway keys).
-#[cfg(test)]
+/// throwaway keys; headroom's note of what it paced, written while the disk may be stalled).
 pub fn write_secret_unsynced(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     write_private(path, contents, mode, false)
 }

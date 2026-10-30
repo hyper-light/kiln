@@ -257,6 +257,11 @@ pub enum AgentMsg {
     /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
     /// encodes variants by index.
     Observe { json: String, bytes: Vec<u8> },
+    /// This machine's headroom (JSON [`crate::headroom::Status`], docs/headroom.md): its targets'
+    /// latencies, its window, what waits and what is paced. Sent on every (re)connect and when what
+    /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
+    /// encodes variants by index.
+    HeadroomStatus { json: String },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -406,6 +411,12 @@ pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
 /// that says it asks for certificates for keys it makes and keeps ([`AgentMsg::Identity`]); a
 /// server that says it issues them ([`ServerMsg::Identity`]).
 pub const CAP_IDENTITY: u64 = 1 << 38;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: headroom (docs/headroom.md). A runner
+/// that says it keeps its machine's headroom from settings the server sends
+/// ([`ServerMsg::Headroom`]) and reports it ([`AgentMsg::HeadroomStatus`]); a server that says it
+/// takes that.
+pub const CAP_HEADROOM: u64 = 1 << 39;
 
 /// [`ServerMsg::Caps`] capability: the server takes a session's changeset as what changed in it
 /// (`crate::harness::core::Update::ChangesPatch`), merged into its copy, so a runner sends the files
@@ -695,6 +706,10 @@ pub enum ServerMsg {
     /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
     /// variants by index.
     Observe { json: String, bytes: Vec<u8> },
+    /// This machine's headroom settings (JSON [`crate::headroom::Push`]): applied at once and kept
+    /// for the runner's next start. Only to runners announcing [`CAP_HEADROOM`]. Appended last:
+    /// postcard encodes variants by index.
+    Headroom { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1024,6 +1039,29 @@ mod tests {
         assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
         assert!(CAP_IDENTITY.is_power_of_two() && CAP_IDENTITY == 1 << 38 && CAP_IDENTITY & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT) == 0);
         Ok(())
+    }
+
+    /// Headroom (docs/headroom.md) comes after identities and observe, appended before it, and its
+    /// bit is a new one: none reads another's messages as its own.
+    #[test]
+    fn headroom_is_appended_after_observe() -> anyhow::Result<()> {
+        let agent = encode(&AgentMsg::Observe { json: String::new(), bytes: Vec::new() })?;
+        let server = encode(&ServerMsg::Observe { json: String::new(), bytes: Vec::new() })?;
+        let (a, s) = (AgentMsg::HeadroomStatus { json: "{}".into() }, ServerMsg::Headroom { json: "{}".into() });
+        let (ab, sb) = (encode(&a)?, encode(&s)?);
+        assert_eq!(ab.first().copied(), agent.first().map(|i| i + 1), "AgentMsg::HeadroomStatus comes right after Observe");
+        assert_eq!(sb.first().copied(), server.first().map(|i| i + 1), "ServerMsg::Headroom comes right after Observe");
+        assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
+        assert!(CAP_HEADROOM.is_power_of_two() && CAP_HEADROOM == 1 << 39 && CAP_HEADROOM & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY) == 0);
+        Ok(())
+    }
+
+    /// A server that takes changesets as patches says so with a bit of its own: a runner never
+    /// takes another capability for it and sends a server patches it can't read.
+    #[test]
+    fn the_changes_patch_bit_is_a_new_one() {
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM;
+        assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
     }
 
     #[test]

@@ -290,6 +290,8 @@ pub fn run_tag() -> String {
 }
 
 pub struct Core {
+    /// The agent session it is (kiln's id): headroom holds and lets in work by it.
+    pub session_id: String,
     pub state: State,
     pub meta: Meta,
     events: VecDeque<Event>,
@@ -369,6 +371,7 @@ pub struct Frozen {
 impl Core {
     pub fn new() -> Self {
         Self {
+            session_id: String::new(),
             state: State::default(),
             meta: Meta::default(),
             events: VecDeque::new(),
@@ -826,6 +829,10 @@ impl Core {
 
     pub fn set_status(&mut self, s: Status) {
         if self.state.status != s {
+            // Gone (ended, or it never got going): any place headroom gave it goes.
+            if s == Status::Exited {
+                crate::headroom::turn_ended(&self.session_id);
+            }
             self.state.status = s;
             self.state_dirty = true;
         }
@@ -833,12 +840,17 @@ impl Core {
 
     /// Recompute the status from what is pending: an open approval means the agent waits.
     pub fn settle_status(&mut self, running: bool) {
+        let was = self.state.status == Status::Running;
         let s = match self.state.status {
             Status::Exited | Status::Disconnected | Status::Starting if !running => self.state.status,
             _ if !self.state.approvals.is_empty() => Status::Waiting,
             _ if running => Status::Running,
             _ => Status::Idle,
         };
+        // A turn ended: headroom learns what it took, and the session asks again for its next.
+        if was && matches!(s, Status::Idle | Status::Exited) {
+            crate::headroom::turn_ended(&self.session_id);
+        }
         self.set_status(s);
     }
 

@@ -501,6 +501,11 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("vmm-jail") {
         return kiln::runner::jail::main();
     }
+    // A headroom pacer's guard (docs/headroom.md, "Failing safe"): a small process of its own that
+    // starts again what its pacer stopped once the pacer ends, however it ends; it needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {
+        return kiln::headroom::guard_main(std::env::args_os().nth(2));
+    }
     // `kiln rustc` (docs/ci.md W24-R09): cargo runs a `RUSTC_WRAPPER` as `<wrapper> <rustc> <args>`,
     // so this binary as one, or `kiln rustc <rustc> <args>`.
     {

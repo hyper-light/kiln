@@ -456,7 +456,7 @@ impl Agy {
         core.touch_state();
     }
 
-    fn next(&mut self, core: &mut Core) {
+    pub(crate) fn next(&mut self, core: &mut Core) {
         if self.busy() || !self.ready || self.reload.is_some() || self.restarting || core.state.status == Status::Exited {
             return;
         }
