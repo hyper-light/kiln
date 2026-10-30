@@ -205,9 +205,11 @@ fn w26_r17_a_resolution_accepted_once_is_offered_again() -> anyhow::Result<()> {
     let (st, r) = call(&w.s, &fixer, "POST", "/api/diffs/D2/conflicts/accept", Some(&json!({})))?;
     assert_eq!(st, 403, "{r}");
     let r = ok(&w.s, &w.kim, "POST", "/api/diffs/D2/conflicts/accept", Some(&json!({})))?;
-    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(2)), "conflict resolved"), "{r}");
+    // The new version is the resolution (after the conflicted replay kiln kept as main moved, W26-R16).
     let v2 = ok(&w.s, &w.kim, "GET", "/api/diffs/D2", None)?;
-    let commit = v2.get("versions").and_then(Value::as_array).and_then(|v| v.last()).map(|v| text(v, "commit").to_owned()).unwrap_or_default();
+    let last = v2.get("versions").and_then(Value::as_array).and_then(|v| v.last()).cloned().unwrap_or_default();
+    assert_eq!((r.get("version"), text(&r, "why")), (last.get("n"), "conflict resolved"), "{r}");
+    let commit = text(&last, "commit").to_owned();
     assert_eq!(show(&w.bare, &commit, "plan/expand.rs")?, expand("110"), "the remembered resolution");
     assert_eq!(show(&w.bare, &commit, "README.md")?, "app, said by D2\n", "D2's own change kept");
     // Accepted, and nothing left to resolve.
@@ -276,10 +278,82 @@ fn w26_r17_structural_resolves_one_of_two_hunks() -> anyhow::Result<()> {
         Ok((text(&l, "state") != "offered").then(|| l.to_string()))
     })?;
     let r = ok(&w.s, &w.kim, "POST", "/api/diffs/D1/conflicts/accept", Some(&json!({})))?;
-    assert_eq!(r.get("version"), Some(&json!(2)), "{r}");
     let v = ok(&w.s, &w.kim, "GET", "/api/diffs/D1", None)?;
-    let commit = v.get("versions").and_then(Value::as_array).and_then(|v| v.last()).map(|v| text(v, "commit").to_owned()).unwrap_or_default();
+    let last = v.get("versions").and_then(Value::as_array).and_then(|v| v.last()).cloned().unwrap_or_default();
+    assert_eq!((r.get("version"), text(&last, "why")), (last.get("n"), "conflict resolved"), "{r}");
+    let commit = text(&last, "commit").to_owned();
     let want = file("10", "20", "    let mut legs = apply(m.include, m.exclude, legs);\n    legs.dedup_by_key(|l| l.key());\n");
     assert_eq!(show(&w.bare, &commit, "plan/expand.rs")?, want);
+    Ok(())
+}
+
+/// W26-R17 with W26-R16: a conflicted replay never holds up the changes above it. A stack D1 ← D2
+/// whose bottom conflicts as main moves: D1's replay is kept as a conflicted revision (its markers
+/// in, why `replayed with conflicts`) and D2 moves onto it at once; the ladder resolves D1 (kiln's
+/// structural merge, its neighbouring one-line functions), kim accepts, D1's new version is the
+/// resolution, and D2 moves onto that.
+#[test]
+fn w26_r17_a_conflicted_replay_keeps_the_stack_moving() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let bare = std::path::PathBuf::from(text(&serde_json::from_str(&body)?, "clone_url").trim_start_matches("file://"));
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let kim = person(&s, "kim", &["developer@repo:acme/app"])?;
+    let file = |a: &str, b: &str| format!("fn a() -> u32 {{ {a} }}\nfn b() -> u32 {{ {b} }}\n");
+
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  resolve-threads: false\n")?;
+    std::fs::write(work.join("lib.rs"), file("1", "2"))?;
+    must(git(&home, &work, &["add", "-A"]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    // The stack: D1 makes b 20; D2 adds a file of its own.
+    std::fs::write(work.join("lib.rs"), file("1", "20"))?;
+    must(git(&home, &work, &["commit", "-qam", &format!("D1: b is twenty\n\nChange-Id: I{}", "1".repeat(40))]), "D1")?;
+    std::fs::write(work.join("d2.txt"), "D2\n")?;
+    must(git(&home, &work, &["add", "d2.txt"]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", &format!("D2: a file of its own\n\nChange-Id: I{}", "2".repeat(40))]), "D2")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "the stack")?;
+
+    // Main makes a 10, on the line next to D1's: git can't merge them.
+    must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "owner"]), "the owner's clone")?;
+    let owner = dir.path().join("owner");
+    std::fs::write(owner.join("lib.rs"), file("10", "2"))?;
+    must(git(&home, &owner, &["commit", "-qam", "main moves"]), "commit")?;
+    must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
+
+    let versions = |d: &str| -> anyhow::Result<Vec<Value>> { Ok(ok(&s, &kim, "GET", &format!("/api/diffs/{d}"), None)?.get("versions").and_then(Value::as_array).cloned().unwrap_or_default()) };
+    let latest = |d: &str| -> anyhow::Result<Value> { Ok(versions(d)?.pop().unwrap_or_default()) };
+    // D1 kept as a conflicted revision; D2 on it already.
+    until(120, "D1 kept with its conflict and D2 moved onto it", || {
+        let (d1, d2) = (latest("D1")?, latest("D2")?);
+        Ok((!(text(&d1, "why") == "replayed with conflicts" && text(&d2, "parent") == text(&d1, "commit"))).then(|| format!("{d1}\n{d2}")))
+    })?;
+    let kept = latest("D1")?;
+    assert!(show(&bare, text(&kept, "commit"), "lib.rs")?.contains("<<<<<<<"), "the kept revision has its markers");
+
+    // The ladder: kiln's structural merge resolves it, nothing to test; offered to a person.
+    until(240, "D1's resolution offered", || {
+        let l = ok(&s, &kim, "GET", "/api/diffs/D1/conflicts/ladder", None)?;
+        Ok((text(&l, "state") != "offered").then(|| l.to_string()))
+    })?;
+    let r = ok(&s, &kim, "POST", "/api/diffs/D1/conflicts/accept", Some(&json!({})))?;
+    let n = r.get("version").and_then(Value::as_u64).unwrap_or_default();
+    let resolved = latest("D1")?;
+    assert_eq!((resolved.get("n").and_then(Value::as_u64), text(&resolved, "why")), (Some(n), "conflict resolved"), "{resolved}");
+    assert_eq!(show(&bare, text(&resolved, "commit"), "lib.rs")?, file("10", "20"));
+    // D2 moves onto the resolution.
+    until(120, "D2 moved onto D1's resolution", || {
+        let d2 = latest("D2")?;
+        Ok((text(&d2, "parent") != text(&resolved, "commit")).then(|| d2.to_string()))
+    })?;
+    assert_eq!(show(&bare, text(&latest("D2")?, "commit"), "d2.txt")?, "D2\n");
     Ok(())
 }

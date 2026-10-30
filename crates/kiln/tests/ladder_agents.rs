@@ -143,6 +143,11 @@ struct World {
 /// A server whose PATH has no harness, its own runner for the checks, and runner r1 with the
 /// fake harness acting as ACT; acme/app with the gate and plan/expand.rs, main about to move.
 fn world(dir: &Path) -> anyhow::Result<World> {
+    world_with(dir, "")
+}
+
+/// [`world`], the trunk's `.kiln/review.yaml` with `more` after its land policy.
+fn world_with(dir: &Path, more: &str) -> anyhow::Result<World> {
     let system = agents::path_without_harnesses(dir)?;
     let s = start_env(dir, &Options { agent: true, ..Options::default() }, false, &[("PATH", &system)])?;
     let act = dir.join("act.py");
@@ -169,7 +174,7 @@ fn world(dir: &Path) -> anyhow::Result<World> {
     let url = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
     git(&home, dir, &["clone", "-q", &url, "owner"])?;
     let owner = dir.join("owner");
-    for (f, body) in [(".kiln/review.yaml", "land:\n  approvals: 1\n  resolve-threads: false\n".to_owned()), (".github/workflows/gate.yml", GATE.to_owned()), ("plan/expand.rs", expand("1"))] {
+    for (f, body) in [(".kiln/review.yaml", format!("land:\n  approvals: 1\n  resolve-threads: false\n{more}")), (".github/workflows/gate.yml", GATE.to_owned()), ("plan/expand.rs", expand("1"))] {
         if let Some(d) = owner.join(f).parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -259,12 +264,21 @@ fn w26_r17_the_authors_agent_resolves() -> anyhow::Result<()> {
     let replay = text(&w.ladder()?, "replay").to_owned();
     let done = dir.path().join("home/.cache/kiln/resolve/D1").join(&replay).join(".fake-agent-done");
     assert_eq!(std::fs::read_to_string(&done).unwrap_or_default(), replay, "its workspace: {}", done.display());
-    // Waiting for a person: nothing lands by itself.
+    // Files reads it from the conflicts themselves: each one's offered try, and the ladder's state.
+    let got = ok(&w.s, &w.kim, "GET", "/api/diffs/D1/conflicts", None)?;
+    assert_eq!((got.pointer("/conflicts/0/offered/rung"), got.pointer("/conflicts/0/offered/tests"), got.pointer("/ladder/state")), (Some(&json!("agent")), Some(&json!("passed")), Some(&json!("offered"))), "{got}");
+    // Ship's row says the agent is on it (W26-R18's Fixing), on D1's latest revision.
+    let (_, head) = w.latest()?;
+    let page = ok(&w.s, &w.kim, "GET", "/api/ship/commits?repo=acme/app", None)?;
+    let row = page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| head.starts_with(text(c, "short")) && !text(c, "short").is_empty()).cloned().unwrap_or_default();
+    assert!(text(&row, "line").contains("fixing"), "D1's row says its agent is fixing: {row}");
+    // Waiting for a person: nothing lands by itself (its latest is still the conflicted replay kiln kept).
+    let waiting = w.latest()?.0;
     std::thread::sleep(Duration::from_secs(4));
     assert_eq!(text(&w.ladder()?, "state"), "offered");
-    assert_eq!(w.latest()?.0, 1, "no new version until a person accepts");
+    assert_eq!(w.latest()?.0, waiting, "no new version until a person accepts");
     let r = ok(&w.s, &w.kim, "POST", "/api/diffs/D1/conflicts/accept", Some(&json!({})))?;
-    assert_eq!(r.get("version"), Some(&json!(2)), "{r}");
+    assert_eq!(r.get("version"), Some(&json!(waiting + 1)), "{r}");
     let (_, commit) = w.latest()?;
     assert_eq!(show(&w.bare, &commit, "plan/expand.rs")?, expand("110"));
     Ok(())
@@ -276,22 +290,27 @@ fn w26_r17_the_authors_agent_resolves() -> anyhow::Result<()> {
 #[test]
 fn w26_r17_a_sent_agent_resolves_in_its_own_workspace() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let w = world(dir.path())?;
+    // Sending agents is the trunk's own (W26-R16's setting); automatic resolution is the Repos page's.
+    let w = world_with(dir.path(), "fresh:\n  conflict-agents: true\n")?;
     let dev = person(&w.s, "dev")?;
     // The agent kiln starts answers with a token of its own (the fake has none from kiln).
     std::fs::write(&w.token_file, token(&w.s, json!({ "kind": "agent", "agent": "resolver", "user": "dev", "grants": ["developer@repo:acme/app"] }))?)?;
     // Off by default; a developer can't turn it on.
     let sw = ok(&w.s, &w.kim, "GET", "/api/repos/acme%2Fapp/ladder", None)?;
-    assert_eq!((sw.get("send_agent"), sw.get("automatic")), (Some(&json!(false)), Some(&json!(false))), "{sw}");
-    let (st, _) = http(w.s.port, "PUT", "/api/repos/acme%2Fapp/ladder", &w.kim, Some(&json!({ "send_agent": true })))?;
+    assert_eq!((sw.get("conflict_agents"), sw.get("automatic")), (Some(&json!(true)), Some(&json!(false))), "{sw}");
+    let (st, _) = http(w.s.port, "PUT", "/api/repos/acme%2Fapp/ladder", &w.s.admin, Some(&json!({ "send_agent": true })))?;
+    assert_eq!(st, 400, "sending agents is set in .kiln/review.yaml, not here");
+    let (st, _) = http(w.s.port, "PUT", "/api/repos/acme%2Fapp/ladder", &w.kim, Some(&json!({ "automatic": true })))?;
     assert_eq!(st, 403);
-    ok(&w.s, &w.s.admin, "PUT", "/api/repos/acme%2Fapp/ladder", Some(&json!({ "send_agent": true, "automatic": true })))?;
+    ok(&w.s, &w.s.admin, "PUT", "/api/repos/acme%2Fapp/ladder", Some(&json!({ "automatic": true })))?;
     w.conflict(dir.path(), &dev)?;
 
     ok(&w.s, &w.kim, "GET", "/api/diffs/D1/conflicts", None)?;
     until(240, "D1 resolved by itself", || {
         let l = w.ladder()?;
-        Ok((w.latest()?.0 != 2).then(|| l.to_string()))
+        let d = ok(&w.s, &w.kim, "GET", "/api/diffs/D1", None)?;
+        let why = d.get("versions").and_then(Value::as_array).and_then(|v| v.last()).map(|v| text(v, "why").to_owned()).unwrap_or_default();
+        Ok((why != "conflict resolved").then(|| l.to_string()))
     })?;
     let (_, commit) = w.latest()?;
     assert_eq!(show(&w.bare, &commit, "plan/expand.rs")?, expand("110"));

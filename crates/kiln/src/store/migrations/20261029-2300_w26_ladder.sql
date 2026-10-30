@@ -6,9 +6,9 @@
 -- tested together (the revision, its workflows, their outcome), who accepted it and when (with the
 -- statement W27-R04 signs it with, null until it does), and the version it became. Resolutions a
 -- person accepted, by their hunk's key (kiln_ci::ladder::key), per repository: the next replay
--- whose hunk has the key is offered them. And each repository's two switches, off until turned on
--- on its page in Repos: sending an agent to a runner that has the repository, and letting a
--- resolution whose tests passed go on without a person. A land queue entry that conflicts with its
+-- whose hunk has the key is offered them. And each repository's automatic resolution, off until
+-- turned on on its page in Repos: a resolution whose tests passed goes on without a person (whether
+-- an agent is sent is the trunk's .kiln/review.yaml, `fresh.conflict-agents`). A land queue entry that conflicts with its
 -- trunk is held while the ladder resolves it (state `held`), with each of its diffs' versions then
 -- (`held`, JSON), and goes back in the queue once one has a newer version. Ship's read
 -- model notes the commits of a change whose ladder moves (Ship's pattern, migration 20261025-0100).
@@ -65,7 +65,6 @@ CREATE TABLE review_remembered (
 
 CREATE TABLE review_ladder_switches (
     repo_id TEXT PRIMARY KEY,
-    send_agent INTEGER NOT NULL DEFAULT 0,
     automatic INTEGER NOT NULL DEFAULT 0,
     set_by TEXT NOT NULL,
     set_at INTEGER NOT NULL

@@ -268,15 +268,24 @@ async fn save(hub: &Hub, d: &Diff, replay: &str, state: State, why: &[String]) -
     Ok(())
 }
 
-/// A repository's switches (off until turned on).
-async fn switches_of(hub: &Hub, repo_id: &str) -> Switches {
+/// A repository's automatic resolution, from its page in Repos (off until turned on; Ada's
+/// decision 4).
+async fn automatic_of(hub: &Hub, repo_id: &str) -> bool {
     let id = repo_id.to_owned();
     hub.store
-        .call(move |c| Ok(c.query_row("SELECT send_agent, automatic FROM review_ladder_switches WHERE repo_id = ?1", [&id], |r| Ok(Switches { send_agent: r.get(0)?, automatic: r.get(1)? })).optional()?))
+        .call(move |c| Ok(c.query_row("SELECT automatic FROM review_ladder_switches WHERE repo_id = ?1", [&id], |r| r.get::<_, bool>(0)).optional()?))
         .await
         .ok()
         .flatten()
-        .unwrap_or_default()
+        .unwrap_or(false)
+}
+
+/// The ladder's switches for `d`: sending an agent is the trunk's `.kiln/review.yaml`
+/// `fresh.conflict-agents` (W26-R16's setting, off by default); automatic resolution is the
+/// repository's page in Repos.
+async fn switches_for(hub: &Hub, d: &Diff, repo_id: &str, path: &str) -> Switches {
+    let (policy, _) = super::review::policy(hub, path, &d.trunk).await;
+    Switches { send_agent: policy.fresh.conflict_agents, automatic: automatic_of(hub, repo_id).await }
 }
 
 /// The language a file's hunks are remembered under: its extension (a file without one, its
@@ -329,14 +338,14 @@ async fn remembered(hub: &Hub, repo_id: &str, c: &ForLadder) -> Result<Option<(V
 /// together once each has one, and where the repository allows a tested whole goes on.
 pub(crate) async fn climb(hub: &Arc<Hub>, d: &Diff) -> Result<(), Fail> {
     let Some(replay) = conflicts::current(hub, d).await?.filter(|r| r.state == "conflicted") else { return Ok(()) };
-    let (repo_id, _) = conflicts::home(hub, d).await?;
+    let (repo_id, path) = conflicts::home(hub, d).await?;
     let views = conflicts::for_ladder(hub, &replay.id).await?;
     let all = tries(hub, &replay.id).await?;
     let before = kept(hub, &replay.id).await?;
     if before.accepted_by.is_some() {
         return Ok(());
     }
-    let sw = switches_of(hub, &repo_id).await;
+    let sw = switches_for(hub, d, &repo_id, &path).await;
     let author = if authors_agent_id(d).is_some() { Author::Agent { live: authors_agent(hub, d).await.is_some() } } else { Author::Person };
     let conflicts: Vec<ladder::Conflict> = views
         .iter()
@@ -434,10 +443,10 @@ async fn ask_agent(hub: &Arc<Hub>, d: &Diff, replay: &Replay, left: &[&ForLadder
     let git_ref = format!("refs/kiln/resolve/{}/{}/conflicted", d.name, replay.id);
     keep_ref(hub, d, &git_ref, &sha).await?;
     let text = brief(hub, d, replay, left, &git_ref);
-    let asked: Result<(String, String), String> = match authors_agent(hub, d).await {
+    let asked: Result<(String, String, String), String> = match authors_agent(hub, d).await {
         Some((id, name)) => {
             if crate::workspace::follow::deliver(hub, &id, text).await {
-                Ok((d.author.clone(), name))
+                Ok((d.author.clone(), name, id))
             } else {
                 Err(format!("kiln couldn't reach {name}"))
             }
@@ -447,16 +456,22 @@ async fn ask_agent(hub: &Arc<Hub>, d: &Diff, replay: &Replay, left: &[&ForLadder
             let starter = crate::harness::lineage::Starter { parent: None, opener: Some(opener), actor: format!("ladder:{}", d.name), plan_run: None, asker: None };
             let ask = crate::harness::lineage::Ask { kind: "claude".into(), prompt: Some(text), name: Some(format!("Resolve {}'s conflicts", d.name)), count: Some(1), ..Default::default() };
             match crate::harness::lineage::start(hub, &starter, ask).await {
-                Ok(infos) => infos.into_iter().next().map(|i| (format!("agent:{}", i.id), i.name)).ok_or_else(|| "no agent started".to_owned()),
+                Ok(infos) => infos.into_iter().next().map(|i| (format!("agent:{}", i.id), i.name, i.id)).ok_or_else(|| "no agent started".to_owned()),
                 Err((_, why)) => Err(why),
             }
         }
         None => Err("no agent to ask".to_owned()),
     };
+    // Ship's row says the agent is on it (W26-R18's Fixing), on the change's latest revision.
+    if let (Ok((_, name, agent)), Some(v)) = (&asked, diffs::versions(hub, d).await.map_err(fail)?.pop())
+        && let Err((_, why)) = crate::ship::conflicts_handed(hub, &d.repo, &v.commit, name, agent, v.n).await
+    {
+        tracing::info!(diff = %d.name, %why, "the hand-off wasn't kept for Ship");
+    }
     for c in left {
         let id = crate::util::new_id();
         match &asked {
-            Ok((by, name)) => record(hub, &id, replay, d, c, Rung::Agent, by, "working", None, Some((&[], &format!("asked {name}"))), None).await?,
+            Ok((by, name, _)) => record(hub, &id, replay, d, c, Rung::Agent, by, "working", None, Some((&[], &format!("asked {name}"))), None).await?,
             Err(why) => record(hub, &id, replay, d, c, Rung::Agent, "kiln", "kept", Some(why), None, None).await?,
         }
     }
@@ -656,10 +671,10 @@ async fn finish(hub: &Arc<Hub>, d: &Diff, replay: &Replay, views: &[ForLadder], 
 /// and why, each conflict's tries, and the resolutions tested together.
 pub async fn view(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     let Some(replay) = conflicts::current(hub, d).await?.filter(|r| r.state == "conflicted") else { return Ok(json!({ "diff": d.name, "replay": null })) };
-    let (repo_id, _) = conflicts::home(hub, d).await?;
+    let (repo_id, path) = conflicts::home(hub, d).await?;
     let all = tries(hub, &replay.id).await?;
     let k = kept(hub, &replay.id).await?;
-    let sw = switches_of(hub, &repo_id).await;
+    let sw = switches_for(hub, d, &repo_id, &path).await;
     let mut by: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for t in &all {
         by.entry(t.conflict.as_str()).or_default().push(t.view());
@@ -670,8 +685,32 @@ pub async fn view(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
         "conflicts": by,
         "whole": k.whole.as_ref().map(|sha| json!({ "commit": sha, "of": k.whole_of, "tests": k.whole_tests.map(Tests::as_str) })),
         "accepted": k.accepted_by.as_ref().map(|who| json!({ "by": who, "at": k.accepted_at, "version": k.version, "signer": Value::Null })),
-        "switches": { "send_agent": sw.send_agent, "automatic": sw.automatic },
+        "switches": { "conflict_agents": sw.send_agent, "automatic": sw.automatic },
     }))
+}
+
+/// The ladder in `GET /api/diffs/:id/conflicts` (`v`, its view of `replay`): each conflict's
+/// `offered`, its rung's latest try (one whose tests passed first), and the replay's `ladder`, its
+/// state and why.
+pub(crate) async fn annotate(hub: &Hub, replay: &str, v: &mut Value) {
+    let (Ok(all), Ok(k)) = (tries(hub, replay).await, kept(hub, replay).await) else { return };
+    if let Some(list) = v.get_mut("conflicts").and_then(Value::as_array_mut) {
+        for c in list {
+            let id = c.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let mine: Vec<&Try> = all.iter().filter(|t| t.conflict == id).collect();
+            let best = mine.iter().rev().find(|t| t.state == "resolved" && t.tests.is_some_and(Tests::count)).or_else(|| mine.last());
+            if let (Some(o), Some(t)) = (c.as_object_mut(), best) {
+                let mut seen = t.view();
+                if let Some(s) = seen.as_object_mut() {
+                    s.insert("signer".into(), Value::Null);
+                }
+                o.insert("offered".into(), seen);
+            }
+        }
+    }
+    if let Some(o) = v.as_object_mut() {
+        o.insert("ladder".into(), k.state.as_ref().map_or(Value::Null, |s| json!({ "state": s, "why": k.why })));
+    }
 }
 
 /// `POST /api/diffs/:id/conflicts/accept`: a person accepts the resolutions the ladder offers (all
@@ -695,8 +734,9 @@ pub async fn accept(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
     Ok(json!({ "diff": d.name, "version": n, "why": conflicts::WHY, "accepted_by": me, "replay": replay.id }))
 }
 
-/// `GET` or `PUT /api/repos/:repo/ladder`: a repository's switches, `send_agent` and `automatic`
-/// (both off by default). Changing them takes `diffs.land` on the repository.
+/// `GET` or `PUT /api/repos/:repo/ladder`: a repository's automatic resolution (`automatic`, off
+/// by default; changing it takes `diffs.land` on the repository), and whether its conflicts send an
+/// agent (`conflict_agents`, read only: the trunk's `.kiln/review.yaml` `fresh.conflict-agents`).
 pub async fn switches(hub: &Hub, repo: &str, caller: &Caller, body: Option<&Value>) -> Result<Value, Fail> {
     let repos = hub.store.repos().await.map_err(fail)?;
     let r = repos.into_iter().find(|r| r.name == repo).ok_or((StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
@@ -708,28 +748,35 @@ pub async fn switches(hub: &Hub, repo: &str, caller: &Caller, body: Option<&Valu
         if !caller.can("diffs.land", &scope) {
             return Err((StatusCode::FORBIDDEN, "changing a repository's ladder needs `diffs.land`".into()));
         }
-        let was = switches_of(hub, &r.id).await;
-        let flag = |k: &str, was: bool| body.get(k).map_or(Ok(was), |v| v.as_bool().ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}`: true or false"))));
-        let sw = Switches { send_agent: flag("send_agent", was.send_agent)?, automatic: flag("automatic", was.automatic)? };
+        if body.get("conflict_agents").is_some() || body.get("send_agent").is_some() {
+            return Err((StatusCode::BAD_REQUEST, "sending an agent is the trunk's .kiln/review.yaml: `fresh: conflict-agents: true`".into()));
+        }
+        let was = automatic_of(hub, &r.id).await;
+        let automatic = body.get("automatic").map_or(Ok(was), |v| v.as_bool().ok_or_else(|| (StatusCode::BAD_REQUEST, "`automatic`: true or false".to_owned())))?;
         let (id, by, now) = (r.id.clone(), caller.name.clone(), crate::util::now_unix());
         hub.store
             .call(move |c| {
                 c.execute(
-                    "INSERT INTO review_ladder_switches (repo_id, send_agent, automatic, set_by, set_at) VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT (repo_id) DO UPDATE SET send_agent = excluded.send_agent, automatic = excluded.automatic, set_by = excluded.set_by, set_at = excluded.set_at",
-                    params![id, sw.send_agent, sw.automatic, by, now],
+                    "INSERT INTO review_ladder_switches (repo_id, automatic, set_by, set_at) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (repo_id) DO UPDATE SET automatic = excluded.automatic, set_by = excluded.set_by, set_at = excluded.set_at",
+                    params![id, automatic, by, now],
                 )?;
                 Ok(())
             })
             .await
             .map_err(fail)?;
-        hub.store.audit(caller.name.clone(), "repo.ladder".into(), format!("{}: send an agent {}, automatic resolution {}", r.name, if sw.send_agent { "on" } else { "off" }, if sw.automatic { "on" } else { "off" })).await;
+        hub.store.audit(caller.name.clone(), "repo.ladder".into(), format!("{}: automatic resolution {}", r.name, if automatic { "on" } else { "off" })).await;
     }
-    let sw = switches_of(hub, &r.id).await;
+    let automatic = automatic_of(hub, &r.id).await;
+    let trunk = r.default_branch.clone().unwrap_or_else(|| "main".to_owned());
+    let conflict_agents = match super::hosting::native_path(hub, &r) {
+        Some(path) => super::review::policy(hub, &path.to_string_lossy(), &trunk).await.0.fresh.conflict_agents,
+        None => false,
+    };
     Ok(json!({
-        "repo": r.name, "send_agent": sw.send_agent, "automatic": sw.automatic,
+        "repo": r.name, "conflict_agents": conflict_agents, "automatic": automatic,
         "says": {
-            "send_agent": "When a change's conflicts are left after kiln's merge and what it remembers, kiln sends an agent to a runner that has this repository, in a workspace of its own, to resolve them and run their tests.",
+            "conflict_agents": "Set in the trunk's .kiln/review.yaml (fresh: conflict-agents: true): when a change's conflicts are left after kiln's merge and what it remembers, kiln sends an agent to a machine with the harness, in a workspace of its own, to resolve them and run their tests.",
             "automatic": "A resolution whose tests pass goes on without a person: it becomes the change's new version by itself. While this is off, a person confirms each one.",
         },
     }))

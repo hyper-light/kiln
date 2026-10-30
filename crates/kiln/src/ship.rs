@@ -1956,6 +1956,20 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
 
 /// Keeps a Hand off of `rec`'s commit, one row for each of `what` (W26-R18): to whom (`to`, its
 /// agent and the incident it opened), the change's revision for its review, by whom, now.
+/// A change's conflicts the conflict ladder handed to an agent (docs/ci.md W26-R17), kept as Hand
+/// off keeps them (W26-R18), so its row reads "<to> fixing" until a new revision replaces it.
+pub(crate) async fn conflicts_handed(hub: &Hub, repo: &str, sha: &str, to: &str, agent: &str, version: u32) -> Result<(), Fail> {
+    let (repo, sha, to, agent, at) = (repo.to_owned(), sha.to_owned(), to.to_owned(), agent.to_owned(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            let repo_id: String = c.query_row("SELECT id FROM repos WHERE name = ?1 OR id = ?1", [&repo], |r| r.get(0))?;
+            c.execute("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at) VALUES (?1, ?2, 'conflicts', ?3, ?4, NULL, ?5, 'kiln', ?6)", params![repo_id, sha, to, agent, version, at])?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keep(hub: &Hub, rec: &Records, what: &[&str], to: &str, agent: Option<&str>, incident: Option<&str>, version: Option<u32>, by: &str) -> Result<(), Fail> {
     let (repo, sha, what) = (rec.repo.clone(), rec.sha.clone(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>());

@@ -590,7 +590,12 @@ pub async fn list(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
         Some(r) => kept(hub, &r.id).await?,
         None => Vec::new(),
     };
-    Ok(view(d, latest, replay.as_ref(), &rows))
+    let mut v = view(d, latest, replay.as_ref(), &rows);
+    // Where the conflict ladder is with each (W26-R17).
+    if let Some(r) = replay.as_ref().filter(|r| r.state == "conflicted") {
+        super::ladder::annotate(hub, &r.id, &mut v).await;
+    }
+    Ok(v)
 }
 
 /// The event saying `d`'s conflicts in `replay` changed (W26-R12), its other parts to fill in.
