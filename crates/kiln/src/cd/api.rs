@@ -195,6 +195,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         (&Method::GET, ["apps", p, n, "rollback-targets"]) => ("cd.apps.rollback_targets".into(), app(p, n)),
         (&Method::POST, ["apps", p, n, "follow"]) => ("cd.apps.follow".into(), app(p, n)),
+        (&Method::GET, ["apps", p, n, "auto-sync"]) => ("cd.apps.auto_sync".into(), app(p, n)),
+        (&Method::PUT, ["apps", p, n, "auto-sync"]) => ("cd.apps.set_auto_sync".into(), with(json_body(body).await?, "app", json!(format!("{p}/{n}")))),
         (&Method::GET, ["apps", p, n, "auto-rollback"]) => ("cd.apps.auto_rollback".into(), app(p, n)),
         (&Method::PUT, ["apps", p, n, "auto-rollback"]) => ("cd.apps.set_auto_rollback".into(), with(json_body(body).await?, "app", json!(format!("{p}/{n}")))),
         (&Method::GET, ["repos", "auto-rollback"]) => ("cd.repos.auto_rollback".into(), json!({})),

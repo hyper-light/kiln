@@ -47,6 +47,7 @@ pub mod model;
 pub mod obj;
 pub mod providers;
 pub mod render;
+pub mod autosync;
 pub mod rollback;
 pub mod rollout;
 pub mod sim;

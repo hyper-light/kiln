@@ -322,6 +322,39 @@ fn w26_r25_a_rollback_to_a_commit_never_deployed_renders_syncs_and_records_it() 
     assert_eq!(image, Some(json!("web:2")));
 }
 
+/// W26-R27: an app's auto-sync as a person sets it, through what the server gives the engine
+/// (`autosync::config`): off by its file, git's change waits; turned on, the app syncs to what git
+/// renders; turned off, git's next change waits; once its file's word changes, the file's stands.
+#[test]
+fn w26_r27_auto_sync_set_for_an_app_starts_and_stops_its_syncs() {
+    use crate::autosync::{Setting, config};
+    let (mut h, git) = harness(fast());
+    let mut def = crate::state::tests::app("web");
+    def.destination.cluster = "dev".into();
+    def.sync.auto = false;
+    let id = def.id();
+    h.input(Input::UpsertApp(config(&def, None)));
+    let started = |h: &Harness| h.records.iter().filter(|r| matches!(r, Record::Started { .. })).count();
+    deploy(&mut h, &git, &id, "r1", vec![deployment("web", "web:1", json!({}))]);
+    h.run_for(10_000);
+    assert_eq!(started(&h), 0, "off by its file: nothing syncs");
+    // A person turns it on: it syncs to what git renders.
+    let on = Setting { on: true, by: Some("ada".into()), at_ms: 1, file: false };
+    h.input(Input::UpsertApp(config(&def, Some(&on))));
+    assert!(h.run_until(60_000, |h| settled(h, &id)), "{:?}", status(&h, &id));
+    // Turned off: git's next change waits.
+    let off = Setting { on: false, by: Some("ada".into()), at_ms: 2, file: false };
+    h.input(Input::UpsertApp(config(&def, Some(&off))));
+    let before = started(&h);
+    deploy(&mut h, &git, &id, "r2", vec![deployment("web", "web:2", json!({}))]);
+    h.run_for(10_000);
+    assert_eq!(started(&h), before, "off: git's change waits");
+    // Its file says auto-sync since: the file's word stands, and r2 syncs.
+    def.sync.auto = true;
+    h.input(Input::UpsertApp(config(&def, Some(&off))));
+    assert!(h.run_until(60_000, |h| started(h) > before && settled(h, &id)));
+}
+
 #[test]
 fn a_wave_starts_only_when_the_one_before_is_healthy() {
     let (mut h, git) = harness(fast());

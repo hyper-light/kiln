@@ -123,6 +123,10 @@ pub fn ops() -> &'static [Op] {
                 input: crate::ops::Input::of::<input::CdAppsAutoRollback>(), run: auto_rollback),
             op!("cd.apps.set_auto_rollback", "Turn auto-rollback on or off for one app (`on`: true or false), or clear it (`on`: null) to follow its repository's, then its deploy file's. The app's word beats both.", ro: false, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsSetAutoRollback>(), run: set_auto_rollback),
+            op!("cd.apps.auto_sync", "Whether kiln syncs an app on its own whenever git changes what it renders, and whose word that is: `from` is `app` (a person set it) or `deploy-file` (its `sync.auto`). A person's word stands until the deploy file changes what it says (docs/ci.md W26-R27).", ro: true, destructive: false,
+                input: crate::ops::Input::of::<input::CdAppsAutoSync>(), run: auto_sync),
+            op!("cd.apps.set_auto_sync", "Turn auto-sync on or off for one app (`on`: true or false), or clear it (`on`: null) to follow its deploy file. It beats the deploy file until the file changes what it says; prune and self-heal keep their own settings.", ro: false, destructive: false,
+                input: crate::ops::Input::of::<input::CdAppsSetAutoSync>(), run: set_auto_sync),
             op!("cd.repos.auto_rollback", "Auto-rollback by repository: every repository apps deploy from and every one people set it for, each with its setting (null: not set) and how many apps follow it.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdReposAutoRollback>(), run: repo_auto_rollbacks),
             op!("cd.repos.set_auto_rollback", "Turn auto-rollback on or off for every app a repository deploys (`on`: true or false), or clear it (`on`: null). An app's own setting beats its repository's. A person's to change.", ro: false, destructive: false,
@@ -515,6 +519,24 @@ pub mod input {
     pub struct CdAppsAutoRollback {
         /// The app's id, `project/name` (a bare name means the default project).
         pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsAutoSync {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsSetAutoSync {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// true, false, or null to clear.
+        #[serde(deserialize_with = "crate::ops::present")]
+        #[schemars(required, extend("type" = ["boolean", "null"]))]
+        pub on: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -918,7 +940,7 @@ async fn list(cx: Cx, q: Value) -> Out {
             next = last.cloned();
             break;
         }
-        items.push(app_row(e, statuses.get(id.as_str()), pins.get(id.as_str())));
+        items.push(app_row(e, statuses.get(id.as_str()), pins.get(id.as_str()), cx.cd.auto_sync_of(id, &e.def).on));
         last = Some(id);
     }
     Ok(json!({"apps": items, "next": next}))
@@ -941,13 +963,13 @@ async fn list_sorted(cx: Cx, q: Value, sort: String) -> Out {
     rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
     let after = str_in(&q, "cursor").and_then(|c| c.split_once('\t')).map(|(r, id)| (r.to_owned(), id.to_owned()));
     let start = after.map_or(0, |(r, id)| rows.partition_point(|x| (x.0.as_str(), x.1.as_str()) <= (r.as_str(), id.as_str())));
-    let page: Vec<Value> = rows.iter().skip(start).take(limit).map(|(_, id, e)| app_row(e, statuses.get(id.as_str()), pins.get(id.as_str()))).collect();
+    let page: Vec<Value> = rows.iter().skip(start).take(limit).map(|(_, id, e)| app_row(e, statuses.get(id.as_str()), pins.get(id.as_str()), cx.cd.auto_sync_of(id, &e.def).on)).collect();
     let next = (rows.len() > start + limit).then(|| rows.get(start + limit - 1).map(|(r, id, _)| format!("{r}\t{id}"))).flatten();
     Ok(json!({"apps": page, "next": next}))
 }
 
 /// An app as lists show it.
-pub fn app_row(e: &AppEntry, s: Option<&Summary>, pin: Option<&state::Pin>) -> Value {
+pub fn app_row(e: &AppEntry, s: Option<&Summary>, pin: Option<&state::Pin>, auto: bool) -> Value {
     let unknown = || json!({"sync": Sync::Unknown.as_str(), "health": Health::Unknown.as_str()});
     let mut row = s.map(super::summary_json).unwrap_or_else(unknown);
     if let Some(m) = row.as_object_mut() {
@@ -957,7 +979,8 @@ pub fn app_row(e: &AppEntry, s: Option<&Summary>, pin: Option<&state::Pin>) -> V
         m.insert("cluster".into(), json!(e.def.destination.cluster));
         m.insert("namespace".into(), json!(e.def.destination.namespace));
         m.insert("environment".into(), json!(e.def.environment));
-        m.insert("auto".into(), json!(e.def.sync.auto));
+        // Its auto-sync as it stands: a person's word, else its deploy file's (W26-R27).
+        m.insert("auto".into(), json!(auto));
         m.insert("labels".into(), json!(e.def.labels));
         m.insert("origin".into(), origin(&e.def.origin));
         m.insert("shadow".into(), json!(super::is_shadow(&e.def)));
@@ -986,7 +1009,7 @@ async fn get(cx: Cx, v: Value) -> Out {
         Some((url, sha)) => cx.cd.live.commit(&cx.cd, &url, &sha).await,
         None => None,
     };
-    let mut out = app_row(&entry, status.as_ref(), pin.as_ref());
+    let mut out = app_row(&entry, status.as_ref(), pin.as_ref(), cx.cd.auto_sync_of(&id, &entry.def).on);
     if let Some(m) = out.as_object_mut() {
         m.insert("definition".into(), serde_json::to_value(&entry.def).unwrap_or(Value::Null));
         m.insert("commits".into(), json!(entry.commits));
@@ -996,6 +1019,7 @@ async fn get(cx: Cx, v: Value) -> Out {
         let artifacts = entry.key.and_then(|k| entry.resolved.iter().find(|r| r.key == k)).map(|r| r.artifacts.clone()).unwrap_or_default();
         m.insert("artifacts".into(), json!(artifacts));
         m.insert("auto_rollback".into(), cx.cd.auto_rollback_of(&id, &entry.def).json());
+        m.insert("auto_sync".into(), cx.cd.auto_sync_json(&id, &entry.def));
     }
     Ok(out)
 }
@@ -1638,6 +1662,31 @@ async fn rollback_targets(cx: Cx, v: Value) -> Out {
     let commits = super::rollback::commits(&cx.cd, &def, &history).await;
     // The store keeps at least one, whatever the definition says (`Command::Deployed`).
     Ok(json!({"app": id, "current": current, "targets": targets, "commits": commits, "kept": def.history_limit.max(1), "shadow": shadow}))
+}
+
+/// An app's auto-sync: whether kiln syncs it on its own, and whose word that is (W26-R27).
+async fn auto_sync(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    Ok(cx.cd.auto_sync_json(&id, &def))
+}
+
+/// Auto-sync set for one app, or cleared: kept in the store's settings with what its deploy file
+/// said then (so the file's word stands again once it changes), audited, and given to the engine
+/// at once.
+async fn set_auto_sync(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let on = on_in(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    if super::is_shadow(&def) {
+        return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
+    }
+    agents_may(&cx, &id, "change the auto-sync of")?;
+    let value = on.map_or(Value::Null, |on| json!(kiln_cd::autosync::Setting { on, by: Some(cx.actor.clone()), at_ms: super::now_ms(), file: def.sync.auto }));
+    propose(&cx.cd, Command::PutSetting(kiln_cd::autosync::app_setting(&id), value)).await?;
+    cx.cd.register(def.clone());
+    audit(&cx, "cd.auto_sync", format!("{id}: {}", on.map_or("cleared", |on| if on { "on" } else { "off" }))).await;
+    Ok(cx.cd.auto_sync_json(&id, &def))
 }
 
 /// An app's auto-rollback: whether kiln goes back on its own after a failure, and who said so.

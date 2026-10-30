@@ -282,10 +282,33 @@ impl Cd {
         })
     }
 
-    /// Registers (or replaces) an app and tells the engine.
+    /// A person's auto-sync for app `id`, if one set it (docs/ci.md W26-R27).
+    pub(crate) fn auto_sync_setting(&self, id: &str) -> Option<kiln_cd::autosync::Setting> {
+        self.store.read(|d| d.settings.get(&kiln_cd::autosync::app_setting(id)).cloned()).filter(|v| !v.is_null()).and_then(|v| serde_json::from_value(v).ok())
+    }
+
+    /// App `id`'s auto-sync: whether kiln syncs it on its own, and whose word that is.
+    pub(crate) fn auto_sync_of(&self, id: &str, def: &AppDef) -> kiln_cd::autosync::Decision {
+        kiln_cd::autosync::decide(def.sync.auto, self.auto_sync_setting(id).as_ref())
+    }
+
+    /// App `id`'s auto-sync as the API shows it: on or off, whose word (`from`: `app` or
+    /// `deploy-file`), what the deploy file says, and the person's setting.
+    pub(crate) fn auto_sync_json(&self, id: &str, def: &AppDef) -> serde_json::Value {
+        let setting = self.auto_sync_setting(id);
+        let d = kiln_cd::autosync::decide(def.sync.auto, setting.as_ref());
+        serde_json::json!({
+            "on": d.on,
+            "from": d.from.as_str(),
+            "deploy_file": def.sync.auto,
+            "app": setting.map(|s| serde_json::json!({"on": s.on, "by": s.by, "at_ms": s.at_ms})),
+        })
+    }
+
+    /// Registers (or replaces) an app and tells the engine, its auto-sync as a person set it.
     pub fn register(&self, def: AppDef) {
         let id = def.id();
-        let mut cfg = def.config();
+        let mut cfg = kiln_cd::autosync::config(&def, self.auto_sync_setting(&id).as_ref());
         cfg.read_only = is_shadow(&def);
         {
             let mut apps = self.apps.write();

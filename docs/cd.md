@@ -257,6 +257,16 @@ its inputs' content address, read from git without rendering). Which way a rollb
 `kiln_cd::rollback`'s (`pick_any`, `held_commits`, `same_as`); the server asks git first what the
 revision is in the app's sources.
 
+**Auto-sync** (ci.md W26-R27). Whether kiln syncs an app on its own whenever git changes what it
+renders is its deploy file's `sync.auto` (its definition's, for an app made by API), unless a person
+set it for the app (`cd.apps.set_auto_sync`, `PUT /api/cd/apps/:app/auto-sync` with `{ on: true |
+false | null }`; Ship's Deploys tab). A person's word wins while the deploy file says what it said
+when they set it; once the file changes its `sync.auto`, the file's word stands again and the
+person's is set aside. `null` clears it. Each change is audited (`cd.auto_sync`) and kept in the
+store's settings (`auto-sync/app/<id>`, with the file's word then), and the engine takes it at once.
+Prune and self-heal keep their own settings. `cd.apps.auto_sync` says which way it stands and whose
+word that is (`from`: `app` or `deploy-file`); the app's `auto` is that word.
+
 **Auto-rollback.** When a deploy fails, kiln goes back on its own: an app whose rollout aborted
 goes back to the deployment before (cd-targets.md §5), kiln's own restart that didn't take has its
 previous image put back by the guard (cd-targets.md §10), and a release that failed after its
@@ -420,6 +430,7 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | `rollback` takes `{ to }` (a deployment's id) or `{ revision }` (a commit, a tag, a chart version), and `prune` |
 | GET | `/api/cd/apps/:app/history` | deployments, each with its commit and the tags that name it |
 | GET | `/api/cd/apps/:app/rollback-targets` | what a rollback can go to, newest first, and what runs now; `commits`: its source's newest commits, each with the deployment that ran it and the one whose render it matches (any of them can be gone back to, ci.md W26-R25) |
+| GET / PUT | `/api/cd/apps/:app/auto-sync` | whether kiln syncs the app on its own, and whose word that is (`from`: `app` or `deploy-file`); PUT `{ on: true \| false \| null }` (ci.md W26-R27) |
 | GET / PUT | `/api/cd/apps/:app/auto-rollback` | whether kiln goes back on its own, and who said so (`from`: `app`, `repo`, `deploy-file`, `default`); PUT `{ on: true \| false \| null }` sets or clears the app's |
 | GET / PUT | `/api/cd/repos/auto-rollback` | auto-rollback by repository; PUT `{ repo, on: true \| false \| null }` |
 | GET | `/api/cd/apps/:app/resources/:key` | one object of the tree: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. `:key` is `group~kind~namespace~name` |

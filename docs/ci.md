@@ -8629,6 +8629,10 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   synced as a rollback, recorded as a deployment, and held there until trunk changes what the app
   renders (cd.md, "Any commit"). Its rollback targets list main's newest commits beside the
   deployments, each naming the deployment that ran it and the one whose render it matches.
+- **W26-R27 Auto-sync from the UI.** A person turns an app's auto-sync on or off from Ship
+  (`cd.apps.set_auto_sync`), kept in the store's settings and audited, as auto-rollback is. It beats
+  the deploy file until the file changes what it says (cd.md, "Auto-sync"). Prune keeps its own
+  knob; deleting an app is as before.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8692,6 +8696,10 @@ repository):
   `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
   `w26_r22_freeze_is_appended_after_every_older_variant`; contain
   `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC16 Auto-sync from the UI.** An app whose deploy file leaves auto-sync off syncs once a
+  person turns it on, and stops when they turn it off; once the file changes its word, the file's
+  stands. *`kiln-cd` `w26_r27_a_persons_auto_sync_beats_the_file_until_the_file_changes` and
+  `w26_r27_auto_sync_set_for_an_app_starts_and_stops_its_syncs` (the simulated cluster).*
 - **W26-AC15 Roll back to any commit.** A commit no deployment ran is rendered, synced and recorded
   as a deployment; a revision resolves to a deployment first, else to a commit or a tag's commit git
   has in a source; a commit that renders what a deployment rendered names it. *`kiln-cd`
