@@ -29,6 +29,7 @@ pub mod fleet;
 pub mod frontdoor;
 pub mod githost;
 pub mod gitops;
+pub mod gitsign;
 pub mod handovers;
 pub mod harness;
 pub mod headroom;

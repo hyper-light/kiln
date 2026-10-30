@@ -147,6 +147,20 @@ pub fn given(json: &str, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether this runner's server issues identities (`CAP_IDENTITY`), so its sessions' git signs as
+/// their agents (W27-R03, [`crate::gitsign`]): a server from before keeps them committing unsigned.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says whether the server issues identities, as it said on connecting.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the server issues identities ([`set_enabled`]).
+pub fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The certificate held for a slot.
 pub fn cert(slot: &str) -> Option<String> {
     HELD.lock().certs.get(slot).map(|(pem, _)| pem.clone())

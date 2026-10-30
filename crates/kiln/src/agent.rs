@@ -2304,6 +2304,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // on each connection (docs/ci.md W27-R01); an ephemeral runner's too (a `k8s`
                         // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
                         server_identity = caps & proto::CAP_IDENTITY != 0;
+                        crate::runner::identity::set_enabled(server_identity);
                         if server_identity {
                             match crate::runner::identity::ask("runner", None, None) {
                                 Ok(json) => {

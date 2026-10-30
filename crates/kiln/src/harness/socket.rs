@@ -84,6 +84,9 @@ pub enum Request {
         #[serde(default)]
         terminal: Option<String>,
     },
+    /// What `kiln-git-sign` asks for an agent's commit (W27-R03): `message` (base64) signed with
+    /// the asking process's session's key at its epoch ([`sign_for`]).
+    Sign { message: String },
 }
 
 /// Who asks the server, as the socket tells them apart.
@@ -179,7 +182,37 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
         Request::Stop { id: None, .. } | Request::Interrupt { id: None, .. } if agent.is_some() => json!({"ok": false, "error": "say which agent (its id): an agent stops only the agents it started"}),
+        Request::Sign { message } => sign_for(host, peer, &message).await,
         other => handle(host, other),
+    }
+}
+
+/// An agent's commit signature (W27-R03): `message` (base64) signed with the key this runner
+/// process holds for the asking process's session at its epoch. The session is told by the process
+/// alone, its group of processes or a harness among its ancestors, never by what it says (the
+/// mark any process can set): one outside every session gets nothing. The key stays here; the
+/// signature and its certificate (DER) go back, base64.
+async fn sign_for(host: &Host, peer: Option<u32>, message: &str) -> Value {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let refuse = |why: String| json!({"ok": false, "error": why});
+    let Some(pid) = peer else { return refuse("the system doesn't say which process asks, so nothing is signed".into()) };
+    let sessions = host.harness_pids();
+    let session = crate::rt::blocking(move || super::survivors::session_by_process(pid, &sessions)).await.ok().flatten();
+    let Some(session) = session else {
+        return refuse("only a process of an agent session kiln runs here signs as that agent: its group of processes or its harness among its ancestors says so, never what it says".into());
+    };
+    let Some(epoch) = host.list().into_iter().find(|i| i.id == session).map(|i| i.epoch) else { return refuse(format!("agent session {session} is gone")) };
+    let Ok(bytes) = b64.decode(message) else { return refuse("what to sign isn't base64".into()) };
+    let slot = crate::runner::identity::slot("agent", Some(&session), Some(epoch));
+    // A session just opened, or just moved to its epoch, may have its key's certificate on the way.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::runner::identity::cert(&slot).is_none() && std::time::Instant::now() < until {
+        crate::rt::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    match crate::runner::identity::sign(&slot, &bytes).and_then(|(sig, pem)| Ok((sig, crate::pki::der_of(&pem)?))) {
+        Ok((sig, cert)) => json!({"ok": true, "session": session, "epoch": epoch, "signature": b64.encode(sig), "certificate": b64.encode(cert)}),
+        Err(e) => refuse(format!("agent session {session} has no key at epoch {epoch} to sign with: {e:#}")),
     }
 }
 
@@ -289,6 +322,8 @@ pub fn handle(host: &Host, req: Request) -> Value {
             json!({"ok": ok, "message": message})
         }
         Request::Op { .. } => json!({"ok": false, "error": "kiln's operations go to the kiln server"}),
+        // Signing is told by the asking process, which only `answer` knows.
+        Request::Sign { .. } => json!({"ok": false, "error": "signing asks the process's own runner (its socket's answer)"}),
     }
 }
 

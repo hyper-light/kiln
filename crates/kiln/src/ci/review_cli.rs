@@ -130,6 +130,16 @@ pub async fn clone(args: CloneArgs, cfg: &Config) -> Result<()> {
     run(&["clone", "-c", &helper, &url, &dir])?;
     let hook = install_hook(Some(&dir))?;
     eprintln!("[kiln] {dir}: commits get a Kiln-Change ({}); `kiln submit` sends them for review", hook.display());
+    // Commits signed as this device's person (W27-R03), with `kiln login`'s key, which stays here.
+    if crate::identities::device_dir().join("identity.pem").exists() {
+        let program = crate::gitsign::installed()?;
+        for (k, v) in crate::gitsign::git_config(&program, crate::gitsign::DEVICE_KEY) {
+            run(&["-C", &dir, "config", "--local", k, &v])?;
+        }
+        eprintln!("[kiln] {dir}: commits are signed as you, with this device's identity (`kiln login`'s key)");
+    } else {
+        eprintln!("[kiln] {dir}: commits aren't signed: `kiln login` gives this device an identity, then `kiln clone` again");
+    }
     Ok(())
 }
 

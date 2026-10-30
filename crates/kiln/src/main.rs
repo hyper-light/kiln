@@ -520,6 +520,11 @@ fn main() -> ExitCode {
             return kiln::runner::rustc::main(argv.get(from..).unwrap_or_default());
         }
     }
+    // git's signing program (docs/ci.md W27-R03): this binary, by the name git runs it as.
+    if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == kiln::gitsign::NAME) {
+        let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+        return kiln::gitsign::main(&args);
+    }
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
         let action = std::env::args().nth(1).unwrap_or_default();

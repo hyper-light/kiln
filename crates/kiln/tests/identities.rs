@@ -532,6 +532,52 @@ fn nowhere(paths: &[std::path::PathBuf], key_pem: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R03, AC03: a person's commit is signed with their key, on their device. sam signs in
+/// (`kiln login`); git, set up as `kiln clone` sets it up, signs a commit through `kiln-git-sign`
+/// with that device's key; the commit's signature verifies to kiln's root as sam, never as anyone
+/// else, and the key never left the laptop.
+#[test]
+fn w27_ac03_a_persons_commit_verifies_as_them() -> anyhow::Result<()> {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    use kiln_ci::identity::gitsig;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let root = root(&s)?;
+    add_person(&s, "sam")?;
+    let link = sign_in_link(&s, "sam")?;
+    let laptop = Device::new(dir.path(), "sam-laptop")?;
+    let (ok, said) = laptop.kiln(&["login", "--link", &link], None)?;
+    anyhow::ensure!(ok, "kiln login --link: {said}");
+    // git's signing program: kiln's own binary by its name, as `kiln clone` places it.
+    let bin = dir.path().join("sam-laptop").join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let program = bin.join(kiln::gitsign::NAME);
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_kiln"), &program).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_kiln"), &program)?;
+    }
+    let repo = dir.path().join("sam-laptop").join("app");
+    std::fs::create_dir_all(&repo)?;
+    let git = |args: &[&str]| -> anyhow::Result<std::process::Output> {
+        Ok(std::process::Command::new("git").arg("-C").arg(&repo).args(args).env("HOME", &laptop.home).env("XDG_CONFIG_HOME", &laptop.config).env("GIT_CONFIG_NOSYSTEM", "1").output()?)
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    let mut config = vec![("user.name", "sam".to_owned()), ("user.email", "sam@example.com".to_owned())];
+    config.extend(kiln::gitsign::git_config(&program, kiln::gitsign::DEVICE_KEY));
+    for (k, v) in &config {
+        git(&["config", "--local", k, v.as_str()])?;
+    }
+    let out = git(&["commit", "-q", "--allow-empty", "-m", "sam's first"])?;
+    anyhow::ensure!(out.status.success(), "git commit: {}", String::from_utf8_lossy(&out.stderr));
+    let raw = git(&["cat-file", "commit", "HEAD"])?.stdout;
+    let sig = gitsig::signature_of(&raw).ok_or_else(|| anyhow::anyhow!("sam's commit isn't signed: {}", String::from_utf8_lossy(&raw)))?;
+    let v = gitsig::verify(&gitsig::payload(&raw), &sig, &root, &revocations_now(&s)?, unix_now()?)?;
+    assert_eq!(v.identity, Identity::new("hyper-light", Actor::Person { name: "sam".into() }), "{v}");
+    // Signed on the laptop: the server saw neither the commit nor the key.
+    let key = std::fs::read_to_string(laptop.file("identity.key"))?;
+    nowhere(&[dir.path().join("data"), dir.path().join("server.log")], &key)?;
+    Ok(())
+}
+
 /// W27-R01, R02: a person signs in from the CLI on their own device and gets a certificate for a
 /// key made there. It verifies to kiln's root as the person, of their organization, for hours at
 /// most; the key is in their config, theirs alone (0600), and nowhere on the server, which keeps
