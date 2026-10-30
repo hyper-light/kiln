@@ -229,7 +229,18 @@ A message a wire can't read is refused to its sender, typed, and noted in one pl
 what it was, a code, and why. Where it came from is a runner and its instance (before its Hello:
 its certificate and address), a person, an agent session, or an address. What it was is a
 variant's index, a tag, a method or a tool, never what it said. An unknown field in a known
-message isn't refused: that's how peers of different versions work together.
+message isn't refused: that's how peers of different versions work together. It's taken, counted
+in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each message), and logged
+once an hour for each wire and field; it's never audited.
+
+What a runner's or the server's frame carries as JSON is read once, where the frame is read
+(`crate::wire::payload_of`): each variant that carries JSON names its type there, and its handler
+takes the value. A kind this build doesn't know (a tag it hasn't heard of) is `unknown`; what isn't
+JSON, or isn't of its type, is `malformed`. What waits on a payload that's refused is told why too:
+a question is answered `{"error": …}`, a stream to open is said to have failed, and an agent session
+to start is said refused, so it can be dismissed. A field written only when it isn't its default
+can be taken for one this build doesn't know when another build sends it at its default: it's
+counted all the same, and never refused.
 
 | Code | When | On the channel and in the UI's nacks |
 |---|---|---|
@@ -268,8 +279,8 @@ What each wire's sender is told. The later steps of the typed-messages plan move
 | `server` | The server's frames, as a runner reads them. | The runner says so (`AgentMsg::Unread`, to a server that says `CAP_UNREAD`), and the server notes it against the runner. |
 | `runner_item` | The items of a runner's channel streams, as the server reads them. | A NACK: `unsupported` for a variant the server doesn't know, `malformed` for the rest. |
 | `server_item` | The items of the server's channel streams, as a runner reads them. | A NACK, as for `runner_item`, and `AgentMsg::Unread` to a server that says `CAP_UNREAD`. |
-| `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | Nothing yet: its item is answered as taken. |
-| `server_payload` | The JSON the server's frame carries (a session's commands), as a runner reads it. | Nothing yet. |
+| `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | On the channel (a session's updates), its item's NACK: `unsupported` for a kind the server doesn't know, `malformed` for the rest. Off it, `ServerMsg::Unread`, if it says `CAP_UNREAD`, and a question it asked (`ReachAsk`) is answered with why. A session's update is kept for the session's page too. |
+| `server_payload` | The JSON the server's frame carries (a session's commands), as a runner reads it. | On the channel (a command), its NACK, as for `runner_payload`. Either way the runner says so (`AgentMsg::Unread`, to a server that says `CAP_UNREAD`), and the server notes it against the runner. A question (`Preview`, `Workspace`) is answered with why, a stream to open is said to have failed, and a session to start is said refused. |
 | `relay` | What runners send the server's relay for one another. | Nothing yet. |
 | `reach_link` | What a runner reads inside a reach link, from the runner at its other end. | Nothing yet: the link ends. |
 | `session_up` | The session socket: what a page sends up. | A nack, `malformed`. |

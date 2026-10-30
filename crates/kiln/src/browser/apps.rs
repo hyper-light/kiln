@@ -152,8 +152,7 @@ pub async fn start(dir: &Path, session: &str, cwd: &Path) -> anyhow::Result<Valu
 }
 
 /// `ServerMsg::Preview` on a runner: `{"op": "look" | "start" | "stop"}`, its answer.
-pub async fn serve(dir: &Path, session: &str, cwd: &Path, root: Option<u32>, json: &str) -> Value {
-    let q: Value = serde_json::from_str(json).unwrap_or_default();
+pub async fn serve(dir: &Path, session: &str, cwd: &Path, root: Option<u32>, q: &Value) -> Value {
     match q.get("op").and_then(Value::as_str) {
         Some("look") => {
             // What they open, they open at once: the conversation's browser is started now.

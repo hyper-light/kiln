@@ -13,12 +13,15 @@ pub mod commands;
 pub mod events;
 pub mod keep;
 pub mod link;
+pub mod payload;
 pub mod sums;
 #[cfg(test)]
 pub mod ts;
 pub mod ui;
 pub mod unread;
 pub mod uplink;
+
+pub use payload::{payload, payload_of};
 
 use crate::harness::core::Update;
 use crate::harness::model::Command;

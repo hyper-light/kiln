@@ -245,9 +245,7 @@ pub fn start_ask(hub: &Hub, pool: &str, executor: &str, kind: &str, image: Optio
 /// Tells the dispatcher a pool's executor didn't start, and why.
 fn failed(hub: &Hub, executor: &str, error: String) {
     let said = crate::runner::pool::Said { executor: executor.to_owned(), state: "failed".into(), error: Some(error) };
-    if let Ok(json) = serde_json::to_string(&said) {
-        hub.ci.send(super::dispatch::Msg::Executor { agent: "kubernetes".into(), json });
-    }
+    hub.ci.send(super::dispatch::Msg::Executor { agent: "kubernetes".into(), said });
 }
 
 /// What a pod made for a leg holds (docs/ci.md W13-R07), evaluated: the job container's image

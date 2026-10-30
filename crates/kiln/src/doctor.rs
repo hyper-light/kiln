@@ -522,21 +522,18 @@ pub async fn diagnose(hub: &Arc<Hub>, name: &str) -> Result<Value, Fail> {
     let mut why: Option<String> = None;
     if live.as_ref().is_some_and(|l| l.connected) {
         let asked = crate::util::now_ms();
-        match hub.ask_runner(name, proto::CAP_DOCTOR, DIAGNOSE_WAIT, |req| ServerMsg::Diagnose { req }).await {
-            Ok(Some(Some(json))) => match serde_json::from_str::<Machine>(&json) {
-                Ok(m) => {
-                    // Its clock, against the server's halfway through the question.
-                    let mid = asked.saturating_add(crate::util::now_ms().saturating_sub(asked) / 2);
-                    let skew = m.now_ms.saturating_sub(mid);
-                    if skew.abs() >= SKEW_MS {
-                        findings.push(finding("clock", Level::Warn, format!("Its clock is {} {} the server's", said_secs(skew.unsigned_abs() / 1000), if skew > 0 { "ahead of" } else { "behind" }), "Certificates, tokens and schedules go wrong with a clock this far off: turn on network time on the machine.", None));
-                    } else {
-                        findings.push(finding("clock", Level::Ok, "Its clock agrees with the server's", "", None));
-                    }
-                    findings.extend(m.findings);
+        match hub.ask_runner::<Machine>(name, proto::CAP_DOCTOR, DIAGNOSE_WAIT, |req| ServerMsg::Diagnose { req }).await {
+            Ok(Some(Some(m))) => {
+                // Its clock, against the server's halfway through the question.
+                let mid = asked.saturating_add(crate::util::now_ms().saturating_sub(asked) / 2);
+                let skew = m.now_ms.saturating_sub(mid);
+                if skew.abs() >= SKEW_MS {
+                    findings.push(finding("clock", Level::Warn, format!("Its clock is {} {} the server's", said_secs(skew.unsigned_abs() / 1000), if skew > 0 { "ahead of" } else { "behind" }), "Certificates, tokens and schedules go wrong with a clock this far off: turn on network time on the machine.", None));
+                } else {
+                    findings.push(finding("clock", Level::Ok, "Its clock agrees with the server's", "", None));
                 }
-                Err(e) => why = Some(format!("its answer was unreadable: {e}")),
-            },
+                findings.extend(m.findings);
+            }
             Ok(Some(None)) => why = Some("it couldn't look at itself".to_owned()),
             Ok(None) => why = Some("its kiln is too old to look at itself: upgrade it to see its disks, caches and logs here".to_owned()),
             Err(e) => why = Some(format!("{e:#}")),
@@ -593,9 +590,8 @@ pub async fn repair(hub: &Arc<Hub>, name: &str, ask: &Ask) -> Result<Value, Fail
         return Err((StatusCode::CONFLICT, format!("{name} is building kiln for another machine with the cache, so it stays until that's done")));
     }
     let a = action.to_owned();
-    match hub.ask_runner(name, proto::CAP_DOCTOR, REPAIR_WAIT, move |req| ServerMsg::Repair { req, action: a }).await {
-        Ok(Some(Some(json))) => {
-            let v: Value = serde_json::from_str(&json).map_err(|e| (StatusCode::BAD_GATEWAY, format!("{name}'s answer was unreadable: {e}")))?;
+    match hub.ask_runner::<Value>(name, proto::CAP_DOCTOR, REPAIR_WAIT, move |req| ServerMsg::Repair { req, action: a }).await {
+        Ok(Some(Some(v))) => {
             match v.get("error").and_then(Value::as_str) {
                 Some(e) => Err((StatusCode::CONFLICT, e.to_owned())),
                 None => Ok(json!({"ok": true, "action": action, "message": v.get("message").cloned().unwrap_or(Value::Null)})),

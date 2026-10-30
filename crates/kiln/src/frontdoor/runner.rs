@@ -67,7 +67,7 @@ pub struct Ctx {
 }
 
 enum Command {
-    Push(String),
+    Push(Box<Push>),
     Ctx(Ctx),
 }
 
@@ -87,8 +87,8 @@ pub struct Handle {
 
 impl Handle {
     /// What the server sent (`ServerMsg::FrontDoor`).
-    pub fn push(&self, json: String) {
-        if self.tx.try_send(Command::Push(json)).is_err() {
+    pub fn push(&self, push: Push) {
+        if self.tx.try_send(Command::Push(Box::new(push))).is_err() {
             tracing::warn!("front door: too many updates at once; one was dropped (the next connect sends it again)");
         }
     }
@@ -158,7 +158,7 @@ async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>
             () = soon(fd.retry_in()).fuse() => None,
         };
         match cmd {
-            Some(Command::Push(json)) => fd.on_push(&json),
+            Some(Command::Push(push)) => fd.on_push(*push),
             Some(Command::Ctx(c)) => {
                 fd.ctx = c;
                 fd.reconcile();
@@ -295,14 +295,7 @@ impl FrontDoor {
         fd
     }
 
-    fn on_push(&mut self, json: &str) {
-        let push: Push = match serde_json::from_str(json) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "front door: unreadable settings from the server");
-                return;
-            }
-        };
+    fn on_push(&mut self, push: Push) {
         if let Some(issued) = &push.issued {
             match self.store.take_issued(issued) {
                 Ok(()) => {
@@ -801,8 +794,8 @@ mod tests {
                 cert: Cert { mode: CertMode::Kiln },
                 ..Settings::default()
             };
-            let push = |s: &Settings, issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: s.clone(), standby, issued, custom: None, renew: false, peers: None });
-            fd.on_push(&push(&settings, None, false)?);
+            let push = |s: &Settings, issued: Option<String>, standby: bool| Push { settings: s.clone(), standby, issued, custom: None, renew: false, peers: None };
+            fd.on_push(push(&settings, None, false));
             let st = fd.status();
             assert_eq!(st.settings, settings.fingerprint());
             assert_eq!(st.dns.state, State::On, "{:?}", st.dns);
@@ -818,7 +811,7 @@ mod tests {
 
             // The server signs it; HTTPS comes up with it.
             let issued = pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)?;
-            fd.on_push(&push(&settings, Some(issued), false)?);
+            fd.on_push(push(&settings, Some(issued), false));
             let st = fd.status();
             assert_eq!(st.https.state, State::On, "{:?}", st.https);
             assert_eq!(st.cert.state, State::On);
@@ -831,7 +824,7 @@ mod tests {
             crate::http::tls::TlsStream::connect(crate::http::io::RtFuturesIo::new(tcp), roots.config()?, crate::http::tls::server_name("www.kiln.test")?).await?;
 
             // Standby: everything stops, the settings stay.
-            fd.on_push(&push(&Settings::default(), None, true)?);
+            fd.on_push(push(&Settings::default(), None, true));
             let st = fd.status();
             assert!(st.standby);
             assert_eq!((st.dns.state, st.https.state), (State::Waiting, State::Waiting));
@@ -853,7 +846,7 @@ mod tests {
             assert!(fd.status().csr.is_none());
 
             // Turned off, it lets go of its ports.
-            fd.on_push(&push(&Settings::default(), None, false)?);
+            fd.on_push(push(&Settings::default(), None, false));
             let st = fd.status();
             assert_eq!((st.dns.state, st.https.state), (State::Off, State::Off));
             Ok(())
@@ -886,18 +879,18 @@ mod tests {
                 cert: Cert { mode: CertMode::Kiln },
                 ..Settings::default()
             };
-            let push = |issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: settings.clone(), standby, issued, custom: None, renew: false, peers: None });
+            let push = |issued: Option<String>, standby: bool| Push { settings: settings.clone(), standby, issued, custom: None, renew: false, peers: None };
             let mut fd = FrontDoor::new(ctx);
-            fd.on_push(&push(None, false)?);
+            fd.on_push(push(None, false));
             let st = fd.status();
             let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;
             let issued = pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)?;
-            fd.on_push(&push(Some(issued), true)?);
+            fd.on_push(push(Some(issued), true));
             assert_eq!(fd.retry_in(), None, "standing by, nothing to try");
 
             // The other process holds the port when this one is told to run.
             let held = hold(https_port).await?;
-            fd.on_push(&push(None, false)?);
+            fd.on_push(push(None, false));
             assert_eq!(fd.status().https.state, State::Error, "{:?}", fd.status().https);
             assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
 
@@ -916,9 +909,9 @@ mod tests {
             assert_eq!(fd.retry_in(), None);
 
             // Held for longer than the while: back to every TICK.
-            fd.on_push(&push(None, true)?);
+            fd.on_push(push(None, true));
             let held = hold(https_port).await?;
-            fd.on_push(&push(None, false)?);
+            fd.on_push(push(None, false));
             assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
             fd.retry_until = Some(Instant::now());
             fd.reconcile();
@@ -941,15 +934,15 @@ mod tests {
                 cert: Cert { mode: CertMode::Custom },
                 ..Settings::default()
             };
-            let push = |custom: Option<crate::frontdoor::CustomCert>| serde_json::to_string(&Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false, peers: None });
-            fd.on_push(&push(None)?);
+            let push = |custom: Option<crate::frontdoor::CustomCert>| Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false, peers: None };
+            fd.on_push(push(None));
             let st = fd.status();
             assert_eq!(st.cert.state, State::Error);
             assert!(st.csr.is_none(), "custom mode asks the CA for nothing");
             // One for another name: served, and the status says which names it misses.
             let key = crate::pki::new_key_pem()?;
             let other = pki.sign_front_door(&crate::pki::front_door_csr(&["other.test".to_owned()], &key)?, &["other.test".to_owned()], 30)?;
-            fd.on_push(&push(Some(crate::frontdoor::CustomCert { cert_pem: other, key_pem: key }))?);
+            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: other, key_pem: key })));
             let st = fd.status();
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
             assert_eq!(st.cert.missing, ["kiln.test", "*.kiln.test"]);
@@ -958,7 +951,7 @@ mod tests {
             // certificate alone.
             let key2 = crate::pki::new_key_pem()?;
             let mine = pki.sign_front_door(&crate::pki::front_door_csr(&["kiln.test".to_owned()], &key2)?, &["kiln.test".to_owned(), "*.kiln.test".to_owned()], 30)?;
-            fd.on_push(&push(Some(crate::frontdoor::CustomCert { cert_pem: format!("{mine}{key2}"), key_pem: key2.clone() }))?);
+            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: format!("{mine}{key2}"), key_pem: key2.clone() })));
             let st = fd.status();
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
             assert!(st.cert.missing.is_empty() && !st.cert.renewing);
@@ -966,12 +959,12 @@ mod tests {
             assert_eq!(pem, crate::pki::public_chain_pem(&mine)?);
             assert!(!serde_json::to_string(&st)?.contains("PRIVATE KEY"), "the status never carries the key");
             // A broken upload is refused, and the stored one stays.
-            fd.on_push(&push(Some(crate::frontdoor::CustomCert { cert_pem: "junk".into(), key_pem: "junk".into() }))?);
+            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: "junk".into(), key_pem: "junk".into() })));
             let st = fd.status();
             assert_eq!(st.cert.state, State::On);
             assert!(st.cert.error.as_deref().is_some_and(|e| e.contains("not taken")), "{:?}", st.cert.error);
             // Renewing is for the self-signed certificate: here it changes nothing.
-            fd.on_push(&serde_json::to_string(&Push { settings: settings.clone(), renew: true, ..Push::default() })?);
+            fd.on_push(Push { settings: settings.clone(), renew: true, ..Push::default() });
             let st = fd.status();
             assert!(st.csr.is_none() && !st.cert.renewing && st.cert.state == State::On);
             Ok(())
@@ -992,13 +985,13 @@ mod tests {
                 https: Https { enabled: true, port: free_port()?, http_port: 0, ..Https::default() },
                 ..Settings::default()
             };
-            let push = |issued: Option<String>, renew: bool| serde_json::to_string(&Push { settings: settings.clone(), issued, renew, ..Push::default() });
+            let push = |issued: Option<String>, renew: bool| Push { settings: settings.clone(), issued, renew, ..Push::default() };
             let issue = |st: &Status| -> anyhow::Result<String> {
                 let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;
                 pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)
             };
-            fd.on_push(&push(None, false)?);
-            fd.on_push(&push(Some(issue(&fd.status())?), false)?);
+            fd.on_push(push(None, false));
+            fd.on_push(push(Some(issue(&fd.status())?), false));
             let st = fd.status();
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
             let first = st.cert.info.clone().ok_or_else(|| anyhow::anyhow!("a certificate"))?;
@@ -1009,7 +1002,7 @@ mod tests {
             assert_eq!(fd.tls_leaf.as_deref(), Some(first.sha256.as_str()));
 
             // Renew: a CSR at once, for a key that is not the one in use; the old one still serves.
-            fd.on_push(&push(None, true)?);
+            fd.on_push(push(None, true));
             let st = fd.status();
             assert!(st.cert.renewing && st.csr.is_some(), "{:?}", st.cert);
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
@@ -1018,13 +1011,13 @@ mod tests {
             let pending = std::fs::read_to_string(fd.store.dir().join("kiln.key.pending"))?;
             assert!(crate::pki::cert_matches_key(&renewed, &pending) && !crate::pki::cert_matches_key(&renewed, &first_key), "a new key");
             // Asked again before it came in: asked again at once, for the same new key.
-            fd.on_push(&push(None, true)?);
+            fd.on_push(push(None, true));
             let again = fd.status();
             assert!(again.cert.renewing && again.csr.is_some() && again.csr != st.csr);
             assert!(crate::pki::cert_matches_key(&issue(&again)?, &pending));
 
             // The new one comes in: served, stored with its key, the old pair gone.
-            fd.on_push(&push(Some(renewed.clone()), false)?);
+            fd.on_push(push(Some(renewed.clone()), false));
             let st = fd.status();
             assert!(!st.cert.renewing && st.csr.is_none(), "{:?}", st.cert);
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));

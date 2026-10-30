@@ -266,7 +266,7 @@ pub struct Unread {
 
 impl Unread {
     /// Its `what` and `why` cut to their most, each at a character's end.
-    fn cut(mut self) -> Unread {
+    pub(crate) fn cut(mut self) -> Unread {
         cut(&mut self.what, WHAT_MOST);
         cut(&mut self.why, WHY_MOST);
         self
@@ -592,7 +592,7 @@ fn summary(from: &Sender, wire: Wire, code: Code, n: u64, newest: &Unread) -> Ro
 }
 
 /// A map of at most `most` entries: the least recently touched is let go to make room.
-struct Recent<K, V> {
+pub(crate) struct Recent<K, V> {
     most: usize,
     next: u64,
     map: HashMap<K, (u64, V)>,
@@ -601,13 +601,13 @@ struct Recent<K, V> {
 }
 
 impl<K: Clone + Eq + Hash, V> Recent<K, V> {
-    fn new(most: usize) -> Self {
+    pub(crate) fn new(most: usize) -> Self {
         Recent { most, next: 0, map: HashMap::new(), order: BTreeMap::new() }
     }
 
     /// `k`'s value, made by `new` if it has none, touched; and the entry let go to make room for
     /// it, if one was.
-    fn entry(&mut self, k: K, new: impl FnOnce() -> V) -> (&mut V, Option<(K, V)>) {
+    pub(crate) fn entry(&mut self, k: K, new: impl FnOnce() -> V) -> (&mut V, Option<(K, V)>) {
         self.next += 1;
         let at = self.next;
         let mut gone = None;

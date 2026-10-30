@@ -215,16 +215,15 @@ impl Relay {
 
     /// An event from a runner: kept when a joining viewer needs it, sent on to each viewer; a
     /// stream that closed or failed to open goes. What's left to do is answered ([`Evented`]).
-    pub fn event(&self, machine: &str, id: &str, mut json: String) -> Evented {
-        let mut v: Value = serde_json::from_str(&json).unwrap_or_default();
+    pub fn event(&self, machine: &str, id: &str, mut v: Value) -> Evented {
         // A recording's end: kept, and said to its viewers with the id to get its files by.
         let ended = v.get("recorded").and_then(|r| self.recorded(machine, id, r));
-        if let Some((_, rec)) = &ended {
-            if let Some(r) = v.get_mut("recorded").and_then(Value::as_object_mut) {
-                r.insert("id".into(), json!(rec.id));
-            }
-            json = v.to_string();
+        if let Some((_, rec)) = &ended
+            && let Some(r) = v.get_mut("recorded").and_then(Value::as_object_mut)
+        {
+            r.insert("id".into(), json!(rec.id));
         }
+        let json = v.to_string();
         let mut after = Evented { again: None, ended };
         let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return after };
         // Its tabs as they were before the ones it said last (said later, arrived first): no news.
@@ -544,12 +543,11 @@ pub async fn preview(hub: &Arc<Hub>, session: &str, op: &str) -> anyhow::Result<
     // Starting an app waits for it to listen (its preview file says how long, at most ten minutes).
     let wait = if op == "start" { Duration::from_secs(610) } else { Duration::from_secs(20) };
     let json = json!({"op": op}).to_string();
-    let answer = hub
-        .ask_routed(&machine, crate::proto::CAP_PREVIEW, wait, |req| ServerMsg::Preview { req, session: session.to_owned(), json })
+    let v = hub
+        .ask_routed::<Value>(&machine, crate::proto::CAP_PREVIEW, wait, |req| ServerMsg::Preview { req, session: session.to_owned(), json })
         .await?
         .ok_or_else(|| anyhow::anyhow!("{machine} runs a kiln too old for this: upgrade its runner"))?
         .ok_or_else(|| anyhow::anyhow!("{machine} said nothing"))?;
-    let v: Value = serde_json::from_str(&answer)?;
     if let Some(e) = v.get("error").and_then(Value::as_str) {
         anyhow::bail!("{e}");
     }
@@ -642,7 +640,7 @@ mod tests {
         r.chunk("m1", "v1", crate::browser::stream::frame(b'c', b'-', 0, 0, 1, b"{\"codec\":\"avc1.42E01f\"}"));
         r.chunk("m1", "v1", crate::browser::stream::frame(b'c', b'a', 0, 0, 1, b"{\"codec\":\"opus\"}"));
         r.chunk("m1", "v1", crate::browser::stream::frame(b'v', b'k', 5, 0, 1, b"key"));
-        r.event("m1", "v1", json!({"navigated": {"url": "http://localhost:5173/a"}}).to_string());
+        r.event("m1", "v1", json!({"navigated": {"url": "http://localhost:5173/a"}}));
         // Another machine's chunk for it isn't its.
         r.chunk("m2", "v1", crate::browser::stream::frame(b'v', b'k', 6, 0, 1, b"not mine"));
         assert_eq!(rx.len(), 4);
@@ -651,25 +649,25 @@ mod tests {
         assert!(l.said.lock().contains_key("navigated"));
         // Its window out of sight where it runs (Safari's, its Mac locked): a viewer joining later
         // is told so, as it is now.
-        r.event("m1", "v1", json!({"hidden": true}).to_string());
+        r.event("m1", "v1", json!({"hidden": true}));
         assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("true")));
-        r.event("m1", "v1", json!({"hidden": false}).to_string());
+        r.event("m1", "v1", json!({"hidden": false}));
         assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("false")));
         // A size its viewer asked for before it opened is asked again as it does.
         *l.resized.lock() = Some(json!({"width": 400, "height": 300, "scale": 2}));
-        let again = r.event("m1", "v1", json!({"opened": {"width": 390}}).to_string()).again;
+        let again = r.event("m1", "v1", json!({"opened": {"width": 390}})).again;
         assert_eq!(again.map(|(_, c)| c), Some(json!({"resize": {"width": 400, "height": 300, "scale": 2}})));
         while rx.try_recv().is_ok() {}
         // Its tabs, as they are now; a list said before (arriving after) is no news.
-        r.event("m1", "v1", json!({"tabs": {"list": [{"id": "t1", "url": "http://localhost:5173/a", "title": "A"}], "shown": "t1", "seq": 2}}).to_string());
-        r.event("m1", "v1", json!({"tabs": {"list": [], "shown": "", "seq": 1}}).to_string());
+        r.event("m1", "v1", json!({"tabs": {"list": [{"id": "t1", "url": "http://localhost:5173/a", "title": "A"}], "shown": "t1", "seq": 2}}));
+        r.event("m1", "v1", json!({"tabs": {"list": [], "shown": "", "seq": 1}}));
         assert!(l.said.lock().get("tabs").is_some_and(|t| t.contains("\"shown\":\"t1\"")));
         assert_eq!(rx.len(), 1);
         while rx.try_recv().is_ok() {}
         assert_eq!(l.codec(), "avc1.42E01f");
         assert_eq!(live("v9", "m1").codec(), "h264");
         // It closed on its machine: it's gone, and its viewers are told.
-        r.event("m1", "v1", json!({"closed": {"why": "the page went away"}}).to_string());
+        r.event("m1", "v1", json!({"closed": {"why": "the page went away"}}));
         assert!(r.get("v1").is_none());
         assert_eq!(rx.len(), 1);
         Ok(())
@@ -702,12 +700,12 @@ mod tests {
         let r = Relay::default();
         let l = live("v1", "m1");
         r.live.lock().insert("v1".into(), l.clone());
-        r.event("m1", "v1", json!({"recorded": {"video": "/s/live-1.mp4", "inputs": "/s/live-1.inputs.jsonl", "test": "/s/live-1.spec.ts", "seconds": 2.5}}).to_string());
+        r.event("m1", "v1", json!({"recorded": {"video": "/s/live-1.mp4", "inputs": "/s/live-1.inputs.jsonl", "test": "/s/live-1.spec.ts", "seconds": 2.5}}));
         // Its stream gone, a late one still counts; another machine's never does.
         r.live.lock().remove("v1");
         r.ended(&l);
-        r.event("m1", "v1", json!({"recorded": {"video": "/s/live-2.mp4"}}).to_string());
-        r.event("m2", "v1", json!({"recorded": {"video": "/x/theirs.mp4"}}).to_string());
+        r.event("m1", "v1", json!({"recorded": {"video": "/s/live-2.mp4"}}));
+        r.event("m2", "v1", json!({"recorded": {"video": "/x/theirs.mp4"}}));
         let recs = r.recordings("s1", None);
         assert_eq!(recs.iter().map(|x| x.video.as_str()).collect::<Vec<_>>(), ["/s/live-1.mp4", "/s/live-2.mp4"]);
         assert_eq!(recs.first().and_then(|x| x.file("test")), Some("/s/live-1.spec.ts"));
@@ -717,7 +715,7 @@ mod tests {
         let (tx, rx) = async_channel::bounded(4);
         l.viewers.lock().push((1, tx));
         r.live.lock().insert("v2".into(), l);
-        r.event("m1", "v2", json!({"recorded": {"video": "/s/live-3.mp4"}}).to_string());
+        r.event("m1", "v2", json!({"recorded": {"video": "/s/live-3.mp4"}}));
         let said: Value = match rx.try_recv() {
             Ok(ToViewer::Event(e)) => serde_json::from_str(&e).unwrap_or_default(),
             _ => Value::Null,

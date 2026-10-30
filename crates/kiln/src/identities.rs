@@ -539,11 +539,7 @@ pub async fn runner_identity(hub: &Hub, machine: &str, instance: &str) -> anyhow
 /// A runner process asked for an identity ([`crate::proto::AgentMsg::Identity`]): the certificate,
 /// recorded, or why not, back to it. Its earlier certificates for the same subject are revoked by
 /// serial (the key goes on in the same process).
-pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
-    let ask: IdentityAsk = match serde_json::from_str(json) {
-        Ok(a) => a,
-        Err(e) => return tracing::debug!(agent = %machine, error = %e, "an unreadable identity request"),
-    };
+pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, ask: IdentityAsk) {
     let mut given = IdentityGiven { kind: ask.kind.clone(), of: ask.of.clone(), epoch: ask.epoch, ..IdentityGiven::default() };
     match issue(hub, peer, machine, &ask).await {
         Ok((uri, pem)) => {

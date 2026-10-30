@@ -140,7 +140,7 @@ mod tests {
 
     /// What a session is, as kiln makes it from a spec.
     fn info(kind: &str, own: Option<&str>) -> anyhow::Result<Info> {
-        let spec = serde_json::json!({ "kind": kind, "cwd": "/work/parser", "name": "the parser" }).to_string();
+        let spec = crate::harness::session::Spec { kind: kind.into(), cwd: Some("/work/parser".into()), name: Some("the parser".into()), ..Default::default() };
         let mut i = crate::harness::host::refusal("s1", &spec, "").into_iter().find_map(|u| if let Update::Open { info, .. } = u { Some(*info) } else { None }).ok_or_else(|| anyhow::anyhow!("no info"))?;
         i.harness_session = own.map(str::to_owned);
         i.exit = None;

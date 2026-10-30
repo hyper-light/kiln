@@ -450,14 +450,7 @@ pub async fn runner_up(hub: &Hub, runner: &str) {
 }
 
 /// `runner` says it took a deployment down (`AgentMsg::Undeployed`), or why it couldn't.
-pub async fn undeployed(hub: &Hub, runner: &str, json: &str) {
-    let said: Undeployed = match serde_json::from_str(json) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(runner, error = %e, "a runner's word on a deployment it took down doesn't read");
-            return;
-        }
-    };
+pub async fn undeployed(hub: &Hub, runner: &str, said: Undeployed) {
     let a = said.asked;
     if let Some(e) = said.error {
         tracing::warn!(runner, repo = %a.repo, environment = %a.environment, kind = %a.kind, error = %e, "a runner couldn't take a preview's deployment down: it's asked again later");

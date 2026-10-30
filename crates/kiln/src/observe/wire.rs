@@ -2,7 +2,8 @@
 //! `ServerMsg::Observe` and `AgentMsg::Observe` on a lane of their own: a [`Msg`] as JSON, so either
 //! side can add fields, and beside it the bytes it carries (a hyper-raft message's, or a write's
 //! entry). A snapshot's files travel over HTTP instead (`GET /api/observe/v1/snapshot/...`), with
-//! the token [`Msg::Member`] gives a machine. A side that doesn't know a kind skips it.
+//! the token [`Msg::Member`] gives a machine. A side that doesn't know a kind doesn't apply it: it's
+//! refused to its sender, as any payload that can't be read is (`crate::wire::payload`), and noted.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

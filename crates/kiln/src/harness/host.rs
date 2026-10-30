@@ -432,6 +432,9 @@ enum Lane {
     /// at (its inbox's fence lifted).
     Open { epoch: u64, back: bool },
     Cmd { c: Box<Command>, epoch: Option<u64> },
+    /// A message for it, sent for `epoch`, that this machine couldn't read, its id `message` read:
+    /// its inbox says what became of it ([`unread_message`]); `why`, as it's said.
+    Unread { message: String, epoch: Option<u64>, why: String },
     /// Everything before it is done.
     Mark(futures::channel::oneshot::Sender<()>),
     /// It went on elsewhere from `epoch`, the epoch it was at here: its inbox here takes nothing
@@ -858,7 +861,10 @@ impl Host {
     }
 
     fn take_over(&self, from: &str, data: &[u8], leaving: bool) -> Result<(), Refused> {
-        let pkg: super::moving::Package = match serde_json::from_slice(data) {
+        // What came, read as every payload is (`crate::wire::payload`): its fields this build
+        // doesn't know taken and counted.
+        let read = std::str::from_utf8(data).map_err(|e| e.to_string()).and_then(|json| crate::wire::payload::<super::moving::Package>(crate::wire::unread::Wire::ServerPayload, "HarnessPackage", json).map_err(|e| e.to_string()));
+        let pkg = match read {
             Ok(pkg) => pkg,
             Err(_) if leaving => return Err(Refused::NotTaken(LEAVING.into())),
             Err(e) => return Err(Refused::NotTaken(format!("the session from {from} is unreadable: {e}"))),
@@ -1175,6 +1181,27 @@ impl Host {
         self.command_at(id, c, None)
     }
 
+    /// A message for session `id`, sent for `epoch`, that this machine couldn't read, its id
+    /// `message` read: down the session's lane after what came before it, its inbox says what
+    /// became of it ([`unread_message`]). Its lane full, it's refused so, as a message is
+    /// ([`Host::command_at`]), to be sent again. False when the session has no lane here, or its
+    /// lane is ending.
+    pub fn unreadable_at(&self, id: &str, message: String, epoch: Option<u64>, why: String) -> bool {
+        let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
+        match lane.try_send(Lane::Unread { message, epoch, why }) {
+            Ok(()) => true,
+            Err(async_channel::TrySendError::Full(Lane::Unread { message, .. })) => {
+                let said = Said { message, answer: Err(inbox::Refusal::Full { session: id.to_owned(), limit: LANE }) };
+                let (sink, id) = (self.sink.clone(), id.to_owned());
+                crate::rt::spawn(async move {
+                    let _ = sink.send((id, Update::Inbox { said: Box::new(said) })).await;
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Hands `c` to session `id`, sent for its `epoch` when the sender says so (the server, from what
     /// it last heard of the session): after whatever it was told before, in order. A message goes
     /// through its inbox first, and what became of it is said back ([`Update::Inbox`]). False when
@@ -1272,6 +1299,7 @@ impl Host {
     async fn step(&self, id: &str, item: Lane) {
         match item {
             Lane::Cmd { c, epoch } => self.take(id, *c, epoch).await,
+            Lane::Unread { message, epoch, why } => self.unread(id, message, epoch, &why).await,
             Lane::Mark(done) => {
                 let _ = done.send(());
             }
@@ -1324,6 +1352,21 @@ impl Host {
             if let Some(inbox) = &self.inbox {
                 let _ = inbox.tidy(id).await;
             }
+        }
+    }
+
+    /// A message for session `id` this machine couldn't read, as its inbox answers it
+    /// ([`unread_message`]); held (a new build not promoted yet), refused as any message is.
+    async fn unread(&self, id: &str, message: String, epoch: Option<u64>, why: &str) {
+        let s = self.get(id);
+        if self.is_held()
+            && let Some(s) = &s
+        {
+            self.say(id, Said { message, answer: Err(inbox::Refusal::Moved { session: id.to_owned(), epoch: s.epoch() }) }).await;
+            return;
+        }
+        if let Some(said) = unread_message(self.inbox.as_deref(), id, s.as_deref(), message, epoch, why, self.clock.unix_ms()).await {
+            self.say(id, said).await;
         }
     }
 
@@ -1893,6 +1936,37 @@ pub(crate) async fn take_message<T: Taker + ?Sized>(inbox: Option<&Inbox>, id: &
     Some(Said { message, answer })
 }
 
+/// A message for session `id` (held here as `s`; none: it isn't), sent for `epoch`, that this machine
+/// couldn't read, its id `message` read: what to tell its sender, from its `inbox`
+/// ([`Inbox::unreadable`]). A repeat of one it took is answered as one, so its sender's retry is
+/// never a second message; one it never took is refused for good; one for an epoch the session
+/// isn't at here is refused so, and sent where it is. Nothing is said while the inbox can't be read,
+/// or without one: the sender's wait ends as it does.
+pub(crate) async fn unread_message<T: Taker + ?Sized>(inbox: Option<&Inbox>, id: &str, s: Option<&T>, message: String, epoch: Option<u64>, why: &str, at: i64) -> Option<Said> {
+    let Some(s) = s else {
+        return Some(Said { message, answer: Err(inbox::Refusal::NoSession { session: id.to_owned() }) });
+    };
+    if s.is_moving() {
+        return Some(Said { message, answer: Err(gone(s, id)) });
+    }
+    let inbox = inbox?;
+    let mut answer = inbox.unreadable(id, &message, epoch, why, at).await;
+    // Its inbox behind the epoch it's at (opening it failed): opened now, and asked again.
+    let lagging = match &answer {
+        Err(inbox::Refusal::Behind { here, .. }) => *here < s.epoch(),
+        Err(inbox::Refusal::Moved { epoch: at, .. }) => *at < s.epoch(),
+        _ => false,
+    };
+    if lagging && inbox.open(id, s.epoch()).await.is_ok() {
+        answer = inbox.unreadable(id, &message, epoch, why, at).await;
+    }
+    if let Err(e @ inbox::Refusal::Unavailable { .. }) = &answer {
+        tracing::warn!(target: "kiln.sends", event = "unread_unanswered", session = %id, %message, error = %e, "a message this machine couldn't read isn't answered: its inbox can't be read now");
+        return None;
+    }
+    Some(Said { message, answer })
+}
+
 /// Session `id` is here at `epoch` (`back`: taken back by this host at the epoch it left at), with
 /// the ids of the messages it `brought`: its inbox opened (or taken back), and those taken as its own.
 pub(crate) async fn arrive(inbox: &Inbox, id: &str, epoch: u64, brought: &[(String, String)], back: bool, at: i64) {
@@ -2090,8 +2164,7 @@ pub fn shell_context(pid: u32) -> (Option<String>, Vec<(String, String)>) {
 }
 
 /// Updates that show a session this machine could not start (and why), so it can be dismissed.
-pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Update> {
-    let spec: Spec = serde_json::from_str(spec_json).unwrap_or_default();
+pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
     let now = crate::util::now_ms();
     let kind = Kind::get(&spec.kind);
     let exit = super::model::ExitInfo::now(None, Some(error.to_owned()));
@@ -2797,6 +2870,192 @@ mod tests {
             anyhow::ensure!(reached.is_ok(), "no prompt reached the harness");
             assert_eq!(prompts(), ["m1"]);
             assert!(s.core.lock().state.queue.is_empty(), "no copy waits behind it");
+            Ok(())
+        })
+    }
+
+    /// T3's check of typed messages' step 4: a message its runner can't read, its id read, is
+    /// answered by its session's inbox. Taken before (its first try read), it's that message's
+    /// repeat, the first time's answer, handed to nothing. Never taken, it's refused for good, as
+    /// often as it comes. For an epoch the session has left, it's refused so, to be sent where the
+    /// session is.
+    #[test]
+    fn a_message_its_runner_cant_read_is_its_repeat_or_refused_for_good() -> anyhow::Result<()> {
+        struct Here(u64, Mutex<Vec<String>>);
+        impl Taker for Here {
+            fn is_moving(&self) -> bool {
+                false
+            }
+            fn epoch(&self) -> u64 {
+                self.0
+            }
+            fn hand(&self, c: Command) -> bool {
+                if let Command::Send { id, .. } = c {
+                    self.1.lock().push(id);
+                }
+                true
+            }
+        }
+        crate::rt::block_on(async move {
+            let inbox = Inbox::new(Arc::new(kiln_seams::records::SimRecords::new()), inbox::Limits::default());
+            inbox.open("s1", 2).await?;
+            let here = Here(2, Mutex::new(Vec::new()));
+            let first = take_message(Some(&inbox), "s1", Some(&here), message("m1", "build it"), Some(2), 1).await.map(|s| s.answer);
+            let Some(Ok(first)) = first else { anyhow::bail!("m1 taken: {first:?}") };
+            let again = unread_message(Some(&inbox), "s1", Some(&here), "m1".into(), Some(2), "unknown: teleport", 2).await.map(|s| s.answer);
+            anyhow::ensure!(again == Some(Ok(Answer { repeat: true, ..first.clone() })), "m1's repeat: {again:?}");
+            for at in [3, 4] {
+                let never = unread_message(Some(&inbox), "s1", Some(&here), "m2".into(), Some(2), "unknown: teleport", at).await.map(|s| s.answer);
+                anyhow::ensure!(matches!(&never, Some(Err(inbox::Refusal::Invalid { what, why })) if what == "message" && why == "its runner couldn't read it: unknown: teleport"), "{never:?}");
+            }
+            let stale = unread_message(Some(&inbox), "s1", Some(&here), "m3".into(), Some(1), "unknown: teleport", 5).await.map(|s| s.answer);
+            anyhow::ensure!(matches!(stale, Some(Err(inbox::Refusal::StaleEpoch { sent: 1, current: 2, .. }))), "{stale:?}");
+            anyhow::ensure!(*here.1.lock() == ["m1"], "m1 handed once, nothing else: {:?}", here.1.lock());
+            Ok(())
+        })
+    }
+
+    /// T3's scenario: m1's first try is read and reaches the harness; its answer lost, the retry
+    /// under its id can't be read here (a newer server's form of it, mid-rollout). Down the
+    /// session's lane, the retry is m1's repeat with the first answer, and the harness gets one
+    /// prompt; a message under an id never taken, unreadable, is refused for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_retry_its_runner_cant_read_is_the_first_messages_repeat() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let heard = dir.path().join("heard.jsonl");
+            let program = dir.path().join("recording-claude");
+            std::fs::write(&program, format!("#!/bin/sh\nexec cat >> '{}'\n", heard.display()))?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+            let (tx, rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("unread".into()), spec)?;
+            let started = crate::rt::timeout(Duration::from_secs(10), async {
+                while s.pid.lock().is_none() || s.core.lock().meta.features.is_empty() {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(started.is_ok(), "the recording harness never started");
+            assert!(host.command("unread", message("m1", "build it")));
+            assert!(host.unreadable_at("unread", "m1".into(), None, "unknown: teleport".into()));
+            assert!(host.unreadable_at("unread", "m2".into(), None, "unknown: teleport".into()));
+            let said = answers(&rx, 3).await?;
+            let first = said.first().and_then(|s| s.answer.clone().ok()).ok_or_else(|| anyhow::anyhow!("{said:?}"))?;
+            assert!(!first.repeat, "{first:?}");
+            assert_eq!(said.get(1).map(|s| s.answer.clone()), Some(Ok(Answer { repeat: true, ..first })));
+            assert!(matches!(said.get(2).map(|s| &s.answer), Some(Err(inbox::Refusal::Invalid { .. }))), "{said:?}");
+            let prompts = || -> Vec<String> {
+                std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).filter_map(|v| v.get("uuid").and_then(serde_json::Value::as_str).map(str::to_owned)).collect()
+            };
+            let reached = crate::rt::timeout(Duration::from_secs(10), async {
+                while prompts().is_empty() {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(reached.is_ok(), "no prompt reached the harness");
+            // Long enough for a second prompt to have come, were there one.
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            assert_eq!(prompts(), ["m1"]);
+            Ok(())
+        })
+    }
+
+    /// Records whose commits wait while `stalled`, counting those waiting: a session's lane held
+    /// behind a step its inbox's records haven't answered.
+    #[derive(Default)]
+    struct Stalling {
+        inner: kiln_seams::records::SimRecords,
+        stalled: std::sync::atomic::AtomicBool,
+        waiting: std::sync::atomic::AtomicUsize,
+    }
+
+    impl kiln_seams::Records for Stalling {
+        fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: kiln_seams::records::Consistency) -> futures::future::BoxFuture<'a, Result<Option<kiln_seams::records::Row>, kiln_seams::records::Refusal>> {
+            self.inner.get(family, key, at)
+        }
+        fn scan<'a>(&'a self, family: &'a str, scan: kiln_seams::records::Scan) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Page, kiln_seams::records::Refusal>> {
+            self.inner.scan(family, scan)
+        }
+        fn commit<'a>(&'a self, tx: kiln_seams::records::Tx) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, kiln_seams::records::Refusal>> {
+            use std::sync::atomic::Ordering;
+            Box::pin(async move {
+                if self.stalled.load(Ordering::SeqCst) {
+                    self.waiting.fetch_add(1, Ordering::SeqCst);
+                    while self.stalled.load(Ordering::SeqCst) {
+                        crate::rt::sleep(Duration::from_millis(5)).await;
+                    }
+                    self.waiting.fetch_sub(1, Ordering::SeqCst);
+                }
+                self.inner.commit(tx).await
+            })
+        }
+        fn changes<'a>(&'a self, family: &'a str, after: kiln_seams::records::Rev, limit: usize) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Changes, kiln_seams::records::Refusal>> {
+            self.inner.changes(family, after, limit)
+        }
+        fn wait<'a>(&'a self, family: &'a str, after: kiln_seams::records::Rev) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, kiln_seams::records::Refusal>> {
+            self.inner.wait(family, after)
+        }
+        fn head(&self) -> futures::future::BoxFuture<'_, Result<kiln_seams::records::Rev, kiln_seams::records::Refusal>> {
+            self.inner.head()
+        }
+    }
+
+    /// T3's second check of typed messages' step 4: a send its runner can't read, its session here
+    /// but its lane full, is refused `full` (sent again later, as a message is), never said gone:
+    /// no `Closed`, nothing final. Once the lane drains, sent again, it's the first message's repeat.
+    #[test]
+    fn an_unreadable_retry_meeting_a_full_lane_is_refused_full_not_gone() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let records = Arc::new(Stalling::default());
+            let host = Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(records.clone()));
+            host.open(Some("s".into()), no_harness(dir.path()))?;
+            assert!(host.command("s", message("m1", "x")));
+            let first = answers(&rx, 1).await?.first().and_then(|s| s.answer.clone().ok()).ok_or_else(|| anyhow::anyhow!("m1 not taken"))?;
+            // A step held on its records, and the lane behind it full.
+            records.stalled.store(true, Ordering::SeqCst);
+            assert!(host.command("s", message("f0", "x")));
+            let held = crate::rt::timeout(Duration::from_secs(10), async {
+                while records.waiting.load(Ordering::SeqCst) == 0 {
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(held.is_ok(), "the lane's step never reached its records");
+            for n in 1..=LANE {
+                assert!(host.command("s", message(&format!("f{n}"), "x")), "f{n}");
+            }
+            // m1 again, unreadable here: its session is here, its lane full.
+            let unread = crate::wire::payload_of(crate::proto::ServerMsg::HarnessSend { session: "s".into(), epoch: 0, json: r#"{"type":"teleport","id":"m1"}"#.into() });
+            let Err(e) = unread else { anyhow::bail!("a command this runner doesn't know was read") };
+            anyhow::ensure!(crate::agent::unread_send(Some(&*host), &e).is_empty(), "nothing said of it gone");
+            let mut said = Vec::new();
+            let got = crate::rt::timeout(Duration::from_secs(10), async {
+                loop {
+                    match rx.recv().await {
+                        Ok((_, super::super::core::Update::Inbox { said: s })) if s.message == "m1" => break Some(*s),
+                        Ok((_, u)) => said.push(u),
+                        Err(_) => break None,
+                    }
+                }
+            })
+            .await;
+            let full = got.ok().flatten();
+            anyhow::ensure!(matches!(full.as_ref().map(|s| &s.answer), Some(Err(inbox::Refusal::Full { .. }))), "refused full: {full:?}");
+            anyhow::ensure!(!said.iter().any(|u| matches!(u, super::super::core::Update::Closed)), "the session isn't said to have ended");
+            // The lane drains; sent again, m1 unreadable is its repeat.
+            records.stalled.store(false, Ordering::SeqCst);
+            let _ = answers(&rx, LANE + 1).await?;
+            assert!(host.unreadable_at("s", "m1".into(), None, "unknown: teleport".into()));
+            let again = answers(&rx, 1).await?;
+            assert_eq!(again.first().map(|s| s.answer.clone()), Some(Ok(Answer { repeat: true, ..first })));
             Ok(())
         })
     }

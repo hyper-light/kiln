@@ -182,11 +182,7 @@ pub const WAIT: Duration = Duration::from_secs(240);
 /// [`crate::harness::session::Info::work_dir`]), the files a finding cites under its folder
 /// (`cwd`), and its workspace `ws` when it has one of its own: `{"facts"}`, `{"made", "said"}`,
 /// `{"drift"}`, `{"plan"}`, `{"landed"}`, or `{"error"}`.
-pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: &str) -> Value {
-    let ask: Ask = match serde_json::from_str(ask) {
-        Ok(a) => a,
-        Err(e) => return json!({"error": format!("a question this machine doesn't understand ({e}): its kiln may be older than the server's")}),
-    };
+pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: Ask) -> Value {
     let r = match ask {
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         ask => answer(work, ws, ask).await,

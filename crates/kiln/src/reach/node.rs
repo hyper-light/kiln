@@ -143,7 +143,7 @@ pub enum In {
     /// A frame of a link, relayed by the server ([`crate::proto::ServerMsg::Reach`]).
     Frame { from: String, link: String, open: bool, data: Vec<u8>, close: Option<String> },
     /// The server's answer to a question ([`crate::proto::ServerMsg::ReachAnswer`]).
-    Answer { req: u64, json: String },
+    Answer { req: u64, answer: Value },
     /// The connection to the server came up (true) or went (false).
     Server(bool),
     Local(Local),
@@ -624,7 +624,7 @@ impl Node {
     async fn on(&mut self, m: In) {
         match m {
             In::Frame { from, link, open, data, close } => self.on_frame(from, link, open, data, close).await,
-            In::Answer { req, json } => self.on_answer(req, &json).await,
+            In::Answer { req, answer } => self.on_answer(req, answer).await,
             In::Server(up) => {
                 self.server = up;
                 // Whatever the directory said may have changed while away: ask again.
@@ -686,15 +686,15 @@ impl Node {
         self.directory.as_ref().filter(|(at, _)| at.elapsed() < DIRECTORY_TTL).map(|(_, d)| d.as_slice())
     }
 
-    async fn on_answer(&mut self, req: u64, json: &str) {
+    async fn on_answer(&mut self, req: u64, answer: Value) {
         if let Some((_, reply)) = self.queries.remove(&req) {
-            let _ = reply.send(Ok(json.to_owned()));
+            let _ = reply.send(Ok(answer.to_string()));
             return;
         }
         if self.asked.remove(&req).is_none() {
             return;
         }
-        let runners: Vec<RunnerInfo> = serde_json::from_str::<Value>(json).ok().and_then(|v| v.get("runners").cloned()).and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
+        let runners: Vec<RunnerInfo> = answer.get("runners").cloned().and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
         self.directory = Some((Instant::now(), runners.clone()));
         for (_, w) in std::mem::take(&mut self.waiting) {
             match w {

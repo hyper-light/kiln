@@ -1307,7 +1307,7 @@ impl Registry {
                 let task = task.to_owned();
                 Ok(Some(crate::rt::blocking(move || s.task_output(&task, since)).await?))
             }
-            Some(Location::Machine(m)) => Ok(hub.harness_task_output(&m, id, task, since).await?.and_then(|j| serde_json::from_str(&j).ok())),
+            Some(Location::Machine(m)) => hub.harness_task_output(&m, id, task, since).await,
         }
     }
 
@@ -1325,7 +1325,7 @@ impl Registry {
                 .await?;
                 Ok(Some(serde_json::to_value(past)?))
             }
-            Location::Machine(m) => Ok(hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX)).await?.and_then(|j| serde_json::from_str(&j).ok())),
+            Location::Machine(m) => hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX)).await?.map(serde_json::to_value).transpose().map_err(Into::into),
         }
     }
 

@@ -271,6 +271,24 @@ pub enum AgentMsg {
     Unread { wire: crate::wire::unread::Wire, what: String, code: crate::wire::unread::Code, why: String, folded: u64, session: Option<String> },
 }
 
+/// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
+/// its attempt (`seq`, from runners that send a leg's events again after a reconnect).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(flatten)]
+    pub event: kiln_ci::wire::JobEventV2,
+}
+
+/// A secret that became available to a running leg ([`ServerMsg::SecretsFor`]'s JSON). Never
+/// logged, so no `Debug`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SecretFor {
+    pub name: String,
+    pub value: String,
+}
+
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]

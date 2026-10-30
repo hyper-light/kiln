@@ -652,7 +652,7 @@ impl Streams {
 
 /// `ServerMsg::StreamOpen` on a runner: the stream opened, its chunks and events sent up on their
 /// lane; whether it opened, said.
-pub async fn serve_open(dir: PathBuf, id: String, session: String, json: String, up: async_channel::Sender<crate::exec::Up>) {
+pub async fn serve_open(dir: PathBuf, id: String, session: String, mut spec: Spec, up: async_channel::Sender<crate::exec::Up>) {
     use crate::exec::Up;
     use futures::FutureExt as _;
     let (tx, rx) = async_channel::bounded::<Out>(512);
@@ -680,16 +680,10 @@ pub async fn serve_open(dir: PathBuf, id: String, session: String, json: String,
             }
         }
     });
-    let spec = serde_json::from_str::<Spec>(&json).map(|mut s| {
-        s.session = Some(session);
-        s
-    });
-    let said = match spec {
-        Ok(spec) => match streams().open(&dir, &id, &spec, Outs { events: tx.clone(), chunks }).await {
-            Ok(v) => v,
-            Err(e) => json!({"error": format!("{e:#}")}),
-        },
-        Err(e) => json!({"error": format!("not a stream's spec: {e}")}),
+    spec.session = Some(session);
+    let said = match streams().open(&dir, &id, &spec, Outs { events: tx.clone(), chunks }).await {
+        Ok(v) => v,
+        Err(e) => json!({"error": format!("{e:#}")}),
     };
     let _ = tx.send(Out::Event { stream: id, json: said.to_string() }).await;
 }
@@ -703,26 +697,16 @@ fn agent_msg(o: Out) -> crate::proto::AgentMsg {
 }
 
 /// `ServerMsg::StreamInput` on a runner: queued for its stream, in order.
-pub fn serve_input(id: &str, json: &str) {
+pub fn serve_input(id: &str, events: Vec<Input>) {
     let Some(s) = streams().get(id) else { return };
-    match serde_json::from_str::<Vec<Input>>(json) {
-        Ok(events) => {
-            // A viewer far ahead of the page loses what the page can't take.
-            let _ = s.inputs.try_send(events);
-        }
-        Err(e) => tracing::debug!(stream = id, error = %e, "a viewer's input isn't any kiln knows"),
-    }
+    // A viewer far ahead of the page loses what the page can't take.
+    let _ = s.inputs.try_send(events);
 }
 
 /// `ServerMsg::StreamControl` on a runner: queued for its stream, done in order (`controlled`).
-pub fn serve_control(id: &str, json: &str) {
+pub fn serve_control(id: &str, c: Value) {
     let Some(s) = streams().get(id) else { return };
-    match serde_json::from_str::<Value>(json) {
-        Ok(c) => {
-            let _ = s.controls.try_send(c);
-        }
-        Err(e) => tracing::debug!(stream = id, error = %e, "a viewer's request isn't any kiln knows"),
-    }
+    let _ = s.controls.try_send(c);
 }
 
 /// What its viewers ask of a stream, done in the order they asked, one at a time: a new size and a

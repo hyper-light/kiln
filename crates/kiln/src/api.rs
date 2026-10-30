@@ -2228,7 +2228,7 @@ async fn voice_transcribe(hub: &Hub, q: &HashMap<String, String>, req: Request) 
 async fn ai_view(hub: &Hub, machine: &str, pid: &str) -> R {
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
     match hub.ai_view(machine, pid).await {
-        Ok(Some(json)) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(json))),
+        Ok(Some(view)) => Ok(srv::json(StatusCode::OK, &view)),
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "no view for that session (not Claude Code, or no transcript)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
@@ -2237,10 +2237,7 @@ async fn ai_view(hub: &Hub, machine: &str, pid: &str) -> R {
 async fn ai_transcript(hub: &Hub, machine: &str, pid: &str) -> R {
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
     match hub.ai_transcript(machine, pid).await {
-        Ok(Some(json)) => {
-            let entries: serde_json::Value = serde_json::from_str(&json).map_err(|e| err(StatusCode::BAD_GATEWAY, format!("unreadable transcript: {e}")))?;
-            Ok(srv::json(StatusCode::OK, &entries))
-        }
+        Ok(Some(entries)) => Ok(srv::json(StatusCode::OK, &entries)),
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that session has no transcript")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
@@ -5539,14 +5536,11 @@ async fn machine_dirs(hub: &Hub, target: &str, q: &HashMap<String, String>) -> R
     if !agents {
         return Err(err(StatusCode::FORBIDDEN, format!("{machine} has terminals (and so agents) turned off")));
     }
-    let json = match hub.dir_list(machine, &path).await {
-        Ok(Some(json)) => json,
-        Ok(None) => return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is too old to list folders: upgrade it"))),
-        Err(e) => return Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
-    };
-    let listing: crate::dirs::Listing =
-        serde_json::from_str(&json).map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{machine} sent an unreadable folder list: {e}")))?;
-    Ok(srv::json(StatusCode::OK, &listing))
+    match hub.dir_list(machine, &path).await {
+        Ok(Some(listing)) => Ok(srv::json(StatusCode::OK, &listing)),
+        Ok(None) => Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is too old to list folders: upgrade it"))),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    }
 }
 
 // ------------------------------------------------------------------ misc

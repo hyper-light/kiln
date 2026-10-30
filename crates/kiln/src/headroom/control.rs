@@ -108,9 +108,9 @@ pub async fn on_caps(hub: &Hub, machine: &str, caps: u64) {
     }
 }
 
-/// What a runner process reports (`AgentMsg::HeadroomStatus`): kept when it's the machine's newest.
-pub fn on_status(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
-    let Ok(status) = serde_json::from_str::<serde_json::Value>(json) else { return };
+/// What a runner process reports (`AgentMsg::HeadroomStatus`, read by `wire::payload`): kept when
+/// it's the machine's newest.
+pub fn on_status(hub: &Hub, peer: PeerId, machine: &str, status: serde_json::Value) {
     if peers(hub, machine).0 != Some(peer) {
         return;
     }

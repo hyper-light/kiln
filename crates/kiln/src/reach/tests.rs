@@ -128,11 +128,11 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
                 AgentMsg::ReachAsk { req, json: asked } => {
                     // An agent's question for kiln's operations comes back as what it asked.
                     let ask: serde_json::Value = serde_json::from_str(&asked).unwrap_or_default();
-                    let json = match ask.get("op").and_then(serde_json::Value::as_str) {
-                        Some("call") => serde_json::json!({"ok": {"name": ask.get("name"), "input": ask.get("input"), "session": ask.get("session")}}).to_string(),
-                        _ => serde_json::json!({ "runners": *directory.lock() }).to_string(),
+                    let answer = match ask.get("op").and_then(serde_json::Value::as_str) {
+                        Some("call") => serde_json::json!({"ok": {"name": ask.get("name"), "input": ask.get("input"), "session": ask.get("session")}}),
+                        _ => serde_json::json!({ "runners": *directory.lock() }),
                     };
-                    handle_of(from).feed(In::Answer { req, json }).await;
+                    handle_of(from).feed(In::Answer { req, answer }).await;
                 }
                 _ => {}
             }

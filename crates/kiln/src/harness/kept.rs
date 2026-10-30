@@ -241,8 +241,7 @@ pub async fn piece(hub: &Hub, location: &Location, session: &str, path: &str, of
             Ok(Some((a, r.map(|(_, d)| d).unwrap_or_default())))
         }
         Location::Machine(m) => {
-            let Some((json, data)) = hub.harness_file_read(m, session, path, offset, len).await? else { return Ok(None) };
-            Ok(Some((serde_json::from_str(&json)?, data)))
+            hub.harness_file_read(m, session, path, offset, len).await
         }
     }
 }
