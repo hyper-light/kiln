@@ -225,6 +225,8 @@ production:
 | GET | `/api/diffs/:id/conflicts` | its latest revision replayed onto where it lands: each conflict where it falls, what's left to resolve, whether Commit resolution may go (`ready`) |
 | POST/DELETE | `/api/diffs/:id/conflicts/:conflict/resolution` | `{ take: main \| this \| both \| agent \| edit, lines? \| text? }` (an agent's is kept as the agent's); DELETE takes it back |
 | POST | `/api/diffs/:id/conflicts/commit` | Commit resolution: one revision, its why `conflict resolved` (`diffs.submit`, a person) |
+| POST | `/api/change-requests/:id/update` | Update (W26-R16): its branch moved to its replay, with a lease; a diff has no branch (`diffs.submit`) |
+| GET | `/api/diffs/:id/collisions` | The open changes it changes the same lines as (W26-R16's collision radar) |
 | POST | `/api/diffs/:id/land` | land it and everything below |
 | GET | `/api/repos/:repo/queue` | the land queue; `DELETE /api/queue/:entry` takes one out |
 | GET | `/api/stacks/:id` | a stack as a tree |

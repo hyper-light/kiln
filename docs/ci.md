@@ -8546,6 +8546,53 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   open change's branch is then pushed each time main moves, with heavy API use and many more CI runs
   on GitHub, GitLab and Bitbucket, and that everyone must pull or rebase before pushing. The planner
   is pure: `kiln_ci::fresh`.
+  - *Built* (plan `01a17856b1b9705cbaa54ae45a51a50c`, branch `w26-fresh`).
+    - **When it runs.** On every move of a trunk, whoever runs the repository's CI: a push the
+      poller sees (ahead of the CI engine's `enabled` check) and the land queue's own moves, whose
+      restack is now this same path. A burst of moves is one round (`crates/kiln/src/ci/fresh.rs`,
+      a queue on the hub).
+    - **The order.** Stack by stack, bottom first. A bottom goes onto the tip; a change above goes
+      onto the revision below it, this round's or the latest, and moves when that one did.
+    - **A replay.** `git merge-tree --write-tree` in kiln's own copy, not `git replay`, which is
+      experimental, makes its own unsigned commits and keeps nothing on a conflict. A diff is
+      cherry-picked onto where it goes; a change request or a host's pull request has the trunk
+      merged in.
+    - **Clean.** Committed by kiln through `revision::commit`, its author and message (and
+      `Kiln-Change`) kept: the path W27-R03 signs, so a replay is signed as kiln when the signing
+      plan's step 2 lands, and reads "unsigned" until then. It's kept as a rebase-only revision, why
+      `replayed`, so approvals carry under `sticky-approvals: rebase`.
+    - **No runs of its own.** A replay starts no checks (a run per open change on every move is the
+      cost Kodiak's `update.always` warns of, and the land candidate tests it on the trunk anyway).
+      Its checks are carried from the version it replays, and the page and row say so ("checks
+      from v4", the version's `checks_from`).
+    - **Conflicted.** Kept as a revision too: git's merge with its markers in, why `replayed with
+      conflicts`, not rebase-only. Its conflicts are kept as R12's are, and the version names its
+      replay (`review_replays.kept_version`) in the same transaction, so the gate holds on it until
+      a resolution is committed. The changes above it replay onto it and keep moving, as jj's do.
+      A resolution is rebuilt from the version that was replayed, and the changes above then move
+      onto it. The conflict ladder (R17) takes it from `conflicts::current`.
+    - **Refs.** A round's versions go in in one transaction, and their `refs/kiln/diffs/<D>/v<n>`
+      move in one `git update-ref --stdin` transaction. A host's pull request is replayed in kiln's
+      mirror and kept at `refs/kiln/pulls/<host>/<n>/replays/<k>` (`review_pull_replays`).
+    - **Update.** `POST /api/change-requests/:id/update` moves a change request's branch to its
+      replay with a lease, refusing, with the reason, when the branch moved since. A diff has no
+      branch. A host's pull request goes through the forge seam's `update` (GitHub's update-branch
+      against the expected head, GitLab's rebase, else the replay pushed with a lease).
+    - **`.kiln/review.yaml`'s `fresh:`.** `replay` (on by default: a repository can keep its
+      changes where their authors put them), `push: manual | auto` and `conflict-agents` (both
+      off). A change turning `push: auto` on warns on approval, through R11's gate, in the words
+      above.
+    - **The collision radar.** After every round, and whenever a kiln diff or change request gets
+      a revision, kiln reads each open change's own lines (a diff's patch; a branch's from where
+      it left the trunk; a mirrored repository's pull requests too). Two changes from different
+      stacks changing the same lines of a file are told to both authors once a pair and file
+      (`change.collision`), listed at `GET /api/diffs/:id/collisions`, and marked gone once they
+      no longer overlap. A host pull request's new head is read on the trunk's next move.
+    - **Freshness.** `GET /api/diffs/:id`'s `fresh`: its words ("replays clean on main@4c1e2a"),
+      whether Update can go and why not, and `checks_from`.
+    - **Open, for the signing plan.** A clean replay is rebase-only, so approvals carry by policy.
+      A signed verdict (W27-R04) carries only to the same verbatim patch-id, so it doesn't verify
+      on a clean replay whose surrounding lines changed.
 - **W26-R17 The conflict ladder.** A conflicted replay is kept as a conflicted revision, so the stack
   above it still moves, and goes up a ladder, each rung checked by the affected tests: a structural
   merge, a resolution remembered from the same hunk, the author's agent (or, where a repository turns
