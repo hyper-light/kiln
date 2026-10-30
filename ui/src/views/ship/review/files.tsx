@@ -326,7 +326,9 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   return (
     <Frame
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · v${version}${ch.latest > version ? ` of ${ch.latest}` : ""}`}
-      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} />}
+      bar={
+        <GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length, offered: cf.ladder?.state === "offered" }} diffKey={key} superseded={ch.superseded_by} />
+      }
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={

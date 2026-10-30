@@ -1075,6 +1075,74 @@
 .rv-seg button[data-rec] {
   color: #cdc6ea;
 }
+/* the conflict ladder (W26-R17): its line, one height from the first paint; its resolution; the
+   buttons in a grid of fixed rows */
+.rv-rung {
+  margin: 0;
+  height: 18px;
+  line-height: 18px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  color: #a1a4ad;
+}
+.rv-rung[data-k="working"],
+.rv-rung[data-k="testing"] {
+  color: #cdc6ea;
+}
+.rv-rung[data-k="passed"] {
+  color: #a8c9bc;
+}
+.rv-rung[data-k="failed"] {
+  color: #efb8bf;
+}
+.rv-cfs[data-side="offered"] {
+  box-shadow: inset 0 0 0 1px rgb(205 198 234 / 30%);
+}
+.rv-cfs[data-side="offered"] .rv-cfl {
+  color: #cdc6ea;
+}
+.rv-cfs[data-side="offered"] .rv-cf-says {
+  padding: 6px 10px 8px;
+  overflow-wrap: anywhere;
+}
+.rv-cfb {
+  display: grid;
+  grid-template-columns: repeat(4, max-content) 28px;
+  gap: 4px;
+  align-items: center;
+}
+.rv-cfb .rv-btn {
+  border: 0;
+  border-radius: 99px;
+  background: rgb(255 255 255 / 6%);
+  color: #c9ccd3;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+  padding: 5px 11px;
+  white-space: nowrap;
+}
+.rv-cfb .rv-btn:hover:not(:disabled) {
+  background: rgb(255 255 255 / 10%);
+}
+.rv-cfb .rv-btn[data-rec] {
+  color: #cdc6ea;
+}
+.rv-cfb .rv-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+@media (max-width: 560px) {
+  .rv-cfb {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .rv-cfb .rv-btn {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
 .rv-cta {
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 12.5px;

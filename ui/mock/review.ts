@@ -906,12 +906,26 @@ interface MockConflict {
   takes: ("main" | "this" | "both" | "agent" | "edit")[];
   agent: { by: string; take: string | null; lines: string[] | null; at: number | null } | null;
   resolution: { take: string; lines: string[] | null; by: string | null; at: number | null } | null;
+  offered?: { rung: string; by: string; state: string; why: string | null; lines: string[] | null; explanation: string | null; tests: string | null; signer: null } | null;
 }
 
 /** D41's conflicts with main when a test turns them on (`POST /api/mock/review/conflicts`). */
-const conflictState = { on: false };
+const conflictState: { on: boolean; ladder: null | "held" | "offered"; tests: "pending" | "passed" | "failed" } = { on: false, ladder: null, tests: "passed" };
 const takenResolutions = new Map<string, { take: string; lines: string[] | null; by: string; at: number }>();
-function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unknown; conflicts: MockConflict[]; unresolved: number; ready: boolean } {
+function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unknown; conflicts: MockConflict[]; unresolved: number; ready: boolean; ladder: { state: string; why: string[] } | null } {
+  // The conflict ladder (W26-R17) when a test turns it on: the agent resolved the text conflict.
+  const offered = conflictState.ladder
+    ? {
+        rung: "agent",
+        by: "agent:port for user:ada",
+        state: "resolved",
+        why: null,
+        lines: ["use serde_json::{Value, json}; // keeps main's alias"],
+        explanation: "Main renamed Value to Json; this change only needs both names in scope. Ran cargo test -p kiln-ci plan::matrix: 14 passed.",
+        tests: conflictState.tests,
+        signer: null,
+      }
+    : null;
   const list: MockConflict[] =
     d.name === "D41" && conflictState.on
       ? [
@@ -931,6 +945,7 @@ function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unkn
             takes: ["main", "this", "both", "agent", "edit"],
             agent: { by: "agent:port", take: null, lines: ["use serde_json::{Value, json}; // keeps main's alias"], at: now() - 100 },
             resolution: (takenResolutions.get("cf1") ?? null) as never,
+            offered,
           },
           {
             id: "cf2",
@@ -948,6 +963,7 @@ function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unkn
             takes: ["main", "this"],
             agent: null,
             resolution: (takenResolutions.get("cf2") ?? null) as never,
+            offered: conflictState.ladder ? { rung: "structural", by: "kiln", state: "kept", why: "a binary file", lines: null, explanation: null, tests: null, signer: null } : null,
           },
         ]
       : [];
@@ -972,6 +988,13 @@ function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unkn
     conflicts: list,
     unresolved,
     ready: list.length > 0 && unresolved === 0,
+    ladder:
+      list.length && conflictState.ladder
+        ? {
+            state: conflictState.ladder,
+            why: conflictState.ladder === "offered" ? ["a person confirms it: the repository's automatic resolution is off"] : ["a person takes a side or edits where every rung is spent"],
+          }
+        : null,
   };
 }
 
@@ -1010,8 +1033,10 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { ok: true }), true);
   }
   if (a === "mock" && b === "review" && m === "POST") {
-    const body = await ctx.body<{ conflicts?: boolean; emit?: { type: string; diff?: string } }>(req);
+    const body = await ctx.body<{ conflicts?: boolean; ladder?: null | "held" | "offered"; ladder_tests?: "pending" | "passed" | "failed"; emit?: { type: string; diff?: string } }>(req);
     if (body.conflicts !== undefined) conflictState.on = body.conflicts;
+    if (body.ladder !== undefined) conflictState.ladder = body.ladder;
+    if (body.ladder_tests !== undefined) conflictState.tests = body.ladder_tests;
     if (body.emit) ctx.emit(body.emit);
     return (ctx.json(res, 200, { ok: true }), true);
   }
@@ -1128,6 +1153,15 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     d.versions += 1;
     ctx.emit({ type: "diff_version", diff: d.name });
     return (ctx.json(res, 200, { diff: d.name, version: d.versions, why: "conflict resolved", commit: sha(`${d.name}v${d.versions}`), by: ME, signer: null, replay: "rp1", conflicts: 0 }), true);
+  }
+  if (c === "conflicts" && d2 === "accept" && m === "POST") {
+    if (conflictState.ladder !== "offered") return (ctx.err(res, 409, `${d.name}: nothing is offered yet`), true);
+    conflictState.on = false;
+    conflictState.ladder = null;
+    takenResolutions.clear();
+    d.versions += 1;
+    ctx.emit({ type: "diff_version", diff: d.name });
+    return (ctx.json(res, 200, { diff: d.name, version: d.versions, why: "conflict resolved", accepted_by: ME, replay: "rp1" }), true);
   }
   if (c === "conflicts" && d2 && e === "resolution") {
     const cf = conflictsOf(d).conflicts.find((x) => x.id === d2);

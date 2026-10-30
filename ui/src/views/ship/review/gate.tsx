@@ -2,7 +2,8 @@
  * The Files section's one row (docs/ci.md W26-R07, R08, f22): the open comments by kind (each
  * icon with its count) and Approve, its words the gate's — a blocking thread or a conflict holds
  * it disabled saying whose to resolve, open issues ask "Approve anyway", open nits are said on
- * approval; while conflicts remain, "Commit resolution" stands in Approve's place (W26-R12).
+ * approval; while conflicts remain, "Commit resolution" stands in Approve's place (W26-R12), and
+ * "Accept resolutions" while the conflict ladder offers its tested resolutions (W26-R17).
  * A host's pull request approves through the forge seam; a commit with no change shows no row.
  */
 import * as React from "react";
@@ -25,7 +26,7 @@ export function GateRow({
 }: {
   gate: ReviewGate | null;
   /** Unresolved conflicts left, and whether every one is taken (commit may go). */
-  conflicts: { unresolved: number; ready: boolean; total: number };
+  conflicts: { unresolved: number; ready: boolean; total: number; offered?: boolean };
   diffKey: string;
   /** The revision that replaced this one: Approve is off, naming it. */
   superseded?: string | null;
@@ -77,6 +78,20 @@ export function GateRow({
       }
     });
 
+  const accept = () =>
+    start(async () => {
+      setErr(null);
+      try {
+        const done = await conflictsApi.accept(diffKey);
+        invalidate("review/");
+        invalidate("ship/");
+        setNote({ k: "ok", t: `v${done.version} · conflicts resolved` });
+        onApprove?.();
+      } catch (e) {
+        setErr(said(e));
+      }
+    });
+
   const approve = (force: boolean) =>
     start(async () => {
       setErr(null);
@@ -99,7 +114,14 @@ export function GateRow({
       : (gate?.holds.map((h) => (h.by ? `${h.at}: ${h.by.replace(/^user:/, "")} resolves ${h.reason}` : `${h.at}: ${h.reason}`)).join(" · ") ?? "held");
 
   let action: React.ReactNode;
-  if (conflicts.total > 0 && conflicts.unresolved === 0 && conflicts.ready)
+  if (conflicts.offered && conflicts.unresolved > 0)
+    action = (
+      <button type="button" className="rv-btn rv-btn-go" disabled={busy} title="The conflict ladder's resolutions, tested together: accepting them makes the change's new version" onClick={accept}>
+        <Check size={13} aria-hidden="true" />
+        <span>Accept resolutions</span>
+      </button>
+    );
+  else if (conflicts.total > 0 && conflicts.unresolved === 0 && conflicts.ready)
     action = (
       <button type="button" className="rv-btn rv-btn-go" disabled={busy} onClick={commit}>
         <Check size={13} aria-hidden="true" />

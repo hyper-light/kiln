@@ -122,10 +122,10 @@ test("a conflict resolves where it falls and commits", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   const cf = row.locator(".rv-cf").first();
   await expect(cf).toBeVisible();
-  await cf.locator(".rv-seg button", { hasText: "this" }).click();
+  await cf.getByRole("button", { name: "Take D41" }).click();
   await expect(cf).toHaveAttribute("data-done", "1");
   const second = row.locator(".rv-cf").nth(1);
-  await second.locator(".rv-seg button", { hasText: "main" }).click();
+  await second.getByRole("button", { name: "Take main" }).click();
   const commit = row.locator(".rv-btn", { hasText: "Commit resolution" });
   await expect(commit).toBeEnabled();
   await commit.click();
@@ -146,8 +146,8 @@ test("every way to resolve a conflict, then Commit resolution clears the gate (W
   await expect(text).toContainText("conflict 1/2");
   await expect(text).toContainText("this change");
   await expect(text).toContainText("a person takes it");
-  for (const take of [/^main$/, /^this$/, /^both$/, /^agent's$/]) {
-    await text.locator(".rv-seg button", { hasText: take }).click();
+  for (const take of ["Take main", "Take D41", "Both", "Use the agent's"]) {
+    await text.getByRole("button", { name: take, exact: true }).click();
     await expect(text).toHaveAttribute("data-done", "1");
     await text.getByRole("button", { name: "Undo" }).click();
     await expect(text).not.toHaveAttribute("data-done", "1");
@@ -160,13 +160,45 @@ test("every way to resolve a conflict, then Commit resolution clears the gate (W
   const binary = row.locator(".rv-cf").nth(1);
   await expect(binary).toContainText("binary file changed on both sides");
   await expect(binary).not.toContainText("<<<<<<<");
-  await expect(binary.locator(".rv-seg button", { hasText: /^both$/ })).toHaveCount(0);
-  await binary.locator(".rv-seg button", { hasText: /^this$/ }).click();
+  await expect(binary.getByRole("button", { name: "Both", exact: true })).toHaveCount(0);
+  await binary.getByRole("button", { name: "Take D41" }).click();
   await expect(binary).toHaveAttribute("data-done", "1");
   await expect(row.getByRole("button", { name: /^Approve/ })).toHaveCount(0);
   // The commit makes the revision; the conflicts go and Approve is back in its place.
   await commit.click();
   await expect(commit).toHaveCount(0);
+  await expect(row.locator(".rv-cf")).toHaveCount(0);
+  await expect(row.getByRole("button", { name: /^Approve/ })).toBeVisible();
+});
+
+test("the conflict ladder: a rung's line at one height, its tested resolution, Use the agent's, then Accept resolutions (W26-R17)", async ({ page }) => {
+  await page.request.post("/api/mock/review", { data: { conflicts: true, ladder: "held", ladder_tests: "pending" } });
+  const row = await open(page, "pipeline: dynamic matrices");
+  const text = row.locator(".rv-cf").first();
+  for (const cf of [text, row.locator(".rv-cf").nth(1)]) if ((await cf.getAttribute("data-done")) === "1") await cf.getByRole("button", { name: "Undo" }).click();
+  // Under test: the line says so, and Use the agent's is drawn but disabled, saying why.
+  const line = text.locator(".rv-rung");
+  await expect(line).toContainText("testing…");
+  const use = text.getByRole("button", { name: "Use the agent's" });
+  await expect(use).toBeVisible();
+  const before = await line.boundingBox();
+  const buttonsBefore = await text.locator(".rv-cfb").boundingBox();
+  // Its tests pass: the same line, the same height, now passed; the resolution shows with its explanation.
+  await page.request.post("/api/mock/review", { data: { ladder_tests: "passed", emit: { type: "conflict", diff: "D41" } } });
+  await expect(line).toContainText("✓ its tests passed");
+  expect((await line.boundingBox())?.height).toBe(before?.height);
+  await expect(text.locator('.rv-cfs[data-side="offered"]')).toContainText("14 passed");
+  await expect(use).toBeEnabled();
+  // The binary file's rung kept the markers, and its Use is disabled, saying why.
+  const binary = row.locator(".rv-cf").nth(1);
+  await expect(binary.locator(".rv-rung")).toContainText("kept the markers");
+  await expect(binary.getByRole("button", { name: "Use kiln's" })).toBeDisabled();
+  expect((await text.locator(".rv-cfb").boundingBox())?.height).toBe(buttonsBefore?.height);
+  // Offered: the gate row's Accept resolutions makes the new version, and the conflicts go.
+  await page.request.post("/api/mock/review", { data: { ladder: "offered", emit: { type: "conflict", diff: "D41" } } });
+  const accept = row.getByRole("button", { name: "Accept resolutions" });
+  await expect(accept).toBeVisible();
+  await accept.click();
   await expect(row.locator(".rv-cf")).toHaveCount(0);
   await expect(row.getByRole("button", { name: /^Approve/ })).toBeVisible();
 });
