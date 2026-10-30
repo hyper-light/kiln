@@ -8903,7 +8903,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   signatures*, below); the CLI signs in with a passkey only through a personal access token (no
   approving a device from the browser yet).
 
-**Built: signatures (R03: commits; AC03 but receive-pack's check).** Plan
+**Built: signatures (R03: commits and pushes; AC03, but what hosts verified).** Plan
 `01a17856b1b273268adf6ce8c4f78410`, research `01a18abcef987683938692b8832c1831`.
 
 - *A signed statement.* `kiln_ci::identity::statement`, the record every signature here takes: a
@@ -8947,6 +8947,37 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   ends and hands it only to the session's own processes; kiln refusing it, the next ask gets
   another. Short of it, git stops rather than push as anyone else. kiln's audit names the agent,
   for its person, as the pusher.
+- *A push's commits checked.* A repository kiln hosts checks each commit a push brings that it
+  hasn't got, once git has the push's objects (quarantined) and before any ref moves: git's
+  `update` hook, for each ref, is kiln's binary (`kiln __git-hook`, set with `core.hooksPath` for
+  that push alone), given what the server knew as the push began in a folder of the push's own
+  (`<data>/pushes/<id>`: its organization, root and revocations, the trunk's `signatures:`,
+  whether the repository requires them, whom an agent pushing acts for, the SSH keys people
+  bound). Each signature is checked as of the push (`kiln_ci::identity::push`): kiln's x509 ones
+  against its root and revocations, SSH ones against the keys people bound. Where signatures are
+  required, a ref is refused when a commit it brings isn't signed, doesn't verify (another root,
+  a revoked signer, another commit's signature), is signed by someone the ref doesn't take, or,
+  pushed by an agent, is signed as the person it acts for; git's report says which commit and why
+  in kiln's words, in place of git's "hook declined" (`! [remote rejected] main (commit 3f2a1c9
+  isn't signed: main takes commits signed by people, agents or kiln of hyper-light)`), the audit
+  records it, and the other refs go on. Where they're not, the push is taken and names each such
+  commit (`kiln: warning: 3f2a1c9 isn't signed (.kiln/review.yaml can require signatures)`). A push
+  that can't be checked is taken nowhere.
+- *Policy.* `.kiln/review.yaml` on the trunk says it: `signatures: {mode: required | warn,
+  signers: [{refs: [<globs>], by: [<who>]}]}`. A rule's refs are branches by name (so a trunk's
+  rule is its review submissions' too) and tags as `tags/<name>`; whom it takes are `people`,
+  `agents`, `kiln` (its server and CD), a person by name, or a person's agents (`ada/agents`); the
+  first rule naming a ref decides, and a ref none names takes anyone of the organization. Without
+  a `mode`, the repository's own decides: a new one requires signatures (the server's
+  `[ci] signatures`, `required` unless it says `warn`, recorded as the repository is made), and
+  one from before warns until its policy says `required` (migration `w27_repo_signatures`).
+- *SSH signers.* A person who signs with SSH binds their key to their identity
+  (`POST /api/me/ssh-signers` `{key}`, its `.pub` line; `GET` lists theirs, `DELETE
+  ?fingerprint=` unbinds one), as a person signed in, never an agent, a job or a peer; a key is
+  bound to one person (migration `w27_ssh_signers`). A commit signed in git's SSH form (OpenSSH's
+  SSHSIG, in git's namespace; Ed25519, ECDSA P-256 or RSA) verifies as the person its key is bound
+  to (`kiln_ci::identity::sshsig`), checked in kiln's own code, so a server needs no `ssh-keygen`;
+  one by a key bound to no one, or unbound, or whose person is disabled, doesn't.
 - *Where the person's key stops.* `identity.key` is a 0600 file of the OS user that agents run as
   too. kiln's own paths never use it for an agent (its git signs and pushes through its runner),
   but past them the boundary is the OS's: a separate user, a container or a sandbox.
@@ -8963,10 +8994,24 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   `w27_r03_only_a_sessions_own_process_signs_as_its_agent` (a process outside the session with
   `KILN_AGENT` set gets no signature); `workspace::git`'s
   `w27_r03_an_agents_commit_the_runner_makes_is_signed_as_the_agent`; `gitsign`'s `w27_r03_*`.
-- *Not yet.* A push's commits checked on receive-pack, and repositories' policy of who may push
-  where (R03's next step); verdicts (R04); legs' results and provenance (R05, R06); lands (R07). A
-  remote naming kiln's server by another name than those (another host name for it) keeps the
-  person's credential. Hosts don't trust kiln's CA, so kiln-signed commits read unverified there.
+  Pushes: `kiln-ci`'s `identity::push` (`w27_r03_*`: required and warn, a revoked or foreign
+  signature, each ref's signers, an agent's push signed as its person, the policy as read) and
+  `identity::sshsig` (`w27_r03_*`: Ed25519 and ECDSA, another commit, namespace or key);
+  `crates/kiln/tests/identities.rs`'s `w27_ac03_an_unsigned_push_is_refused` (a repository from
+  before warns before and after new ones come to require; a new one refuses an unsigned commit,
+  takes sam's, refuses sam's where its policy takes only kim's, and refuses what sam signs once
+  sam is disabled; nothing refused moves) and `w27_r03_a_persons_ssh_key_signs_as_them` (git
+  signing through `ssh-keygen`: a bound key's commit lands, a loose or unbound key's is refused,
+  an agent binds none).
+- *Hosts.* GitHub, GitLab and Bitbucket don't trust kiln's CA, so a commit signed as kiln, an
+  agent or a person through kiln reads "unverified" on them. For a host's pull request, kiln
+  records what the host says it verified of each commit and marks what it couldn't (step 3's host
+  half, through the forge seam).
+- *Not yet.* What hosts verified of a pull request's commits (above); verdicts (R04); legs'
+  results and provenance (R05, R06); lands (R07). A remote naming kiln's server by another name
+  than those (another host name for it) keeps the person's credential. A job's push (its
+  `GITHUB_TOKEN`) can't sign its commits, so it's refused where signatures are required. Agents
+  the server runs itself hold no key of theirs, so what they commit is unsigned.
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

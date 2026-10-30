@@ -25,6 +25,7 @@ pub mod facade;
 pub mod graphs;
 pub mod hooks;
 pub mod hosting;
+pub mod pushsig;
 pub mod imap;
 pub mod inbound;
 pub mod images;

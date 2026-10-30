@@ -141,10 +141,11 @@ pub struct Signatures {
     pub signers: Vec<Signers>,
 }
 
-/// [`Signatures::mode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// [`Signatures::mode`]; by default, what a new repository requires.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SignatureMode {
+    #[default]
     Required,
     Warn,
 }

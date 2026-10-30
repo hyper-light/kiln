@@ -687,6 +687,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let caller = caller_of(&hub, req.headers()).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "sign in first"))?;
             boxed(|| me_identity(&hub, caller, req)).await
         }
+        // The SSH keys a person signs commits with, bound to their identity (W27-R03).
+        (&Method::GET | &Method::POST | &Method::DELETE, ["api", "me", "ssh-signers"]) => {
+            let caller = caller_of(&hub, req.headers()).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "sign in first"))?;
+            boxed(|| me_ssh_signers(&hub, caller, req)).await
+        }
         (&Method::GET, ["api", "identities"]) => {
             let kind = srv::query(&req).remove("kind");
             boxed(|| async {
@@ -2589,6 +2594,9 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
     } else {
         r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git"))
     };
+    // A new repository kiln hosts requires signed commits as the server says (W27-R03); one added
+    // again keeps what it had.
+    let new = native && !hub.store.repos().await?.iter().any(|x| x.name == name);
     let repo = hub
         .store
         .upsert_repo(Repo {
@@ -2608,6 +2616,9 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
         .await?;
     if native {
         hub.store.set_repo_public(repo.id.clone(), r.public).await?;
+    }
+    if new {
+        hub.store.set_repo_signatures(repo.id.clone(), hub.cfg.ci.signatures == kiln_ci::land::SignatureMode::Required).await?;
     }
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
     crate::gitops::want(hub, &repo.id);
@@ -3002,6 +3013,49 @@ async fn me_identity(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R
         }
         Err(crate::identities::PersonRefused::Failed(e)) => Err(e.into()),
         Err(r) => Ok(srv::json(r.status(), &json!({ "error": r.to_string(), "code": r.code() }))),
+    }
+}
+
+/// `GET /api/me/ssh-signers`: the SSH keys bound to the caller, a person, so the commits each signs
+/// verify as them (docs/ci.md W27-R03); `POST` `{key}` binds one (its `.pub` file's line), and
+/// `DELETE ?fingerprint=` unbinds one. Never an agent's, a job's or a peer's to change. A refusal
+/// says why, with a `code`.
+async fn me_ssh_signers(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R {
+    use crate::identities::PersonRefused;
+    let refused = |r: PersonRefused| -> R {
+        match r {
+            PersonRefused::Failed(e) => Err(e.into()),
+            r => Ok(srv::json(r.status(), &json!({ "error": r.to_string(), "code": r.code() }))),
+        }
+    };
+    match req.method().clone() {
+        Method::POST => {
+            let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let key = b.get("key").and_then(serde_json::Value::as_str).ok_or_else(|| err(StatusCode::BAD_REQUEST, "send a key: an SSH public key, as its .pub file has it"))?;
+            match crate::identities::add_ssh_signer(&hub.store, &caller, key).await {
+                Ok(signer) => {
+                    hub.store.audit(caller.name.clone(), "identity.ssh_signer".into(), format!("bound {} ({})", signer.fingerprint, signer.kind)).await;
+                    Ok(srv::json(StatusCode::OK, &json!({ "signer": signer })))
+                }
+                Err(r) => refused(r),
+            }
+        }
+        Method::DELETE => {
+            let fingerprint = srv::query(&req).remove("fingerprint").ok_or_else(|| err(StatusCode::BAD_REQUEST, "say which key: ?fingerprint=SHA256:…"))?;
+            match crate::identities::remove_ssh_signer(&hub.store, &caller, &fingerprint).await {
+                Ok(removed) => {
+                    if removed {
+                        hub.store.audit(caller.name.clone(), "identity.ssh_signer".into(), format!("unbound {fingerprint}")).await;
+                    }
+                    Ok(srv::json(StatusCode::OK, &json!({ "removed": removed })))
+                }
+                Err(r) => refused(r),
+            }
+        }
+        _ => match crate::identities::ssh_signers(&hub.store, &caller).await {
+            Ok(signers) => Ok(srv::json(StatusCode::OK, &json!({ "signers": signers }))),
+            Err(r) => refused(r),
+        },
     }
 }
 

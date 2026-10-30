@@ -683,6 +683,190 @@ fn w27_ac03_a_persons_commit_verifies_as_them() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R03, AC03: a repository kiln hosts takes only what verifies, as its policy says. One from
+/// before (made while the server's new repositories only warned) takes an unsigned push and says
+/// which commit isn't signed, before and after the server comes to require signatures of new ones.
+/// A new one refuses that push, naming the commit and why; takes sam's signed commit (its policy
+/// with it); refuses sam's commit where that policy takes only kim's; and once sam is disabled,
+/// their certificate revoked, refuses what sam signs, saying so. Each refusal is in git's own
+/// report, and no refused ref moves.
+#[test]
+fn w27_ac03_an_unsigned_push_is_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // New repositories warn at first (the tests' default): `acme/old` is one from before.
+    let mut s = start(dir.path(), &Options::default())?;
+    let make = |s: &Server, name: &str| -> anyhow::Result<()> {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": name, "mode": "native"})))?;
+        anyhow::ensure!(st == 200, "{name}: {st} {body}");
+        Ok(())
+    };
+    make(&s, "acme/old")?;
+    // sam signs on their laptop, as `kiln clone` sets git up there.
+    add_person(&s, "sam")?;
+    let link = sign_in_link(&s, "sam")?;
+    let laptop = Device::new(dir.path(), "sam-laptop")?;
+    let (ok, said) = laptop.kiln(&["login", "--link", &link], None)?;
+    anyhow::ensure!(ok, "kiln login --link: {said}");
+    let bin = dir.path().join("sam-laptop").join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let program = bin.join(kiln::gitsign::NAME);
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_kiln"), &program).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_kiln"), &program)?;
+    }
+    let work = dir.path().join("sam-laptop").join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let git = |args: &[&str]| -> anyhow::Result<std::process::Output> {
+        Ok(std::process::Command::new("git").arg("-C").arg(&work).args(args).env("HOME", &laptop.home).env("XDG_CONFIG_HOME", &laptop.config).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0").output()?)
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    let mut config = vec![("user.name", "sam".to_owned()), ("user.email", "sam@example.com".to_owned())];
+    config.extend(kiln::gitsign::git_config(&program, kiln::gitsign::DEVICE_KEY));
+    for (k, v) in &config {
+        git(&["config", "--local", k, v.as_str()])?;
+    }
+    let commit = |message: &str, signed: bool| -> anyhow::Result<(String, String)> {
+        let out = git(&["commit", "-q", "--allow-empty", if signed { "--gpg-sign" } else { "--no-gpg-sign" }, "-m", message])?;
+        anyhow::ensure!(out.status.success(), "git commit: {}", String::from_utf8_lossy(&out.stderr));
+        let sha = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"])?.stdout).trim().to_owned();
+        let short = sha.get(..7).unwrap_or_default().to_owned();
+        Ok((sha, short))
+    };
+    let push = |s: &Server, repo: &str, spec: &str| -> anyhow::Result<(bool, String)> {
+        let out = git(&["push", &format!("http://x:{}@127.0.0.1:{}/git/{repo}.git", s.admin, s.port), spec])?;
+        Ok((out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))))
+    };
+    let at = |s: &Server, repo: &str, branch: &str| -> anyhow::Result<String> {
+        let out = git(&["ls-remote", &format!("http://x:{}@127.0.0.1:{}/git/{repo}.git", s.admin, s.port), &format!("refs/heads/{branch}")])?;
+        Ok(String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or_default().to_owned())
+    };
+    let (_, unsigned) = commit("unsigned", false)?;
+    let (ok, said) = push(&s, "acme/old", "HEAD:main")?;
+    anyhow::ensure!(ok, "a repository that warns takes it: {said}");
+    assert!(said.contains(&format!("warning: {unsigned} isn't signed (.kiln/review.yaml can require signatures)")), "{said}");
+
+    // Then new repositories require signatures, as kiln's default has them.
+    let toml = std::fs::read_to_string(dir.path().join("kiln.toml"))?;
+    std::fs::write(dir.path().join("kiln.toml"), toml.replace("signatures = \"warn\"", "signatures = \"required\""))?;
+    s.restart()?;
+    make(&s, "acme/new")?;
+    let (ok, said) = push(&s, "acme/new", "HEAD:main")?;
+    assert!(!ok && said.contains("[remote rejected]") && said.contains(&format!("(commit {unsigned} isn't signed: main takes commits signed by people, agents or kiln of hyper-light)")), "{said}");
+    assert_eq!(at(&s, "acme/new", "main")?, "", "nothing moved");
+    // The one from before still only warns.
+    let (_, again) = commit("unsigned again", false)?;
+    let (ok, said) = push(&s, "acme/old", "HEAD:main")?;
+    anyhow::ensure!(ok, "{said}");
+    assert!(said.contains(&format!("warning: {again} isn't signed")), "{said}");
+
+    // sam's signed commit lands, with a policy that takes only kim's signatures on release branches.
+    git(&["checkout", "-q", "--orphan", "signed"])?;
+    std::fs::write(work.join(".kiln/review.yaml"), "signatures:\n  signers:\n    - refs: [\"release/*\"]\n      by: [kim]\n")?;
+    git(&["add", ".kiln/review.yaml"])?;
+    let (policy, _) = commit("policy", true)?;
+    let (ok, said) = push(&s, "acme/new", "HEAD:main")?;
+    anyhow::ensure!(ok, "sam's signed commit: {said}");
+    assert_eq!(at(&s, "acme/new", "main")?, policy);
+    let (_, sams) = commit("sam's release fix", true)?;
+    let (ok, said) = push(&s, "acme/new", "HEAD:refs/heads/release/1")?;
+    assert!(!ok && said.contains(&format!("(commit {sams} is signed by sam: release/1 takes commits signed by kim of hyper-light)")), "{said}");
+    assert_eq!(at(&s, "acme/new", "release/1")?, "", "nothing moved");
+    let (ok, said) = push(&s, "acme/new", "HEAD:refs/heads/topic")?;
+    anyhow::ensure!(ok, "a branch no rule names takes sam's: {said}");
+
+    // sam is disabled, which revokes their certificate: what they sign now is refused.
+    let (st, body) = http(s.port, "DELETE", "/api/users/sam", &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "disable sam: {st} {body}");
+    let (_, late) = commit("after sam was disabled", true)?;
+    let (ok, said) = push(&s, "acme/new", "HEAD:refs/heads/topic")?;
+    assert!(!ok && said.contains(&format!("(commit {late}'s signature doesn't verify (")) && said.contains("was revoked at") && said.contains("person disabled"), "{said}");
+    Ok(())
+}
+
+/// W27-R03: a person who signs with SSH binds their key to their identity, and a commit it signs
+/// verifies as them on a push: git signs through `ssh-keygen` (`gpg.format = ssh`), as people's git
+/// does. A key bound to no one is refused where signatures are required, and so is a key once
+/// unbound; an agent can't bind one for its person.
+#[test]
+fn w27_r03_a_persons_ssh_key_signs_as_them() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { ci: "signatures = \"required\"", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": "acme/ssh", "mode": "native"})))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    add_person(&s, "sam")?;
+    let token = |kind: &str| -> anyhow::Result<String> {
+        let mut ask = serde_json::json!({ "kind": kind, "user": "sam", "grants": ["developer"], "expires_in_days": 1 });
+        if kind == "agent"
+            && let Some(o) = ask.as_object_mut()
+        {
+            o.insert("agent".into(), serde_json::json!("matrix"));
+        }
+        let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&ask))?;
+        anyhow::ensure!(st == 201, "a {kind} token for sam: {st} {body}");
+        Ok(field(&serde_json::from_str::<Value>(&body)?, "token").to_owned())
+    };
+    let sam = token("pat")?;
+    // Two keys on sam's laptop, as ssh-keygen makes them: one bound, one not.
+    let keys = dir.path().join("sam-keys");
+    std::fs::create_dir_all(&keys)?;
+    for name in ["bound", "loose"] {
+        let made = std::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-C", &format!("sam@{name}"), "-f"]).arg(keys.join(name)).status()?;
+        anyhow::ensure!(made.success(), "ssh-keygen");
+    }
+    let public = |name: &str| -> anyhow::Result<String> { Ok(std::fs::read_to_string(keys.join(format!("{name}.pub")))?.trim().to_owned()) };
+    let (st, body) = http(s.port, "POST", "/api/me/ssh-signers", &sam, Some(&serde_json::json!({ "key": public("bound")? })))?;
+    anyhow::ensure!(st == 200, "bind sam's key: {st} {body}");
+    let fingerprint = serde_json::from_str::<Value>(&body)?.pointer("/signer/fingerprint").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert!(fingerprint.starts_with("SHA256:"), "{body}");
+    let (st, body) = http(s.port, "GET", "/api/me/ssh-signers", &sam, None)?;
+    assert!(st == 200 && body.contains(&fingerprint) && body.contains("sam@bound"), "{st} {body}");
+    // An agent can't bind a key for its person.
+    let (st, body) = http(s.port, "POST", "/api/me/ssh-signers", &token("agent")?, Some(&serde_json::json!({ "key": public("loose")? })))?;
+    assert_eq!((st, field(&serde_json::from_str::<Value>(&body)?, "code")), (403, "not_a_person"), "{body}");
+
+    // sam's git signs with SSH.
+    let home = dir.path().join("sam-home");
+    let work = dir.path().join("sam-work");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&work)?;
+    let git = |args: &[&str]| -> anyhow::Result<std::process::Output> {
+        Ok(std::process::Command::new("git").arg("-C").arg(&work).args(args).env("HOME", &home).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0").output()?)
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    for (k, v) in [("user.name", "sam"), ("user.email", "sam@example.com"), ("gpg.format", "ssh")] {
+        git(&["config", "--local", k, v])?;
+    }
+    let signed_with = |key: &str, message: &str| -> anyhow::Result<String> {
+        git(&["config", "--local", "user.signingkey", &keys.join(key).to_string_lossy()])?;
+        let out = git(&["commit", "-q", "--allow-empty", "--gpg-sign", "-m", message])?;
+        anyhow::ensure!(out.status.success(), "git commit: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&git(&["rev-parse", "HEAD"])?.stdout).trim().to_owned())
+    };
+    let push = |spec: &str| -> anyhow::Result<(bool, String)> {
+        let out = git(&["push", &format!("http://x:{}@127.0.0.1:{}/git/acme/ssh.git", s.admin, s.port), spec])?;
+        Ok((out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))))
+    };
+    let sha = signed_with("bound", "sam's, signed with SSH")?;
+    let (ok, said) = push("HEAD:main")?;
+    anyhow::ensure!(ok, "sam's SSH-signed commit: {said}");
+    let raw = String::from_utf8_lossy(&git(&["cat-file", "commit", "HEAD"])?.stdout).into_owned();
+    assert!(raw.contains("-----BEGIN SSH SIGNATURE-----"), "git signed it with SSH: {raw}");
+    let listed = String::from_utf8_lossy(&git(&["ls-remote", &format!("http://x:{}@127.0.0.1:{}/git/acme/ssh.git", s.admin, s.port), "refs/heads/main"])?.stdout).into_owned();
+    assert!(listed.starts_with(&sha), "{listed}");
+    // A key bound to no one: refused, saying so.
+    let loose = signed_with("loose", "signed with a key kiln doesn't know")?;
+    let (ok, said) = push("HEAD:refs/heads/topic")?;
+    assert!(!ok && said.contains(&format!("(commit {}'s signature doesn't verify (its SSH key (SHA256:", loose.get(..7).unwrap_or_default())) && said.contains("is bound to no one in kiln"), "{said}");
+    // Unbound, sam's first key signs for no one either.
+    let query = fingerprint.replace(':', "%3A").replace('+', "%2B").replace('/', "%2F");
+    let (st, body) = http(s.port, "DELETE", &format!("/api/me/ssh-signers?fingerprint={query}"), &sam, None)?;
+    assert!(st == 200 && body.contains("\"removed\":true"), "{st} {body}");
+    git(&["reset", "-q", "--hard", &sha])?;
+    signed_with("bound", "after the key was unbound")?;
+    let (ok, said) = push("HEAD:refs/heads/topic")?;
+    assert!(!ok && said.contains("is bound to no one in kiln"), "{said}");
+    Ok(())
+}
+
 /// W27-R01, R02: a person signs in from the CLI on their own device and gets a certificate for a
 /// key made there. It verifies to kiln's root as the person, of their organization, for hours at
 /// most; the key is in their config, theirs alone (0600), and nowhere on the server, which keeps

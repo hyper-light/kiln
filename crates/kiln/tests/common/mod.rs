@@ -1096,7 +1096,7 @@ tailscale = false
 {cd}
 [ci]
 enabled = true
-{ci}
+{signatures}{ci}
 
 {extra}
 "#,
@@ -1105,6 +1105,9 @@ enabled = true
         scheme = if https { "https" } else { "http" },
         agent = o.agent,
         ci = o.ci,
+        // New repositories here warn of unsigned commits rather than refuse them (docs/ci.md
+        // W27-R03), unless the test says otherwise: tests push with plain git.
+        signatures = if o.ci.contains("signatures") { "" } else { "signatures = \"warn\"\n" },
         extra = extra,
         // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
         cd = if o.extra.contains("[cd]") {

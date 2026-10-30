@@ -713,6 +713,22 @@ impl Store {
         .await
     }
 
+    /// Whether repository `id` requires a push's commits to be signed where its policy doesn't say
+    /// (docs/ci.md W27-R03): `required`, else it warns.
+    pub async fn repo_requires_signatures(&self, id: String) -> anyhow::Result<bool> {
+        self.call(move |c| Ok(c.query_row("SELECT signatures FROM repos WHERE id = ?1", [&id], |r| r.get::<_, String>(0)).optional()?.is_some_and(|s| s == "required"))).await
+    }
+
+    /// Says whether repository `id` requires a push's commits to be signed (`required`, else
+    /// `warn`), as a new one is made.
+    pub async fn set_repo_signatures(&self, id: String, required: bool) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute("UPDATE repos SET signatures = ?2 WHERE id = ?1", params![id, if required { "required" } else { "warn" }])?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn delete_repo(&self, id: String) -> anyhow::Result<()> {
         self.call(move |c| {
             c.execute("DELETE FROM repos WHERE id = ?1 OR name = ?1", [id])?;

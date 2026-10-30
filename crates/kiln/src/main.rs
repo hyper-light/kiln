@@ -506,6 +506,12 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {
         return kiln::headroom::guard_main(std::env::args_os().nth(2));
     }
+    // git's update hook in a push to a repository kiln hosts (docs/ci.md W27-R03): its commits'
+    // signatures checked before any ref moves; it needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::ci::pushsig::HOOK_ARG) {
+        let args: Vec<String> = std::env::args_os().skip(2).map(|a| a.to_string_lossy().into_owned()).collect();
+        return kiln::ci::pushsig::hook_main(&args);
+    }
     // `kiln rustc` (docs/ci.md W24-R09): cargo runs a `RUSTC_WRAPPER` as `<wrapper> <rustc> <args>`,
     // so this binary as one, or `kiln rustc <rustc> <args>`.
     {

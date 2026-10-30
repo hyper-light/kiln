@@ -6,6 +6,7 @@
 //! name gets a new key the revocation doesn't touch), and [`revocations`] feeds the chain checker
 //! (`kiln_ci::identity::chain`).
 
+use base64::Engine as _;
 use kiln_ci::identity::chain::{Actor, Holder, Identity, Revocation};
 use rusqlite::{OptionalExtension as _, params};
 
@@ -144,6 +145,10 @@ pub enum PersonRefused {
     KeyTaken(String),
     #[error("not a certificate request: {0}")]
     BadCsr(String),
+    #[error("not an SSH public key kiln reads: {0}")]
+    BadKey(String),
+    #[error("this SSH key signs for {0} already, and a key signs for one person")]
+    KeyBound(String),
     #[error(transparent)]
     Failed(#[from] anyhow::Error),
 }
@@ -159,6 +164,8 @@ impl PersonRefused {
             Self::KeyRevoked(_) => "key_revoked",
             Self::KeyTaken(_) => "key_taken",
             Self::BadCsr(_) => "bad_csr",
+            Self::BadKey(_) => "bad_key",
+            Self::KeyBound(_) => "key_bound",
             Self::Failed(_) => "failed",
         }
     }
@@ -167,8 +174,8 @@ impl PersonRefused {
         use http::StatusCode;
         match self {
             Self::NotAPerson | Self::Disabled | Self::Unnamed(_) => StatusCode::FORBIDDEN,
-            Self::KeyRevoked(_) | Self::KeyTaken(_) => StatusCode::CONFLICT,
-            Self::BadCsr(_) => StatusCode::BAD_REQUEST,
+            Self::KeyRevoked(_) | Self::KeyTaken(_) | Self::KeyBound(_) => StatusCode::CONFLICT,
+            Self::BadCsr(_) | Self::BadKey(_) => StatusCode::BAD_REQUEST,
             Self::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -188,6 +195,94 @@ pub fn person_name(user: Option<&str>) -> Result<String, String> {
         Err(kiln_ci::identity::chain::Refusal::BadIdentity { why, .. }) => Err(format!("kiln can't name `{name}` in an identity as it is ({why}), and changed to fit it could name someone else")),
         Err(e) => Err(format!("kiln can't name `{name}` in an identity: {e}")),
     }
+}
+
+/// The name of the person `caller` is (W27-R02): a person signed in (the owner, a user, a user's
+/// personal access token), never an agent, a job or a peer, and still enabled.
+async fn person_signed_in(store: &Store, caller: &crate::authz::Caller) -> Result<String, PersonRefused> {
+    use crate::authz::gate::Kind;
+    if caller.agent.is_some() || !matches!(caller.kind, Kind::Owner | Kind::User | Kind::Pat) {
+        return Err(PersonRefused::NotAPerson);
+    }
+    let name = match caller.user.clone() {
+        None => None,
+        Some(uid) => Some(store.call(move |c| Ok(c.query_row("SELECT name FROM users WHERE id = ?1 AND disabled_at IS NULL", [uid], |r| r.get::<_, String>(0)).optional()?)).await?.ok_or(PersonRefused::Disabled)?),
+    };
+    person_name(name.as_deref()).map_err(PersonRefused::Unnamed)
+}
+
+/// An SSH key a person signs commits with, bound to their identity (W27-R03).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SshSigner {
+    pub fingerprint: String,
+    pub kind: String,
+    pub comment: String,
+    pub added_at: i64,
+}
+
+/// Binds SSH public key `line` (as its `.pub` file has it) to the identity of the person `caller`
+/// is (W27-R03), so the commits it signs verify as them: a person signed in, never an agent, a job
+/// or a peer; a key is bound to one person.
+pub async fn add_ssh_signer(store: &Store, caller: &crate::authz::Caller, line: &str) -> Result<SshSigner, PersonRefused> {
+    let person = person_signed_in(store, caller).await?;
+    let key = kiln_ci::identity::sshsig::PublicKey::parse(line).map_err(PersonRefused::BadKey)?;
+    let signer = SshSigner { fingerprint: key.fingerprint(), kind: key.kind.clone(), comment: key.comment.clone(), added_at: crate::util::now_unix() };
+    let (b64, row) = (base64::engine::general_purpose::STANDARD.encode(&key.blob), signer.clone());
+    let bound = store
+        .call(move |c| {
+            let other: Option<String> = c.query_row("SELECT person FROM ssh_signers WHERE key = ?1 AND removed_at IS NULL AND person <> ?2", params![b64, person], |r| r.get(0)).optional()?;
+            if other.is_some() {
+                return Ok(other);
+            }
+            c.execute(
+                "INSERT INTO ssh_signers (key, person, kind, fingerprint, comment, added_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(key) DO UPDATE SET person = excluded.person, comment = excluded.comment, added_at = excluded.added_at, removed_at = NULL",
+                params![b64, person, row.kind, row.fingerprint, row.comment, row.added_at],
+            )?;
+            Ok(None)
+        })
+        .await?;
+    match bound {
+        Some(other) => Err(PersonRefused::KeyBound(other)),
+        None => Ok(signer),
+    }
+}
+
+/// The SSH keys bound to the person `caller` is (W27-R03).
+pub async fn ssh_signers(store: &Store, caller: &crate::authz::Caller) -> Result<Vec<SshSigner>, PersonRefused> {
+    let person = person_signed_in(store, caller).await?;
+    Ok(store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT fingerprint, kind, comment, added_at FROM ssh_signers WHERE person = ?1 AND removed_at IS NULL ORDER BY added_at, fingerprint")?;
+            let rows = q.query_map([person], |r| Ok(SshSigner { fingerprint: r.get(0)?, kind: r.get(1)?, comment: r.get(2)?, added_at: r.get(3)? }))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?)
+}
+
+/// Unbinds the SSH key with `fingerprint` from the person `caller` is (W27-R03): it signs for no
+/// one from now. Whether one was bound.
+pub async fn remove_ssh_signer(store: &Store, caller: &crate::authz::Caller, fingerprint: &str) -> Result<bool, PersonRefused> {
+    let person = person_signed_in(store, caller).await?;
+    let fingerprint = fingerprint.to_owned();
+    Ok(store.call(move |c| Ok(c.execute("UPDATE ssh_signers SET removed_at = ?3 WHERE person = ?1 AND fingerprint = ?2 AND removed_at IS NULL", params![person, fingerprint, crate::util::now_unix()])? > 0)).await?)
+}
+
+/// Every SSH key bound to a person still enabled, as a push's commits are checked against them
+/// (W27-R03): each person's name and their key's blob.
+pub async fn bound_ssh_keys(store: &Store) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let rows: Vec<(String, String)> = store
+        .call(|c| {
+            let mut q = c.prepare(
+                "SELECT s.person, s.key FROM ssh_signers s WHERE s.removed_at IS NULL
+                   AND (s.person = 'admin' OR EXISTS (SELECT 1 FROM users u WHERE u.name = s.person AND u.disabled_at IS NULL))
+                 ORDER BY s.person, s.added_at",
+            )?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(rows.into_iter().filter_map(|(person, b64)| base64::engine::general_purpose::STANDARD.decode(b64).ok().map(|blob| (person, blob))).collect())
 }
 
 /// A person's identity for a key made on their own device (W27-R02): issued to a person signed
