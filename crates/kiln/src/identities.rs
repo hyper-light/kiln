@@ -84,6 +84,17 @@ pub fn sign_own(pki: &crate::pki::Pki, kind: &str, message: &[u8]) -> anyhow::Re
     Ok((signature, crate::pki::der_of(&cert)?))
 }
 
+/// `commit` (a commit object as `git cat-file commit` gives it) signed by `sign` in git's x509 form
+/// (W27-R03, `kiln_ci::identity::gitsig`): the object to write in its place. `sign` signs the bytes
+/// it's given and says the certificate (DER) its signature verifies under, as [`sign_own`] does.
+pub fn signed_commit(commit: &[u8], sign: impl FnOnce(&[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<Vec<u8>> {
+    use kiln_ci::identity::gitsig;
+    let payload = gitsig::payload(commit);
+    let (signature, cert) = sign(&gitsig::to_sign(&payload).map_err(|e| anyhow::anyhow!("{e}"))?)?;
+    let armored = gitsig::armor(&payload, &signature, &[&cert]).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(gitsig::with_signature(commit, &armored))
+}
+
 /// Keeps the server's and CD's identities current while the server runs (W27-R01):
 /// [`own_identities`] every [`OWN_EVERY`], so neither expires between restarts.
 pub async fn own_identities_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
@@ -1129,6 +1140,39 @@ mod tests {
                 assert!(verify_signed(&[&certificate], &pki.ca_der, &revoked, now, b"train 8 landed 7d0e1f", &signature).is_err(), "over that message alone");
             }
             assert!(sign_own(&pki, "runner", b"x").is_err(), "the server and CD alone");
+            Ok(())
+        })
+    }
+
+    /// W27-R03: what kiln commits is signed as kiln. A commit CD makes in a hosted repository (a
+    /// release) carries a gpgsig, git's x509 form, that verifies to kiln's root as CD over the commit
+    /// as git keeps it; the server's signature over the same commit verifies as the server.
+    #[test]
+    fn w27_r03_kilns_own_commits_sign_as_kiln() -> anyhow::Result<()> {
+        use crate::deploy::host::{Author, Change, Committed, Hosted};
+        use kiln_ci::identity::gitsig;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = std::sync::Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            own_identities(&store, &pki).await?;
+            let (now, revoked) = (crate::util::now_unix(), revocations(&store).await?);
+            let hosted = Hosted::new(&dir.path().join("hosted")).signing_as(std::sync::Arc::clone(&pki), "cd");
+            let change = Change { path: "app.yaml".into(), content: Some(b"image: kiln:4c1e2a\n".to_vec()) };
+            let made = hosted.commit("kiln/releases", "main", None, &[change], "release 7", &Author::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let Committed::New(sha) = made else { anyhow::bail!("nothing was committed") };
+            let out = std::process::Command::new("git").arg("-C").arg(hosted.path("kiln/releases")?).args(["cat-file", "commit", &sha]).output()?;
+            anyhow::ensure!(out.status.success(), "git cat-file: {}", String::from_utf8_lossy(&out.stderr));
+            let sig = gitsig::signature_of(&out.stdout).ok_or_else(|| anyhow::anyhow!("CD's commit isn't signed"))?;
+            let v = gitsig::verify(&gitsig::payload(&out.stdout), &sig, &pki.ca_der, &revoked, now)?;
+            assert_eq!(v.identity, Identity::new(pki.organization(), Actor::Cd));
+            assert_eq!(hosted.head("kiln/releases", "main")?.as_deref(), Some(sha.as_str()), "the branch holds the signed commit");
+            // The server signs the same commit as itself.
+            let unsigned = gitsig::payload(&out.stdout);
+            let by_server = signed_commit(&unsigned, |m| sign_own(&pki, "server", m))?;
+            let sig = gitsig::signature_of(&by_server).ok_or_else(|| anyhow::anyhow!("not signed"))?;
+            let v = gitsig::verify(&gitsig::payload(&by_server), &sig, &pki.ca_der, &revoked, now)?;
+            assert_eq!(v.identity, Identity::new(pki.organization(), Actor::Server));
             Ok(())
         })
     }

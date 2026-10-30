@@ -178,17 +178,18 @@ fn w26_ac03_a_diffs_suggestion_is_a_revision_of_whoever_applies_it() -> anyhow::
     anyhow::ensure!(versions(&get(&r.s, &r.ada, "/api/diffs/D1")?) == 2, "neither applied");
 
     // The review agent's one-line block, applied by ada: v3, sam's commit amended, committed by ada,
-    // the agent a co-author; unsigned until W27-R03 signs it, never signed as anyone else.
+    // the agent a co-author; signed as kiln's server, which makes it (W27-R03), never as anyone else.
     let t = r.thread(d1, &agents)?;
     assert_eq!(t.pointer("/comments/0/suggestions"), Some(&json!([{ "index": 0, "lines": [empty], "field": false, "applied": null, "outdated": false }])), "{t}");
     let (st, out) = r.apply(&r.ada, &agents, json!({}))?;
     anyhow::ensure!(st == 200, "apply: {st} {out}");
-    assert_eq!((out.get("version"), out.get("state"), out.get("signer")), (Some(&json!(3)), Some(&json!("resolved")), Some(&Value::Null)), "{out}");
+    assert_eq!((out.get("version"), out.get("state")), (Some(&json!(3)), Some(&json!("resolved"))), "{out}");
+    assert!(out.get("signer").and_then(Value::as_str).is_some_and(|s| s.starts_with("kiln://") && s.ends_with("/server")), "kiln commits it, signed as its server (W27-R03): {out}");
     let (author, committer, message) = r.commit("refs/kiln/diffs/D1/v3")?;
     assert_eq!((author.as_str(), committer.as_str()), ("Sam <sam@example.com>", "ada <ada@kiln>"));
     assert_eq!(message, format!("pipeline: dynamic matrices\n\nChange-Id: {change_id}\nCo-authored-by: agent:review <agent-review@kiln>"));
     assert_eq!(text(&out, "commit"), r.g(&["rev-parse", "FETCH_HEAD"])?.trim());
-    assert!(!r.g(&["cat-file", "commit", "FETCH_HEAD"])?.contains("gpgsig"), "unsigned until W27-R03");
+    assert!(r.g(&["cat-file", "commit", "FETCH_HEAD"])?.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"), "signed in git's x509 form (W27-R03)");
     assert_eq!(r.file("refs/kiln/diffs/D1/v3")?, matrix(&[(20, &["let r20 = 2 * 10;"]), (42, &[empty])]));
     // The diff shows it; the revision says why, the block and the thread which revision applied it.
     let files = get(&r.s, &r.ada, "/api/diffs/D1/versions/3/files")?;
@@ -256,7 +257,8 @@ fn w26_ac03_a_change_requests_suggestion_is_a_commit_of_whoever_applies_it() -> 
     // The agent's block, applied by ada: a commit of hers on topic, the agent a co-author: CR1 v2.
     let (st, out) = r.apply(&r.ada, &agents, json!({}))?;
     anyhow::ensure!(st == 200, "apply: {st} {out}");
-    assert_eq!((out.get("version"), out.get("state"), out.get("signer")), (Some(&json!(2)), Some(&json!("resolved")), Some(&Value::Null)), "{out}");
+    assert_eq!((out.get("version"), out.get("state")), (Some(&json!(2)), Some(&json!("resolved"))), "{out}");
+    assert!(out.get("signer").and_then(Value::as_str).is_some_and(|s| s.starts_with("kiln://") && s.ends_with("/server")), "kiln commits it, signed as its server (W27-R03): {out}");
     let (author, committer, message) = r.commit("topic")?;
     assert_eq!((author.as_str(), committer.as_str()), ("ada <ada@kiln>", "ada <ada@kiln>"));
     assert_eq!(message, "Apply a suggestion from agent:review\n\nOn matrix.rs, line 42.\n\nCo-authored-by: agent:review <agent-review@kiln>");
