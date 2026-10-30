@@ -99,10 +99,101 @@ impl Meter {
     }
 }
 
-/// The actuator: groups and their shares, applied on a thread of its own every 50 ms.
+/// How often the pacer looks at its groups.
+const TICK: Duration = Duration::from_millis(50);
+/// The shortest period. A 5 ms one (the runner disk's probe interval) gave `5 * share / 100 == 0`, so
+/// every share under 20 never ran (2026-10-30: all of a runner's sessions stopped for 8 hours).
+pub const MIN_PERIOD: Duration = Duration::from_secs(1);
+
+/// The period in force, in ms: what was asked for, and never under [`MIN_PERIOD`].
+fn cycle_ms(asked: Duration) -> u64 {
+    u64::try_from(asked.max(MIN_PERIOD).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The engine's share (1: full speed) as the whole percent the pacer holds a group to; above 0 it is
+/// at least 1, never a stop.
+pub fn step_of(share: f64) -> u8 {
+    let steps = (share * kiln_ci::headroom::pace::SHARE_STEPS).floor();
+    if share > 0.0 { steps.clamp(1.0, 99.0) as u8 } else { 0 }
+}
+
+/// When each paced group runs. A group earns its share of the time that passes and spends the time
+/// it runs: it starts a slice once it has earned one (its share of a period, and at least a tick)
+/// and runs until that is spent, so any share above 0 runs and over time gets exactly its share.
+#[derive(Default)]
+struct Duty {
+    groups: HashMap<PathBuf, Credit>,
+}
+
+struct Credit {
+    /// When it was last looked at (ms), and the time it has earned and not yet run (ms).
+    at: u64,
+    earned: f64,
+    running: bool,
+}
+
+impl Duty {
+    /// Whether the group in `dir`, held to `share` percent of every `period` ms, runs at `now` ms.
+    fn runs(&mut self, dir: &Path, share: u8, now: u64, period: u64) -> bool {
+        if share == 0 {
+            self.groups.remove(dir);
+            return false;
+        }
+        let tick = TICK.as_millis() as f64;
+        let s = f64::from(share.min(99)) / 100.0;
+        let slice = (period as f64 * s).max(tick);
+        // What a slice's run leaves owed: the share earned while it runs pays for part of it.
+        let owed = slice * (1.0 - s);
+        let c = self.groups.entry(dir.to_owned()).or_insert_with(|| {
+            // Each group starts at its own place in the cycle (a stop, then a slice), so they don't all run at once.
+            let place = dir.to_string_lossy().bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))) % 1000;
+            let (cycle, at) = (slice / s, slice / s * place as f64 / 1000.0);
+            let stop = cycle - slice;
+            let (earned, running) = if at < stop { (at * s, false) } else { ((cycle - at) * (1.0 - s), true) };
+            Credit { at: now, earned, running }
+        });
+        let dt = (now.saturating_sub(c.at) as f64).min(4.0 * tick);
+        c.at = now;
+        c.earned += dt * s - if c.running { dt } else { 0.0 };
+        // A slice goes on while what's earned pays for another whole tick of it.
+        c.running = c.earned >= if c.running { (1.0 - s) * tick } else { owed };
+        c.running
+    }
+
+    /// Forgets the groups that aren't paced.
+    fn keep(&mut self, paced: &[(PathBuf, u8)]) {
+        self.groups.retain(|d, _| paced.iter().any(|(p, _)| p == d));
+    }
+}
+
+/// How long a group has been held stopped in all, for the share of a stretch it was let run.
+#[derive(Default)]
+struct Stopped {
+    total: Duration,
+    since: Option<Instant>,
+}
+
+impl Stopped {
+    fn hold(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+    }
+
+    fn release(&mut self, now: Instant) {
+        if let Some(s) = self.since.take() {
+            self.total += now.saturating_duration_since(s);
+        }
+    }
+
+    fn total(&self, now: Instant) -> Duration {
+        self.total + self.since.map_or(Duration::ZERO, |s| now.saturating_duration_since(s))
+    }
+}
+
+/// The actuator: groups and their shares, applied on a thread of its own every [`TICK`].
 pub struct Pacer {
     shares: Arc<Mutex<HashMap<PathBuf, u8>>>,
     period: Arc<Mutex<Duration>>,
+    stopped: Arc<Mutex<HashMap<PathBuf, Stopped>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -129,18 +220,25 @@ impl Pacer {
     pub fn start_with(dir: &Path, guard: GuardCmd) -> Self {
         release_left(dir);
         let shares: Arc<Mutex<HashMap<PathBuf, u8>>> = Arc::default();
-        let period = Arc::new(Mutex::new(Duration::from_millis(1000)));
+        let period = Arc::new(Mutex::new(MIN_PERIOD));
+        let stopped: Arc<Mutex<HashMap<PathBuf, Stopped>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
-        let (sh, pe, st, dir) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stop), dir.to_owned());
+        let (sh, pe, sp, st, dir) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stopped), Arc::clone(&stop), dir.to_owned());
         let spawned = std::thread::Builder::new().name("kiln-pacer".into()).spawn(move || match Proc::me() {
             Some(me) => {
                 let record = dir.join(RECORDS).join(format!("{}-{}.json", me.pid, me.start));
-                run(&sh, &pe, &st, &Paced { me, record, how: guard });
+                run(&sh, &pe, &sp, &st, &Paced { me, record, how: guard });
             }
             None => tracing::warn!("headroom: this process's own start is unknown, so nothing is paced"),
         });
         let thread = spawned.map_err(|e| tracing::warn!(error = %e, "headroom: the pacer couldn't start; work past the window still waits to start")).ok();
-        Self { shares, period, stop, thread }
+        Self { shares, period, stopped, stop, thread }
+    }
+
+    /// How long each paced group has been held stopped in all, as of now.
+    pub fn stopped(&self) -> HashMap<PathBuf, Duration> {
+        let now = Instant::now();
+        self.stopped.lock().iter().map(|(d, s)| (d.clone(), s.total(now))).collect()
     }
 
     /// Each paced group's share from now (percent; groups at 100 aren't listed).
@@ -209,8 +307,9 @@ struct Paced {
 
 /// The pacer's thread: each paced group stopped for its share of every period, and only while a
 /// guard runs that will start it again.
-fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stop: &AtomicBool, p: &Paced) {
+fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stopped: &Mutex<HashMap<PathBuf, Stopped>>, stop: &AtomicBool, p: &Paced) {
     let base = Instant::now();
+    let mut duty = Duty::default();
     // The groups stopped now, each with what starts it again (`imp::release`).
     let mut held: HashMap<PathBuf, Vec<String>> = HashMap::new();
     // What the guard and the record list, group by group: all a paced group has had stopped.
@@ -225,8 +324,8 @@ fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stop: &At
     // from, killed with its guard): looked at once a period.
     let mut next_look = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let per = *period.lock();
-        let p_ms = u64::try_from(per.as_millis()).unwrap_or(u64::MAX).max(1);
+        let per = (*period.lock()).max(MIN_PERIOD);
+        let p_ms = cycle_ms(per);
         let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
         let want: Vec<(PathBuf, u8)> = shares.lock().iter().map(|(d, s)| (d.clone(), *s)).collect();
         if Instant::now() >= next_look {
@@ -270,10 +369,7 @@ fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stop: &At
         let guarded = guard.as_ref().is_some_and(Guard::ready);
         let mut unheard = false;
         for (dir, share) in &want {
-            // Each group's period starts at its own offset, so they don't all start at once.
-            let offset = dir.to_string_lossy().bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))) % p_ms;
-            let run = (now + offset) % p_ms < p_ms * u64::from(*share) / 100;
-            if run {
+            if duty.runs(dir, *share, now, p_ms) {
                 if let Some(keys) = held.remove(dir) {
                     keys.iter().for_each(|k| imp::release(k));
                 }
@@ -316,7 +412,20 @@ fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stop: &At
         if listed.len() != before {
             tell(&mut guard, &listed, p);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        duty.keep(&want);
+        let at = Instant::now();
+        let mut clocks = stopped.lock();
+        for dir in held.keys() {
+            clocks.entry(dir.clone()).or_default().hold(at);
+        }
+        clocks.retain(|dir, s| {
+            if !held.contains_key(dir) {
+                s.release(at);
+            }
+            held.contains_key(dir) || want.iter().any(|(d, _)| d == dir)
+        });
+        drop(clocks);
+        std::thread::sleep(TICK);
     }
     // Ending: everything runs again, the guard hears nothing is left, and it goes.
     release_all(&mut held, &mut listed, &mut guard, p);
@@ -1031,6 +1140,122 @@ mod portable_tests {
     }
 }
 
+#[cfg(test)]
+mod duty_tests {
+    use super::*;
+
+    /// A group held to `share` percent under `asked`, looked at every tick (50 to 52 ms apart, as
+    /// the loop's are) for `secs`: the part of the time it ran, and its longest stop in ms.
+    fn simulate(share: u8, asked: Duration, secs: u64) -> (f64, u64) {
+        let mut duty = Duty::default();
+        let (dir, period) = (PathBuf::from("session:a"), cycle_ms(asked));
+        let (mut now, mut ran, mut stopped, mut longest, mut seed) = (0u64, 0u64, 0u64, 0u64, 7u64);
+        while now < secs * 1000 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let dt = 50 + (seed >> 33) % 3;
+            if duty.runs(&dir, share, now, period) {
+                ran += dt;
+                stopped = 0;
+            } else {
+                stopped += dt;
+                longest = longest.max(stopped);
+            }
+            now += dt;
+        }
+        (ran as f64 / now as f64, longest)
+    }
+
+    #[test]
+    fn a_share_above_zero_runs_whatever_period_was_asked_for() {
+        // The runner disk's probe asks for 5 ms, where 5 * share / 100 is 0 for every share under 20.
+        for asked in [Duration::from_millis(5), Duration::from_millis(172), Duration::from_secs(1), Duration::from_secs(3)] {
+            for share in [1u8, 2, 5, 14, 19, 20, 33, 50, 75, 99] {
+                let (ran, longest) = simulate(share, asked, 900);
+                let want = f64::from(share) / 100.0;
+                assert!((ran - want).abs() <= 0.01f64.max(want * 0.05), "{share}% of {asked:?}: ran {ran}");
+                // A slice is its share of the period and at least a tick, and the stop after it pays for it,
+                // for the few ms a tick runs over as well.
+                let (period, share) = (cycle_ms(asked) as f64, f64::from(share));
+                let slice = (period * share / 100.0).max(50.0);
+                assert!(longest as f64 <= (slice + 4.0) * (100.0 - share) / share + 200.0, "{share}% of {asked:?}: stopped {longest} ms at a stretch");
+            }
+        }
+    }
+
+    #[test]
+    fn a_share_of_zero_never_runs() {
+        assert_eq!(simulate(0, Duration::from_secs(1), 120).0, 0.0);
+    }
+
+    #[test]
+    fn a_period_is_never_shorter_than_the_least_the_pacer_keeps() {
+        assert_eq!(cycle_ms(Duration::from_millis(5)), 1000);
+        assert_eq!(cycle_ms(Duration::ZERO), 1000);
+        assert_eq!(cycle_ms(Duration::from_secs(4)), 4000);
+    }
+
+    #[test]
+    fn groups_at_one_share_do_not_all_run_at_once() {
+        let mut duty = Duty::default();
+        let mut seed = 11u64;
+        let dirs: Vec<PathBuf> = (0..20)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                PathBuf::from(format!("session:{:016x}{:016x}", seed, seed.rotate_left(29)))
+            })
+            .collect();
+        for tick in 0..400u64 {
+            let now = tick * 50;
+            let running = dirs.iter().filter(|d| duty.runs(d, 50, now, 1000)).count();
+            assert!(now < 2000 || (3..=17).contains(&running), "{running} of 20 run at {now} ms");
+        }
+    }
+
+    #[test]
+    fn a_group_first_paced_at_a_high_share_runs_within_a_tick() {
+        let mut duty = Duty::default();
+        for i in 0..50 {
+            let dir = PathBuf::from(format!("session:{i}"));
+            duty.runs(&dir, 99, 5000, 1000);
+            assert!(duty.runs(&dir, 99, 5050, 1000), "{dir:?} held to 99% still stopped a tick after it was first looked at");
+        }
+    }
+
+    #[test]
+    fn a_group_no_longer_paced_is_forgotten() {
+        let mut duty = Duty::default();
+        let (a, b) = (PathBuf::from("a"), PathBuf::from("b"));
+        duty.runs(&a, 50, 0, 1000);
+        duty.runs(&b, 50, 0, 1000);
+        duty.keep(&[(a.clone(), 50)]);
+        assert!(duty.groups.contains_key(&a) && !duty.groups.contains_key(&b));
+    }
+
+    #[test]
+    fn a_share_above_zero_is_a_step_of_at_least_one_and_never_a_stop() {
+        assert_eq!(step_of(0.0), 0);
+        assert_eq!(step_of(0.004), 1);
+        assert_eq!(step_of(0.014), 1);
+        assert_eq!(step_of(0.5), 50);
+        assert_eq!(step_of(0.999), 99);
+        assert_eq!(step_of(1.0), 99);
+    }
+
+    #[test]
+    fn what_a_group_was_held_stopped_adds_up_across_holds() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut s = Stopped::default();
+        s.hold(at(100));
+        s.hold(at(150));
+        assert_eq!(s.total(at(300)), Duration::from_millis(200));
+        s.release(at(400));
+        s.release(at(450));
+        s.hold(at(500));
+        assert_eq!(s.total(at(550)), Duration::from_millis(350));
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -1095,6 +1320,20 @@ mod tests {
     /// Set in the child pacer [`a_pacer_killed_while_its_group_is_frozen_leaves_it_running`]
     /// starts: the folder its group is in.
     const PACER: &str = "KILN_HEADROOM_TEST_PACER";
+
+    #[test]
+    fn a_group_held_to_a_small_share_of_a_short_period_is_stopped_and_still_runs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let g = group(dir.path(), "g", false)?;
+        let p = Pacer::start_with(dir.path(), test_guard);
+        // 14% of 5 ms: the pacer once gave every share under 20% of a period that short no time to run.
+        p.set(HashMap::from([(g.clone(), 14)]), Duration::from_millis(5));
+        anyhow::ensure!(within(Duration::from_secs(20), || frozen(&g)), "stopped once its guard runs");
+        anyhow::ensure!(within(Duration::from_secs(10), || !frozen(&g)), "held to 14%, it never ran");
+        anyhow::ensure!(p.stopped().get(&g).is_some_and(|d| !d.is_zero()), "what it was held stopped isn't counted");
+        drop(p);
+        Ok(())
+    }
 
     #[test]
     fn a_pacer_killed_while_its_group_is_frozen_leaves_it_running() -> anyhow::Result<()> {
