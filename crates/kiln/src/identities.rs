@@ -37,7 +37,7 @@ pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Res
     for (kind, actor) in [("server", Actor::Server), ("cd", Actor::Cd)] {
         let identity = Identity::new(pki.organization(), actor);
         let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (key_path, cert_path) = (pki.dir().join(format!("{kind}-signing.key")), pki.dir().join(format!("{kind}-signing.pem")));
+        let (key_path, cert_path) = signing_files(pki, kind);
         let held = std::fs::read_to_string(&cert_path).ok();
         let marks = held.as_deref().and_then(|c| crate::pki::fingerprints(c).ok());
         let key_revoked = marks.as_ref().is_some_and(|m| revoked.iter().any(|r| r.key.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(&m.key))));
@@ -62,6 +62,26 @@ pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Res
         tracing::info!(identity = %identity, "issued an identity");
     }
     Ok(())
+}
+
+/// Where the server's or CD's (`kind`) signing key and certificate are.
+fn signing_files(pki: &crate::pki::Pki, kind: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    (pki.dir().join(format!("{kind}-signing.key")), pki.dir().join(format!("{kind}-signing.pem")))
+}
+
+/// Signs `message` as the server itself, or CD (`kind`: `server` or `cd`), with its own key
+/// ([`own_identities`]), read from its file each time it signs, so the hub keeps no copy: the
+/// signature (ECDSA P-256 with SHA-256, ASN.1) and the certificate it verifies under (DER), as
+/// `kiln_ci::identity::statement::bundle` takes them. It verifies to kiln's root as
+/// `kiln://<org>/server` (CD's as `…/server/cd`) through `kiln_ci::identity::chain::verify_signed`.
+pub fn sign_own(pki: &crate::pki::Pki, kind: &str, message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    use rcgen::SigningKey as _;
+    anyhow::ensure!(matches!(kind, "server" | "cd"), "kiln signs as its server or CD, not as {kind:?}");
+    let (key_path, cert_path) = signing_files(pki, kind);
+    let key = std::fs::read_to_string(&key_path).map_err(|e| anyhow::anyhow!("the {kind}'s signing key ({}): {e}", key_path.display()))?;
+    let cert = std::fs::read_to_string(&cert_path).map_err(|e| anyhow::anyhow!("the {kind}'s signing certificate ({}): {e}", cert_path.display()))?;
+    let signature = rcgen::KeyPair::from_pem(&key)?.sign(message)?;
+    Ok((signature, crate::pki::der_of(&cert)?))
 }
 
 /// Keeps the server's and CD's identities current while the server runs (W27-R01):
@@ -1085,6 +1105,30 @@ mod tests {
             assert!(revoked_keys(&store).await?.iter().any(|(k, why)| *k == fb.key && why.contains("key lost, by sam")));
             // A subject with nothing recorded revokes nothing.
             assert!(revoke(&store, Target::Subject("nobody".into()), "x", "ada", 0).await?.is_empty());
+            Ok(())
+        })
+    }
+
+    /// W27-R01: the server and CD sign as themselves, with their own keys ([`sign_own`]): a
+    /// signature verifies to kiln's root as kiln://<org>/server, and CD's as kiln://<org>/server/cd,
+    /// over that message alone; nothing else signs as them.
+    #[test]
+    fn w27_r01_the_server_and_cd_sign_as_themselves() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::verify_signed;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            own_identities(&store, &pki).await?;
+            let (now, revoked) = (crate::util::now_unix(), revocations(&store).await?);
+            for (kind, actor) in [("server", Actor::Server), ("cd", Actor::Cd)] {
+                let (signature, certificate) = sign_own(&pki, kind, b"train 7 landed 4c1e2a")?;
+                let v = verify_signed(&[&certificate], &pki.ca_der, &revoked, now, b"train 7 landed 4c1e2a", &signature)?;
+                assert_eq!(v.identity, Identity::new(pki.organization(), actor.clone()));
+                assert_eq!(v.identity.uri()?, Identity::new(pki.organization(), actor).uri()?);
+                assert!(verify_signed(&[&certificate], &pki.ca_der, &revoked, now, b"train 8 landed 7d0e1f", &signature).is_err(), "over that message alone");
+            }
+            assert!(sign_own(&pki, "runner", b"x").is_err(), "the server and CD alone");
             Ok(())
         })
     }

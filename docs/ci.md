@@ -8829,7 +8829,8 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   the leg (`w27_r01_an_ephemeral_runner_and_its_leg_have_identities`). The server's and CD's keys
   are made in `<data>/pki`, each in its own 0600 file (`server-signing.key`, `cd-signing.key`), apart from the
   TLS leaf, and certified for 90 days (`kiln://<org>/server`; CD's `kiln://<org>/server/cd`, acting
-  for the server). The server looks at them as it starts, every 6 hours while it runs and after any
+  for the server). They sign with `identities::sign_own` (ECDSA P-256, the certificate as DER),
+  which reads the key from its file each time, so the hub keeps no copy. The server looks at them as it starts, every 6 hours while it runs and after any
   revocation: one with less than 30 days left is renewed, and one revoked is replaced at once, a new
   key and a certificate for it (a revocation takes the certificate's key with it). Test:
   `w27_r01_server_and_cd` (each verifies to kiln's root, as the server and as CD for the server;
