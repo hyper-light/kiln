@@ -36,6 +36,8 @@ pub const CAPABILITIES: &[&str] = &[
     "runs.trigger",
     "runs.cancel",
     "runs.rerun",
+    // Pause and Resume a run's jobs (docs/ci.md W26-R22).
+    "runs.pause",
     "runs.debug",
     "runs.approve",
     "logs.read",
@@ -89,7 +91,7 @@ pub const SIGNED_IN: &str = "signed-in";
 /// variables; `admin` and `owner` have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
     const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read", "observe.read"];
-    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use", "observe.write"];
+    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "runs.pause", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use", "observe.write"];
     const MAINTAINER: &[&str] = &[
         "runs.debug",
         "runs.approve",
@@ -425,6 +427,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),
     r("POST", "/api/runs/*/retry", "runs.rerun", At::Run(2)),
+    r("POST", "/api/runs/*/pause", "runs.pause", At::Run(2)),
+    r("POST", "/api/runs/*/resume", "runs.pause", At::Run(2)),
     r("GET", "/api/jobs/*", "runs.read", At::Job(2)),
     r("GET", "/api/jobs/*/tools", "runs.read", At::Job(2)),
     // The agent it starts is the asker's (`agents.start`), so at most their permissions.

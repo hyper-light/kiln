@@ -653,6 +653,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let id = (*id).to_owned();
             boxed(|| retry(&hub, &id, req)).await
         }
+        (&Method::POST, ["api", "runs", id, verb @ ("pause" | "resume")]) => {
+            let (id, paused) = ((*id).to_owned(), *verb == "pause");
+            boxed(|| pause(&hub, &id, req, paused)).await
+        }
         (&Method::GET, ["api", "jobs", id]) => boxed(|| job(&hub, id)).await,
         // What a job lacks, and an agent to install it (crate::toolfix).
         (&Method::GET, ["api", "jobs", id, "tools"]) => boxed(|| crate::toolfix::report(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
@@ -2703,6 +2707,17 @@ async fn cancel(hub: &Hub, id: &str, req: Request) -> R {
     hub.cancel_run(id, "cancelled by user").await?;
     hub.store.audit("admin".into(), "run.cancel".into(), id.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/runs/:id/pause` and `/resume` with `{ jobs: [ids] }` (docs/ci.md W26-R22): those of
+/// the run's jobs, either engine's, paused (frozen where they run, or held before they start) or
+/// resumed, each answering what became of it.
+async fn pause(hub: &Hub, id: &str, req: Request, paused: bool) -> R {
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let jobs = srv::body_json::<SetReq>(req.into_body(), JSON_LIMIT).await.ok().and_then(|b| b.jobs).filter(|j| !j.is_empty());
+    let Some(jobs) = jobs else { return Err(err(StatusCode::BAD_REQUEST, "name the jobs: { jobs: [ids] }")) };
+    let v = crate::ci::retry::pause_set(hub, id, jobs, paused, &by).await.map_err(|(c, m)| err(c, m))?;
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 #[derive(Deserialize)]

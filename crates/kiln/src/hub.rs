@@ -37,6 +37,9 @@ const HISTORY: usize = 720;
 const DECLINE_BACKOFF: Duration = Duration::from_secs(15);
 /// How long a command whose caller doesn't wait for it is waited for, to log what came of it.
 pub(crate) const LOG_WITHIN: Duration = Duration::from_secs(300);
+/// How long a runner is given to say it froze a job, or let it go on (docs/ci.md W26-R22): its
+/// cgroup's freezer and `docker pause` are given 5 and 10 s there, and undoing half of it as long.
+const FREEZE_WITHIN: Duration = Duration::from_secs(45);
 /// How long a person's command (through the API) waits for its runner's answer.
 pub const COMMAND_WITHIN: Duration = Duration::from_secs(30);
 /// How often the server says again what it has of each runner's channel streams.
@@ -466,6 +469,11 @@ pub struct Hub {
     /// What the hub sent each runner process on its control lane, in order: for tests to read.
     #[cfg(test)]
     pub(crate) sent: Mutex<Vec<(PeerId, ServerMsg)>>,
+    /// The jobs paused in this server's life (docs/ci.md W26-R22), and those a restart found paused:
+    /// how long each was paused before, and since when it is now (unix seconds). A paused leg's
+    /// token lives that while longer ([`Hub::paused_for`]). Kept for the server's life: a person
+    /// pauses few jobs.
+    paused: Mutex<HashMap<String, (i64, Option<i64>)>>,
     /// Agents that have been sent Cancel for a job, with when (for the timeout escalation).
     cancel_sent: Mutex<HashMap<String, Instant>>,
     /// (job, agent) pairs recently declined: not offered again until DECLINE_BACKOFF passes.
@@ -614,6 +622,7 @@ impl Hub {
             refusals: Mutex::new(crate::wire::unread::Refusals::new(Arc::clone(&clock))),
             #[cfg(test)]
             sent: Mutex::new(Vec::new()),
+            paused: Mutex::new(HashMap::new()),
             clock,
             cancel_sent: Mutex::new(HashMap::new()),
             declined: Mutex::new(HashMap::new()),
@@ -2941,6 +2950,88 @@ impl Hub {
         Ok(done.jobs)
     }
 
+    /// Pause and Resume (docs/ci.md W26-R22): each named job of a run, either engine's, paused
+    /// (`paused`) or resumed. A running one is frozen where it runs, or let go on, by its runner,
+    /// only one that says it can (`CAP_FREEZE`); its time limit doesn't run while it's paused. A
+    /// waiting one is held, dispatched nowhere until it's resumed. Nothing resumes a job by itself.
+    /// Each job named, and whether it was, or why not.
+    pub async fn pause_jobs(&self, run_id: &str, jobs: Vec<String>, paused: bool) -> anyhow::Result<Vec<(String, Result<(), String>)>> {
+        let mut out = Vec::new();
+        let mut any = false;
+        for (id, t) in self.store.pause_targets(run_id.to_owned(), jobs).await? {
+            let r = match t {
+                None => Err("not a job of this run".to_owned()),
+                Some(t) => self.pause_one(&t, paused).await,
+            };
+            if let Ok(changed) = &r {
+                any |= *changed;
+                if *changed {
+                    self.emit_job(&id).await;
+                }
+            }
+            out.push((id, r.map(|_| ())));
+        }
+        if any {
+            self.emit_run(run_id).await;
+            if !paused {
+                self.wake.notify();
+            }
+        }
+        Ok(out)
+    }
+
+    /// How long job `job` has been paused at `now`, all told, the while it is now included
+    /// (docs/ci.md W26-R22): its token lives that while longer.
+    pub fn paused_for(&self, job: &str, now: i64) -> i64 {
+        self.paused.lock().get(job).map_or(0, |(before, since)| before + since.map_or(0, |s| (now - s).max(0)))
+    }
+
+    /// Job `job` found paused, or paused before, as a restart restores it: `paused_ms` before, and
+    /// `since` now.
+    pub fn restore_paused(&self, job: &str, paused_ms: i64, since: Option<i64>) {
+        self.paused.lock().insert(job.to_owned(), (paused_ms / 1000, since));
+    }
+
+    /// One job paused or resumed ([`Hub::pause_jobs`]): whether it changed, or why not.
+    async fn pause_one(&self, t: &crate::store::PauseTarget, paused: bool) -> Result<bool, String> {
+        if t.status.is_terminal() {
+            return Err(format!("`{}` has ended: it's {}", t.key, t.status.as_str()));
+        }
+        match (t.paused_at.is_some(), paused) {
+            (true, true) => return Ok(false),
+            (false, false) => return Err(format!("`{}` isn't paused", t.key)),
+            _ => {}
+        }
+        if t.status == Status::Running {
+            let Some(agent) = &t.agent else { return Err(format!("`{}` is starting: it has no runner yet", t.key)) };
+            // Only the runner process that holds it, and only one that can freeze a job in place.
+            let caps = self.instances.lock().wide_caps_for(agent, &crate::instances::Owned::Job(t.id.clone()));
+            if caps & crate::proto::CAP_FREEZE == 0 {
+                return Err(format!("its runner {agent} can't freeze a job in place: it runs Windows, or a kiln from before Pause"));
+            }
+            let answer = self.command(agent, &ServerMsg::Freeze { job: t.id.clone(), frozen: paused }, FREEZE_WITHIN).await;
+            if let Some((_, why)) = answer.failure(agent) {
+                return Err(why);
+            }
+        }
+        let now = crate::util::now_unix();
+        let changed = self.store.set_paused(t.id.clone(), paused, now).await.map_err(|e| format!("{e:#}"))?;
+        if changed {
+            let mut p = self.paused.lock();
+            let e = p.entry(t.id.clone()).or_insert((0, None));
+            match (paused, e.1.take()) {
+                (true, _) => e.1 = Some(now),
+                (false, Some(since)) => e.0 += (now - since).max(0),
+                (false, None) => {}
+            }
+        }
+        // The engine's scheduler holds a paused waiting leg until it's resumed.
+        if t.engine {
+            self.ci.send(crate::ci::dispatch::Msg::LegPaused { leg: t.id.clone(), paused });
+        }
+        Ok(changed)
+    }
+
     // ------------------------------------------------------------ scheduler
 
     /// Assign queued jobs to agents (or launch pods) until nothing more fits. Runs on every wake
@@ -3226,7 +3317,8 @@ impl Hub {
             let Some(spec) = &job.spec else { continue };
             let Some(started) = job.started_at else { continue };
             let limit = i64::from(spec.timeout_minutes) * 60;
-            if now - started <= limit {
+            // Its time limit doesn't run while it's paused (W26-R22).
+            if now - started - job.paused_s(now) <= limit {
                 continue;
             }
             let sent = self.cancel_sent.lock().get(&job.id).copied();
@@ -3675,6 +3767,71 @@ pub(crate) mod tests {
         assert!(fits(&["linux"], "linux", "x86_64", &["Linux"]), "`Linux` against `linux`");
         assert!(fits(&["Linux"], "linux", "x86_64", &["linux"]), "`linux` against `Linux`");
         assert!(!fits(&["baremetal"], "macos", "aarch64", &["baremetal", "linux"]), "a Mac isn't Linux");
+    }
+
+    /// W26-R22: a runner that doesn't say it can freeze a job in place (`CAP_FREEZE`: one on
+    /// Windows, or from before Pause) is asked nothing: pausing its running job is refused, saying
+    /// why, and the job stays as it was. One that says it is asked, and its job reads paused (a
+    /// test's runner takes the command as one before the channel did, unanswered). A waiting job is
+    /// held with no word to any runner, and resumed; one that has ended is refused, and so is
+    /// resuming one that isn't paused.
+    #[test]
+    fn w26_r22_an_old_runner_gets_no_freeze() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
+            join_runner(&hub, 1, "old", proto::CAP_WIRE);
+            join_runner(&hub, 2, "new", proto::CAP_WIRE | proto::CAP_FREEZE);
+            let repo = hub
+                .store
+                .upsert_repo(crate::store::Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                .await?;
+            let p = crate::pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {steps: [{run: y}]}\n  c: {steps: [{run: z}]}\n  d: {steps: [{run: w}]}\n")?;
+            let planned = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+            let run = crate::store::Run {
+                id: "run1".into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 0,
+                pipeline: "ci".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: "abc".into(),
+                message: String::new(),
+                author: String::new(),
+                status: Status::Queued,
+                created_at: 0,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: None,
+            };
+            hub.store.create_run(run, planned).await?;
+            let ids: HashMap<String, String> = hub.store.jobs("run1".into(), false).await?.into_iter().map(|j| (j.key, j.id)).collect();
+            let id = |k: &str| ids.get(k).cloned().unwrap_or_default();
+            let (a, b, c, d) = (id("a"), id("b"), id("c"), id("d"));
+            anyhow::ensure!(hub.store.claim_job(a.clone(), "old".into(), "baremetal".into()).await?);
+            anyhow::ensure!(hub.store.claim_job(b.clone(), "new".into(), "baremetal".into()).await?);
+            anyhow::ensure!(hub.store.claim_job(d.clone(), "new".into(), "baremetal".into()).await?);
+            hub.store.finish_job(d.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            let each: HashMap<String, Result<(), String>> = hub.pause_jobs("run1", vec![a.clone(), b.clone(), c.clone(), d.clone(), "nope".into()], true).await?.into_iter().collect();
+            let why = |j: &str| each.get(j).cloned().and_then(Result::err).unwrap_or_default();
+            anyhow::ensure!(why(&a).contains("its runner old can't freeze a job in place"), "{each:?}");
+            anyhow::ensure!(each.get(&b) == Some(&Ok(())), "the one that can is asked: {each:?}");
+            anyhow::ensure!(each.get(&c) == Some(&Ok(())), "a waiting job is held: {each:?}");
+            anyhow::ensure!(why(&d).contains("has ended: it's succeeded"), "{each:?}");
+            anyhow::ensure!(why("nope") == "not a job of this run", "{each:?}");
+            let paused = |j: String| {
+                let hub = Arc::clone(&hub);
+                async move { anyhow::Ok(hub.store.job(j).await?.and_then(|j| j.paused_at).is_some()) }
+            };
+            anyhow::ensure!(!paused(a.clone()).await? && paused(b.clone()).await? && paused(c.clone()).await?, "the old runner's job doesn't read paused");
+            anyhow::ensure!(!hub.sent.lock().iter().any(|(_, m)| matches!(m, ServerMsg::Freeze { .. })), "no runner hears of a waiting job's pause");
+            // Resumed: c again; a, never paused, is refused.
+            let each: HashMap<String, Result<(), String>> = hub.pause_jobs("run1", vec![c.clone(), a.clone()], false).await?.into_iter().collect();
+            anyhow::ensure!(each.get(&c) == Some(&Ok(())) && !paused(c).await?, "{each:?}");
+            anyhow::ensure!(each.get(&a).cloned().and_then(Result::err).is_some_and(|w| w.contains("isn't paused")), "{each:?}");
+            Ok(())
+        })
     }
 
     /// A test's hub, on `clock`, with runner `name` connected as process 1: its Hello taken, its

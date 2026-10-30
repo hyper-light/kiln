@@ -304,6 +304,28 @@ pub async fn cancel_set(hub: &Hub, run: &str, ids: Vec<String>, by: &str) -> Res
     Ok(json!({ "run": run, "jobs": jobs }))
 }
 
+/// Some of a run's jobs paused or resumed (docs/ci.md W26-R22), either engine's, through
+/// [`Hub::pause_jobs`]: each job's log says who paused or resumed it, and each job named answers
+/// what became of it (`paused` or `resumed`, and why not).
+pub async fn pause_set(hub: &Hub, run: &str, ids: Vec<String>, paused: bool, by: &str) -> Result<Value, Fail> {
+    let what = ids.join(", ");
+    let each = hub.pause_jobs(run, ids, paused).await.map_err(internal)?;
+    let (verb, word) = if paused { ("runs.pause_jobs", "paused") } else { ("runs.resume_jobs", "resumed") };
+    hub.store.audit(by.to_owned(), verb.into(), format!("{run}: {what}")).await;
+    let mut jobs = Vec::new();
+    for (j, r) in &each {
+        match r {
+            Ok(()) => {
+                let line = if paused { format!("paused by {by}: frozen where it runs, its time limit stopped, until it's resumed") } else { format!("resumed by {by}: it goes on from where it was") };
+                mark(hub, j, &line).await;
+                jobs.push(json!({ "job": j, word: true }));
+            }
+            Err(why) => jobs.push(json!({ "job": j, word: false, "why": why })),
+        }
+    }
+    Ok(json!({ "run": run, "jobs": jobs }))
+}
+
 /// `POST /api/ci/legs/:id/retry` with `{ runner?, elsewhere? }` (W05-R28): a finished job again,
 /// on any runner that can run it, on any but the one its last attempt ran on, or on the one
 /// named. A leg of the engine's is a new attempt of its run (the leg, and the jobs that need it,

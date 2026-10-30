@@ -335,6 +335,34 @@ pub struct Job {
     /// Where a person's retry asked it to run (docs/ci.md W05-R28).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<kiln_ci::sched::Placement>,
+    /// Paused since then (unix seconds; docs/ci.md W26-R22): waiting, it isn't dispatched; running,
+    /// it's frozen where it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub paused_at: Option<i64>,
+    /// How long it was paused before, all told: its time limit didn't run then.
+    #[serde(default, skip)]
+    #[cfg_attr(test, ts(skip))]
+    pub paused_ms: i64,
+}
+
+impl Job {
+    /// How long it has been paused, all told, the while it is now included (seconds).
+    pub fn paused_s(&self, now: i64) -> i64 {
+        self.paused_ms / 1000 + self.paused_at.map_or(0, |at| (now - at).max(0))
+    }
+}
+
+/// One of a run's jobs as Pause and Resume see it (docs/ci.md W26-R22).
+#[derive(Debug, Clone)]
+pub struct PauseTarget {
+    pub id: String,
+    pub key: String,
+    pub status: Status,
+    pub agent: Option<String>,
+    pub paused_at: Option<i64>,
+    /// The CI engine's leg, not v1's job.
+    pub engine: bool,
 }
 
 /// What [`Store::retry_job`] did (docs/ci.md W05-R28).
@@ -1052,7 +1080,7 @@ impl Store {
     pub async fn queued_jobs(&self, limit: u32) -> anyhow::Result<Vec<Job>> {
         self.call(move |c| {
             let mut st = c.prepare(&format!(
-                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL AND NOT EXISTS (
+                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL AND paused_at IS NULL AND NOT EXISTS (
                    SELECT 1 FROM runs r JOIN runs o ON o.concurrency_group = r.concurrency_group
                    WHERE r.id = jobs.run_id AND o.id != r.id AND o.status IN ('queued','running','pending')
                      AND (o.created_at < r.created_at OR (o.created_at = r.created_at AND o.rowid < r.rowid)))
@@ -1311,6 +1339,44 @@ impl Store {
     /// again and stopped through the engine (docs/ci.md W26-R21).
     pub async fn is_engine_run(&self, run: String) -> anyhow::Result<bool> {
         self.call(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_plans WHERE run_id = ?1)", [&run], |r| r.get::<_, bool>(0))?)).await
+    }
+
+    /// Jobs of run `run_id` as Pause and Resume see them (docs/ci.md W26-R22), either engine's: each
+    /// named, and what it is, `None` for one that isn't the run's.
+    pub async fn pause_targets(&self, run_id: String, jobs: Vec<String>) -> anyhow::Result<Vec<(String, Option<PauseTarget>)>> {
+        self.call(move |c| {
+            let mut st = c.prepare_cached("SELECT key, status, agent, paused_at, job_id IS NOT NULL FROM jobs WHERE id = ?1 AND run_id = ?2")?;
+            let mut out = Vec::with_capacity(jobs.len());
+            for id in jobs {
+                let t = st
+                    .query_row(params![id, run_id], |r| {
+                        Ok(PauseTarget { id: id.clone(), key: r.get(0)?, status: Status::parse(&r.get::<_, String>(1)?), agent: r.get::<_, Option<String>>(2)?.filter(|a| !a.is_empty() && a != "-"), paused_at: r.get(3)?, engine: r.get(4)? })
+                    })
+                    .optional()?;
+                out.push((id, t));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Job `job` paused at `now` (docs/ci.md W26-R22), or resumed, the while it was paused added to
+    /// its total, and to the life of its job tokens (`GITHUB_TOKEN`): a job doesn't age while it's
+    /// paused. Whether it changed: one paused already isn't paused again.
+    pub async fn set_paused(&self, job: String, paused: bool, now: i64) -> anyhow::Result<bool> {
+        self.call(move |c| {
+            if paused {
+                return Ok(c.execute("UPDATE jobs SET paused_at = ?2 WHERE id = ?1 AND paused_at IS NULL", params![job, now])? > 0);
+            }
+            let tx = crate::store::tx(c)?;
+            let Some(at) = tx.query_row("SELECT paused_at FROM jobs WHERE id = ?1", [&job], |r| r.get::<_, Option<i64>>(0)).optional()?.flatten() else { return Ok(false) };
+            let while_s = (now - at).max(0);
+            tx.execute("UPDATE jobs SET paused_ms = paused_ms + ?2 * 1000, paused_at = NULL WHERE id = ?1", params![job, while_s])?;
+            tx.execute("UPDATE tokens SET expires_at = expires_at + ?2 WHERE kind = 'job' AND principal = ?1 AND revoked_at IS NULL AND expires_at IS NOT NULL", params![job, while_s])?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
     }
 
     /// Jobs of one v1 run run again together (docs/ci.md W26-R21), each as [`Store::retry_job`]
@@ -1675,7 +1741,7 @@ impl Store {
 }
 
 const JOB_SELECT: &str = "SELECT id, run_id, key, display, status, labels, needs, agent, executor,
-    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec, matrix, placement FROM jobs";
+    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec, matrix, placement, paused_at, paused_ms FROM jobs";
 
 fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -1724,6 +1790,8 @@ fn row_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .filter(|v| v.as_object().is_some_and(|o| !o.is_empty())),
         placement: r.get::<_, Option<String>>(19)?.and_then(|s| serde_json::from_str::<kiln_ci::sched::Placement>(&s).ok()).filter(|p| !p.is_empty()),
+        paused_at: r.get(20)?,
+        paused_ms: r.get(21)?,
     })
 }
 
@@ -2254,6 +2322,58 @@ mod tests {
             // g was skipped by a's failure already; nothing for the cancel of c to change there.
             s.cancel_jobs("run1".into(), vec![id("c")], "cancelled".into()).await?;
             assert_eq!(s.job(id("g")).await?.and_then(|j| j.error), Some("dependency failed".to_owned()));
+            Ok(())
+        })
+    }
+
+    /// W26-R22: a waiting job paused isn't dispatched until it's resumed, the others going on; a
+    /// running one paused keeps its runner, and the while it was paused is kept so its time limit
+    /// leaves it out; paused twice, nothing changes; resumed when it isn't paused, nothing either.
+    #[test]
+    fn w26_r22_a_paused_job_waits_and_its_paused_time_is_kept() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (s, ids) = w26_r21_run("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {steps: [{run: y}]}\n  c: {steps: [{run: z}]}\n").await?;
+            let id = |k: &str| ids.get(k).cloned().unwrap_or_default();
+            let (b, c) = (id("b"), id("c"));
+            let queued = || {
+                let s = s.clone();
+                async move {
+                    let mut q: Vec<String> = s.queued_jobs(100).await?.into_iter().map(|j| j.key).collect();
+                    q.sort();
+                    anyhow::Ok(q)
+                }
+            };
+            assert_eq!(queued().await?, ["a", "b", "c"]);
+            // b waits, paused; c runs on ag1, paused at 1000.
+            assert!(s.set_paused(b.clone(), true, 1000).await?);
+            assert!(!s.set_paused(b.clone(), true, 1001).await?, "paused already: nothing changes");
+            assert_eq!(queued().await?, ["a", "c"], "a paused waiting job isn't dispatched");
+            assert!(s.claim_job(c.clone(), "ag1".into(), "baremetal".into()).await?);
+            assert!(s.set_paused(c.clone(), true, 1000).await?);
+            let t = s.pause_targets("run1".into(), vec![b.clone(), c.clone(), "nope".into()]).await?;
+            let t: std::collections::HashMap<String, Option<PauseTarget>> = t.into_iter().collect();
+            let tc = t.get(&c).cloned().flatten().ok_or_else(|| anyhow::anyhow!("no c"))?;
+            assert_eq!((tc.status, tc.agent.as_deref(), tc.paused_at, tc.engine), (Status::Running, Some("ag1"), Some(1000), false));
+            assert_eq!(t.get(&b).cloned().flatten().map(|t| (t.status, t.paused_at)), Some((Status::Queued, Some(1000))));
+            assert!(t.get("nope").is_some_and(Option::is_none), "not the run's");
+            // Its job token (`GITHUB_TOKEN`) lives the paused while longer.
+            let c2 = c.clone();
+            s.call(move |db| Ok(db.execute("INSERT INTO tokens (id, kind, principal, hash, scopes, created_at, expires_at) VALUES ('t1', 'job', ?1, 'h1', '{}', 900, 5000)", [&c2])?)).await?;
+            // Paused 30 s, then again 12 s: 42 s it doesn't count, and while it is, the time since.
+            assert!(s.set_paused(c.clone(), false, 1030).await?);
+            assert!(!s.set_paused(c.clone(), false, 1031).await?, "not paused: nothing changes");
+            assert!(s.set_paused(c.clone(), true, 1100).await?);
+            let jc = s.job(c.clone()).await?.ok_or_else(|| anyhow::anyhow!("no c"))?;
+            assert_eq!((jc.paused_at, jc.paused_ms, jc.paused_s(1105)), (Some(1100), 30_000, 35));
+            assert!(s.set_paused(c.clone(), false, 1112).await?);
+            let jc = s.job(c.clone()).await?.ok_or_else(|| anyhow::anyhow!("no c"))?;
+            assert_eq!((jc.paused_at, jc.paused_s(2000), jc.status, jc.agent.as_deref()), (None, 42, Status::Running, Some("ag1")));
+            let expires: i64 = s.call(|db| Ok(db.query_row("SELECT expires_at FROM tokens WHERE id = 't1'", [], |r| r.get(0))?)).await?;
+            assert_eq!(expires, 5042, "its job token lives the 42 s longer");
+            // b resumed: dispatched again.
+            assert!(s.set_paused(b.clone(), false, 1200).await?);
+            assert_eq!(queued().await?, ["a", "b"]);
+            assert_eq!(s.job(b.clone()).await?.map(|j| j.paused_at), Some(None));
             Ok(())
         })
     }

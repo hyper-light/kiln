@@ -135,6 +135,9 @@ pub enum Msg {
     /// A runner sent a sample (its CPUs busy, its memory in use): the engine weighs its headroom
     /// by it (the scheduler's headroom, W05).
     RunnerSample { agent: String },
+    /// A person paused a leg, or resumed it (docs/ci.md W26-R22): waiting, it's placed nowhere
+    /// until it's resumed. The store has it paused already, and its runner froze it if it runs.
+    LegPaused { leg: String, paused: bool },
 }
 
 /// Where and how a leg runs, as the scheduler placed it.
@@ -1125,6 +1128,11 @@ impl Dispatch {
             Msg::Finished { agent, result } => self.finished(&agent, result).await,
             Msg::RepoDeleted { repo } => {
                 self.repo_deleted(&repo).await;
+                Ok(())
+            }
+            Msg::LegPaused { leg, paused } => {
+                let cmds = self.sched.handle(Input::LegPaused { leg, paused }, now_ms());
+                Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
             Msg::Rejected { agent, leg } => {
@@ -3191,6 +3199,21 @@ impl Dispatch {
             })
             .collect();
         let legs: Vec<(String, String, String, Option<String>, u32, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5)).collect();
+        // Those a person paused (W26-R22): they come back paused, and their tokens live the while
+        // they were paused longer.
+        let run_owned = run.to_owned();
+        let pauses: Vec<(String, i64, Option<i64>)> = self
+            .hub
+            .store
+            .call(move |c| {
+                let mut st = c.prepare("SELECT id, paused_ms, paused_at FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND (paused_at IS NOT NULL OR paused_ms > 0)")?;
+                Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        for (id, ms, since) in &pauses {
+            self.hub.restore_paused(id, *ms, *since);
+        }
+        let paused: HashSet<String> = pauses.into_iter().filter(|p| p.2.is_some()).map(|p| p.0).collect();
         let event = v.get("event").and_then(|e| serde_json::from_value::<Event>(e.clone()).ok()).unwrap_or_else(|| Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() });
         let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
         let path = run_path(&input.github);
@@ -3257,6 +3280,7 @@ impl Dispatch {
                 },
             );
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
+            li.paused = paused.contains(&id);
             // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
             li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
             li.finish_within = st.sup.as_ref().map(|s| s.finish_within);

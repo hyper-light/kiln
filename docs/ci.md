@@ -8581,6 +8581,27 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   - On the engine, a set's rerun is one new attempt of a finished run, `kiln_ci::plan::rerun`'s
     `Mode::Set`. Legs cancelled one by one go through the plan (`on_cancel_legs`), logged, so a
     restart replays them.
+- **W26-R22 Pause and Resume.** Any set of a run's jobs pauses where it stands and resumes from
+  there, on either engine. `POST /api/runs/:id/pause` and `/resume` take `{ jobs }`, under
+  `runs.pause`, and each job named answers what became of it, or why not.
+  - A running job is frozen where it runs, keeping its runner and its slot. On Linux its steps are
+    in a cgroup of the job's own (`kiln-jobs-<pid>/<job>` under the runner's), joined before they
+    run anything, and that's frozen (`cgroup.freeze`), whatever they started. Elsewhere on Unix,
+    and on Linux without a cgroup v2 the runner may write, its steps' process groups are stopped
+    (SIGSTOP). Its job container is paused (`docker pause`). Resume undoes each.
+  - The runner is asked with `ServerMsg::Freeze` (appended last), only a runner that says it can
+    (`CAP_FREEZE`, bit 43: Unix). Its answer comes once it's done, or why not. Pausing a job on any
+    other runner (Windows, a kiln from before Pause) is refused saying so, and nothing is sent.
+  - Its time limits stop while it's paused: the job's and a step's on the runner, and v1's
+    `timeout_minutes` on the server, which leaves out the paused while (`paused_at`, `paused_ms`).
+  - A waiting job paused isn't dispatched until it's resumed: v1's queue skips it; the engine's
+    scheduler holds the leg (`Input::LegPaused`, waiting `paused`), its place in the queue kept,
+    and a restart brings it back paused.
+  - Nothing resumes a job by itself, but cancelling: a cancelled job is let go on first, so it
+    hears it's to end. A runner process that starts lets go of what runner processes before it
+    left frozen as they ended, as a dead runner's jobs always ran on.
+  - A job that has ended can't be paused, and one that isn't paused can't be resumed: each says so.
+    Pausing a paused job changes nothing.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8633,6 +8654,17 @@ repository):
   store `w26_r21_a_set_of_jobs_retried_together` and `w26_r21_a_set_of_jobs_cancelled_the_run_going_on`;
   `kiln-ci` `w26_r21_a_set_runs_again_each_and_what_needs_it` and
   `w26_r21_cancelling_some_legs_stops_them_and_skips_what_needs_them_the_rest_go_on`.*
+- **W26-AC13 Pause and Resume.** On a runner of the server's own, a v1 job and an engine leg each
+  running, paused: each reads paused, its processes are frozen (`cgroup.freeze` 1) and nothing of it
+  moves. Resumed, each runs on and finishes, the leg after more than its step's 15 s all told,
+  paused 12 of them. A job paused while it waited isn't dispatched once its need is met, until it's
+  resumed. A runner that can't freeze is sent nothing, and the pause says why.
+  *`tests/pause.rs` `w26_r22_a_running_job_paused_is_frozen_in_place_and_goes_on_when_resumed`;
+  `runner::freeze` `w26_r22_*` (a cgroup, process groups, a Docker container); store
+  `w26_r22_a_paused_job_waits_and_its_paused_time_is_kept`; hub `w26_r22_an_old_runner_gets_no_freeze`;
+  `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
+  `w26_r22_freeze_is_appended_after_every_older_variant`; contain
+  `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
 
 **Progress.** In progress. R06 to R15, each Ship item's dropdown owning its review, are built
 (Review plan step 3, kiln plan `01a17856b1aa77df93c0ef014cda0a71`, with the CI/CD Integration
