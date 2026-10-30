@@ -23,7 +23,6 @@ import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate, useSearchParams } from "@/lib/router";
-import { cn } from "@/lib/utils";
 import { atOf, doingOf, findAgents } from "./broadcast";
 import { useAttachments } from "./controls";
 import { agentLabel, modelLabel, tildify } from "./derive";
@@ -701,7 +700,7 @@ export function NewAgent({
           void attachments.add(e.dataTransfer.files);
         }}
       >
-        <div className={cn("hx-compose-box", busy && "hx-compose-live")}>
+        <div className="hx-compose-box">
           {attachments.chips}
           <textarea
             ref={attach}
