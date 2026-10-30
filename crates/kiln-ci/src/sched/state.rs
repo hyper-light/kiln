@@ -13,6 +13,12 @@
 //! promoted a class, never above `interactive` (W05-R31). Capacity that frees looks only at the
 //! signatures that runner can serve.
 //!
+//! Each assignment is a grant (W05-R34, docs/needs.md §8): its [`Fence`] (the epoch, then its
+//! number in it, no other grant's) and, with a lease, an expiry its runner's renewals move on. A
+//! grant past its expiry is lost before anything else is decided at that time, as its runner's
+//! loss would end it ([`Command::Lost`]); a refusal or renewal naming a grant that isn't the leg's
+//! now changes nothing.
+//!
 //! A leg whose preferences name `warm` or `affinity` (W24-R18) goes where it's expected to finish
 //! first, from what each runner holds warm ([`Input::Warm`], [`super::warm`]), and may wait a
 //! bounded while for a busy runner that would finish it sooner ([`WaitReason::Warm`]).
@@ -386,6 +392,14 @@ pub struct Config {
     pub warm: warm::Model,
     /// Each class's floor and bound (docs/needs.md §7, W05-R31); a class not here has neither.
     pub classes: BTreeMap<Class, ClassConfig>,
+    /// How long a grant lives without being renewed (docs/needs.md §8, W05-R34): one not renewed
+    /// by then is lost. `None`: grants don't expire, as where nothing renews them; kiln's `[sched]
+    /// lease` sets it, 60 s by default.
+    pub lease: Option<Ms>,
+    /// How long past a lost grant's expiry its item's next attempt waits when the item stops on
+    /// losing its lease ([`LeaseLoss::Stop`], W05-R34): its runner has stopped it by then.
+    /// kiln's `[sched] lock_delay`, 15 s by default.
+    pub lock_delay: Ms,
 }
 
 /// A level of fair share (W28-R66).
@@ -418,6 +432,50 @@ impl Default for Config {
             admission: None,
             warm: warm::Model::default(),
             classes: default_classes(),
+            lease: None,
+            lock_delay: 15_000,
+        }
+    }
+}
+
+/// What an item's runner does with it once its lease is lost (docs/needs.md §8, W05-R34).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeaseLoss {
+    /// It runs to its end, and what it writes is refused once its grant is gone (a CI leg).
+    #[default]
+    Finish,
+    /// Its runner stops it at the lease's end, by its own clock; its next attempt waits the
+    /// lock-delay past the grant's expiry.
+    Stop,
+}
+
+/// A grant's fencing token (docs/needs.md §8, W05-R34): the epoch it was made in, then its number
+/// among that epoch's grants. A later grant's is greater, across failovers too (a later leader's
+/// epoch is), and no two grants share one, not even an attempt granted again after a refusal: so
+/// what names a grant by it (a renewal, a refusal, a write) is told from what a stale one sends,
+/// as Chubby's sequencers and Kleppmann's fencing tokens are checked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Fence {
+    pub epoch: u64,
+    pub n: u64,
+}
+
+/// Why the engine took a grant back ([`Command::Lost`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loss {
+    /// Not renewed by its expiry (W05-R34).
+    Expired,
+    /// Its runner was lost.
+    RunnerLost,
+}
+
+impl Loss {
+    /// In words, as the attempt's record says why it ended.
+    pub fn why(self) -> &'static str {
+        match self {
+            Loss::Expired => "its lease ran out: its runner didn't renew it",
+            Loss::RunnerLost => "its runner was lost",
         }
     }
 }
@@ -486,6 +544,8 @@ pub struct LegIn {
     pub workflow_file: String,
     /// Where a person's retry asked it to run (W05-R28).
     pub placement: Placement,
+    /// What its runner does with it once its lease is lost (W05-R34): a CI leg runs to its end.
+    pub on_lease_loss: LeaseLoss,
 }
 
 /// Where a person's retry asked a leg to run (W05-R28): only on `runner`, or on any runner but
@@ -555,8 +615,9 @@ pub enum Input {
     /// W24-R04's check of what an ended execution read came back, at an adopter's own commit.
     Checked { leg: String, matched: bool },
     LegQueued(Box<LegIn>),
-    /// After a restart: a leg the runner still runs (W05-R25).
-    LegRunning { leg: Box<LegIn>, runner: String, attempt: u32 },
+    /// After a restart: a leg the runner still runs (W05-R25), under the grant the store holds,
+    /// its fence kept. It gets a lease afresh.
+    LegRunning { leg: Box<LegIn>, runner: String, attempt: u32, fence: Fence },
     /// The plan cancelled a leg (fail-fast, the run cancelled).
     LegCancelled { leg: String, reason: String },
     /// A leg gone with its repository: dropped without settling (its records are gone with it),
@@ -569,9 +630,13 @@ pub enum Input {
         attempt: u32,
         outcome: Outcome,
     },
-    /// The runner refused the assignment (no free slot, draining): the leg goes back to its queue,
-    /// the same attempt, and not to that runner.
-    Rejected { leg: String },
+    /// The runner refused the grant `fence` (no free slot, draining): the leg goes back to its
+    /// queue, the same attempt, and not to that runner. A refusal of a grant that isn't the leg's
+    /// now changes nothing (W05-R34).
+    Rejected { leg: String, fence: Fence },
+    /// A runner renews the grants it holds (its heartbeat, W05-R34): each it names by its fence
+    /// that's its own lives a lease from now. A grant it doesn't name isn't renewed.
+    Renewed { runner: String, held: Vec<(String, Fence)> },
     RunnerUp(Box<RunnerIn>),
     RunnerChanged(Box<RunnerIn>),
     RunnerLost { runner: String },
@@ -692,8 +757,20 @@ pub enum Command {
     CancelRun { run: String, reason: String },
     /// `image` is the routing rule's, for container and microVM executors (W13); `docker`, the
     /// Docker access the rules give the leg (W13-R04); `slot`, the pool's executor it runs in
-    /// (W13-R09).
-    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String>, slot: Option<String> },
+    /// (W13-R09). The grant (W05-R34): its fence, until when it lives (unix ms; `None` with no
+    /// lease) unless renewed, and what its runner does once its lease is lost.
+    Assign {
+        leg: String,
+        runner: String,
+        attempt: u32,
+        executor: Option<String>,
+        image: Option<String>,
+        docker: Option<String>,
+        slot: Option<String>,
+        fence: Fence,
+        expires: Option<i64>,
+        lease_loss: LeaseLoss,
+    },
     /// Start one of a pool's executors on `runner`, ready for a leg (W13-R09).
     /// `leg`: the one it's made for (a `k8s` pod of that leg's containers, W13-R07).
     StartExecutor {
@@ -718,6 +795,10 @@ pub enum Command {
     Demand { leg: String, decision: Decision },
     /// An adopter's execution ended: it's done, reused from `from`, as `from` ended (W28-R44).
     Adopted { leg: String, from: String, outcome: Outcome },
+    /// The engine took a grant back (W05-R34): `attempt` of `leg` on `runner`, under `fence`, is
+    /// over, lost as `why` says; a `Retry` or `Settled` for the leg follows. Its runner is to stop
+    /// it, and what it writes under that fence is to be refused.
+    Lost { leg: String, attempt: u32, runner: String, fence: Fence, why: Loss },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -784,6 +865,10 @@ struct Leg {
     held: bool,
     /// While it runs: when it's expected to end (unix ms), so its runner has room again.
     ends: Option<i64>,
+    /// While it runs, its grant (W05-R34): its fence, and when it expires unless renewed (`None`
+    /// with no lease), as [`Scheduler::leases`] keeps it.
+    fence: Fence,
+    expires: Option<i64>,
 }
 
 /// A leg's wait for a busy runner where it would finish sooner (W24-R18).
@@ -1006,9 +1091,16 @@ pub struct Scheduler {
     /// what's left of its floor of the fleet's time, taken by what went over it.
     paced: BTreeMap<Class, i64>,
     /// Promotions to look at, by when: (leg, when it was queued, the class it goes up from)
-    /// (W05-R31); and the time of the last timer asked for to look at them.
+    /// (W05-R31).
     promotions: BTreeMap<i64, Vec<(String, i64, Class)>>,
-    promotion_timer: Option<i64>,
+    /// The epoch its grants are made in (docs/needs.md §8: the store group's term), how many it
+    /// has made in it (the last one's fence), and the grants that expire, by (expiry, leg)
+    /// (W05-R34).
+    epoch: u64,
+    fences: u64,
+    leases: BTreeSet<(i64, String)>,
+    /// The time of the last timer asked for to look at the next promotion or expiry.
+    timer: Option<i64>,
     seq: u64,
     timers: BTreeMap<i64, Vec<String>>,
     in_progress: BTreeMap<String, usize>,
@@ -1043,8 +1135,14 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(cfg: Config) -> Scheduler {
+        Scheduler::with_epoch(cfg, 0)
+    }
+
+    /// A scheduler whose grants are made in `epoch` (docs/needs.md §8: the store group's term, so
+    /// a later leader's are later).
+    pub fn with_epoch(cfg: Config, epoch: u64) -> Scheduler {
         let admit = Admit::new(cfg.window);
-        Scheduler { cfg, admit, ..Scheduler::default() }
+        Scheduler { cfg, admit, epoch, ..Scheduler::default() }
     }
 
     fn config(&self) -> &Config {
@@ -1057,6 +1155,9 @@ impl Scheduler {
         self.now = now;
         // Every leg in the class its wait has brought it to by now (W05-R31).
         self.promote_due(now);
+        // Every grant not renewed by now is lost before anything else is decided (W05-R34): a
+        // renewal that comes at or after its expiry comes too late.
+        self.expire_due(now, &mut out);
         // Reservations' windows that opened or closed since: what may run where changes.
         if !self.cfg.reservations.is_empty() && self.windows_at.is_none_or(|at| now >= at) {
             self.refresh_windows(now, &mut out);
@@ -1089,12 +1190,14 @@ impl Scheduler {
                 }
             }
             Input::LegQueued(leg) => self.leg_queued(*leg, now, &mut out),
-            Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt, now, &mut out),
+            Input::LegRunning { leg, runner, attempt, fence } => self.adopt(*leg, runner, attempt, fence, now, &mut out),
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
             Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
-            Input::Rejected { leg } => {
-                if let Some(runner) = self.release(&leg, now) {
+            Input::Rejected { leg, fence } => {
+                if self.live(&leg, fence)
+                    && let Some(runner) = self.release(&leg, now)
+                {
                     self.stopped(&leg);
                     self.discard_used(&leg, &mut out);
                     // Refused by the runner a person's retry asked for (W05-R28): only it may run
@@ -1117,6 +1220,7 @@ impl Scheduler {
                     self.try_runner(&runner, now, &mut out);
                 }
             }
+            Input::Renewed { runner, held } => self.renew(&runner, &held, now),
             Input::RunnerUp(r) | Input::RunnerChanged(r) => self.runner_up(*r, now, &mut out),
             Input::RunnerLost { runner } => self.runner_lost(&runner, now, &mut out),
             Input::RunnerDraining { runner } => {
@@ -1148,16 +1252,57 @@ impl Scheduler {
             Input::Tick => self.tick(now, &mut out),
             Input::Warm { runner, held } => self.warm_changed(runner, held),
         }
-        // A timer for the next promotion to look at, so it's looked at then and not at whatever
-        // input comes next (W05-R31): one at a time, asked for again once it has passed or when
-        // an earlier one is due.
-        if let Some(next) = self.promotions.first_key_value().map(|(at, _)| (*at).max(now))
-            && self.promotion_timer.is_none_or(|t| t <= now || next < t)
+        // A timer for the next promotion to look at or grant to expire, so each is looked at then
+        // and not at whatever input comes next (W05-R31, R34): one at a time, the earlier of the
+        // two, asked for again once it has passed or when an earlier one is due.
+        let next = [self.promotions.first_key_value().map(|(at, _)| *at), self.leases.first().map(|(at, _)| *at)].into_iter().flatten().min().map(|at| at.max(now));
+        if let Some(next) = next
+            && self.timer.is_none_or(|t| t <= now || next < t)
         {
-            self.promotion_timer = Some(next);
+            self.timer = Some(next);
             out.push(Command::Timer { at: next });
         }
         out
+    }
+
+    /// Whether `fence` is `leg`'s grant now: it's assigned, under that grant (W05-R34).
+    fn live(&self, leg: &str, fence: Fence) -> bool {
+        self.legs.get(leg).is_some_and(|l| l.fence == fence && matches!(l.state, State::Assigned { .. }))
+    }
+
+    /// `runner` renews the grants it names (W05-R34): each that's its own, under that fence, lives
+    /// a lease from now. One it doesn't hold, or that's been granted again since, isn't renewed.
+    fn renew(&mut self, runner: &str, held: &[(String, Fence)], now: i64) {
+        let Some(lease) = self.cfg.lease else { return };
+        let until = later(now, lease);
+        for (id, fence) in held {
+            let Some(l) = self.legs.get_mut(id) else { continue };
+            if l.fence != *fence || !matches!(&l.state, State::Assigned { runner: r } if r == runner) {
+                continue;
+            }
+            if let Some(was) = l.expires.filter(|was| *was < until) {
+                l.expires = Some(until);
+                self.leases.remove(&(was, id.clone()));
+                self.leases.insert((until, id.clone()));
+            }
+        }
+    }
+
+    /// Every grant past its expiry by `now` is lost, the earliest first (W05-R34): its attempt
+    /// ends as its runner's loss would end it (W05-R16's retry), and a stop item's next attempt
+    /// waits the lock-delay past the expiry ([`Self::finished`]).
+    fn expire_due(&mut self, now: i64, out: &mut Vec<Command>) {
+        while let Some((at, id)) = self.leases.first().cloned().filter(|(at, _)| *at <= now) {
+            self.leases.remove(&(at, id.clone()));
+            let Some(l) = self.legs.get(&id) else { continue };
+            let State::Assigned { runner } = &l.state else { continue };
+            // One gone with its repository leaves nothing to tell (its records are gone).
+            if !l.gone {
+                out.push(Command::Lost { leg: id.clone(), attempt: l.attempt, runner: runner.clone(), fence: l.fence, why: Loss::Expired });
+            }
+            let attempt = l.attempt;
+            self.finished(&id, attempt, Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }), now, out);
+        }
     }
 
     fn run_queued(&mut self, run: String, group: Option<(String, String, GroupConfig)>, supersede: Option<(String, Supersede)>, now: i64, out: &mut Vec<Command>) {
@@ -1276,7 +1421,7 @@ impl Scheduler {
         let group = input.group.clone();
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
+            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, fence: Fence::default(), expires: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1397,8 +1542,14 @@ impl Scheduler {
         }
     }
 
-    fn adopt(&mut self, input: LegIn, runner: String, attempt: u32, now: i64, out: &mut Vec<Command>) {
+    fn adopt(&mut self, input: LegIn, runner: String, attempt: u32, fence: Fence, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
+        // Its grant keeps its fence, and gets a lease afresh: its runner renews it once it's back,
+        // or it's lost then (W05-R34).
+        let expires = self.cfg.lease.map(|ms| later(now, ms));
+        if let Some(was) = self.legs.get(&id).and_then(|l| l.expires) {
+            self.leases.remove(&(was, id.clone()));
+        }
         let req = self.requirement(&input);
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
@@ -1431,8 +1582,13 @@ impl Scheduler {
                 hold: None,
                 held: false,
                 ends: None,
+                fence,
+                expires,
             },
         );
+        if let Some(at) = expires {
+            self.leases.insert((at, id.clone()));
+        }
         // When it started isn't known: it's expected to take its whole run from now (W24-R18).
         let ends = self.legs.get(&id).map(|l| later(now, self.expected_ms(l, &runner)));
         if let Some(l) = self.legs.get_mut(&id) {
@@ -2094,9 +2250,17 @@ impl Scheduler {
         l.ends = expected.map(|ms| later(now, ms));
         l.last_runner = Some(runner.to_owned());
         l.started = Some(now);
+        // Its grant (W05-R34): the next fence of this epoch, living a lease unless renewed.
+        let expires = self.cfg.lease.map(|ms| later(now, ms));
+        self.fences += 1;
+        let fence = Fence { epoch: self.epoch, n: self.fences };
+        (l.fence, l.expires) = (fence, expires);
+        if let Some(at) = expires {
+            self.leases.insert((at, id.to_owned()));
+        }
         self.demands.started(id, now);
         let Some(l) = self.legs.get_mut(id) else { return };
-        let (attempt, request, repo) = (l.attempt, l.input.request, l.input.repo.clone());
+        let (attempt, request, repo, lease_loss) = (l.attempt, l.input.request, l.input.repo.clone(), l.input.on_lease_loss);
         let req = l.req.clone();
         let (image, docker) = (req.image.clone(), req.docker.clone());
         *self.in_progress.entry(repo).or_default() += 1;
@@ -2117,11 +2281,15 @@ impl Scheduler {
             e.since = now;
             e.id.clone()
         });
-        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker, slot });
+        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker, slot, fence, expires, lease_loss });
     }
 
     fn release(&mut self, id: &str, now: i64) -> Option<String> {
         self.settle_charge(id, now);
+        // Its grant is over: it expires no more (W05-R34).
+        if let Some(at) = self.legs.get_mut(id).and_then(|l| l.expires.take()) {
+            self.leases.remove(&(at, id.to_owned()));
+        }
         let l = self.legs.get(id)?;
         let State::Assigned { runner } = &l.state else { return None };
         let (runner, request, repo) = (runner.clone(), l.input.request, l.input.repo.clone());
@@ -2149,12 +2317,25 @@ impl Scheduler {
 
     fn finished(&mut self, id: &str, attempt: u32, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
         let Some(l) = self.legs.get(id) else { return };
-        if l.attempt != attempt || l.state == State::Done {
+        // The attempt that runs ends, or one that ended before it ran (its executor couldn't be
+        // made while it was queued, W13-R07): an end of any other changes nothing (W05-R34).
+        let queued = l.state == State::Queued;
+        if l.attempt != attempt || !(queued || matches!(l.state, State::Assigned { .. })) {
             return;
         }
         if l.gone {
             self.drop_gone(id, now, out);
             return;
+        }
+        // A stop item lost with its grant: its next attempt waits the lock-delay past the grant's
+        // expiry, by which its runner has stopped it by its own clock (W05-R34).
+        let lock = match &outcome {
+            Outcome::Failed(f) if f.class == FailureClass::RunnerLost && l.input.on_lease_loss == LeaseLoss::Stop => Some(l.expires.unwrap_or(now).max(now).saturating_add(ms_i64(self.cfg.lock_delay))),
+            _ => None,
+        };
+        // Out of its queue before it's queued again or settled, so it's queued once.
+        if queued {
+            self.unqueue(id);
         }
         let runner = self.release(id, now);
         self.stopped(id);
@@ -2179,7 +2360,7 @@ impl Scheduler {
         };
         match decision {
             Some(d) => {
-                let at = now + i64::try_from(d.delay_ms).unwrap_or(i64::MAX / 2);
+                let at = (now + i64::try_from(d.delay_ms).unwrap_or(i64::MAX / 2)).max(lock.unwrap_or(now));
                 if let Some(l) = self.legs.get_mut(id) {
                     l.attempt += 1;
                     l.state = State::Retrying { at };
@@ -2195,7 +2376,7 @@ impl Scheduler {
                     }
                     out.push(Command::Retry { leg: id.to_owned(), attempt: l.attempt, at });
                 }
-                if d.delay_ms == 0 {
+                if at <= now {
                     self.enqueue(id, now, out);
                 } else {
                     self.timers.entry(at).or_default().push(id.to_owned());
@@ -2576,7 +2757,11 @@ impl Scheduler {
         // would rather have.
         self.requeued = Some(Vec::new());
         for leg in legs {
-            let attempt = self.legs.get(&leg).map_or(0, |l| l.attempt);
+            let Some((attempt, fence, gone)) = self.legs.get(&leg).map(|l| (l.attempt, l.fence, l.gone)) else { continue };
+            // Its grant is lost with its runner (W05-R34).
+            if !gone {
+                out.push(Command::Lost { leg: leg.clone(), attempt, runner: runner.to_owned(), fence, why: Loss::RunnerLost });
+            }
             self.finished(&leg, attempt, Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }), now, out);
         }
         let mut changed: BTreeSet<String> = self.requeued.take().unwrap_or_default().into_iter().collect();
@@ -3321,6 +3506,62 @@ impl Scheduler {
     /// Legs queued now (for metrics).
     pub fn queued(&self) -> usize {
         self.sigs.values().map(Sig::len).sum()
+    }
+
+    /// Each running leg's grant (W05-R34): its runner, attempt, fence and expiry.
+    #[cfg(test)]
+    pub(super) fn grants(&self) -> BTreeMap<String, (String, u32, Fence, Option<i64>)> {
+        let mut out = BTreeMap::new();
+        for (id, l) in self.legs.iter() {
+            if let State::Assigned { runner } = &l.state {
+                out.insert(id.clone(), (runner.clone(), l.attempt, l.fence, l.expires));
+            }
+        }
+        out
+    }
+
+    /// The legs waiting to be retried, each with when (a stop item's lock-delay among them).
+    #[cfg(test)]
+    pub(super) fn retrying(&self) -> BTreeMap<String, i64> {
+        self.legs.iter().filter_map(|(id, l)| if let State::Retrying { at } = l.state { Some((id.clone(), at)) } else { None }).collect()
+    }
+
+    /// The grants' invariants (W05-R34, docs/needs.md G2's half in the engine), checked after every
+    /// input in tests: each running leg holds one grant, its fence its own, made in this epoch (no
+    /// later than the last fence) or an earlier one, expiring as the expiry index has it when
+    /// leases are on; the index holds nothing else; and no leg runs on two runners or twice on one.
+    #[cfg(test)]
+    pub(super) fn check_grants(&self) -> Result<(), String> {
+        let (mut indexed, mut fences) = (BTreeSet::new(), BTreeSet::new());
+        for (id, l) in self.legs.iter() {
+            match (&l.state, l.expires) {
+                (State::Assigned { runner }, expires) => {
+                    if l.fence > (Fence { epoch: self.epoch, n: self.fences }) {
+                        return Err(format!("{id}'s fence {:?} is past this epoch's last, {:?}", l.fence, Fence { epoch: self.epoch, n: self.fences }));
+                    }
+                    if l.fence != Fence::default() && !fences.insert(l.fence) {
+                        return Err(format!("{id}'s fence {:?} is another grant's too", l.fence));
+                    }
+                    if expires.is_some() != self.cfg.lease.is_some() {
+                        return Err(format!("{id} on {runner} has expiry {expires:?} with lease {:?}", self.cfg.lease));
+                    }
+                    if let Some(at) = expires {
+                        indexed.insert((at, id.clone()));
+                    }
+                    let on = self.runners.values().filter(|r| r.running.iter().any(|x| x == id)).count();
+                    let here = self.runners.get(runner).map_or(0, |r| r.running.iter().filter(|x| *x == id).count());
+                    if on != 1 || here != 1 {
+                        return Err(format!("{id} runs on {on} runners' lists, {here} times on {runner}'s"));
+                    }
+                }
+                (_, Some(at)) => return Err(format!("{id} isn't running but its grant expires at {at}")),
+                (_, None) => {}
+            }
+        }
+        if indexed != self.leases {
+            return Err(format!("the expiry index holds {:?}, the running legs' grants {:?}", self.leases, indexed));
+        }
+        Ok(())
     }
 
     /// What runs where (each assigned leg's runner and attempt), each runner's legs as it counts

@@ -28,7 +28,7 @@ use std::time::Duration;
 use kiln_ci::facts::{Cpu, Mem, RunnerFacts};
 use kiln_ci::sched::retry::{Failed, FailureClass};
 use kiln_ci::sched::routing::{LegRoute, RunnerView};
-use kiln_ci::sched::state::{Command, Config, Cpus, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, WaitReason};
+use kiln_ci::sched::state::{Command, Config, Cpus, Fence, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, WaitReason};
 use kiln_sim::net::{Fate, Node};
 use kiln_sim::{Faults, Net, Queue, Rng, Trace};
 
@@ -161,8 +161,10 @@ struct Sim {
     links: Vec<Option<(u32, Duration)>>,
     /// The legs queued, as queued.
     legs: BTreeMap<String, LegIn>,
-    /// Each leg's runner and attempt, as the engine's commands said (no runner between attempts).
+    /// Each leg's runner and attempt, as the engine's commands said (no runner between attempts),
+    /// and its last grant's fence, which the dispatcher names a refusal by.
     placed: BTreeMap<String, (Option<usize>, u32)>,
+    fences: BTreeMap<String, Fence>,
     settled: BTreeMap<String, Outcome>,
     took: BTreeMap<String, Duration>,
     fails: BTreeSet<String>,
@@ -240,6 +242,7 @@ impl Sim {
             links,
             legs: BTreeMap::new(),
             placed: BTreeMap::new(),
+            fences: BTreeMap::new(),
             settled: BTreeMap::new(),
             took: BTreeMap::new(),
             fails: BTreeSet::new(),
@@ -359,8 +362,9 @@ impl Sim {
         for c in cmds {
             self.step(format!("engine: {c:?}"));
             match c {
-                Command::Assign { leg, runner, attempt, .. } => {
+                Command::Assign { leg, runner, attempt, fence, .. } => {
                     let Some(r) = self.runners.iter().position(|x| x.input.id == runner) else { continue };
+                    self.fences.insert(leg.clone(), fence);
                     self.counts.assigned += 1;
                     if self.placed.iter().any(|(l, (on, _))| *l == leg && on.is_some_and(|o| o != r)) || self.runners.iter().enumerate().any(|(i, x)| i != r && x.jobs.contains_key(&leg)) {
                         self.counts.twice += 1;
@@ -453,7 +457,8 @@ impl Sim {
                     }
                     p.0 = None;
                 }
-                self.input(Input::Rejected { leg });
+                let fence = self.fences.get(&leg).copied().unwrap_or_default();
+                self.input(Input::Rejected { leg, fence });
             }
             Frame::Finished { leg, attempt, outcome } => {
                 self.tell_runner(r, session, Frame::Received { leg: leg.clone() });

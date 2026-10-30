@@ -16,7 +16,7 @@ use kiln_ci::sched::retry::{Failed, FailureClass, RetryOn, RetryPolicy};
 use kiln_ci::sched::routing::{LegRoute, RunnerView};
 use kiln_ci::sched::demand::{Demand, Domain, Intent, Supersession, When, Work};
 use kiln_ci::sched::state::Decision;
-use kiln_ci::sched::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler, Supersede};
+use kiln_ci::sched::{Command, Config, Fence, Input, LegIn, Outcome, RunnerIn, Scheduler, Supersede};
 use kiln_ci::trigger::Event;
 use kiln_ci::wf::Workflow;
 use kiln_ci::wire::{self, AssignmentV2, JobEventV2};
@@ -67,6 +67,8 @@ pub enum Msg {
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
     RunnerLost { agent: String },
+    /// A runner's heartbeat named the legs it runs: it renews their grants (W05-R34).
+    Renew { agent: String, running: Vec<String> },
     /// A runner's probes reported (W13-R01): it is routed by what they found.
     RunnerFacts { agent: String },
     Event { agent: String, leg: String, json: String },
@@ -440,6 +442,10 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
 /// The scheduler's settings: `[ci.scheduler]`, `[ci.fairness]` and the routing rules.
 fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config {
     let (s, f) = (&hub.cfg.ci.scheduler, &hub.cfg.ci.fairness);
+    let (lease, lock_delay) = hub.cfg.sched.leases().unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "grants' leases are kiln's own");
+        (60_000, 15_000)
+    });
     Config {
         rules,
         // Config's numbers, in the engine's integers (docs/needs.md, E1).
@@ -459,6 +465,10 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
             tracing::warn!(error = %format!("{e:#}"), "the classes' floors and bounds are kiln's own");
             kiln_ci::sched::state::default_classes()
         }),
+        // Grants are leases, renewed by runners' heartbeats (W05-R34): kiln's while what's set
+        // doesn't read.
+        lease: Some(lease),
+        lock_delay,
         ..Config::default()
     }
 }
@@ -693,6 +703,9 @@ struct LegSt {
     seq: u64,
     /// Gone with its repository while it ran: its end frees its slot, and nothing is written.
     gone: bool,
+    /// Its grant's fence (W05-R34), from the scheduler's `Assign`: what a renewal or a refusal of
+    /// it names.
+    fence: Fence,
 }
 
 /// An event's place in its attempt (`seq`, from runners that send events again after a reconnect).
@@ -1133,6 +1146,15 @@ impl Dispatch {
                 self.commands(cmds).await;
                 Ok(())
             }
+            // The legs it names that are its own now, each by the fence of the grant it was sent.
+            Msg::Renew { agent, running } => {
+                let held: Vec<(String, Fence)> = running.into_iter().filter_map(|id| self.legs.get(&id).filter(|l| l.agent.as_deref() == Some(agent.as_str())).map(|l| (id, l.fence))).collect();
+                if !held.is_empty() {
+                    let cmds = self.sched.handle(Input::Renewed { runner: agent, held }, now_ms());
+                    self.commands(cmds).await;
+                }
+                Ok(())
+            }
             Msg::Event { agent, leg, json } => self.event(&agent, &leg, &json).await,
             Msg::Finished { agent, result } => self.finished(&agent, result).await,
             Msg::RepoDeleted { repo } => {
@@ -1141,10 +1163,12 @@ impl Dispatch {
             }
             Msg::Rejected { agent, leg } => {
                 self.hub.release_slot(&agent, &leg);
+                let mut fence = Fence::default();
                 if let Some(l) = self.legs.get_mut(&leg) {
                     l.agent = None;
+                    fence = l.fence;
                 }
-                let cmds = self.sched.handle(Input::Rejected { leg }, now_ms());
+                let cmds = self.sched.handle(Input::Rejected { leg, fence }, now_ms());
                 self.commands(cmds).await;
                 Ok(())
             }
@@ -2069,7 +2093,7 @@ impl Dispatch {
         let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
         self.legs.insert(
             id.clone(),
-            LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false },
+            LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false, fence: Fence::default() },
         );
         self.hub.emit_job(&id).await;
         if let Some(m) = dockerless {
@@ -2169,7 +2193,12 @@ impl Dispatch {
                     self.actions(&run, held).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
-                Command::Assign { leg, runner, attempt, executor, image, docker, slot } => self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await,
+                Command::Assign { leg, runner, attempt, executor, image, docker, slot, fence, .. } => {
+                    if let Some(l) = self.legs.get_mut(&leg) {
+                        l.fence = fence;
+                    }
+                    self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await
+                }
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
                 // its containers in it when it has them.
                 Command::StartExecutor { pool, executor, runner, kind, leg, .. } if runner.is_empty() => {
@@ -2243,6 +2272,13 @@ impl Dispatch {
                     r
                 }
                 Command::Adopted { leg, from, outcome } => self.adopted(&leg, &from, outcome).await,
+                // A grant the scheduler took back (W05-R34): its attempt ended so, and its runner
+                // holds it no more; the `Retry` or `Settled` that follows does the rest.
+                Command::Lost { leg, attempt, runner, why, .. } => {
+                    self.hub.release_slot(&runner, &leg);
+                    let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.why().to_owned()), peak_rss: None, cpu_seconds: None };
+                    runs::attempt_finished(&self.hub, &leg, attempt, end).await
+                }
             };
             if let Err(e) = r {
                 tracing::warn!(error = %format!("{e:#}"), "CI dispatcher command");
@@ -2472,7 +2508,8 @@ impl Dispatch {
                     l.agent = None;
                 }
                 runs::requeue(&self.hub, leg, attempt, Some(format!("the assignment could not be delivered: {}", a.words()))).await?;
-                let cmds = self.sched.handle(Input::Rejected { leg: leg.to_owned() }, now_ms());
+                let fence = self.legs.get(leg).map(|l| l.fence).unwrap_or_default();
+                let cmds = self.sched.handle(Input::Rejected { leg: leg.to_owned(), fence }, now_ms());
                 Box::pin(self.commands(cmds)).await;
             }
             None => pending.log_when_answered(crate::hub::LOG_WITHIN),
@@ -3161,6 +3198,7 @@ impl Dispatch {
                     env_url: None,
                     seq: 0,
                     gone: false,
+                    fence: Fence::default(),
                 },
             );
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
@@ -3173,8 +3211,13 @@ impl Dispatch {
                 // `spawn`'s `runner_up`), one yet to says when it does, or loses it after its
                 // grace (`absent`). Not put on `a`'s record here: a leg its hello left out would
                 // hold one of its slots for good.
+                // Its grant gets a lease from now (W05-R34): the timer for its expiry is kept.
                 (Status::Running, Some(a)) => {
-                    let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1) }, now_ms());
+                    for c in self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1), fence: Fence::default() }, now_ms()) {
+                        if let Command::Timer { at } = c {
+                            self.timers.insert(at);
+                        }
+                    }
                 }
                 _ => queued.push(li),
             }
@@ -3506,6 +3549,20 @@ mod tests {
         for bad in ["[sched.classes.batch]\nfloor = 150\n", "[sched.classes.batch]\nbound = \"soon\"\n"] {
             let cfg: crate::config::Config = toml::from_str(bad)?;
             assert!(cfg.sched.classes().is_err(), "{bad}");
+        }
+        Ok(())
+    }
+
+    /// W05-R34: `[sched] lease` and `lock_delay` are read as durations, kiln's 60 s and 15 s when
+    /// unset; a lease shorter than two heartbeats, or a duration that doesn't read, is refused.
+    #[test]
+    fn w05_r34_lease_and_lock_delay_are_read() -> anyhow::Result<()> {
+        assert_eq!(crate::config::Config::default().sched.leases()?, (60_000, 15_000));
+        let cfg: crate::config::Config = toml::from_str("[sched]\nlease = \"2m\"\nlock_delay = \"40s\"\n")?;
+        assert_eq!(cfg.sched.leases()?, (120_000, 40_000));
+        for bad in ["[sched]\nlease = \"10s\"\n", "[sched]\nlease = \"soon\"\n", "[sched]\nlock_delay = \"later\"\n"] {
+            let cfg: crate::config::Config = toml::from_str(bad)?;
+            assert!(cfg.sched.leases().is_err(), "{bad}");
         }
         Ok(())
     }

@@ -243,6 +243,15 @@ pub struct Sched {
     /// bound = "45m"   # promoted a class after waiting this long, its class passed over
     /// ```
     pub classes: BTreeMap<kiln_ci::sched::Class, ClassSettings>,
+    /// How long a grant lives unless its runner renews it (docs/needs.md §8, docs/ci.md W05-R34):
+    /// one not renewed by then is lost, and its item's next attempt queued. Runners renew with
+    /// their heartbeat, every 10 s. 60 s by default (`90s`, `2m`), at least 20 s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
+    /// How long past a lost grant's expiry an item that stops on losing its lease waits before its
+    /// next attempt (W05-R34): its runner has stopped it by then. 15 s by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_delay: Option<String>,
 }
 
 /// `[sched.classes.<class>]`.
@@ -277,6 +286,17 @@ impl Sched {
             }
         }
         Ok(out)
+    }
+
+    /// The lease and the lock-delay, in milliseconds, as the engine takes them (W05-R34): kiln's
+    /// 60 s and 15 s, or what's set here.
+    pub fn leases(&self) -> anyhow::Result<(u64, u64)> {
+        let read = |name: &str, set: Option<&str>, default: u64| -> anyhow::Result<u64> {
+            set.map_or(Ok(default), |v| Ok(kiln_ci::work::reap::parse_duration(v).map_err(|e| anyhow::anyhow!("[sched] {name}: {e}"))?.saturating_mul(1000)))
+        };
+        let lease = read("lease", self.lease.as_deref(), 60_000)?;
+        anyhow::ensure!(lease >= 20_000, "[sched] lease: at least 20s, as runners renew every 10s");
+        Ok((lease, read("lock_delay", self.lock_delay.as_deref(), 15_000)?))
     }
 }
 

@@ -49,14 +49,26 @@
 //!   lost loses its legs, and comes back with none. A leg that comes back from a runner still
 //!   connected takes W05-R04's two looks in their order: it's offered to the runners it may run on,
 //!   then the runner it left takes what fits it.
+//! - Grants (W05-R34): each placement is a grant, its fence the case's epoch and the placement's
+//!   number. With a lease, it expires a lease after it's made unless its runner renews it, naming
+//!   it by its fence; at each input, before the input, every grant past its expiry is lost, the
+//!   earliest first (then by leg), as its runner's loss would end it, with the second look. A leg
+//!   that stops on losing its lease waits the lock-delay past the expiry (or past its runner's
+//!   loss, if later) before its retry is queued, at the next tick from then, in the order they
+//!   came to wait. A refusal naming a grant that isn't the leg's, a renewal naming one that isn't
+//!   the runner's, and an end of an attempt the leg isn't at change nothing.
+//! - Draining (W05-R34): a draining runner takes nothing, and its runner's offers leave the fleet;
+//!   the runners that legs stay off while another could take them take what fits them, in name
+//!   order; undrained, it's back as a runner that came back is.
 //!
-//! Pools, warm placement, reservations, groups, quotas, admission, draining, preferences and retry
-//! policies are outside it, and its cases don't make them.
+//! Pools, warm placement, reservations, groups, quotas, admission, preferences and retry policies
+//! are outside it, and its cases don't make them.
 //!
 //! The differential test runs [`CASES`] small random cases (at most 4 runners, 12 legs and 40
-//! inputs) through it and the engine, and compares what runs where and what's queued after every
-//! input, checking the engine's invariants too: no runner holding more than it has room for, no
-//! leg assigned while it runs or on two runners, its queues holding the queued legs alone. A case
+//! inputs) through it and the engine, and compares what runs where (with each grant's fence and
+//! expiry), what's queued and what waits to be retried after every input, checking the engine's
+//! invariants too: no runner holding more than it has room for, no leg assigned while it runs or on
+//! two runners, its queues holding the queued legs alone, its grants as `check_grants` holds. A case
 //! where they part is cut down to the fewest inputs that still part and printed with its seed;
 //! `KILN_SCHED_REFERENCE_SEED=<seed> cargo test -p kiln-ci --lib sched::reference -- --nocapture`
 //! replays one, its inputs in words.
@@ -65,7 +77,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::retry::{Failed, FailureClass};
 use super::routing::{LegRoute, RunnerView};
-use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, default_classes, own_order};
+use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Fence, Input, LeaseLoss, LegIn, Outcome, Resources, RunnerIn, Scheduler, default_classes, own_order};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -76,8 +88,9 @@ const GIB: u64 = 1 << 30;
 const DIMS: usize = 4;
 const SETS: usize = 16;
 
-/// What runs where (each running leg's runner and attempt), and what's queued.
-type Placement = (BTreeMap<String, (String, u32)>, BTreeSet<String>);
+/// What runs where (each running leg's runner, attempt, grant's fence and expiry), what's queued,
+/// and what waits to be retried, until when.
+type Placement = (BTreeMap<String, (String, u32, Fence, Option<i64>)>, BTreeSet<String>, BTreeMap<String, i64>);
 
 /// One input of a case.
 #[derive(Debug, Clone)]
@@ -87,8 +100,18 @@ enum Step {
     Lost(String),
     Queued(LegIn),
     Ended { leg: String, attempt: u32, outcome: Outcome },
-    /// The runner running the leg refused it.
-    Refused(String),
+    /// A runner refused the grant `fence` of the leg: the one it holds, or (a refusal come late)
+    /// one that isn't the leg's any more.
+    Refused { leg: String, fence: Fence },
+    /// A runner renews the grants it names (W05-R34).
+    Renew { runner: String, held: Vec<(String, Fence)> },
+    Drain(String),
+    /// A draining runner is back to taking legs.
+    Undrain(RunnerIn),
+    /// The time a timer asked for: retries due by now are queued.
+    Tick,
+    /// An attempt the leg isn't at says it ended (its grant was lost, its runner answers late).
+    Stale { leg: String, attempt: u32 },
 }
 
 impl Step {
@@ -98,7 +121,12 @@ impl Step {
             Step::Lost(runner) => Input::RunnerLost { runner: runner.clone() },
             Step::Queued(l) => Input::LegQueued(Box::new(l.clone())),
             Step::Ended { leg, attempt, outcome } => Input::AttemptFinished { leg: leg.clone(), attempt: *attempt, outcome: outcome.clone() },
-            Step::Refused(leg) => Input::Rejected { leg: leg.clone() },
+            Step::Refused { leg, fence } => Input::Rejected { leg: leg.clone(), fence: *fence },
+            Step::Renew { runner, held } => Input::Renewed { runner: runner.clone(), held: held.clone() },
+            Step::Drain(runner) => Input::RunnerDraining { runner: runner.clone() },
+            Step::Undrain(r) => Input::RunnerChanged(Box::new(r.clone())),
+            Step::Tick => Input::Tick,
+            Step::Stale { leg, attempt } => Input::AttemptFinished { leg: leg.clone(), attempt: *attempt, outcome: Outcome::Success },
         }
     }
 
@@ -112,7 +140,8 @@ impl Step {
             Step::Queued(l) => {
                 let asks = if l.request == Resources::default() { String::new() } else { format!(", asks {} CPUs and {} GiB{}", l.request.cpu, l.request.mem / GIB, if l.request.gpu > 0 { format!(" and {} GPUs", l.request.gpu) } else { String::new() }) };
                 let cost = l.cost.map_or_else(|| "the default cost".to_owned(), |ms| format!("cost {} s", ms / 1000));
-                format!("{} queued: {}, {}, priority {}{}{asks}, labels {:?}, {cost}", l.id, l.repo, l.class.as_str(), l.priority, if l.exclusive { ", exclusive" } else { "" }, l.route.labels)
+                let stop = if l.on_lease_loss == LeaseLoss::Stop { ", stops on losing its lease" } else { "" };
+                format!("{} queued: {}, {}, priority {}{}{asks}, labels {:?}, {cost}{stop}", l.id, l.repo, l.class.as_str(), l.priority, if l.exclusive { ", exclusive" } else { "" }, l.route.labels)
             }
             Step::Ended { leg, attempt, outcome } => {
                 let how = match outcome {
@@ -122,7 +151,15 @@ impl Step {
                 };
                 format!("{leg}'s attempt {attempt} ended: {how}")
             }
-            Step::Refused(leg) => format!("{leg} refused by its runner"),
+            Step::Refused { leg, fence } => format!("{leg}'s grant {}.{} refused", fence.epoch, fence.n),
+            Step::Renew { runner, held } => {
+                let named: Vec<String> = held.iter().map(|(l, f)| format!("{l} {}.{}", f.epoch, f.n)).collect();
+                format!("{runner} renews [{}]", named.join(", "))
+            }
+            Step::Drain(runner) => format!("{runner} drains"),
+            Step::Undrain(r) => format!("{} undrained", r.id),
+            Step::Tick => "tick".to_owned(),
+            Step::Stale { leg, attempt } => format!("{leg}'s attempt {attempt} ended, late"),
         }
     }
 }
@@ -160,8 +197,11 @@ struct Queued {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum At {
     Queued(Queued),
-    /// Running there, the `nth` leg placed, and what its placing charged fair share.
-    On { runner: String, nth: u64, charged: Charged },
+    /// Running there, the `nth` leg placed, and what its placing charged fair share; its grant's
+    /// fence and expiry.
+    On { runner: String, nth: u64, charged: Box<Charged>, fence: Fence, expires: Option<i64> },
+    /// Waiting to be retried at `at`, the `seq`th to wait (a stop leg's lock-delay).
+    Retrying { at: i64, seq: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +216,7 @@ struct Leg {
 struct Runner {
     input: RunnerIn,
     connected: bool,
+    draining: bool,
 }
 
 /// What an exclusive leg holds of a runner: all of it, or a share.
@@ -268,6 +309,8 @@ fn carries(r: &RunnerIn, l: &LegIn) -> bool {
 /// The reference scheduler.
 struct Reference {
     cfg: Config,
+    /// The epoch its grants are made in.
+    epoch: u64,
     runners: BTreeMap<String, Runner>,
     legs: BTreeMap<String, Leg>,
     /// Fair share's tags, by class and node, for each set of dimensions.
@@ -279,17 +322,24 @@ struct Reference {
     paced: BTreeMap<Class, i64>,
     arrivals: u64,
     placed: u64,
+    /// Legs that came to wait for a retry.
+    waited: u64,
     /// What it did that the cases are meant to make it do: legs promoted, placed ahead of a class
-    /// before theirs by a floor, and placed over a floor.
+    /// before theirs by a floor, and placed over a floor; grants renewed and expired, and stop legs
+    /// that waited the lock-delay.
     promoted: u64,
     ahead: u64,
     over: u64,
+    renewed: u64,
+    expired: u64,
+    locked: u64,
 }
 
 impl Reference {
-    fn new(cfg: Config) -> Reference {
+    fn new(cfg: Config, epoch: u64) -> Reference {
         Reference {
             cfg,
+            epoch,
             runners: BTreeMap::new(),
             legs: BTreeMap::new(),
             vtimes: BTreeMap::new(),
@@ -298,9 +348,13 @@ impl Reference {
             paced: BTreeMap::new(),
             arrivals: 0,
             placed: 0,
+            waited: 0,
             promoted: 0,
             ahead: 0,
             over: 0,
+            renewed: 0,
+            expired: 0,
+            locked: 0,
         }
     }
 
@@ -309,25 +363,33 @@ impl Reference {
     }
 
     /// Whether a step applies now: a runner coming up that's connected, a leg queued that's known,
-    /// an attempt ending or refused that isn't running don't, and a case leaves them out.
+    /// an attempt ending that isn't running, a refusal of a leg not known, a drain of a runner that
+    /// isn't up or drains already (an undrain of one that doesn't), and a late end of the attempt a
+    /// leg is at don't, and a case leaves them out.
     fn applies(&self, step: &Step) -> bool {
         match step {
             Step::Up(r) => !self.runners.get(&r.id).is_some_and(|x| x.connected),
             Step::Lost(runner) => self.runners.get(runner).is_some_and(|x| x.connected),
             Step::Queued(l) => !self.legs.contains_key(&l.id),
             Step::Ended { leg, attempt, .. } => self.legs.get(leg).is_some_and(|l| l.attempt == *attempt && self.running(l)),
-            Step::Refused(leg) => self.legs.get(leg).is_some_and(|l| self.running(l)),
+            Step::Refused { leg, .. } => self.legs.contains_key(leg),
+            Step::Renew { runner, .. } => self.runners.contains_key(runner),
+            Step::Drain(runner) => self.runners.get(runner).is_some_and(|x| x.connected && !x.draining),
+            Step::Undrain(r) => self.runners.get(&r.id).is_some_and(|x| x.connected && x.draining),
+            Step::Tick => true,
+            Step::Stale { leg, attempt } => self.legs.get(leg).is_some_and(|l| l.attempt != *attempt),
         }
     }
 
     fn handle(&mut self, step: &Step, now: i64) {
         self.promote(now);
+        self.expire(now);
         match step {
             // W05-R04's second look, in the engine's order: the runners that legs stayed off while
             // this one was away take what fits them, then this one takes what fits it, each in its
             // own pick order (docs/needs.md E2.1: a runner goes by the dimensions it offers).
-            Step::Up(r) => {
-                self.runners.insert(r.id.clone(), Runner { input: r.clone(), connected: true });
+            Step::Up(r) | Step::Undrain(r) => {
+                self.runners.insert(r.id.clone(), Runner { input: r.clone(), connected: true, draining: false });
                 let avoided: BTreeSet<String> =
                     self.legs.values().filter(|l| matches!(l.at, At::Queued(..))).filter_map(|l| l.avoid.as_ref().filter(|(_, off)| *off == Off::Lost).map(|(runner, _)| runner.clone())).collect();
                 for runner in avoided {
@@ -350,7 +412,11 @@ impl Reference {
             }
             // W05-R04's two looks, in their order: the leg that came back is offered to the runners
             // it may run on, then the runner it left takes what fits it.
-            Step::Ended { leg, outcome, .. } => {
+            // The attempt may have lost its grant at this input's time, before it.
+            Step::Ended { leg, attempt, outcome } => {
+                if !self.legs.get(leg).is_some_and(|l| l.attempt == *attempt && self.running(l)) {
+                    return self.place(now);
+                }
                 let left = self.runner_of(leg);
                 self.ended(leg, outcome, now);
                 if self.legs.get(leg).is_some_and(|l| matches!(l.at, At::Queued(..))) {
@@ -360,7 +426,10 @@ impl Reference {
                     self.fill(&r, now);
                 }
             }
-            Step::Refused(leg) => {
+            Step::Refused { leg, fence } => {
+                if !self.legs.get(leg).is_some_and(|l| matches!(&l.at, At::On { fence: f, .. } if f == fence)) {
+                    return self.place(now);
+                }
                 let left = self.runner_of(leg);
                 self.settle(leg, now);
                 if let Some(l) = self.legs.get_mut(leg)
@@ -372,8 +441,76 @@ impl Reference {
                     self.fill(runner, now);
                 }
             }
+            // Each grant it names that's its own, by that fence, lives a lease from now.
+            Step::Renew { runner, held } => {
+                let until = self.cfg.lease.map(|ms| now + i64::try_from(ms).unwrap_or(i64::MAX / 4));
+                for (id, fence) in held {
+                    if let (Some(until), Some(l)) = (until, self.legs.get_mut(id))
+                        && let At::On { runner: r, fence: f, expires: Some(e), .. } = &mut l.at
+                        && r == runner
+                        && f == fence
+                        && *e < until
+                    {
+                        *e = until;
+                        self.renewed += 1;
+                    }
+                }
+            }
+            // The runners legs stay off while another could take them take what fits them.
+            Step::Drain(runner) => {
+                if let Some(r) = self.runners.get_mut(runner) {
+                    r.draining = true;
+                }
+                let avoided: BTreeSet<String> =
+                    self.legs.values().filter(|l| matches!(l.at, At::Queued(..))).filter_map(|l| l.avoid.as_ref().filter(|(_, off)| *off == Off::Lost).map(|(runner, _)| runner.clone())).collect();
+                for r in avoided {
+                    self.fill(&r, now);
+                }
+            }
+            // Retries due by now are queued, the earliest first, then in the order they came to
+            // wait, each offered as it's queued.
+            Step::Tick => {
+                let mut due: Vec<(i64, u64, String)> = self.legs.iter().filter_map(|(id, l)| if let At::Retrying { at, seq } = l.at { (at <= now).then(|| (at, seq, id.clone())) } else { None }).collect();
+                due.sort();
+                for (_, _, id) in due {
+                    self.enqueue(&id, now);
+                    self.offer(&id, now);
+                }
+            }
+            Step::Stale { .. } => {}
         }
         self.place(now);
+    }
+
+    /// Every grant past its expiry by `now` is lost, the earliest first, then by leg (W05-R34): as
+    /// a runner-lost end of its attempt, with W05-R04's two looks.
+    fn expire(&mut self, now: i64) {
+        loop {
+            let due = self.legs.iter().filter_map(|(id, l)| if let At::On { expires: Some(e), .. } = &l.at { (*e <= now).then(|| (*e, id.clone())) } else { None }).min();
+            let Some((_, id)) = due else { return };
+            self.expired += 1;
+            let left = self.runner_of(&id);
+            let lost = Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() });
+            self.ended(&id, &lost, now);
+            if self.legs.get(&id).is_some_and(|l| matches!(l.at, At::Queued(..))) {
+                self.offer(&id, now);
+            }
+            if let Some(r) = left {
+                self.fill(&r, now);
+            }
+        }
+    }
+
+    /// The earliest grant's expiry or retry to come: when the engine's timer is due.
+    fn next_timer(&self) -> Option<i64> {
+        self.legs
+            .values()
+            .filter_map(|l| match &l.at {
+                At::On { expires, .. } => *expires,
+                At::Retrying { at, .. } => Some(*at),
+                At::Queued(..) => None,
+            })
+            .min()
     }
 
     fn runner_of(&self, leg: &str) -> Option<String> {
@@ -490,17 +627,26 @@ impl Reference {
         }
     }
 
-    /// An attempt ended: one its runner lost is retried once, elsewhere when it can be (W05-R16);
-    /// the rest settle.
+    /// An attempt ended: one its runner lost is retried once, elsewhere when it can be (W05-R16),
+    /// a stop leg's retry waiting the lock-delay past its grant's expiry or `now`, the later
+    /// (W05-R34); the rest settle.
     fn ended(&mut self, id: &str, outcome: &Outcome, now: i64) {
         self.settle(id, now);
+        let lock = i64::try_from(self.cfg.lock_delay).unwrap_or(i64::MAX / 4);
         let Some(l) = self.legs.get_mut(id) else { return };
-        let At::On { runner, .. } = &l.at else { return };
+        let At::On { runner, expires, .. } = &l.at else { return };
         match outcome {
             Outcome::Failed(f) if f.class == FailureClass::RunnerLost && l.attempt < 2 => {
                 l.attempt += 1;
                 l.avoid = Some((runner.clone(), Off::Lost));
-                self.enqueue(id, now);
+                let at = if l.input.on_lease_loss == LeaseLoss::Stop { expires.unwrap_or(now).max(now) + lock } else { now };
+                if at > now {
+                    self.waited += 1;
+                    self.locked += 1;
+                    l.at = At::Retrying { at, seq: self.waited };
+                } else {
+                    self.enqueue(id, now);
+                }
             }
             _ => {
                 self.legs.remove(id);
@@ -534,10 +680,10 @@ impl Reference {
         self.offers(r).map(|o| o > 0)
     }
 
-    /// What the connected runners offer, in each dimension.
+    /// What the connected runners that aren't draining offer, in each dimension.
     fn fleet(&self) -> [u64; DIMS] {
         let mut fleet = [0u64; DIMS];
-        for x in self.runners.values().filter(|x| x.connected) {
+        for x in self.runners.values().filter(|x| x.connected && !x.draining) {
             for (f, o) in fleet.iter_mut().zip(self.offers(&x.input)) {
                 *f += o;
             }
@@ -670,8 +816,10 @@ impl Reference {
         self.served.insert((sig, class), now);
         self.placed += 1;
         let charged = Charged { class, nodes, shares, ms, at: now, holds, paced };
+        // Its grant: the next fence, and a lease from now (W05-R34).
+        let (fence, expires) = (Fence { epoch: self.epoch, n: self.placed }, self.cfg.lease.map(|ms| now + i64::try_from(ms).unwrap_or(i64::MAX / 4)));
         if let Some(l) = self.legs.get_mut(leg) {
-            l.at = At::On { runner: runner.to_owned(), nth: self.placed, charged };
+            l.at = At::On { runner: runner.to_owned(), nth: self.placed, charged: Box::new(charged), fence, expires };
         }
     }
 
@@ -721,15 +869,16 @@ impl Reference {
 
     fn may_run(&self, l: &Leg, r: &Runner) -> bool {
         let on: Vec<&LegIn> = self.on(&r.input.id).iter().filter_map(|id| self.legs.get(id)).map(|l| &l.input).collect();
-        r.connected && carries(&r.input, &l.input) && !self.stays_off(l, &r.input.id) && room(&self.cfg, &r.input, &on, &l.input)
+        r.connected && !r.draining && carries(&r.input, &l.input) && !self.stays_off(l, &r.input.id) && room(&self.cfg, &r.input, &on, &l.input)
     }
 
     /// A runner the leg stays off: one that refused it; one that lost it, while another that
-    /// could take it is connected: one carrying its labels with room for it when idle.
+    /// could take it is connected and not draining: one carrying its labels with room for it when
+    /// idle.
     fn stays_off(&self, l: &Leg, runner: &str) -> bool {
         match &l.avoid {
             Some((r, Off::Refused)) => r == runner,
-            Some((r, Off::Lost)) => r == runner && self.runners.values().any(|o| o.input.id != runner && o.connected && carries(&o.input, &l.input) && room(&self.cfg, &o.input, &[], &l.input)),
+            Some((r, Off::Lost)) => r == runner && self.runners.values().any(|o| o.input.id != runner && o.connected && !o.draining && carries(&o.input, &l.input) && room(&self.cfg, &o.input, &[], &l.input)),
             None => false,
         }
     }
@@ -738,11 +887,14 @@ impl Reference {
         let mut p = Placement::default();
         for (id, l) in &self.legs {
             match &l.at {
-                At::On { runner, .. } => {
-                    p.0.insert(id.clone(), (runner.clone(), l.attempt));
+                At::On { runner, fence, expires, .. } => {
+                    p.0.insert(id.clone(), (runner.clone(), l.attempt, *fence, *expires));
                 }
                 At::Queued(..) => {
                     p.1.insert(id.clone());
+                }
+                At::Retrying { at, .. } => {
+                    p.2.insert(id.clone(), *at);
                 }
             }
         }
@@ -822,14 +974,18 @@ fn leg(d: &mut Draw, n: u64) -> LegIn {
         actor: format!("a{}", d.below(2)),
         lane: format!("l{}", d.below(2)),
         class: Class::ALL.get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or_default(),
+        // A quarter stop on losing their lease (W05-R34).
+        on_lease_loss: if d.below(4) == 0 { LeaseLoss::Stop } else { LeaseLoss::Finish },
         ..LegIn::default()
     }
 }
 
-/// A seed's case: resource mode or slots, and up to 40 steps, each at its time. Made beside a
-/// reference, so each step applies when it's made: an attempt ends or is refused while it runs, a
-/// runner is lost while connected and comes back once lost.
-fn case(seed: u64) -> (Config, Vec<(Step, i64)>) {
+/// A seed's case: resource mode or slots, grants as leases or not, its epoch, and up to 40 steps,
+/// each at its time. Made beside a reference, so each step applies when it's made: an attempt ends
+/// or is refused while it runs, a runner is lost while connected and comes back once lost, renews
+/// the grants it holds (now and then leaving one out, or naming one that isn't its own), drains and
+/// is undrained.
+fn case(seed: u64) -> (Config, u64, Vec<(Step, i64)>) {
     let mut d = Draw(seed);
     let resources = d.below(2) == 0;
     // Fair share by repository, then by actor, then by lane (W28-R66, docs/needs.md E2.2).
@@ -845,15 +1001,23 @@ fn case(seed: u64) -> (Config, Vec<(Step, i64)>) {
         _ => Class::ALL.into_iter().map(|c| (c, ClassConfig { floor: [0, 0, 100, 250, 500].get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or(0), bound: (d.below(2) == 0).then(|| 60_000 * (1 + d.below(20))) })).collect(),
     };
     let aging_per_minute = [0, 1000, 10_000].get(usize::try_from(d.below(3)).unwrap_or(0)).copied().unwrap_or(1000);
-    let cfg = Config { resources, fair_by, classes, aging_per_minute, ..Config::default() };
-    let mut r = Reference::new(cfg.clone());
+    // Grants as leases half the time, of 1 to 8 minutes, the lock-delay as kiln has it or drawn
+    // (W05-R34).
+    let lease = (d.below(2) == 0).then(|| [1, 2, 4, 8].get(usize::try_from(d.below(4)).unwrap_or(0)).copied().unwrap_or(1) * 60_000);
+    let lock_delay = if d.below(2) == 0 { Config::default().lock_delay } else { 15_000 * d.below(9) };
+    let cfg = Config { resources, fair_by, classes, aging_per_minute, lease, lock_delay, ..Config::default() };
+    let epoch = d.below(5);
+    let mut r = Reference::new(cfg.clone(), epoch);
     let shapes: Vec<RunnerIn> = (0..1 + d.below(4)).map(|n| runner(&mut d, n)).collect();
     let (most, mut queued, mut now, mut steps) = (1 + d.below(12), 0, 0, Vec::new());
     for _ in 0..40 {
+        let before = now;
         now += ms(&mut d, 3 * MINUTE);
-        let running: Vec<String> = r.placement().0.into_keys().collect();
+        let placed = r.placement();
+        let running: Vec<String> = placed.0.keys().cloned().collect();
         let up: Vec<String> = r.runners.values().filter(|x| x.connected).map(|x| x.input.id.clone()).collect();
-        let step = match d.below(10) {
+        let known: Vec<String> = r.legs.keys().cloned().collect();
+        let step = match d.below(16) {
             0 | 1 => shapes.iter().find(|s| !up.contains(&s.id)).cloned().map(Step::Up),
             2..=4 if queued < most => {
                 queued += 1;
@@ -867,35 +1031,81 @@ fn case(seed: u64) -> (Config, Vec<(Step, i64)>) {
                 };
                 Step::Ended { leg: l.input.id.clone(), attempt: l.attempt, outcome }
             }),
-            8 => d.pick(&running).cloned().map(Step::Refused),
+            8 => d.pick(&running).and_then(|id| placed.0.get(id).map(|g| Step::Refused { leg: id.clone(), fence: g.2 })),
             9 => d.pick(&up).cloned().map(Step::Lost),
-            _ => None,
+            // A runner renews the grants it holds, now and then one left out, and now and then
+            // naming another runner's grant or one gone (W05-R34).
+            10..=12 => d.pick(&up).cloned().map(|runner| {
+                let mut held: Vec<(String, Fence)> = placed.0.iter().filter(|(_, g)| g.0 == runner).filter(|_| d.below(5) > 0).map(|(id, g)| (id.clone(), g.2)).collect();
+                if d.below(4) == 0
+                    && let Some(id) = d.pick(&known)
+                {
+                    held.push((id.clone(), Fence { epoch, n: d.below(r.placed + 1) }));
+                }
+                Step::Renew { runner, held }
+            }),
+            13 => match r.runners.values().find(|x| x.connected && x.draining) {
+                Some(x) => Some(Step::Undrain(x.input.clone())),
+                None => d.pick(&up).cloned().map(Step::Drain),
+            },
+            // A tick, half the time at the moment the engine's timer asks for: the next expiry or
+            // retry since the step before.
+            14 => {
+                if d.below(2) == 0
+                    && let Some(at) = r.next_timer().filter(|at| (before..=now).contains(at))
+                {
+                    now = at;
+                }
+                Some(Step::Tick)
+            }
+            // A late refusal, or a late end of an attempt the leg has left.
+            _ => d.pick(&known).and_then(|id| r.legs.get(id)).map(|l| {
+                if d.below(2) == 0 && l.attempt > 1 {
+                    Step::Stale { leg: l.input.id.clone(), attempt: l.attempt - 1 }
+                } else {
+                    Step::Refused { leg: l.input.id.clone(), fence: Fence { epoch, n: d.below(r.placed + 1) } }
+                }
+            }),
         };
         if let Some(step) = step.filter(|s| r.applies(s)) {
             r.handle(&step, now);
             steps.push((step, now));
         }
     }
-    (cfg, steps)
+    (cfg, epoch, steps)
 }
 
 /// The engine's own word for what runs where, and its invariants: an `Assign` at most once, and
-/// only for a leg not running (or one the step took off its runner: refused, ended, or on a runner
-/// lost); each runner's legs the legs running there, each once; its queues holding the queued legs
-/// alone; no runner holding more than it has room for.
+/// only for a leg not running (or one the step, or a grant expiring before it, took off its runner:
+/// refused, ended, on a runner lost, or lost); each runner's legs the legs running there, each
+/// once; its queues holding the queued legs alone; no runner holding more than it has room for;
+/// its grants as `check_grants` holds them.
 fn engine(cfg: &Config, s: &Scheduler, step: &Step, before: &Placement, commands: &[Command], runners: &BTreeMap<String, RunnerIn>, legs: &BTreeMap<String, LegIn>) -> Result<Placement, String> {
-    let (running, on, queued) = s.placement();
-    let off: BTreeSet<&String> = match step {
-        Step::Refused(leg) | Step::Ended { leg, .. } => BTreeSet::from([leg]),
-        Step::Lost(runner) => before.0.iter().filter(|(_, (r, _))| r == runner).map(|(l, _)| l).collect(),
-        Step::Up(_) | Step::Queued(_) => BTreeSet::new(),
+    let (_, on, queued) = s.placement();
+    let running: BTreeMap<String, (String, u32, Fence, Option<i64>)> = s.grants();
+    let mut off: BTreeSet<&String> = match step {
+        Step::Refused { leg, .. } | Step::Ended { leg, .. } => BTreeSet::from([leg]),
+        Step::Lost(runner) => before.0.iter().filter(|(_, g)| g.0 == *runner).map(|(l, _)| l).collect(),
+        _ => BTreeSet::new(),
     };
+    for c in commands {
+        if let Command::Lost { leg, .. } = c
+            && let Some((l, _)) = before.0.get_key_value(leg)
+        {
+            off.insert(l);
+        }
+    }
+    s.check_grants()?;
+    // A leg assigned and lost in one input (its grant expiring before the input, its runner lost
+    // by it) may be assigned again in it.
     let mut assigned = BTreeSet::new();
     for c in commands {
-        if let Command::Assign { leg, .. } = c
-            && ((before.0.contains_key(leg) && !off.contains(leg)) || !assigned.insert(leg.clone()))
-        {
-            return Err(format!("{leg} assigned while it ran"));
+        match c {
+            Command::Assign { leg, .. } if (before.0.contains_key(leg) && !off.contains(leg)) || !assigned.insert(leg.clone()) => return Err(format!("{leg} assigned while it ran")),
+            Command::Lost { leg, .. } => {
+                assigned.remove(leg);
+            }
+            _ => {}
         }
     }
     let mut seen = BTreeSet::new();
@@ -922,18 +1132,19 @@ fn engine(cfg: &Config, s: &Scheduler, step: &Step, before: &Placement, commands
     if s.queued() != queued.len() {
         return Err(format!("its queues hold {} entries for {} queued legs", s.queued(), queued.len()));
     }
-    Ok((running, queued))
+    Ok((running, queued, s.retrying()))
 }
 
 fn show(p: &Placement) -> String {
-    let on: Vec<String> = p.0.iter().map(|(l, (r, a))| format!("{l}@{r}#{a}")).collect();
-    format!("running [{}], queued {:?}", on.join(" "), p.1)
+    let on: Vec<String> = p.0.iter().map(|(l, (r, a, f, e))| format!("{l}@{r}#{a}/{}.{}{}", f.epoch, f.n, e.map_or_else(String::new, |e| format!(" until {}:{:02}", e / MINUTE, e % MINUTE / 1000)))).collect();
+    let waiting: Vec<String> = p.2.iter().map(|(l, at)| format!("{l} at {}:{:02}", at / MINUTE, at % MINUTE / 1000)).collect();
+    format!("running [{}], queued {:?}, retrying [{}]", on.join(" "), p.1, waiting.join(", "))
 }
 
 /// A case's steps through both, leaving out those that don't apply: `Err` where the engine breaks
 /// an invariant or the two part, with the steps that applied up to there.
-fn run(cfg: &Config, steps: &[(Step, i64)], mut tell: impl FnMut(&str)) -> Result<(), (Vec<(Step, i64)>, String)> {
-    let (mut s, mut r) = (Scheduler::new(cfg.clone()), Reference::new(cfg.clone()));
+fn run(cfg: &Config, epoch: u64, steps: &[(Step, i64)], mut tell: impl FnMut(&str)) -> Result<(), (Vec<(Step, i64)>, String)> {
+    let (mut s, mut r) = (Scheduler::with_epoch(cfg.clone(), epoch), Reference::new(cfg.clone(), epoch));
     let (mut runners, mut legs, mut applied) = (BTreeMap::new(), BTreeMap::new(), Vec::new());
     for (step, now) in steps {
         if !r.applies(step) {
@@ -941,7 +1152,7 @@ fn run(cfg: &Config, steps: &[(Step, i64)], mut tell: impl FnMut(&str)) -> Resul
         }
         applied.push((step.clone(), *now));
         match step {
-            Step::Up(x) => {
+            Step::Up(x) | Step::Undrain(x) => {
                 runners.insert(x.id.clone(), x.clone());
             }
             Step::Queued(l) => {
@@ -964,13 +1175,13 @@ fn run(cfg: &Config, steps: &[(Step, i64)], mut tell: impl FnMut(&str)) -> Resul
 
 /// A failing case cut down: steps left out one at a time while it still fails, until leaving out
 /// any one makes it pass.
-fn shrink(cfg: &Config, steps: Vec<(Step, i64)>, why: String) -> (Vec<(Step, i64)>, String) {
+fn shrink(cfg: &Config, epoch: u64, steps: Vec<(Step, i64)>, why: String) -> (Vec<(Step, i64)>, String) {
     let (mut steps, mut why) = (steps, why);
     'smaller: loop {
         for i in 0..steps.len() {
             let mut fewer = steps.clone();
             fewer.remove(i);
-            if let Err((applied, w)) = run(cfg, &fewer, |_| {}) {
+            if let Err((applied, w)) = run(cfg, epoch, &fewer, |_| {}) {
                 (steps, why) = (applied, w);
                 continue 'smaller;
             }
@@ -979,11 +1190,12 @@ fn shrink(cfg: &Config, steps: Vec<(Step, i64)>, why: String) -> (Vec<(Step, i64
     }
 }
 
-/// A case's settings in words: its mode, fair share's levels, aging, and each class's floor and
-/// bound.
+/// A case's settings in words: its mode, fair share's levels, aging, each class's floor and bound,
+/// and its leases.
 fn settings(cfg: &Config) -> String {
     let classes: Vec<String> = cfg.classes.iter().map(|(c, cc)| format!("{} floor {}‰{}", c.as_str(), cc.floor, cc.bound.map_or_else(String::new, |b| format!(" bound {} min", b / 60_000)))).collect();
-    format!("{}, fair by {:?}, aging {}‰ a minute, {}", if cfg.resources { "resource mode" } else { "slots" }, cfg.fair_by, cfg.aging_per_minute, classes.join(", "))
+    let leases = cfg.lease.map_or_else(|| "no leases".to_owned(), |ms| format!("leases of {} min, lock-delay {} s", ms / 60_000, cfg.lock_delay / 1000));
+    format!("{}, fair by {:?}, aging {}‰ a minute, {}, {leases}", if cfg.resources { "resource mode" } else { "slots" }, cfg.fair_by, cfg.aging_per_minute, classes.join(", "))
 }
 
 fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
@@ -1001,10 +1213,10 @@ fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
 #[test]
 fn e1_5_the_engine_agrees_with_the_reference() {
     if let Some(seed) = std::env::var("KILN_SCHED_REFERENCE_SEED").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
-        let (cfg, steps) = case(seed);
+        let (cfg, epoch, steps) = case(seed);
         println!("seed {seed} ({}):", settings(&cfg));
-        let failed = run(&cfg, &steps, |line| println!("{line}")).err().map(|(applied, why)| {
-            let (fewer, why) = shrink(&cfg, applied, why);
+        let failed = run(&cfg, epoch, &steps, |line| println!("{line}")).err().map(|(applied, why)| {
+            let (fewer, why) = shrink(&cfg, epoch, applied, why);
             report(seed, &cfg, &fewer, &why)
         });
         assert!(failed.is_none(), "{}", failed.unwrap_or_default());
@@ -1012,13 +1224,13 @@ fn e1_5_the_engine_agrees_with_the_reference() {
     }
     let mut parted = Vec::new();
     for seed in 0..CASES {
-        let (cfg, steps) = case(seed);
-        if let Err((applied, why)) = run(&cfg, &steps, |_| {}) {
-            parted.push((seed, cfg, applied, why));
+        let (cfg, epoch, steps) = case(seed);
+        if let Err((applied, why)) = run(&cfg, epoch, &steps, |_| {}) {
+            parted.push((seed, cfg, epoch, applied, why));
         }
     }
-    let first = parted.first().map(|(seed, cfg, applied, why)| {
-        let (fewer, why) = shrink(cfg, applied.clone(), why.clone());
+    let first = parted.first().map(|(seed, cfg, epoch, applied, why)| {
+        let (fewer, why) = shrink(cfg, *epoch, applied.clone(), why.clone());
         report(*seed, cfg, &fewer, &why)
     });
     assert!(parted.is_empty(), "{} of {CASES} cases part; the first:\n{}", parted.len(), first.unwrap_or_default());
@@ -1026,16 +1238,18 @@ fn e1_5_the_engine_agrees_with_the_reference() {
 
 /// The cases cover what the reference is for: both modes, exclusive legs held whole and in
 /// shares, legs refused and retried after a runner was lost, runners coming back, every class,
-/// and legs promoted, placed ahead by a floor and placed over one.
+/// legs promoted, placed ahead by a floor and placed over one; and grants renewed and expired,
+/// stop legs waiting the lock-delay, runners draining and undrained, ticks, and refusals and ends
+/// that come late.
 #[test]
 fn e1_5_the_cases_cover_the_rules() {
     let (mut kinds, mut modes, mut depths, mut classes) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
-    let (mut promoted, mut ahead, mut over) = (0, 0, 0);
+    let (mut promoted, mut ahead, mut over, mut renewed, mut expired, mut locked) = (0, 0, 0, 0, 0, 0);
     for seed in 0..500 {
-        let (cfg, steps) = case(seed);
+        let (cfg, epoch, steps) = case(seed);
         modes.insert(cfg.resources);
         depths.insert(cfg.fair_by.len());
-        let mut r = Reference::new(cfg.clone());
+        let mut r = Reference::new(cfg.clone(), epoch);
         for (s, now) in &steps {
             if r.applies(s) {
                 r.handle(s, *now);
@@ -1045,6 +1259,7 @@ fn e1_5_the_cases_cover_the_rules() {
             }
         }
         (promoted, ahead, over) = (promoted + r.promoted, ahead + r.ahead, over + r.over);
+        (renewed, expired, locked) = (renewed + r.renewed, expired + r.expired, locked + r.locked);
         let mut lost = BTreeSet::new();
         for (s, _) in &steps {
             kinds.insert(match s {
@@ -1062,7 +1277,12 @@ fn e1_5_the_cases_cover_the_rules() {
                 Step::Ended { outcome: Outcome::Failed(f), .. } if f.class == FailureClass::RunnerLost => "ended lost",
                 Step::Ended { attempt: 2, .. } => "ended retried",
                 Step::Ended { .. } => "ended",
-                Step::Refused(_) => "refused",
+                Step::Refused { .. } => "refused",
+                Step::Renew { .. } => "renewed",
+                Step::Drain(_) => "drained",
+                Step::Undrain(_) => "undrained",
+                Step::Tick => "tick",
+                Step::Stale { .. } => "ended late",
             });
         }
     }
@@ -1070,7 +1290,8 @@ fn e1_5_the_cases_cover_the_rules() {
     assert_eq!(depths.len(), 3, "fair share by repository, actor and lane");
     assert_eq!(classes.len(), Class::ALL.len(), "every class");
     assert!(promoted > 0 && ahead > 0 && over > 0, "promoted {promoted}, ahead by a floor {ahead}, over one {over}");
-    for k in ["up", "up with GPUs", "back", "lost", "queued", "asks a GPU", "exclusive whole", "exclusive share", "ended", "ended lost", "ended retried", "refused"] {
+    assert!(renewed > 0 && expired > 0 && locked > 0, "renewed {renewed}, expired {expired}, stop legs locked {locked}");
+    for k in ["up", "up with GPUs", "back", "lost", "queued", "asks a GPU", "exclusive whole", "exclusive share", "ended", "ended lost", "ended retried", "refused", "renewed", "drained", "undrained", "tick", "ended late"] {
         assert!(kinds.contains(k), "no case has `{k}`");
     }
 }

@@ -1741,7 +1741,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   Step retries rerun only that step (for `run:` steps, and for `uses:` steps that declare
   `retry`). Leg retries make a new attempt.
 - **W05-R15 Failure classes.** The runner reports a class with every failed attempt:
-  `runner-lost` (the connection lapsed past the reconnect grace), `infra` (the executor failed to
+  `runner-lost` (the connection lapsed past the reconnect grace, or the attempt's grant wasn't
+  renewed by its expiry, W05-R34), `infra` (the executor failed to
   start, the pod could not be scheduled, a kiln service failed), `image-pull`, `oom` (cgroup
   `oom_kill` count rose, or exit 137 with memory at its limit), `disk-full` (ENOSPC seen, or the
   work volume full), `timeout`, `failure` (anything else).
@@ -1893,6 +1894,24 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   by its own set's tags: a resource only some runners offer (GPUs) counts on those runners, not
   against the same tenant's work on the others (H-DRF), and each tenant is ranked by its dominant
   resource among what that runner has. In slots mode the only dimension is slots.
+- **W05-R34 Grants are fenced leases** (docs/needs.md §8, E3.1). Each assignment is a grant with a
+  fence: the epoch it was made in, then its number among that epoch's grants. A later grant's fence
+  is greater, and no two grants share one, not even an attempt granted again after a refusal
+  (W05-R02 keeps the attempt). A grant expires a lease after it's made (`[sched] lease`, 60 s by
+  default, at least 20 s) unless its runner renews it: a runner's heartbeat, every 10 s, renews
+  the grants of the legs it names, each that's its own by its fence, for a lease from then. A grant
+  not renewed by its expiry is lost before anything else is decided at that time (the scheduler
+  asks for a timer at the next expiry), and the scheduler says so (`Lost`); its attempt ends
+  `runner-lost`, "its lease ran out", and is retried as W05-R16 says. An item that stops on losing
+  its lease (`on_lease_loss: stop`; a CI leg runs to its end) waits `[sched] lock_delay` (15 s by
+  default) past its grant's expiry, or its runner's loss if that's later, before its retry is
+  queued: its runner has stopped it by then. A refusal naming a grant that isn't the leg's now, a
+  renewal naming one that isn't that runner's, and the end of an attempt the leg isn't at change
+  nothing.
+- **W05-R35 Runners lost and draining** (docs/needs.md §8, E3.1, E3.6). A runner lost, whatever it
+  held, leaves the fleet until it's back, and each grant it held is lost, said so (`Lost`). A
+  draining runner takes no new grant, its grants run to their end, and its capacity leaves the
+  fleet's; undrained, it takes work again.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),

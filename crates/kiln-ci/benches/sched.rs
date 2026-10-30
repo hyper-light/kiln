@@ -20,7 +20,8 @@ fn main() {
 }
 
 fn once() -> (f64, f64, f64) {
-    let mut s = Scheduler::new(Config::default());
+    // Grants as leases, as kiln has them (W05-R34).
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
     let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
     for i in 0..1_000 {
         let r = RunnerIn { id: format!("r{i}"), view: RunnerView { name: format!("r{i}"), labels: vec![format!("pool-{}", i % 50)], facts: facts.clone(), caps: 0, pool: None }, slots: 4, capacity: None, executor: None };

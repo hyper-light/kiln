@@ -1645,7 +1645,14 @@ impl Hub {
         }
         match msg {
             AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
-            AgentMsg::Heartbeat { .. } | AgentMsg::JobStarted { .. } => {}
+            // A heartbeat renews the grants of the legs it names (W05-R34).
+            AgentMsg::Heartbeat { running, .. } => {
+                let legs: Vec<String> = running.into_iter().filter(|j| self.ci.is_leg(j)).collect();
+                if !legs.is_empty() {
+                    self.ci.send(crate::ci::dispatch::Msg::Renew { agent: agent.clone(), running: legs });
+                }
+            }
+            AgentMsg::JobStarted { .. } => {}
             AgentMsg::Sample(s) => {
                 if let Some(a) = self.agents.lock().get_mut(&agent) {
                     a.sample = Some(s.clone());

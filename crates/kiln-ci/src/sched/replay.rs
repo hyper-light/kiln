@@ -1,7 +1,9 @@
 //! E1.4 (docs/needs.md): the engine gives the same commands on every machine. Seeded scenarios
 //! (SplitMix64, as kiln-sim draws) of runners of mixed sizes and platforms, legs of mixed needs,
 //! classes, priorities and repositories, attempts finishing, failing and retried, legs cancelled
-//! and runners lost and back drive the engine through its simulator. Every command it gives is written
+//! and runners lost and back drive the engine through its simulator; in half the seeds grants are
+//! leases, renewed by runners' heartbeats, some runners falling silent past them (W05-R34). Every
+//! command it gives is written
 //! in a stable text form and hashed with SHA-256, and the digest must be the one committed beside
 //! this file (`replay.digest`). kiln's CI runs it on x86-64 and on arm64 (`.kiln/ci.yaml`).
 //!
@@ -14,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use super::retry::{FailureClass, RetryOn, RetryPolicy, RunnerChoice};
 use super::routing::{LegRoute, RunnerView};
 use super::sim::Sim;
-use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Input, LegIn, Outcome, Resources, RunnerIn};
+use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Input, LeaseLoss, LegIn, Loss, Outcome, Resources, RunnerIn};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -49,8 +51,13 @@ fn line(c: &Command) -> String {
     match c {
         Command::StartRun { run } => format!("start-run {}", q(run)),
         Command::CancelRun { run, reason } => format!("cancel-run {} {}", q(run), q(reason)),
-        Command::Assign { leg, runner, attempt, executor, image, docker, slot } => {
-            format!("assign {} {} attempt={attempt} executor={} image={} docker={} slot={}", q(leg), q(runner), opt(executor), opt(image), opt(docker), opt(slot))
+        Command::Assign { leg, runner, attempt, executor, image, docker, slot, fence, expires, lease_loss } => {
+            let expires = expires.map_or_else(|| "-".to_owned(), |at| at.to_string());
+            let loss = match lease_loss {
+                LeaseLoss::Finish => "finish",
+                LeaseLoss::Stop => "stop",
+            };
+            format!("assign {} {} attempt={attempt} executor={} image={} docker={} slot={} fence={}.{} expires={expires} on-lease-loss={loss}", q(leg), q(runner), opt(executor), opt(image), opt(docker), opt(slot), fence.epoch, fence.n)
         }
         Command::StartExecutor { pool, executor, runner, kind, image, leg } => format!("start-executor {} {} {} {} image={} leg={}", q(pool), q(executor), q(runner), q(kind), opt(image), opt(leg)),
         Command::StopExecutor { executor, runner } => format!("stop-executor {} {}", q(executor), q(runner)),
@@ -61,6 +68,13 @@ fn line(c: &Command) -> String {
         Command::Timer { at } => format!("timer at={at}"),
         Command::Demand { leg, decision } => format!("demand {} {}", q(leg), serde_json::to_string(decision).unwrap_or_default()),
         Command::Adopted { leg, from, outcome: o } => format!("adopted {} from {} {}", q(leg), q(from), outcome(o)),
+        Command::Lost { leg, attempt, runner, fence, why } => {
+            let why = match why {
+                Loss::Expired => "expired",
+                Loss::RunnerLost => "runner-lost",
+            };
+            format!("lost {} attempt={attempt} {} fence={}.{} {why}", q(leg), q(runner), fence.epoch, fence.n)
+        }
     }
 }
 
@@ -130,11 +144,16 @@ fn leg(d: &mut Draw, n: u64) -> (LegIn, i64, Vec<FailureClass>) {
     (l, duration, fails)
 }
 
-/// One seed's commands, each with its time, in the order the engine gave them.
+/// One seed's commands, each with its time, in the order the engine gave them. With leases
+/// (W05-R34), runners renew every 10 s, some fall silent for half a minute to three (their grants
+/// lost past a minute), and some legs stop on losing theirs.
 fn scenario(seed: u64, cfg: &Config) -> Vec<(i64, String)> {
     let mut d = Draw(seed);
     let mut sim = Sim::new(cfg.clone());
     sim.trace = Some(Vec::new());
+    if cfg.lease.is_some() {
+        sim.renew_every(10 * SECOND);
+    }
     let runners: Vec<RunnerIn> = (0..3 + d.below(5)).map(|i| runner(&mut d, &format!("r{i}"))).collect();
     for r in &runners {
         sim.runner(0, r.clone());
@@ -142,10 +161,21 @@ fn scenario(seed: u64, cfg: &Config) -> Vec<(i64, String)> {
     let (mut t, mut ids) = (0, Vec::new());
     for n in 0..15 + d.below(30) {
         t += ms(&mut d, 20 * SECOND);
-        let (l, duration, fails) = leg(&mut d, n);
+        let (mut l, duration, fails) = leg(&mut d, n);
+        if cfg.lease.is_some() && d.below(4) == 0 {
+            l.on_lease_loss = LeaseLoss::Stop;
+        }
         sim.fail(&l.id, &fails);
         ids.push(l.id.clone());
         sim.leg(t, l, duration);
+    }
+    if cfg.lease.is_some() {
+        for _ in 0..1 + d.below(3) {
+            let from = ms(&mut d, t + 60 * SECOND);
+            if let Some(r) = runners.get(usize::try_from(d.below(runners.len() as u64)).unwrap_or(0)) {
+                sim.silence(&r.id, from, from + 30 * SECOND + ms(&mut d, 150 * SECOND));
+            }
+        }
     }
     // Runners lost, and back a while later.
     for _ in 0..d.below(4) {
@@ -180,7 +210,9 @@ fn replay(cfg: &Config) -> (Vec<String>, String) {
             1 => vec![FairBy::Repo, FairBy::Actor],
             _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
         };
-        let mut cfg = Config { resources: seed % 2 == 1, fair_by, ..cfg.clone() };
+        // Grants are leases in seeds 4 to 7 of every 8 (W05-R34).
+        let lease = ((seed / 4) % 2 == 1).then_some(60 * 1000);
+        let mut cfg = Config { resources: seed % 2 == 1, fair_by, lease, ..cfg.clone() };
         if (seed / 6) % 2 == 1 {
             let minutes = |m: u64| Some(m * 60 * 1000);
             cfg.classes = [(Class::Interactive, ClassConfig { floor: 50, bound: None }), (Class::Batch, ClassConfig { floor: 250, bound: minutes(2) }), (Class::Background, ClassConfig { floor: 100, bound: minutes(3) })].into_iter().collect();
@@ -209,7 +241,8 @@ fn e1_4_the_replay_gives_the_committed_digest() {
     // retried after a backoff and assigned again, and runners lost under legs (a leg retried at
     // once, or failed for it).
     let has = |what: &[&str]| lines.iter().any(|l| what.iter().all(|w| l.contains(w)));
-    for what in [&[" wait "][..], &[" success "], &[" failed "], &[" settled ", " cancelled "], &[" cancel ", " attempt="], &[" timer "], &[" assign ", " attempt=2 "]] {
+    // And grants lost past their leases, a stop leg's among them (W05-R34).
+    for what in [&[" wait "][..], &[" success "], &[" failed "], &[" settled ", " cancelled "], &[" cancel ", " attempt="], &[" timer "], &[" assign ", " attempt=2 "], &[" lost ", " expired"], &[" assign ", " on-lease-loss=stop"]] {
         assert!(has(what), "no command has {what:?} in it");
     }
     let lost = lines.iter().any(|l| {

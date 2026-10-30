@@ -6,7 +6,7 @@ use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
-use super::state::{Command, Config, Cpus, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
+use super::state::{Command, Config, Cpus, Fence, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
 use crate::facts::{Disk, RunnerFacts};
 
 const MIN: i64 = 60_000;
@@ -326,6 +326,11 @@ fn bench(id: &str, cpus: u64, gib: u64) -> LegIn {
     LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(cpus), mem: gib << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) }
 }
 
+/// The fence of `leg`'s grant now (W05-R34); the default when it holds none.
+fn fence(s: &Scheduler, leg: &str) -> Fence {
+    s.grants().get(leg).map(|g| g.2).unwrap_or_default()
+}
+
 fn assigned(c: &[Command]) -> Vec<String> {
     c.iter().filter_map(|x| if let Command::Assign { leg, .. } = x { Some(leg.clone()) } else { None }).collect()
 }
@@ -373,7 +378,7 @@ fn an_exclusive_leg_asking_nothing_still_takes_the_whole_runner() {
 #[test]
 fn a_bench_adopted_after_a_restart_keeps_its_share() {
     let mut s = Scheduler::new(Config::default());
-    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16, 16)), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16, 16)), runner: "a".into(), attempt: 1, fence: Fence::default() }, 0);
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
     let mut on = Vec::new();
     for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
@@ -382,7 +387,7 @@ fn a_bench_adopted_after_a_restart_keeps_its_share() {
     assert_eq!(on, vec!["o1", "o2"], "the adopted bench still holds half the runner");
     // And one asking for nothing, adopted, still holds all of it.
     let mut s = Scheduler::new(Config::default());
-    s.handle(Input::LegRunning { leg: Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) }), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::LegRunning { leg: Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) }), runner: "a".into(), attempt: 1, fence: Fence::default() }, 0);
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
     let c = s.handle(Input::LegQueued(Box::new(leg("o", "acme/x", 60))), 2);
     assert!(assigned(&c).is_empty(), "nothing beside an adopted exclusive leg");
@@ -440,8 +445,9 @@ impl Draw {
 
 /// One seed's inputs, in order with their times: runners coming, going and back, legs queued at
 /// mixed priorities over runs, repositories, actors and lanes (some exclusive, some with work other
-/// runs adopt, some coalescing in a lane), attempts finishing and failing, legs cancelled, runs
-/// superseded with deprioritize and pushes' demands adopting, routing rules changed, ticks.
+/// runs adopt, some coalescing in a lane, some stopping on losing their lease), attempts finishing
+/// and failing, refused, legs cancelled, runs superseded with deprioritize and pushes' demands
+/// adopting, routing rules changed, grants renewed (some at attempts they don't hold), ticks.
 fn inputs(seed: u64) -> Vec<(Input, i64)> {
     let mut d = Draw(seed);
     let (mut out, mut now, mut legs) = (Vec::new(), 0i64, Vec::<String>::new());
@@ -466,6 +472,9 @@ fn inputs(seed: u64) -> Vec<(Input, i64)> {
                 if d.below(4) == 0 {
                     l.work = Some(super::demand::Work { key: Some(format!("K{}", d.below(3))), domain: super::demand::Domain::Trusted, lane: "acme/x".into(), observed: false });
                 }
+                if d.below(4) == 0 {
+                    l.on_lease_loss = super::state::LeaseLoss::Stop;
+                }
                 if d.below(5) == 0 {
                     let coalesce = (d.below(2) == 0).then_some(super::admit::Coalesce { quiet: 5_000, max_wait: 60_000, always: d.below(2) == 0 });
                     l.admission = Some(super::admit::Demand { lane: "acme/x\0ci\0main".into(), unit: "test".into(), order: u64::try_from(legs.len()).unwrap_or(0), coalesce, cadence: None, speculative: false });
@@ -485,6 +494,21 @@ fn inputs(seed: u64) -> Vec<(Input, i64)> {
             78..=84 => Input::RunnerUp(Box::new(linux(&runner(&mut d), 1 + u32::try_from(d.below(3)).unwrap_or(0)))),
             85..=89 => match d.pick(&legs) {
                 Some(id) => Input::LegCancelled { leg: id.clone(), reason: "cancelled".into() },
+                None => Input::Tick,
+            },
+            // A runner renews some legs under fences of this epoch, its own or not; a refusal
+            // (W05-R34).
+            95..=97 => {
+                let mut held = Vec::new();
+                for _ in 0..d.below(4) {
+                    if let Some(id) = d.pick(&legs).cloned() {
+                        held.push((id, Fence { epoch: seed, n: 1 + d.below(20) }));
+                    }
+                }
+                Input::Renewed { runner: runner(&mut d), held }
+            }
+            98 => match d.pick(&legs) {
+                Some(id) => Input::Rejected { leg: id.clone(), fence: Fence { epoch: seed, n: 1 + d.below(20) } },
                 None => Input::Tick,
             },
             // A push's demand, then its run, which adopts what an older one has in flight (W28-R46).
@@ -508,7 +532,7 @@ fn inputs(seed: u64) -> Vec<(Input, i64)> {
 #[test]
 fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
     use super::state::{Class, ClassConfig, FairBy};
-    let mut seen = [0u64; 3];
+    let mut seen = [0u64; 4];
     for seed in 0..1_000u64 {
         // Fair share across repositories, or within them by actor and lane too (W28-R66); the
         // classes' floors and bounds as they come, or, every other seed, higher floors and bounds
@@ -518,11 +542,14 @@ fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
             1 => vec![FairBy::Repo, FairBy::Actor],
             _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
         };
-        let mut cfg = Config { fair_by, ..Config::default() };
+        // Grants as leases short enough to run out in a seed's minutes, in a seed of every four
+        // (W05-R34).
+        let lease = (seed % 4 == 3).then_some(20_000);
+        let mut cfg = Config { fair_by, lease, ..Config::default() };
         if seed % 2 == 1 {
             cfg.classes = [(Class::Batch, ClassConfig { floor: 300, bound: Some(40_000) }), (Class::Background, ClassConfig { floor: 200, bound: Some(60_000) })].into_iter().collect();
         }
-        let (mut a, mut b) = (Scheduler::new(cfg.clone()), Scheduler::new(cfg));
+        let (mut a, mut b) = (Scheduler::with_epoch(cfg.clone(), seed), Scheduler::with_epoch(cfg, seed));
         for (step, ((x, now), (y, _))) in inputs(seed).into_iter().zip(inputs(seed)).enumerate() {
             let (ca, cb) = (a.handle(x, now), b.handle(y, now));
             for c in &ca {
@@ -530,15 +557,18 @@ fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
                     Command::Adopted { .. } => seen[0] += 1,
                     Command::Demand { .. } => seen[1] += 1,
                     Command::Wait { reason: WaitReason::Coalescing { .. }, .. } => seen[2] += 1,
+                    Command::Lost { why: super::state::Loss::Expired, .. } => seen[3] += 1,
                     _ => {}
                 }
             }
             assert_eq!(ca, cb, "seed {seed}, input {step} at {now}");
+            let grants = a.check_grants();
+            assert!(grants.is_ok(), "seed {seed}, input {step} at {now}: {grants:?}");
         }
     }
-    // What the seeds cover of the work in flight and admission: adoptions, demands' decisions,
-    // legs coalescing.
-    assert!(seen.iter().all(|n| *n > 0), "adopted, demand decisions, coalescing: {seen:?}");
+    // What the seeds cover of the work in flight, admission and leases: adoptions, demands'
+    // decisions, legs coalescing, grants run out.
+    assert!(seen.iter().all(|n| *n > 0), "adopted, demand decisions, coalescing, expired: {seen:?}");
 }
 
 /// E1 (docs/needs.md), W05-R03: the rule counts in thousandths and compares without dividing, so
@@ -656,7 +686,7 @@ fn w05_r03_needs_place_a_leg_and_one_too_big_waits_saying_so() -> Result<(), Str
 #[test]
 fn restart_adopts_running_legs() {
     let mut s = Scheduler::new(Config::default());
-    s.handle(Input::LegRunning { leg: Box::new(leg("run1", "acme/x", 60)), runner: "a".into(), attempt: 2 }, 0);
+    s.handle(Input::LegRunning { leg: Box::new(leg("run1", "acme/x", 60)), runner: "a".into(), attempt: 2, fence: Fence::default() }, 0);
     let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 1);
     assert!(c.is_empty(), "nothing assigned twice: {c:?}");
     let c = s.handle(Input::LegQueued(Box::new(leg("next", "acme/x", 60))), 2);
@@ -673,13 +703,13 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     let c = s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "a")));
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
-    let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: fence(&s, "x") }, 2);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
     // With no other runner, it waits for one, and says so.
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
     s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
-    let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: fence(&s, "x") }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
     assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true, asked: false }));
 }
@@ -793,7 +823,7 @@ fn w05_r28_a_placed_retry() {
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
     let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("r", "acme/x", 60) })), 0);
     assert!(assigned(&c, "r", "a"), "{c:?}");
-    let c = s.handle(Input::Rejected { leg: "r".into() }, 1);
+    let c = s.handle(Input::Rejected { leg: "r".into(), fence: fence(&s, "r") }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "neither the other nor at once: {c:?}");
     assert!(c.contains(&Command::Timer { at: 1 + super::state::REFUSED_AGAIN_MS }), "{c:?}");
     assert_eq!(s.reason("r"), pinned("a", PinnedState::Busy).as_ref());
@@ -871,7 +901,7 @@ fn w05_r13_a_leg_refused_by_the_only_runner_big_enough_says_so() {
     s.handle(Input::RunnerUp(Box::new(sized("small", 2))), 0);
     let share = LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(4), mem: 4 << 30, ..Resources::default() }, ..leg("x", "acme/x", 60) };
     s.handle(Input::LegQueued(Box::new(share)), 0);
-    let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: fence(&s, "x") }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
     assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "big".into(), refused: true, asked: false }));
 }
@@ -1315,7 +1345,7 @@ fn w28_ac41_a_restart_ends_with_one_execution() {
     let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 0);
     assert_eq!(decision(&c, "B/rust"), Some(Decision::Asked(Ask::Execute)));
     let running = LegIn { started: Some(-30_000), ..job("A", "rust", "K1", 200.0) };
-    let c = s.handle(Input::LegRunning { leg: Box::new(running), runner: "a".into(), attempt: 1 }, 0);
+    let c = s.handle(Input::LegRunning { leg: Box::new(running), runner: "a".into(), attempt: 1, fence: Fence::default() }, 0);
     assert!(c.contains(&adopted("B/rust", "A/rust", "A")), "{c:?}");
     let c = s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 1);
     assert!(assigns(&c).is_empty(), "nothing runs twice: {c:?}");
@@ -2483,4 +2513,142 @@ fn w05_ac14_g7_a_repositorys_actors_split_its_share() {
             }
         }
     }
+}
+
+/// W05-R34: a grant lives a lease unless its runner renews it. Renewed at 10 s and 20 s and then
+/// not, it's lost at 80 s, not a millisecond before, and the engine asked for a timer at its
+/// expiry. A finish leg's retry is queued then, back on the only runner; a stop leg's waits the
+/// lock-delay past the expiry, until 95 s.
+#[test]
+fn w05_r34_a_grant_not_renewed_is_lost_at_its_expiry() {
+    use super::state::{LeaseLoss, Loss};
+    for (loss, retry_at) in [(LeaseLoss::Finish, 80_000), (LeaseLoss::Stop, 95_000)] {
+        let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 7);
+        s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+        let c = s.handle(Input::LegQueued(Box::new(LegIn { on_lease_loss: loss, ..leg("x", "acme/x", 60) })), 0);
+        let first = Fence { epoch: 7, n: 1 };
+        assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, fence, expires: Some(60_000), lease_loss, .. } if leg == "x" && *fence == first && *lease_loss == loss)), "{c:?}");
+        assert!(c.contains(&Command::Timer { at: 60_000 }), "a timer at the expiry: {c:?}");
+        for t in [10_000, 20_000] {
+            s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), first)] }, t);
+        }
+        assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(80_000));
+        let c = s.handle(Input::Tick, 79_999);
+        assert!(!c.iter().any(|x| matches!(x, Command::Lost { .. })) && s.grants().contains_key("x"), "live a millisecond before: {c:?}");
+        let c = s.handle(Input::Tick, 80_000);
+        assert!(c.iter().any(|x| matches!(x, Command::Lost { leg, attempt: 1, runner, fence, why: Loss::Expired } if leg == "x" && runner == "a" && *fence == first)), "{c:?}");
+        assert!(c.iter().any(|x| matches!(x, Command::Retry { leg, attempt: 2, at } if leg == "x" && *at == retry_at)), "{c:?}");
+        let again = |c: &[Command]| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 2, fence, .. } if leg == "x" && runner == "a" && *fence == Fence { epoch: 7, n: 2 }));
+        if loss == LeaseLoss::Stop {
+            assert!(!again(&c) && c.contains(&Command::Timer { at: 95_000 }), "{c:?}");
+            assert!(!again(&s.handle(Input::Tick, 94_999)));
+            let c = s.handle(Input::Tick, 95_000);
+            assert!(again(&c), "{c:?}");
+        } else {
+            assert!(again(&c), "{c:?}");
+        }
+        assert_eq!(s.check_grants(), Ok(()));
+    }
+}
+
+/// W05-R34: a renewal names the grants it renews by their fences. One for attempt 1's grant, come
+/// after the leg was lost and granted again on the same runner, renews nothing; nor does one
+/// naming attempt 2's grant from another runner; attempt 2's own does.
+#[test]
+fn w05_r34_a_renewal_names_its_grant() {
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 3);
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    s.handle(Input::Tick, 60_000);
+    let (first, second) = (Fence { epoch: 3, n: 1 }, Fence { epoch: 3, n: 2 });
+    assert_eq!(s.grants().get("x"), Some(&("a".to_owned(), 2, second, Some(120_000))), "lost, and granted again on the only runner");
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), first)] }, 100_000);
+    s.handle(Input::Renewed { runner: "b".into(), held: vec![("x".into(), second)] }, 100_000);
+    assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(120_000), "neither renews it");
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), second)] }, 100_000);
+    assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(160_000));
+}
+
+/// W05-R34: a refusal or an end about a grant that isn't the leg's now changes nothing. Attempt 1
+/// lost and attempt 2 on the same runner, attempt 1's refusal and end come late. And an attempt
+/// refused by one runner, then another, and granted again to the first: that first refusal, come
+/// again, refuses nothing (the attempt is the same, its fence isn't).
+#[test]
+fn w05_r34_a_late_answer_about_an_old_grant_changes_nothing() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    s.handle(Input::Tick, 60_000);
+    let now = s.grants();
+    assert_eq!(now.get("x").map(|g| (g.1, g.2)), Some((2, Fence { epoch: 0, n: 2 })));
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 1 } }, 61_000);
+    let c2 = s.handle(Input::AttemptFinished { leg: "x".into(), attempt: 1, outcome: Outcome::Success }, 62_000);
+    assert!(c.is_empty() && c2.is_empty() && s.grants() == now, "{c:?} {c2:?}");
+    // Refused by a, then b, and back to a: a's first refusal again refuses nothing.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let to = |s: &Scheduler| s.grants().get("x").map(|g| (g.0.clone(), g.2.n));
+    assert_eq!(to(&s), Some(("a".into(), 1)));
+    s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 1 } }, 1);
+    assert_eq!(to(&s), Some(("b".into(), 2)));
+    s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 2 } }, 2);
+    assert_eq!(to(&s), Some(("a".into(), 3)));
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 1 } }, 3);
+    assert!(c.is_empty() && to(&s) == Some(("a".into(), 3)), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R34, W05-R25: after a restart, a leg its runner still runs keeps its grant's fence and gets
+/// a lease from then; its runner renews it by that fence, and the engine's own grants are of its
+/// own epoch. Not renewed again, it's lost at its lease's end.
+#[test]
+fn w05_r34_an_adopted_grant_keeps_its_fence_and_gets_a_lease() {
+    use super::state::Loss;
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 9);
+    let old = Fence { epoch: 8, n: 41 };
+    s.handle(Input::LegRunning { leg: Box::new(leg("x", "acme/x", 60)), runner: "a".into(), attempt: 1, fence: old }, 1_000);
+    assert_eq!(s.grants().get("x"), Some(&("a".to_owned(), 1, old, Some(61_000))));
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 2_000);
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), old)] }, 30_000);
+    assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(90_000));
+    let c = s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 31_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, fence, .. } if leg == "y" && *fence == Fence { epoch: 9, n: 1 })), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::Tick, 90_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Lost { leg, fence, why: Loss::Expired, .. } if leg == "x" && *fence == old)), "{c:?}");
+}
+
+/// W05-R35, the engine's half: a draining runner gets no new grant while its grants run to their
+/// end, and gets work again once undrained; a runner lost loses its grants, each told (`Lost`), and
+/// one lost holding nothing leaves the fleet too, getting nothing until it's back.
+#[test]
+fn w05_r35_draining_and_lost_runners() {
+    use super::state::Loss;
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 3))), 0);
+    for id in ["p", "q"] {
+        s.handle(Input::LegQueued(Box::new(leg(id, "acme/x", 60))), 0);
+    }
+    s.handle(Input::RunnerDraining { runner: "a".into() }, 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("r", "acme/x", 60))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "no third while it drains: {c:?}");
+    for (id, t) in [("p", 3), ("q", 4)] {
+        let c = s.handle(Input::AttemptFinished { leg: id.into(), attempt: 1, outcome: Outcome::Success }, t);
+        assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Success, .. } if leg == id)), "its grants run to their end: {c:?}");
+        assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    }
+    let c = s.handle(Input::RunnerChanged(Box::new(linux("a", 3))), 5);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "r")), "undrained, it takes work: {c:?}");
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 6);
+    assert!(c.iter().any(|x| matches!(x, Command::Lost { leg, attempt: 1, runner, why: Loss::RunnerLost, .. } if leg == "r" && runner == "a")), "{c:?}");
+    // Lost holding nothing.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    s.handle(Input::RunnerLost { runner: "b".into() }, 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "y" && runner == "b")), "{c:?}");
 }

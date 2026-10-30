@@ -45,4 +45,4 @@ mod replay;
 #[cfg(test)]
 mod tests;
 
-pub use state::{Class, ClassConfig, Command, Config, FairBy, Input, LegIn, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};
+pub use state::{Class, ClassConfig, Command, Config, FairBy, Fence, Input, LeaseLoss, LegIn, Loss, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};

@@ -9,7 +9,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use super::retry::{Failed, FailureClass};
-use super::state::{Command, Config, DIMS, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, WaitReason, offers};
+use super::state::{Command, Config, DIMS, Fence, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, WaitReason, offers};
 
 /// Something the simulation does at a time.
 #[derive(Debug, Clone)]
@@ -17,6 +17,8 @@ enum Ev {
     Input(Box<Input>),
     Finish { leg: String, attempt: u32 },
     Tick,
+    /// A runner's heartbeat, renewing the grants it holds (W05-R34).
+    Heartbeat { runner: String },
 }
 
 /// One assignment, as it happened.
@@ -71,6 +73,15 @@ pub struct Sim {
     /// Executors started: (time, executor, host); and stopped: (time, executor).
     pub executors_started: Vec<(i64, String, String)>,
     pub executors_stopped: Vec<(i64, String)>,
+    /// How often each runner renews its grants, once [`Self::renew_every`] says (W05-R34); the
+    /// runners whose heartbeats are going; and when each runner is silent, its heartbeats lost.
+    heartbeat: Option<i64>,
+    beating: BTreeSet<String>,
+    silences: Vec<(String, i64, i64)>,
+    /// Grants the engine took back: (time, leg, attempt, runner) (W05-R34); and each leg's last
+    /// grant's fence, which its runner's heartbeats name.
+    pub lost: Vec<(i64, String, u32, String)>,
+    fences: BTreeMap<String, Fence>,
 }
 
 impl Sim {
@@ -104,7 +115,23 @@ impl Sim {
             trace: None,
             executors_started: Vec::new(),
             executors_stopped: Vec::new(),
+            heartbeat: None,
+            beating: BTreeSet::new(),
+            silences: Vec::new(),
+            lost: Vec::new(),
+            fences: BTreeMap::new(),
         }
+    }
+
+    /// Each runner renews the grants it holds every `ms` from when it comes up (W05-R34), naming
+    /// the legs it runs at their attempts, those the engine took back among them, until they end.
+    pub fn renew_every(&mut self, ms: i64) {
+        self.heartbeat = Some(ms.max(1));
+    }
+
+    /// `runner`'s heartbeats from `from` until `until` are lost: its grants aren't renewed then.
+    pub fn silence(&mut self, runner: &str, from: i64, until: i64) {
+        self.silences.push((runner.to_owned(), from, until));
     }
 
     fn at(&mut self, t: i64, e: Ev) {
@@ -120,6 +147,11 @@ impl Sim {
 
     pub fn runner(&mut self, t: i64, r: RunnerIn) {
         self.offered.insert(r.id.clone(), r.clone());
+        if let Some(every) = self.heartbeat
+            && self.beating.insert(r.id.clone())
+        {
+            self.at(t + every, Ev::Heartbeat { runner: r.id.clone() });
+        }
         self.input(t, Input::RunnerUp(Box::new(r)));
     }
 
@@ -148,9 +180,23 @@ impl Sim {
             let cmds = match ev {
                 Ev::Input(i) => self.sched.handle(*i, t),
                 Ev::Tick => self.sched.handle(Input::Tick, t),
+                Ev::Heartbeat { runner } => {
+                    if let Some(every) = self.heartbeat {
+                        self.at(t + every, Ev::Heartbeat { runner: runner.clone() });
+                    }
+                    if self.silences.iter().any(|(r, from, until)| *r == runner && (*from..*until).contains(&t)) {
+                        continue;
+                    }
+                    let held: Vec<(String, Fence)> = self.running.iter().filter(|(_, (r, _, _))| *r == runner).filter_map(|(leg, _)| self.fences.get(leg).map(|f| (leg.clone(), *f))).collect();
+                    self.sched.handle(Input::Renewed { runner, held }, t)
+                }
                 Ev::Finish { leg, attempt } => {
-                    // An attempt that isn't the one running ended already (its runner was lost).
+                    // An attempt that isn't the one running here any more (its runner was lost,
+                    // or its grant): its runner still says it ended, and the engine takes nothing
+                    // from it (W05-R34).
                     if self.running.get(&leg).is_none_or(|r| r.2 != attempt) {
+                        let cmds = self.sched.handle(Input::AttemptFinished { leg, attempt, outcome: Outcome::Success }, t);
+                        self.apply(cmds);
                         continue;
                     }
                     let Some((runner, start, _)) = self.running.remove(&leg) else { continue };
@@ -177,7 +223,8 @@ impl Sim {
                 trace.push((self.now, c.clone()));
             }
             match c {
-                Command::Assign { leg, runner, attempt, .. } => {
+                Command::Assign { leg, runner, attempt, fence, .. } => {
+                    self.fences.insert(leg.clone(), fence);
                     self.assigned.push(Assigned { at: self.now, leg: leg.clone(), runner: runner.clone(), attempt });
                     let d = self.durations_on.get(&(leg.clone(), runner.clone())).or_else(|| self.durations.get(&leg)).copied().unwrap_or(60_000);
                     self.running.insert(leg.clone(), (runner, self.now, attempt));
@@ -223,6 +270,9 @@ impl Sim {
                 c @ (Command::StartRun { .. } | Command::CancelRun { .. }) => self.runs.push((self.now, c)),
                 Command::Retry { .. } => {}
                 Command::Adopted { leg, from, outcome } => self.adopted.push((self.now, leg, from, outcome)),
+                // The attempt runs on where it was, and says it ended when it does (a CI leg
+                // runs to its end): the slot-time it takes there still counts.
+                Command::Lost { leg, attempt, runner, .. } => self.lost.push((self.now, leg, attempt, runner)),
                 Command::Demand { leg, decision } => self.decisions.push((self.now, leg, decision.why())),
             }
         }
