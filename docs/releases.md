@@ -172,6 +172,9 @@ runner's credentials would change under it):
 - **It works for another server:** joining stops it first, once asked (or with `--yes`). Its agents
   stay with that server.
 - **The server can't be asked:** nothing is joined. Try again once it answers.
+- **It is the server's own machine, and the server runs its local agent:** that agent is the
+  machine's runner, so joining under its name is refused (409) rather than enrolled as `<name>-2`.
+  Turn the server's off (`[local_agent] enabled = false`) to run a separate runner there.
 
 **Handing over.** While a machine has more than one runner process (a take-over, an upgrade beside
 the running runner, or one left over from before), the server has each older process hand its

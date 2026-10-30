@@ -3179,7 +3179,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     };
     // An outpost never takes another machine's name: the same machine enrolling again keeps its
     // own, another one gets `<name>-2`.
-    let name = if outpost { free_agent_name(hub, &name, &r.hostname).await } else { name };
+    let name = if outpost { free_agent_name(hub, &name, &r.hostname).await? } else { name };
     let days = if ephemeral {
         crate::pki::EPHEMERAL_DAYS
     } else if outpost {
@@ -3555,11 +3555,24 @@ async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
     }
 }
 
+/// Whether a machine asking for `wanted` from `hostname` is the server's own machine (`server_host`)
+/// asking for its local agent's name (`local`): that agent is already the machine's runner.
+fn own_machines_runner(local: Option<&str>, server_host: &str, wanted: &str, hostname: &str) -> bool {
+    local == Some(wanted) && hostname.eq_ignore_ascii_case(server_host)
+}
+
 /// A name for an approved machine: the one it asked for, unless another machine's agent (or the
-/// server's own local agent) has it, then `<name>-2`, `<name>-3`, …
-async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> String {
+/// server's own local agent) has it, then `<name>-2`, `<name>-3`, … The server's own machine asking
+/// for its local agent's name is refused, never named `<name>-2`: a machine runs one kiln runner.
+async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> Result<String, ApiError> {
     let agents = hub.agent_list().await;
     let local = hub.cfg.local_agent.enabled.then(|| crate::pki::sanitize_name(&hub.cfg.local_agent_name()));
+    if own_machines_runner(local.as_deref(), &crate::config::Config::hostname(), wanted, hostname) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("{hostname} already runs this server's own runner, {wanted}, and a machine runs one kiln runner: turn the server's off (`[local_agent] enabled = false`) to run a separate one here"),
+        ));
+    }
     let taken = |n: &str| {
         local.as_deref() == Some(n) || agents.iter().any(|a| a.name == n && !a.hostname.eq_ignore_ascii_case(hostname))
     };
@@ -3570,7 +3583,7 @@ async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> String {
         name = format!("{}{suffix}", crate::util::truncate(wanted, 63 - suffix.len()));
         n += 1;
     }
-    name
+    Ok(name)
 }
 
 /// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
@@ -3586,7 +3599,7 @@ async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
         all.iter().find(|i| crate::discovery::invite::request_for(i, &all, std::slice::from_ref(&listed)).is_some()).map(|i| i.id.clone())
     });
     let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
-    let name = free_agent_name(hub, &wanted, &c.hostname).await;
+    let name = free_agent_name(hub, &wanted, &c.hostname).await?;
     // An outpost that asked instead of bringing an invite gets what an invited one gets.
     let outpost = c.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL);
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
@@ -5693,6 +5706,17 @@ fn back(connected: u64, before: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_servers_own_machine_asking_for_its_local_agents_name_is_not_given_another_runner() {
+        let local = Some("adas-macbook-pro.local");
+        // The 2026-10-30 case: the server's Mac joined its own server and was named `<name>-2`.
+        assert!(own_machines_runner(local, "Adas-MacBook-Pro.local", "adas-macbook-pro.local", "Adas-MacBook-Pro.local"));
+        // Another machine with that name, the same machine under another name, or no local agent.
+        assert!(!own_machines_runner(local, "Adas-MacBook-Pro.local", "adas-macbook-pro.local", "fedora"));
+        assert!(!own_machines_runner(local, "Adas-MacBook-Pro.local", "build-box", "Adas-MacBook-Pro.local"));
+        assert!(!own_machines_runner(None, "Adas-MacBook-Pro.local", "adas-macbook-pro.local", "Adas-MacBook-Pro.local"));
+    }
 
     #[test]
     fn a_viewer_takes_what_its_query_asks_for() {
