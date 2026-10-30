@@ -1,6 +1,13 @@
 //! The ladder's rules (docs/ci.md W26-R17).
 
-use super::{Author, Candidate, Conflict, Rung, State, Step, Switches, Tests, Tried, key, next};
+use super::{Author, Candidate, Conflict, Rung, State, Step, Switches, Tests, Tried, Whole, key};
+
+const ALL: [Rung; 3] = Rung::LADDER;
+const PASSED: Whole = Some(Tests::Passed);
+
+fn next(conflicts: &[Conflict], author: Author, sw: Switches) -> super::Next {
+    super::next(conflicts, author, sw, &ALL, PASSED)
+}
 
 fn conflict(id: &str, candidates: Vec<Candidate>) -> Conflict {
     Conflict { id: id.into(), place: format!("plan/expand.rs:{id}"), text: true, candidates, taken: false }
@@ -119,6 +126,25 @@ fn w26_r17_remembered_key_ignores_labels_base_and_order() {
     assert_ne!(k, key("python", &main, &this));
     assert_ne!(k, key("rust", &main, &lines(&["    let legs = apply(m.include, legs);"])));
     assert_eq!(k.len(), 64);
+}
+
+#[test]
+fn w26_r17_resolutions_are_tested_together_before_theyre_offered() {
+    let d42 = vec![conflict("18", vec![resolved(Rung::Structural, "kiln", Tests::Passed)]), conflict("31", vec![kept(Rung::Structural, "same place"), resolved(Rung::Remembered, "kiln", Tests::Passed)])];
+    assert_eq!(super::next(&d42, AGENT, OFF, &ALL, None).state, State::TestWhole);
+    assert_eq!(super::next(&d42, AGENT, OFF, &ALL, Some(Tests::Pending)).state, State::Waiting);
+    let failed = super::next(&d42, AGENT, Switches { send_agent: false, automatic: true }, &ALL, Some(Tests::Failed));
+    assert_eq!(failed.state, State::Held);
+    assert!(failed.why.iter().any(|w| w.contains("together they failed")), "{:?}", failed.why);
+    assert_eq!(super::next(&d42, AGENT, OFF, &ALL, PASSED).state, State::Offered);
+}
+
+#[test]
+fn w26_r17_a_rung_the_server_doesnt_run_is_passed_over() {
+    let c = conflict("31", vec![]);
+    let n = super::next(std::slice::from_ref(&c), AGENT, OFF, &[Rung::Remembered], None);
+    assert_eq!(n.steps.first().map(|(_, s)| s.clone()), Some(Step::Try { rung: Rung::Remembered }));
+    assert!(n.why.iter().any(|w| w.contains("isn't on this kiln's ladder")), "{:?}", n.why);
 }
 
 #[test]

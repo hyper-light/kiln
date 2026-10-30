@@ -8,6 +8,8 @@
 //! - A rung's resolution counts only once the affected tests passed on it ([`Tests::Passed`], or
 //!   [`Tests::NoneToRun`] where nothing the resolution touches has a test): a failed one is kept
 //!   and said, and the next rung is tried; one whose tests haven't finished waits.
+//! - Each resolution is tested with the conflicts it doesn't resolve taking main's side; once
+//!   every conflict has one, they're tested together ([`Whole`]) before any is offered.
 //! - Who decides (Ada's decision on the Review design's page 4): with automatic resolution off, a
 //!   repository's default, a person confirms every resolution before it lands, whichever rung made
 //!   it; on, a resolution whose tests passed goes on by itself, saying which rung made it.
@@ -173,7 +175,9 @@ pub enum State {
     Waiting,
     /// Some conflict waits for a person to take a side or edit.
     Held,
-    /// Every conflict is resolved and tested; a person confirms.
+    /// Every conflict has a resolution whose tests passed: they're to be tested together.
+    TestWhole,
+    /// Every conflict is resolved and tested, together too; a person confirms.
     Offered,
     /// Every conflict is resolved and tested, and may go on without a person.
     GoesOn,
@@ -185,11 +189,15 @@ impl State {
             State::Climbing => "climbing",
             State::Waiting => "waiting",
             State::Held => "held",
+            State::TestWhole => "test_whole",
             State::Offered => "offered",
             State::GoesOn => "goes_on",
         }
     }
 }
+
+/// The resolutions together: not yet tested, or their tests this far.
+pub type Whole = Option<Tests>;
 
 /// What the ladder says of a replay: each conflict's step (by id, in order), the replay's state,
 /// and why, in words.
@@ -200,8 +208,11 @@ pub struct Next {
     pub why: Vec<String>,
 }
 
-/// Whether a rung can try a conflict at all, and if not, why.
-fn reaches(rung: Rung, c: &Conflict, author: Author, sw: Switches) -> Result<(), String> {
+/// Whether a rung can try a conflict at all, and if not, why. `can`: the rungs the server runs.
+fn reaches(rung: Rung, c: &Conflict, author: Author, sw: Switches, can: &[Rung]) -> Result<(), String> {
+    if !can.contains(&rung) {
+        return Err(format!("{}: {} isn't on this kiln's ladder", c.place, rung.named()));
+    }
     match rung {
         Rung::Structural | Rung::Remembered if !c.text => Err(format!("{}: {} reads only text", c.place, rung.named())),
         Rung::Agent => match author {
@@ -216,7 +227,7 @@ fn reaches(rung: Rung, c: &Conflict, author: Author, sw: Switches) -> Result<(),
 
 /// One conflict's step: the first rung whose resolution counts; else one at work; else the next
 /// rung not yet tried that reaches it; else the person.
-fn step(c: &Conflict, author: Author, sw: Switches, why: &mut Vec<String>) -> Step {
+fn step(c: &Conflict, author: Author, sw: Switches, can: &[Rung], why: &mut Vec<String>) -> Step {
     if c.taken {
         return Step::Taken;
     }
@@ -229,7 +240,7 @@ fn step(c: &Conflict, author: Author, sw: Switches, why: &mut Vec<String>) -> St
             return Step::Waiting { rung };
         }
         if tried.is_empty() {
-            match reaches(rung, c, author, sw) {
+            match reaches(rung, c, author, sw, can) {
                 Ok(()) => return Step::Try { rung },
                 Err(w) => why.push(w),
             }
@@ -246,10 +257,11 @@ fn step(c: &Conflict, author: Author, sw: Switches, why: &mut Vec<String>) -> St
     Step::ToPerson
 }
 
-/// What happens next for a replay whose conflicts are `conflicts`.
-pub fn next(conflicts: &[Conflict], author: Author, sw: Switches) -> Next {
+/// What happens next for a replay whose conflicts are `conflicts`: `can`, the rungs the server
+/// runs; `whole`, how the resolutions fared tested together.
+pub fn next(conflicts: &[Conflict], author: Author, sw: Switches, can: &[Rung], whole: Whole) -> Next {
     let mut why = Vec::new();
-    let steps: Vec<(String, Step)> = conflicts.iter().map(|c| (c.id.clone(), step(c, author, sw, &mut why))).collect();
+    let steps: Vec<(String, Step)> = conflicts.iter().map(|c| (c.id.clone(), step(c, author, sw, can, &mut why))).collect();
     let any = |f: fn(&Step) -> bool| steps.iter().any(|(_, s)| f(s));
     let state = if any(|s| matches!(s, Step::Try { .. })) {
         State::Climbing
@@ -267,6 +279,15 @@ pub fn next(conflicts: &[Conflict], author: Author, sw: Switches) -> Next {
             }
         }
         let made = steps.iter().any(|(_, s)| matches!(s, Step::Ready { .. }));
+        match whole {
+            None => return Next { steps, state: State::TestWhole, why },
+            Some(Tests::Pending) => return Next { steps, state: State::Waiting, why },
+            Some(Tests::Failed) => {
+                why.push("each resolution passed its tests, but together they failed: a person takes a side or edits".to_owned());
+                return Next { steps, state: State::Held, why };
+            }
+            Some(Tests::Passed | Tests::NoneToRun) => {}
+        }
         if made && !sw.automatic {
             why.push("a person confirms it: the repository's automatic resolution is off".to_owned());
             State::Offered
