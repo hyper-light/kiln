@@ -308,10 +308,21 @@ jobs:
     Ok(vec![Measure::new("runs.created_p99", "ms", Better::Lower, 500.0, vec![p99])])
 }
 
+/// The epoch the CI engine on `store` last took (W05-R25).
+async fn epoch_of(store: &crate::store::Store) -> Result<u64> {
+    let e: i64 = store.call(|c| Ok(c.query_row("SELECT epoch FROM ci_epoch WHERE one = 1", [], |r| r.get(0))?)).await?;
+    Ok(u64::try_from(e).unwrap_or(0))
+}
+
 /// W05-AC09 (§1.5): a server's queue rebuilt after a restart. One hub, on a store on disk, queues a
 /// run of ten jobs of `legs / 10` legs each for runners there aren't; a second on that store, as
 /// the server is when it starts again, replays it. Its dispatcher's rebuild: ≤ 2 s.
-async fn restart(dir: &Path, legs: usize) -> Result<Vec<Measure>> {
+///
+/// `running` (W05-AC09 with leases, docs/needs.md E3.7): the legs are running as the server goes,
+/// each on one of a hundred runners under a grant of its own (attempt 1, the first hub's epoch).
+/// The second hub, in its next epoch, takes each back as that grant with a lease from now; none
+/// is granted again. It says so or fails.
+async fn restart(dir: &Path, legs: usize, running: bool) -> Result<Vec<Measure>> {
     use kiln_ci::trigger::Event;
     let db = dir.join("restart.db");
     let per = (legs / 10).clamp(1, 1_000);
@@ -352,8 +363,37 @@ async fn restart(dir: &Path, legs: usize) -> Result<Vec<Measure>> {
         }
     }
     .await;
+    // Running, each under its grant, as the claims would have left them (W05-R05).
+    let marked = async {
+        let want = queued?;
+        if running {
+            let before = epoch_of(&first.store).await?;
+            let e = i64::try_from(before)?;
+            first
+                .store
+                .call(move |c| {
+                    let tx = crate::store::tx(c)?;
+                    let now = crate::util::now_unix();
+                    tx.execute(
+                        "UPDATE jobs SET status = 'running', agent = 'bench-r' || (rowid % 100), executor = 'host', attempt = 1, started_at = ?1, grant_epoch = ?2, grant_n = rowid WHERE status = 'queued'",
+                        rusqlite::params![now, e],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO ci_attempts (id, leg_id, number, status, runner, executor, queued_at, started_at, grant_epoch, grant_n)
+                         SELECT lower(hex(randomblob(16))), id, 1, 'running', agent, 'host', queued_at, started_at, grant_epoch, grant_n FROM jobs WHERE status = 'running'",
+                        [],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
+            return anyhow::Ok((want, Some(before)));
+        }
+        anyhow::Ok((want, None))
+    }
+    .await;
     first.shutdown.cancel();
-    let want = queued?;
+    let (want, before) = marked?;
     let second = bench_hub_on(&dir.join("two"), crate::store::Store::open(&db)?)?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let restored = loop {
@@ -366,9 +406,22 @@ async fn restart(dir: &Path, legs: usize) -> Result<Vec<Measure>> {
         }
         crate::rt::sleep(Duration::from_millis(5)).await;
     };
+    // Each running leg is back as the grant it ran under, made in the epoch before, and none is
+    // granted again: one live grant each, through the restart (G10).
+    let (grants, after) = (second.ci.live_grants(), epoch_of(&second.store).await);
     second.shutdown.cancel();
     anyhow::ensure!(restored.legs >= want, "{} of {want} legs rebuilt", restored.legs);
-    Ok(vec![Measure::new("restart.rebuild_ms", "ms", Better::Lower, 2_000.0, vec![restored.took.as_secs_f64() * 1000.0])])
+    let ms = vec![restored.took.as_secs_f64() * 1000.0];
+    let Some(before) = before else { return Ok(vec![Measure::new("restart.rebuild_ms", "ms", Better::Lower, 2_000.0, ms)]) };
+    let after = after?;
+    anyhow::ensure!(after > before, "the epoch rose: {before} then {after}");
+    anyhow::ensure!(grants.len() == want, "{} of {want} running legs hold a grant", grants.len());
+    let fences: std::collections::HashSet<_> = grants.values().map(|(_, _, f)| *f).collect();
+    anyhow::ensure!(fences.len() == want, "each grant its own fence");
+    if let Some((leg, g)) = grants.iter().find(|(_, (r, attempt, f))| !r.starts_with("bench-r") || *attempt != 1 || f.epoch != before) {
+        anyhow::bail!("{leg} holds {g:?}, not the grant it ran under (attempt 1, epoch {before}): granted again");
+    }
+    Ok(vec![Measure::new("restart.rebuild_running_ms", "ms", Better::Lower, 2_000.0, ms)])
 }
 
 /// W21-AC04: the runs list's first page with `n` runs in a store on disk (twenty repositories, a
@@ -768,7 +821,13 @@ async fn bench(a: BenchArgs) -> Result<u8> {
     if want("restart") {
         let dir = a.data.join(crate::util::new_id());
         std::fs::create_dir_all(&dir)?;
-        let measured = restart(&dir, a.queued_legs.max(10)).await;
+        let measured = restart(&dir, a.queued_legs.max(10), false).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        measures.extend(measured?);
+        // The same number running, with leases (W05-AC09, E3.7).
+        let dir = a.data.join(crate::util::new_id());
+        std::fs::create_dir_all(&dir)?;
+        let measured = restart(&dir, a.queued_legs.max(10), true).await;
         let _ = std::fs::remove_dir_all(&dir);
         measures.extend(measured?);
     }
@@ -810,6 +869,21 @@ mod tests {
         assert!(!Measure::new("z", "ms", Better::Lower, 1.0, Vec::new()).ok, "nothing measured misses");
         let p = parsing(1);
         assert!(p.value > 0.0 && p.samples.len() == 1, "{p:?}");
+    }
+
+    /// W05-AC09 with leases (docs/needs.md E3.7): 1,000 legs running on a hundred runners as a
+    /// server restarts. The next server rebuilds each as the grant it ran under (attempt 1, the
+    /// epoch before, with a lease from now), in its next epoch, and grants none again: each leg has
+    /// one live grant through the restart. Within 2 s; `kiln ci bench` measures it at 10,000.
+    #[test]
+    fn w05_ac09_a_grant_survives_a_restart_and_is_never_granted_twice() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().to_path_buf();
+        crate::rt::block_on(async move {
+            let m = restart(&dir, 1_000, true).await?;
+            assert!(m.iter().any(|x| x.name == "ci.bench.restart.rebuild_running_ms" && x.value < 2_000.0), "{m:?}");
+            anyhow::Ok(())
+        })
     }
 
     /// W08-AC08's network half, small: a 9 MiB entry restored from its blob URL over HTTP, in two

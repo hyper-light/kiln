@@ -1845,6 +1845,18 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 
 - **W05-R25 Restart.** At start the dispatcher loads queued and waiting legs and live groups from
   SQLite and rebuilds the state; with 10,000 queued legs this takes < 2 s.
+  - Its epoch (docs/needs.md §8, E3.7) is the cluster group's term, which each start's campaign
+    raises, or one past the last it took if that's greater (`ci_epoch`), so every start and every
+    new leader raises it, the group on or off. Grants are made in it; a grant keeps the epoch it
+    was made in.
+  - A leg the store has running comes back as the grant it ran under (its runner, attempt and
+    fence) with a lease from now, none granted again; with 10,000 running legs this takes < 2 s.
+  - A runner back says what it runs (`Hello.running`) and, a lease runner, renews what it holds.
+    A grant the store has for it there, under that fence, is adopted and renewed. Anything else (a
+    stale attempt, a leg settled, or given to another runner) it's told to stop (`Stop`, naming
+    the grant, once), and what it sends under it is refused (W05-R36). A runner from before
+    leases is reconciled by leg, as before. A grant nobody renews is lost at its lease's end:
+    there's no other grace for a runner that doesn't come back.
 - **W05-R26 Speed.** The targets of §1.5: ready → `Assign` p99 < 50 ms with capacity, ≥ 2,000
   assignments per second, 10,000 queued legs, 1,000 runners.
 - **W05-R27 Pools.** The scheduler asks W13's pool manager to scale up when the legs waiting for a

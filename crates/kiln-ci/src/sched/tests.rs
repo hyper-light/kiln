@@ -2718,3 +2718,25 @@ fn w05_r35_a_runner_said_draining_stays_drained_through_its_changes() {
     assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "y" && runner == "a")), "undrained, it takes y: {c:?}");
     assert_eq!(s.check_grants(), Ok(()));
 }
+
+/// W05-R25: an engine made in epoch 7 grants under it; taking epoch 8 (its node leading again),
+/// the next grant is 8's first, greater than any of 7's, while a grant made under 7 keeps its
+/// fence and is renewed by it. An older epoch than its own is never taken.
+#[test]
+fn w05_r25_a_new_epoch_numbers_grants_afresh_above_the_old() {
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 7);
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let old = fence(&s, "x");
+    assert_eq!(old.epoch, 7);
+    s.new_epoch(8);
+    s.new_epoch(6);
+    assert_eq!(s.epoch(), 8);
+    s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 1);
+    assert_eq!(fence(&s, "y"), Fence { epoch: 8, n: 1 });
+    assert!(fence(&s, "y") > old && fence(&s, "x") == old, "x keeps 7's fence");
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), old)] }, 50_000);
+    let c = s.handle(Input::Tick, 61_000);
+    assert!(!c.iter().any(|x| matches!(x, Command::Lost { leg, .. } if leg == "x")), "renewed by its old fence: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}

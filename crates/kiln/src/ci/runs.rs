@@ -264,6 +264,19 @@ pub async fn requeue(hub: &Hub, leg: &str, attempt: u32, note: Option<String>) -
         .await
 }
 
+/// The epoch the CI engine's grants are made in from now (W05-R25, R34): the cluster group's term
+/// `term`, or one past the last epoch taken, whichever is greater, kept as the last. It rises on
+/// every start, and with every new leader, whose campaign raised the term.
+pub async fn next_epoch(store: &crate::store::Store, term: u64) -> anyhow::Result<u64> {
+    let term = i64::try_from(term).unwrap_or(i64::MAX);
+    store
+        .call(move |c| {
+            let epoch: i64 = c.query_row("UPDATE ci_epoch SET epoch = MAX(epoch + 1, ?1) WHERE one = 1 RETURNING epoch", [term], |r| r.get(0))?;
+            Ok(u64::try_from(epoch).unwrap_or(0))
+        })
+        .await
+}
+
 /// A kept leg: its id, its runner, until when, and the grant it was kept under (its attempt and
 /// fence; none from an older build).
 pub type Kept = (String, String, i64, Option<(u32, kiln_ci::sched::Fence)>);

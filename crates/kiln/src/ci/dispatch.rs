@@ -560,6 +560,14 @@ pub(crate) async fn refuse_write(hub: &Hub, agent: &str, g: &crate::proto::Grant
     }
 }
 
+/// `agent` told to stop grant `g`, once a grant (W05-R25, R36): one it holds that isn't the leg's.
+async fn stop_grant(hub: &Hub, agent: &str, g: &crate::proto::Grant, why: &str) {
+    if hub.ci.first_refusal(g) {
+        tracing::warn!(leg = %g.leg, attempt = g.attempt, epoch = g.epoch, grant = g.n, runner = agent, "a runner holds a grant that isn't the leg's: it's told to stop it");
+        hub.command_start(agent, &ServerMsg::Stop { grant: g.clone(), reason: why.to_owned() }).await.log_when_answered(crate::hub::LOG_WITHIN);
+    }
+}
+
 /// [`runs::claim`]; in a test build with `claim=<duration>` (`KILN_CHAOS`), the first held back
 /// that long and then failed, as a store that can't write would (W05-R05).
 async fn claim(hub: &Hub, leg: &str, runner: &str, executor: &str, attempt: u32, fence: Fence) -> anyhow::Result<()> {
@@ -645,6 +653,11 @@ impl Handle {
     /// writes about the leg, so its word unnamed isn't taken.
     pub fn fenced(&self, leg: &str) -> bool {
         self.grants.lock().get(leg).is_some_and(|(_, _, fence)| *fence != Fence::default())
+    }
+
+    /// Every leg's live grant: its runner, attempt and fence (a measure's, `kiln ci bench`).
+    pub(crate) fn live_grants(&self) -> HashMap<String, (String, u32, Fence)> {
+        self.grants.lock().clone()
     }
 
     /// Whether `leg`'s live grant is `attempt`'s, under `fence` (W10-R03): a token minted for that
@@ -1024,9 +1037,6 @@ struct Dispatch {
     in_commands: bool,
     /// The `k8s` pools' executors this server started as pods (W13-R07).
     pods: std::collections::HashSet<String>,
-    /// When the runners of legs the rebuild after a restart found running have had their grace to
-    /// say hello (ms): a leg whose runner hasn't by then was lost with it ([`Dispatch::absent`]).
-    absent_after: Option<i64>,
     /// Each leg's last decision in demands, for its routing (W28-R47).
     decisions: HashMap<String, Decision>,
     /// What each runner last said it holds warm (W24-R18), numbered: legs' cold durations are read
@@ -1171,9 +1181,16 @@ pub fn spawn(hub: Arc<Hub>) {
         let rules = sources.effective();
         let mut cfg = sched_config(&hub, rules);
         (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
+        // Its grants' epoch (W05-R25): the cluster group's term, which this start's campaign
+        // raised, or one past the last if that's greater; a grant made before keeps its own.
+        let term = hub.store.group().map_or(0, crate::store::group::Group::term);
+        let epoch = runs::next_epoch(&hub.store, term).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), term, "the CI engine's epoch couldn't be kept: it takes the group's term");
+            term
+        });
         let mut d = Dispatch {
             hub: Arc::clone(&hub),
-            sched: Scheduler::new(cfg),
+            sched: Scheduler::with_epoch(cfg, epoch),
             routing: sources,
             held: HashMap::new(),
             runs: HashMap::new(),
@@ -1182,7 +1199,6 @@ pub fn spawn(hub: Arc<Hub>) {
             next: Vec::new(),
             in_commands: false,
             pods: std::collections::HashSet::new(),
-            absent_after: None,
             decisions: HashMap::new(),
             warm: HashMap::new(),
             warm_seq: 0,
@@ -1197,7 +1213,7 @@ pub fn spawn(hub: Arc<Hub>) {
         }
         let restored = Restored { runs: d.runs.len(), legs: d.legs.len(), took: started.elapsed() };
         if restored.runs > 0 {
-            tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), "the CI engine rebuilt its runs");
+            tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), epoch, "the CI engine rebuilt its runs");
         }
         *hub.ci.restored.lock() = Some(restored);
         // The runners that said hello while it rebuilt: what each said it runs is on its record
@@ -1206,13 +1222,8 @@ pub fn spawn(hub: Arc<Hub>) {
         for (a, running) in agents {
             d.runner_up(&a, &running).await;
         }
-        // Those yet to say it have their grace to.
-        let here: HashSet<String> = hub.agents.lock().keys().cloned().collect();
-        if d.legs.values().any(|l| l.agent.as_ref().is_some_and(|a| !here.contains(a))) {
-            let at = now_ms() + i64::try_from(crate::hub::AGENT_GRACE.as_millis()).unwrap_or(i64::MAX);
-            d.absent_after = Some(at);
-            d.timers.insert(at);
-        }
+        // Those yet to say it renew their grants once they're back, or lose them at their lease's
+        // end (W05-R25): the rebuild gave each a lease from now.
         loop {
             let wait = d.timers.first().map(|at| Duration::from_millis(u64::try_from((at - now_ms()).max(0)).unwrap_or(0)));
             let msg = match wait {
@@ -1286,6 +1297,12 @@ impl Dispatch {
                     self.commands(cmds).await;
                 }
                 let lost: Vec<crate::proto::Grant> = held.into_iter().filter(|g| self.held_by(&agent, g).is_none()).collect();
+                // What it holds that isn't its own (W05-R25): a stale attempt, a leg settled or
+                // given to another runner, as after a restart. Stopped, once a grant; what it
+                // sends under it is refused (W05-R36).
+                for g in &lost {
+                    stop_grant(&self.hub, &agent, g, "its grant isn't the leg's any more: settled, granted again, or lost").await;
+                }
                 let lease_ms = self.sched.lease().unwrap_or(0);
                 self.hub.send_peer(peer, &ServerMsg::Renewed { seq, lease_ms, epoch: self.sched.epoch(), lost }).await;
                 Ok(())
@@ -1418,9 +1435,14 @@ impl Dispatch {
             self.timers.pop_first();
             woke = true;
         }
-        if self.absent_after.is_some_and(|t| t <= now) {
-            self.absent_after = None;
-            self.absent().await;
+        // A new term while this node leads (elected anew): grants from now are made in the next
+        // epoch (W05-R25).
+        let term = self.hub.store.group().map_or(0, crate::store::group::Group::term);
+        if term > self.sched.epoch() {
+            match runs::next_epoch(&self.hub.store, term).await {
+                Ok(epoch) => self.sched.new_epoch(epoch),
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), term, "the CI engine's next epoch couldn't be kept"),
+            }
         }
         // Wait timers that ran out (W15-R03).
         if woke && !self.held.is_empty() {
@@ -1509,19 +1531,6 @@ impl Dispatch {
         let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral), draining: a.draining };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         cmds.extend(self.lose(gone, "the runner lost it").await);
-        self.commands(cmds).await;
-    }
-
-    /// The legs the rebuild after a restart found running on runners that haven't said hello
-    /// within their grace: lost with them, as [`Dispatch::runner_up`]'s are.
-    async fn absent(&mut self) {
-        let here: HashSet<String> = self.hub.agents.lock().keys().cloned().collect();
-        let gone: Vec<(String, u32)> = self.legs.iter().filter(|(_, l)| l.agent.as_ref().is_some_and(|a| !here.contains(a))).map(|(id, l)| (id.clone(), l.attempt)).collect();
-        if gone.is_empty() {
-            return;
-        }
-        tracing::warn!(legs = gone.len(), "legs' runners didn't come back after the restart: the legs were lost with them");
-        let cmds = self.lose(gone, "its runner didn't come back after the server restarted").await;
         self.commands(cmds).await;
     }
 
@@ -3456,11 +3465,13 @@ impl Dispatch {
             li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
             li.finish_within = st.sup.as_ref().map(|s| s.finish_within);
             match (s, agent) {
-                // Running on `a` as the store has it; `a` says whether it still is. A runner that
-                // said hello while this rebuilt said what it runs (what it left out it lost:
-                // `spawn`'s `runner_up`), one yet to says when it does, or loses it after its
-                // grace (`absent`). Not put on `a`'s record here: a leg its hello left out would
-                // hold one of its slots for good.
+                // Running on `a` as the store has it, under the grant it was given (its attempt and
+                // the epoch it was made in): `a` says whether it still is. A runner that said hello
+                // while this rebuilt said what it runs (what it left out it lost: `spawn`'s
+                // `runner_up`); one yet to renews it when it's back, and its other grants are
+                // stopped; one that isn't back by the lease's end loses it then (W05-R25). Not put
+                // on `a`'s record here: a leg its hello left out would hold one of its slots for
+                // good.
                 // Its grant gets a lease from now (W05-R34): the timer for its expiry is kept.
                 (Status::Running, Some(a)) => {
                     self.hub.ci.grant(&id, Some((a.clone(), attempt.max(1), fence)));
@@ -3843,7 +3854,6 @@ mod tests {
             next: Vec::new(),
             in_commands: false,
             pods: std::collections::HashSet::new(),
-            absent_after: None,
             decisions: std::collections::HashMap::new(),
             warm: std::collections::HashMap::new(),
             warm_seq: 0,
@@ -3930,6 +3940,81 @@ mod tests {
                 assert!(revoked(&hub, t).await?, "{end}: its job token is revoked");
             }
             assert_eq!(ends.len(), 9);
+            Ok(())
+        })
+    }
+
+    /// W05-R25: the store's cluster group opened three times, as three starts of a server. Each
+    /// open campaigns, so the group's term rises; each start's epoch is the next (the term, or one
+    /// past the last taken), so the three rise; and the Assign an engine of each epoch makes
+    /// carries it.
+    #[test]
+    fn w05_r25_a_restart_raises_the_epoch() -> anyhow::Result<()> {
+        use kiln_ci::sched::{Command, Config, Input, LegIn, RunnerIn, Scheduler};
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let mut seen: Vec<(u64, u64)> = Vec::new();
+            for _ in 0..3 {
+                let store = crate::store::Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+                let term = store.group().map_or(0, crate::store::group::Group::term);
+                let epoch = super::runs::next_epoch(&store, term).await?;
+                let mut s = Scheduler::with_epoch(Config::default(), epoch);
+                let view = kiln_ci::sched::routing::RunnerView { name: "a".into(), labels: vec!["kiln".into()], ..kiln_ci::sched::routing::RunnerView::default() };
+                s.handle(Input::RunnerUp(Box::new(RunnerIn { id: "a".into(), view, slots: 1, ..RunnerIn::default() })), 0);
+                let route = kiln_ci::sched::routing::LegRoute { labels: vec!["kiln".into()], ..kiln_ci::sched::routing::LegRoute::default() };
+                let c = s.handle(Input::LegQueued(Box::new(LegIn { id: "x".into(), run: "R".into(), repo: "acme/x".into(), route, ..LegIn::default() })), 0);
+                let carried = c.iter().find_map(|x| match x {
+                    Command::Assign { fence, .. } => Some(fence.epoch),
+                    _ => None,
+                });
+                assert_eq!(carried, Some(epoch), "the Assign carries its epoch: {c:?}");
+                seen.push((term, epoch));
+                drop(store);
+            }
+            let rising = |v: Vec<u64>| v.windows(2).all(|w| matches!(w, [a, b] if a < b));
+            assert!(rising(seen.iter().map(|(t, _)| *t).collect()) && seen.iter().all(|(t, _)| *t > 0), "each open campaigns, its term rising: {seen:?}");
+            assert!(rising(seen.iter().map(|(_, e)| *e).collect()) && seen.iter().all(|(t, e)| e >= t), "each start's epoch rising, at least its term: {seen:?}");
+            Ok(())
+        })
+    }
+
+    /// W05-R25, the example of docs/needs.md E3.7: the server restarted, its epoch 7 to 8, while
+    /// runner A ran L's attempt 2 (in the store, granted under epoch 7) and M's attempt 1 (which the
+    /// store has settled). The rebuild brought L back as that grant, its lease begun then. A
+    /// reconnects: its hello and its Renew name both. L is adopted at epoch 7 and renewed: it isn't
+    /// lost at the lease it was rebuilt with, and what A writes under it is taken. M isn't A's: A is
+    /// told to stop it (once a grant), and its result is refused, changing nothing.
+    #[test]
+    fn w05_r25_hello_running_is_reconciled_after_a_restart() -> anyhow::Result<()> {
+        use crate::proto::Grant;
+        use kiln_ci::sched::{Command, Config, Fence, Input, LegIn, Scheduler};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut d = dispatcher(&hub);
+            d.sched = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 8);
+            hub.agents.lock().insert("a".into(), runner("a", 2));
+            // The rebuild, 30 s ago: L running on A under its grant of epoch 7, attempt 2.
+            let (l, m) = (Fence { epoch: 7, n: 4 }, Grant { leg: "m".into(), attempt: 1, epoch: 7, n: 3 });
+            track(&mut d, "l", "a");
+            if let Some(x) = d.legs.get_mut("l") {
+                (x.attempt, x.fence) = (2, l);
+            }
+            hub.ci.grant("l", Some(("a".into(), 2, l)));
+            let route = kiln_ci::sched::routing::LegRoute { labels: vec!["kiln".into()], ..kiln_ci::sched::routing::LegRoute::default() };
+            let li = LegIn { id: "l".into(), run: "R".into(), repo: "acme/x".into(), route, ..LegIn::default() };
+            let rebuilt = super::now_ms() - 30_000;
+            d.sched.handle(Input::LegRunning { leg: Box::new(li), runner: "a".into(), attempt: 2, fence: l }, rebuilt);
+            // A back: its hello, then its Renew.
+            d.handle(super::Msg::RunnerUp { agent: "a".into(), running: vec!["l".into(), "m".into()] }).await;
+            d.handle(super::Msg::Leased { agent: "a".into(), peer: 7, seq: 1, held: vec![Grant::of("l", 2, l), m.clone()] }).await;
+            let c = d.sched.handle(Input::Tick, rebuilt + 61_000);
+            assert!(!c.iter().any(|x| matches!(x, Command::Lost { leg, .. } if leg == "l")), "L renewed, not lost at the lease it was rebuilt with: {c:?}");
+            assert_eq!(granted(&hub, "l"), Some(("a".to_owned(), 2, l)), "adopted at epoch 7, attempt 2");
+            assert!(d.live("a", &Grant::of("l", 2, l)), "what A writes under it is taken");
+            assert!(!hub.ci.first_refusal(&m), "A was told to stop M already");
+            d.finished("a", crate::proto::JobResult { job: "m".into(), status: crate::store::Status::Succeeded, exit_code: None, error: None, peak_rss: None, cpu_seconds: None }, Some(m.clone())).await?;
+            assert!(!d.legs.contains_key("m") && granted(&hub, "m").is_none(), "M's result refused, changing nothing");
+            assert_eq!(d.sched.epoch(), 8, "grants from now are made in 8");
             Ok(())
         })
     }

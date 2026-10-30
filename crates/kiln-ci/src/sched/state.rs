@@ -1163,6 +1163,15 @@ impl Scheduler {
         self.epoch
     }
 
+    /// A new epoch (W05-R25): its node leads again, the group's term risen. Grants from now are
+    /// made in it, numbered afresh (each fence still greater than any of an earlier epoch's);
+    /// those made before keep their fences. Never back.
+    pub fn new_epoch(&mut self, epoch: u64) {
+        if epoch > self.epoch {
+            (self.epoch, self.fences) = (epoch, 0);
+        }
+    }
+
     /// How long its grants live unrenewed (W05-R34), if they're leases.
     pub fn lease(&self) -> Option<Ms> {
         self.cfg.lease

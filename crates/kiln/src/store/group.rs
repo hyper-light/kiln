@@ -279,6 +279,9 @@ pub struct Group {
     outgoing: async_channel::Receiver<(u64, Vec<u8>)>,
     /// Why its driver stopped, once it has (it applies nothing from then on).
     stopped: Arc<Mutex<Option<String>>>,
+    /// The group's term while this member leads (the server's), else 0: the CI engine's epoch
+    /// (docs/ci.md W05-R25). Every open campaigns, so each raises it.
+    term: Arc<AtomicU64>,
 }
 
 /// What opening a member of the group found wrong.
@@ -374,7 +377,8 @@ impl Group {
         let applied = Arc::new(AtomicU64::new(0));
         let log_start = Arc::new(AtomicU64::new(0));
         let stopped = Arc::new(Mutex::new(None));
-        let (applied2, point2, log_start2, stopped2) = (applied.clone(), point.clone(), log_start.clone(), stopped.clone());
+        let term = Arc::new(AtomicU64::new(0));
+        let (applied2, point2, log_start2, stopped2, term2) = (applied.clone(), point.clone(), log_start.clone(), stopped.clone(), term.clone());
         let join = thread::Builder::new()
             .name("kiln-cluster".into())
             .spawn(move || {
@@ -408,6 +412,7 @@ impl Group {
                     point: point2,
                     log_start: log_start2,
                     stopped: stopped2,
+                    term: term2,
                     outgoing: out_tx,
                     server: !learner,
                     wanted: None,
@@ -425,7 +430,7 @@ impl Group {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped })
+        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped, term })
     }
 
     /// Where it stands: kiln.db's last write, and the last entry applied (`/healthz/server`).
@@ -437,6 +442,12 @@ impl Group {
     /// learner again).
     pub fn stopped(&self) -> Option<String> {
         self.stopped.lock().clone()
+    }
+
+    /// The group's term while this member leads it (the server's), else 0 (a learner's). Every
+    /// open campaigns, so each raises it: the CI engine takes it as its epoch (docs/ci.md W05-R25).
+    pub fn term(&self) -> u64 {
+        self.term.load(Ordering::SeqCst)
     }
 
     /// The last entry applied, with its term, and the group's configuration there: where a copy
@@ -640,6 +651,8 @@ struct Driver {
     outgoing: async_channel::Sender<(u64, Vec<u8>)>,
     /// Why it stopped, for [`Group::stopped`].
     stopped: Arc<Mutex<Option<String>>>,
+    /// Its term while it leads, for [`Group::term`].
+    term: Arc<AtomicU64>,
     /// The server's member (the group's leader), or a runner's learner.
     server: bool,
     /// The learners the group should have, once the server has said.
@@ -663,6 +676,7 @@ impl Driver {
                 ready.send(Err(Opening::Failed(e))).ok();
                 return;
             }
+            self.term.fetch_max(self.replica.term(), Ordering::SeqCst);
             self.replica.machine_mut().opened();
         } else if let Err(e) = self.drive() {
             ready.send(Err(Opening::Failed(e))).ok();
@@ -724,6 +738,11 @@ impl Driver {
             if self.server {
                 self.reconcile();
                 self.beat_learners();
+                // A new term while it leads (a leader again, elected anew): the CI engine's next
+                // epoch (docs/ci.md W05-R25).
+                if self.replica.is_leader() {
+                    self.term.fetch_max(self.replica.term(), Ordering::SeqCst);
+                }
             }
             // Compacting makes kiln.db durable (a commit that waits for the disk, holding its write
             // lock), so it's every so many writes, not by the image's size (on one node a marker).
