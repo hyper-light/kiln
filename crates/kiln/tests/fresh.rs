@@ -431,7 +431,8 @@ fn w26_r16_turning_auto_push_on_warns() -> anyhow::Result<()> {
 #[test]
 fn w26_r16_collision_radar_names_both_changes() -> anyhow::Result<()> {
     let body: String = (1..=80).map(|i| format!("line {i}\n")).collect();
-    let x = setup(&[("sched/fair.rs", body.as_bytes())])?;
+    // Collisions go to the inboxes of the people they're about (W19-R06's `inbox`).
+    let x = setup(&[("sched/fair.rs", body.as_bytes()), (".kiln/notify.yaml", b"- on: [change.collision]\n  to: [inbox]\n")])?;
     let s = &x.s;
     let edit = |from: u32, to: u32, tag: &str| -> String { (1..=80).map(|i| if (from..=to).contains(&i) { format!("line {i}, {tag}\n") } else { format!("line {i}\n") }).collect() };
     // D1 changes lines 40–58; D2, on top of it, too (one stack: no collision).
@@ -442,7 +443,9 @@ fn w26_r16_collision_radar_names_both_changes() -> anyhow::Result<()> {
     must(git(&x.home, &x.work, &["checkout", "-qb", "d3", "origin/main"]), "branch")?;
     x.commit(&[("sched/fair.rs", edit(45, 70, "D3").as_bytes())], "D3: fair too")?;
     let sha = must(git(&x.home, &x.work, &["rev-parse", "HEAD"]), "rev")?.trim().to_owned();
-    must(git(&x.home, &x.work, &["push", "-o", &format!("change={sha}:new"), "origin", "HEAD:refs/for/main"]), "D3")?;
+    // kim's change, pushed with her token: two authors.
+    let as_kim = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", x.kim, s.port);
+    must(git(&x.home, &x.work, &["push", "-o", &format!("change={sha}:new"), &as_kim, "HEAD:refs/for/main"]), "D3")?;
     let listed = |d: &str| -> anyhow::Result<Vec<Value>> { Ok(ok(s, &x.kim, "GET", &format!("/api/diffs/{d}/collisions"), None)?.get("collisions").and_then(Value::as_array).cloned().unwrap_or_default()) };
     until(30, "D1 and D3 named to each other", || {
         let one = listed("D1")?;
@@ -453,6 +456,29 @@ fn w26_r16_collision_radar_names_both_changes() -> anyhow::Result<()> {
     let three = listed("D3")?;
     assert_eq!(three.iter().map(|c| text(c, "with")).collect::<Vec<_>>(), ["D1"], "{three:?}");
     assert!(listed("D2")?.is_empty(), "D2 is in D1's stack and touches other lines");
+
+    // Both authors are told, once each, through `change.collision`.
+    let told = |token: &str| -> anyhow::Result<Vec<Value>> {
+        let v = ok(s, token, "GET", "/api/review/inbox", None)?;
+        Ok(v.get("notifications").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|n| text(n, "event") == "change.collision").collect())
+    };
+    until(30, "dev and kim told", || {
+        let (d, k) = (told(&x.dev)?.len(), told(&x.kim)?.len());
+        Ok((d < 1 || k < 1).then(|| format!("dev {d}, kim {k}")))
+    })?;
+    let mine = told(&x.dev)?;
+    assert_eq!(mine.len(), 1, "{mine:?}");
+    assert!(text(mine.first().unwrap_or(&Value::Null), "line").contains("D1 and D3 both change sched/fair.rs lines 45–58"), "{mine:?}");
+    assert_eq!(told(&x.kim)?.len(), 1);
+    // Main moves elsewhere: both replayed, the same overlap still there, and no one told again.
+    let tip = x.main_moves(&[("z.txt", b"elsewhere\n")], "main moves")?;
+    until(60, "D1 and D3 replayed", || {
+        let (one, three) = (versions(s, &x.kim, "/api/diffs/D1")?.pop().unwrap_or_default(), versions(s, &x.kim, "/api/diffs/D3")?.pop().unwrap_or_default());
+        Ok((text(&one, "base") != tip || text(&three, "base") != tip).then(|| format!("{one} {three}")))
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!((told(&x.dev)?.len(), told(&x.kim)?.len()), (1, 1), "the same overlap tells no one twice");
+    assert_eq!(listed("D1")?.len(), 1);
     // D3 moves off those lines: no longer a collision.
     write(&x.work, &[("sched/fair.rs", edit(75, 80, "D3").as_bytes())])?;
     must(git(&x.home, &x.work, &["commit", "-q", "--amend", "-a", "--no-edit"]), "amend")?;

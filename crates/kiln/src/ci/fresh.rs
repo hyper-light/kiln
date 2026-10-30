@@ -340,7 +340,10 @@ fn pull_stacks(all: Vec<Pull>, trunk: &str) -> Vec<(Pull, Option<String>)> {
 /// kept (`review_pull_replays`, `refs/kiln/pulls/<host>/<n>/replays/<k>`) for Update to push.
 /// Nothing moves on the host.
 async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::Result<Round> {
-    let found = pull_stacks(open_pulls(hub, repo).await?, trunk);
+    let all = open_pulls(hub, repo).await?;
+    let seen = all.len();
+    let found = pull_stacks(all, trunk);
+    tracing::info!(repo = %repo.name, %trunk, open = seen, on_trunk = found.len(), pulls = ?found.iter().map(|(p, b)| format!("{}<-{}", p.id(), b.as_deref().unwrap_or(trunk))).collect::<Vec<_>>(), "a host's open pull requests, as fresh sees them");
     if found.is_empty() {
         return Ok(Round::default());
     }
