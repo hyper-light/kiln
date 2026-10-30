@@ -8624,6 +8624,11 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     `jobs`, those the action applies to.
   - Its heights are held: nothing moves as jobs are picked, acted on and go on, and nothing scrolls
     sideways from 320 px up.
+- **W26-R25 Roll back to any commit.** A deploy can go back to any commit of its app's sources, not
+  only one it deployed: rendered with that source at the commit and the others at their heads,
+  synced as a rollback, recorded as a deployment, and held there until trunk changes what the app
+  renders (cd.md, "Any commit"). Its rollback targets list main's newest commits beside the
+  deployments, each naming the deployment that ran it and the one whose render it matches.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8687,6 +8692,13 @@ repository):
   `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
   `w26_r22_freeze_is_appended_after_every_older_variant`; contain
   `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC15 Roll back to any commit.** A commit no deployment ran is rendered, synced and recorded
+  as a deployment; a revision resolves to a deployment first, else to a commit or a tag's commit git
+  has in a source; a commit that renders what a deployment rendered names it. *`kiln-cd`
+  `w26_r25_a_rollback_goes_to_any_commit_and_names_the_render_it_matches`,
+  `w26_r25_a_rollback_to_a_commit_never_deployed_renders_syncs_and_records_it` (the simulated
+  cluster), `w26_r25_a_log_lists_a_revisions_newest_commits`; server
+  `w26_r25_a_rollback_goes_to_a_deployment_or_any_commit_git_has`.*
 - **W26-AC14 The jobs pane.** In Chromium and WebKit, at a desktop's width and a phone's: the pane
   as approved (the strip, the jobs by stage, the output beside them or under the line with the strip
   again), a line and its glyph picking, each word and each action reaching `POST /api/ship/jobs`

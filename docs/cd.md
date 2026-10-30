@@ -245,6 +245,18 @@ each with its commit (author, time, the whole message) and the tags that name it
 the app's history (`history_limit`, 10 by default; failures go first when it's full). The choosing
 is `kiln_cd::rollback`, pure; the server resolves a tag to its commit first.
 
+**Any commit** (ci.md W26-R25). A commit, or a tag's commit, that no deployment kiln can go back to
+ran is gone back to all the same when one of the app's git sources has it: kiln renders the app
+with that source at the commit and its other sources at their heads, syncs it as any rollback, and
+records it as a deployment. Its artifacts are its own, resolved now (an image CI never built for it
+says so). It holds there, its pin naming no deployment (`to` 0), until git changes what the app
+renders, as rollbacks do. `rollback_targets` also lists the newest 20 commits of the app's first own
+git source at the revision it follows (`commits`), each with who, when and what, the deployment
+that ran it (`deployment`), and the newest deployment that rendered what it renders (`same_as`, by
+its inputs' content address, read from git without rendering). Which way a rollback goes stays
+`kiln_cd::rollback`'s (`pick_any`, `held_commits`, `same_as`); the server asks git first what the
+revision is in the app's sources.
+
 **Auto-rollback.** When a deploy fails, kiln goes back on its own: an app whose rollout aborted
 goes back to the deployment before (cd-targets.md §5), kiln's own restart that didn't take has its
 previous image put back by the guard (cd-targets.md §10), and a release that failed after its
@@ -407,7 +419,7 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | GET | `/api/cd/apps/:app/manifests` | what the app renders now, as kiln applies it (another revision's: not yet) |
 | POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | `rollback` takes `{ to }` (a deployment's id) or `{ revision }` (a commit, a tag, a chart version), and `prune` |
 | GET | `/api/cd/apps/:app/history` | deployments, each with its commit and the tags that name it |
-| GET | `/api/cd/apps/:app/rollback-targets` | what a rollback can go to, newest first, and what runs now |
+| GET | `/api/cd/apps/:app/rollback-targets` | what a rollback can go to, newest first, and what runs now; `commits`: its source's newest commits, each with the deployment that ran it and the one whose render it matches (any of them can be gone back to, ci.md W26-R25) |
 | GET / PUT | `/api/cd/apps/:app/auto-rollback` | whether kiln goes back on its own, and who said so (`from`: `app`, `repo`, `deploy-file`, `default`); PUT `{ on: true \| false \| null }` sets or clears the app's |
 | GET / PUT | `/api/cd/repos/auto-rollback` | auto-rollback by repository; PUT `{ repo, on: true \| false \| null }` |
 | GET | `/api/cd/apps/:app/resources/:key` | one object of the tree: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. `:key` is `group~kind~namespace~name` |

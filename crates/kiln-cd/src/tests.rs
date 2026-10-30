@@ -294,6 +294,34 @@ fn a_rollback_syncs_as_one_step_and_automation_cannot_cut_in() {
     assert_eq!(image, Some(json!("web:1")));
 }
 
+/// W26-R25: a rollback to a commit no deployment ran: git has it (r2, a commit auto-sync never
+/// took, r3 came after it), the engine renders it as the rollback asks, syncs it in one step and
+/// records it as a deployment (its revision and render key), and the cluster runs what it renders.
+#[test]
+fn w26_r25_a_rollback_to_a_commit_never_deployed_renders_syncs_and_records_it() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.sync.self_heal = false;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    // r2 is in git and never deployed: r3 came before auto-sync saw it.
+    git.borrow_mut().insert("r2".to_owned(), vec![deployment("web", "web:2", json!({}))]);
+    deploy(&mut h, &git, "web", "r3", vec![deployment("web", "web:3", json!({}))]);
+    let finished = |h: &Harness| -> Vec<(Option<String>, bool)> { h.records.iter().filter_map(|r| match r { Record::Finished { revision, succeeded, .. } => Some((revision.as_ref().map(|r| r.to_string()), *succeeded)), _ => None }).collect() };
+    assert!(h.run_until(60_000, |h| finished(h).len() == 2));
+    assert!(!finished(&h).iter().any(|(r, _)| r.as_deref() == Some("r2")), "r2 was never deployed");
+    let key = obj::hash_bytes(b"r2");
+    let request = SyncRequest { trigger: Some(crate::engine::Trigger::Rollback), ..SyncRequest::default() };
+    h.input(Input::SyncTo { app: "web".into(), revision: "r2".into(), key, content: key, request });
+    assert!(h.run_until(60_000, |h| finished(h).len() == 3 && settled(h, "web")));
+    let recorded = h.records.iter().rev().find_map(|r| match r { Record::Finished { revision, key: k, succeeded, .. } => Some((revision.as_ref().map(|r| r.to_string()), *k, *succeeded)), _ => None });
+    assert_eq!(recorded, Some((Some("r2".to_owned()), Some(key), true)), "recorded as a deployment of r2, its render's key");
+    let dep = ResKey::new("apps", "Deployment", "web", "web");
+    let image = h.clusters.get("dev").and_then(|c| c.get(&dep)).and_then(|v| v.pointer("/spec/template/spec/containers/0/image").cloned());
+    assert_eq!(image, Some(json!("web:2")));
+}
+
 #[test]
 fn a_wave_starts_only_when_the_one_before_is_healthy() {
     let (mut h, git) = harness(fast());

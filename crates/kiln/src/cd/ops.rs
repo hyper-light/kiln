@@ -1543,7 +1543,9 @@ async fn rollback(cx: Cx, v: Value) -> Out {
         (None, Some(r)) => format!(" ({})", r.get(..12).unwrap_or(r)),
         _ => String::new(),
     };
-    audit(&cx, "cd.rollback", format!("{id} to deployment {to}{what}")).await;
+    // A commit no deployment ran (W26-R25) is gone back to by its commit.
+    let to = if to == 0 { "a commit never deployed".to_owned() } else { format!("deployment {to}") };
+    audit(&cx, "cd.rollback", format!("{id} to {to}{what}")).await;
     Ok(out)
 }
 
@@ -1559,11 +1561,18 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
     }
     not_syncing(cd, &id)?;
     let history = cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
-    let (n, tag) = super::rollback::target(cd, &id, &def, &history, to, revision).await?;
-    let target = history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?;
-    // Each source's commit; entries kept before kiln recorded them carry the revision only
-    // (`kiln_cd::rollback::renderable` let only a lone source's through).
-    let commits = if target.commits.is_empty() { vec![target.revision.clone()] } else { target.commits.clone() };
+    // A deployment of its history, or a commit none of them ran (docs/ci.md W26-R25): rendered
+    // anew, that source held at it and the others at their heads, its artifacts its own now.
+    let (target, commits, tag): (Option<&kiln_cd::state::Deployment>, Vec<Option<String>>, Option<String>) = match super::rollback::target(cd, &id, &def, &history, to, revision).await? {
+        super::rollback::Going::Deployment { id: n, tag } => {
+            let target = history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?;
+            // Each source's commit; entries kept before kiln recorded them carry the revision only
+            // (`kiln_cd::rollback::renderable` let only a lone source's through).
+            let commits = if target.commits.is_empty() { vec![target.revision.clone()] } else { target.commits.clone() };
+            (Some(target), commits, tag)
+        }
+        super::rollback::Going::Commit { source, commit, tag } => (None, kiln_cd::rollback::held_commits(def.sources.len(), source, &commit), tag),
+    };
     // A Kubernetes cluster's version and APIs shape the render; a target beyond Kubernetes has none.
     let (kube_version, api_versions) = if kiln_cd::providers::is_target(&def.destination.cluster) {
         (None, Vec::new())
@@ -1585,11 +1594,17 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
     // The pin holds while git renders what it rendered: the head's content before its artifacts,
     // as the source poll compares it. A rollback never waits for the head's artifacts: the head
     // may be what broke, or its image still building. The deployment's are exactly as recorded.
-    let (a, p) = cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    // A commit none of them ran has no artifacts recorded: its own, now (an image CI hasn't built
+    // for it says so).
+    let (a, p) = cd.recorded_artifacts(&def, target.map(|t| t.artifacts.clone()).unwrap_or_default(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
     back.add_artifacts(a, p);
     // Its secrets as its definition pins them now: a rollback doesn't bring back older values.
     back.add_secrets(cd.app_secrets(&def).await.map_err(|e| bad(format!("{e:#}")))?);
-    let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
+    // What a commit renders the same as, when a deployment rendered it.
+    let same = target.is_none().then(|| kiln_cd::rollback::same_as(&history, back.key).map(|d| d.id)).flatten();
+    let revision = target.map_or_else(|| Some(back.revision.clone()), |t| t.revision.clone());
+    // A pin to a commit no deployment ran holds no deployment (`to` 0).
+    let pin = state::Pin { to: target.map_or(0, |t| t.id), revision: revision.clone(), commits: commits.clone(), head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
     propose(cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
     // The held inputs and their sync as one step: nothing syncs the app in between.
     let request = SyncRequest { prune, by: Some(by.to_owned()), trigger: Some(Trigger::Rollback), ..SyncRequest::default() };
@@ -1598,7 +1613,10 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
         cd.keep_inputs(&id, &back);
         cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
     }
-    Ok(json!({"rolling_back": id, "to": target.id, "revision": target.revision, "commits": target.commits, "tag": tag}))
+    Ok(match target {
+        Some(t) => json!({"rolling_back": id, "to": t.id, "revision": t.revision, "commits": t.commits, "tag": tag}),
+        None => json!({"rolling_back": id, "to": null, "commit": revision, "revision": revision, "commits": commits, "tag": tag, "same_as": same}),
+    })
 }
 
 /// What an app can be rolled back to, newest first (`kiln_cd::rollback::candidates`), and what
@@ -1616,8 +1634,10 @@ async fn rollback_targets(cx: Cx, v: Value) -> Out {
         targets.push(super::rollback::row(&cx.cd, &def, d).await);
     }
     let shadow = super::is_shadow(&def);
+    // Its source's newest commits beside them: any of them can be gone back to (docs/ci.md W26-R25).
+    let commits = super::rollback::commits(&cx.cd, &def, &history).await;
     // The store keeps at least one, whatever the definition says (`Command::Deployed`).
-    Ok(json!({"app": id, "current": current, "targets": targets, "kept": def.history_limit.max(1), "shadow": shadow}))
+    Ok(json!({"app": id, "current": current, "targets": targets, "commits": commits, "kept": def.history_limit.max(1), "shadow": shadow}))
 }
 
 /// An app's auto-rollback: whether kiln goes back on its own after a failure, and who said so.

@@ -141,6 +141,24 @@ impl Cd {
         got
     }
 
+    /// The source of `def` whose mirror has commit `rev` (7 or more of its first hex digits, or a
+    /// whole one), and that commit whole: one a rollback can go back to though no deployment ran
+    /// it (docs/ci.md W26-R25). Git sources only; none where `rev` isn't a commit's.
+    pub(crate) async fn find_commit(self: &Arc<Self>, def: &AppDef, rev: &str) -> Option<(usize, String)> {
+        let rev = rev.trim().to_ascii_lowercase();
+        if !(7..=64).contains(&rev.len()) || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        for (i, s) in def.sources.iter().enumerate().filter(|(_, s)| s.chart.is_none()) {
+            let (dir, auth, url, r) = (self.mirror_dir(&s.repo), self.git_auth(&s.repo), s.repo.clone(), rev.clone());
+            let found = crate::rt::blocking(move || kiln_cd::git::Mirror::open(&dir, &url, auth)?.resolve(&r)).await.ok().and_then(Result::ok);
+            if let Some(c) = found.filter(|c| c.starts_with(&rev)) {
+                return Some((i, c));
+            }
+        }
+        None
+    }
+
     /// The commit a tag names in one of an app's git sources.
     async fn tag_commit(self: &Arc<Self>, def: &AppDef, name: &str) -> Option<String> {
         for s in def.sources.iter().filter(|s| s.chart.is_none()) {
@@ -159,31 +177,120 @@ fn refused(r: Refused) -> Fail {
     }
 }
 
-/// The deployment a rollback of `id` goes to: `to` by its id, `revision` by what it ran (a commit,
-/// a revision as recorded, or a tag of one of the app's git sources), else the one before what
-/// runs. With the tag, when a tag found it.
-pub(super) async fn target(cd: &Arc<Cd>, id: &str, def: &AppDef, history: &VecDeque<Deployment>, to: Option<u64>, revision: Option<&str>) -> Result<(u64, Option<String>), Fail> {
+/// Where a rollback of an app goes, as the server resolved it: a deployment of its history, or a
+/// commit of one of its sources none of them ran (docs/ci.md W26-R25); with the tag, when a tag
+/// named it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Going {
+    Deployment { id: u64, tag: Option<String> },
+    Commit { source: usize, commit: String, tag: Option<String> },
+}
+
+/// What a rollback's `revision` is in an app's sources, looked up in git before a rollback is
+/// chosen: the source with that commit (and the commit whole), and the tag of that name (and the
+/// commit it names, with the source that has it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Looked {
+    pub commit: Option<(usize, String)>,
+    pub tag: Option<(String, Option<(usize, String)>)>,
+}
+
+/// Where a rollback of `id` goes: `to` by its id, `revision` by what it ran (a commit, a revision as
+/// recorded, or a tag of one of the app's git sources), else the one before what runs. A commit (or
+/// a tag's) that no deployment that can be gone back to ran is gone back to all the same, rendered
+/// anew, when one of the app's git sources has it.
+pub(super) async fn target(cd: &Arc<Cd>, id: &str, def: &AppDef, history: &VecDeque<Deployment>, to: Option<u64>, revision: Option<&str>) -> Result<Going, Fail> {
     let sources = def.sources.len();
+    // Git is asked only for what the history doesn't know.
+    let mut looked = Looked::default();
+    if let Some(name) = revision.map(str::trim).filter(|r| to.is_none() && !r.is_empty())
+        && rollback::pick(id, history, Ask::Revision(name), sources).is_err()
+    {
+        looked.commit = cd.find_commit(def, name).await;
+        if looked.commit.is_none()
+            && let Some(c) = cd.tag_commit(def, name).await
+        {
+            let found = cd.find_commit(def, &c).await.or(Some((usize::MAX, c)));
+            looked.tag = Some((name.to_owned(), found));
+        }
+    }
+    choose(id, history, sources, to, revision, looked)
+}
+
+/// [`target`]'s choice, from the history and what git said ([`Looked`]): pure.
+pub(super) fn choose(id: &str, history: &VecDeque<Deployment>, sources: usize, to: Option<u64>, revision: Option<&str>, looked: Looked) -> Result<Going, Fail> {
     let ask = match (to, revision) {
         (Some(_), Some(_)) => return Err((StatusCode::BAD_REQUEST, "name the deployment (`to`) or what it ran (`revision`), not both".into())),
         (Some(n), None) => Ask::Deployment(n),
         (None, Some(r)) => Ask::Revision(r),
         (None, None) => Ask::Previous,
     };
-    match rollback::pick(id, history, ask, sources) {
-        Ok(d) => Ok((d.id, None)),
-        // Not a commit or revision it ran: a tag, then, of the commit it ran.
-        Err(Refused::Missing(why)) if revision.is_some() => {
-            let name = revision.unwrap_or_default().trim();
-            let Some(commit) = cd.tag_commit(def, name).await else { return Err((StatusCode::NOT_FOUND, format!("{why}; nor is {name} a tag of its sources"))) };
-            match rollback::pick(id, history, Ask::Revision(&commit), sources) {
-                Ok(d) => Ok((d.id, Some(name.to_owned()))),
-                Err(Refused::Missing(_)) => Err((StatusCode::NOT_FOUND, format!("tag {name} is commit {}, which no deployment of {id} ran: kiln rolls back only to what it deployed", short(&commit)))),
-                Err(r) => Err(refused(r)),
-            }
-        }
-        Err(r) => Err(refused(r)),
+    let going = |t: rollback::Target<'_>, tag: Option<String>| match t {
+        rollback::Target::Deployment(d) => Going::Deployment { id: d.id, tag },
+        rollback::Target::Commit { source, commit } => Going::Commit { source, commit, tag },
+    };
+    let why = match rollback::pick(id, history, ask, sources) {
+        Ok(d) => return Ok(Going::Deployment { id: d.id, tag: None }),
+        Err(r) if revision.is_none() => return Err(refused(r)),
+        Err(r) => r,
+    };
+    let name = revision.unwrap_or_default().trim();
+    // A commit of one of its sources, whole or by its first hex digits.
+    if let Some(found) = looked.commit {
+        return rollback::pick_any(id, history, Ask::Revision(name), sources, Some(found)).map(|t| going(t, None)).map_err(refused);
     }
+    // A tag, then, of a commit: the deployment that ran it, else the commit anew.
+    let Some((tag, found)) = looked.tag else {
+        return Err(match why {
+            Refused::Missing(m) => (StatusCode::NOT_FOUND, format!("{m}; nor is {name} a commit or a tag of its sources")),
+            r => refused(r),
+        });
+    };
+    let commit = found.as_ref().map(|(_, c)| c.clone()).unwrap_or_default();
+    rollback::pick_any(id, history, Ask::Revision(&commit), sources, found.filter(|(s, _)| *s < sources)).map(|t| going(t, Some(tag.clone()))).map_err(|r| match r {
+        Refused::Missing(_) => (StatusCode::NOT_FOUND, format!("tag {tag} is commit {}, which none of {id}'s sources has", short(&commit))),
+        r => refused(r),
+    })
+}
+
+/// How many of an app's source's newest commits a rollback offers beside its deployments.
+const COMMITS: usize = 20;
+
+/// An app's source's newest commits as a rollback offers them (docs/ci.md W26-R25): its first git
+/// source of its own, at the revision it follows, newest first, each who, when and what, with the
+/// deployment that ran it and the newest that rendered what it renders (by its inputs' address,
+/// worked out from git without rendering). None where git can't be read.
+pub(super) async fn commits(cd: &Arc<Cd>, def: &AppDef, history: &VecDeque<Deployment>) -> Vec<Value> {
+    let Some((i, src)) = def.sources.iter().enumerate().find(|(_, s)| s.chart.is_none() && s.as_ref.is_none()) else { return Vec::new() };
+    // A Kubernetes cluster's version and APIs shape some renders' addresses; not connected, theirs
+    // are read without them (and may match no deployment's).
+    let cluster = cd.clusters.read().get(&def.destination.cluster).cloned();
+    let (kube_version, api_versions) = match cluster.filter(|_| !kiln_cd::providers::is_target(&def.destination.cluster)) {
+        Some(c) => (c.version.read().clone(), c.discovery.read().api_versions.clone()),
+        None => (None, Vec::new()),
+    };
+    let (cd2, d2, url, rev, n) = (cd.clone(), def.clone(), src.repo.clone(), src.revision.clone(), def.sources.len());
+    let rows = crate::rt::blocking(move || -> anyhow::Result<Vec<(kiln_cd::git::Commit, Option<u64>)>> {
+        let log = kiln_cd::git::Mirror::open(&cd2.mirror_dir(&url), &url, cd2.git_auth(&url))?.log(&rev, COMMITS)?;
+        Ok(log
+            .into_iter()
+            .map(|c| {
+                let key = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&rollback::held_commits(n, i, &c.sha))).ok().map(|r| r.key);
+                (c, key)
+            })
+            .collect())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|(c, key)| {
+            let ran = rollback::ran_by(history, &c.sha).map(|d| d.id);
+            let same = key.and_then(|k| rollback::same_as(history, k)).map(|d| d.id);
+            json!({"sha": c.sha, "author": c.author, "at": c.at, "subject": c.subject, "deployment": ran, "same_as": same})
+        })
+        .collect()
 }
 
 fn short(sha: &str) -> &str {
@@ -232,4 +339,37 @@ pub(super) async fn row(cd: &Arc<Cd>, def: &AppDef, d: &Deployment) -> Value {
         m.insert("tags".into(), json!(tags));
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dep(id: u64, rev: &str, key: u64, ok: bool) -> Deployment {
+        Deployment { app: "default/web".into(), id, revision: Some(rev.into()), key: Some(key), succeeded: ok, commits: vec![Some(rev.into())], ..Deployment::default() }
+    }
+
+    /// W26-R25: a rollback goes to a deployment by its id, by what it ran or by a tag of that, and
+    /// else to a commit git found in one of the app's sources, or a tag's commit, rendered anew;
+    /// what's neither says so.
+    #[test]
+    fn w26_r25_a_rollback_goes_to_a_deployment_or_any_commit_git_has() {
+        let c = |n: u32| format!("{n:07}bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let h: VecDeque<Deployment> = vec![dep(1, &c(1), 10, true), dep(2, &c(2), 20, true)].into();
+        let at = |to, rev: Option<&str>, looked| choose("default/web", &h, 1, to, rev, looked);
+        assert_eq!(at(None, None, Looked::default()), Ok(Going::Deployment { id: 1, tag: None }), "the one before what runs");
+        assert_eq!(at(Some(2), None, Looked::default()), Ok(Going::Deployment { id: 2, tag: None }));
+        assert_eq!(at(None, Some(&c(1)[..8]), Looked::default()), Ok(Going::Deployment { id: 1, tag: None }), "what a deployment ran");
+        // A commit none ran, which git has in source 0.
+        let found = Looked { commit: Some((0, c(5))), tag: None };
+        assert_eq!(at(None, Some(&c(5)[..9]), found), Ok(Going::Commit { source: 0, commit: c(5), tag: None }));
+        // A tag of a commit a deployment ran, and of one none ran.
+        let tagged = |commit: String| Looked { commit: None, tag: Some(("v1".into(), Some((0, commit)))) };
+        assert_eq!(at(None, Some("v1"), tagged(c(1))), Ok(Going::Deployment { id: 1, tag: Some("v1".into()) }));
+        assert_eq!(at(None, Some("v1"), tagged(c(6))), Ok(Going::Commit { source: 0, commit: c(6), tag: Some("v1".into()) }));
+        // Neither a commit nor a tag of its sources: 404, saying so.
+        let none = at(None, Some("nowhere"), Looked::default());
+        assert!(matches!(&none, Err((StatusCode::NOT_FOUND, m)) if m.contains("nor is nowhere a commit or a tag")), "{none:?}");
+        assert!(matches!(at(Some(1), Some("v1"), Looked::default()), Err((StatusCode::BAD_REQUEST, _))));
+    }
 }
