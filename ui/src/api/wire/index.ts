@@ -52,6 +52,7 @@ export type { ExperimentDecision } from "./ExperimentDecision";
 export type { FailedLeg } from "./FailedLeg";
 export type { FileChange } from "./FileChange";
 export type { FileDiff } from "./FileDiff";
+export type { FileKey } from "./FileKey";
 export type { FileMeta } from "./FileMeta";
 export type { GateResult } from "./GateResult";
 export type { Given } from "./Given";

@@ -79,7 +79,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
     let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
     let text = std::str::from_utf8(rest.get(..len)?).ok()?;
     let patch = std::str::from_utf8(rest.get(len..)?).ok()?;
-    Some(Frame { text: Arc::from(text), patch: (!patch.is_empty()).then(|| Arc::from(patch)), rev: u64::from_le_bytes(*rev) })
+    Some(Frame { text: Arc::from(text), patch: (!patch.is_empty()).then(|| Arc::from(patch)), patch_of: super::registry::PatchOf::of(patch), rev: u64::from_le_bytes(*rev) })
 }
 
 /// How a feed's publish went.
@@ -301,17 +301,19 @@ mod tests {
         Ok(Arc::new(crate::bus::QuiverBus::open(&crate::bus::Config::default(), Arc::new(kiln_seams::clock::SimClock::new()))?))
     }
 
-    /// A frame goes on the bus and comes back as it went, its patch and its revision with it; bytes
-    /// it didn't make come back as none.
+    /// A frame goes on the bus and comes back as it went, its patch (and what that's a patch of) and
+    /// its revision with it; bytes it didn't make come back as none.
     #[test]
     fn a_frame_comes_back_from_the_bus_as_it_went() {
+        use super::super::registry::PatchOf;
         let frames = [
             Frame::of(r#"{"t":"events","events":[]}"#.to_owned()),
-            Frame { text: Arc::from(r#"{"t":"state","state":{"a":1},"rev":42}"#), patch: Some(Arc::from(r#"{"t":"state_patch","set":{"a":1},"rev":42}"#)), rev: 42 },
+            Frame { text: Arc::from(r#"{"t":"state","state":{"a":1},"rev":42}"#), patch: Some(Arc::from(r#"{"t":"state_patch","set":{"a":1},"rev":42}"#)), patch_of: PatchOf::State, rev: 42 },
+            Frame { text: Arc::from(r#"{"t":"changes","files":[],"rev":43}"#), patch: Some(Arc::from(r#"{"t":"changes_patch","gone":[{"path":"a"}],"rev":43}"#)), patch_of: PatchOf::Changes, rev: 43 },
         ];
         for f in frames {
-            let back = decode(&encode(&f)).map(|b| (b.text.to_string(), b.patch.as_deref().map(str::to_owned), b.rev));
-            assert_eq!(back, Some((f.text.to_string(), f.patch.as_deref().map(str::to_owned), f.rev)));
+            let back = decode(&encode(&f)).map(|b| (b.text.to_string(), b.patch.as_deref().map(str::to_owned), b.patch.is_some().then_some(b.patch_of), b.rev));
+            assert_eq!(back, Some((f.text.to_string(), f.patch.as_deref().map(str::to_owned), f.patch.is_some().then_some(f.patch_of), f.rev)));
         }
         assert!(decode(b"\x09\x00").is_none());
         assert!(decode(b"\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00abc").is_none());

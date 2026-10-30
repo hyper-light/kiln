@@ -1291,6 +1291,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Their updates over the channel, once the server says it keeps it (docs/wire.md): kept until
     // the server has them, and sent again after a reconnect from where it has them, never whole.
     let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+    // What each session's stream carried of its changeset, so a server that takes patches gets
+    // only what changed.
+    let mut sent_changes = SentChanges::default();
     // The server keeps the channel: it said so on this connection, before its Welcome.
     let mut server_wire = false;
     // The server takes what this runner's QUIC layer dropped (`AgentMsg::NetDrops`), and what it
@@ -2317,6 +2320,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
                         server_limit = caps & proto::CAP_AGENT_LIMIT != 0;
+                        sent_changes.server(caps & proto::CAP_CHANGES_PATCH != 0);
                         server_headroom = caps & proto::CAP_HEADROOM != 0;
                         // How headroom does, now that this server takes it.
                         headroom_sent = None;
@@ -2339,7 +2343,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         for key in updates.take_stale() {
                             if let Some(id) = key.strip_prefix("s:") {
                                 if let Some(s) = harness.as_ref().and_then(|h| h.get(id)) {
-                                    start_stream(&mut updates, id, &s, server_kept.get(id));
+                                    start_stream(&mut updates, id, &s, server_kept.get(id), &mut sent_changes);
                                 }
                             } else if let Some(id) = key.strip_prefix("t:")
                                 && let Some((_, state)) = terms.get(id)
@@ -2349,7 +2353,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 state.detach();
                                 updates.start(&key);
                                 if let Ok(b) = proto::encode(&AgentMsg::TermReplay { session: id.to_owned(), data: a.replay }) {
-                                    updates.push(&key, b);
+                                    updates.picture(&key, b);
                                 }
                             }
                         }
@@ -2413,7 +2417,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 while let Ok((session, u)) = harness_rx.try_recv() {
                                     note_announced(&mut announced, &session, &u);
                                     if updates.started(&crate::wire::uplink::session_key(&session)) {
-                                        push_update(&mut updates, &session, &u);
+                                        push_update(&mut updates, &session, &u, false, &mut sent_changes);
                                     }
                                 }
                             } else {
@@ -2429,7 +2433,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let Some(s) = h.get(&info.id) else { continue };
                                 if updates_on {
                                     if !updates.started(&crate::wire::uplink::session_key(&info.id)) && announced.contains(&info.id) {
-                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id));
+                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id), &mut sent_changes);
                                     }
                                     continue;
                                 }
@@ -3518,6 +3522,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Over the channel: kept until the server has it, down or not. A new session's
                     // stream starts with its Open; a closed one's ends once answered.
                     let key = crate::wire::uplink::session_key(&session);
+                    let mut opens = false;
                     if !updates.started(&key)
                         && let crate::harness::core::Update::Open { info, .. } = &u
                     {
@@ -3526,15 +3531,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // Welcome starts one, with only what the copy lacks.
                         let kept = server_kept.get(&session).filter(|k| k.epoch == info.epoch);
                         if let (Some(kept), Some(s)) = (kept, harness.as_ref().and_then(|h| h.get(&session))) {
-                            start_stream(&mut updates, &session, &s, Some(kept));
+                            start_stream(&mut updates, &session, &s, Some(kept), &mut sent_changes);
                             if connected {
                                 flush_updates(&mut updates, &uplink).await;
                             }
                             continue 'events;
                         }
                         updates.start(&key);
+                        opens = true;
                     }
-                    push_update(&mut updates, &session, &u);
+                    // A new session's Open is its stream's picture.
+                    push_update(&mut updates, &session, &u, opens, &mut sent_changes);
                     if matches!(u, crate::harness::core::Update::Closed) {
                         updates.closing(&key);
                     }
@@ -3686,14 +3693,161 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
 }
 
 
-/// One agent-session update onto its session's channel stream, as the frames it needs.
-fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update) -> usize {
+/// What each session's channel stream has carried of its changeset: a digest of each of its files,
+/// by key. To a server that takes patches (`proto::CAP_CHANGES_PATCH`), a changeset then goes as
+/// what changed in it: an agent touching one file of hundreds sends that one, not every file's diff
+/// again (a long session's changeset ran to 690 KB, sent whole for every edit).
+#[derive(Default)]
+struct SentChanges {
+    /// The server takes changesets as patches.
+    patches: bool,
+    sessions: HashMap<String, HashMap<crate::harness::model::FileKey, u64>>,
+}
+
+impl SentChanges {
+    /// The server says (again) whether it takes patches: one that doesn't has nothing to compare
+    /// with.
+    fn server(&mut self, patches: bool) {
+        if !patches {
+            self.sessions.clear();
+        }
+        self.patches = patches;
+    }
+
+    /// `session`'s stream carried an Open (its server's copy starts its changeset over) or ended.
+    fn forget(&mut self, session: &str) {
+        self.sessions.remove(session);
+    }
+
+    /// `session`'s changeset `files` as frames that fit, and what its stream carries of it noted:
+    /// to a server that takes patches, what changed since what the stream carried (or, in a
+    /// picture, all of it: its first part whole, the rest as patches); else whole, its largest
+    /// diffs left out to fit.
+    fn frames(&mut self, session: &str, files: &[crate::harness::model::FileChange], picture: bool) -> Vec<String> {
+        use crate::harness::core::Update;
+        if !self.patches {
+            return fit_changes(files).into_iter().collect();
+        }
+        let budget = HARNESS_FRAME - 1024;
+        let digest = |f: &crate::harness::model::FileChange| {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_vec(f).unwrap_or_default().hash(&mut h);
+            h.finish()
+        };
+        let now: HashMap<crate::harness::model::FileKey, u64> = files.iter().map(|f| (f.key(), digest(f))).collect();
+        let frames = if picture {
+            let mut parts = file_parts(files, budget).into_iter();
+            let first = Update::Changes { files: parts.next().unwrap_or_default() };
+            std::iter::once(first).chain(parts.map(|set| Update::ChangesPatch { set, gone: Vec::new() })).filter_map(|u| serde_json::to_string(&u).ok()).collect()
+        } else {
+            let had = self.sessions.get(session);
+            let set: Vec<crate::harness::model::FileChange> = files.iter().filter(|f| had.and_then(|h| h.get(&f.key())) != now.get(&f.key())).cloned().collect();
+            let mut gone: Vec<crate::harness::model::FileKey> = had.map(|h| h.keys().filter(|k| !now.contains_key(*k)).cloned().collect()).unwrap_or_default();
+            gone.sort();
+            patch_frames(&set, gone)
+        };
+        self.sessions.insert(session.to_owned(), now);
+        frames
+    }
+}
+
+/// A changeset's patch as frames that fit, in order: what's gone first, then the files set, as
+/// many to a frame as fit (a file too large alone goes as its counts only).
+fn patch_frames(set: &[crate::harness::model::FileChange], gone: Vec<crate::harness::model::FileKey>) -> Vec<String> {
+    use crate::harness::core::Update;
+    let budget = HARNESS_FRAME - 1024;
+    let gone = (!gone.is_empty()).then_some(Update::ChangesPatch { set: Vec::new(), gone });
+    gone.into_iter().chain(file_parts(set, budget).into_iter().map(|set| Update::ChangesPatch { set, gone: Vec::new() })).filter_map(|u| serde_json::to_string(&u).ok()).collect()
+}
+
+/// A changeset's files as parts that each fit a frame of `budget` bytes, in order: a file too large
+/// to fit alone goes as its counts only (`FileChange::counts_only`: "Diff shortened" where it's
+/// shown).
+fn file_parts(files: &[crate::harness::model::FileChange], budget: usize) -> Vec<Vec<crate::harness::model::FileChange>> {
+    // What a part's frame holds besides its files.
+    let room = budget.saturating_sub(64);
+    let mut parts = Vec::new();
+    let mut part = Vec::new();
+    let mut size = 0usize;
+    for f in files {
+        let mut n = json_len(f).saturating_add(1);
+        let f = if n > room {
+            let short = f.counts_only();
+            n = json_len(&short).saturating_add(1);
+            short
+        } else {
+            f.clone()
+        };
+        if size.saturating_add(n) > room && !part.is_empty() {
+            parts.push(std::mem::take(&mut part));
+            size = 0;
+        }
+        size = size.saturating_add(n);
+        part.push(f);
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+/// A changeset whole, in a frame that fits: its largest files' diffs left out, the largest first,
+/// each file's counts kept (`FileChange::counts_only`), until it fits; then its longest texts cut
+/// (a path out of all reason). Its hundreds of short diff lines are what no text cut shortens: as
+/// it was cut before, a large changeset was dropped whole, and its page went on showing the old one.
+/// None: it can't fit even so.
+fn fit_changes(files: &[crate::harness::model::FileChange]) -> Option<String> {
+    use crate::harness::core::Update;
+    let budget = HARNESS_FRAME - 1024;
+    let whole = Update::Changes { files: files.to_vec() };
+    let json = serde_json::to_string(&whole).ok()?;
+    if json.len() <= budget {
+        return Some(json);
+    }
+    let Update::Changes { mut files } = whole else { return None };
+    let mut size = json.len();
+    let mut largest: Vec<(usize, usize)> = files.iter().enumerate().map(|(i, f)| (json_len(f), i)).collect();
+    largest.sort_unstable_by(|a, b| b.cmp(a));
+    for (n, i) in largest {
+        if size <= budget {
+            break;
+        }
+        if let Some(f) = files.get_mut(i) {
+            let short = f.counts_only();
+            size = size.saturating_sub(n).saturating_add(json_len(&short));
+            *f = short;
+        }
+    }
+    let fitted = serde_json::to_value(Update::Changes { files }).ok().map(|v| cut_value(v, budget))?;
+    serde_json::to_string(&fitted).ok().filter(|j| j.len() <= HARNESS_FRAME)
+}
+
+/// One agent-session update onto its session's channel stream, as the frames it needs: part of the
+/// picture its stream starts with (`picture`: its snapshot, a new session's Open), which goes
+/// whatever its size, or after it. A changeset goes as what changed in it where the server takes
+/// that (`sent`).
+fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update, picture: bool, sent: &mut SentChanges) -> usize {
+    use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
+    let frames = match u {
+        Update::Changes { files } => sent.frames(session, files, picture),
+        // Its server's copy starts its changeset over (an Open), or lets the session go.
+        Update::Open { .. } | Update::Closed => {
+            sent.forget(session);
+            harness_frames(session, u)
+        }
+        _ => harness_frames(session, u),
+    };
     let mut bytes = 0;
-    for json in harness_frames(session, u) {
+    for json in frames {
         if let Ok(b) = proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }) {
             bytes += b.len();
-            updates.push(&key, b);
+            if picture {
+                updates.picture(&key, b);
+            } else {
+                updates.push(&key, b);
+            }
         }
     }
     bytes
@@ -3701,7 +3855,7 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
 
 /// Starts `session`'s channel stream (again), its snapshot first: when the server's copy is of
 /// the same epoch (`kept`), only what the copy lacks (`crate::wire::sums`), else all of it.
-fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &crate::harness::session::Session, kept: Option<&proto::KeptSession>) {
+fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &crate::harness::session::Session, kept: Option<&proto::KeptSession>, sent: &mut SentChanges) {
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     updates.start(&key);
@@ -3709,7 +3863,7 @@ fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &c
     // Its bytes, and of them its newest meta, state and changes, and its events after the copy's.
     let (mut bytes, mut newest, mut after) = (0, 0, 0);
     for u in &snapshot {
-        let n = push_update(updates, session, u);
+        let n = push_update(updates, session, u, true, sent);
         bytes += n;
         match u {
             Update::Meta { .. } | Update::State { .. } | Update::Changes { .. } => newest += n,
@@ -3815,10 +3969,11 @@ const HARNESS_FRAME: usize = 512 * 1024;
 
 /// An agent-session update as frames that fit: a long run of events goes in parts (events are
 /// upserts by id, so the parts mean what the whole did), and an event too large on its own has
-/// its longest texts cut, saying so. Anything else too large (a state, the changeset) is cut the
-/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck. A
-/// state still too large sheds its finished tasks, the oldest first. Only what still doesn't fit
-/// is dropped, and logged.
+/// its longest texts cut, saying so. Anything else too large (a state) is cut the same way:
+/// dropped, its page would go on showing what no longer is, the agent looking stuck. A state still
+/// too large sheds its finished tasks, the oldest first; a changeset leaves out its largest diffs,
+/// their counts kept (`fit_changes`), and a changeset's patch goes in parts. Only what still doesn't
+/// fit is dropped, and logged.
 /// The command being applied on the channel (`answer_after`) is refused, saying how and why: a
 /// message that came alone has no one to tell.
 fn refuse(answer_after: &mut Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)>, code: crate::wire::channel::Refusal, why: impl Into<String>) {
@@ -3832,6 +3987,19 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
     if json.len() <= HARNESS_FRAME {
         return vec![json];
+    }
+    // A changeset fits with its largest diffs left out; a patch of one goes in as many frames as
+    // it takes. Neither is dropped: a changeset's page would go on showing what no longer is.
+    if let Update::Changes { files } = u {
+        let fitted = fit_changes(files);
+        match &fitted {
+            Some(j) => tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session changeset too large whole: its largest diffs left out"),
+            None => tracing::warn!(session, bytes = json.len(), "agent session changeset too large to send, even as counts; dropped"),
+        }
+        return fitted.into_iter().collect();
+    }
+    if let Update::ChangesPatch { set, gone } = u {
+        return patch_frames(set, gone.clone());
     }
     let Update::Events { events } = u else {
         let budget = HARNESS_FRAME - 1024;
@@ -4345,6 +4513,117 @@ mod tests {
         // An instance's own runner (upgraded before) gives way to the new one, in either spelling.
         assert_eq!(with_instance(&args(&["agent", "--instance", "old", "--slots", "2"]), "g2"), args(&["agent", "--slots", "2", "--instance", "g2"]));
         assert_eq!(with_instance(&args(&["agent", "--instance=old"]), "g3"), args(&["agent", "--instance", "g3"]));
+    }
+
+    /// A long session's snapshot, larger than a stream's room (a Codex session's was 10 to 16 MB
+    /// against 8 MiB), starts its stream whole as its picture, and its updates go on after it.
+    /// Pushed against the room, as it was, it went stale part-way, and the stream started over
+    /// with the same snapshot at each frame from the server, without end: the server never heard
+    /// from the session again.
+    #[test]
+    fn a_snapshot_larger_than_a_streams_room_starts_it() {
+        let mut updates = crate::wire::uplink::Updates::new("boot");
+        let history = Update::Events { events: (0..5000).map(|i| said(i, "x".repeat(2000))).collect() };
+        let frames = harness_frames("s", &history).len();
+        let key = crate::wire::uplink::session_key("s");
+        let mut sent = SentChanges::default();
+        updates.start(&key);
+        let bytes = push_update(&mut updates, "s", &history, true, &mut sent);
+        assert!(bytes > crate::wire::uplink::ROOM, "{bytes} bytes");
+        push_update(&mut updates, "s", &Update::Events { events: vec![said(5000, "after".into())] }, false, &mut sent);
+        assert!(updates.take_stale().is_empty(), "its picture went whole");
+        assert_eq!(updates.unanswered(), frames + 1, "the snapshot and what came after it");
+        // As it was pushed before: held to the room, it goes stale part-way.
+        let other = crate::wire::uplink::session_key("t");
+        updates.start(&other);
+        push_update(&mut updates, "t", &history, false, &mut sent);
+        assert_eq!(updates.take_stale(), vec![other]);
+    }
+
+    /// A file of a changeset with `lines` added lines, each about as long as a line of code.
+    fn change(path: &str, lines: usize) -> crate::harness::model::FileChange {
+        let n = u32::try_from(lines).unwrap_or(u32::MAX);
+        let lines = (0..lines).map(|i| format!("+    let value_{i} = compute(argument_{i}, &context); // line {i}")).collect();
+        crate::harness::model::FileChange { path: path.into(), tree: None, created: false, deleted: false, added: n, removed: 0, hunks: vec![crate::harness::model::Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: n, lines }], truncated: false, at: 1 }
+    }
+
+    /// A long session's changeset, as one's was: 43 files whose diffs are thousands of short lines,
+    /// about 700 KB together.
+    fn long_changeset() -> Vec<crate::harness::model::FileChange> {
+        (1..=43).map(|i| change(&format!("crates/kiln/src/f{i:02}.rs"), i * 10)).collect()
+    }
+
+    /// A changeset too large for a frame goes whole all the same, to a server that takes no patches:
+    /// its largest files as their counts only ("Diff shortened"), the rest as they are. Cut as other
+    /// updates are, its short lines left it too large, and it was dropped: its page showed the
+    /// changeset as it was before.
+    #[test]
+    fn a_changeset_too_large_for_a_frame_goes_with_its_largest_diffs_left_out() -> anyhow::Result<()> {
+        let files = long_changeset();
+        let whole = serde_json::to_string(&Update::Changes { files: files.clone() })?;
+        anyhow::ensure!(whole.len() > HARNESS_FRAME, "{} bytes", whole.len());
+        let frames = harness_frames("s", &Update::Changes { files: files.clone() });
+        let [frame] = frames.as_slice() else { anyhow::bail!("{} frames", frames.len()) };
+        anyhow::ensure!(frame.len() <= HARNESS_FRAME);
+        let Ok(Update::Changes { files: sent }) = serde_json::from_str::<Update>(frame) else { anyhow::bail!("not a changeset: {}", frame.get(..80).unwrap_or_default()) };
+        // Every file, each with its counts.
+        anyhow::ensure!(sent.iter().map(|f| (&f.path, f.added)).eq(files.iter().map(|f| (&f.path, f.added))));
+        // The largest left out, the smallest whole.
+        anyhow::ensure!(sent.last().is_some_and(|f| f.truncated && f.hunks.is_empty()));
+        anyhow::ensure!(sent.first() == files.first());
+        Ok(())
+    }
+
+    /// To a server that takes patches, a changeset goes as what changed in it: its picture whole, in
+    /// as many frames as it takes, every diff kept; then only the file an agent touched, or the one
+    /// it put back. The server's copy, taking them in, is the session's changeset each time; an Open
+    /// (the copy starting its changeset over) has it sent whole again.
+    #[test]
+    fn a_changeset_goes_as_what_changed_in_it_to_a_server_that_takes_that() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "codex".into(), ..Default::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info.clone()), since: None });
+            let mut sent = SentChanges::default();
+            sent.server(true);
+            let take = |frames: &[String]| -> anyhow::Result<()> {
+                for f in frames {
+                    anyhow::ensure!(f.len() <= HARNESS_FRAME, "a frame of {} bytes", f.len());
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(f)?);
+                }
+                Ok(())
+            };
+            let copy = || hub.harness.conclusion("s").map(|(_, _, changes)| changes).unwrap_or_default();
+            let mut files = long_changeset();
+            let frames = sent.frames("s", &files, true);
+            anyhow::ensure!(frames.len() > 1 && frames.first().is_some_and(|f| f.starts_with(r#"{"t":"changes""#)));
+            take(&frames)?;
+            anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the picture, whole, every diff kept");
+            // The agent edits one file of 43: one small frame, that file.
+            if let Some(f) = files.get_mut(20) {
+                *f = change(&f.path, 300);
+            }
+            let frames = sent.frames("s", &files, false);
+            let [edit] = frames.as_slice() else { anyhow::bail!("{} frames", frames.len()) };
+            anyhow::ensure!(edit.starts_with(r#"{"t":"changes_patch""#) && edit.len() < 32 << 10, "{} bytes", edit.len());
+            take(&frames)?;
+            anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the edit taken in place");
+            // It puts one back: that file's key alone.
+            let back = files.remove(5);
+            let frames = sent.frames("s", &files, false);
+            anyhow::ensure!(frames == vec![serde_json::to_string(&Update::ChangesPatch { set: Vec::new(), gone: vec![back.key()] })?]);
+            take(&frames)?;
+            anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the file put back gone");
+            anyhow::ensure!(sent.frames("s", &files, false).is_empty(), "nothing changed, nothing sent");
+            // The copy starts over (an Open on the stream): every file again.
+            let mut updates = crate::wire::uplink::Updates::new("boot");
+            updates.start(&crate::wire::uplink::session_key("s"));
+            push_update(&mut updates, "s", &Update::Open { info: Box::new(info), since: None }, true, &mut sent);
+            let again: Vec<crate::harness::model::FileChange> = sent.frames("s", &files, false).iter().filter_map(|f| match serde_json::from_str::<Update>(f) { Ok(Update::ChangesPatch { set, .. }) => Some(set), _ => None }).flatten().collect();
+            anyhow::ensure!(again == files);
+            Ok(())
+        })
     }
 
     #[test]

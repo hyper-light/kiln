@@ -5,6 +5,7 @@ import type { AgentInfo } from "./AgentInfo";
 import type { AgentState } from "./AgentState";
 import type { Event } from "./Event";
 import type { FileChange } from "./FileChange";
+import type { FileKey } from "./FileKey";
 import type { InboxAnswer } from "./InboxAnswer";
 import type { KeptFile } from "./KeptFile";
 import type { Meta } from "./Meta";
@@ -17,7 +18,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
  * revision of the server's copy it brings a viewer to when it's one of the session's feed
  * (docs/wire.md, "Revisions").
  */
-export type SessionDown = { rev?: number, } & ({ "t": "open", info: AgentInfo, born?: number, } | { "t": "resumed", info: AgentInfo, born?: number, } | { "t": "meta", meta: Meta, } | { "t": "state", state: AgentState, } | { "t": "state_patch", set: Partial<AgentState>, gone?: Array<string>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "files", files: Array<KeptFile>, } | { "t": "events", events: Array<Event>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "reset", from?: number, } | { "t": "closed" } | { "t": "synced" } | { "t": "error", error: string, refused?: Refusal, } | { "t": "ack", id: string, outcome: AckOutcome, 
+export type SessionDown = { rev?: number, } & ({ "t": "open", info: AgentInfo, born?: number, } | { "t": "resumed", info: AgentInfo, born?: number, } | { "t": "meta", meta: Meta, } | { "t": "state", state: AgentState, } | { "t": "state_patch", set: Partial<AgentState>, gone?: Array<string>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "changes_patch", set?: Array<FileChange>, gone?: Array<FileKey>, } | { "t": "files", files: Array<KeptFile>, } | { "t": "events", events: Array<Event>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "reset", from?: number, } | { "t": "closed" } | { "t": "synced" } | { "t": "error", error: string, refused?: Refusal, } | { "t": "ack", id: string, outcome: AckOutcome, 
 /**
  * What its inbox said, when it took a message (`accepted`).
  */
