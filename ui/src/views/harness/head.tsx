@@ -22,13 +22,13 @@ import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, work
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import "./console.css";
 
-type BorderState = "active" | "stopped" | "finished" | "ready" | "disconnected";
+export type BorderState = "active" | "needs" | "stopped" | "finished" | "ready" | "disconnected";
 
 function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null, kiln: number): { tone: BorderState; label: string } {
   if (status === "disconnected" || (conn !== "open" && status !== "exited")) return { tone: "disconnected", label: conn === "reconnecting" ? "Reconnecting…" : "Disconnected" };
   if (state?.pause ?? info?.pause) return { tone: "stopped", label: "Paused at a usage limit" };
   if (status === "exited") return { tone: "stopped", label: "Stopped" };
-  if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "ready", label: "Waiting for you" };
+  if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "needs", label: "Waiting for you" };
   if (status === "starting") return { tone: "active", label: state?.harness_session ? "Resuming…" : "Starting…" };
   if (status === "running") return { tone: "active", label: "Working" };
   // Its turn over, a subagent it sent off still works (its harness's own, or one kiln started for its goals: `kiln`).

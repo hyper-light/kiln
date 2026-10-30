@@ -759,7 +759,7 @@ export function Composer({
 
       {/* Files dropped or pasted here are the agent page's to attach (it takes them anywhere on
           the page); taking them here as well attached each one twice. */}
-      <div className={cn("hx-compose-box", running && "hx-compose-live")}>
+      <div className="hx-compose-box">
         {chips}
         {canOverride && (withOpen || override.model || override.effort) && (
           <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />

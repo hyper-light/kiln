@@ -63,7 +63,9 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
 - An `Update::Inbox` rides its session's update stream like any update. The channel takes each item
   once. A stream that starts over drops what it hadn't had answered and starts from the session's
   snapshot, which holds no `Update::Inbox`. That happens when either side restarted, or the stream
-  filled up. One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
+  filled up. The snapshot goes whole however large it is: a stream's room (8 MiB, 64 MiB for all of
+  a runner's together) bounds only what's sent after it, since a snapshot held to it could never
+  start a long session's stream again (`wire/uplink.rs`). One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
   One case is open. After a server restart, a stream the old server took items of but answered
   none of goes on: nothing says it lost them, since a server that never received any says the
   same. Its inbox answer then reaches the new server too. That server finds no waiter for it,
@@ -613,6 +615,7 @@ From wherever a session runs to the server, inside `Harness`, and on to its view
 | `Reply` | answer | Answers one client's ask. | As its class says. |
 | `Inbox` | answer | What a session's inbox made of a message (`HarnessSend`): taken, a repeat with the first time's answer, or refused and why (CP-T3.2). | T3: rides the session's stream. Sent again after a server restart, it finds no waiter, or a retry's own waiter (CP-T3.3 gives each send a nonce). |
 | `Reset` | stream | The timeline starts over (a snapshot follows). | As `Harness`. |
+| `ChangesPatch` | stream | What changed in its changeset since the last one the server's copy took: the files set (each in place of the one with its key, or after the rest) and those gone. Only to a server that says `CAP_CHANGES_PATCH`, so a file an agent touches doesn't send every file's diff again; a snapshot has the whole changeset, its first frame whole and the rest as patches when it doesn't fit one. | As `Harness`. The server stores the whole changeset it makes. |
 
 ## The UI's sockets
 
@@ -682,6 +685,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `state` | state | The newest wins. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `state_patch` | state | What changed since the last state. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `changes` | state | The whole changeset. | Sent whole on every attach. |
+| `/api/harness/sessions/:id/ws` | down | `changes_patch` | state | What changed since the last changeset (`?patch=changes`): the files set and those gone, taken in place. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `files` | state | Files its messages mention. | Sent on attach. |
 | `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events. | Every attach, and a viewer that falls behind, gets them all again. |
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |

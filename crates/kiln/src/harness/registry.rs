@@ -65,7 +65,11 @@ struct Mirror {
     state: Value,
     /// The state as its viewers last had it sent (what a state patch is made against).
     sent: Value,
+    /// Its changeset, as a list taken in by [`merge_changes`]: its viewers take a patch of it the
+    /// same way, so theirs stays in this one's order.
     changes: Value,
+    /// The changeset as its viewers last had it sent (what a changeset's patch is made against).
+    changes_sent: Value,
     /// Shared, so a snapshot takes them under the mirrors' lock as references and is made after
     /// it's let go: a viewer starting over never holds up another session's publish.
     events: Vec<Arc<Value>>,
@@ -108,6 +112,7 @@ impl Mirror {
             state: Value::Null,
             sent: Value::Null,
             changes: Value::Null,
+            changes_sent: Value::Null,
             events: Vec::new(),
             index: HashMap::new(),
             feed,
@@ -135,7 +140,38 @@ impl Mirror {
         let text = crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::State { state: self.state.clone() }).text();
         let patch = state_patch(&self.sent, &self.state);
         self.sent.clone_from(&self.state);
-        Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from), rev: self.rev })
+        Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from), patch_of: PatchOf::State, rev: self.rev })
+    }
+
+    /// The changeset as a frame for its viewers, with what changed in it since the last one: a
+    /// file the agent touches doesn't send them every file again.
+    fn changes_frame(&mut self) -> Option<Frame> {
+        if self.feed.viewers() == 0 {
+            // The next viewer starts from a snapshot, not the last viewer's patch baseline.
+            self.changes_sent = Value::Null;
+            return None;
+        }
+        let text = crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Changes { files: self.changes.clone() }).text();
+        let patch = changes_patch(&self.changes_sent, &self.changes);
+        self.changes_sent.clone_from(&self.changes);
+        Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from), patch_of: PatchOf::Changes, rev: self.rev })
+    }
+
+    /// Takes in a changeset, whole (`whole`: the files it doesn't have are gone) or as what changed
+    /// in it, in place in the copy's ([`merge_changes`]).
+    fn take_changes(&mut self, set: Vec<Value>, gone: Vec<Value>, whole: bool) {
+        let mut files = match std::mem::take(&mut self.changes) {
+            Value::Array(files) => files,
+            _ => Vec::new(),
+        };
+        let gone = if whole {
+            let kept: std::collections::HashSet<FileId> = set.iter().map(file_id).collect();
+            files.iter().filter(|f| !kept.contains(&file_id(f))).cloned().collect()
+        } else {
+            gone
+        };
+        merge_changes(&mut files, set, &gone);
+        self.changes = Value::Array(files);
     }
 
     fn reindex(&mut self) {
@@ -461,18 +497,56 @@ pub struct Attachment {
 
 /// A live frame for a session's viewers. A state comes as well as only what changed since the
 /// last one (`patch`), for a viewer that takes that: during a turn its usage and activity change
-/// all the time, its skills, plugins and servers seldom.
+/// all the time, its skills, plugins and servers seldom. So does a changeset: an agent touches a
+/// file or two of the hundreds it may have changed.
 #[derive(Clone)]
 pub struct Frame {
     pub text: Arc<str>,
     pub patch: Option<Arc<str>>,
+    /// What `patch` is a patch of: a viewer gets it if it takes that kind.
+    pub patch_of: PatchOf,
     /// The copy's revision as it went (`"rev"` in its JSON): what its viewer resumes from.
     pub rev: u64,
 }
 
+/// What a frame's patch is a patch of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOf {
+    /// A state (`state_patch`).
+    State,
+    /// A changeset (`changes_patch`).
+    Changes,
+}
+
+impl PatchOf {
+    /// What `patch` (a frame's JSON, its tag first) is a patch of: a frame on the bus carries no
+    /// more than its text (`super::live::encode`), and one from before changesets had patches is a
+    /// state's.
+    pub fn of(patch: &str) -> Self {
+        if patch.starts_with(r#"{"t":"changes_patch""#) { Self::Changes } else { Self::State }
+    }
+}
+
+/// The patches a viewer takes, as its socket's query says (`patch=state`, `patch=changes`): one
+/// from before a kind takes that kind whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Patches {
+    pub state: bool,
+    pub changes: bool,
+}
+
+impl Patches {
+    fn take(self, of: PatchOf) -> bool {
+        match of {
+            PatchOf::State => self.state,
+            PatchOf::Changes => self.changes,
+        }
+    }
+}
+
 impl Frame {
     pub fn of(text: String) -> Self {
-        Self { text: Arc::from(text), patch: None, rev: 0 }
+        Self { text: Arc::from(text), patch: None, patch_of: PatchOf::State, rev: 0 }
     }
 
     /// The frame with its copy's revision in it, as `"rev"`.
@@ -483,13 +557,13 @@ impl Frame {
                 _ => Arc::from(t),
             }
         };
-        Self { text: stamp(&self.text), patch: self.patch.as_deref().map(stamp), rev }
+        Self { text: stamp(&self.text), patch: self.patch.as_deref().map(stamp), patch_of: self.patch_of, rev }
     }
 
-    /// The frame for a viewer that takes state patches, or one that doesn't.
-    pub fn for_viewer(&self, patches: bool) -> &str {
+    /// The frame for a viewer that takes the patches `takes` says.
+    pub fn for_viewer(&self, takes: Patches) -> &str {
         match &self.patch {
-            Some(p) if patches => p,
+            Some(p) if takes.take(self.patch_of) => p,
             _ => &self.text,
         }
     }
@@ -503,6 +577,70 @@ fn state_patch(was: &Value, now: &Value) -> Option<String> {
     let gone: Vec<&String> = was.keys().filter(|k| !now.contains_key(*k)).collect();
     let gone = gone.into_iter().cloned().collect();
     Some(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::StatePatch { set, gone }).text())
+}
+
+/// A changeset's file as its JSON names it ([`crate::harness::model::FileKey`]): its path, and
+/// the top of its working tree when it's in one.
+type FileId = (Option<String>, Option<String>);
+
+fn file_id(f: &Value) -> FileId {
+    let s = |k: &str| f.get(k).and_then(Value::as_str).map(str::to_owned);
+    (s("path"), s("tree"))
+}
+
+/// A changeset's file's key, as a patch says it's gone (`{"path", "tree"?}`).
+fn file_key(f: &Value) -> Value {
+    let mut key = serde_json::Map::new();
+    for k in ["path", "tree"] {
+        if let Some(v) = f.get(k).filter(|v| !v.is_null()) {
+            key.insert(k.to_owned(), v.clone());
+        }
+    }
+    Value::Object(key)
+}
+
+/// Takes `set` and `gone` into `files`, as a changeset's patch says: each file set goes in place of
+/// the one with its key, or after the rest when it's new; each gone goes. A viewer takes a patch
+/// the same way (the UI's `changesPatched`), so its list keeps this one's order.
+pub fn merge_changes(files: &mut Vec<Value>, set: Vec<Value>, gone: &[Value]) {
+    if !gone.is_empty() {
+        let out: std::collections::HashSet<FileId> = gone.iter().map(file_id).collect();
+        files.retain(|f| !out.contains(&file_id(f)));
+    }
+    let mut at: HashMap<FileId, usize> = files.iter().enumerate().map(|(i, f)| (file_id(f), i)).collect();
+    for f in set {
+        let id = file_id(&f);
+        match at.get(&id).copied() {
+            Some(i) => {
+                if let Some(slot) = files.get_mut(i) {
+                    *slot = f;
+                }
+            }
+            None => {
+                at.insert(id, files.len());
+                files.push(f);
+            }
+        }
+    }
+}
+
+/// `{"t":"changes_patch","set":[..],"gone":[..]}`: the files of `now` new or different from
+/// `was`'s, in `now`'s order, and the keys of those it no longer has: taken into `was` as
+/// [`merge_changes`] does, they make `now`. None when there is nothing to patch (no changeset
+/// before), or when they wouldn't make `now` (a changeset that started over in another order):
+/// then it goes whole.
+fn changes_patch(was: &Value, now: &Value) -> Option<String> {
+    let (Value::Array(was), Value::Array(now)) = (was, now) else { return None };
+    let before: HashMap<FileId, &Value> = was.iter().map(|f| (file_id(f), f)).collect();
+    let kept: std::collections::HashSet<FileId> = now.iter().map(file_id).collect();
+    let set: Vec<Value> = now.iter().filter(|f| before.get(&file_id(f)).is_none_or(|b| *b != *f)).cloned().collect();
+    let gone: Vec<Value> = was.iter().filter(|f| !kept.contains(&file_id(f))).map(file_key).collect();
+    // Taken in, the files keep their places and the new ones come after: `now` must be in that order.
+    let order: Vec<FileId> = was.iter().map(file_id).filter(|id| kept.contains(id)).chain(set.iter().map(file_id).filter(|id| !before.contains_key(id))).collect();
+    if order != now.iter().map(file_id).collect::<Vec<_>>() {
+        return None;
+    }
+    Some(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::ChangesPatch { set, gone }).text())
 }
 
 /// A file uploaded for a message, kept briefly until the message is sent.
@@ -1280,7 +1418,8 @@ impl Registry {
                 }
             }
         }
-        if let Some(store) = self.convo.as_ref().filter(|_| !shipped) {
+        // A changeset's patch is stored as the whole changeset it makes, once taken in (below).
+        if let Some(store) = self.convo.as_ref().filter(|_| !shipped && !matches!(u, Update::ChangesPatch { .. })) {
             store.send(id, &u);
         }
         {
@@ -1331,6 +1470,7 @@ impl Registry {
                     }
                 }
                 m.changes = Value::Null;
+                m.changes_sent = Value::Null;
                 changed = Some(info);
             }
             let Some(m) = g.get_mut(id) else {
@@ -1406,7 +1546,14 @@ impl Registry {
                     }
                 }
                 Update::Meta { meta } => m.meta = serde_json::to_value(meta).unwrap_or(Value::Null),
-                Update::Changes { files } => m.changes = serde_json::to_value(files).unwrap_or(Value::Null),
+                Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
+                Update::ChangesPatch { set, gone } => {
+                    m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
+                    if let Some(store) = self.convo.as_ref().filter(|_| !shipped) {
+                        let changes = serde_json::to_string(&m.changes).ok();
+                        store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes, epoch: None, open: false, at: crate::util::now_ms() }]);
+                    }
+                }
                 Update::Events { events } => {
                     for e in events {
                         if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
@@ -1439,6 +1586,7 @@ impl Registry {
                 }
                 Update::Open { since: Some(_), .. } => None,
                 Update::State { .. } => m.state_frame(),
+                Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
                 _ if m.feed.viewers() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
                 _ => None,
             };
@@ -2434,6 +2582,10 @@ fn proposed_in(e: &super::model::Event) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A viewer that takes state patches, and one that takes nothing as a patch.
+    const STATE: Patches = Patches { state: true, changes: false };
+    const WHOLE: Patches = Patches { state: false, changes: false };
+
     /// CP-T3.2: a message a machine without inboxes took (`seq` 0) is answered as taken, and as
     /// unchecked: sent again, it's another message. One an inbox took says nothing of the kind.
     #[test]
@@ -2610,21 +2762,21 @@ mod tests {
         let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         // The first goes whole: there is nothing before it to patch.
         assert!(f.patch.is_none());
-        assert_eq!(f.for_viewer(true), f.for_viewer(false));
+        assert_eq!(f.for_viewer(STATE), f.for_viewer(WHOLE));
         m.feed.publish(&f);
         m.state = json!({"status": "running", "activity": "editing", "skills": skills});
         let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         m.feed.publish(&f);
         let frames = on_feed(&bus, &m, at)?;
         let [first, second] = frames.as_slice() else { anyhow::bail!("{} frames on the feed", frames.len()) };
-        let whole: Value = serde_json::from_str(second.for_viewer(false))?;
+        let whole: Value = serde_json::from_str(second.for_viewer(WHOLE))?;
         assert_eq!(whole, json!({"t": "state", "state": m.state}));
         // As what changed: the activity set, the pause gone, the skills (most of it) left out.
-        let patch: Value = serde_json::from_str(second.for_viewer(true))?;
+        let patch: Value = serde_json::from_str(second.for_viewer(STATE))?;
         assert_eq!(patch, json!({"t": "state_patch", "set": {"activity": "editing"}, "gone": ["pause"]}));
-        assert!(second.for_viewer(true).len() * 20 < second.for_viewer(false).len());
+        assert!(second.for_viewer(STATE).len() * 20 < second.for_viewer(WHOLE).len());
         // Applied to what came first, it makes the state now.
-        let mut had: Value = serde_json::from_str(first.for_viewer(true))?;
+        let mut had: Value = serde_json::from_str(first.for_viewer(STATE))?;
         let had = had.get_mut("state").and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("no state"))?;
         for (k, v) in patch.get("set").and_then(Value::as_object).into_iter().flatten() {
             had.insert(k.clone(), v.clone());
@@ -2653,8 +2805,74 @@ mod tests {
         let frame = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         // A field that appeared while nobody watched is absent from the whole state too.
         assert!(frame.patch.is_none());
-        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(true))?, json!({"t": "state", "state": m.state}));
+        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(STATE))?, json!({"t": "state", "state": m.state}));
         Ok(())
+    }
+
+    /// A viewer that takes changesets as patches too.
+    const CHANGES: Patches = Patches { state: true, changes: true };
+
+    /// A file of a changeset, as its JSON goes.
+    fn file(path: &str, tree: Option<&str>, added: u32) -> Value {
+        let mut f = json!({"path": path, "added": added, "removed": 0, "hunks": [{"old_start": 1, "old_lines": 0, "new_start": 1, "new_lines": added, "lines": vec!["+x"; added as usize]}], "at": 1});
+        if let (Some(t), Some(o)) = (tree, f.as_object_mut()) {
+            o.insert("tree".into(), json!(t));
+        }
+        f
+    }
+
+    /// A changeset's patch is taken in place: a file set replaces the one with its key where it
+    /// is (the same path in another working tree is another file), a new one comes after the
+    /// rest, and one gone goes.
+    #[test]
+    fn a_changesets_patch_is_taken_in_place() {
+        let mut files = vec![file("a.rs", None, 1), file("b.rs", None, 1), file("a.rs", Some("/w"), 1)];
+        merge_changes(&mut files, vec![file("c.rs", None, 1), file("a.rs", Some("/w"), 5)], &[json!({"path": "b.rs"})]);
+        assert_eq!(files, vec![file("a.rs", None, 1), file("a.rs", Some("/w"), 5), file("c.rs", None, 1)]);
+    }
+
+    /// A changeset goes to its viewers whole and as what changed in it: the file the agent touched
+    /// and the one it put back, not every file's diff again. A viewer that takes only states as
+    /// patches (one from before changesets had them) gets it whole.
+    #[test]
+    fn a_changeset_goes_out_whole_and_as_what_changed_in_it() -> anyhow::Result<()> {
+        let bus = sim_bus();
+        let mut m = Mirror::new(Info::default(), Location::Local, Arc::clone(&bus));
+        let (_viewer, at) = m.feed.attach();
+        let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
+        let many: Vec<Value> = (0..40).map(|n| file(&format!("src/f{n}.rs"), None, 50)).collect();
+        m.take_changes(many, Vec::new(), true);
+        let f = m.changes_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
+        // The first goes whole: there is nothing before it to patch.
+        assert!(f.patch.is_none());
+        m.feed.publish(&f);
+        m.take_changes(vec![file("src/f3.rs", None, 51), file("src/new.rs", None, 2)], vec![json!({"path": "src/f7.rs"})], false);
+        let f = m.changes_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
+        m.feed.publish(&f);
+        let frames = on_feed(&bus, &m, at)?;
+        let [first, second] = frames.as_slice() else { anyhow::bail!("{} frames on the feed", frames.len()) };
+        assert_eq!(serde_json::from_str::<Value>(second.for_viewer(STATE))?, json!({"t": "changes", "files": m.changes}));
+        let patch: Value = serde_json::from_str(second.for_viewer(CHANGES))?;
+        assert_eq!(patch, json!({"t": "changes_patch", "set": [file("src/f3.rs", None, 51), file("src/new.rs", None, 2)], "gone": [{"path": "src/f7.rs"}]}));
+        assert!(second.for_viewer(CHANGES).len() * 10 < second.for_viewer(STATE).len());
+        // Taken into what came first as the copy takes one, it makes the changeset now, in order.
+        let mut had = serde_json::from_str::<Value>(first.for_viewer(CHANGES))?.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
+        let set = patch.get("set").and_then(Value::as_array).cloned().unwrap_or_default();
+        let gone = patch.get("gone").and_then(Value::as_array).cloned().unwrap_or_default();
+        merge_changes(&mut had, set, &gone);
+        assert_eq!(Value::Array(had), m.changes);
+        Ok(())
+    }
+
+    /// A changeset its viewers couldn't make from theirs by taking a patch (the same files in
+    /// another order) goes whole.
+    #[test]
+    fn a_changeset_in_another_order_goes_whole() {
+        let was = json!([file("a.rs", None, 1), file("b.rs", None, 1)]);
+        assert!(changes_patch(&was, &json!([file("b.rs", None, 1), file("a.rs", None, 1)])).is_none());
+        assert!(changes_patch(&Value::Null, &was).is_none());
+        let patch = changes_patch(&was, &json!([file("a.rs", None, 2), file("b.rs", None, 1)])).unwrap_or_default();
+        assert_eq!(serde_json::from_str::<Value>(&patch).ok(), Some(json!({"t": "changes_patch", "set": [file("a.rs", None, 2)]})));
     }
 
     /// The ids of the events a viewer attaching to `id` gets, in order.

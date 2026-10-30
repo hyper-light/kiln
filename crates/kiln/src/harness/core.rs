@@ -154,6 +154,16 @@ pub enum Update {
         #[cfg_attr(test, ts(optional))]
         from: Option<u64>,
     },
+    /// What changed in the changeset since the last one its taker had: the files `set` (each in
+    /// place of the one with its key, or after the rest when new) and those `gone`. A runner sends
+    /// it a server that takes it (`proto::CAP_CHANGES_PATCH`), rather than the whole changeset for
+    /// every file the agent touches; a snapshot always has the whole one.
+    ChangesPatch {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        set: Vec<super::model::FileChange>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gone: Vec<super::model::FileKey>,
+    },
 }
 
 /// How a file was before the agent first changed it.

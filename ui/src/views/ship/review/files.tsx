@@ -20,10 +20,12 @@ import {
   pullSearchRes,
   reviewApi,
   searchRes,
+  whoSaid,
   type HostPullDetail,
   type Thread,
 } from "@/api/review";
 import type { ShipCommit } from "@/api/ship";
+import { AboutContext, type AboutAgent } from "@/components/code/about";
 import { toast } from "@/components/ui/toast";
 import { useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
@@ -115,6 +117,14 @@ const refresh = () => {
 
 /** Shared empties and a no-op, so stable references stay stable (W26-R15). */
 const EMPTY_THREADS: Thread[] = [];
+
+/** Who asking about code goes to (components/code/about.tsx): the agent that made the commit, as
+ * Ship's read model says it (`made_by`, ship.rs: one place, which Chain of Ownership fills for every
+ * commit in time). Code no agent of kiln's made stays inert, as on the review page: today a person's
+ * change, a lone commit and a host's pull request. `name`: how the card names it. */
+function aboutOf(agent: string | null | undefined, name?: string): AboutAgent | null {
+  return agent ? { id: agent, name: name ?? agent, subagents: true, busy: false } : null;
+}
 const noop = () => {};
 
 interface FrameP {
@@ -298,6 +308,8 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       ),
     [key],
   );
+  const maker = item.made_by?.agent;
+  const about = React.useMemo(() => aboutOf(maker, whoSaid(d.author)), [maker, d.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf, viewed }),
     [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf, viewed],
@@ -330,11 +342,13 @@ function KilnFiles({ item }: { item: ShipCommit }) {
         </Conversation>
       }
     >
-      {whole ? (
-        <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={blobTextRes(key, version, whole, "new")} />
-      ) : (
-        list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={meta.get(f.path)} />)
-      )}
+      <AboutContext.Provider value={about}>
+        {whole ? (
+          <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={blobTextRes(key, version, whole, "new")} />
+        ) : (
+          list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={meta.get(f.path)} />)
+        )}
+      </AboutContext.Provider>
     </Frame>
   );
 }
@@ -491,6 +505,8 @@ function CommitFiles({ item }: { item: ShipCommit }) {
     }),
     [ops],
   );
+  const maker = item.made_by?.agent;
+  const about = React.useMemo(() => aboutOf(maker), [maker]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: EMPTY_THREADS, conflicts: [], rowsByFile, version: 1, draft, setDraft, open: setWhole, q: "", linesOf }),
     [fullOps, rowsByFile, draft, linesOf],
@@ -506,11 +522,13 @@ function CommitFiles({ item }: { item: ShipCommit }) {
         </ul>
       }
     >
-      {whole ? (
-        <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
-      ) : (
-        list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
-      )}
+      <AboutContext.Provider value={about}>
+        {whole ? (
+          <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
+        ) : (
+          list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
+        )}
+      </AboutContext.Provider>
     </Frame>
   );
 }

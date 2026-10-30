@@ -1,5 +1,6 @@
 //! Each agent session's processes held together by the kernel: a cgroup (v2) of its own,
-//! `kiln-agents/<session>` under the cgroup the runner runs in. Its harness joins it between fork
+//! `kiln-agents/<session>` under the cgroup the runner runs in (`kiln-agents-<pid>/<session>` for a
+//! runner that isn't the machine's installed one: [`prune_ended`]). Its harness joins it between fork
 //! and exec, before it runs anything, so everything it starts is in it too, however that's
 //! parented later (a command that daemonized, `setsid`, a double fork): no process leaves its
 //! cgroup by forking. Listing an agent's processes is reading its `cgroup.procs`; whose a process
@@ -109,7 +110,46 @@ fn base() -> Option<&'static Base> {
         return None;
     }
     static B: OnceLock<Option<Base>> = OnceLock::new();
-    B.get_or_init(|| Base::under_own(AGENTS)).as_ref()
+    B.get_or_init(|| {
+        if cfg!(test) || crate::os::supervise::started_by_supervisor() {
+            return Base::under_own(AGENTS);
+        }
+        let b = Base::under_own(&format!("{AGENTS}-{}", std::process::id()))?;
+        if let Some(own) = b.dir.parent() {
+            prune_ended(own);
+        }
+        Some(b)
+    })
+    .as_ref()
+}
+
+/// The shared folder (`kiln-agents`) is the machine's installed runner's: it outlives that runner's
+/// process for its next image or its blue/green successor to take up. Any other runner (a test's or
+/// a lab's, one started by hand) may run in a live runner's cgroup (a CI job's commands run in the
+/// runner's own), where that folder holds the live runner's agents, so it makes `kiln-agents-<pid>`
+/// instead and never holds, paces or ends another runner's agents. Those of runners that have ended
+/// go once nothing runs in them.
+fn prune_ended(own: &Path) {
+    let prefix = format!("{AGENTS}-");
+    for e in fs::read_dir(own).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(&prefix).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if !Path::new(&format!("/proc/{pid}")).exists() && e.file_type().is_ok_and(|t| t.is_dir()) {
+            prune(&e.path(), DEPTH);
+        }
+    }
+}
+
+/// Removes `dir` and the groups in it that nothing runs in, at once (a busy one stays).
+fn prune(dir: &Path, depth: usize) {
+    if depth > 0 {
+        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                prune(&e.path(), depth - 1);
+            }
+        }
+    }
+    let _ = fs::remove_dir(dir);
 }
 
 /// A session id as a folder's name: only what an id is made of (kiln's are hex), so it can't name

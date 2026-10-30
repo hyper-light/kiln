@@ -1540,9 +1540,6 @@ textarea.hx-input {
   border-color: #4a4560;
   box-shadow: 0 0 0 3px rgb(186 176 227 / 8%);
 }
-.hx-compose-live {
-  border-color: #2f2b40;
-}
 .hx-compose-input {
   display: block;
   width: 100%;

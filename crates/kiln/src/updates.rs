@@ -2302,6 +2302,22 @@ async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf)
 
 static UPGRADING: AtomicBool = AtomicBool::new(false);
 
+/// This runner's upgrade under way: [`UPGRADING`] until it's dropped, however the upgrade ends.
+struct Upgrading;
+
+impl Upgrading {
+    fn start() -> anyhow::Result<Self> {
+        anyhow::ensure!(!UPGRADING.swap(true, Ordering::AcqRel), "an upgrade is already running on this runner");
+        Ok(Self)
+    }
+}
+
+impl Drop for Upgrading {
+    fn drop(&mut self) {
+        UPGRADING.store(false, Ordering::Release);
+    }
+}
+
 /// Whether this runner is fetching an upgrade now (`crate::doctor` leaves the caches alone meanwhile).
 pub fn upgrading() -> bool {
     UPGRADING.load(Ordering::Acquire)
@@ -2332,21 +2348,19 @@ pub struct Order<'a> {
 /// for a runner set up that way), reporting each line of its output. Nothing this runner runs is
 /// stopped by it.
 pub async fn run_on_runner(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, own_dir: &Path, service: &str, up: &crate::exec::Uplink) -> anyhow::Result<()> {
-    anyhow::ensure!(!UPGRADING.swap(true, Ordering::AcqRel), "an upgrade is already running on this runner");
-    let r = upgrade_here(http, server_url, order, own_dir, service, up).await;
-    UPGRADING.store(false, Ordering::Release);
-    r
+    let _upgrading = Upgrading::start()?;
+    upgrade_here(http, server_url, order, own_dir, service, up).await
 }
 
 /// Download the binary `order` names from the server into `bin`, and check it: Ok with its build.
 async fn download_verified(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, bin: &Path, up: &crate::exec::Uplink) -> anyhow::Result<String> {
     use std::io::Write as _;
-    let say = |line: String| up.msg(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
+    let say = |line: String| up.say(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
     let (path, sha256, size) = (order.path, order.sha256, order.size);
     anyhow::ensure!(path.starts_with("/dl/kiln/") && !path.contains(".."), "refusing to fetch {path}");
     anyhow::ensure!(usize::try_from(size).is_ok_and(|s| s <= MAX_BINARY), "the binary is too large ({size} bytes)");
     let url = format!("{}{path}", server_url.trim_end_matches('/'));
-    say(format!("downloading {url}")).await;
+    say(format!("downloading {url}"));
     let mut resp = http.get(&url).timeout(Duration::from_secs(600)).send().await?;
     anyhow::ensure!(resp.is_success(), "the server answered {} for {url}", resp.status());
     let mut file = std::fs::File::create(bin).with_context(|| format!("create {}", bin.display()))?;
@@ -2371,7 +2385,7 @@ async fn download_verified(http: &crate::http::client::Client, server_url: &str,
     }
     crate::os::make_executable(bin)?;
     let build = build_id(&hash);
-    say(format!("verified build {build} ({got} bytes)")).await;
+    say(format!("verified build {build} ({got} bytes)"));
     Ok(build)
 }
 
@@ -2379,8 +2393,8 @@ async fn download_verified(http: &crate::http::client::Client, server_url: &str,
 /// kept under `<state>/versions/<build>/`, where the new build's runner runs from (nothing that
 /// runs is replaced). Its path and build.
 pub async fn fetch_build(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, state_dir: &Path, up: &crate::exec::Uplink) -> anyhow::Result<(PathBuf, String)> {
-    anyhow::ensure!(!UPGRADING.swap(true, Ordering::AcqRel), "an upgrade is already running on this runner");
-    let r = async {
+    let _upgrading = Upgrading::start()?;
+    async {
         let versions = state_dir.join("versions");
         let mut mk = std::fs::DirBuilder::new();
         mk.recursive(true);
@@ -2400,9 +2414,7 @@ pub async fn fetch_build(http: &crate::http::client::Client, server_url: &str, o
         std::fs::rename(&part, &exe).with_context(|| format!("keep {}", exe.display()))?;
         Ok((exe, build))
     }
-    .await;
-    UPGRADING.store(false, Ordering::Release);
-    r
+    .await
 }
 
 /// Every build kept under `<state>/versions/` but `keep`'s (the one running) and the newest few:
@@ -2423,10 +2435,10 @@ pub fn prune_versions(state_dir: &Path, keep: &str) {
 
 async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, own_dir: &Path, service: &str, up: &crate::exec::Uplink) -> anyhow::Result<()> {
     use std::io::{Read as _, Seek as _};
-    let say = |line: String| up.msg(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
+    let say = |line: String| up.say(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
     let (bin, log_path) = upgrade_files(own_dir);
     download_verified(http, server_url, order, &bin, up).await?;
-    say(format!("kiln install --agent --upgrade --service {service}")).await;
+    say(format!("kiln install --agent --upgrade --service {service}"));
 
     // Its output goes to a file, not a pipe: a runner that takes the binary in place re-executes
     // itself while the install runs, and the install must not die writing to a closed pipe.
@@ -2457,7 +2469,7 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
         while let Some(i) = pending.find('\n') {
             let line: String = pending.drain(..=i).collect();
             if !line.trim().is_empty() {
-                say(line.trim_end().to_owned()).await;
+                say(line.trim_end().to_owned());
             }
         }
         if let Some(st) = exited {
@@ -2470,7 +2482,7 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
         }
     };
     if !pending.trim().is_empty() {
-        say(pending.trim_end().to_owned()).await;
+        say(pending.trim_end().to_owned());
     }
     let _ = std::fs::remove_file(&bin);
     anyhow::ensure!(status.success(), "install --agent --upgrade exited with {status}");
@@ -2597,6 +2609,26 @@ pub fn outpost_build() -> AgentMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upgrade's progress never waits on a full uplink (adacachy's sat 40 minutes after its
+    /// download, its build never started), and the upgrade under way is over once it ends, so the
+    /// next one can start.
+    #[test]
+    fn an_upgrade_neither_waits_on_a_full_uplink_nor_outlives_itself() -> anyhow::Result<()> {
+        let (tx, rx) = async_channel::bounded(1);
+        let up = crate::exec::Uplink(tx);
+        let line = |l: &str| AgentMsg::UpgradeLog { job: "j".into(), line: l.into() };
+        up.say(line("downloading"));
+        up.say(line("verified build"));
+        assert_eq!(rx.len(), 1);
+        {
+            let _u = Upgrading::start()?;
+            assert!(upgrading() && Upgrading::start().is_err());
+        }
+        assert!(!upgrading());
+        let _again = Upgrading::start()?;
+        Ok(())
+    }
 
     /// A runner upgrade kiln gave up on: the machine got there later.
     fn given_up(blue_green: bool) -> Job {

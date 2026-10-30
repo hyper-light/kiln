@@ -295,7 +295,7 @@ export default function Mission() {
     <div className="container-console page ms-page">
       <title>Agents · kiln</title>
       <PageIntro index={5} label="Agents" title="Mission control." compact />
-      <React.Suspense fallback={<div className="st" aria-hidden="true" />}>
+      <React.Suspense fallback={<div className="sd" aria-hidden="true" />}>
         <StandsNow />
       </React.Suspense>
       <Loadable label="Loading agents" fallback={<RowsLoading />}>
