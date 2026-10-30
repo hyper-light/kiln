@@ -55,10 +55,16 @@ person sends "now" never waits.
 
 **Pacing.** When running work wants more than a budget, the budget is water-filled class by class,
 max-min fair within a class, and each group runs that share of every period (`cgroup.freeze`):
-only for the resource that's short. Groups are each agent session's cgroup and, with `escapes`
-on, the user's transient units (`systemd-run --user`: agents' builds). Those are paced only by the
-machine's installed runner: the one its supervisor started (its parent is the process serving the
-supervisor's control socket it was given), holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`
+only for the resource that's short. The pacer looks every 50 ms and a period is at least a second.
+A group earns its share of the time that passes and spends the time it runs: it starts a slice once
+it has earned one (its share of a period, and at least a tick) and runs until that is spent. So a
+share above zero always runs and over time gets exactly its share (a 5 ms period, which a fast
+disk's probe asks for, once gave every share under a fifth no time at all). A group's CPU and
+writes are measured over at least a period too, and the engine is told the part of that time the
+group was let run, not the share it was given. Groups are each agent session's cgroup
+and, with `escapes` on, the user's transient units (`systemd-run --user`: agents' builds). Those
+are paced only by the machine's installed runner: the one its supervisor started (its parent is
+the process serving the supervisor's control socket it was given), holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`
 (tried again until held, so a runner that took over from another takes it once that one is gone).
 A runner a test or a person started paces its own sessions only. Units kiln itself runs in, units
 the desktop starts for a person (`app-…`, `dbus-…`, `xdg-…`) and kiln's guards
