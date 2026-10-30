@@ -95,7 +95,11 @@ The runner keeps its new certificate in place of the old one. It's refused while
 is connected, for an id other than the one its facts said, for an id another runner is known by,
 and for a runner the server doesn't know (one that never connected, or one forgotten); it then goes
 on by its name and asks again as it starts next. One known by a machine id already never moves to
-another (a VM copied with its runner's state is caught as a copy instead). Its old name isn't revoked, so a machine on an
+another (a VM copied with its runner's state is caught as a copy instead).
+
+Its certificate for the id is one of kiln's identities (docs/ci.md W27-R01), recorded before
+anything moves, and who enrolled it moves with it: forgetting the runner revokes its key, and so
+its certificate for its old name too. A revoked key doesn't move. Its old name isn't revoked, so a machine on an
 older kiln that shares it keeps working.
 
 The server's own runner (`[local_agent]`) is known by its machine's id too

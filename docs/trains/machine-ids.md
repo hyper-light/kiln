@@ -5,9 +5,10 @@ delivers, what deploying it does and how to watch it, its risks, its rollback, a
 open.
 
 **Where it stands (2026-10-28, when written):**
-- **Merged:** with this file, onto main at 2e0fb8fd (Ship's commit pages and Mission control's
-  composer merged in: Ship's replanting runners and the composer's machine are named by their
-  labels too). The landing commit's message has the gate's evidence.
+- **Merged:** with this file, onto main at f381c422, with what main brought since this began:
+  Ship's commit pages and Mission control's composer (their runners named by their labels too),
+  and kiln's identities (W27: a runner's move records its certificate for the id, moves who
+  enrolled it, and refuses a revoked key). The landing commit's message has the gate's evidence.
 - **Deployed:** not yet. Deploys go through Ada, and so do runner upgrades: a runner moves to its
   machine id only once it runs this build and starts.
 - **Gated** on adacachy (2026-10-28, 23:19 to 23:53Z) on 0c9be472, the tree this push carries but
@@ -57,8 +58,9 @@ open.
 - **Runners from before move** to their ids as they start (`POST /api/agents/rekey`), what kiln kept
   under their names with them: rows, jobs, attempts, insights, reap policy, grants, front door,
   agent limit, upgrade policy, agent sessions, synced copies and places, their member in the
-  cluster group. Their names become their labels. The server's own runner too, the first time the
-  server starts.
+  cluster group, who enrolled them. Their names become their labels, and their certificates for
+  their ids are kiln's identities: forgetting one revokes its key. The server's own runner too, the
+  first time the server starts.
 - **A copy is caught:** a machine asking to be known by the id of a connected runner (a cloned VM)
   is refused, and told how to give it an id of its own.
 
