@@ -15,8 +15,12 @@
 # reports, W13), as a runner never does. Without a systemd user manager (macOS, a container) it
 # runs uncapped at nice 19, and says so.
 #
-# While it runs it watches the machine's own services: system.slice's I/O pressure ("full" avg10)
-# over 30, or --guard-url answering in over 3 s, three checks running (10 s apart), stops it.
+# While it runs it watches the services it shares the machine with: kiln's own, the server and runner
+# units kiln's installer makes (system or user), each its own I/O pressure ("full" avg10) over 30, or
+# --guard-url answering in over 3 s, three checks running (10 s apart), stops it. Not all of
+# system.slice: Docker's containers are there, the gate's own pool tests' among them, and on an idle
+# machine those alone held it over 30. A machine without kiln's units is watched by system.slice's,
+# as before.
 #
 # Its build is its own: a target dir and TMPDIR under ${XDG_CACHE_HOME:-~/.cache}/kiln-gate/<tree>,
 # and git's environment cleared, with an empty global config of its own (writable: tests write it)
@@ -127,6 +131,26 @@ if [ "$io" != off ]; then
   props+=(-p "IOReadBandwidthMax=$base $io_read" -p "IOWriteBandwidthMax=$base $io_write")
 fi
 
+# What the guard watches: kiln's own services here, as its installer makes them (each unit says it's
+# a "self-supervising CI/CD job server"), by their cgroups' I/O pressure; tests' units and transient
+# ones (`systemd-run`, this gate's own) aren't. Unit and pressure file, one a line.
+watched=''
+if command -v systemctl > /dev/null; then
+  for scope in --system --user; do
+    for u in $(systemctl "$scope" list-units --type=service --state=running --no-legend --plain 'kiln*' 2> /dev/null | awk '{ print $1 }'); do
+      case $u in kiln-test-* | kiln-gate-*) continue ;; esac
+      systemctl "$scope" show -p Description --value "$u" 2> /dev/null | grep -q 'self-supervising CI/CD job server' || continue
+      cg=$(systemctl "$scope" show -p ControlGroup --value "$u" 2> /dev/null || true)
+      if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/io.pressure" ]; then watched="$watched$u /sys/fs/cgroup$cg/io.pressure"$'\n'; fi
+    done
+  done
+fi
+if [ -n "$watched" ]; then
+  guarding="the I/O pressure (full avg10) of kiln's services here ($(printf '%s' "$watched" | awk '{ print $1 }' | paste -sd, - | sed 's/,/, /g')) over 30"
+else
+  guarding="system.slice's I/O pressure (full avg10) over 30 (no kiln services here to watch)"
+fi
+
 steps=("clippy-linux: cargo clippy --locked --workspace --all-targets -j $jobs -- -D warnings"
   "test-build: cargo test --locked --workspace --lib --no-run -j $jobs"
   "test: cargo test --locked --workspace --no-fail-fast -j $jobs (RUST_TEST_THREADS=$threads)")
@@ -142,7 +166,7 @@ else
   echo "caps: $caps would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19"
 fi
 echo "cargo: -j $jobs, $threads test threads"
-echo "guard: system.slice I/O pressure (full avg10) over 30${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
+echo "guard: $guarding${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
 echo "steps:"
 n=0
 for s in "${steps[@]}"; do n=$((n + 1)); echo "  $n. $s"; done
@@ -168,7 +192,13 @@ bad=0 why=''
 while kill -0 "$pid" 2> /dev/null; do
   sleep 10
   strained=''
-  if [ -r /sys/fs/cgroup/system.slice/io.pressure ]; then
+  if [ -n "$watched" ]; then
+    while read -r u f; do
+      [ -n "$u" ] && [ -r "$f" ] || continue
+      full=$(awk '/^full/ { split($2, a, "="); print a[2] }' "$f")
+      if awk -v x="${full:-0}" 'BEGIN { exit !(x > 30) }'; then strained="${strained:+$strained, }$u's I/O pressure $full"; fi
+    done <<< "$watched"
+  elif [ -r /sys/fs/cgroup/system.slice/io.pressure ]; then
     full=$(awk '/^full/ { split($2, a, "="); print a[2] }' /sys/fs/cgroup/system.slice/io.pressure)
     if awk -v f="$full" 'BEGIN { exit !(f > 30) }'; then strained="system services' I/O pressure $full"; fi
   fi
