@@ -931,6 +931,31 @@ pub(crate) async fn accept(hub: &Arc<Hub>, d: &Diff, replay: &Replay, sha: &str,
     adopt(hub, d, replay, &at, &made, me, by).await
 }
 
+/// A text conflict of `replay` in its file, for the structural merge: the file before it and
+/// after it (its other conflicts taking main's side), and its base's, main's and this side's
+/// lines, each with its newline. `None` for a conflict that isn't text, or whose base git didn't
+/// carry.
+pub(crate) struct Around {
+    pub file: String,
+    pub before: String,
+    pub base: String,
+    pub main: String,
+    pub this: String,
+    pub after: String,
+}
+
+pub(crate) async fn around(hub: &Hub, d: &Diff, replay: &Replay, conflict: &str) -> Result<Option<Around>, Fail> {
+    let rows = kept(hub, &replay.id).await?;
+    let Some(c) = rows.iter().find(|c| c.id == conflict) else { return Ok(None) };
+    let Some(index) = c.hunk.filter(|_| c.kind.by_lines()).and_then(|h| usize::try_from(h).ok()) else { return Ok(None) };
+    let at = again(hub, d, replay).await?;
+    let text = Text::parse(&String::from_utf8_lossy(&blob(hub, &at.path, &format!("{}:{}", at.merged.tree, c.file)).await?)).map_err(internal)?;
+    let (Some((before, after)), Some(h)) = (text.around(index), text.hunks().get(index).copied()) else { return Ok(None) };
+    let Some(base) = h.base.as_deref() else { return Ok(None) };
+    let lines = |ls: &[String]| ls.iter().map(|l| format!("{l}\n")).collect::<String>();
+    Ok(Some(Around { file: c.file.clone(), before, base: lines(base), main: lines(&h.main), this: lines(&h.this), after }))
+}
+
 /// Where a replay's repository lives here, and its id.
 pub(crate) async fn home(hub: &Hub, d: &Diff) -> Result<(String, String), Fail> {
     let (repo, path) = diffs::home(hub, d).await?;

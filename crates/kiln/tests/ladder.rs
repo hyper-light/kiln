@@ -107,6 +107,12 @@ struct World {
 }
 
 fn world(dir: &Path) -> anyhow::Result<World> {
+    world_of(dir, &expand("1"), &[(&expand("10"), None), (&expand("10"), Some("app, said by D2\n"))], &expand("100"))
+}
+
+/// A trunk with the gate and plan/expand.rs as `base`; D1, D2 … from it, each making it as
+/// `changes` say (and README.md, where one says so); then main making it `main`.
+fn world_of(dir: &Path, base: &str, changes: &[(&str, Option<&str>)], main: &str) -> anyhow::Result<World> {
     let s = start(dir, &Options { agent: true, ..Options::default() })?;
     let home = dir.join("githome");
     std::fs::create_dir_all(&home)?;
@@ -120,7 +126,7 @@ fn world(dir: &Path) -> anyhow::Result<World> {
 
     must(git(&home, dir, &["clone", "-q", &url(&dev), "work"]), "clone")?;
     let work = dir.join("work");
-    for (f, body) in [(".kiln/review.yaml", "land:\n  approvals: 1\n  resolve-threads: false\n".to_owned()), (".github/workflows/gate.yml", GATE.to_owned()), ("plan/expand.rs", expand("1")), ("README.md", "app\n".to_owned())] {
+    for (f, body) in [(".kiln/review.yaml", "land:\n  approvals: 1\n  resolve-threads: false\n".to_owned()), (".github/workflows/gate.yml", GATE.to_owned()), ("plan/expand.rs", base.to_owned()), ("README.md", "app\n".to_owned())] {
         if let Some(d) = work.join(f).parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -131,10 +137,10 @@ fn world(dir: &Path) -> anyhow::Result<World> {
     must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
     let trunk0 = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
 
-    // D1 and D2, each from the first trunk, each making one()'s line 10 (D2 a README line too).
-    for (i, extra) in [(1, None), (2, Some("app, said by D2\n"))] {
+    for (i, (this, extra)) in changes.iter().enumerate() {
+        let i = i + 1;
         must(git(&home, &work, &["checkout", "-q", "-B", &format!("d{i}"), &trunk0]), "checkout")?;
-        std::fs::write(work.join("plan/expand.rs"), expand("10"))?;
+        std::fs::write(work.join("plan/expand.rs"), this)?;
         if let Some(e) = extra {
             std::fs::write(work.join("README.md"), e)?;
         }
@@ -142,10 +148,10 @@ fn world(dir: &Path) -> anyhow::Result<World> {
         must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
     }
 
-    // Main makes the same line 100.
+    // Main moves.
     must(git(&home, dir, &["clone", "-q", &url(&s.admin), "owner"]), "the owner's clone")?;
     let owner = dir.join("owner");
-    std::fs::write(owner.join("plan/expand.rs"), expand("100"))?;
+    std::fs::write(owner.join("plan/expand.rs"), main)?;
     must(git(&home, &owner, &["commit", "-qam", "main moves"]), "commit")?;
     must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
     Ok(World { s, bare, dev, kim })
@@ -231,5 +237,49 @@ fn w26_r17_a_rung_whose_tests_fail_hands_on() -> anyhow::Result<()> {
     assert!(why.contains("failed its tests") && why.contains("a person takes a side or edits"), "{l}");
     let (st, r) = call(&w.s, &w.kim, "POST", "/api/diffs/D2/conflicts/accept", Some(&json!({})))?;
     assert_eq!(st, 409, "nothing offered: {r}");
+    Ok(())
+}
+
+/// The goal's example, D42's two hunks in plan/expand.rs (here D1's): in the first, main and D1
+/// change neighbouring one-line functions, which git can't merge and kiln's structural merge does;
+/// in the second both add a line in the same place, which it keeps. The structural merge's
+/// resolution is tested, then the person resolves the other, the two are tested together and
+/// offered, and kim accepts: v2 has both.
+#[test]
+fn w26_r17_structural_resolves_one_of_two_hunks() -> anyhow::Result<()> {
+    let file = |a: &str, b: &str, added: &str| format!("fn a() -> u32 {{ {a} }}\nfn b() -> u32 {{ {b} }}\n\n// apart\n// from\n// the\n// first\n\nfn expand(m: &Matrix) -> Legs {{\n    let legs = m.cross();\n{added}    legs\n}}\n");
+    let base = file("1", "2", "");
+    let d1 = file("1", "20", "    let legs = apply(m.include, m.exclude, legs);\n");
+    let main = file("10", "2", "    legs.dedup_by_key(|l| l.key());\n");
+    let dir = tempfile::tempdir()?;
+    let w = world_of(dir.path(), &base, &[(&d1, None)], &main)?;
+    let got = ok(&w.s, &w.kim, "GET", "/api/diffs/D1/conflicts", None)?;
+    let ids: Vec<String> = got.get("conflicts").and_then(Value::as_array).map(|l| l.iter().map(|c| text(c, "id").to_owned()).collect()).unwrap_or_default();
+    let [one, two] = ids.as_slice() else { anyhow::bail!("two hunks: {got}") };
+    until(240, "the structural merge tried both, and the second held", || {
+        let l = ladder(&w, "D1")?;
+        Ok((text(&l, "state") != "held").then(|| l.to_string()))
+    })?;
+    let l = ladder(&w, "D1")?;
+    let first = l.pointer(&format!("/conflicts/{one}")).and_then(Value::as_array).cloned().unwrap_or_default();
+    let structural = first.iter().find(|t| text(t, "rung") == "structural").cloned().unwrap_or_default();
+    assert_eq!((text(&structural, "state"), text(&structural, "tests"), text(&structural, "by")), ("resolved", "passed", "kiln"), "{l}");
+    assert_eq!(structural.get("lines"), Some(&json!(["fn a() -> u32 { 10 }", "fn b() -> u32 { 20 }"])), "{l}");
+    let second = l.pointer(&format!("/conflicts/{two}")).and_then(Value::as_array).cloned().unwrap_or_default();
+    let kept = second.iter().find(|t| text(t, "rung") == "structural").cloned().unwrap_or_default();
+    assert_eq!((text(&kept, "state"), text(&kept, "why")), ("kept", "both sides added different code in the same place"), "{l}");
+
+    // The person resolves the second; both are tested together and offered.
+    ok(&w.s, &w.dev, "POST", &format!("/api/diffs/D1/conflicts/{two}/resolution"), Some(&json!({ "take": "edit", "text": "    let mut legs = apply(m.include, m.exclude, legs);\n    legs.dedup_by_key(|l| l.key());" })))?;
+    until(240, "offered", || {
+        let l = ladder(&w, "D1")?;
+        Ok((text(&l, "state") != "offered").then(|| l.to_string()))
+    })?;
+    let r = ok(&w.s, &w.kim, "POST", "/api/diffs/D1/conflicts/accept", Some(&json!({})))?;
+    assert_eq!(r.get("version"), Some(&json!(2)), "{r}");
+    let v = ok(&w.s, &w.kim, "GET", "/api/diffs/D1", None)?;
+    let commit = v.get("versions").and_then(Value::as_array).and_then(|v| v.last()).map(|v| text(v, "commit").to_owned()).unwrap_or_default();
+    let want = file("10", "20", "    let mut legs = apply(m.include, m.exclude, legs);\n    legs.dedup_by_key(|l| l.key());\n");
+    assert_eq!(show(&w.bare, &commit, "plan/expand.rs")?, want);
     Ok(())
 }

@@ -32,7 +32,7 @@ use crate::hub::Hub;
 use crate::wire::events::{ConflictChange, ServerEvent};
 
 /// The rungs this kiln runs.
-const CAN: &[Rung] = &[Rung::Remembered];
+const CAN: &[Rung] = &[Rung::Structural, Rung::Remembered];
 
 fn fail(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
@@ -385,6 +385,7 @@ fn picks(ready: &BTreeMap<String, &Try>) -> HashMap<String, Vec<String>> {
 /// under test.
 async fn attempt(hub: &Hub, d: &Diff, replay: &Replay, repo_id: &str, c: &ForLadder, rung: Rung, ready: &BTreeMap<String, &Try>) -> Result<(), Fail> {
     let made: Result<(Vec<String>, String), String> = match rung {
+        Rung::Structural => structural(hub, d, replay, c).await?,
         Rung::Remembered => match remembered(hub, repo_id, c).await? {
             Some((lines, by)) => Ok((lines, format!("remembered from {by}'s resolution"))),
             None => Err("nothing is remembered for this conflict".to_owned()),
@@ -403,6 +404,20 @@ async fn attempt(hub: &Hub, d: &Diff, replay: &Replay, repo_id: &str, c: &ForLad
     keep_ref(hub, d, &git_ref, &sha).await?;
     let started = test(hub, d, replay, &sha, &git_ref).await?;
     record(hub, &id, replay, d, c, rung, "kiln", "resolved", None, Some((&lines, &explanation)), Some((&sha, &started))).await
+}
+
+/// Rung 1: kiln's structural merge of the hunk in its file (`kiln_search::merge`), its lines, or
+/// why it kept the markers.
+async fn structural(hub: &Hub, d: &Diff, replay: &Replay, c: &ForLadder) -> Result<Result<(Vec<String>, String), String>, Fail> {
+    let Some(a) = conflicts::around(hub, d, replay, &c.id).await? else { return Ok(Err("git didn't carry this conflict's base".to_owned())) };
+    Ok(match kiln_search::merge::resolve_hunk(&a.file, &a.before, &a.base, &a.main, &a.this, &a.after) {
+        kiln_search::merge::Outcome::Resolved(text) => {
+            let body = text.strip_suffix('\n').unwrap_or(&text);
+            let lines = if text.is_empty() { Vec::new() } else { body.split('\n').map(str::to_owned).collect() };
+            Ok((lines, "merged by its syntax: each side changed different parts".to_owned()))
+        }
+        kiln_search::merge::Outcome::Kept(k) => Err(k.why().to_owned()),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
