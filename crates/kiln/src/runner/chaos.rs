@@ -20,6 +20,9 @@
 //! - `claim=<duration>`: the server's: the CI engine's first claim of a grant (written before its
 //!   Assign is sent) is held back that long and then fails, as a store that can't write would
 //!   (W05-R05).
+//! - `stop=<job>`: the server's: the CI engine grants that job's legs as items that stop when their
+//!   lease is lost (`on_lease_loss: stop`), as no CI leg does, so their runner stops them at its
+//!   lease's end (W05-R37).
 //! - `shed=<lane>[/<variant>]:<every>`: this process's QUIC layer drops about one frame in `every`
 //!   of `lane` (`control`, `term` ... or its number; of those whose first byte, a message's
 //!   variant index, is `variant`, when given), picked by a seeded draw, as a frame lost below the
@@ -64,6 +67,7 @@ pub struct Chaos {
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
     pub claim_fails: Option<Duration>,
+    pub stop_job: Option<String>,
     /// What goes wrong below the channel: `shed`, `twice`, `late`, in the order given, drawn from
     /// `seed`.
     pub faults: Vec<crate::net::Shed>,
@@ -116,6 +120,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             }
             "rebuild" => c.rebuild_after = Some(d()?),
             "claim" => c.claim_fails = Some(d()?),
+            "stop" if !v.is_empty() => c.stop_job = Some(v.to_owned()),
             "shed" | "twice" | "late" => {
                 let act = match k {
                     "shed" => crate::net::Act::Drop,
@@ -127,7 +132,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
             "old" => c.old = true,
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, claim, shed, twice, late, seed, fanout or old"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, claim, stop=<job>, shed, twice, late, seed, fanout or old"),
         }
     }
     Ok(c)
@@ -345,6 +350,7 @@ mod tests {
                 platform: None,
                 rebuild_after: None,
                 claim_fails: None,
+                stop_job: None,
                 faults: Vec::new(),
                 seed: 0,
                 fanout: None,
@@ -356,6 +362,8 @@ mod tests {
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("claim=3s")?.claim_fails, Some(Duration::from_secs(3)));
+        assert_eq!(parse("stop=stopper")?.stop_job.as_deref(), Some("stopper"));
+        assert!(parse("stop").is_err());
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));

@@ -1931,6 +1931,22 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   nothing. A refused write is taken as a frame (not sent again), counted
   (`kiln_ci_refused_writes_total`), said once a grant, and its runner told once to stop that grant
   (`Stop`).
+- **W05-R37 A runner keeps its own leases** (docs/needs.md §8, E3.5). A lease runner sends `Renew`
+  every 10 s in place of its heartbeat, and keeps each grant's lease end by its own clock: from
+  when it sent the last `Renew` naming the grant that the server answered, the lease less a tenth
+  (Chubby's conservative local lease: the server's began no earlier than the request was sent). A
+  grant assigned on a connection counts from the last `Renew` answered on it, or from its `Hello`,
+  since the server grants on a connection only once it has the hello; a new connection renews
+  nothing granted before it. Its clock counts suspend (Linux `CLOCK_BOOTTIME`, macOS the
+  continuous timebase `CLOCK_MONOTONIC_RAW` reads, Windows interrupt time) and never goes back, so
+  a machine waking from sleep finds its leases ended. It checks every half second, so within a
+  second of a lease's end a grant whose lease ended unrenewed and that stops on losing it
+  (`on_lease_loss: stop`) is stopped as a `Cancel` stops it, and ends failed, `runner-lost`
+  (`lease lost`), as its runner's loss is (W05-R16); a grant the server's answer says isn't the runner's any more
+  ends at once. A `finish` grant runs on, and what it writes is refused once its grant is gone
+  (W05-R36). The runner doesn't apply an `Assign`, a `Stop` or a `Renewed` from an epoch older
+  than the newest it has seen (`StaleEpoch`). Self-fencing narrows the window: the guarantee
+  rests on fencing (G2), since a runner that is itself paused can't stop anything.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),

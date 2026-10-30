@@ -281,6 +281,9 @@ pub(crate) fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>,
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
 const CANCEL_GRACE: Duration = Duration::from_secs(120);
 
+/// What a job stopped for its lease ends with (docs/ci.md W05-R37).
+const LEASE_LOST: &str = "lease lost: this runner's lease on it ended unrenewed, and it stops on losing it";
+
 /// A frame as the server takes it (docs/ci.md W05-R34): to a server that takes leases, what this
 /// runner sends about a leg it holds a grant for goes fenced by that grant (its steps, events and
 /// result carried whole, a refusal naming it, its output on [`proto::LANE_FENCED_LOGS`]); the rest,
@@ -315,12 +318,20 @@ fn held_grants(grants: &HashMap<String, proto::Grant>, jobs: &HashMap<String, Ru
     held
 }
 
+/// The grants `held` names, by leg and fence, as [`crate::runner::lease::Leases`] keeps them.
+fn named(held: &[proto::Grant]) -> Vec<(String, kiln_ci::sched::Fence)> {
+    held.iter().map(|g| (g.leg.clone(), g.fence())).collect()
+}
+
 /// One turn of the agent's event loop (computed inside `select!`, handled after it).
 enum Ev {
     Shutdown,
     Net(Option<NetEvent>),
     Done(JobResult),
     Heartbeat,
+    /// The leases' check, every half second: a grant is stopped within a second of its lease's
+    /// end, the loop's own delays besides (docs/ci.md W05-R37).
+    Lease,
     Sample,
     Watchdog,
     Redial,
@@ -1319,6 +1330,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut server_leases = false;
     let mut grants: HashMap<String, proto::Grant> = HashMap::new();
     let mut renew_seq = 0u64;
+    // Where each grant's lease ends by this machine's clock, which counts sleep, and which grants
+    // stop once it has (W05-R37); the jobs stopped so, whose results say it.
+    let mut leases = crate::runner::lease::Leases::default();
+    let mut lease_lost: std::collections::HashSet<String> = std::collections::HashSet::new();
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
@@ -1413,6 +1428,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
+    let mut lease_check = Interval::new(Duration::from_millis(500));
     let mut watchdog = Interval::new(Duration::from_secs(5));
     let mut served_dedicated = false;
     let started = Instant::now();
@@ -1472,6 +1488,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
+            () = lease_check.tick().fuse() => Ev::Lease,
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
@@ -2009,6 +2026,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let mut running: Vec<String> = jobs.keys().cloned().collect();
                 running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
                 let msg = AgentMsg::Hello(hello(running));
+                // What's granted on this connection is granted after the server has this hello
+                // (W05-R37).
+                leases.connected(crate::runner::lease::now_ms());
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
@@ -2102,6 +2122,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
+                leases.away();
                 // The channel's items in flight go again once the server says what it has.
                 updates.down();
                 server_wire = false;
@@ -2239,7 +2260,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // Its grants first, renewed before anything else (W05-R34).
                         if server_leases {
                             renew_seq += 1;
-                            if let Ok(b) = proto::encode(&AgentMsg::Renew { seq: renew_seq, held: held_grants(&grants, &jobs, &unreceived) }) {
+                            let held = held_grants(&grants, &jobs, &unreceived);
+                            leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
+                            if let Ok(b) = proto::encode(&AgentMsg::Renew { seq: renew_seq, held }) {
                                 net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                             }
                         }
@@ -2422,6 +2445,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
                         }
                     }
+                    // From an epoch older than the newest this runner has seen (W05-R37): not applied.
+                    ServerMsg::Stop { grant, .. } if leases.stale(grant.epoch) => {
+                        refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("a Stop from epoch {}, older than this runner has seen", grant.epoch));
+                    }
                     // Its grant to stop (W05-R34): another of the leg's grants it runs since is let be.
                     ServerMsg::Stop { grant, reason } => match jobs.get(&grant.leg).filter(|_| grants.get(&grant.leg) == Some(&grant)) {
                         Some(r) => {
@@ -2436,12 +2463,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         None => refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no grant {}.{} of {} runs here", grant.epoch, grant.n, grant.leg)),
                     },
-                    // What the server renewed (W05-R34); a grant it says isn't this runner's any more
-                    // is the server's to stop.
-                    ServerMsg::Renewed { lost, .. } => {
-                        for g in lost {
+                    // What the server renewed (W05-R34): each grant it named lives its lease from
+                    // when its Renew was sent, less a tenth; one it says isn't this runner's any more
+                    // ends now, and if it stops on losing its lease it's stopped at the next check
+                    // (W05-R37). An answer from an older epoch changes nothing.
+                    ServerMsg::Renewed { seq, lease_ms, epoch, lost } => {
+                        for g in &lost {
                             tracing::warn!(job = %g.leg, attempt = g.attempt, "the server says this runner's grant for the leg isn't its own any more");
                         }
+                        leases.renewed(seq, lease_ms, epoch, &named(&lost));
                     }
                     ServerMsg::Drain => draining = true,
                     ServerMsg::Retire { instance } => {
@@ -3046,6 +3076,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         };
                         let id = a.job_id.clone();
+                        // From an epoch older than the newest this runner has seen (W05-R37): not taken.
+                        if let Some(f) = a.fence.filter(|f| leases.stale(f.epoch)) {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("an assignment from epoch {}, older than this runner has seen", f.epoch));
+                            continue;
+                        }
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
@@ -3073,6 +3108,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             Some(fence) => grants.insert(id.clone(), proto::Grant::of(&id, a.attempt, fence)),
                             None => grants.remove(&id),
                         };
+                        // Its lease, by this machine's clock (W05-R37).
+                        match (a.fence, a.lease_ms) {
+                            (Some(fence), Some(ms)) if server_leases => leases.granted(&id, fence, ms, a.on_lease_loss == kiln_ci::sched::LeaseLoss::Stop),
+                            _ => leases.ended(&id),
+                        }
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
@@ -3413,11 +3453,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Done(r) => {
+            Ev::Done(mut r) => {
                 if retiring {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
                 if jobs.remove(&r.job).is_some() {
+                    leases.ended(&r.job);
+                    // Stopped for its lease: it ends so, whatever it said, as a runner's loss, so
+                    // that a server that takes it before its own lease ran out tries the leg again
+                    // (W05-R37, R16).
+                    if lease_lost.remove(&r.job) {
+                        r.status = Status::Failed;
+                        if !r.error.as_deref().is_some_and(|e| e.starts_with(LEASE_LOST)) {
+                            r.error = Some(LEASE_LOST.to_owned());
+                        }
+                        if let Ok(json) = serde_json::to_string(&kiln_ci::wire::JobEventV2::FailureClass { class: kiln_ci::sched::retry::FailureClass::RunnerLost.as_str().to_owned() }) {
+                            uplink.msg(AgentMsg::JobEvent { job: r.job.clone(), json }).await;
+                        }
+                    }
                     crate::runner::cpus::pins().release(&r.job);
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
                     if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
@@ -3428,6 +3481,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Reported over already: a cancelled job let go of after its grace that ended
                     // after all (or the grace's report, after the job's own).
                     tracing::info!(job = %r.job, "a job already reported over has ended");
+                }
+            }
+            // A grant whose lease ended unrenewed, and that stops on losing it, is stopped now, as a
+            // Cancel stops it; a finish grant runs on (W05-R37). By this machine's clock, which
+            // counts sleep: one waking past its lease end stops them within a second.
+            Ev::Lease => {
+                let now = crate::runner::lease::now_ms();
+                for job in leases.due(now) {
+                    let Some(r) = jobs.get(&job) else { continue };
+                    let end = leases.end(&job).unwrap_or_default();
+                    tracing::warn!(%job, "its lease ended unrenewed (at {end} ms by this machine's clock, now {now} ms), and it stops on losing it: stopping it");
+                    r.cancel.cancel();
+                    lease_lost.insert(job.clone());
+                    let tx = done_tx.clone();
+                    crate::rt::spawn(async move {
+                        crate::rt::sleep(CANCEL_GRACE).await;
+                        let error = format!("{LEASE_LOST}; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
+                        let _ = tx.send(JobResult { job, status: Status::Failed, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                    });
                 }
             }
             Ev::Heartbeat => {
@@ -3447,9 +3519,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 grants.retain(|job, _| jobs.contains_key(job) || unreceived.contains_key(job));
                 if connected && server_leases {
-                    // A lease runner's heartbeat renews the grants it holds (W05-R34).
+                    // A lease runner's heartbeat renews the grants it holds (W05-R34), each lease
+                    // counted from now (W05-R37).
                     renew_seq += 1;
-                    uplink.msg(AgentMsg::Renew { seq: renew_seq, held: held_grants(&grants, &jobs, &unreceived) }).await;
+                    let held = held_grants(&grants, &jobs, &unreceived);
+                    leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
+                    uplink.msg(AgentMsg::Renew { seq: renew_seq, held }).await;
                 } else if connected {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;

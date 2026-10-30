@@ -65,6 +65,12 @@ fn run_leg(dir: &Path, env: &[(&str, &str)], script: &str, secs: u64) -> anyhow:
 /// `acme/lease`, pushed a workflow of one job: `job` its keys before `steps` (YAML lines at the
 /// job's indent), `script` its one step (a shell's lines). The server, the job's run on its way.
 fn push_leg(dir: &Path, env: &[(&str, &str)], job: &str, script: &str) -> anyhow::Result<Server> {
+    let body: String = script.lines().map(|l| format!("          {l}\n")).collect();
+    push_workflow(dir, env, &format!("on: push\njobs:\n  long:\n    runs-on: local\n{job}    steps:\n      - run: |\n{body}"))
+}
+
+/// [`push_leg`], the workflow pushed being `workflow`.
+fn push_workflow(dir: &Path, env: &[(&str, &str)], workflow: &str) -> anyhow::Result<Server> {
     let s = start_env(dir, &Options { agent: true, ci: "kiln_workflows = true", extra: "[sched]\nlease = \"20s\"\n" }, false, env)?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/lease", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
@@ -81,8 +87,6 @@ fn push_leg(dir: &Path, env: &[(&str, &str)], job: &str, script: &str) -> anyhow
         let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
         Ok(body.contains("\"last_polled_at\":null").then_some(body))
     })?;
-    let body: String = script.lines().map(|l| format!("          {l}\n")).collect();
-    let workflow = format!("on: push\njobs:\n  long:\n    runs-on: local\n{job}    steps:\n      - run: |\n{body}");
     std::fs::write(work.join(".kiln/lease.yaml"), workflow)?;
     git(&home, &work, &["add", "."])?;
     git(&home, &work, &["commit", "-qm", "a leg past two leases"])?;
@@ -315,5 +319,64 @@ fn w05_r05_a_grant_is_in_the_store_before_assign_is_sent() -> anyhow::Result<()>
     assert!(log.contains("started"), "{log}");
     let started: u64 = std::fs::read_to_string(&mark)?.trim().parse()?;
     assert!(started >= failed + 14, "queued again 15 s after its claim failed: started at {started}, failed at {failed}");
+    Ok(())
+}
+
+/// W05-R37, the example of docs/needs.md E3.5: the server's runner, cut off (its link down 40 s,
+/// the lease 20 s), stops a stop grant at the end of its own lease, by its own clock, within a
+/// second; a finish grant on it runs on to its end. The `stopper` job's legs stop when their lease
+/// is lost (KILN_CHAOS stop=stopper), the `finisher`'s run to their end, as CI legs do. Each step
+/// writes a line every fifth of a second for 40 s, into a file named for its job and leg.
+#[cfg(feature = "chaos")]
+#[test]
+fn w05_r37_a_runner_cut_off_stops_its_stop_grants_at_its_lease_end() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let marks = dir.path().join("marks");
+    std::fs::create_dir_all(&marks)?;
+    let job = |name: &str| {
+        let line = format!("if [ \"$KILN_ATTEMPT\" = 1 ]; then for i in $(seq 1 200); do echo $i >> \"{}/{name}-$KILN_JOB\"; sleep 0.2; done; fi", marks.display());
+        format!("  {name}:\n    runs-on: local\n    steps:\n      - run: |\n          {line}\n")
+    };
+    let workflow = format!("on: push\njobs:\n{}{}", job("stopper"), job("finisher"));
+    let s = push_workflow(dir.path(), &[("KILN_CHAOS", "drop=12s,down=40s,stop=stopper")], &workflow)?;
+    // Each job's leg and how many lines it wrote, once both have started.
+    let legs = || -> anyhow::Result<Vec<(String, String, usize)>> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir(&marks)? {
+            let name = e?.file_name().to_string_lossy().into_owned();
+            if let Some((job, leg)) = name.split_once('-') {
+                v.push((job.to_owned(), leg.to_owned(), std::fs::read_to_string(marks.join(&name))?.lines().count()));
+            }
+        }
+        v.sort();
+        Ok(v)
+    };
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let stopped = loop {
+        if let Some(l) = s.log().lines().find(|l| l.contains("it stops on losing it: stopping it")) {
+            break l.to_owned();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the runner never stopped a stop grant: {:?}\n{}", legs()?, s.log());
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // Stopped within a second of its lease's end, by the runner's clock.
+    let num = |after: &str| stopped.split(after).nth(1).and_then(|t| t.split(' ').next()).and_then(|n| n.parse::<u64>().ok());
+    let (end, now) = (num("(at "), num(", now "));
+    assert!(matches!((end, now), (Some(e), Some(n)) if n >= e && n - e <= 1000), "{stopped}");
+    eprintln!("w05_r37: the stop grant stopped {} ms after its lease's end, by the runner's clock", now.zip(end).map_or(0, |(n, e)| n - e));
+    let [(finisher, f_leg, _), (stopper, s_leg, _)] = <[_; 2]>::try_from(legs()?).map_err(|l| anyhow::anyhow!("two legs: {l:?}"))?;
+    assert_eq!((finisher.as_str(), stopper.as_str()), ("finisher", "stopper"));
+    assert!(stopped.contains(&s_leg) && !s.log().lines().any(|l| l.contains("stopping it") && l.contains(&f_leg)), "the stopper's leg stopped, not the finisher's: {stopped}");
+    // The stopper's step stops writing, short of its end; the finisher's writes on to its end.
+    std::thread::sleep(Duration::from_secs(3));
+    let at = legs()?;
+    std::thread::sleep(Duration::from_secs(3));
+    let count = |l: &[(String, String, usize)], job: &str| l.iter().find(|(j, ..)| j == job).map_or(0, |(.., n)| *n);
+    assert!(count(&legs()?, "stopper") == count(&at, "stopper") && count(&at, "stopper") < 200, "the stop grant's step stopped: {at:?}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while count(&legs()?, "finisher") < 200 {
+        anyhow::ensure!(Instant::now() < deadline, "the finish grant ran on to its end: {:?}\n{}", legs()?, s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
     Ok(())
 }

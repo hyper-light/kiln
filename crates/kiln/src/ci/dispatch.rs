@@ -443,6 +443,12 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         workflow_file: r.path.clone(),
         prefer,
         placement: r.placed.get(&spec.key).cloned().unwrap_or_default(),
+        // A CI leg runs to its end when its lease is lost (W05-R34); a test build's `stop=<job>`
+        // makes that job's legs stop then, as stop items do (W05-R37).
+        on_lease_loss: match crate::runner::chaos::get().and_then(|c| c.stop_job.as_deref()) {
+            Some(job) if spec.job.rsplit('/').next() == Some(job) => kiln_ci::sched::LeaseLoss::Stop,
+            _ => kiln_ci::sched::LeaseLoss::Finish,
+        },
         ..LegIn::default()
     }
 }
