@@ -115,6 +115,9 @@ pub struct Policy {
     /// Branches (globs) that are never deleted or rewritten, and that only those who may land
     /// push (W14-R02's branch protection).
     pub protected: Vec<String>,
+    /// Keeping open changes fresh as the trunk moves (W26-R16): automatic pushes and conflict
+    /// agents, both off until declared.
+    pub fresh: crate::fresh::Settings,
 }
 
 impl Policy {
