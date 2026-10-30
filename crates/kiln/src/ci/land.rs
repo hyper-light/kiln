@@ -6,8 +6,11 @@
 //! 1. builds a candidate: the next batch of entries (up to `queue.batch`, halved after each
 //!    failure until the culprit is alone) applied onto the trunk's tip, without a working tree
 //!    (`git merge-tree`; a temporary worktree where git is older than 2.40), each landed commit
-//!    with `Differential-Revision:` and `Reviewed-by:` trailers; an entry that conflicts leaves
-//!    the queue as "needs rebase";
+//!    with `Differential-Revision:` and `Reviewed-by:` trailers; an entry that conflicts with the
+//!    trunk is held while the conflict ladder resolves it (W26-R17), and goes back in the queue
+//!    with the resolution once a person accepts it (one whose diffs' replays don't conflict leaves
+//!    as "needs rebase"); one that conflicts only with an entry ahead of it in the batch waits for
+//!    the next;
 //! 2. keeps it at `refs/kiln/land/<trunk>/<batch>` and starts its `land` and `merge_group`
 //!    workflows; a required check (`land.checks`) none of them runs ejects the batch;
 //! 3. when they all pass, moves the trunk to it in one compare-and-swap update (a trunk that
@@ -190,6 +193,76 @@ async fn eject(hub: &Arc<Hub>, e: &Entry, reason: &str, code: &str) -> anyhow::R
     Ok(())
 }
 
+/// Holds entry `e`, which conflicts with `trunk` in `files`, while the conflict ladder resolves its
+/// diffs' conflicts (W26-R17): its diffs back to their review state, so their replays conflict and
+/// climb, each diff's version kept to know the resolution by. One none of whose diffs' replays
+/// conflict (a strategy's own conflict) leaves as needing a rebase, as before.
+async fn hold(hub: &Arc<Hub>, e: &Entry, trunk: &str, files: &[String]) -> anyhow::Result<()> {
+    let shown: Vec<String> = files.iter().take(5).cloned().collect();
+    let files_said = format!("{}{}", shown.join(", "), if files.len() > 5 { ", …" } else { "" });
+    set_diff_state(hub, &e.diffs, State::Accepted).await?;
+    let mut versions: BTreeMap<String, u32> = BTreeMap::new();
+    let mut climbing = false;
+    for id in &e.diffs {
+        let Some(d) = diffs::find(hub, id).await? else { continue };
+        if let Some(v) = diffs::versions(hub, &d).await?.pop() {
+            versions.insert(d.id.clone(), v.n);
+        }
+        climbing |= super::conflicts::current(hub, &d).await.ok().flatten().is_some_and(|r| r.state == "conflicted");
+        super::ladder::kick(&d.id);
+    }
+    if !climbing {
+        return eject(hub, e, &format!("needs rebase: conflicts in {files_said}"), "INVALID_MERGE_COMMIT").await;
+    }
+    let reason = format!("conflicts with {trunk} in {files_said}: held while the conflict ladder resolves it, back in the queue once its resolution is accepted");
+    let (id, held, why) = (e.id.clone(), serde_json::to_string(&versions).unwrap_or_default(), reason.clone());
+    hub.store
+        .call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'held', held = ?2, reason = ?3, batch = NULL, base = NULL, candidate = NULL, updated_at = ?4 WHERE id = ?1", params![id, held, why, crate::util::now_unix()]).map(|_| ())?))
+        .await?;
+    hub.store.audit("kiln".into(), "queue.hold".into(), format!("{}: {reason}", e.id)).await;
+    tell(hub, e, "held", Some(&reason)).await;
+    tracing::info!(entry = %e.id, %reason, "held in the land queue");
+    Ok(())
+}
+
+/// Each entry of `trunk`'s held for a conflict whose resolution is now a version of one of its
+/// diffs, back in the queue (W26-R17); one with a diff no longer open, out.
+async fn release(hub: &Arc<Hub>, repo_id: &str, trunk: &str) -> anyhow::Result<()> {
+    for e in entries(hub, repo_id, trunk, &["held"]).await? {
+        let id = e.id.clone();
+        let held: BTreeMap<String, u32> = hub
+            .store
+            .call(move |c| Ok(c.query_row("SELECT held FROM land_queue WHERE id = ?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten()))
+            .await?
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let mut latest: BTreeMap<String, u32> = BTreeMap::new();
+        let mut gone = None;
+        for d in &e.diffs {
+            let Some(diff) = diffs::find(hub, d).await? else { continue };
+            if !State::parse(&diff.state).is_some_and(State::is_open) {
+                gone = Some(format!("{} is {}", diff.name, diff.state));
+            }
+            if let Some(v) = diffs::versions(hub, &diff).await?.pop() {
+                latest.insert(diff.id.clone(), v.n);
+            }
+        }
+        if let Some(why) = gone {
+            eject(hub, &e, &why, "UNKNOWN_REMOVAL_REASON").await?;
+            continue;
+        }
+        if !land::released(&held, &latest) {
+            continue;
+        }
+        let id = e.id.clone();
+        hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'queued', held = NULL, reason = NULL, updated_at = ?2 WHERE id = ?1", params![id, crate::util::now_unix()]).map(|_| ())?)).await?;
+        set_diff_state(hub, &e.diffs, State::Landing).await?;
+        hub.store.audit("kiln".into(), "queue.release".into(), format!("{}: its conflict's resolution accepted", e.id)).await;
+        tell(hub, &e, "queued", Some("its conflict's resolution accepted")).await;
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ enqueueing
 
 /// The open diffs `d` stands on, bottom first, and `d`.
@@ -269,7 +342,7 @@ pub async fn list(hub: &Hub, repo: &str) -> Result<Value, Fail> {
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT q.id, q.trunk, q.diffs, q.strategy, q.state, q.batch, q.candidate, q.reason, q.enqueued_by, q.created_at, q.updated_at FROM land_queue q JOIN repos p ON p.id = q.repo_id
-                 WHERE p.name = ?1 OR p.id = ?1 ORDER BY q.state IN ('queued', 'testing') DESC, q.created_at DESC LIMIT 200",
+                 WHERE p.name = ?1 OR p.id = ?1 ORDER BY q.state IN ('queued', 'testing', 'held') DESC, q.created_at DESC LIMIT 200",
             )?;
             let rows = st.query_map([&key], |r| {
                 let ids: Vec<String> = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
@@ -303,7 +376,7 @@ pub async fn cancel(hub: &Hub, entry: &str, caller: &Caller) -> Result<Value, Fa
     let key = entry.to_owned();
     let found = hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {ENTRY_COLUMNS} FROM land_queue WHERE id = ?1"), [&key], entry_row).optional()?)).await.map_err(fail)?;
     let Some(e) = found else { return Err((StatusCode::NOT_FOUND, "no such entry".into())) };
-    if !matches!(e.state.as_str(), "queued" | "testing") {
+    if !matches!(e.state.as_str(), "queued" | "testing" | "held") {
         return Err((StatusCode::CONFLICT, format!("the entry is {}", e.state)));
     }
     let id = e.id.clone();
@@ -327,8 +400,8 @@ pub async fn queued_of(hub: &Hub, d: &Diff) -> Option<(String, String, i64, i64,
     hub.store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT q.id, q.state, (SELECT COUNT(*) FROM land_queue o WHERE o.repo_id = q.repo_id AND o.trunk = q.trunk AND o.state IN ('queued', 'testing') AND o.created_at <= q.created_at), q.created_at, q.enqueued_by
-                 FROM land_queue q WHERE q.state IN ('queued', 'testing') AND EXISTS (SELECT 1 FROM json_each(q.diffs) WHERE value = ?1) ORDER BY q.created_at DESC LIMIT 1",
+                "SELECT q.id, q.state, (SELECT COUNT(*) FROM land_queue o WHERE o.repo_id = q.repo_id AND o.trunk = q.trunk AND o.state IN ('queued', 'testing', 'held') AND o.created_at <= q.created_at), q.created_at, q.enqueued_by
+                 FROM land_queue q WHERE q.state IN ('queued', 'testing', 'held') AND EXISTS (SELECT 1 FROM json_each(q.diffs) WHERE value = ?1) ORDER BY q.created_at DESC LIMIT 1",
                 [&id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
@@ -804,7 +877,7 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
     let groups: Vec<(String, String)> = hub
         .store
         .call(|c| {
-            let mut st = c.prepare("SELECT DISTINCT repo_id, trunk FROM land_queue WHERE state IN ('queued', 'testing')")?;
+            let mut st = c.prepare("SELECT DISTINCT repo_id, trunk FROM land_queue WHERE state IN ('queued', 'testing', 'held')")?;
             let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -825,7 +898,7 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
 /// One move of a trunk's queue: a tested batch lands or comes apart, else the next is built.
 async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
     let Some(path) = super::hosting::native_path(hub, repo) else {
-        for e in entries(hub, &repo.id, trunk, &["queued", "testing"]).await? {
+        for e in entries(hub, &repo.id, trunk, &["queued", "testing", "held"]).await? {
             eject(hub, &e, "the repository isn't hosted here", "UNKNOWN_REMOVAL_REASON").await?;
         }
         return Ok(());
@@ -895,25 +968,29 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Nothing under test: build the next batch.
-    let queued = entries(hub, &repo.id, trunk, &["queued"]).await?;
+    // Nothing under test: what was held for a conflict and is resolved goes back; then the next batch.
+    release(hub, &repo.id, trunk).await?;
+    let mut queued = entries(hub, &repo.id, trunk, &["queued", "held"]).await?;
+    let n = land::next_batch(policy.queue.batch, failures().lock().get(&key).copied().unwrap_or(0));
+    let pairs: Vec<(&str, &str)> = queued.iter().map(|e| (e.id.as_str(), e.state.as_str())).collect();
+    let taken: Vec<String> = land::batch(&pairs, usize::try_from(n).unwrap_or(1)).into_iter().map(str::to_owned).collect();
+    queued.retain(|e| taken.contains(&e.id));
     if queued.is_empty() {
         return Ok(());
     }
-    let n = land::next_batch(policy.queue.batch, failures().lock().get(&key).copied().unwrap_or(0));
     let base = gitops::run_git(hub, &["-C", &path, "rev-parse", "--verify", &format!("refs/heads/{trunk}^{{commit}}")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned())?;
     let mut tip = base.clone();
     let mut built: Vec<(Entry, Applied)> = Vec::new();
-    for e in queued.into_iter().take(usize::try_from(n).unwrap_or(1)) {
+    for e in queued {
         match apply(hub, &path, &tip, &e).await {
             Ok(a) => {
                 tip = a.tip.clone();
                 built.push((e, a));
             }
-            Err(Refusal::Conflict(files)) => {
-                let shown: Vec<String> = files.iter().take(5).cloned().collect();
-                eject(hub, &e, &format!("needs rebase: conflicts in {}{}", shown.join(", "), if files.len() > 5 { ", …" } else { "" }), "INVALID_MERGE_COMMIT").await?;
-            }
+            // With an entry ahead of it in the batch: it waits for the next.
+            Err(Refusal::Conflict(_)) if tip != base => {}
+            // With the trunk: up the conflict ladder (W26-R17), held until it's resolved.
+            Err(Refusal::Conflict(files)) => hold(hub, &e, trunk, &files).await?,
             Err(Refusal::Other(why)) => eject(hub, &e, &why, "UNKNOWN_REMOVAL_REASON").await?,
         }
     }

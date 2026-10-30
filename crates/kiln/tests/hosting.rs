@@ -559,8 +559,8 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
 
 /// W14-AC03: four entries tested as one batch whose candidate fails (one of them brings `BAD`,
 /// which only the `merge_group` run rejects): the queue bisects, ejects the culprit with its
-/// reason and lands the other three; and an entry that conflicts with the trunk is ejected as
-/// "needs rebase". The checks run for real on the server's own runner, which fetches each commit
+/// reason and lands the other three; and an entry that conflicts with the trunk is held while the
+/// conflict ladder resolves it (W26-R17), not ejected. The checks run for real on the server's own runner, which fetches each commit
 /// through kiln's git with the leg's token.
 #[test]
 fn w14_ac03_queue() -> anyhow::Result<()> {
@@ -651,20 +651,23 @@ jobs:
     assert_eq!(landed.lines().count(), 3, "{landed}");
     assert!(!landed.contains("culprit"), "{landed}");
 
-    // The two README changes: the first lands, the second needs a rebase.
+    // The two README changes: the first lands; the second, conflicting with it, is held.
     for d in ["D5", "D6"] {
         let (st, e) = post(&s, &lead, &format!("/api/diffs/{d}/land"), &json!({}))?;
         anyhow::ensure!(st == 200, "{d}: {e}");
     }
-    until(300, "D5 lands and D6 is ejected", || {
-        let (a, b) = (state("D5")?, state("D6")?);
-        Ok(!(a == "landed" && b == "accepted")).map(|w| w.then(|| format!("{a} {b}")))
+    let held = || -> anyhow::Result<Value> {
+        let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
+        Ok(q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D6"])))).cloned().unwrap_or_default())
+    };
+    until(300, "D5 lands and D6 is held", || {
+        let (a, b, e) = (state("D5")?, state("D6")?, held()?);
+        Ok(!(a == "landed" && b == "accepted" && text(&e, "state") == "held")).map(|w| w.then(|| format!("{a} {b} {e}")))
     })?;
-    let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
-    let d6 = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D6"])))).cloned().unwrap_or_default();
-    assert!(text(&d6, "reason").contains("needs rebase") && text(&d6, "reason").contains("README.md"), "{d6}");
+    let d6 = held()?;
+    assert!(text(&d6, "reason").contains("conflict ladder") && text(&d6, "reason").contains("README.md"), "{d6}");
     // Each entry's merge queue events, with GitHub's reasons.
-    let wanted = ["queue enqueued  D1", "queue dequeued MERGE D1", "queue dequeued CI_FAILURE D2", "queue dequeued MERGE D5", "queue dequeued INVALID_MERGE_COMMIT D6"];
+    let wanted = ["queue enqueued  D1", "queue dequeued MERGE D1", "queue dequeued CI_FAILURE D2", "queue dequeued MERGE D5"];
     until(240, "the merge queue events", || {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=200", &s.admin, None)?;
         let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();

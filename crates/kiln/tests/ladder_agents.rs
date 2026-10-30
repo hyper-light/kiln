@@ -90,7 +90,10 @@ jobs:
           git init -q .
           git -c http.extraHeader="Authorization: Bearer $TOKEN" fetch -q --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
-      - run: "grep -q 'let a = 110;' plan/expand.rs"
+      - run: "! grep -q 'let a = 99;' plan/expand.rs"
+      # A land candidate takes a while: main can move under it.
+      - if: startsWith(github.ref, 'refs/kiln/land/')
+        run: sleep 6
 "#;
 
 /// What the fake agent does with a message: the brief's facts (its ```json block); clones the
@@ -181,17 +184,31 @@ fn world(dir: &Path) -> anyhow::Result<World> {
 impl World {
     /// D1 from the first trunk (one is 10), pushed with `token`; then main makes it 100.
     fn conflict(&self, dir: &Path, token: &str) -> anyhow::Result<()> {
+        self.push_d1(dir, token)?;
+        self.move_main(dir)
+    }
+
+    fn push_d1(&self, dir: &Path, token: &str) -> anyhow::Result<()> {
         let url = |t: &str| format!("http://x:{t}@127.0.0.1:{}/git/acme/app.git", self.s.port);
         git(&self.home, dir, &["clone", "-q", &url(token), "work"])?;
         let work = dir.join("work");
         std::fs::write(work.join("plan/expand.rs"), expand("10"))?;
         git(&self.home, &work, &["commit", "-qam", &format!("D1: one is ten\n\nChange-Id: I{}", "1".repeat(40))])?;
         git(&self.home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"])?;
+        Ok(())
+    }
+
+    fn move_main(&self, dir: &Path) -> anyhow::Result<()> {
         let owner = dir.join("owner");
         std::fs::write(owner.join("plan/expand.rs"), expand("100"))?;
         git(&self.home, &owner, &["commit", "-qam", "main moves"])?;
         git(&self.home, &owner, &["push", "-q", "origin", "HEAD:main"])?;
         Ok(())
+    }
+
+    fn entry(&self) -> anyhow::Result<Value> {
+        let q = ok(&self.s, &self.kim, "GET", "/api/repos/acme%2Fapp/queue", None)?;
+        Ok(q.get("entries").and_then(Value::as_array).and_then(|l| l.first()).cloned().unwrap_or_default())
     }
 
     fn ladder(&self) -> anyhow::Result<Value> {
@@ -281,5 +298,46 @@ fn w26_r17_a_sent_agent_resolves_in_its_own_workspace() -> anyhow::Result<()> {
     let sessions: Value = serde_json::from_str(&http(w.s.port, "GET", "/api/harness/sessions", &w.s.admin, None)?.1).unwrap_or_default();
     let started = sessions.as_array().cloned().unwrap_or_default().into_iter().find(|s| text(s, "name") == "Resolve D1's conflicts").unwrap_or_default();
     assert!(text(&started, "target").contains("r1") || text(&started, "machine").contains("r1") || started.to_string().contains("r1"), "on r1: {started}");
+    Ok(())
+}
+
+/// W26-R17: the land queue sends a conflicting entry up the ladder rather than ejecting it. D1, the
+/// agent's, is approved and landing when main moves under its candidate: the entry is held; the
+/// agent resolves it and its resolution is offered, the entry still held; kim accepts it, and the
+/// entry goes back in the queue with D1's v2 and lands.
+#[test]
+fn w26_r17_the_queue_holds_a_conflict_until_its_accepted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let w = world(dir.path())?;
+    let cwd = dir.path().join("agent-cwd");
+    std::fs::create_dir_all(&cwd)?;
+    let session = agents::open_session(w.s.port, &w.s.admin, "r1", &cwd, Duration::from_secs(120))?;
+    let agent = token(&w.s, json!({ "kind": "agent", "agent": session, "user": "kim", "grants": ["developer@repo:acme/app"] }))?;
+    std::fs::write(&w.token_file, &agent)?;
+    w.push_d1(dir.path(), &agent)?;
+    let lead = person(&w.s, "lead")?;
+    ok(&w.s, &lead, "POST", "/api/diffs/D1/review", Some(&json!({ "action": "accept" })))?;
+    ok(&w.s, &w.s.admin, "POST", "/api/diffs/D1/land", Some(&json!({})))?;
+    until(120, "D1's candidate under test", || {
+        let e = w.entry()?;
+        Ok((text(&e, "state") != "testing").then(|| e.to_string()))
+    })?;
+    w.move_main(dir.path())?;
+    until(240, "D1's entry held", || {
+        let e = w.entry()?;
+        Ok((text(&e, "state") != "held").then(|| e.to_string()))
+    })?;
+    assert!(text(&w.entry()?, "reason").contains("conflict ladder"), "{}", w.entry()?);
+    until(240, "the agent's resolution offered", || {
+        let l = w.ladder()?;
+        Ok((text(&l, "state") != "offered").then(|| l.to_string()))
+    })?;
+    assert_eq!(text(&w.entry()?, "state"), "held", "held until a person accepts it");
+    ok(&w.s, &w.kim, "POST", "/api/diffs/D1/conflicts/accept", Some(&json!({})))?;
+    until(300, "D1 lands", || {
+        let d = ok(&w.s, &w.kim, "GET", "/api/diffs/D1", None)?;
+        Ok((text(&d, "state") != "landed").then(|| format!("{} {}", text(&d, "state"), w.entry().map(|e| e.to_string()).unwrap_or_default())))
+    })?;
+    assert_eq!(show(&w.bare, "main", "plan/expand.rs")?, expand("110"));
     Ok(())
 }

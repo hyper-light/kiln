@@ -8,9 +8,14 @@
 -- person accepted, by their hunk's key (kiln_ci::ladder::key), per repository: the next replay
 -- whose hunk has the key is offered them. And each repository's two switches, off until turned on
 -- on its page in Repos: sending an agent to a runner that has the repository, and letting a
--- resolution whose tests passed go on without a person. Ship's read model notes the commits of a
--- change whose ladder moves (Ship's pattern, migration 20261025-0100). New tables only: an older
--- kiln never names them.
+-- resolution whose tests passed go on without a person. A land queue entry that conflicts with its
+-- trunk is held while the ladder resolves it (state `held`), with each of its diffs' versions then
+-- (`held`, JSON), and goes back in the queue once one has a newer version. Ship's read
+-- model notes the commits of a change whose ladder moves (Ship's pattern, migration 20261025-0100).
+-- New tables and one nullable column: an older kiln never names them, and never sees a held entry
+-- (it reads only those queued or under test).
+ALTER TABLE land_queue ADD COLUMN held TEXT;
+
 CREATE TABLE review_resolutions (
     id TEXT PRIMARY KEY,
     replay_id TEXT NOT NULL,

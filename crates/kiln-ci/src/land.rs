@@ -370,6 +370,19 @@ pub fn landed_message(message: &str, revision: &str, reviewed_by: &[String], cha
     crate::identity::with_kiln_changes(&out, changes)
 }
 
+/// The entries the next batch takes (W14-R08, W26-R17): those queued, in the order they came, up
+/// to `n`; an entry held while the conflict ladder resolves its conflict with the trunk never.
+pub fn batch<'a>(entries: &[(&'a str, &str)], n: usize) -> Vec<&'a str> {
+    entries.iter().filter(|(_, state)| *state == "queued").map(|(id, _)| *id).take(n).collect()
+}
+
+/// Whether an entry held for a conflict goes back in the queue (W26-R17): once one of its diffs
+/// has a version newer than the one that conflicted (the ladder's resolution, accepted). `held` is
+/// each diff's version when it was held, `latest` each one's latest now.
+pub fn released(held: &BTreeMap<String, u32>, latest: &BTreeMap<String, u32>) -> bool {
+    held.iter().any(|(d, v)| latest.get(d).is_some_and(|n| n > v))
+}
+
 /// How many candidates the queue tests together next: the policy's batch, halved after each
 /// failure (so a failing batch is bisected down to its culprit), whole again after a land.
 pub fn next_batch(policy_batch: u32, failures_since_land: u32) -> u32 {
@@ -380,6 +393,23 @@ pub fn next_batch(policy_batch: u32, failures_since_land: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w26_r17_a_held_entry_never_enters_a_candidate() {
+        let entries = [("e1", "queued"), ("e2", "held"), ("e3", "queued"), ("e4", "testing"), ("e5", "queued")];
+        assert_eq!(batch(&entries, 4), ["e1", "e3", "e5"]);
+        assert_eq!(batch(&entries, 2), ["e1", "e3"]);
+        assert!(batch(&[("e2", "held")], 4).is_empty());
+    }
+
+    #[test]
+    fn w26_r17_a_held_entry_goes_back_once_its_resolution_is_a_version() {
+        let m = |v: &[(&str, u32)]| v.iter().map(|(d, n)| ((*d).to_owned(), *n)).collect::<BTreeMap<_, _>>();
+        let held = m(&[("d40", 3), ("d41", 2)]);
+        assert!(!released(&held, &m(&[("d40", 3), ("d41", 2)])), "nothing new yet");
+        assert!(released(&held, &m(&[("d40", 3), ("d41", 3)])), "d41's resolution accepted");
+        assert!(!released(&held, &m(&[("d40", 3)])), "a diff gone isn't a resolution");
+    }
 
     fn review(reviewer: &str, version: u32, action: Action) -> Review {
         Review { reviewer: reviewer.into(), agent: reviewer.starts_with("agent:"), version, action }
