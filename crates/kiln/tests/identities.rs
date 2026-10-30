@@ -239,6 +239,44 @@ fn w27_r01_each_runner_process_its_own_identity() -> anyhow::Result<()> {
 }
 
 /// Every file under `dir`.
+/// Whether `bytes` hold a PEM private key: its BEGIN line, a base64 body and the END line that
+/// matches it, as the leg's scan (SCAN) takes one. The words alone aren't one: the UI server kiln
+/// carries names the header in a placeholder, a pattern and Bun's TLS strings.
+fn pem_key(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut rest: &str = &text;
+    while let Some((_, after)) = rest.split_once("-----BEGIN ") {
+        rest = after;
+        let Some((label, body)) = after.split_once("-----") else { return false };
+        if !label.ends_with("PRIVATE KEY") || !label.bytes().all(|b| b.is_ascii_uppercase() || b == b' ') {
+            continue;
+        }
+        let Some((b64, _)) = body.split_once(&format!("-----END {label}-----")) else { continue };
+        let base64 = b64.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\n' | b'\r'));
+        if base64 && b64.bytes().filter(|b| !b.is_ascii_whitespace()).count() >= 32 {
+            return true;
+        }
+    }
+    false
+}
+
+/// W27-AC02: the walk takes a PEM private key for one, never the words alone, which the UI server
+/// kiln carries holds (a placeholder, a pattern, Bun's TLS strings) wherever it's built packed.
+#[test]
+fn w27_ac02_a_header_alone_is_no_key() -> anyhow::Result<()> {
+    assert!(pem_key(kiln::pki::new_key_pem()?.as_bytes()), "a key is one");
+    for not in [
+        "placeholder=\"-----BEGIN PRIVATE KEY-----\"",
+        "/-----BEGIN [A-Z ]*PRIVATE KEY-----/",
+        "-----BEGIN PRIVATE KEY-----\u{0}\u{1}not base64\u{2}-----END PRIVATE KEY-----",
+        "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----",
+        "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKHBfpegQ0SAMA0GCSqGSIb3DQEBCwUA\n-----END CERTIFICATE-----",
+    ] {
+        assert!(!pem_key(not.as_bytes()), "{not:?}");
+    }
+    Ok(())
+}
+
 fn walk(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let mut todo = vec![dir.to_path_buf()];
@@ -1272,8 +1310,7 @@ fn w27_ac02_keys() -> anyhow::Result<()> {
         if name.contains("/githome/") || name.contains("/tree/") || name.contains("/work") {
             continue;
         }
-        let bytes = std::fs::read(&f).unwrap_or_default();
-        if String::from_utf8_lossy(&bytes).contains("PRIVATE KEY") {
+        if pem_key(&std::fs::read(&f).unwrap_or_default()) {
             keys.push(name);
         }
     }
