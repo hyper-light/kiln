@@ -3006,13 +3006,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
-                    None => kind
-                        .launch(&spec, &s.id)
-                        .map(|mut p| {
+                    None => match kind.launch(&spec, &s.id) {
+                        Ok(mut p) => {
                             p.env(super::survivors::MARK, &s.id);
-                            p
-                        })
-                        .and_then(|p| crate::proc::spawn_duplex_in(p, crate::os::contain::Group::of(&s.id).as_ref())),
+                            crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
+                        }
+                        Err(e) => Err(e),
+                    },
                 };
                 (adapter, spawned, Vec::new(), false)
             }

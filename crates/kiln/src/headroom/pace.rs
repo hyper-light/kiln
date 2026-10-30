@@ -444,31 +444,66 @@ fn spawn_apart(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     }
 }
 
+/// How often a guard looks whether its pacer still runs.
+const GUARD_WATCH: Duration = Duration::from_secs(2);
+
 /// A pacer's guard (`kiln headroom-guard <record>`): says it runs, keeps the last whole line its
 /// pacer sends (everything the pacer may stop, sent before any of it stops), and once the pacer's
-/// end of its input closes, however the pacer ended, starts all of it again and removes the record.
+/// end of its input closes, or the pacer ends with its input's end still open elsewhere (a process
+/// that came to hold it too), however the pacer ended, starts all of it again and removes the
+/// record. The pacer is the one its record is named for (`<pid>-<start>`).
 pub fn guard(record: &Path) -> std::process::ExitCode {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::Write as _;
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{GUARD_READY}").and_then(|()| out.flush());
+    let pacer = pacer_of(record);
+    let (tx, rx) = std::sync::mpsc::channel();
     let mut last: Vec<String> = Vec::new();
+    match std::thread::Builder::new().name("kiln-guard-input".into()).spawn(move || read_lists(&tx)) {
+        Ok(_) => loop {
+            match rx.recv_timeout(GUARD_WATCH) {
+                Ok(l) => last = l,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if pacer.as_ref().is_none_or(Proc::alive) => {}
+                Err(_) => break,
+            }
+        },
+        // No thread to read with: its input alone says when.
+        Err(_) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            read_lists(&tx);
+            last = rx.try_iter().last().unwrap_or_default();
+        }
+    }
+    last.iter().for_each(|k| imp::release(k));
+    let _ = std::fs::remove_file(record);
+    std::process::ExitCode::SUCCESS
+}
+
+/// Each whole line of the guard's input, as the list it says, until the input ends.
+fn read_lists(tx: &std::sync::mpsc::Sender<Vec<String>>) {
+    use std::io::BufRead as _;
     let mut input = std::io::stdin().lock();
     let mut line = String::new();
     loop {
         line.clear();
         match input.read_line(&mut line) {
             Ok(n) if n > 0 && line.ends_with('\n') => {
-                if let Ok(l) = serde_json::from_str(line.trim_end()) {
-                    last = l;
+                if let Ok(l) = serde_json::from_str(line.trim_end())
+                    && tx.send(l).is_err()
+                {
+                    return;
                 }
             }
             // The end, or a line cut short: one the pacer ended telling, nothing on it stopped yet.
-            _ => break,
+            _ => return,
         }
     }
-    last.iter().for_each(|k| imp::release(k));
-    let _ = std::fs::remove_file(record);
-    std::process::ExitCode::SUCCESS
+}
+
+/// The pacer a record is named for (`<pid>-<start>.json`).
+fn pacer_of(record: &Path) -> Option<Proc> {
+    let (pid, start) = record.file_stem()?.to_str()?.split_once('-')?;
+    Some(Proc { pid: pid.parse().ok()?, start: start.parse().ok()? })
 }
 
 /// Starts again what pacers before this one left stopped: the old shared record's list, and each
@@ -1094,6 +1129,33 @@ mod tests {
         c.kill()?;
         c.wait()?;
         Ok(p)
+    }
+
+    /// The outage of 2026-10-29: a lab runner's pacer ended while a process it left kept its end
+    /// of the guard's input open, so its guard never started what it had stopped.
+    #[test]
+    fn a_guard_whose_pacer_ended_releases_though_its_input_stays_open() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir()?;
+        let g = group(dir.path(), "a", true)?;
+        let mut pacer = Command::new("sleep").arg("60").spawn()?;
+        let p = Proc::of(pacer.id()).ok_or_else(|| anyhow::anyhow!("no start for {}", pacer.id()))?;
+        let record = dir.path().join(format!("{}-{}.json", p.pid, p.start));
+        let mut guard = test_guard(&record)?.stdin(Stdio::piped()).stdout(Stdio::null()).spawn()?;
+        let mut input = guard.stdin.take().ok_or_else(|| anyhow::anyhow!("the guard's input wasn't kept"))?;
+        writeln!(input, "{}", serde_json::to_string(&[g.display().to_string()])?)?;
+        input.flush()?;
+        std::thread::sleep(GUARD_WATCH + Duration::from_millis(500));
+        let held = frozen(&g);
+        pacer.kill()?;
+        pacer.wait()?;
+        let released = within(GUARD_WATCH * 5, || !frozen(&g));
+        drop(input);
+        let _ = guard.kill();
+        let _ = guard.wait();
+        anyhow::ensure!(held, "started again while its pacer still ran");
+        anyhow::ensure!(released, "still stopped after its pacer ended");
+        Ok(())
     }
 
     #[test]

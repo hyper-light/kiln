@@ -403,7 +403,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         // A group of its own where this machine holds processes together (`crate::os::contain`):
         // what it leaves running ends with it, however that's parented (a daemon, `setsid`).
         let group = crate::os::contain::Group::of(&format!("run-{}", uuid::Uuid::now_v7().simple()));
-        let duplex = match crate::os::proc::spawn_duplex_in(cmd, group.as_ref()) {
+        let duplex = match crate::proc::spawn_duplex_in_pool(cmd, group.clone()).await {
             Ok(d) => d,
             Err(e) => {
                 if let Some(g) = group {
