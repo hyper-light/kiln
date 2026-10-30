@@ -523,6 +523,21 @@ pub fn ops() -> &'static [Op] {
                     let state = v.get("state").and_then(Value::as_str).unwrap_or("resolved");
                     diffs(&cx, Method::PATCH, &["comments", c.as_str()], &HashMap::new(), &json!({ "state": state })).await
                 }),
+            op!("ci.diffs.conflicts", "A diff's conflicts with where it lands (W26-R12): each where it falls, main's side, this change's and the base, and how it's resolved.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "conflicts"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "conflicts"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.diffs.conflicts.resolve", "Resolve one of a diff's conflicts: take main, this or both, or edit (`text`, its lines); an agent says why in `explanation`, with the tests it ran (W26-R17: it goes up the conflict ladder, tested, and a person confirms it).", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "conflict": {"type": "string"}, "take": {"type": "string", "enum": ["main", "this", "both", "agent", "edit"]}, "text": {"type": "string"}, "explanation": {"type": "string"}}), &["diff", "conflict", "take"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "conflicts", &text(v, "conflict")?, "resolution"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let (d, c) = (text(&v, "diff")?, text(&v, "conflict")?);
+                    diffs(&cx, Method::POST, &["diffs", d.as_str(), "conflicts", c.as_str(), "resolution"], &HashMap::new(), &v).await
+                }),
+            op!("ci.diffs.conflicts.ladder", "Where a diff's conflicts are on the conflict ladder (W26-R17): each rung's try, its tests, and what waits on whom.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "conflicts", "ladder"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "conflicts", "ladder"], &HashMap::new(), &Value::Null).await }),
             op!("ci.diffs.review", "Review a diff: accept, request changes, comment, or resign; publishes your draft comments.", base: "", ro: false, destructive: false,
                 input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "action": {"type": "string", "enum": ["accept", "request_changes", "comment", "resign"]}, "body": {"type": "string"}}), &["diff", "action"]),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "review"]), HashMap::new())),
@@ -1001,7 +1016,7 @@ mod tests {
     #[test]
     fn w20_r01_each_operation_is_a_route() {
         // Every field a route reads, as one input (parsed: it outgrows `json!`).
-        let probe: Value = serde_json::from_str(r#"{"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error", "job": "build", "scope": "repo:acme/app", "name": "N", "value": "v", "integration": "hook", "diff": "D1", "thread": "t1", "body": "b", "comment": "c1", "action": "accept", "cache": "c1", "kind": "gha", "artifact": "7", "event_type": "e", "sha": "0123456789abcdef0123456789abcdef01234567", "pack": "", "other": "last-green", "delivery": "d1", "hook": "h1", "number": 4, "version": 2, "from": 1, "to": 2, "change_request": "CR1", "entry": "q1", "stack": "s1", "runner": "mac", "providers": ["kiln"], "verdict": "comment", "test": "t1", "experiment": "E1", "variant": "a"}"#).unwrap_or_default();
+        let probe: Value = serde_json::from_str(r#"{"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error", "job": "build", "scope": "repo:acme/app", "name": "N", "value": "v", "integration": "hook", "diff": "D1", "thread": "t1", "body": "b", "comment": "c1", "action": "accept", "cache": "c1", "kind": "gha", "artifact": "7", "event_type": "e", "sha": "0123456789abcdef0123456789abcdef01234567", "pack": "", "other": "last-green", "delivery": "d1", "hook": "h1", "number": 4, "version": 2, "from": 1, "to": 2, "change_request": "CR1", "entry": "q1", "stack": "s1", "runner": "mac", "providers": ["kiln"], "verdict": "comment", "test": "t1", "experiment": "E1", "variant": "a", "conflict": "k1"}"#).unwrap_or_default();
         for op in ops() {
             let route = (op.route)(&probe);
             assert!(route.is_ok(), "{}", op.name);

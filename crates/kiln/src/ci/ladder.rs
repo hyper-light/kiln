@@ -32,7 +32,7 @@ use crate::hub::Hub;
 use crate::wire::events::{ConflictChange, ServerEvent};
 
 /// The rungs this kiln runs.
-const CAN: &[Rung] = &[Rung::Structural, Rung::Remembered];
+const CAN: &[Rung] = &[Rung::Structural, Rung::Remembered, Rung::Agent];
 
 fn fail(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
@@ -337,7 +337,7 @@ pub(crate) async fn climb(hub: &Arc<Hub>, d: &Diff) -> Result<(), Fail> {
         return Ok(());
     }
     let sw = switches_of(hub, &repo_id).await;
-    let author = if d.author_kind == "agent" { Author::Agent { live: false } } else { Author::Person };
+    let author = if authors_agent_id(d).is_some() { Author::Agent { live: authors_agent(hub, d).await.is_some() } } else { Author::Person };
     let conflicts: Vec<ladder::Conflict> = views
         .iter()
         .map(|v| ladder::Conflict { id: v.id.clone(), place: v.place.clone(), text: v.text, candidates: all.iter().filter(|t| t.conflict == v.id).map(Try::candidate).collect(), taken: v.taken })
@@ -347,11 +347,19 @@ pub(crate) async fn climb(hub: &Arc<Hub>, d: &Diff) -> Result<(), Fail> {
     let ready = ready(&first.steps, &all);
     let whole = if before.whole.is_some() && before.whole_of == ready.keys().cloned().collect::<Vec<_>>() { before.whole_tests } else { None };
     let next = ladder::next(&conflicts, author, sw, CAN, whole);
+    let mut for_agent: Vec<&ForLadder> = Vec::new();
     for (id, step) in &next.steps {
         if let (Step::Try { rung }, Some(v)) = (step, views.iter().find(|v| &v.id == id)) {
+            if *rung == Rung::Agent {
+                for_agent.push(v);
+                continue;
+            }
             attempt(hub, d, &replay, &repo_id, v, *rung, &ready).await?;
             kick(&d.id);
         }
+    }
+    if !for_agent.is_empty() {
+        ask_agent(hub, d, &replay, &for_agent, sw).await?;
     }
     match next.state {
         State::TestWhole => test_whole(hub, d, &replay, &ready).await?,
@@ -404,6 +412,122 @@ async fn attempt(hub: &Hub, d: &Diff, replay: &Replay, repo_id: &str, c: &ForLad
     keep_ref(hub, d, &git_ref, &sha).await?;
     let started = test(hub, d, replay, &sha, &git_ref).await?;
     record(hub, &id, replay, d, c, rung, "kiln", "resolved", None, Some((&lines, &explanation)), Some((&sha, &started))).await
+}
+
+/// The agent a change's author names (`agent:<id> for user:…`), by id.
+fn authors_agent_id(d: &Diff) -> Option<&str> {
+    d.author.strip_prefix("agent:").and_then(|s| s.split(' ').next()).filter(|s| !s.is_empty())
+}
+
+/// The change's author's agent, while it runs: its session's id and name.
+async fn authors_agent(hub: &Hub, d: &Diff) -> Option<(String, String)> {
+    let id = authors_agent_id(d)?;
+    let agent = crate::workspace::change::of(hub, id).await.map_or_else(|| id.to_owned(), |r| r.agent);
+    hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited).map(|i| (i.id, i.name))
+}
+
+/// Rung 3: the conflicts left, handed to the change's author's agent, or, where the repository
+/// turns it on, to an agent kiln starts (on a runner kiln picks; it clones the repository into a
+/// workspace of its own). Each is at work until the agent answers it (`answered`).
+async fn ask_agent(hub: &Arc<Hub>, d: &Diff, replay: &Replay, left: &[&ForLadder], sw: Switches) -> Result<(), Fail> {
+    let sha = conflicts::conflicted(hub, d, replay).await?;
+    let git_ref = format!("refs/kiln/resolve/{}/{}/conflicted", d.name, replay.id);
+    keep_ref(hub, d, &git_ref, &sha).await?;
+    let text = brief(hub, d, replay, left, &git_ref);
+    let asked: Result<(String, String), String> = match authors_agent(hub, d).await {
+        Some((id, name)) => {
+            if crate::workspace::follow::deliver(hub, &id, text).await {
+                Ok((d.author.clone(), name))
+            } else {
+                Err(format!("kiln couldn't reach {name}"))
+            }
+        }
+        None if sw.send_agent => {
+            let opener = d.author_for.clone().unwrap_or_else(|| d.author.clone());
+            let starter = crate::harness::lineage::Starter { parent: None, opener: Some(opener), actor: format!("ladder:{}", d.name), plan_run: None, asker: None };
+            let ask = crate::harness::lineage::Ask { kind: "claude".into(), prompt: Some(text), name: Some(format!("Resolve {}'s conflicts", d.name)), count: Some(1), ..Default::default() };
+            match crate::harness::lineage::start(hub, &starter, ask).await {
+                Ok(infos) => infos.into_iter().next().map(|i| (format!("agent:{}", i.id), i.name)).ok_or_else(|| "no agent started".to_owned()),
+                Err((_, why)) => Err(why),
+            }
+        }
+        None => Err("no agent to ask".to_owned()),
+    };
+    for c in left {
+        let id = crate::util::new_id();
+        match &asked {
+            Ok((by, name)) => record(hub, &id, replay, d, c, Rung::Agent, by, "working", None, Some((&[], &format!("asked {name}"))), None).await?,
+            Err(why) => record(hub, &id, replay, d, c, Rung::Agent, "kiln", "kept", Some(why), None, None).await?,
+        }
+    }
+    Ok(())
+}
+
+/// What an agent is asked: the conflicts left, where to work on them, and how to answer.
+fn brief(hub: &Hub, d: &Diff, replay: &Replay, left: &[&ForLadder], git_ref: &str) -> String {
+    let clone = format!("{}/git/{}.git", hub.cfg.server.public_url.trim_end_matches('/'), d.repo);
+    let workspace = format!("~/.cache/kiln/resolve/{}/{}", d.name, replay.id);
+    let mut out = format!(
+        "{} conflicts with {} where it lands, and kiln's structural merge and the resolutions it remembers didn't settle {}. Resolve {}, say why, and run the tests they affect.\n\nWork in a workspace of your own:\n\n    git clone {clone} {workspace} && cd {workspace} && git fetch origin {git_ref} && git checkout FETCH_HEAD\n\nThat's {} replayed onto {}, git's markers (zdiff3: main's side, the base, this change's) where each conflict is.\n\nThe conflicts:\n",
+        d.name,
+        replay.onto_name,
+        if left.len() == 1 { "this one" } else { "these" },
+        if left.len() == 1 { "it" } else { "each" },
+        d.name,
+        replay.onto_name,
+    );
+    for c in left {
+        out.push_str(&format!("\n- {} (conflict `{}`): main has\n{}\n  and {} has\n{}\n", c.place, c.id, c.main.iter().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n"), d.name, c.this.iter().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n")));
+    }
+    out.push_str(&format!(
+        "\nAnswer each with ci.diffs.conflicts.resolve: {{\"diff\": \"{}\", \"conflict\": \"<its id>\", \"take\": \"edit\", \"text\": \"<the lines it resolves to>\", \"explanation\": \"<why, and which tests you ran and what they said>\"}}. kiln commits your resolution as you, runs the change's tests on it again, and a person confirms it before it lands.\n",
+        d.name
+    ));
+    let facts = json!({ "diff": d.name, "replay": replay.id, "clone": clone, "ref": git_ref, "workspace": workspace, "conflicts": left.iter().map(|c| json!({ "id": c.id, "file": c.file, "place": c.place, "main": c.main, "this": c.this })).collect::<Vec<_>>() });
+    out.push_str(&format!("\n```json\n{facts}\n```\n"));
+    out
+}
+
+/// An agent's resolution of conflict `conflict` (its lines and why), as rung 3's candidate: a
+/// revision committed as the agent (`by`), kept and under test.
+pub(crate) async fn answered(hub: &Hub, d: &Diff, replay: &Replay, conflict: &str, by: &str, lines: &[String], explanation: Option<&str>) -> Result<(), Fail> {
+    let all = tries(hub, &replay.id).await?;
+    let mut p: HashMap<String, Vec<String>> = HashMap::new();
+    for t in all.iter().filter(|t| t.conflict != conflict && t.state == "resolved" && t.tests.is_some_and(Tests::count)) {
+        if let Some(l) = &t.lines {
+            p.insert(t.conflict.clone(), l.clone());
+        }
+    }
+    p.insert(conflict.to_owned(), lines.to_vec());
+    let sha = conflicts::candidate(hub, d, replay, &p, by, &[]).await?;
+    let working = all.iter().rfind(|t| t.conflict == conflict && t.rung == Rung::Agent && t.state == "working").map(|t| t.id.clone());
+    let id = working.clone().unwrap_or_else(crate::util::new_id);
+    let git_ref = format!("refs/kiln/resolve/{}/{id}", d.name);
+    keep_ref(hub, d, &git_ref, &sha).await?;
+    let started = test(hub, d, replay, &sha, &git_ref).await?;
+    match working {
+        Some(id) => {
+            let tests = if started.is_empty() { Tests::NoneToRun } else { Tests::Pending };
+            let (by, lines, explanation, sha, started, now) = (by.to_owned(), json!(lines).to_string(), explanation.map(str::to_owned), sha.clone(), json!({ "workflows": started }).to_string(), crate::util::now_unix());
+            hub.store
+                .call(move |c| {
+                    c.execute(
+                        "UPDATE review_resolutions SET state = 'resolved', made_by = ?2, lines = ?3, explanation = ?4, commit_sha = ?5, started = ?6, tests = ?7, updated_at = ?8 WHERE id = ?1",
+                        params![id, by, lines, explanation, sha, started, tests.as_str(), now],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(fail)?;
+        }
+        None => {
+            let views = conflicts::for_ladder(hub, &replay.id).await?;
+            let Some(c) = views.iter().find(|v| v.id == conflict) else { return Ok(()) };
+            record(hub, &id, replay, d, c, Rung::Agent, by, "resolved", None, Some((lines, explanation.unwrap_or_default())), Some((&sha, &started))).await?;
+        }
+    }
+    kick(&d.id);
+    Ok(())
 }
 
 /// Rung 1: kiln's structural merge of the hunk in its file (`kiln_search::merge`), its lines, or

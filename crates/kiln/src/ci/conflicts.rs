@@ -629,6 +629,13 @@ pub async fn resolve(hub: &Hub, d: &Diff, id: &str, caller: &Caller, body: &Valu
     let whose = if agent { "an agent's resolution" } else { "resolved" };
     hub.store.audit(caller.name.clone(), "diffs.conflict.resolve".into(), format!("{} {} v{} ({place}): {whose}, taking {taken}", d.repo, d.name, replay.version)).await;
     hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { conflict: Some(c.id.clone()), take: Some(taken.to_owned()), by: Some(me.clone()), agent: Some(agent), ..changed(d, &replay.id) })));
+    // An agent's resolution goes up the ladder as its rung's candidate (W26-R17).
+    if agent && let Some(lines) = lines.as_deref() {
+        let explanation = body.get("explanation").and_then(Value::as_str).map(str::trim).filter(|e| !e.is_empty());
+        if let Err((_, why)) = super::ladder::answered(hub, d, &replay, &c.id, &caller.name, lines, explanation).await {
+            tracing::info!(diff = %d.name, %why, "an agent's resolution couldn't be tried");
+        }
+    }
     super::ladder::kick(&d.id);
     let rows = kept(hub, &replay.id).await?;
     Ok(view(d, Some(replay.version), Some(&replay), &rows))
@@ -954,6 +961,15 @@ pub(crate) async fn around(hub: &Hub, d: &Diff, replay: &Replay, conflict: &str)
     let Some(base) = h.base.as_deref() else { return Ok(None) };
     let lines = |ls: &[String]| ls.iter().map(|l| format!("{l}\n")).collect::<String>();
     Ok(Some(Around { file: c.file.clone(), before, base: lines(base), main: lines(&h.main), this: lines(&h.this), after }))
+}
+
+/// `replay` as a commit of kiln's, git's markers where each conflict is (its tree as git wrote it),
+/// onto where it goes: what an agent resolving it checks out.
+pub(crate) async fn conflicted(hub: &Hub, d: &Diff, replay: &Replay) -> Result<String, Fail> {
+    let at = again(hub, d, replay).await?;
+    let message = format!("{} v{} replayed onto {}, conflicted\n", d.name, replay.version, at.onto.name);
+    let made = revision::commit(hub, &at.path, &revision::Commit { tree: &at.merged.tree, parents: &[at.onto.commit.as_str()], author: ("kiln", None), by: "kiln", co_authors: &[], message: &message }).await.map_err(internal)?;
+    Ok(made.sha)
 }
 
 /// Where a replay's repository lives here, and its id.
