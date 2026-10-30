@@ -2430,6 +2430,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "postcard",
+ "proptest",
  "rayon",
  "regex",
  "serde",

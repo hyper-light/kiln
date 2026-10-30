@@ -40,6 +40,7 @@ vorpal-language = { version = "=0.10.2", default-features = false, features = [
 vorpal-outline = "=0.10.2"
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3.27.0"
 
 [lints]
