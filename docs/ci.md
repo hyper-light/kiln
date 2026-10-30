@@ -8734,6 +8734,54 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   references. Drafts live in the browser's drafts store, which live updates never touch;
   mutations are React Actions with optimistic state; there are no effects; an open item holds
   still and is patched in place.
+- *R17*, the conflict ladder (`kiln_ci::ladder`, pure; `crates/kiln/src/ci/ladder.rs`;
+  `kiln_search::merge`; migration `20261029-2300_w26_ladder`). A conflicted replay climbs, a
+  conflict at a time, until each has a resolution whose tests passed:
+  - **kiln's structural merge** (`kiln_search::merge`): the hunk in its file, its other
+    conflicts taking main's side, merged on the tree-sitter grammars kiln vendors through vorpal.
+    Siblings are matched by name or text, and only disjoint changes merge. The markers stay, with
+    why, where both sides changed the same node or added in the same place, a name is defined
+    twice (ambiguous, or would be after the merge), text outside a node's children changed, or a
+    version or the merge doesn't parse. Mergiraf's approach, not its code (it's GPL-3.0-only):
+    replayed against kiln's own 204 conflicted merges, it never dropped a side's change.
+  - **a remembered resolution**: whatever a person accepted or committed, kept by its hunk's key
+    (`ladder::key`, rerere's normalisation, sides in a fixed order, with the file's language) in
+    `review_remembered`, and offered to the next replay of any change in the repository with
+    that hunk.
+  - **an agent**: the change's author's agent while it runs, or, where the trunk's
+    `.kiln/review.yaml` turns sending on (`fresh: conflict-agents: true`, W26-R16's setting, off by
+    default), one kiln starts on a machine with the harness. Ship's row then says the agent is fixing
+    it (W26-R18's hand-off). Its brief names a workspace of its
+    own (`~/.cache/kiln/resolve/<diff>/<replay>`), the conflicted revision to check out there
+    (`refs/kiln/resolve/<diff>/<replay>/conflicted`, git's markers in place) and how to answer:
+    `ci.diffs.conflicts.resolve` with its lines and an explanation, with the tests it ran.
+  - **the person**, who takes a side or edits where every rung is spent.
+
+  Each rung's resolution is a revision of whoever made it (kiln for the first two, the agent for
+  the third), committed through `revision::commit` and kept at `refs/kiln/resolve/<diff>/<id>`,
+  the other conflicts taking main's side. It's tested by the workflows the land queue runs on a
+  candidate (`on: merge_group` or `land`) before it counts; one that fails is said and the next
+  rung tried. Once each conflict has one they're committed and tested together
+  (`…/<replay>/whole`), then offered: `GET /api/diffs/:id/conflicts/ladder` says where each is
+  and why. A person accepts them (`POST /api/diffs/:id/conflicts/accept`; an agent can't), and
+  they're the change's new version, why `conflict resolved`, and the changes above it move onto
+  it. Where the repository turned automatic resolution on, on its page in Repos (`GET` and `PUT
+  /api/repos/:repo/ladder`, `automatic`, off by default; changing it takes `diffs.land`), a tested
+  whole goes on by itself, saying so. A conflicted replay kiln makes as main moves (W26-R16) is
+  kept as a revision with its markers (why `replayed with conflicts`), and the changes above it
+  move onto it at once; the ladder climbs it like any other. Files (`review/conflicts.tsx`) shows
+  each conflict's rung on one line at one height, its tested resolution with its explanation, and
+  Take main, Take <the change>, Both, Use the agent's (or kiln's) and Edit, in a grid of fixed rows;
+  the gate row's place holds Accept resolutions while the ladder offers them (`GET
+  /api/diffs/:id/conflicts` carries each conflict's `offered` and the replay's `ladder`). The land
+  queue holds an entry that
+  conflicts with its trunk (state `held`) while its diffs climb, and queues it again once a
+  resolution is accepted; one that conflicts only with an entry ahead of it in the batch waits
+  for the next.
+
+  Not yet: signatures. The resolutions' revisions go through `revision::commit` and the person's
+  acceptance is kept on the ladder's record (`review_ladders.accepted_statement`, a statement's
+  JSON bundle), so W27-R03 and R04 sign them where they're made; until then they read unsigned.
 - *R18*, Hand off (`crates/kiln/src/ship.rs`'s `hand_off`, `POST /api/ship/hand-off`, migration
   `20261029-0100_w26_handoffs`). A row's Hand off names one endpoint, and the server decides
   where it goes. While the change's author's agent runs, it gets the conflicts, open threads and
@@ -8771,8 +8819,21 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     ms at 1280 and at 390, and a keystroke takes 1 ms. WebKit's is 46 ms and 49 ms: every line of
     the whole file is in the page, and WebKit lays them out more slowly. AC06 isn't met in WebKit
     until the whole file draws only the lines in view.
+  - R17: kiln-ci `ladder.rs` (`w26_r17_*`: the rungs' order, what counts, who decides, the
+    remembered key) and `land.rs` (`w26_r17_a_held_entry_*`); kiln-search `merge` (`w26_r17_structural_*`,
+    each resolved and kept case per grammar, a property test, and three real merges from kiln's
+    history; the whole replay is the ignored `w26_r17_structural_against_real_merges`, reading
+    `KILN_MERGE_CASES`); kiln `tests/ladder.rs` on real git (a remembered resolution offered again,
+    one whose tests fail handing on, the goal's D42 with one hunk merged structurally) and
+    `tests/ladder_agents.rs` with the fake harness acting (`FAKE_CLAUDE_ACT`): the author's agent
+    resolving in its own workspace and waiting for a person (Ship's row reading fixing), a sent
+    agent with automatic resolution on, and the land queue holding a conflict until it's accepted;
+    `tests/ladder.rs`' `w26_r17_a_conflicted_replay_keeps_the_stack_moving` (with W26-R16's
+    replays). UI: `e2e/ship-review.spec.ts`'s conflict ladder test and `e2e/ship-ladder-320.spec.ts`,
+    in Chromium and WebKit at desktop and phone.
 
-**Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; research `01a174af7d0476b896d3b236098ddded`;
+**Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; the ladder's plan
+`01a17856b1bb75d29fdefaf1bc53a04b` and research `01a18b45a79570939238c7a8229eb3a7`; research `01a174af7d0476b896d3b236098ddded`;
 the mock `~/.cache/kiln-review-design/ship/review-ship.html` (Ship's prototype, from the CI/CD
 Integration agent's `~/.cache/kiln-cicd-design/proto/f-ship.html`).
 
