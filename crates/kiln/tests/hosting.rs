@@ -224,16 +224,21 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
     must(git(&home, &work, &["branch", "-qf", "stack", "HEAD"]), "keep it")?;
     must(git(&home, &work, &["checkout", "-q", "stack"]), "back")?;
 
-    // The trunk moves; the stack, rebased onto it, gets rebase-only versions.
+    // The trunk moves; kiln replays the stack onto it as rebase-only versions (W26-R16), and the
+    // author's own rebase onto it is the same patches on the same base: nothing new.
     must(git(&home, &work, &["checkout", "-q", "main"]), "main")?;
     std::fs::write(work.join("z.txt"), "elsewhere\n")?;
     must(git(&home, &work, &["add", "z.txt"]), "add")?;
     must(git(&home, &work, &["commit", "-qm", "trunk moves"]), "commit")?;
     must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main"]), "the owner moves trunk")?;
+    until(60, "the stack replayed onto the moved trunk", || {
+        let d3 = api(&s, &dev, "GET", "/api/diffs/D3")?;
+        Ok((versions(&d3).len() < 2).then(|| d3.to_string()))
+    })?;
     must(git(&home, &work, &["checkout", "-q", "stack"]), "stack")?;
     must(git(&home, &work, &["rebase", "-q", "main"]), "rebase")?;
     let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "the rebase")?;
-    for want in ["D1 v2 (rebased", "D2 v3 (rebased", "D3 v2 (rebased"] {
+    for want in ["D1 v2 (unchanged)", "D2 v3 (unchanged)", "D3 v2 (unchanged)"] {
         assert!(out.contains(want), "{want} in {out}");
     }
     assert_eq!(versions(&api(&s, &dev, "GET", "/api/diffs/D2")?), [(1, false), (2, false), (3, true)]);
@@ -526,7 +531,8 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     until(30, "D6 restacked", || {
         let d6 = api(&s, &dev, "GET", "/api/diffs/D6")?;
         let last = d6.get("versions").and_then(Value::as_array).and_then(|v| v.last()).cloned().unwrap_or_default();
-        Ok((!(last.get("rebase_only") == Some(&json!(true)) && text(&last, "parent") == tip && d6.get("parent") == Some(&Value::Null))).then(|| d6.to_string()))
+        // Replayed by kiln as the trunk moved (W26-R16): the one path kiln rebases by.
+        Ok((!(last.get("rebase_only") == Some(&json!(true)) && text(&last, "why") == "replayed" && text(&last, "parent") == tip && d6.get("parent") == Some(&Value::Null))).then(|| d6.to_string()))
     })?;
 
     // ff-only: the trunk moves to the commit as it is; a diverged one is refused.

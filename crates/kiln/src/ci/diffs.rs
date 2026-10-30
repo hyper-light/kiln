@@ -858,38 +858,60 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
     start_at(hub, &repo, &e, &f.sha, &d.title, &who).await
 }
 
-/// A new version of `d` that kiln made (a restack onto a moved trunk, W14-R08): kept at its ref,
-/// its checks started. Its number.
+/// A new version of `d` that kiln made (a revision of someone's: a suggestion applied, a conflict
+/// resolved): kept at its ref, its checks started. Its number.
 pub(crate) async fn add_version(hub: &Arc<Hub>, repo: &Repo, path: &str, d: &Diff, v: NewVersion) -> anyhow::Result<u32> {
-    let (id, nv) = (d.id.clone(), v.clone());
-    let (n, by): (u32, Option<String>) = hub
+    add_versions(hub, repo, path, vec![(d.clone(), v)], true).await?.pop().ok_or_else(|| anyhow::anyhow!("{}'s version wasn't kept", d.name))
+}
+
+/// New versions kiln made, of one repository's diffs (replays as its trunk moved, W26-R16): kept
+/// in one transaction, their refs moved together in one (`git update-ref --stdin`), each one's
+/// checks started when `checks` says so (a replay's aren't: they carry from the version it replays,
+/// as its approvals do). Their numbers, in order.
+pub(crate) async fn add_versions(hub: &Arc<Hub>, repo: &Repo, path: &str, made: Vec<(Diff, NewVersion)>, checks_too: bool) -> anyhow::Result<Vec<u32>> {
+    if made.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, NewVersion)> = made.iter().map(|(d, v)| (d.id.clone(), v.clone())).collect();
+    let numbered: Vec<(u32, Option<String>)> = hub
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
-            let n: u32 = tx.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM diff_versions WHERE diff_id = ?1", [&id], |r| r.get(0))?;
-            // The same commits, rebased: whom the version before came from (W10-R02's `secrets.use`).
-            let by: Option<String> = tx.query_row("SELECT started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [&id], |r| r.get(0)).optional()?.flatten();
             let now = crate::util::now_unix();
-            tx.execute(
-                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now, by],
-            )?;
-            tx.execute("UPDATE diffs SET parent_diff = ?2, updated_at = ?3 WHERE id = ?1", params![id, nv.parent_diff, now])?;
+            let mut out = Vec::with_capacity(rows.len());
+            for (id, nv) in &rows {
+                let n: u32 = tx.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM diff_versions WHERE diff_id = ?1", [id], |r| r.get(0))?;
+                // The same commits, rebased: whom the version before came from (W10-R02's `secrets.use`).
+                let by: Option<String> = tx.query_row("SELECT started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [id], |r| r.get(0)).optional()?.flatten();
+                tx.execute(
+                    "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now, by],
+                )?;
+                tx.execute("UPDATE diffs SET parent_diff = ?2, updated_at = ?3 WHERE id = ?1", params![id, nv.parent_diff, now])?;
+                out.push((n, by));
+            }
             tx.commit()?;
-            Ok((n, by))
+            Ok(out)
         })
         .await?;
-    gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/{}/v{n}", d.name), &v.commit], LS_REMOTE_TIMEOUT).await?;
-    let (title, summary) = review::title_and_summary(&v.message);
-    let started_by = by.as_deref().and_then(|t| serde_json::from_str(t).ok());
-    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by };
-    let (hub2, repo2, trunk, author, base) = (hub.clone(), repo.clone(), d.trunk.clone(), (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" }), v.base.clone());
-    crate::rt::spawn(async move {
-        if let Err(e) = checks(&hub2, &repo2, &trunk, &base, &author, &f).await {
-            tracing::warn!(diff = f.number, version = f.n, error = %format!("{e:#}"), "a diff's workflows didn't start");
-        }
-    });
-    Ok(n)
+    let mut refs = String::from("start\n");
+    for ((d, v), (n, _)) in made.iter().zip(&numbered) {
+        refs.push_str(&format!("update refs/kiln/diffs/{}/v{n} {}\n", d.name, v.commit));
+    }
+    refs.push_str("prepare\ncommit\n");
+    git_with_input(hub, &["-C", path, "update-ref", "--stdin"], refs.into_bytes()).await?;
+    for ((d, v), (n, by)) in made.iter().zip(&numbered).filter(|_| checks_too) {
+        let (title, summary) = review::title_and_summary(&v.message);
+        let started_by = by.as_deref().and_then(|t| serde_json::from_str(t).ok());
+        let f = Fresh { number: d.number, n: *n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by };
+        let (hub2, repo2, trunk, author, base) = (hub.clone(), repo.clone(), d.trunk.clone(), (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" }), v.base.clone());
+        crate::rt::spawn(async move {
+            if let Err(e) = checks(&hub2, &repo2, &trunk, &base, &author, &f).await {
+                tracing::warn!(diff = f.number, version = f.n, error = %format!("{e:#}"), "a diff's workflows didn't start");
+            }
+        });
+    }
+    Ok(numbered.into_iter().map(|(n, _)| n).collect())
 }
 
 /// A version kiln makes.

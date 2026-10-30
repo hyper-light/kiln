@@ -176,13 +176,19 @@ fn w26_ac08_plain_git_amend_rebase_split_squash() -> anyhow::Result<()> {
     r.submit(&[], &["D1 v1 (unchanged)", "D2 v2 (updated)", "D3 v1 (unchanged)"])?;
     assert_eq!(text(&r.diff("D2")?, "change"), id, "the same change");
 
-    // The trunk moves; the stack, rebased with plain git, gets rebase-only versions of D1–D3.
+    // The trunk moves; kiln replays D1–D3 onto it as rebase-only versions (W26-R16), and the stack
+    // rebased with plain git is found to be them: the same changes, nothing new.
     r.g(&["checkout", "-q", "main"])?;
     r.commit("z.txt", "elsewhere\n", "trunk moves")?;
     must(git(&r.home, &r.work, &["push", "-q", &format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", r.s.admin, r.s.port), "HEAD:main"]), "the owner moves trunk")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while r.diff("D3")?.get("versions").and_then(Value::as_array).map_or(0, Vec::len) < 2 {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "the stack wasn't replayed onto the moved trunk: {}", r.diff("D3")?);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     r.g(&["checkout", "-q", "stack"])?;
     r.g(&["rebase", "-q", "main"])?;
-    r.submit(&[], &["D1 v2 (rebased", "D2 v3 (rebased", "D3 v2 (rebased"])?;
+    r.submit(&[], &["D1 v2 (unchanged)", "D2 v3 (unchanged)", "D3 v2 (unchanged)"])?;
 
     // D2 split in two: its first seven lines keep D2; the last three are D4, split from D2.
     let top = r.g(&["rev-parse", "HEAD"])?.trim().to_owned();

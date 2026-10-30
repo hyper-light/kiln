@@ -491,7 +491,10 @@ pub async fn facts(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Facts, F
         .await
         .map_err(fail)?;
     let latest = versions.last();
-    let checks = match latest {
+    // A revision kiln replayed as the trunk moved (W26-R16) starts no runs: the checks are those of
+    // the revision it replays, the latest one that isn't a replay.
+    let tested = versions.iter().rev().find(|v| v.why.as_deref() != Some(kiln_ci::fresh::WHY)).or(latest);
+    let checks = match tested {
         Some(v) => checks_on(hub, &d.repo, &v.commit).await.map_err(fail)?,
         None => BTreeMap::new(),
     };

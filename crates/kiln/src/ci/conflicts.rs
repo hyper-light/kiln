@@ -271,7 +271,7 @@ async fn onto_of(hub: &Hub, d: &Diff, path: &str) -> Result<Onto, Fail> {
 /// `v` replayed onto `onto` by `git merge-tree --write-tree` (zdiff3 markers, so they carry the
 /// base): a diff as a cherry-pick of its commit (its parent the merge base), a change request as a
 /// merge of its branch. Whether it went cleanly, and what git printed.
-async fn merge_tree(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<(bool, Merged), Fail> {
+pub(crate) async fn merge_tree(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<(bool, Merged), Fail> {
     let base = format!("--merge-base={}", v.parent);
     let mut args = vec!["-C", path, "-c", "merge.conflictStyle=zdiff3", "merge-tree", "--write-tree", "-z"];
     if !request {
