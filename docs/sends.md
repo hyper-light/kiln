@@ -66,7 +66,7 @@ session is at, and the inbox refuses, naming both epochs:
 | `no_session` | the session isn't on that host | answers the sender |
 | `full` | the session's lane holds 1,024 waiting | answers the sender |
 | `unavailable` | its records can't be read or written now | answers the sender |
-| `invalid` | an id that can't be kept (empty, over 128 bytes, a control character) | answers the sender |
+| `invalid` | an id that can't be kept (empty, over 128 bytes, a control character), or a message its runner couldn't read that it never took (below) | answers the sender |
 
 **Moves.** As a move begins, a session takes no more messages: those it was sent and hadn't taken go
 with it at the end of its queue, and those after are refused `moved` before its inbox takes them, so
@@ -194,6 +194,19 @@ To a runner announcing `CAP_INBOX` (past `Build`'s 32 bits, in its `AgentMsg::Ca
 (appended last, after the wire's and the cluster group's: postcard variants); the runner's process
 that holds the session answers it. A runner from before inboxes gets `HarnessCmd` as before: its
 messages go on unchecked, and no answer is waited for.
+
+A message its runner can't read (docs/wire.md, "What can't be read": `server_payload`) is answered
+by its session's inbox all the same, when its id can be read: the runner puts what it could read of
+it on the session's lane, after what came before it, and the inbox answers it as it would the
+message. One it took before is answered as its repeat: its words can't be compared, so whatever
+comes under an id it took is taken for that message, as one brought from another machine is, never
+`reused`. One sent for an epoch other than the one its session is at here, or as it went on
+elsewhere, is refused as above (`stale_epoch`, `behind`, `moved`); its lane full, `full`; its
+session not here, `no_session`. One it never took is refused for good, `invalid`, saying its runner
+couldn't read it and why. The runner tells a server that takes it (`CAP_UNREAD`) what it couldn't
+read (`AgentMsg::Unread`, naming the session), and it's kept on the agent's page. When not even its
+id can be read, or its inbox can't be read just then, nothing answers it: the server stops waiting
+for its answer, as it does for any that doesn't come (`kiln_sends_unanswered_total`).
 
 ## Metrics
 

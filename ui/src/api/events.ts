@@ -1,6 +1,8 @@
 import { useSyncExternalStore } from "react";
 import { api, wsUrl } from "./client";
+import { readFrame, unread } from "./frames";
 import type { ServerEvent } from "./types";
+import type { UnreadFrame } from "./wire";
 
 /**
  * One shared, reconnecting WebSocket to /api/events for the whole app. Backs off from 0.5 s to
@@ -21,6 +23,82 @@ interface Snapshot {
 }
 
 type Handler = (ev: ServerEvent) => void;
+
+/** The events socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
+const EVENT_FRAMES = {
+  resync: true,
+  run: true,
+  job: true,
+  agent: true,
+  sample: true,
+  queue: true,
+  terminals: true,
+  updates: true,
+  places: true,
+  discovery: true,
+  join_requests: true,
+  tailscale: true,
+  push: true,
+  peers: true,
+  keep: true,
+  "machine.battery_low": true,
+  ai_sessions: true,
+  update_job: true,
+  account_flow: true,
+  plan_stack: true,
+  comment: true,
+  review: true,
+  diff_run: true,
+  attachment: true,
+  incident: true,
+  "preview.removed": true,
+  landed: true,
+  ci_image: true,
+  experiment: true,
+  inbox: true,
+  registry_package: true,
+  deploy: true,
+  deploy_registration: true,
+  deploy_move: true,
+  front_door: true,
+  agent_limit: true,
+  headroom: true,
+  agent_change: true,
+  harness: true,
+  harness_closed: true,
+  notices: true,
+  program: true,
+  cd_plan: true,
+  cd_rollout: true,
+  cd_app_deleted: true,
+  cd_apps: true,
+  "runner.offline": true,
+  conflict: true,
+  refused: true,
+  "run.succeeded": true,
+  "run.fixed": true,
+  "run.cancelled": true,
+  "run.failed": true,
+  "leg.flaky": true,
+  "deploy.succeeded": true,
+  "deploy.failed": true,
+  "land.ejected": true,
+  "diff.landed": true,
+  "test.quarantined": true,
+  "quota.near": true,
+  "secret.unused": true,
+  "approval.waiting": true,
+  "review.requested": true,
+  "comment.reply": true,
+  mention: true,
+  "deploy.held": true,
+  "deploy.rolled_back": true,
+  "deploy.rollback_failed": true,
+  "agent.needs_you": true,
+  "agent.finished": true,
+  "agent.stopped": true,
+  "agent.paused": true,
+} satisfies Record<ServerEvent["type"], true>;
 
 class EventStream {
   private ws: WebSocket | null = null;
@@ -113,13 +191,15 @@ class EventStream {
       this.wasOpen = true;
     };
     ws.onmessage = (msg) => {
-      if (typeof msg.data !== "string") return;
-      let ev: ServerEvent;
-      try {
-        ev = JSON.parse(msg.data) as ServerEvent;
-      } catch {
+      // Applied only when it reads as one of the socket's frames; else the server, which sent it, is told.
+      const read = typeof msg.data === "string" ? readFrame<ServerEvent>(msg.data, "type", EVENT_FRAMES) : unread("", "a binary frame: the events socket sends text");
+      if ("unread" in read) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(read.unread satisfies UnreadFrame));
         return;
       }
+      const ev = read.frame;
+      // What the server couldn't read of what this page sent: noted there, nothing to apply here.
+      if (ev.type === "refused") return;
       this.snap = { ...this.snap, lastMessageAt: Date.now() };
       this.handlers.forEach((h) => {
         try {

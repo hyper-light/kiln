@@ -158,13 +158,31 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   letter-spacing: -0.025em;
   overflow-wrap: anywhere;
 }
-/* The clock has a quiet row of its own. Keep its place between turns so the conversation stays put. */
+/* The clock has a quiet row of its own. Keep its place between turns so the conversation stays put.
+   The flag for refused messages sits at its end, so it comes and goes without moving anything. */
 .ag-clock-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   height: 18px;
   margin-top: 6px;
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 18px;
+}
+/* A larger target than the row is tall, without making it taller. */
+.ag-refused {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  margin: -3px 0 -3px auto;
+  color: var(--color-fail);
+}
+.ag-refused:hover,
+.ag-refused[aria-expanded="true"] {
+  color: #ecc9cb;
 }
 /* The clock's column stays fixed as the number of digits changes. */
 .ag-turn-time {
@@ -1382,6 +1400,78 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   }
 }
 :root[data-motion="paused"] .ag-head .hx-usage-panel {
+  animation: none;
+}
+
+/* ---------------------------------------------------------------- refused messages: the flag opens them in place */
+/* How many by wire and code, then a row each, the newest first: when, the wire and code, what and why. */
+.ag-refused-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 720px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #1d1f23;
+  animation: ag-usage-in 0.12s ease-out;
+}
+.ag-refused-counts {
+  margin: 0;
+  color: var(--color-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+.ag-refused-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ag-refused-row {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 10rem) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  min-height: 22px;
+  font-size: 12px;
+}
+.ag-refused-at {
+  color: var(--color-subtle);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ag-refused-wire {
+  overflow: hidden;
+  color: var(--color-fail);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ag-refused-why {
+  color: var(--color-foreground);
+  overflow-wrap: anywhere;
+}
+/* A phone: what and why under when and the wire, the whole width. */
+@container (max-width: 520px) {
+  .ag-refused-row {
+    grid-template-columns: 4.5rem minmax(0, 1fr);
+    gap: 2px 10px;
+  }
+  .ag-refused-why {
+    grid-column: 1 / -1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ag-refused-list {
+    animation: none;
+  }
+}
+:root[data-motion="paused"] .ag-refused-list {
   animation: none;
 }
 

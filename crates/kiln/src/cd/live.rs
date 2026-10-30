@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use super::Cd;
 use super::kube::Cluster;
 use super::ops::Fail;
-use crate::http::ws::{self, Message};
+use crate::http::ws;
 use crate::wire::ui::{CdLogDown, CdLogLine};
 
 /// How long a list or a tree is reused.
@@ -553,7 +553,7 @@ pub async fn logs(c: &Cluster, pods: &[&Node], q: &LogQuery) -> (Vec<CdLogLine>,
 /// Streams some pods' logs as they are written to a WebSocket, as [`CdLogDown`]s:
 /// `{type: "lines", lines: [{pod, ts, text}]}`, `{type: "error", pod, message}`, and
 /// `{type: "end"}` once every log has ended. Closing the socket stops it.
-pub async fn follow(c: Arc<Cluster>, pods: Vec<(String, String, String)>, q: LogQuery, socket: ws::WebSocket) -> anyhow::Result<()> {
+pub async fn follow(hub: &crate::hub::Hub, sock: &crate::wire::ui::Socket, c: Arc<Cluster>, pods: Vec<(String, String, String)>, q: LogQuery, socket: ws::WebSocket) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     enum Ev {
         Data(usize, bytes::Bytes),
@@ -592,14 +592,12 @@ pub async fn follow(c: Arc<Cluster>, pods: Vec<(String, String, String)>, q: Log
     let mut partial: Vec<String> = vec![String::new(); pods.len()];
     while open > 0 {
         futures::select_biased! {
-            msg = rx.next().fuse() => match msg {
-                Some(Ok(Message::Close(_))) => {
+            msg = rx.next().fuse() => {
+                if hub.unread_only(sock, &mut tx, crate::wire::ui::came(msg), |r| CdLogDown::Refused(r).text()).await? {
                     tx.close(None).await.ok();
                     return Ok(());
                 }
-                None | Some(Err(_)) => return Ok(()),
-                _ => {}
-            },
+            }
             ev = all.next().fuse() => match ev {
                 Some(Ev::Data(i, b)) => {
                     let Some(buf) = partial.get_mut(i) else { continue };
@@ -631,4 +629,125 @@ pub async fn follow(c: Arc<Cluster>, pods: Vec<(String, String, String)>, q: Log
     tx.send(ws::text(CdLogDown::End.text())).await?;
     tx.close(None).await.ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::server::{Request, Response};
+    use crate::http::ws::Message;
+
+    /// A stand-in for Kubernetes's API whose pods' logs follow without end: a line each, then
+    /// nothing more while the test runs.
+    #[derive(Default)]
+    struct Pods {
+        logs: Mutex<Vec<async_channel::Sender<bytes::Bytes>>>,
+    }
+
+    impl crate::http::server::Handler for Pods {
+        async fn handle(self: Arc<Self>, _req: Request) -> Response {
+            let (tx, rx) = async_channel::unbounded();
+            let _ = tx.try_send(bytes::Bytes::from_static(b"2026-10-27T00:00:00.000000000Z started\n"));
+            self.logs.lock().push(tx);
+            crate::http::server::response(StatusCode::OK, "text/plain", crate::http::server::channel_body(rx))
+        }
+    }
+
+    /// A deployment's log socket, as `follow_logs` serves it: a pod of `cluster`'s followed, what
+    /// comes up noted from the person `user:deploy`. Its limit is small, for a frame past it.
+    struct Follows {
+        hub: Arc<crate::hub::Hub>,
+        cluster: Arc<Cluster>,
+    }
+
+    impl crate::http::server::Handler for Follows {
+        async fn handle(self: Arc<Self>, req: Request) -> Response {
+            use crate::wire::unread::Wire;
+            let (resp, upgrade) = match ws::accept_limited(req, 4096) {
+                Ok(a) => a,
+                Err(r) => return crate::http::server::text(r.status, r.reason),
+            };
+            crate::rt::spawn(async move {
+                let Ok(socket) = upgrade.await else { return };
+                let sock = crate::wire::ui::Socket::of(Wire::LogUp, Wire::LogDown, "user:deploy", None);
+                let pods = vec![("ns".to_owned(), "web-1".to_owned(), "web".to_owned())];
+                let _ = follow(&self.hub, &sock, Arc::clone(&self.cluster), pods, LogQuery::from_json(&json!({})), socket).await;
+            });
+            resp
+        }
+    }
+
+    /// An HTTP port of `handler`'s.
+    fn http_server<H: crate::http::server::Handler>(handler: Arc<H>) -> anyhow::Result<std::net::SocketAddr> {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let at = tcp.local_addr()?;
+        let tcp = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(tcp), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::rt::spawn(async move {
+            while let Ok(stream) = tcp.accept().await {
+                let (h, remote) = (Arc::clone(&handler), stream.peer_addr().ok());
+                crate::rt::spawn(crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), h, remote));
+            }
+        });
+        Ok(at)
+    }
+
+    /// Typed messages, step 6: a deployment's log socket answers what it can't read with a
+    /// `refused` frame, closes with 1009 past its limit, and notes each from its person.
+    #[test]
+    fn a_deployments_log_socket_answers_what_it_cant_read_and_notes_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let pods = Arc::new(Pods::default());
+            let api = http_server(Arc::clone(&pods))?;
+            let endpoint = kiln_cd::kube::Endpoint { server: format!("http://{api}"), ca: None, insecure: false, tls_server_name: None, auth: kiln_cd::kube::Auth::None, namespace: None };
+            let cluster = Arc::new(Cluster::new("stand-in", endpoint)?);
+            let at = http_server(Arc::new(Follows { hub: Arc::clone(&hub), cluster }))?;
+            let socket = crate::http::client::Client::public()?.websocket(&format!("http://{at}/logs"), 1 << 20).await?;
+            let (mut tx, mut rx) = socket.split();
+            // The next frame that says what couldn't be read, or the close that ended the socket.
+            let mut next = async || -> anyhow::Result<Value> {
+                loop {
+                    match crate::rt::timeout(Duration::from_secs(10), rx.next()).await.map_err(|_| anyhow::anyhow!("nothing came in 10 s"))? {
+                        Some(Ok(Message::Text(t))) => {
+                            let v: Value = serde_json::from_str(t.as_str())?;
+                            if v.get("type").and_then(Value::as_str) == Some("refused") {
+                                return Ok(v);
+                            }
+                        }
+                        Some(Ok(Message::Close(c))) => return Ok(json!({"closed": c.map(|c| u16::from(c.code))})),
+                        Some(Ok(_)) => {}
+                        other => anyhow::bail!("the socket ended: {other:?}"),
+                    }
+                }
+            };
+            let said = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned).unwrap_or_default();
+            tx.send(ws::text("not json")).await?;
+            let got = next().await?;
+            assert_eq!((said(&got, "of"), said(&got, "code")), ("text".into(), "malformed".into()), "{got}");
+            tx.send(ws::text(r#"{"t":"hologram"}"#)).await?;
+            let got = next().await?;
+            assert_eq!((said(&got, "of"), said(&got, "code"), said(&got, "why")), ("hologram".into(), "unknown".into(), "no frame hologram".into()), "{got}");
+            tx.send(ws::binary(vec![0u8, 1, 2])).await?;
+            let got = next().await?;
+            assert_eq!((said(&got, "of"), said(&got, "code")), ("binary".into(), "malformed".into()), "{got}");
+            // A frame the page couldn't read of what came down: noted, answered nothing (the next
+            // thing that comes is the close of one past the socket's limit).
+            tx.send(ws::text(r#"{"t":"unread","of":"hologram","why":"unknown frame"}"#)).await?;
+            tx.send(ws::text("x".repeat(5000))).await?;
+            assert_eq!(next().await?, json!({"closed": 1009}));
+            // Each noted from the person: audited, the first of each wire and code at once.
+            let rows: Vec<(String, String)> = hub
+                .store
+                .call(|c| {
+                    let mut st = c.prepare("SELECT target, result FROM audit2 WHERE action = 'security.wire_refused' AND principal = 'user:deploy' ORDER BY target, result")?;
+                    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .await?;
+            let want = [("log_down", "unknown"), ("log_up", "malformed"), ("log_up", "unknown")].map(|(w, c)| (w.to_owned(), c.to_owned()));
+            assert_eq!(rows, want);
+            drop(pods);
+            Ok(())
+        })
+    }
 }

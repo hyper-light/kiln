@@ -608,18 +608,22 @@ impl NetMetrics {
 /// and its runner's or agent's page say that.
 pub struct WireMetrics {
     pub refused: CounterVec,
+    /// Fields this build doesn't know in payloads it read, taken (`crate::wire::payload`), by
+    /// `wire`: one for each such field of each message.
+    pub ignored: CounterVec,
 }
 
 pub fn wire() -> &'static WireMetrics {
     static M: OnceLock<WireMetrics> = OnceLock::new();
     M.get_or_init(|| {
-        let refused = CounterVec::new(&["wire", "code"]);
-        for w in crate::wire::unread::Wire::ALL {
+        let (refused, ignored) = (CounterVec::new(&["wire", "code"]), CounterVec::new(&["wire"]));
+        for w in crate::wire::WIRES {
             for c in crate::wire::unread::Code::ALL {
                 refused.add(&[w.name(), c.name()], 0);
             }
+            ignored.add(&[w.name()], 0);
         }
-        WireMetrics { refused }
+        WireMetrics { refused, ignored }
     })
 }
 
@@ -629,6 +633,11 @@ fn render_wire(o: &mut String) {
         "# HELP kiln_wire_refused_total Messages kiln couldn't read, refused, by wire and code (unknown, malformed).\n# TYPE kiln_wire_refused_total counter"
     );
     wire().refused.render(o, "kiln_wire_refused_total");
+    let _ = writeln!(
+        o,
+        "# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each message.\n# TYPE kiln_wire_ignored_fields_total counter"
+    );
+    wire().ignored.render(o, "kiln_wire_ignored_fields_total");
 }
 
 pub fn net() -> &'static NetMetrics {
@@ -866,9 +875,9 @@ mod tests {
         let text = render();
         assert!(text.contains("# TYPE kiln_wire_refused_total counter\n"), "{text}");
         let series = text.lines().filter(|l| l.starts_with("kiln_wire_refused_total{")).count();
-        assert_eq!(series, crate::wire::unread::Wire::ALL.len() * crate::wire::unread::Code::ALL.len());
+        assert_eq!(series, crate::wire::WIRES.len() * crate::wire::unread::Code::ALL.len());
         assert!(series <= 200, "{series} series: past the budget for one family");
-        for w in crate::wire::unread::Wire::ALL {
+        for w in crate::wire::WIRES {
             for c in crate::wire::unread::Code::ALL {
                 let line = format!("kiln_wire_refused_total{{wire=\"{}\",code=\"{}\"}} ", w.name(), c.name());
                 assert!(text.contains(&line), "{line}");

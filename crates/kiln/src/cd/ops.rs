@@ -49,7 +49,7 @@ pub struct Op {
     /// It can delete or overwrite something.
     pub destructive: bool,
     /// Its input's JSON Schema.
-    pub input: fn() -> Value,
+    pub input: crate::ops::Input,
     pub(crate) run: fn(Cx, Value) -> Fut,
 }
 
@@ -59,43 +59,6 @@ fn bad(msg: impl Into<String>) -> Fail {
 
 fn missing(msg: impl Into<String>) -> Fail {
     (StatusCode::NOT_FOUND, msg.into())
-}
-
-fn obj_schema(props: Value, required: &[&str]) -> Value {
-    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
-}
-
-const APP: &str = "The app's id, `project/name` (a bare name means the default project).";
-
-fn app_only() -> Value {
-    obj_schema(json!({"app": {"type": "string", "description": APP}}), &["app"])
-}
-
-fn selector_props() -> Value {
-    json!({
-        "project": {"type": "string", "description": "A project; several separated by commas."},
-        "cluster": {"type": "string", "description": "A cluster; several separated by commas."},
-        "namespace": {"type": "string", "description": "A destination namespace; several separated by commas."},
-        "environment": {"type": "string"},
-        "sync": {"type": "string", "description": "Synced, OutOfSync or Unknown; several separated by commas."},
-        "health": {"type": "string", "description": "Healthy, Progressing, Degraded, Suspended, Missing or Unknown; several separated by commas."},
-        "q": {"type": "string", "description": "A part of the app's id (any case)."},
-        "labels": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Labels the app must have, all of them."}
-    })
-}
-
-fn res_props() -> serde_json::Map<String, Value> {
-    let mut m = serde_json::Map::new();
-    m.insert("app".into(), json!({"type": "string", "description": APP}));
-    m.insert("group".into(), json!({"type": "string", "description": "API group; empty for the core group."}));
-    m.insert("kind".into(), json!({"type": "string"}));
-    m.insert("namespace".into(), json!({"type": "string", "description": "Empty for cluster-scoped objects."}));
-    m.insert("name".into(), json!({"type": "string"}));
-    m
-}
-
-fn res_only() -> Value {
-    obj_schema(Value::Object(res_props()), &["app", "kind", "name"])
 }
 
 macro_rules! op {
@@ -110,178 +73,641 @@ pub fn ops() -> &'static [Op] {
     OPS.get_or_init(|| {
         vec![
             op!("cd.summary", "Counts of apps by sync and health, and of clusters.", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: summary),
+                input: crate::ops::Input::of::<input::CdSummary>(), run: summary),
             op!("cd.apps.list", "Apps matching filters, a page at a time (cursor), each with sync, health, resources and what differs.", ro: true, destructive: false,
-                input: || {
-                    let mut p = selector_props();
-                    if let Some(m) = p.as_object_mut() {
-                        m.insert("limit".into(), json!({"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}));
-                        m.insert("cursor".into(), json!({"type": "string", "description": "The `next` of the previous page."}));
-                        m.insert("sort".into(), json!({"type": "string", "enum": ["name", "health", "sync", "deployed"], "default": "name",
-                            "description": "By id; worst health first; out of sync first; most recently deployed first."}));
-                    }
-                    obj_schema(p, &[])
-                }, run: list),
+                input: crate::ops::Input::of::<input::CdAppsList>(), run: list),
             op!("cd.apps.facets", "How many apps each filter value would show (sync, health, cluster, project, namespace), given the other filters chosen, and how many match all of them.", ro: true, destructive: false,
-                input: || obj_schema(selector_props(), &[]), run: facets),
+                input: crate::ops::Input::of::<input::CdAppsFacets>(), run: facets),
             op!("cd.apps.get", "One app: definition, status, the last sync, source commits (the revision's author, time and message), children.", ro: true, destructive: false,
-                input: app_only, run: get),
+                input: crate::ops::Input::of::<input::CdAppsGet>(), run: get),
             op!("cd.apps.tree", "An app's resource tree: its objects and every live object they own (ReplicaSets, Pods, Jobs, EndpointSlices…), each with uid, parents, health, sync (managed ones), age, ready counts, restarts, images and info. Read from the cluster, kept a few seconds.", ro: true, destructive: false,
-                input: || obj_schema(json!({"app": {"type": "string", "description": APP}, "fresh": {"type": "boolean", "description": "Read the cluster now rather than within the last few seconds."}}), &["app"]),
+                input: crate::ops::Input::of::<input::CdAppsTree>(),
                 run: tree),
             op!("cd.apps.manifests", "The manifests an app renders now, as kiln applies them (Secrets masked).", ro: true, destructive: false,
-                input: app_only, run: manifests),
+                input: crate::ops::Input::of::<input::CdAppsManifests>(), run: manifests),
             op!("cd.apps.resource", "One object of an app's tree in depth: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. Secrets are masked.", ro: true, destructive: false,
-                input: res_only, run: resource),
+                input: crate::ops::Input::of::<input::CdAppsResource>(), run: resource),
             op!("cd.apps.resource_events", "An object's Kubernetes events, newest first.", ro: true, destructive: false,
-                input: res_only, run: resource_events),
+                input: crate::ops::Input::of::<input::CdAppsResourceEvents>(), run: resource_events),
             op!("cd.apps.resource_logs", "The last lines of a pod's log, or of the pods of a workload (merged by time, each line with its pod). Follow a log over `GET /api/cd/apps/:app/resources/:key/logs/ws`.", ro: true, destructive: false,
-                input: || {
-                    let mut m = res_props();
-                    m.insert("container".into(), json!({"type": "string", "description": "The container; the pod's first when not given."}));
-                    m.insert("pod".into(), json!({"type": "string", "description": "Only this pod of the workload."}));
-                    m.insert("tail_lines".into(), json!({"type": "integer", "minimum": 1, "maximum": 10000, "default": 500}));
-                    m.insert("since_seconds".into(), json!({"type": "integer", "minimum": 1}));
-                    m.insert("previous".into(), json!({"type": "boolean", "description": "The container's previous run (after a restart or crash)."}));
-                    obj_schema(Value::Object(m), &["app", "kind", "name"])
-                }, run: resource_logs),
+                input: crate::ops::Input::of::<input::CdAppsResourceLogs>(), run: resource_logs),
             op!("cd.apps.resources", "An app's resources, each with sync, health, and why it differs when it does.", ro: true, destructive: false,
-                input: || obj_schema(json!({"app": {"type": "string", "description": APP}, "out_of_sync": {"type": "boolean", "description": "Only those that differ."}}), &["app"]),
+                input: crate::ops::Input::of::<input::CdAppsResources>(),
                 run: resources),
             op!("cd.apps.diff", "What a sync would change in an app: per resource that differs, the live YAML, what applying git makes of it (`predicted`), and the unified hunks between them. Fields the cluster fills in itself don't show.", ro: true, destructive: false,
-                input: app_only, run: diff),
+                input: crate::ops::Input::of::<input::CdAppsDiff>(), run: diff),
             op!("cd.apps.history", "An app's deployments, newest first.", ro: true, destructive: false,
-                input: app_only, run: history),
+                input: crate::ops::Input::of::<input::CdAppsHistory>(), run: history),
             op!("cd.plans.get", "What a commit, or every diff of a stack, would deploy before it lands. For each app it touches: its own change (its render against the render of the diff below), the stack's change (against trunk), and the steps a sync would take against what runs, in order: what it creates, what it changes (live and predicted, with hunks), the hooks it runs, what it prunes and what Prune=false keeps. A diff fails when its sources can't be read or rendered, or it drops an object Prune=false keeps. Renders are kept by content, so planning again is cheap.", ro: true, destructive: false,
-                input: || {
-                    let mut p = selector_props();
-                    if let Some(m) = p.as_object_mut() {
-                        m.insert("repo".into(), json!({"type": "string", "description": "The repository, in any spelling of its URL; by default whichever of the apps' repositories has the commit."}));
-                        m.insert("commit".into(), json!({"type": "string", "description": "One commit (hash, branch or tag), planned against its first parent, or `base`."}));
-                        m.insert("head".into(), json!({"type": "string", "description": "A stack's top commit: every commit above `base` up to it is planned, bottom first."}));
-                        m.insert("base".into(), json!({"type": "string", "description": "The commit below the stack's bottom; by default where `head` leaves trunk."}));
-                        m.insert("trunk".into(), json!({"type": "string", "description": "The branch it lands on (only apps that follow it are planned); by default the repository's default branch."}));
-                        m.insert("pr".into(), json!({"type": "integer", "minimum": 1, "description": "A pull request: its head is fetched and planned as a stack."}));
-                        m.insert("brief".into(), json!({"type": "boolean", "description": "Counts and keys only, no hunks."}));
-                        m.insert("max_apps".into(), json!({"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}));
-                    }
-                    obj_schema(p, &[])
-                }, run: plan),
+                input: crate::ops::Input::of::<input::CdPlansGet>(), run: plan),
             op!("cd.plans.repos", "The repositories apps deploy from, for choosing what to plan: each with how many apps deploy from it, its default branch and its newest branches.", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: plan_repos),
+                input: crate::ops::Input::of::<input::CdPlansRepos>(), run: plan_repos),
             op!("cd.apps.sync", "Start a sync of an app (optionally only some resources, with pruning, as a dry run, with Argo CD sync options).", ro: false, destructive: true,
-                input: || obj_schema(json!({
-                    "app": {"type": "string", "description": APP},
-                    "prune": {"type": "boolean"},
-                    "dry_run": {"type": "boolean"},
-                    "resources": {"type": "array", "items": {"type": "object", "properties": {"group": {"type": "string"}, "kind": {"type": "string"}, "namespace": {"type": "string"}, "name": {"type": "string"}}, "required": ["kind", "name"]}},
-                    "options": {"type": "array", "items": {"type": "string"}, "description": "Argo CD sync options, e.g. `ServerSideApply=true`."}
-                }), &["app"]), run: sync),
+                input: crate::ops::Input::of::<input::CdAppsSync>(), run: sync),
             op!("cd.apps.sync_many", "Start a sync of every app a selector matches (at most `max`).", ro: false, destructive: true,
-                input: || {
-                    let mut p = selector_props();
-                    if let Some(m) = p.as_object_mut() {
-                        m.insert("prune".into(), json!({"type": "boolean"}));
-                        m.insert("dry_run".into(), json!({"type": "boolean"}));
-                        m.insert("max".into(), json!({"type": "integer", "minimum": 1, "maximum": 100000, "default": 1000}));
-                    }
-                    obj_schema(p, &[])
-                }, run: sync_many),
+                input: crate::ops::Input::of::<input::CdAppsSyncMany>(), run: sync_many),
             op!("cd.apps.refresh", "Compare an app again; `hard` renders it again too.", ro: false, destructive: false,
-                input: || obj_schema(json!({"app": {"type": "string", "description": APP}, "hard": {"type": "boolean"}}), &["app"]), run: refresh),
+                input: crate::ops::Input::of::<input::CdAppsRefresh>(), run: refresh),
             op!("cd.apps.refresh_many", "Compare again every app a selector matches.", ro: false, destructive: false,
-                input: || {
-                    let mut p = selector_props();
-                    if let Some(m) = p.as_object_mut() {
-                        m.insert("hard".into(), json!({"type": "boolean"}));
-                    }
-                    obj_schema(p, &[])
-                }, run: refresh_many),
-            op!("cd.apps.terminate", "Stop an app's running sync.", ro: false, destructive: false, input: app_only, run: terminate),
+                input: crate::ops::Input::of::<input::CdAppsRefreshMany>(), run: refresh_many),
+            op!("cd.apps.terminate", "Stop an app's running sync.", ro: false, destructive: false, input: crate::ops::Input::of::<input::CdAppsTerminate>(), run: terminate),
             op!("cd.apps.take_over", "Stop shadowing an app adopted from Argo CD: kiln syncs it from now on.", ro: false, destructive: false,
-                input: app_only, run: take_over),
+                input: crate::ops::Input::of::<input::CdAppsTakeOver>(), run: take_over),
             op!("cd.apps.rollback", "Roll an app back to an earlier deployment that succeeded: by its id (`to`), or by what it ran (`revision`: a commit, 7 or more of its first hex digits, a tag of the app's git sources, or a chart version as recorded); by default the one before what runs now. kiln renders that deployment's commits again and syncs them; the app holds there until git changes it, then follows git again. cd.apps.rollback_targets lists what it can go back to.", ro: false, destructive: true,
-                input: || obj_schema(json!({
-                    "app": {"type": "string", "description": APP},
-                    "to": {"type": "integer", "minimum": 1, "description": "The deployment's id (cd.apps.history, cd.apps.rollback_targets)."},
-                    "revision": {"type": "string", "description": "What the deployment ran: a commit (whole, or 7 or more of its first hex digits), a tag, or a revision as recorded (a chart's version). Not with `to`."},
-                    "prune": {"type": "boolean", "description": "Also delete what that deployment didn't have."}
-                }), &["app"]), run: rollback),
+                input: crate::ops::Input::of::<input::CdAppsRollback>(), run: rollback),
             op!("cd.apps.rollback_targets", "What an app can be rolled back to, newest first: each deployment that succeeded and can be rendered again (what runs now and repeats of one render left out), with its commit (author, time, the whole message) and the tags that name it; and what runs now.", ro: true, destructive: false,
-                input: app_only, run: rollback_targets),
+                input: crate::ops::Input::of::<input::CdAppsRollbackTargets>(), run: rollback_targets),
             op!("cd.apps.follow", "Let a rolled-back app follow git again (an automatic app then deploys what git says).", ro: false, destructive: false,
-                input: app_only, run: follow),
+                input: crate::ops::Input::of::<input::CdAppsFollow>(), run: follow),
             op!("cd.apps.auto_rollback", "Whether kiln goes back on its own when one of an app's deploys fails (its rollout aborts, kiln's own restart doesn't take, a release fails after its commit), and who said so: `from` is `app` (set for it), `repo` (set for its repository), `deploy-file` (its rollout's `auto-rollback`) or `default` (on).", ro: true, destructive: false,
-                input: app_only, run: auto_rollback),
+                input: crate::ops::Input::of::<input::CdAppsAutoRollback>(), run: auto_rollback),
             op!("cd.apps.set_auto_rollback", "Turn auto-rollback on or off for one app (`on`: true or false), or clear it (`on`: null) to follow its repository's, then its deploy file's. The app's word beats both.", ro: false, destructive: false,
-                input: || obj_schema(json!({
-                    "app": {"type": "string", "description": APP},
-                    "on": {"type": ["boolean", "null"], "description": "true, false, or null to clear."}
-                }), &["app", "on"]), run: set_auto_rollback),
+                input: crate::ops::Input::of::<input::CdAppsSetAutoRollback>(), run: set_auto_rollback),
             op!("cd.repos.auto_rollback", "Auto-rollback by repository: every repository apps deploy from and every one people set it for, each with its setting (null: not set) and how many apps follow it.", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: repo_auto_rollbacks),
+                input: crate::ops::Input::of::<input::CdReposAutoRollback>(), run: repo_auto_rollbacks),
             op!("cd.repos.set_auto_rollback", "Turn auto-rollback on or off for every app a repository deploys (`on`: true or false), or clear it (`on`: null). An app's own setting beats its repository's. A person's to change.", ro: false, destructive: false,
-                input: || obj_schema(json!({
-                    "repo": {"type": "string", "description": "The repository's URL, as apps name it (cd.repos.auto_rollback lists them)."},
-                    "on": {"type": ["boolean", "null"], "description": "true, false, or null to clear."}
-                }), &["repo", "on"]), run: set_repo_auto_rollback),
+                input: crate::ops::Input::of::<input::CdReposSetAutoRollback>(), run: set_repo_auto_rollback),
             op!("cd.apps.rollout", "An app's rollouts on targets beyond Kubernetes (docs/cd-targets.md §5), the one under way first: each with where it stands (state, green's share, the step it's at), its steps, its checks and what they measured, what happened, and the approvals it waits for.", ro: true, destructive: false,
-                input: app_only, run: rollouts),
+                input: crate::ops::Input::of::<input::CdAppsRollout>(), run: rollouts),
             op!("cd.apps.rollout_act", "Act on an app's rollout: `promote` it past the step it waits at (`full`: past every step and check), `pause` or `resume` it, `abort` it (traffic back to blue; with auto-rollback the app goes back to the deployment before), `retry` an aborted one from its first step, or `approve` or `deny` an approval check it waits for (`check`).", ro: false, destructive: true,
-                input: || obj_schema(json!({
-                    "app": {"type": "string", "description": APP},
-                    "action": {"type": "string", "enum": ["promote", "pause", "resume", "abort", "retry", "approve", "deny"]},
-                    "full": {"type": "boolean", "description": "promote: past every step and check at once."},
-                    "check": {"type": "string", "description": "approve, deny: the approval check."},
-                    "reason": {"type": "string", "description": "abort: why, for the rollout's record."},
-                    "rollout": {"type": "string", "description": "Which rollout, by id (cd.apps.rollout), when the app has more than one under way."}
-                }), &["app", "action"]), run: rollout_act),
+                input: crate::ops::Input::of::<input::CdAppsRolloutAct>(), run: rollout_act),
             op!("cd.apps.create", "Create or replace an app kept in kiln (an AppDef).", ro: false, destructive: true,
-                input: || obj_schema(json!({"definition": {"type": "object", "description": "The app: name, project, sources, destination, sync, ignore, tracking."}}), &["definition"]),
+                input: crate::ops::Input::of::<input::CdAppsCreate>(),
                 run: create),
             op!("cd.apps.delete", "Delete an app; its objects too unless `cascade` is `orphan`.", ro: false, destructive: true,
-                input: || obj_schema(json!({"app": {"type": "string", "description": APP}, "cascade": {"type": "string", "enum": ["foreground", "background", "orphan"]}}), &["app"]),
+                input: crate::ops::Input::of::<input::CdAppsDelete>(),
                 run: delete),
             op!("cd.import", "Import Argo CD manifests (Applications), which start in shadow mode.", ro: false, destructive: false,
-                input: || obj_schema(json!({"manifests": {"type": "string", "description": "YAML or JSON, any number of documents."}}), &["manifests"]),
+                input: crate::ops::Input::of::<input::CdImport>(),
                 run: import),
             op!("cd.clusters.list", "Clusters: connection, version, kinds served, labels.", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: clusters),
+                input: crate::ops::Input::of::<input::CdClustersList>(), run: clusters),
             op!("cd.clusters.add", "Add a cluster from a kubeconfig context on the server.", ro: false, destructive: false,
-                input: || obj_schema(json!({"name": {"type": "string"}, "context": {"type": "string"}, "kubeconfig": {"type": "string"},
-                    "labels": {"type": "object", "additionalProperties": {"type": "string"}}}), &["name", "context"]),
+                input: crate::ops::Input::of::<input::CdClustersAdd>(),
                 run: add_cluster),
             op!("cd.clusters.remove", "Remove a cluster no app deploys to.", ro: false, destructive: true,
-                input: || obj_schema(json!({"name": {"type": "string"}}), &["name"]), run: remove_cluster),
+                input: crate::ops::Input::of::<input::CdClustersRemove>(), run: remove_cluster),
             op!("cd.repos.list", "Repositories with credentials (secrets never shown).", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: repos),
+                input: crate::ops::Input::of::<input::CdReposList>(), run: repos),
             op!("cd.repos.add", "Add credentials for a repository or URL prefix.", ro: false, destructive: false,
-                input: || obj_schema(json!({"url": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string"}, "insecure": {"type": "boolean"}}), &["url"]),
+                input: crate::ops::Input::of::<input::CdReposAdd>(),
                 run: add_repo),
             op!("cd.repos.remove", "Remove a repository's credentials.", ro: false, destructive: true,
-                input: || obj_schema(json!({"url": {"type": "string"}}), &["url"]), run: remove_repo),
+                input: crate::ops::Input::of::<input::CdReposRemove>(), run: remove_repo),
             op!("cd.providers.list", "Every provider kiln deploys with (docs/cd-targets.md §3): its kinds, settings, place, capabilities, whether it's built, and the accounts (integrations) that could serve it.", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: super::targets::api::providers),
+                input: crate::ops::Input::of::<input::CdProvidersList>(), run: super::targets::api::providers),
             op!("cd.targets.list", "The targets beyond Kubernetes apps deploy to (provider, account, place), each with its connection, its error if it can't be reached, and its apps.", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: super::targets::api::targets),
+                input: crate::ops::Input::of::<input::CdTargetsList>(), run: super::targets::api::targets),
             op!("cd.discover", "What an account holds on a provider (ECS clusters and services, Lambda functions, …), for building or importing an app; with `name` (and `scope`, an ECS cluster), that one resource and the definition that adopts it as it runs.", ro: true, destructive: false,
-                input: || obj_schema(json!({"provider": {"type": "string"}, "account": {"type": "string", "description": "The integration it acts through."},
-                    "region": {"type": "string"}, "project": {"type": "string"}, "zone": {"type": "string"}, "subscription": {"type": "string"}, "resource-group": {"type": "string"},
-                    "environment": {"type": "string"}, "scope": {"type": "string"}, "name": {"type": "string"}}), &["provider", "account"]),
+                input: crate::ops::Input::of::<input::CdDiscover>(),
                 run: super::targets::api::discover),
             op!("cd.validate", "A deploy file (and environments file) checked as kiln reads them: each app with where it deploys and, for a provider's app, the objects it renders now from `repo`'s files at trunk, its artifacts resolved.", ro: true, destructive: false,
-                input: || obj_schema(json!({"deploy": {"type": "string"}, "environments": {"type": "string"}, "repo": {"type": "string", "description": "A kiln repository (owner/name) whose files renders read."}}), &["deploy"]),
+                input: crate::ops::Input::of::<input::CdValidate>(),
                 run: super::targets::api::validate),
             op!("cd.apps.keep", "Keep in kiln the apps a deploy file (and environments file) defines, rather than in the repository: they read `repo`'s files as any app does, and are marked as kiln's own.", ro: false, destructive: false,
-                input: || obj_schema(json!({"deploy": {"type": "string"}, "environments": {"type": "string"}, "repo": {"type": "string"}}), &["deploy", "repo"]),
+                input: crate::ops::Input::of::<input::CdAppsKeep>(),
                 run: super::targets::api::keep),
             op!("cd.images.list", "Where each image kiln publishes lives: the local Docker that builds it (the default), or a registry repository.", ro: true, destructive: false,
-                input: || obj_schema(json!({}), &[]), run: images_list),
+                input: crate::ops::Input::of::<input::CdImagesList>(), run: images_list),
             op!("cd.images.set", "Set where a published image lives: `local`, or a registry `repository` (with the `integration` that pulls it).", ro: false, destructive: false,
-                input: || obj_schema(json!({"name": {"type": "string"}, "kind": {"type": "string", "enum": ["local", "registry"]}, "repository": {"type": "string"}, "integration": {"type": "string"}}), &["name", "kind"]),
+                input: crate::ops::Input::of::<input::CdImagesSet>(),
                 run: images_set),
         ]
     })
+}
+
+/// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
+/// its type, each field's description from its doc comment.
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdSummary {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CdAppsListSort {
+        Name,
+        Health,
+        Sync,
+        Deployed,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsList {
+        /// A project; several separated by commas.
+        pub project: Option<String>,
+        /// A cluster; several separated by commas.
+        pub cluster: Option<String>,
+        /// A destination namespace; several separated by commas.
+        pub namespace: Option<String>,
+        pub environment: Option<String>,
+        /// Synced, OutOfSync or Unknown; several separated by commas.
+        pub sync: Option<String>,
+        /// Healthy, Progressing, Degraded, Suspended, Missing or Unknown; several separated by
+        /// commas.
+        pub health: Option<String>,
+        /// A part of the app's id (any case).
+        pub q: Option<String>,
+        /// Labels the app must have, all of them.
+        #[schemars(extend("additionalProperties" = {"type": "string"}))]
+        pub labels: Option<serde_json::Map<String, serde_json::Value>>,
+        #[schemars(extend("default" = 200))]
+        #[schemars(range(min = 1, max = 1000))]
+        pub limit: Option<i64>,
+        /// The `next` of the previous page.
+        pub cursor: Option<String>,
+        /// By id; worst health first; out of sync first; most recently deployed first.
+        #[schemars(extend("default" = "name"))]
+        pub sort: Option<CdAppsListSort>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsFacets {
+        /// A project; several separated by commas.
+        pub project: Option<String>,
+        /// A cluster; several separated by commas.
+        pub cluster: Option<String>,
+        /// A destination namespace; several separated by commas.
+        pub namespace: Option<String>,
+        pub environment: Option<String>,
+        /// Synced, OutOfSync or Unknown; several separated by commas.
+        pub sync: Option<String>,
+        /// Healthy, Progressing, Degraded, Suspended, Missing or Unknown; several separated by
+        /// commas.
+        pub health: Option<String>,
+        /// A part of the app's id (any case).
+        pub q: Option<String>,
+        /// Labels the app must have, all of them.
+        #[schemars(extend("additionalProperties" = {"type": "string"}))]
+        pub labels: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsGet {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsTree {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// Read the cluster now rather than within the last few seconds.
+        pub fresh: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsManifests {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsResource {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// API group; empty for the core group.
+        pub group: Option<String>,
+        pub kind: String,
+        /// Empty for cluster-scoped objects.
+        pub namespace: Option<String>,
+        pub name: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsResourceEvents {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// API group; empty for the core group.
+        pub group: Option<String>,
+        pub kind: String,
+        /// Empty for cluster-scoped objects.
+        pub namespace: Option<String>,
+        pub name: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsResourceLogs {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// API group; empty for the core group.
+        pub group: Option<String>,
+        pub kind: String,
+        /// Empty for cluster-scoped objects.
+        pub namespace: Option<String>,
+        pub name: String,
+        /// The container; the pod's first when not given.
+        pub container: Option<String>,
+        /// Only this pod of the workload.
+        pub pod: Option<String>,
+        #[schemars(extend("default" = 500))]
+        #[schemars(range(min = 1, max = 10000))]
+        pub tail_lines: Option<i64>,
+        #[schemars(range(min = 1))]
+        pub since_seconds: Option<i64>,
+        /// The container's previous run (after a restart or crash).
+        pub previous: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsResources {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// Only those that differ.
+        pub out_of_sync: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsDiff {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsHistory {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdPlansGet {
+        /// A project; several separated by commas.
+        pub project: Option<String>,
+        /// A cluster; several separated by commas.
+        pub cluster: Option<String>,
+        /// A destination namespace; several separated by commas.
+        pub namespace: Option<String>,
+        pub environment: Option<String>,
+        /// Synced, OutOfSync or Unknown; several separated by commas.
+        pub sync: Option<String>,
+        /// Healthy, Progressing, Degraded, Suspended, Missing or Unknown; several separated by
+        /// commas.
+        pub health: Option<String>,
+        /// A part of the app's id (any case).
+        pub q: Option<String>,
+        /// Labels the app must have, all of them.
+        #[schemars(extend("additionalProperties" = {"type": "string"}))]
+        pub labels: Option<serde_json::Map<String, serde_json::Value>>,
+        /// The repository, in any spelling of its URL; by default whichever of the apps'
+        /// repositories has the commit.
+        pub repo: Option<String>,
+        /// One commit (hash, branch or tag), planned against its first parent, or `base`.
+        pub commit: Option<String>,
+        /// A stack's top commit: every commit above `base` up to it is planned, bottom first.
+        pub head: Option<String>,
+        /// The commit below the stack's bottom; by default where `head` leaves trunk.
+        pub base: Option<String>,
+        /// The branch it lands on (only apps that follow it are planned); by default the
+        /// repository's default branch.
+        pub trunk: Option<String>,
+        /// A pull request: its head is fetched and planned as a stack.
+        #[schemars(range(min = 1))]
+        pub pr: Option<i64>,
+        /// Counts and keys only, no hunks.
+        pub brief: Option<bool>,
+        #[schemars(extend("default" = 200))]
+        #[schemars(range(min = 1, max = 5000))]
+        pub max_apps: Option<i64>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdPlansRepos {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct CdAppsSyncResource {
+        pub group: Option<String>,
+        pub kind: String,
+        pub namespace: Option<String>,
+        pub name: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsSync {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        pub prune: Option<bool>,
+        pub dry_run: Option<bool>,
+        pub resources: Option<Vec<CdAppsSyncResource>>,
+        /// Argo CD sync options, e.g. `ServerSideApply=true`.
+        pub options: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsSyncMany {
+        /// A project; several separated by commas.
+        pub project: Option<String>,
+        /// A cluster; several separated by commas.
+        pub cluster: Option<String>,
+        /// A destination namespace; several separated by commas.
+        pub namespace: Option<String>,
+        pub environment: Option<String>,
+        /// Synced, OutOfSync or Unknown; several separated by commas.
+        pub sync: Option<String>,
+        /// Healthy, Progressing, Degraded, Suspended, Missing or Unknown; several separated by
+        /// commas.
+        pub health: Option<String>,
+        /// A part of the app's id (any case).
+        pub q: Option<String>,
+        /// Labels the app must have, all of them.
+        #[schemars(extend("additionalProperties" = {"type": "string"}))]
+        pub labels: Option<serde_json::Map<String, serde_json::Value>>,
+        pub prune: Option<bool>,
+        pub dry_run: Option<bool>,
+        #[schemars(extend("default" = 1000))]
+        #[schemars(range(min = 1, max = 100000))]
+        pub max: Option<i64>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsRefresh {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        pub hard: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsRefreshMany {
+        /// A project; several separated by commas.
+        pub project: Option<String>,
+        /// A cluster; several separated by commas.
+        pub cluster: Option<String>,
+        /// A destination namespace; several separated by commas.
+        pub namespace: Option<String>,
+        pub environment: Option<String>,
+        /// Synced, OutOfSync or Unknown; several separated by commas.
+        pub sync: Option<String>,
+        /// Healthy, Progressing, Degraded, Suspended, Missing or Unknown; several separated by
+        /// commas.
+        pub health: Option<String>,
+        /// A part of the app's id (any case).
+        pub q: Option<String>,
+        /// Labels the app must have, all of them.
+        #[schemars(extend("additionalProperties" = {"type": "string"}))]
+        pub labels: Option<serde_json::Map<String, serde_json::Value>>,
+        pub hard: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsTerminate {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsTakeOver {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsRollback {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// The deployment's id (cd.apps.history, cd.apps.rollback_targets).
+        #[schemars(range(min = 1))]
+        pub to: Option<i64>,
+        /// What the deployment ran: a commit (whole, or 7 or more of its first hex digits), a tag,
+        /// or a revision as recorded (a chart's version). Not with `to`.
+        pub revision: Option<String>,
+        /// Also delete what that deployment didn't have.
+        pub prune: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsRollbackTargets {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsFollow {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsAutoRollback {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsSetAutoRollback {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// true, false, or null to clear.
+        #[serde(deserialize_with = "crate::ops::present")]
+        #[schemars(required, extend("type" = ["boolean", "null"]))]
+        pub on: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdReposAutoRollback {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdReposSetAutoRollback {
+        /// The repository's URL, as apps name it (cd.repos.auto_rollback lists them).
+        pub repo: String,
+        /// true, false, or null to clear.
+        #[serde(deserialize_with = "crate::ops::present")]
+        #[schemars(required, extend("type" = ["boolean", "null"]))]
+        pub on: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsRollout {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CdAppsRolloutActAction {
+        Promote,
+        Pause,
+        Resume,
+        Abort,
+        Retry,
+        Approve,
+        Deny,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsRolloutAct {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        pub action: CdAppsRolloutActAction,
+        /// promote: past every step and check at once.
+        pub full: Option<bool>,
+        /// approve, deny: the approval check.
+        pub check: Option<String>,
+        /// abort: why, for the rollout's record.
+        pub reason: Option<String>,
+        /// Which rollout, by id (cd.apps.rollout), when the app has more than one under way.
+        pub rollout: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsCreate {
+        /// The app: name, project, sources, destination, sync, ignore, tracking.
+        pub definition: serde_json::Map<String, serde_json::Value>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CdAppsDeleteCascade {
+        Foreground,
+        Background,
+        Orphan,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsDelete {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        pub cascade: Option<CdAppsDeleteCascade>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdImport {
+        /// YAML or JSON, any number of documents.
+        pub manifests: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdClustersList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdClustersAdd {
+        pub name: String,
+        pub context: String,
+        pub kubeconfig: Option<String>,
+        #[schemars(extend("additionalProperties" = {"type": "string"}))]
+        pub labels: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdClustersRemove {
+        pub name: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdReposList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdReposAdd {
+        pub url: String,
+        pub username: Option<String>,
+        pub password: Option<String>,
+        pub insecure: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdReposRemove {
+        pub url: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdProvidersList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdTargetsList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdDiscover {
+        pub provider: String,
+        /// The integration it acts through.
+        pub account: String,
+        pub region: Option<String>,
+        pub project: Option<String>,
+        pub zone: Option<String>,
+        pub subscription: Option<String>,
+        #[serde(rename = "resource-group")]
+        pub resource_group: Option<String>,
+        pub environment: Option<String>,
+        pub scope: Option<String>,
+        pub name: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdValidate {
+        pub deploy: String,
+        pub environments: Option<String>,
+        /// A kiln repository (owner/name) whose files renders read.
+        pub repo: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsKeep {
+        pub deploy: String,
+        pub environments: Option<String>,
+        pub repo: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdImagesList {}
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CdImagesSetKind {
+        Local,
+        Registry,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdImagesSet {
+        pub name: String,
+        pub kind: CdImagesSetKind,
+        pub repository: Option<String>,
+        pub integration: Option<String>,
+    }
 }
 
 /// Runs an operation by name.

@@ -2,11 +2,11 @@
 // no element scrolls sideways (the page, or anything in it that would scroll its content left and
 // right) but a code block, which keeps each line on one line (`[data-code-scroll]`: a comment's
 // code in Ship's Files and Conversation), and nothing is `position: fixed` but the shell's own (its
-// skip link, its toasts, a tooltip, the overlay, dialog and drawer it opens). Each is said by what
-// the element is, at most eight a kind.
+// skip link, its toasts and what waits on you above them, a tooltip, the overlay, dialog and drawer
+// it opens). Each is said by what the element is, at most eight a kind.
 
 /** The shell's own fixed layers. */
-const SHELL = ".skip-link, .toast-viewport, [role=tooltip], .overlay, .dialog, .drawer";
+const SHELL = ".skip-link, .toast-viewport, .rq-viewport, [role=tooltip], .overlay, .dialog, .drawer";
 
 export async function layoutProblems(page) {
   return page.evaluate((shell) => {

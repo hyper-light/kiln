@@ -105,7 +105,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Some(c) = crate::runner::chaos::get() {
         net.command(crate::net::Out::Seed(c.seed)).await;
         for rule in c.faults.iter().copied() {
-            net.command(crate::net::Out::Shed(rule)).await;
+            net.command(crate::net::Out::Shed(rule.past(crate::wire::server_classes().len()))).await;
         }
     }
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.

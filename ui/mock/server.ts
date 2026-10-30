@@ -20,7 +20,8 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
-import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
+import { handleFamily, handleFamilySession, refuseAgent, setFamilyEmit } from "./agents.ts";
+import { ahead, note, runnerRefused } from "./refused.ts";
 import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
@@ -243,6 +244,9 @@ addAgent({ name: "metal-epyc-01", labels: ["baremetal", "bench", "gpu", "linux",
 addAgent({ name: "metal-mac-mini", labels: ["baremetal", "macos", "arm64"], slots: 2, hostname: "mac-mini.lan", os: "macos", arch: "aarch64", version: VERSION, ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 9 }, newHost(10, 32, 1000));
 addAgent({ name: "metal-pi-04", labels: ["baremetal", "arm64", "linux"], slots: 1, hostname: "pi-04.lan", os: "linux", arch: "aarch64", version: "0.0.9", ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 60, draining: true }, newHost(4, 8, 120));
 addAgent({ name: "metal-nuc-old", labels: ["baremetal", "linux", "x86_64"], slots: 2, hostname: "nuc.lan", os: "linux", arch: "x86_64", version: "0.0.8", ephemeral: false, connected: false, last_seen: t - 86400 * 2 - 3600, enrolled_at: t - 86400 * 120 }, newHost(8, 16, 500));
+// What kiln couldn't read of metal-ryzen-01, of the server's to it and of reach's, kept for its page (refused.ts).
+const refusing = agents.get("metal-ryzen-01");
+if (refusing) refusing.refused = runnerRefused();
 
 /* ------------------------------------------------------------------ */
 /* Repos & runs                                                        */
@@ -1457,6 +1461,19 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/mock/quiet" && m === "POST") {
       quiet = (await body<{ on?: boolean }>(req)).on ?? true;
       return json(res, 200, { quiet });
+    }
+    // The browser checks note a message kiln couldn't read, `what` it was: a runner's frame
+    // (`?runner=`), or its runner's update of an agent (`?agent=`). Its page is told, as kiln's are.
+    if (p === "/api/mock/refuse" && m === "POST") {
+      const what = url.searchParams.get("what") ?? "variant 53";
+      const a = agents.get(url.searchParams.get("runner") ?? "");
+      if (a) {
+        a.refused = note(a.refused, ahead(a.name, what), Date.now());
+        emit({ type: "agent", agent: a });
+        return json(res, 200, a.refused);
+      }
+      const refused = refuseAgent(url.searchParams.get("agent") ?? "", what);
+      return refused ? json(res, 200, refused) : err(res, 404, "no such runner or agent");
     }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;

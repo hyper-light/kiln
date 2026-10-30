@@ -234,16 +234,10 @@ pub async fn on_caps(hub: &Hub, machine: &str, peer: PeerId, caps: u64) {
     }
 }
 
-/// A runner said what it holds (`AgentMsg::AgentLimit`): the process new work goes to speaks for
-/// its machine.
-pub fn on_held(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
-    let held: Held = match serde_json::from_str(json) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::debug!(machine, error = %e, "agent limit: an unreadable report");
-            return;
-        }
-    };
+/// A runner said what it holds (`AgentMsg::AgentLimit`, read as `crate::wire::payload` reads what
+/// a frame carries: one that can't be read is refused to the runner there): the process new work
+/// goes to speaks for its machine.
+pub fn on_held(hub: &Hub, peer: PeerId, machine: &str, held: Held) {
     if hub.instances.lock().newest(machine) != Some(peer) {
         return;
     }

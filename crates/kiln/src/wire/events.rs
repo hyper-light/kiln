@@ -122,6 +122,9 @@ pub enum ServerEvent {
     /// A change's conflicts changed (W26-R12): its replay found some, one was resolved or taken
     /// back, or their resolution was committed.
     Conflict(Box<ConflictChange>),
+    /// What the page sent up this socket that couldn't be read: to that socket alone, never
+    /// [`crate::hub::Hub::emit`]ted.
+    Refused(crate::wire::ui::Refused),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]

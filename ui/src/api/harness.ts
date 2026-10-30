@@ -7,6 +7,7 @@ import * as React from "react";
 import { wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
+import { readFrame, unread } from "./frames";
 import type { TerminalSessionInfo } from "./types";
 import type {
   Account,
@@ -27,6 +28,7 @@ import type {
   SlashCommand,
   AgentState as State,
   SessionStatus as Status,
+  UnreadFrame,
 } from "./wire";
 export type {
   Account,
@@ -818,6 +820,28 @@ export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]
 /** The socket's query: a snapshot packed when it can be unpacked here, and a state and a changeset as what changed in them. */
 const TAKES = GUNZIP ? "?z=gzip&patch=state&patch=changes" : "?patch=state&patch=changes";
 
+/** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
+const SESSION_FRAMES = {
+  open: true,
+  resumed: true,
+  meta: true,
+  state: true,
+  state_patch: true,
+  changes: true,
+  changes_patch: true,
+  files: true,
+  events: true,
+  stream: true,
+  reply: true,
+  inbox: true,
+  reset: true,
+  closed: true,
+  synced: true,
+  error: true,
+  ack: true,
+  nack: true,
+} satisfies Record<SessionDown["t"], true>;
+
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
 interface Incoming {
   info: AgentInfo | null;
@@ -1054,11 +1078,26 @@ export class SessionStore {
       // The server restarted, or the network came back: this socket may be gone too without having said so.
       events.onReopen(() => this.kick(true)),
       // The session is on the server again (its machine came back): no need to wait for the next try.
+      // And what of its messages couldn't be read, which only the server says, as it changes.
       events.on((ev) => {
-        if (ev.type === "harness" && ev.info.id === this.id) this.kick(false);
+        if (ev.type !== "harness" || ev.info.id !== this.id) return;
+        this.refused(ev.info.refused);
+        this.kick(false);
       }),
     ];
     this.connect();
+  }
+
+  /**
+   * What of its messages couldn't be read (`crate::wire::unread`), as an event about it says: the
+   * server keeps it, and the socket's open said it only as it was then. Shown at once.
+   */
+  private refused(refused: AgentInfo["refused"]) {
+    const info = this.snap.info;
+    if (!info || share(info.refused, refused) === info.refused) return;
+    const next = { ...info, refused };
+    if (!refused) delete next.refused;
+    this.patch({ info: next });
   }
 
   /** Nothing shows it any more: it stays live a while, then closes. */
@@ -1131,7 +1170,9 @@ export class SessionStore {
         .then((text) => {
           if (this.ws === ws) for (const line of text.split("\n")) if (line) this.take1(line);
         })
-        .catch(() => undefined)
+        .catch((e: unknown) => {
+          if (this.ws === ws) this.told(unread("", `a packed snapshot that couldn't be unpacked: ${e instanceof Error ? e.message : String(e)}`).unread);
+        })
         .finally(() => {
           if (this.ws === ws) this.unpacking -= 1;
         });
@@ -1154,17 +1195,19 @@ export class SessionStore {
     });
   }
 
-  /** One update, as JSON. */
+  /** One update, as JSON: applied when it reads as the socket's frame; else not, and the server is told. */
   private take1(data: string) {
-    let u: SessionDown;
-    try {
-      u = JSON.parse(data) as SessionDown;
-    } catch {
-      return;
-    }
+    const read = readFrame<SessionDown>(data, "t", SESSION_FRAMES);
+    if ("unread" in read) return this.told(read.unread);
+    const u = read.frame;
     this.frames += 1;
     this.apply(u);
     this.mark(u);
+  }
+
+  /** A frame that came down and couldn't be read: the server, which sent it, is told (it notes it). */
+  private told(f: UnreadFrame) {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(f satisfies SessionUp));
   }
 
   /** Where a frame says the server's copy is: an "open" or "resumed" once what follows it is in, a

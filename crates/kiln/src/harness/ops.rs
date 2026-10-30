@@ -18,9 +18,7 @@ use super::model::{Command, SendMode};
 use super::registry::Sent;
 use super::session::Info;
 use super::wait::{self, Until};
-use crate::ops::{Cx, Fail, Op, Out, path, schema, text};
-
-const AGENT: &str = "The agent's id (as agents.list gives it).";
+use crate::ops::{Cx, Fail, Input, Op, Out, path, text};
 
 fn agent_of(v: &Value) -> Result<String, Fail> {
     text(v, "agent")
@@ -580,7 +578,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Agents kiln runs, on every machine, each with where it stands (stand: working, idle, needs_you, paused, stopped, offline, ended), its machine, harness, folder, mode and what it changed. Filter by `machine` (a runner's name, or local for the server), `harness`, `state` (a stand or a status), `parent` (the agents an agent started) or `plan_run`.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"machine": {"type": "string"}, "harness": {"type": "string"}, "state": {"type": "string"}, "parent": {"type": "string", "description": "Only the agents this agent started."}, "plan_run": {"type": "string"}}), &[]),
+            input: Input::of::<input::AgentsList>(),
             route: |_| Ok((Method::GET, path(&["api", "harness", "agents"]))),
             run: |cx, v| Box::pin(list(cx, v)),
         },
@@ -589,7 +587,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "One agent: where it stands, its info and its state (status, approvals waiting on a person, queue, tasks, to-dos, usage, how its last turn ended).",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            input: Input::of::<input::AgentsGet>(),
             route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?]))),
             run: |cx, v| Box::pin(get(cx, v)),
         },
@@ -598,23 +596,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Start agents to do part of the work: `kind` (claude, codex, devin, gemini, opencode, goose, amp, antigravity), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "kind": {"type": "string", "description": "The harness: claude, codex, devin, gemini, opencode, goose, amp or antigravity."},
-                        "on": {"type": "string", "description": "A machine's name (local for the server), or what it needs: linux/amd64, macos, arm64, +gpu, cpus>=16, mem>=32g."},
-                        "cwd": {"type": "string", "description": "Its folder there (a path, or ~/…)."},
-                        "prompt": {"type": "string", "description": "Its first message: the task."},
-                        "model": {"type": "string"},
-                        "effort": {"type": "string"},
-                        "mode": {"type": "string", "description": "Its permission mode, at most yours (claude: plan, default, acceptEdits, auto, bypassPermissions; codex: read-only, untrusted, auto, full-access). Left out: its harness's default when that's within yours, else the most that is."},
-                        "name": {"type": "string"},
-                        "count": {"type": "integer", "minimum": 1, "maximum": 16},
-                        "workspace": {"type": "string", "enum": ["folder", "volume"], "description": "Where it works: `folder`, its folder itself (the default), or `volume`, a Slates volume of its own laid over the folder's repository, where what it changes stays its own until it goes up for review (agents.change) or a person writes it to disk. Where the machine has Slates."}
-                    }),
-                    &["kind"],
-                )
-            },
+            input: Input::of::<input::AgentsStart>(),
             route: |_| Ok((Method::POST, path(&["api", "harness", "agents"]))),
             run: |cx, v| Box::pin(start(cx, v)),
         },
@@ -623,22 +605,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Ask about a piece of code in an agent's conversation: a name, a line, or a change it made (`path`, `line`, `selection`, the `code` around it, `change`, and a `question` if not \"what is this?\"). A child of the agent answers in four parts (what it is, what it does here, where else it's used, what's worth knowing), reading the repository and changing nothing. When the agent runs no subagents (`max_subagents` 0) it answers itself: after its turn, or with `now` between its steps.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "path": {"type": "string", "description": "The file the code is in."},
-                        "line": {"type": "integer", "description": "Its line there."},
-                        "end_line": {"type": "integer", "description": "The last of the lines, when they're several."},
-                        "selection": {"type": "string", "description": "The name tapped; none: the whole line."},
-                        "code": {"type": "string", "description": "The code around it."},
-                        "change": {"type": "boolean", "description": "It's about the change on that line."},
-                        "question": {"type": "string"},
-                        "now": {"type": "boolean", "description": "An agent answering itself does between its steps."}
-                    }),
-                    &["agent", "path", "code"],
-                )
-            },
+            input: Input::of::<input::AgentsAbout>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "about"]))),
             run: |cx, v| Box::pin(about(cx, v)),
         },
@@ -647,17 +614,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Send an agent a message. To an agent you started (and theirs): `queue` (after its turn, the default), `steer` (into the turn under way) or `now` (stopping it). To any other agent that works for the same person: `queue` only, and it's told the message is from you and how to answer you. Give a `key` to send it safely again: a call with the same key is the same message, which the agent gets once, and every such call is answered as the first was.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "text": {"type": "string"},
-                        "mode": {"type": "string", "enum": ["queue", "steer", "now"]},
-                        "key": {"type": "string", "description": "An idempotency key of yours, made once for this message (1 to 256 bytes): sent again with it (its answer lost), the message is the same one, delivered once. Without it, each call is another message: pass it whenever you may send it again."}
-                    }),
-                    &["agent", "text"],
-                )
-            },
+            input: Input::of::<input::AgentsSend>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "send"]))),
             run: |cx, v| Box::pin(send(cx, v)),
         },
@@ -666,19 +623,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn. Messages other agents send you don't wait behind your turn while you wait: it returns early once one is in your queue, with them in `messages` (who sent each, `from` and `name`, and its `text`), taken out of your queue since they're delivered now (a program's waits in code mode don't hand them over unless they pass `hand_over: true`, and then must return them). You needn't wait: kiln tells you when each agent you started settles; wait when you can't go on without it.",
             read_only: true,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "agents": {"type": "array", "items": {"type": "string"}, "description": "Several agents."},
-                        "until": {"type": "string", "enum": ["settled", "change"]},
-                        "any": {"type": "boolean", "description": "Return when the first of them is done, rather than all."},
-                        "timeout_s": {"type": "number", "minimum": 0, "maximum": 600},
-                        "hand_over": {"type": "boolean", "description": "Hand over the messages other agents sent you, taking them out of your queue (default true; false for a program's waits in code mode unless it says true)."}
-                    }),
-                    &[],
-                )
-            },
+            input: Input::of::<input::AgentsWait>(),
             route: |_| Ok((Method::GET, path(&["api", "harness", "agents", "wait"]))),
             run: |cx, v| Box::pin(wait_for(cx, v)),
         },
@@ -687,7 +632,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "What an agent concluded: its last reply, how its last turn ended, what it changed (files, lines added and removed), its folder and machine, its cost, and its change request and branch (agents.change) once it has one.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            input: Input::of::<input::AgentsResult>(),
             route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "result"]))),
             run: |cx, v| Box::pin(result(cx, v)),
         },
@@ -696,7 +641,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "The agents still running that an agent started, and theirs.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            input: Input::of::<input::AgentsChildren>(),
             route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "children"]))),
             run: |cx, v| Box::pin(children(cx, v)),
         },
@@ -705,7 +650,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Stop the turn an agent you started is in (it stays, ready for the next message).",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            input: Input::of::<input::AgentsInterrupt>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "interrupt"]))),
             run: |cx, v| Box::pin(interrupt(cx, v)),
         },
@@ -714,19 +659,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft`, `trunk` (else the repository's default).",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": "The agent whose work it is (as agents.list gives it); leave it out for your own."},
-                        "title": {"type": "string"},
-                        "body": {"type": "string", "description": "What it changes and why, for reviewers."},
-                        "draft": {"type": "boolean", "description": "Not ready for review yet (kiln's own review)."},
-                        "trunk": {"type": "string", "description": "The branch it goes into."},
-                        "fix_checks": {"type": "boolean", "description": "Failing checks go to the agent to fix (the default)."}
-                    }),
-                    &[],
-                )
-            },
+            input: Input::of::<input::AgentsChange>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "change"]))),
             run: |cx, v| Box::pin(change(cx, v)),
         },
@@ -735,7 +668,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "An agent's workspace of its own (a Slates volume over its folder): the folder it's laid over, its volume and mount, and the files under it that changed on disk after the agent changed them (drift).",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            input: Input::of::<input::AgentsWorkspace>(),
             route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "workspace"]))),
             run: |cx, v| Box::pin(workspace(cx, v)),
         },
@@ -744,15 +677,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), for a person to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`) — only a person can write, never an agent. Build output and what git ignores stay out, and so does `.git`.",
             read_only: false,
             destructive: true,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "manifest": {"type": "string", "description": "The plan's manifest hash: what is written is exactly what that plan lists."}
-                    }),
-                    &["agent"],
-                )
-            },
+            input: Input::of::<input::AgentsLand>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "land"]))),
             run: |cx, v| Box::pin(land(cx, v)),
         },
@@ -761,7 +686,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Agents' change requests: whose, where (repository, branch, the change and its page), its versions, review and checks, and whether it landed. `agent` for one.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &[]),
+            input: Input::of::<input::AgentsChanges>(),
             route: |_| Ok((Method::GET, path(&["api", "harness", "changes"]))),
             run: |cx, v| Box::pin(changes(cx, v)),
         },
@@ -770,11 +695,207 @@ pub fn list_ops() -> Vec<Op> {
             summary: "End an agent you started for good (its changes stay on disk); with `children`, the agents it started (and theirs) too.",
             read_only: false,
             destructive: true,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "children": {"type": "boolean", "description": "End the agents it started (and theirs) too."}}), &["agent"]),
+            input: Input::of::<input::AgentsStop>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "stop"]))),
             run: |cx, v| Box::pin(stop(cx, v)),
         },
     ]
+}
+
+/// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
+/// its type, each field's description from its doc comment.
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsList {
+        pub machine: Option<String>,
+        pub harness: Option<String>,
+        pub state: Option<String>,
+        /// Only the agents this agent started.
+        pub parent: Option<String>,
+        pub plan_run: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsGet {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentsStartWorkspace {
+        Folder,
+        Volume,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsStart {
+        /// The harness: claude, codex, devin, gemini, opencode, goose, amp or antigravity.
+        pub kind: String,
+        /// A machine's name (local for the server), or what it needs: linux/amd64, macos, arm64,
+        /// +gpu, cpus>=16, mem>=32g.
+        pub on: Option<String>,
+        /// Its folder there (a path, or ~/…).
+        pub cwd: Option<String>,
+        /// Its first message: the task.
+        pub prompt: Option<String>,
+        pub model: Option<String>,
+        pub effort: Option<String>,
+        /// Its permission mode, at most yours (claude: plan, default, acceptEdits, auto,
+        /// bypassPermissions; codex: read-only, untrusted, auto, full-access). Left out: its
+        /// harness's default when that's within yours, else the most that is.
+        pub mode: Option<String>,
+        pub name: Option<String>,
+        #[schemars(range(min = 1, max = 16))]
+        pub count: Option<i64>,
+        /// Where it works: `folder`, its folder itself (the default), or `volume`, a Slates volume
+        /// of its own laid over the folder's repository, where what it changes stays its own until
+        /// it goes up for review (agents.change) or a person writes it to disk. Where the machine
+        /// has Slates.
+        pub workspace: Option<AgentsStartWorkspace>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsAbout {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The file the code is in.
+        pub path: String,
+        /// Its line there.
+        pub line: Option<i64>,
+        /// The last of the lines, when they're several.
+        pub end_line: Option<i64>,
+        /// The name tapped; none: the whole line.
+        pub selection: Option<String>,
+        /// The code around it.
+        pub code: String,
+        /// It's about the change on that line.
+        pub change: Option<bool>,
+        pub question: Option<String>,
+        /// An agent answering itself does between its steps.
+        pub now: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentsSendMode {
+        Queue,
+        Steer,
+        Now,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsSend {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        pub text: String,
+        pub mode: Option<AgentsSendMode>,
+        /// An idempotency key of yours, made once for this message (1 to 256 bytes): sent again
+        /// with it (its answer lost), the message is the same one, delivered once. Without it, each
+        /// call is another message: pass it whenever you may send it again.
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentsWaitUntil {
+        Settled,
+        Change,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsWait {
+        /// The agent's id (as agents.list gives it).
+        pub agent: Option<String>,
+        /// Several agents.
+        pub agents: Option<Vec<String>>,
+        pub until: Option<AgentsWaitUntil>,
+        /// Return when the first of them is done, rather than all.
+        pub any: Option<bool>,
+        #[schemars(range(min = 0, max = 600))]
+        pub timeout_s: Option<f64>,
+        /// Hand over the messages other agents sent you, taking them out of your queue (default
+        /// true; false for a program's waits in code mode unless it says true).
+        pub hand_over: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsResult {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsChildren {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsInterrupt {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsChange {
+        /// The agent whose work it is (as agents.list gives it); leave it out for your own.
+        pub agent: Option<String>,
+        pub title: Option<String>,
+        /// What it changes and why, for reviewers.
+        pub body: Option<String>,
+        /// Not ready for review yet (kiln's own review).
+        pub draft: Option<bool>,
+        /// The branch it goes into.
+        pub trunk: Option<String>,
+        /// Failing checks go to the agent to fix (the default).
+        pub fix_checks: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsWorkspace {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsLand {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The plan's manifest hash: what is written is exactly what that plan lists.
+        pub manifest: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsChanges {
+        /// The agent's id (as agents.list gives it).
+        pub agent: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsStop {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// End the agents it started (and theirs) too.
+        pub children: Option<bool>,
+    }
 }
 
 #[cfg(test)]
@@ -803,13 +924,13 @@ mod tests {
     fn no_operation_answers_for_a_person() {
         // Approvals, questions and plans wait on people: nothing here decides them.
         for op in list_ops() {
-            let schema = (op.input)().to_string();
+            let schema = op.input.schema().to_string();
             for word in ["decision", "approve", "answers", "choices"] {
                 assert!(!schema.contains(word), "{} takes {word}", op.name);
             }
             assert!(!op.name.contains("approve") && !op.name.contains("answer"), "{}", op.name);
         }
-        let sends = list_ops().into_iter().find(|o| o.name == "agents.send").map(|o| (o.input)()).unwrap_or_default();
+        let sends = list_ops().into_iter().find(|o| o.name == "agents.send").map(|o| o.input.schema()).unwrap_or_default();
         assert_eq!(sends.pointer("/properties/mode/enum"), Some(&json!(["queue", "steer", "now"])), "a message is all an agent sends another");
     }
 

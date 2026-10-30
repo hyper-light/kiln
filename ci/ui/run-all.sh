@@ -7,9 +7,12 @@
 #   environments board and pages (W21-R10);
 # - insights_setup.py's: Insights, and the pages no other check drives (pages_check.mjs);
 # - review_setup.py's: the review pages (W14-AC06);
+# - the mock server's (ui/mock/server.ts, serving ui/dist): refused messages on a runner's and an
+#   agent's pages (refused_check.mjs), which a server keeps in memory only, planted there;
 # - none: the flow view's edits (workflow_doc_check.ts) and the editor's patches (patch_check.ts).
 # Needs the kiln binary to check (`$1`, its UI built in), Docker, python3, git, and node with npm
-# (bun if it's on PATH, else Bun's npm package). Each check's report and screenshots go to
+# (bun if it's on PATH, else Bun's npm package), and, for the mock server, ui/'s packages and its
+# build (`npm ci --prefix ui && npm run --prefix ui build`). Each check's report and screenshots go to
 # `$SHOTS/<check>` (default ci/ui/shots); a FAIL line is said for each failed check, and the exit
 # code is how many checks failed (or 1 when a fixture couldn't be made).
 #
@@ -119,6 +122,29 @@ stop "$run/insights.json" "$run/insights"
 fixture review review_setup.py
 browser review_ac06 AC06 "$run/review.json" --ipc host
 stop "$run/review.json" "$run/review"
+
+# The mock server, on a free port, until its check is done; stopped if it's still the one started.
+port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+(cd "$root/ui" && PORT=$port HOST=127.0.0.1 MOCK_NO_AUTH=1 exec node --import tsx mock/server.ts) > "$run/mock.log" 2>&1 &
+mock=$!
+if python3 -I -c '
+import sys, time, urllib.request
+end = time.time() + 120
+while time.time() < end:
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/api/me", timeout=5)
+        sys.exit(0)
+    except Exception:
+        time.sleep(0.5)
+sys.exit(1)' "$port"; then
+  echo "{\"base\": \"http://127.0.0.1:$port\"}" > "$run/mock.json"
+  browser refused_check MOCK "$run/mock.json"
+else
+  ran=$((ran + 1))
+  failed=$((failed + 1))
+  echo "FAIL refused_check's mock server: $(tail -3 "$run/mock.log")"
+fi
+case "$(tr '\0' ' ' 2> /dev/null < "/proc/$mock/cmdline")" in *mock/server.ts*) kill "$mock" ;; esac
 
 echo "$failed of $ran checks failed"
 exit "$failed"

@@ -69,7 +69,7 @@ pub enum Msg {
     RunnerLost { agent: String },
     /// A runner's probes reported (W13-R01): it is routed by what they found.
     RunnerFacts { agent: String },
-    Event { agent: String, leg: String, json: String },
+    Event { agent: String, leg: String, event: Box<crate::proto::JobEvent> },
     Finished { agent: String, result: JobResult },
     /// A repository deleted (its runs' records with it): its runs end here, their legs stopped
     /// where they run.
@@ -113,7 +113,7 @@ pub enum Msg {
         reply: async_channel::Sender<Result<u32, String>>,
     },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
-    Executor { agent: String, json: String },
+    Executor { agent: String, said: crate::runner::pool::Said },
     /// The stored pools changed: read them again.
     PoolsChanged,
     /// The pools and their executors now.
@@ -690,12 +690,6 @@ struct LegSt {
     gone: bool,
 }
 
-/// An event's place in its attempt (`seq`, from runners that send events again after a reconnect).
-#[derive(serde::Deserialize)]
-struct Seq {
-    seq: Option<u64>,
-}
-
 /// A leg its environment's protection holds back (W15-R03, R04): not yet the scheduler's.
 struct Held {
     leg: LegIn,
@@ -1119,7 +1113,7 @@ impl Dispatch {
                 Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
-            Msg::Event { agent, leg, json } => self.event(&agent, &leg, &json).await,
+            Msg::Event { agent, leg, event } => self.event(&agent, &leg, *event).await,
             Msg::Finished { agent, result } => self.finished(&agent, result).await,
             Msg::RepoDeleted { repo } => {
                 self.repo_deleted(&repo).await;
@@ -1160,8 +1154,7 @@ impl Dispatch {
                 }
                 Ok(())
             }
-            Msg::Executor { agent, json } => {
-                let said: crate::runner::pool::Said = serde_json::from_str(&json).unwrap_or_default();
+            Msg::Executor { agent, said } => {
                 let input = match said.state.as_str() {
                     "ready" => Input::ExecutorReady { executor: said.executor },
                     _ => {
@@ -2746,15 +2739,14 @@ impl Dispatch {
     }
 
     /// What a runner says about a leg while it runs (W06, §2.5).
-    async fn event(&mut self, agent: &str, leg: &str, json: &str) -> anyhow::Result<()> {
-        if let (Ok(Seq { seq: Some(seq) }), Some(l)) = (serde_json::from_str::<Seq>(json), self.legs.get_mut(leg)) {
+    async fn event(&mut self, agent: &str, leg: &str, event: crate::proto::JobEvent) -> anyhow::Result<()> {
+        if let (Some(seq), Some(l)) = (event.seq, self.legs.get_mut(leg)) {
             if seq <= l.seq {
                 return Ok(());
             }
             l.seq = seq;
         }
-        let e: JobEventV2 = serde_json::from_str(json)?;
-        match e {
+        match event.event {
             JobEventV2::StepStarted { idx, name, kind, action } => {
                 runs::step_started(&self.hub, leg, idx, &name, &kind, action).await?;
                 self.hub.logs.step(leg, idx, Status::Running.as_str());

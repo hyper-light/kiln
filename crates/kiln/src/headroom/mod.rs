@@ -148,9 +148,10 @@ pub struct Ctx {
 pub struct Handle;
 
 impl Handle {
-    /// What the server sent (`ServerMsg::Headroom`): applied at once, and kept for the next start.
-    pub fn push(&self, json: &str) {
-        match serde_json::from_str::<Push>(json).map_err(|e| e.to_string()).and_then(|p| p.settings.validated().map(|s| (s, p.standby))) {
+    /// What the server sent (`ServerMsg::Headroom`, read by `wire::payload`): applied at once, and
+    /// kept for the next start.
+    pub fn push(&self, p: Push) {
+        match p.settings.validated().map(|s| (s, p.standby)) {
             Ok((s, standby)) => {
                 SHARED.standby.store(standby, Ordering::Release);
                 *SHARED.pushed.lock() = Some(s);

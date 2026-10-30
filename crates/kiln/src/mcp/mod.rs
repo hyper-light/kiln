@@ -12,6 +12,7 @@
 //! (`kiln_mcp_<label>_<hmac>`), under which every call is audited as `agent:<label>`.
 
 pub mod code;
+pub mod rpc;
 pub mod skills;
 
 use std::sync::Arc;
@@ -222,20 +223,29 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
 }
 
 /// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
-/// mode runs on the runner, `crate::reach::mcp`): `{"op": "registry", "session"}` for the
-/// operations, `{"op": "call", "session", "name", "input"}` to run one, or `{"op": "page",
-/// "session", "do", ...}` for a page it shows (`crate::harness::visuals::ask`). The session must be one
-/// kiln knows on that runner, which mustn't be a job's; it acts for whoever started it (the owner
-/// on a kiln nobody else signs in to), audited as `agent:<session>@<runner> for <them>`. The
-/// answer: `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`.
-pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
+/// mode runs on the runner, `crate::reach::mcp`): the operations (`registry`), one run (`call`), a
+/// page it shows or streams (`page`, `stream`: `crate::harness::visuals::ask`,
+/// `crate::harness::streams::ask`), or word of a message from its agent it couldn't read
+/// (`unread`, `runner_unread`). The session must be one kiln knows on that runner, which
+/// mustn't be a job's; it acts for whoever started it (the owner on a kiln nobody else signs in
+/// to), audited as `agent:<session>@<runner> for <them>`. The answer: `{"registry", "skills"}`,
+/// `{"ok": <answer>}`, or `{"error", "status"?}`.
+pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Question) -> Value {
+    use crate::reach::Question;
     if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
-    let session = ask.get("session").and_then(Value::as_str).unwrap_or("");
-    let terminal = ask.get("terminal").and_then(Value::as_str).unwrap_or("");
+    let (session, terminal) = match ask {
+        Question::Directory => return json!({ "runners": hub.reach_directory() }),
+        // Noted whoever started the session (`runner_unread`).
+        Question::Unread { session, what, code, why } => return runner_unread(hub, runner, session, what, *code, why).await,
+        Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
+        Question::Page { session, .. } | Question::Stream { session, .. } => (session.as_str(), ""),
+        // The hub answers these itself (`Hub::on_read`).
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => return json!({"error": "not a question for kiln's operations"}),
+    };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
-    let caller = if session.is_empty() && !terminal.is_empty() && ask.get("op").and_then(Value::as_str) == Some("call") {
+    let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
         terminal_caller(hub, terminal, Some(runner)).await
     } else if session.is_empty() || !hub.harness.located_on(session, runner) {
         return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
@@ -246,26 +256,36 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
         Ok(c) => c,
         Err(e) => return json!({"error": e}),
     };
-    let answer = match ask.get("op").and_then(Value::as_str) {
-        Some("registry") => {
+    let answer = match ask {
+        Question::Registry { .. } => {
             let skills: Vec<Value> = skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();
             let tools: Vec<&str> = agent_ops().iter().map(|o| o.name).collect();
             json!({"registry": code::registry(hub), "skills": skills, "agent_tools": tools})
         }
-        Some("call") => {
-            let name = ask.get("name").and_then(Value::as_str).unwrap_or("");
-            let input = ask.get("input").cloned().unwrap_or(Value::Null);
-            match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input).await {
+        Question::Call { name, input, .. } => match crate::ops::misfit(&caller, name, input) {
+            // An input that doesn't fit the operation: refused saying where and why, and noted,
+            // on the runner's page too.
+            Some(m) => {
+                let mut a = misfit(hub, crate::wire::unread::Wire::McpReach, &caller, &format!("tools/call {}", tool_name(name)), name, &m, Some(crate::wire::unread::Page::Runner(runner.to_owned()))).await;
+                if let Some(o) = a.as_object_mut() {
+                    o.insert("status".into(), json!(StatusCode::BAD_REQUEST.as_u16()));
+                }
+                a
+            }
+            None => match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input.clone()).await {
                 Ok(v) => json!({"ok": v}),
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
-            }
-        }
+            },
+        },
         // A page it shows in its conversation (`crate::harness::visuals`), or one it streams
         // live there (`crate::harness::streams`): its own session's, audited as the agent acting
         // for whoever started it.
-        Some(op @ ("page" | "stream")) => {
-            let r = if op == "page" { crate::harness::visuals::ask(hub, session, ask).await } else { crate::harness::streams::ask(hub, session, ask).await };
-            let what = format!("{}.{}", if op == "page" { "pages" } else { "streams" }, ask.get("do").and_then(Value::as_str).unwrap_or("?"));
+        Question::Page { .. } | Question::Stream { .. } => {
+            // What it asks, as its handler reads it: `{"op", "session", "do", ...}`.
+            let page = matches!(ask, Question::Page { .. });
+            let q = serde_json::to_value(ask).unwrap_or_default();
+            let r = if page { crate::harness::visuals::ask(hub, session, &q).await } else { crate::harness::streams::ask(hub, session, &q).await };
+            let what = format!("{}.{}", if page { "pages" } else { "streams" }, q.get("do").and_then(Value::as_str).unwrap_or("?"));
             if what != "pages.measured" {
                 let (principal, on_behalf_of) = crate::audit::who(&caller);
                 let entry = crate::audit::Entry {
@@ -287,13 +307,28 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
                 Err(e) => json!({"error": format!("{e:#}")}),
             }
         }
-        _ => json!({"error": "an unknown question"}),
+        Question::Directory => json!({ "runners": hub.reach_directory() }),
+        Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {
         return json!({"error": format!("the answer is {size} bytes, more than the {RUNNER_ANSWER_MAX} a runner is sent: filter or page on the server")});
     }
     answer
+}
+
+/// Word from an agent session's MCP server on `runner` (`crate::reach::mcp`) of a message its
+/// agent sent that it couldn't read: noted against the session (wire `mcp_reach`), on the runner's
+/// page too. Word of a session that doesn't run there is refused.
+async fn runner_unread(hub: &Arc<Hub>, runner: &str, session: &str, what: &str, code: crate::wire::unread::Code, why: &str) -> Value {
+    use crate::wire::unread::{Page, Sender, Unread, Wire};
+    if session.is_empty() || !hub.harness.located_on(session, runner) {
+        return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
+    }
+    let u = Unread { wire: Wire::McpReach, from: Sender::Session { id: session.to_owned() }, what: what.to_owned(), code, why: why.to_owned() };
+    let _ = hub.note_unread(u, Some(Page::Runner(runner.to_owned()))).await;
+    json!({"ok": {}})
 }
 
 /// kiln's skills as a Claude Code plugin directory at `dir`.
@@ -409,36 +444,80 @@ pub fn caller(hub: &Hub, headers: &HeaderMap, authed: bool) -> Option<String> {
 
 /// `POST /api/mcp`: one JSON-RPC message or a batch, each operation as `caller` may (W20-R06).
 pub async fn http(hub: &Arc<Hub>, caller: Caller, body: kiln_http::Incoming) -> Result<Response, (StatusCode, String)> {
-    let bytes = srv::body_bytes(body, 16 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let msg: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(e) => return Ok(srv::json(StatusCode::OK, &rpc_error(Value::Null, -32700, &format!("parse error: {e}")))),
-    };
-    let server = Server { hub: hub.clone(), caller };
-    let answer = match msg {
-        Value::Array(batch) => {
-            let mut out = Vec::new();
-            for m in batch {
-                if let Some(a) = server.handle(m).await {
-                    out.push(a);
-                }
-            }
-            if out.is_empty() { None } else { Some(Value::Array(out)) }
+    use http_body_util::BodyExt as _;
+    let read = http_body_util::Limited::new(body, rpc::BODY_MOST).collect().await.map(|b| b.to_bytes());
+    Ok(respond(hub, caller, read).await)
+}
+
+/// What a body `caller` sent is answered: its messages' answers, or 202 when none has one. A body
+/// it couldn't read whole is refused as JSON-RPC 2.0 has it, under a null id, and noted like any
+/// message it can't read: one past [`rpc::BODY_MOST`] (413), or one cut short.
+pub(crate) async fn respond(hub: &Arc<Hub>, caller: Caller, read: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>) -> Response {
+    let bytes = match read {
+        Ok(b) => b,
+        Err(e) => {
+            let (status, refused) = if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                (StatusCode::PAYLOAD_TOO_LARGE, rpc::too_large())
+            } else {
+                (StatusCode::BAD_REQUEST, rpc::Refused::new(Value::Null, rpc::PARSE_ERROR, "Parse error: the body was cut short"))
+            };
+            let server = Server { hub: hub.clone(), caller };
+            return srv::json(status, &server.refused(Box::new(refused)).await);
         }
-        m => server.handle(m).await,
     };
-    Ok(match answer {
+    match answer(hub, caller, &bytes).await {
         Some(a) => srv::json(StatusCode::OK, &a),
         None => srv::status(StatusCode::ACCEPTED),
-    })
+    }
+}
+
+/// What `bytes` that `caller` sent (one JSON-RPC message or a batch) is answered, if anything.
+/// Each message is read into a request, or refused as JSON-RPC 2.0 says (`rpc`) and noted against
+/// whoever sent it: the agent session its MCP token names, or the person.
+pub(crate) async fn answer(hub: &Arc<Hub>, caller: Caller, bytes: &[u8]) -> Option<Value> {
+    let body = rpc::body(bytes);
+    let server = Server { hub: hub.clone(), caller };
+    let mut answers = Vec::new();
+    for m in body.messages {
+        let answer = match m {
+            // A notification is never answered; one no client sends is noted all the same.
+            Ok(req) if req.id.is_none() => {
+                if let Some(r) = req.unknown_notification() {
+                    server.note(&r).await;
+                }
+                None
+            }
+            Ok(req) => Some(match server.handle(&req).await {
+                Ok(result) => rpc_ok(req.answer_id(), result),
+                Err(refused) => server.refused(refused).await,
+            }),
+            Err(refused) => Some(server.refused(refused).await),
+        };
+        answers.extend(answer);
+    }
+    rpc::reply(body.batch, answers)
 }
 
 fn rpc_ok(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+/// A call (`what`: `tools/call goals_add`) of operation `name` whose input doesn't fit it
+/// (`crate::ops::misfit`), as `caller` made it on `wire`: noted against whoever made it, and on
+/// `on`'s page too; the answer to give it, saying where and why so the model can correct it.
+pub(crate) async fn misfit(hub: &Hub, wire: crate::wire::unread::Wire, caller: &Caller, what: &str, name: &str, m: &crate::ops::Misfit, on: Option<crate::wire::unread::Page>) -> Value {
+    let u = crate::wire::unread::Unread { wire, from: sender_of(caller), what: what.to_owned(), code: crate::wire::unread::Code::Malformed, why: m.noted() };
+    let _ = hub.note_unread(u, on).await;
+    m.answer(name)
+}
+
+/// What a message refused is noted from (`crate::wire::unread`): the agent session `caller` is,
+/// shown on its page, or the person.
+pub fn sender_of(caller: &Caller) -> crate::wire::unread::Sender {
+    match caller.agent.as_deref() {
+        Some(id) => crate::wire::unread::Sender::Session { id: id.to_owned() },
+        None => crate::wire::unread::Sender::Person { user: caller.name.clone() },
+    }
 }
 
 /// The most of a run's logs `kiln://runs/<id>/logs` gives at once.
@@ -468,65 +547,88 @@ impl Server {
         crate::ops::Cx { hub: self.hub.clone(), caller: self.caller.clone() }
     }
 
-    async fn handle(&self, msg: Value) -> Option<Value> {
-        let id = msg.get("id").cloned();
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        // Notifications get no answer.
-        let id = match id {
-            Some(id) if !id.is_null() => id,
-            _ => return None,
-        };
-        Some(match method {
+    /// `refused` noted against whoever sent it (`crate::wire::unread`, wire `mcp_http`), when it
+    /// says a message couldn't be read.
+    async fn note(&self, refused: &rpc::Refused) {
+        if refused.unreadable() {
+            let u = crate::wire::unread::Unread { wire: crate::wire::unread::Wire::McpHttp, from: sender_of(&self.caller), what: refused.what.clone(), code: refused.code(), why: refused.noted() };
+            let _ = self.hub.note_unread(u, None).await;
+        }
+    }
+
+    /// `refused`, noted ([`Server::note`]), as the answer to send.
+    async fn refused(&self, refused: Box<rpc::Refused>) -> Value {
+        self.note(&refused).await;
+        refused.answer()
+    }
+
+    /// A request's result, or why it's refused.
+    async fn handle(&self, req: &rpc::Request) -> Result<Value, Box<rpc::Refused>> {
+        Ok(match req.method.as_str() {
             "initialize" => {
-                let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
+                let p: rpc::Initialize = req.params()?;
+                let asked = p.protocol_version.unwrap_or_default();
                 let version = VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(VERSIONS.first().copied().unwrap_or("2025-11-25"));
-                rpc_ok(
-                    id,
-                    json!({
-                        "protocolVersion": version,
-                        "capabilities": {
-                            "tools": {"listChanged": false},
-                            "resources": {"listChanged": false},
-                            "extensions": {SKILLS_EXTENSION: {}},
-                        },
-                        "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
-                        "instructions": instructions(&self.caller),
-                    }),
-                )
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": {
+                        "tools": {"listChanged": false},
+                        "resources": {"listChanged": false},
+                        "extensions": {SKILLS_EXTENSION: {}},
+                    },
+                    "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": instructions(&self.caller),
+                })
             }
-            "ping" => rpc_ok(id, json!({})),
-            "tools/list" => rpc_ok(id, json!({"tools": tools(&self.hub)})),
+            "ping" => json!({}),
+            "tools/list" => {
+                req.params::<rpc::Paginated>()?;
+                json!({"tools": tools(&self.hub)})
+            }
             "tools/call" => {
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                rpc_ok(id, self.call_tool(name, args).await)
+                let p: rpc::ToolsCall = req.params()?;
+                // A tool it doesn't have is a protocol error (MCP 2025-11-25), not the tool's.
+                if !matches!(p.name.as_str(), "code_search" | "code_run") && !crate::ops::all(&self.hub).iter().any(|o| tool_name(o.name) == p.name) {
+                    return Err(Box::new(req.unknown_tool(&p.name)));
+                }
+                self.call_tool(&p.name, Value::Object(p.arguments.unwrap_or_default())).await
             }
-            "resources/list" => rpc_ok(id, json!({"resources": skills::resources()})),
+            "resources/list" => {
+                req.params::<rpc::Paginated>()?;
+                json!({"resources": skills::resources()})
+            }
             "resources/read" => {
-                let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+                let p: rpc::ResourcesRead = req.params()?;
+                let uri = p.uri.as_str();
                 if uri.starts_with("kiln://") {
-                    return Some(match self.read_kiln(uri).await {
-                        Ok(text) => rpc_ok(id, json!({"contents": [{"uri": uri, "mimeType": if uri.starts_with("kiln://workflows/") { "application/yaml" } else { "text/plain" }, "text": text}]})),
-                        Err(e) => rpc_error(id, -32002, &e),
-                    });
+                    return match self.read_kiln(uri).await {
+                        Ok(text) => Ok(json!({"contents": [{"uri": uri, "mimeType": if uri.starts_with("kiln://workflows/") { "application/yaml" } else { "text/plain" }, "text": text}]})),
+                        Err(e) => Err(Box::new(rpc::Refused::new(req.answer_id(), -32002, e))),
+                    };
                 }
                 match skills::read(uri) {
-                    Some(c) => rpc_ok(id, json!({"contents": [c]})),
-                    None => rpc_error(id, -32002, &format!("no resource {uri}")),
+                    Some(c) => json!({"contents": [c]}),
+                    None => return Err(Box::new(rpc::Refused::new(req.answer_id(), -32002, format!("no resource {uri}")))),
                 }
             }
-            "skills/list" => rpc_ok(id, json!({"skills": skills::list()})),
+            "skills/list" => json!({"skills": skills::list()}),
             "skills/get" => {
-                let key = params.get("uri").or_else(|| params.get("name")).and_then(Value::as_str).unwrap_or("");
-                match skills::get(key) {
-                    Some(s) => rpc_ok(id, s),
-                    None => rpc_error(id, -32002, &format!("no skill {key}")),
+                let p: rpc::SkillsGet = req.params()?;
+                let key = p.uri.or(p.name).unwrap_or_default();
+                match skills::get(&key) {
+                    Some(s) => s,
+                    None => return Err(Box::new(rpc::Refused::new(req.answer_id(), -32002, format!("no skill {key}")))),
                 }
             }
-            "resources/templates/list" => rpc_ok(id, json!({"resourceTemplates": templates()})),
-            "prompts/list" => rpc_ok(id, json!({"prompts": []})),
-            other => rpc_error(id, -32601, &format!("method not found: {other}")),
+            "resources/templates/list" => {
+                req.params::<rpc::Paginated>()?;
+                json!({"resourceTemplates": templates()})
+            }
+            "prompts/list" => {
+                req.params::<rpc::Paginated>()?;
+                json!({"prompts": []})
+            }
+            _ => return Err(Box::new(req.unknown_method())),
         })
     }
 
@@ -577,6 +679,11 @@ impl Server {
         let cx = self.cx();
         match name {
             "code_search" | "code_run" => {
+                // Arguments that don't fit the tool's type: a tool error saying where and why, noted,
+                // as an operation's are. A program left out is refused, not run empty.
+                if let Some(m) = code_input(name).and_then(|i| i.fits(&args).err()) {
+                    return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), name, &m, None).await);
+                }
                 let program = args.get("program").and_then(Value::as_str).unwrap_or("").to_owned();
                 let mode = if name == "code_search" { code::Mode::Search } else { code::Mode::Run { input: args.get("input").cloned().unwrap_or(Value::Null) } };
                 let result = crate::rt::blocking(move || code::run(cx, mode, &program, code::Limits::default())).await;
@@ -590,6 +697,11 @@ impl Server {
                 let Some(op) = crate::ops::all(&self.hub).into_iter().find(|o| tool_name(o.name) == name) else {
                     return tool_error(&format!("no tool {name}"));
                 };
+                // An input that doesn't fit the operation: a tool error saying where and why, so
+                // the model can correct it; noted.
+                if let Some(m) = crate::ops::misfit(&self.caller, op.name, &args) {
+                    return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), op.name, &m, None).await);
+                }
                 match crate::ops::call(cx, op.name, args).await {
                     Ok(v) => tool_ok(v),
                     Err((_, e)) => tool_error(&e),
@@ -619,20 +731,18 @@ pub fn tools(hub: &Hub) -> Vec<Value> {
 }
 
 fn tools_of(ops: Vec<crate::ops::Info>) -> Vec<Value> {
+    let schema = |tool: &str| code_input(tool).map_or(Value::Null, |i| i.schema());
     let mut out = vec![
         json!({
             "name": "code_search",
             "description": "Run a JavaScript program over kiln's operation registry and return what it returns. The program sees `registry` (every operation: {name, call, summary, read_only, destructive, input}) and `skills` ({name, description}). Example: `return registry.filter(o => o.name.startsWith(\"cd.apps\")).map(o => ({call: o.call, input: o.input}))`.",
-            "inputSchema": {"type": "object", "properties": {"program": {"type": "string", "description": "The body of an async function; `return` its answer."}}, "required": ["program"]},
+            "inputSchema": schema("code_search"),
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         }),
         json!({
             "name": "code_run",
             "description": "Run a JavaScript program that calls kiln and return what it returns: only that enters your context. Operations are async functions on `kiln` (`await kiln.cd.apps.list({health: \"Degraded\"})`, `kiln.call(\"cd.apps.get\", {app})`); a refused call throws an Error with `result`. `input` is given as `input`. Bounded: 64 MiB, 60 s, 2,000 calls, a 4 MiB answer.",
-            "inputSchema": {"type": "object", "properties": {
-                "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
-                "input": {"description": "Any JSON, available as `input`."}
-            }, "required": ["program"]},
+            "inputSchema": schema("code_run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
         }),
     ];
@@ -641,25 +751,57 @@ fn tools_of(ops: Vec<crate::ops::Info>) -> Vec<Value> {
             "name": tool_name(o.name),
             "title": o.name,
             "description": o.summary,
-            "inputSchema": (o.input)(),
+            "inputSchema": o.input.schema(),
             "annotations": {"readOnlyHint": o.read_only, "destructiveHint": o.destructive, "openWorldHint": false},
         }));
     }
     out
 }
 
+/// What code mode's tool `tool` takes, as an operation takes its input: its schema is the tool's
+/// `inputSchema`, and each call's arguments are read as it before the program runs.
+fn code_input(tool: &str) -> Option<crate::ops::Input> {
+    match tool {
+        "code_search" => Some(crate::ops::Input::of::<input::CodeSearch>()),
+        "code_run" => Some(crate::ops::Input::of::<input::CodeRun>()),
+        _ => None,
+    }
+}
+
+/// Code mode's tools' inputs (a runner's own server takes [`input::CodeSearch`] too,
+/// `crate::reach::mcp`).
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CodeSearch {
+        /// The body of an async function; `return` its answer.
+        pub program: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CodeRun {
+        /// The body of an async function; `return` its answer.
+        pub program: String,
+        /// Any JSON, available as `input`.
+        pub input: Option<serde_json::Value>,
+    }
+}
+
 /// `kiln mcp`: MCP over stdio for local clients, each message forwarded to the server's
 /// `/api/mcp` and each answer written back, one JSON message a line.
 pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::Write as _;
     let client = crate::http::client::Client::public()?;
-    let (tx, rx) = async_channel::bounded::<String>(64);
-    // stdin is read on a thread of its own: it blocks.
+    let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
+    // stdin is read on a thread of its own: it blocks. Each line goes as it came, so the server
+    // refuses one that isn't UTF-8 as it refuses what isn't JSON.
     std::thread::Builder::new().name("kiln-mcp-stdin".into()).spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            if !line.trim().is_empty() && tx.send_blocking(line).is_err() {
+        for line in rpc::lines(std::io::stdin().lock()) {
+            if tx.send_blocking(line).is_err() {
                 break;
             }
         }
@@ -682,9 +824,18 @@ pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
         };
         let out = match answer {
             Ok(text) => text,
+            // Each request it held is answered that kiln is unreachable; a notification isn't.
             Err(e) => {
-                let id = serde_json::from_str::<Value>(&line).ok().and_then(|v| v.get("id").cloned()).unwrap_or(Value::Null);
-                rpc_error(id, -32603, &format!("kiln is unreachable: {e:#}")).to_string()
+                let body = rpc::body(&line);
+                let ids = body.messages.into_iter().filter_map(|m| match m {
+                    Ok(req) => req.id,
+                    Err(refused) => Some(refused.id),
+                });
+                let answers = ids.map(|id| rpc::Refused::new(id, rpc::INTERNAL_ERROR, format!("kiln is unreachable: {e:#}")).answer()).collect();
+                match rpc::reply(body.batch, answers) {
+                    Some(a) => a.to_string(),
+                    None => continue,
+                }
             }
         };
         let mut stdout = std::io::stdout().lock();
@@ -803,6 +954,238 @@ mod tests {
             assert!(!name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'), "{name}");
             assert!(t.get("inputSchema").and_then(|s| s.get("type")).is_some(), "{name}");
         }
+    }
+
+    fn open(id: &str) -> crate::harness::core::Update {
+        crate::harness::core::Update::Open { info: Box::new(crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..Default::default() }), since: None }
+    }
+
+    /// A value of the wrong type for a property whose schema is `s`: a number for a string, a
+    /// string for the rest; none for one of several kinds (`anyOf`).
+    fn wrong_for(s: &Value) -> Option<Value> {
+        let types: Vec<&str> = match s.get("type")? {
+            Value::String(t) => vec![t.as_str()],
+            Value::Array(ts) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => return None,
+        };
+        if types.contains(&"string") { Some(json!(1)) } else { Some(json!("x")) }
+    }
+
+    /// Every operation (kiln's own, CI's, releases' and deployments', with deployments on)
+    /// publishes its input type's schema, as an MCP tool and in code mode's registry, and a call's
+    /// input is read as that type. Called through `/api/mcp`, each refuses an argument it doesn't
+    /// take (its schema says `additionalProperties: false`) and one of the wrong type, as a tool
+    /// error saying which (`unknown_field`, `invalid_type`) and where. One that takes nothing, or
+    /// only what may be of several kinds, is given arguments that aren't an object: -32602 there,
+    /// and refused by its type too (`crate::ops::misfit`, as code mode reads a call).
+    #[test]
+    fn every_operation_is_typed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.cd.enabled = true).await?;
+            let ops = crate::ops::all(&hub);
+            let tools = tools_of(crate::ops::all(&hub));
+            let registry = code::registry_of(&ops);
+            anyhow::ensure!(ops.len() > 300, "{} operations", ops.len());
+            let caller = Caller::owner();
+            let call = |tool: &str, arguments: Value| {
+                let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}).to_string();
+                let (hub, caller) = (&hub, caller.clone());
+                async move { answer(hub, caller, body.as_bytes()).await }
+            };
+            // A tool error saying `code` at `path`.
+            let refused = |a: &Option<Value>, code: &str, path: &str| {
+                let at = |p: &str| a.as_ref().and_then(|a| a.pointer(p)).cloned();
+                at("/result/isError") == Some(json!(true)) && at("/result/structuredContent/code") == Some(json!(code)) && at("/result/structuredContent/path") == Some(json!(path))
+            };
+            let mut differ = Vec::new();
+            for op in &ops {
+                let schema = op.input.schema();
+                let name = tool_name(op.name);
+                let tool = tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(name.as_str()));
+                let listed = registry.as_array().and_then(|r| r.iter().find(|o| o.get("name").and_then(Value::as_str) == Some(op.name)));
+                if tool.and_then(|t| t.get("inputSchema")) != Some(&schema) || listed.and_then(|o| o.get("input")) != Some(&schema) {
+                    differ.push(op.name);
+                }
+                anyhow::ensure!(schema.get("additionalProperties") == Some(&json!(false)), "{}", op.name);
+                let a = call(&name, json!({"zz_not_a_field": 1})).await;
+                anyhow::ensure!(refused(&a, "unknown_field", "/zz_not_a_field"), "{}: {a:?}", op.name);
+                let wrong = schema.get("properties").and_then(Value::as_object).and_then(|p| p.iter().find_map(|(k, v)| wrong_for(v).map(|w| (k.clone(), w))));
+                if let Some((field, w)) = wrong {
+                    let a = call(&name, json!({ field.clone(): w })).await;
+                    anyhow::ensure!(refused(&a, "invalid_type", &format!("/{field}")), "{}: {a:?}", op.name);
+                } else {
+                    let a = call(&name, json!("x")).await;
+                    anyhow::ensure!(a.as_ref().and_then(|a| a.pointer("/error/code")) == Some(&json!(rpc::INVALID_PARAMS)), "{}: {a:?}", op.name);
+                    let m = crate::ops::misfit(&caller, op.name, &json!("x"));
+                    anyhow::ensure!(m.as_ref().is_some_and(|m| m.path.is_empty() && m.code() == "invalid_type"), "{}: {m:?}", op.name);
+                }
+            }
+            anyhow::ensure!(differ.is_empty(), "published schemas that aren't their input type's: {differ:?}");
+            Ok(())
+        })
+    }
+
+    /// Code mode's tools are typed as the operations are: each publishes its input type's schema,
+    /// which says what the hand-written one did (but for spelling, `ops::as_written_by_hand`, and
+    /// `additionalProperties: false`), and a call's arguments are read as it before the program
+    /// runs. An argument it doesn't take, one of the wrong type, and a program left out or
+    /// misspelled (it ran empty before) are tool errors saying which and where, each noted against
+    /// the agent, on its page. `code_run`'s `input` is any JSON.
+    #[test]
+    fn code_mode_s_tools_are_typed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
+            agent.agent = Some("s1".into());
+            let call = |tool: &str, arguments: Value| {
+                let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}).to_string();
+                let (hub, caller) = (&hub, agent.clone());
+                async move { answer(hub, caller, body.as_bytes()).await }
+            };
+            // A tool error saying `code` at `path`.
+            let refused = |a: &Option<Value>, code: &str, path: &str| {
+                let at = |p: &str| a.as_ref().and_then(|a| a.pointer(p)).cloned();
+                at("/result/isError") == Some(json!(true)) && at("/result/structuredContent/code") == Some(json!(code)) && at("/result/structuredContent/path") == Some(json!(path))
+            };
+            // What each published before it was typed, as it was written by hand.
+            let before = [
+                ("code_search", json!({"type": "object", "properties": {"program": {"type": "string", "description": "The body of an async function; `return` its answer."}}, "required": ["program"]})),
+                (
+                    "code_run",
+                    json!({"type": "object", "properties": {
+                        "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
+                        "input": {"description": "Any JSON, available as `input`."}
+                    }, "required": ["program"]}),
+                ),
+            ];
+            let tools = tools_of(Vec::new());
+            for (name, was) in before {
+                let schema = tools.iter().find(|t| t.get("name") == Some(&json!(name))).and_then(|t| t.get("inputSchema")).cloned().unwrap_or_default();
+                anyhow::ensure!(Some(&schema) == code_input(name).map(|i| i.schema()).as_ref(), "{name} publishes its type's schema: {schema}");
+                anyhow::ensure!(schema.get("additionalProperties") == Some(&json!(false)) && crate::ops::as_written_by_hand(&schema) == was, "{name}: {schema}");
+                let a = call(name, json!({"zz_not_a_field": 1})).await;
+                anyhow::ensure!(refused(&a, "unknown_field", "/zz_not_a_field"), "{name}: {a:?}");
+                let a = call(name, json!({"program": 1})).await;
+                anyhow::ensure!(refused(&a, "invalid_type", "/program"), "{name}: {a:?}");
+                let a = call(name, json!({"programm": "return 1"})).await;
+                anyhow::ensure!(refused(&a, "unknown_field", "/programm"), "{name}: {a:?}");
+                let a = call(name, json!({})).await;
+                anyhow::ensure!(refused(&a, "missing_field", ""), "{name}: {a:?}");
+            }
+            let a = call("code_search", json!({"program": "return 1", "input": 2})).await;
+            anyhow::ensure!(refused(&a, "unknown_field", "/input"), "code_search takes no input: {a:?}");
+            let a = call("code_run", json!({"program": "return input", "input": [1, {"a": null}]})).await;
+            anyhow::ensure!(a.as_ref().and_then(|a| a.pointer("/result/structuredContent/result")) == Some(&json!([1, {"a": null}])), "{a:?}");
+            // Each refusal noted against the agent, on its page.
+            let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(9), "{kept:?}");
+            Ok(())
+        })
+    }
+
+    /// `/api/mcp` answers each message it can't read as JSON-RPC 2.0 and MCP say, and notes it
+    /// against the agent its token names, on its page: what isn't JSON, what isn't a request
+    /// (`{}`, each of `[1,2,3]`, one without a method), a method or a tool kiln doesn't have, a
+    /// list's cursor that isn't one. An argument an operation doesn't take, or of the wrong type,
+    /// is a tool error saying where and why, noted too. No notification is answered, and one no
+    /// client sends is noted all the same.
+    #[test]
+    fn what_mcp_cant_read_is_answered_as_json_rpc_says_and_noted() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
+            agent.agent = Some("s1".into());
+            let ask = |body: &'static str| answer(&hub, agent.clone(), body.as_bytes());
+            let counted = |code: &str| crate::metrics::wire().refused.get(&["mcp_http", code]);
+            let (unknown, malformed) = (counted("unknown"), counted("malformed"));
+            let code = |v: Option<Value>| v.and_then(|v| v.pointer("/error/code").and_then(Value::as_i64));
+            anyhow::ensure!(code(ask("{").await) == Some(rpc::PARSE_ERROR));
+            anyhow::ensure!(code(ask("{}").await) == Some(rpc::INVALID_REQUEST));
+            let three = ask("[1,2,3]").await;
+            let each = |e: &Value| e.pointer("/error/code") == Some(&json!(rpc::INVALID_REQUEST)) && e.get("id") == Some(&Value::Null);
+            anyhow::ensure!(three.as_ref().and_then(Value::as_array).is_some_and(|a| a.len() == 3 && a.iter().all(each)), "{three:?}");
+            anyhow::ensure!(code(ask(r#"{"jsonrpc":"2.0","id":1}"#).await) == Some(rpc::INVALID_REQUEST), "no method");
+            anyhow::ensure!(code(ask(r#"{"jsonrpc":"2.0","id":2,"method":"teleport"}"#).await) == Some(rpc::METHOD_NOT_FOUND));
+            anyhow::ensure!(code(ask(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"teleport"}}"#).await) == Some(rpc::INVALID_PARAMS));
+            let at = |v: &Option<Value>, p: &str| v.as_ref().and_then(|v| v.pointer(p)).cloned();
+            let golas = ask(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"goals_add","arguments":{"golas":["x"]}}}"#).await;
+            anyhow::ensure!(at(&golas, "/result/isError") == Some(json!(true)) && at(&golas, "/result/structuredContent/code") == Some(json!("unknown_field")) && at(&golas, "/result/structuredContent/path") == Some(json!("/golas")), "{golas:?}");
+            let typed = ask(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"goals_add","arguments":{"goals":"x"}}}"#).await;
+            anyhow::ensure!(at(&typed, "/result/structuredContent/code") == Some(json!("invalid_type")) && at(&typed, "/result/structuredContent/path") == Some(json!("/goals")), "{typed:?}");
+            anyhow::ensure!(ask(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await.is_none(), "a notification isn't answered");
+            anyhow::ensure!(ask(r#"{"jsonrpc":"2.0","method":"notifications/teleport"}"#).await.is_none(), "nor is one no client sends");
+            anyhow::ensure!(code(ask(r#"{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"cursor":5}}"#).await) == Some(rpc::INVALID_PARAMS), "a cursor is a string");
+            // Each counted, noted against the agent, on its page, and audited naming it: the
+            // method, the tool and the notification `unknown`, the other nine `malformed`.
+            anyhow::ensure!(counted("unknown") >= unknown + 3 && counted("malformed") >= malformed + 9, "counted");
+            let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(12), "{kept:?}");
+            let principal: String = hub.store.call(|c| Ok(c.query_row("SELECT principal FROM audit2 WHERE action = 'security.wire_refused' AND target = 'mcp_http' LIMIT 1", [], |r| r.get(0))?)).await?;
+            anyhow::ensure!(principal == "agent:s1", "{principal}");
+            Ok(())
+        })
+    }
+
+    /// A body `/api/mcp` can't read whole is answered as JSON-RPC 2.0 has it, under a null id,
+    /// and noted against the agent: one past the most it reads (413), and one cut short (400).
+    #[test]
+    fn a_body_it_cant_read_whole_is_refused_and_noted() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
+            agent.agent = Some("s1".into());
+            let said = |r: Response| async move {
+                let status = r.status();
+                let body = r.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                (status, serde_json::from_slice::<Value>(&body).ok())
+            };
+            let code = |v: &Option<Value>| v.as_ref().and_then(|v| v.pointer("/error/code")).and_then(Value::as_i64);
+            // What `http` reads of a body past the most: `Limited`'s own error.
+            let past = http_body_util::Limited::new(http_body_util::Full::new(bytes::Bytes::from_static(b"[1,2,3]")), 4).collect().await.map(|b| b.to_bytes());
+            let (status, v) = said(respond(&hub, agent.clone(), past).await).await;
+            anyhow::ensure!(status == StatusCode::PAYLOAD_TOO_LARGE && code(&v) == Some(rpc::INVALID_REQUEST) && v.as_ref().and_then(|v| v.get("id")) == Some(&Value::Null), "{status} {v:?}");
+            let (status, v) = said(respond(&hub, agent.clone(), Err("connection reset".into())).await).await;
+            anyhow::ensure!(status == StatusCode::BAD_REQUEST && code(&v) == Some(rpc::PARSE_ERROR), "{status} {v:?}");
+            let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(2), "{kept:?}");
+            Ok(())
+        })
+    }
+
+    /// Through reach (`ReachAsk`): word from a session's MCP server on a runner of what it couldn't
+    /// read is noted against the session, on its page and the runner's; a call whose input doesn't
+    /// fit is answered saying where and why, and noted the same way. Word of a session that runs
+    /// elsewhere is refused, and not noted.
+    #[test]
+    fn through_reach_what_couldnt_be_read_is_noted_against_its_session() -> anyhow::Result<()> {
+        use crate::reach::Question;
+        use crate::wire::unread::{Code, Kept};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for name in ["box", "mac"] {
+                hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, "linux", "x86_64"));
+            }
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            let unread = Question::Unread { session: "s1".into(), what: "tools/call teleport".into(), code: Code::Unknown, why: "Unknown tool: teleport".into() };
+            let a = runner_ask(&hub, "box", &unread).await;
+            anyhow::ensure!(a.get("ok").is_some(), "{a}");
+            let elsewhere = runner_ask(&hub, "mac", &unread).await;
+            anyhow::ensure!(elsewhere.get("error").is_some(), "{elsewhere}");
+            let call = Question::Call { session: "s1".into(), terminal: String::new(), name: "goals.add".into(), input: json!({"golas": ["x"]}) };
+            let a = runner_ask(&hub, "box", &call).await;
+            anyhow::ensure!(a.get("code") == Some(&json!("unknown_field")) && a.get("path") == Some(&json!("/golas")) && a.get("status") == Some(&json!(400)), "{a}");
+            let session = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(session.as_ref().map(Kept::total) == Some(2), "the session's page: {session:?}");
+            let runner = hub.agent_list().await.into_iter().find(|r| r.name == "box").and_then(|r| r.refused);
+            anyhow::ensure!(runner.as_ref().map(Kept::total) == Some(2), "the runner's page: {runner:?}");
+            let principal: String = hub.store.call(|c| Ok(c.query_row("SELECT principal FROM audit2 WHERE action = 'security.wire_refused' AND target = 'mcp_reach' LIMIT 1", [], |r| r.get(0))?)).await?;
+            anyhow::ensure!(principal == "agent:s1", "{principal}");
+            Ok(())
+        })
     }
 
     /// An agent kiln runs is told who it is and how its goal stack and plans work; anyone else
