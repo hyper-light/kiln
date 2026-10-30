@@ -46,7 +46,7 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
     // The device's setting is the page's one switch: every animation looks at it.
     await expect(page.locator("html")).toHaveAttribute("data-motion", "paused");
     // The stands' rule, a canvas: drawn at rest, and not again while its counts hold.
-    const rule = page.locator("canvas.st-rule").first();
+    const rule = page.locator("canvas.sd-rule").first();
     await expect(rule).toBeVisible();
     const drawn = () => rule.evaluate((c) => (c as HTMLCanvasElement).toDataURL());
     const still = await drawn();

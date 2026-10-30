@@ -1,12 +1,14 @@
 /* How your agents stand (stands.tsx): under Mission control's head, a rule with a stretch for each
    way they stand (stands-light.ts draws it, one string of light across them all), and under it
-   each one's badge and count. What CSS moves here is transform and opacity only: the badges and the counts' digits. */
+   each one's badge and count. What CSS moves here is transform and opacity only: the badges and the counts' digits.
+   Its names are sd-, not st-: st- is Settings' (settings.css), and this sheet, in no layer, stays
+   once Mission control or Ship has loaded it, so a name the two shared moved Settings' page. */
 
-.st {
+.sd {
   min-height: 26px;
   margin: -6px 0 26px;
 }
-.st-lead {
+.sd-lead {
   max-width: 560px;
   margin: -6px 0 26px;
   color: #a1a4ad;
@@ -14,40 +16,40 @@
   line-height: 1.8;
 }
 @media (max-width: 640px) {
-  .st,
-  .st-lead {
+  .sd,
+  .sd-lead {
     margin: -2px 0 16px;
   }
 }
-.st [data-stand] {
-  --st-t: #a1a4ad;
+.sd [data-stand] {
+  --sd-t: #a1a4ad;
 }
-.st [data-stand="needs"] {
-  --st-t: #e2cfae;
+.sd [data-stand="needs"] {
+  --sd-t: #e2cfae;
 }
-.st [data-stand="crashed"] {
-  --st-t: #e2b9bd;
+.sd [data-stand="crashed"] {
+  --sd-t: #e2b9bd;
 }
-.st [data-stand="paused"] {
-  --st-t: #b8c2d3;
+.sd [data-stand="paused"] {
+  --sd-t: #b8c2d3;
 }
-.st [data-stand="working"] {
-  --st-t: #cdc6ea;
+.sd [data-stand="working"] {
+  --sd-t: #cdc6ea;
 }
-.st [data-stand="finished"] {
-  --st-t: #bfdccf;
+.sd [data-stand="finished"] {
+  --sd-t: #bfdccf;
 }
-.st [data-stand="ready"] {
-  --st-t: #a1a4ad;
+.sd [data-stand="ready"] {
+  --sd-t: #a1a4ad;
 }
-.st [data-stand="offline"] {
-  --st-t: #8b8e96;
+.sd [data-stand="offline"] {
+  --sd-t: #8b8e96;
 }
 
 /* The rule: a canvas taller than the line it was, so what floats about the string and its swings
    have room; it takes the same room in the page (16 points over it and 7 under it given back),
    the string at rest where the line was, and the badges under it don't move. */
-.st-rule {
+.sd-rule {
   display: block;
   width: 100%;
   height: 44px;
@@ -56,7 +58,7 @@
 }
 
 /* Under it, each one's badge and count, and on a desktop its name. */
-.st-row {
+.sd-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -65,38 +67,38 @@
   padding: 0;
   list-style: none;
 }
-.st-item {
+.sd-item {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  color: var(--st-t);
+  color: var(--sd-t);
 }
 
 /* The badges: what each state is. Working's arc turns, needs you's bubble brightens and dims,
    ready's light breathes. */
-.st-mark {
+.sd-mark {
   display: block;
   flex: none;
   width: 14px;
   height: 14px;
   overflow: visible;
 }
-.st-turning {
-  animation: st-turn 1.4s linear infinite;
+.sd-turning {
+  animation: sd-turn 1.4s linear infinite;
 }
-.st-calling {
-  animation: st-call 0.8s ease-in-out infinite alternate;
+.sd-calling {
+  animation: sd-call 0.8s ease-in-out infinite alternate;
 }
-.st-breathing {
+.sd-breathing {
   transform-box: fill-box;
   transform-origin: center;
-  animation: st-breathe 1.3s ease-in-out infinite alternate;
+  animation: sd-breathe 1.3s ease-in-out infinite alternate;
 }
 
-/* A count: a cell a digit wide (--st-dw, the widest digit, measured) for each place, two at least,
+/* A count: a cell a digit wide (--sd-dw, the widest digit, measured) for each place, two at least,
    so 9 going to 10 moves nothing beside it. A place whose digit changes rolls: up as the count
    rises, down as it falls. */
-.st-n {
+.sd-n {
   display: inline-flex;
   flex: none;
   height: 14px;
@@ -107,32 +109,32 @@
   letter-spacing: 0;
   line-height: 14px;
 }
-.st-d {
+.sd-d {
   position: relative;
   display: block;
   flex: none;
-  width: var(--st-dw, 0.56em);
+  width: var(--sd-dw, 0.56em);
   height: 14px;
 }
-.st-d > b {
+.sd-d > b {
   position: absolute;
   inset: 0;
   font-weight: inherit;
   text-align: center;
 }
-.st-in.st-up {
-  animation: st-in-up 0.45s var(--ease) both;
+.sd-in.sd-up {
+  animation: sd-in-up 0.45s var(--ease) both;
 }
-.st-out.st-up {
-  animation: st-out-up 0.45s var(--ease) both;
+.sd-out.sd-up {
+  animation: sd-out-up 0.45s var(--ease) both;
 }
-.st-in.st-down {
-  animation: st-in-down 0.45s var(--ease) both;
+.sd-in.sd-down {
+  animation: sd-in-down 0.45s var(--ease) both;
 }
-.st-out.st-down {
-  animation: st-out-down 0.45s var(--ease) both;
+.sd-out.sd-down {
+  animation: sd-out-down 0.45s var(--ease) both;
 }
-.st-probe {
+.sd-probe {
   position: absolute;
   display: inline-block;
   height: auto;
@@ -140,8 +142,8 @@
   visibility: hidden;
 }
 
-.st-quiet,
-.st-word {
+.sd-quiet,
+.sd-word {
   color: #97999f;
   font-family: var(--font-mono);
   font-size: 10px;
@@ -149,17 +151,17 @@
   text-transform: uppercase;
 }
 @media (max-width: 640px) {
-  .st-word {
+  .sd-word {
     display: none;
   }
 }
 
-@keyframes st-turn {
+@keyframes sd-turn {
   to {
     transform: rotate(360deg);
   }
 }
-@keyframes st-call {
+@keyframes sd-call {
   from {
     opacity: 0.72;
   }
@@ -167,7 +169,7 @@
     opacity: 1;
   }
 }
-@keyframes st-breathe {
+@keyframes sd-breathe {
   from {
     transform: scale(0.86);
   }
@@ -175,49 +177,49 @@
     transform: scale(1);
   }
 }
-@keyframes st-in-up {
+@keyframes sd-in-up {
   from {
     transform: translateY(100%);
     opacity: 0;
   }
 }
-@keyframes st-out-up {
+@keyframes sd-out-up {
   to {
     transform: translateY(-100%);
     opacity: 0;
   }
 }
-@keyframes st-in-down {
+@keyframes sd-in-down {
   from {
     transform: translateY(-100%);
     opacity: 0;
   }
 }
-@keyframes st-out-down {
+@keyframes sd-out-down {
   to {
     transform: translateY(100%);
     opacity: 0;
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .st *,
-  .st *::before,
-  .st *::after {
+  .sd *,
+  .sd *::before,
+  .sd *::after {
     animation: none !important;
   }
-  .st-out {
+  .sd-out {
     display: none;
   }
 }
 /* Motion paused: a changed count shows its new digit at once. */
-html[data-motion="paused"] .st-out {
+html[data-motion="paused"] .sd-out {
   display: none;
 }
-html[data-motion="paused"] .st-in {
+html[data-motion="paused"] .sd-in {
   animation: none;
 }
 
 /* A stand another page always shows (Ship's), at zero: there, but dimmed. */
-.st-item[data-zero] {
+.sd-item[data-zero] {
   opacity: 0.38;
 }
