@@ -63,6 +63,26 @@ pub fn auto_push_warning(trunk: &str) -> String {
     )
 }
 
+/// Whether a change turns automatic pushes on: its `.kiln/review.yaml` says `push: auto` where the
+/// trunk's doesn't.
+pub fn turns_auto_push_on(trunk: &Settings, change: &Settings) -> bool {
+    trunk.push != Push::Auto && change.push == Push::Auto
+}
+
+/// The gate on a change that turns automatic pushes on (W26-R11's, with W26-R16's warning): approving
+/// it warns, in plain words, what turning them on means; a gate that holds still holds.
+pub fn warn(mut gate: crate::review::Gate, warning: &str) -> crate::review::Gate {
+    use crate::review::Verdict;
+    if matches!(gate.verdict, Verdict::Clear | Verdict::Inform) {
+        gate.verdict = Verdict::Warn;
+    }
+    gate.warning = Some(match gate.warning.take() {
+        Some(w) => format!("{w}; {warning}"),
+        None => warning.to_owned(),
+    });
+    gate
+}
+
 /// A trunk moved: from `before` to `after`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Move {
@@ -556,6 +576,24 @@ mod tests {
         assert!(!Policy::parse("fresh:\n  replay: false\n")?.fresh.replay);
         assert!(Policy::parse("fresh:\n  push: sometimes\n").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn w26_r16_turning_auto_push_on_warns_on_approval() {
+        let manual = Settings::default();
+        let auto = Settings { push: Push::Auto, ..Settings::default() };
+        assert!(turns_auto_push_on(&manual, &auto));
+        assert!(!turns_auto_push_on(&auto, &auto), "already on: nothing turns it on");
+        assert!(!turns_auto_push_on(&manual, &manual));
+        let w = auto_push_warning("main");
+        let clear = crate::review::gate(&[], &[], None);
+        let g = warn(clear, &w);
+        assert_eq!(g.verdict, crate::review::Verdict::Warn);
+        assert_eq!(g.approve(false), Err(format!("{w}: approve anyway with `force`")));
+        assert!(g.approve(true).is_ok_and(|said| said.is_some_and(|s| s.contains("pull or rebase"))));
+        // A gate that holds still holds.
+        let held = crate::review::gate(&[], &[crate::review::Conflict { file: "a.rs".into(), line: Some(3), taken: false }], None);
+        assert_eq!(warn(held, &w).verdict, crate::review::Verdict::Hold);
     }
 
     #[test]

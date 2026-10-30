@@ -285,3 +285,104 @@ fn w26_r16_a_hand_rebase_after_the_replay_reads_unchanged() -> anyhow::Result<()
     assert_eq!(versions(&x.s, &x.kim, "/api/diffs/D2")?.len(), 2);
     Ok(())
 }
+
+fn call(s: &Server, token: &str, method: &str, path: &str, body: Option<&Value>) -> anyhow::Result<(u16, Value)> {
+    let (st, text) = http(s.port, method, path, token, body)?;
+    Ok((st, serde_json::from_str(&text).unwrap_or(Value::String(text))))
+}
+
+/// A change request (CR1, branch topic) whose replay onto a moved main is its v2: the head of its
+/// branch, and v2's commit. `review` is the trunk's `.kiln/review.yaml`.
+fn replayed_request(review: &[u8]) -> anyhow::Result<(Setup, String)> {
+    let x = setup(&[("t.txt", b"t\n"), (".kiln/review.yaml", review)])?;
+    must(git(&x.home, &x.work, &["checkout", "-qb", "topic"]), "branch")?;
+    x.commit(&[("t.txt", b"t, topic\n")], "topic work")?;
+    let out = must(git(&x.home, &x.work, &["push", "origin", "topic:refs/for/main/branch/topic"]), "the change request")?;
+    anyhow::ensure!(out.contains("CR1"), "{out}");
+    x.main_moves(&[("z.txt", b"elsewhere\n")], "main moves")?;
+    let mut replay = String::new();
+    until(60, "CR1 replayed", || {
+        let v = versions(&x.s, &x.kim, "/api/change-requests/CR1")?.pop().unwrap_or_default();
+        replay = text(&v, "commit").to_owned();
+        Ok((text(&v, "why") != "replayed").then(|| v.to_string()))
+    })?;
+    Ok((x, replay))
+}
+
+/// W26-R16, AC07: a branch moves only when someone presses Update. CR1's replay leaves topic where it
+/// was; Update moves it to the replay, with a lease (pressed again, it says it's there already); a
+/// diff has no branch to move; and a branch pushed since its replay is refused, saying why.
+#[test]
+fn w26_r16_update_moves_a_branch_only_when_asked() -> anyhow::Result<()> {
+    let (x, replay) = replayed_request(b"land:\n  approvals: 1\n")?;
+    let s = &x.s;
+    let topic = |x: &Setup| rev(&x.bare, &["rev-parse", "refs/heads/topic"]);
+    let head = topic(&x)?;
+    assert_ne!(head, replay, "the replay didn't move topic");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(topic(&x)?, head, "nor does anything later, unasked");
+    let r = ok(s, &x.kim, "POST", "/api/change-requests/CR1/update", Some(&json!({})))?;
+    assert_eq!((text(&r, "branch"), text(&r, "head")), ("topic", replay.as_str()), "{r}");
+    assert_eq!(topic(&x)?, replay, "Update moved topic to the replay");
+    let (st, r) = call(s, &x.kim, "POST", "/api/change-requests/CR1/update", Some(&json!({})))?;
+    assert!(st == 409 && r.to_string().contains("at CR1's replay already"), "{st} {r}");
+
+    // A diff has no branch.
+    must(git(&x.home, &x.work, &["checkout", "-q", "-B", "d", "origin/main"]), "branch")?;
+    x.commit(&[("d.txt", b"d\n")], "a diff")?;
+    must(git(&x.home, &x.work, &["push", "origin", "HEAD:refs/for/main"]), "D2")?;
+    let main = x.main_moves(&[("z.txt", b"moved again\n")], "main moves again")?;
+    until(60, "D2 replayed", || {
+        let v = versions(s, &x.kim, "/api/diffs/D2")?.pop().unwrap_or_default();
+        Ok((text(&v, "base") != main).then(|| v.to_string()))
+    })?;
+    let (st, r) = call(s, &x.kim, "POST", "/api/diffs/D2/update", Some(&json!({})))?;
+    assert!(st == 409 && r.to_string().contains("has no branch to move"), "{st} {r}");
+
+    // CR1 replayed again onto that move; then its author pushes to topic before anyone presses
+    // Update: Update is refused (the branch moved, or the push is CR1's latest revision now) and the
+    // author's push stands.
+    until(60, "CR1 replayed again", || {
+        let v = versions(s, &x.kim, "/api/change-requests/CR1")?.pop().unwrap_or_default();
+        Ok((text(&v, "commit") == replay).then(|| v.to_string()))
+    })?;
+    must(git(&x.home, &x.work, &["fetch", "-q", "origin"]), "fetch")?;
+    must(git(&x.home, &x.work, &["checkout", "-q", "-B", "topic2", "origin/topic"]), "topic")?;
+    x.commit(&[("t.txt", b"t, topic, more\n")], "more topic work")?;
+    let pushed = must(git(&x.home, &x.work, &["rev-parse", "HEAD"]), "rev")?.trim().to_owned();
+    must(git(&x.home, &x.work, &["push", "-q", "origin", "HEAD:topic"]), "push topic")?;
+    let (st, r) = call(s, &x.kim, "POST", "/api/change-requests/CR1/update", Some(&json!({})))?;
+    assert!(st == 409 && (r.to_string().contains("topic moved since CR1 was replayed") || r.to_string().contains("isn't a replay")), "{st} {r}");
+    assert_eq!(topic(&x)?, pushed, "the author's push stands");
+    Ok(())
+}
+
+/// W26-R16, AC07: with `fresh.push: auto`, a change request's replay is pushed to its branch as
+/// main moves, and says so in the audit.
+#[test]
+fn w26_r16_auto_push_only_when_declared() -> anyhow::Result<()> {
+    let (x, replay) = replayed_request(b"land:\n  approvals: 1\nfresh:\n  push: auto\n")?;
+    until(30, "topic pushed automatically", || {
+        let at = rev(&x.bare, &["rev-parse", "refs/heads/topic"])?;
+        Ok((at != replay).then(|| format!("topic at {at}, the replay {replay}")))
+    })?;
+    Ok(())
+}
+
+/// W26-R16: a change that turns automatic pushes on warns before it's approved, in plain words:
+/// every open change's branch pushed each time main moves, the API use and CI runs on GitHub,
+/// GitLab and Bitbucket, and pulling or rebasing before pushing.
+#[test]
+fn w26_r16_turning_auto_push_on_warns() -> anyhow::Result<()> {
+    let x = setup(&[])?;
+    x.commit(&[(".kiln/review.yaml", b"land:\n  approvals: 1\n  resolve-threads: false\nfresh:\n  push: auto\n")], "fresh: push replays automatically")?;
+    must(git(&x.home, &x.work, &["push", "origin", "HEAD:refs/for/main"]), "D1")?;
+    let (st, r) = call(&x.s, &x.kim, "POST", "/api/diffs/D1/review", Some(&json!({ "action": "accept" })))?;
+    let said = r.to_string();
+    assert_eq!(st, 409, "{r}");
+    for words in ["every open change's branch is pushed each time main moves", "GitHub, GitLab and Bitbucket", "heavy API use", "many more CI runs", "pull or rebase before they push", "approve anyway with `force`"] {
+        assert!(said.contains(words), "{words}: {said}");
+    }
+    ok(&x.s, &x.kim, "POST", "/api/diffs/D1/review", Some(&json!({ "action": "accept", "force": true })))?;
+    Ok(())
+}

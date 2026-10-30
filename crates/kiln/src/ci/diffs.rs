@@ -1777,6 +1777,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 // Its conflicts with where it lands, resolved where they fall, then committed (W26-R12).
                 (&Method::GET, ["conflicts"]) => ok(super::conflicts::list(hub, &d).await?),
                 (&Method::POST, ["conflicts", "commit"]) => ok(super::conflicts::commit(hub, &d, caller).await?),
+                // W26-R16: Update moves a change's branch to its replay.
+                (&Method::POST, ["update"]) => ok(super::fresh::update(hub, &d, caller).await?),
                 (&Method::POST, ["conflicts", id, "resolution"]) => ok(super::conflicts::resolve(hub, &d, id, caller, body).await?),
                 (&Method::DELETE, ["conflicts", id, "resolution"]) => ok(super::conflicts::undo(hub, &d, id, caller).await?),
                 (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),

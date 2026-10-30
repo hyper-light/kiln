@@ -184,6 +184,13 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
     for ((d, v), n) in made.iter().zip(&numbers) {
         // Why the revision exists (W26-R04).
         revision::record(hub, &d.id, *n, &v.commit, &revision::Why { why: plan::WHY, thread: None, comment: None, note: None }).await?;
+        // Pushed now only where the repository turned automatic pushes on (`fresh.push: auto`).
+        if plan::then(policy.fresh, plan::Outcome::Clean, d.branch.is_some() && d.kind == "change_request").push {
+            match move_branch(hub, repo, &path, d, &v.commit).await {
+                Ok(branch) => hub.store.audit("kiln".into(), "review.fresh.push".into(), format!("{} {} v{n}: {branch} moved to its replay, automatically (.kiln/review.yaml's fresh.push: auto)", repo.name, d.name)).await,
+                Err(why) => tracing::info!(repo = %repo.name, diff = %d.name, %why, "a replay wasn't pushed automatically"),
+            }
+        }
     }
     // A conflicting replay is kept where it falls, for the ladder; the ones above it wait.
     for id in &conflicted {
@@ -349,4 +356,43 @@ async fn keep_pull_replay(hub: &Hub, repo: &Repo, p: &Pull, tip: &str, tip_name:
             Ok(k)
         })
         .await
+}
+
+/// Moves change request `d`'s branch to `replay`, its latest revision kiln replayed, if the branch
+/// is still where the replay was made from (the replay's first parent): a push with a lease, in
+/// kiln's own repository. Why it can't, in words.
+async fn move_branch(hub: &Hub, repo: &Repo, path: &str, d: &Diff, replay: &str) -> Result<String, String> {
+    let Some(branch) = d.branch.as_deref().filter(|_| d.kind == "change_request") else {
+        return Err(format!("{} is a diff: its replay is its latest revision already, and it has no branch to move", d.name));
+    };
+    let at = gitops::run_git(hub, &["-C", path, "rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
+    if at == replay {
+        return Err(format!("{branch} is at {}'s replay already", d.name));
+    }
+    let expected = gitops::run_git(hub, &["-C", path, "rev-parse", "--verify", "--quiet", &format!("{replay}^1")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| format!("{e:#}"))?;
+    if gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/heads/{branch}"), replay, &expected], LS_REMOTE_TIMEOUT).await.is_err() {
+        let now = gitops::run_git(hub, &["-C", path, "rev-parse", "--short", &format!("refs/heads/{branch}")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
+        return Err(format!("{branch} moved since {} was replayed (it's at {now} now): it replays again first", d.name));
+    }
+    // The poller takes the branch's move now: its runs, as any push's.
+    gitops::want(hub, &repo.id);
+    Ok(branch.to_owned())
+}
+
+/// `POST /api/diffs/:id/update` and `/api/change-requests/:id/update` (W26-R16): someone pressed
+/// Update. A change request's branch moves to its latest replay (with a lease: refused, saying why,
+/// when the branch moved since); a diff has no branch, its replay being its latest revision already.
+pub async fn update(hub: &Hub, d: &Diff, caller: &crate::authz::Caller) -> Result<serde_json::Value, super::Fail> {
+    use http::StatusCode;
+    if !State::parse(&d.state).is_some_and(|s| s.is_open() && s != State::Landing) {
+        return Err((StatusCode::CONFLICT, format!("{} is {}", d.name, d.state)));
+    }
+    let latest = diffs::versions(hub, d).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.pop().ok_or((StatusCode::CONFLICT, format!("{} has no revision", d.name)))?;
+    if latest.why.as_deref() != Some(plan::WHY) {
+        return Err((StatusCode::CONFLICT, format!("{} v{} isn't a replay: nothing to update", d.name, latest.n)));
+    }
+    let (repo, path) = diffs::home(hub, d).await?;
+    let branch = move_branch(hub, &repo, &path, d, &latest.commit).await.map_err(|why| (StatusCode::CONFLICT, why))?;
+    hub.store.audit(caller.name.clone(), "review.fresh.update".into(), format!("{} {} v{}: {branch} moved to its replay ({})", d.repo, d.name, latest.n, latest.commit)).await;
+    Ok(serde_json::json!({ "change": d.name, "version": latest.n, "branch": branch, "head": latest.commit, "by": caller.name }))
 }

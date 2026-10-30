@@ -170,7 +170,26 @@ async fn gate_threads(hub: &Hub, d: &Diff) -> Result<Vec<kiln_ci::review::Thread
 /// replay onto where it lands holds it until Commit resolution makes a revision of it (W26-R12).
 pub async fn gate_of(hub: &Hub, d: &Diff, asking: Option<&str>) -> Result<Gate, Fail> {
     let conflicts = super::conflicts::for_gate(hub, d).await;
-    Ok(kiln_ci::review::gate(&gate_threads(hub, d).await?, &conflicts, asking))
+    let gate = kiln_ci::review::gate(&gate_threads(hub, d).await?, &conflicts, asking);
+    // A change that turns automatic pushes on warns, in plain words, before it's approved (W26-R16).
+    Ok(match turns_auto_push_on(hub, d).await {
+        true => kiln_ci::fresh::warn(gate, &kiln_ci::fresh::auto_push_warning(&d.trunk)),
+        false => gate,
+    })
+}
+
+/// Whether `d`'s latest revision turns automatic pushes on: its `.kiln/review.yaml` says
+/// `fresh.push: auto` where its trunk's doesn't (W26-R16).
+async fn turns_auto_push_on(hub: &Hub, d: &Diff) -> bool {
+    let Ok((_, path)) = super::diffs::home(hub, d).await else { return false };
+    let Some(latest) = super::diffs::versions(hub, d).await.ok().and_then(|mut v| v.pop()) else { return false };
+    let read = |rev: String| {
+        let path = path.clone();
+        async move { gitops::run_git(hub, &["-C", &path, "show", &format!("{rev}:.kiln/review.yaml")], LS_REMOTE_TIMEOUT).await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }
+    };
+    let ours = Policy::parse(&read(latest.commit.clone()).await).unwrap_or_default();
+    let theirs = Policy::parse(&read(format!("refs/heads/{}", d.trunk)).await).unwrap_or_default();
+    kiln_ci::fresh::turns_auto_push_on(&theirs.fresh, &ours.fresh)
 }
 
 /// A new comment: on a thread (`thread`), or a new thread on a version's `file`, `side` and

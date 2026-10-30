@@ -385,6 +385,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
     r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
@@ -406,6 +407,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
