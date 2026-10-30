@@ -1156,7 +1156,10 @@ fn w27_ac02_keys() -> anyhow::Result<()> {
     let mut keys = Vec::new();
     for f in walk(dir.path())? {
         let name = f.to_string_lossy().into_owned();
-        if name.contains("/githome/") || name.contains("/tree/") || name.contains("/work") {
+        // The UI server kiln carries (its Bun and scripts, src/uiserver/carried.rs) holds the words
+        // in its code, not a key: whether its unpacking had reached them as the server was dropped
+        // decided this test before (an observe-followups gate, 2026-10-30, under load).
+        if name.contains("/githome/") || name.contains("/tree/") || name.contains("/work") || name.contains("/ui-server/") {
             continue;
         }
         let bytes = std::fs::read(&f).unwrap_or_default();
