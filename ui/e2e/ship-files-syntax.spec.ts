@@ -5,7 +5,8 @@
  * tree-sitter's tokens (lib/syntax); D41 is an agent's change, so a name tapped in its code opens
  * the card under that line (components/code/about.tsx), About streams the agent's helper's answer
  * into it, and Close ends it; a line's number still starts a comment. The colours move nothing:
- * every line, and Files itself, measure the same with them and without.
+ * every line, and Files itself, measure the same with them and without; and a card opening and
+ * answering shifts nothing of Ship's but by its own height as it slides (Kiln PRs' review).
  */
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
@@ -95,4 +96,42 @@ test("the colours move nothing: every line and Files itself measure the same wit
   await files.evaluate((el) => el.querySelectorAll(".rv-t span[class]").forEach((s) => s.removeAttribute("class")));
   await expect(files.locator(".rv-t span[class]")).toHaveCount(0);
   expect(await measure()).toEqual(coloured);
+});
+
+test("a card opening and answering shifts nothing of Ship's: only the card's own height moves what's under it, as it slides", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "layout-shift entries are Chromium's");
+  const files = await filesOf(page);
+  const line = files.locator(".rv-l", { hasText: "pub fn legs" }).first();
+  await expect(line.locator(".rv-t .hl-kw").first()).toBeVisible();
+  await line.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(1000);
+  // From here on, Ship's own shifts that no tap or click made (a slide inside its 500 ms is the tap's),
+  // outside the card: inside it, about.tsx's skeleton gives way to the answer's parts in the room it
+  // kept, as in agent chat.
+  await page.evaluate(() => {
+    const w = window as unknown as { shift: number; moved: string[] };
+    w.shift = 0;
+    w.moved = [];
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries() as unknown as { value: number; hadRecentInput: boolean; sources?: { node?: Node | null }[] }[]) {
+        if (e.hadRecentInput) continue;
+        const ours = (e.sources ?? [])
+          .map((s) => (s.node instanceof Element ? s.node : (s.node?.parentElement ?? null)))
+          .filter((n): n is Element => !!n?.closest(".ship") && !n.closest(".hx-about-card"));
+        if (!ours.length) continue;
+        w.shift += e.value;
+        w.moved.push(ours.map((n) => `${n.tagName.toLowerCase()}.${String(n.className).split(" ")[0]}`).join(", "));
+      }
+    }).observe({ type: "layout-shift" });
+  });
+  const at = await wordIn(line.locator(".rv-t"), "legs");
+  await page.mouse.click(at?.x ?? 0, at?.y ?? 0);
+  const card = files.getByRole("region", { name: "About legs" });
+  await expect(card).toBeVisible();
+  await card.getByRole("button", { name: "About", exact: true }).click();
+  // Its answer streams into the room kept for it from the start.
+  await expect(card).toContainText("Worth knowing", { ignoreCase: true, timeout: 15_000 });
+  await page.waitForTimeout(1000);
+  const seen = await page.evaluate(() => ({ shift: (window as unknown as { shift: number }).shift, moved: (window as unknown as { moved: string[] }).moved }));
+  expect(seen.shift, `what moved: ${seen.moved.join(" | ")}`).toBe(0);
 });

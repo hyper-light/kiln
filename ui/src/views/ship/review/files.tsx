@@ -118,8 +118,9 @@ const refresh = () => {
 /** Shared empties and a no-op, so stable references stay stable (W26-R15). */
 const EMPTY_THREADS: Thread[] = [];
 
-/** Who asking about code goes to (components/code/about.tsx): its author, where an agent wrote it
- * (`agent:<id>`, as its agent token pushed it); none for a person's, as on the review page. */
+/** Who asking about a change's code goes to (components/code/about.tsx): its author, where an agent
+ * wrote it (`agent:<id>`, as its agent token pushed it); none for a person's, as on the review page.
+ * A lone commit's code, and a host's pull request's, stays inert: neither names a session to ask. */
 function aboutOf(author: string): AboutAgent | null {
   const id = author.startsWith("agent:") ? (author.slice("agent:".length).split(" ")[0] ?? "") : "";
   return id ? { id, name: whoSaid(author), subagents: true, busy: false } : null;
@@ -503,7 +504,6 @@ function CommitFiles({ item }: { item: ShipCommit }) {
     }),
     [ops],
   );
-  const about = React.useMemo(() => aboutOf(item.author), [item.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: EMPTY_THREADS, conflicts: [], rowsByFile, version: 1, draft, setDraft, open: setWhole, q: "", linesOf }),
     [fullOps, rowsByFile, draft, linesOf],
@@ -519,13 +519,11 @@ function CommitFiles({ item }: { item: ShipCommit }) {
         </ul>
       }
     >
-      <AboutContext.Provider value={about}>
-        {whole ? (
-          <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
-        ) : (
-          list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
-        )}
-      </AboutContext.Provider>
+      {whole ? (
+        <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
+      ) : (
+        list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
+      )}
     </Frame>
   );
 }
