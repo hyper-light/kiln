@@ -921,7 +921,17 @@ interface MockConflict {
   takes: ("main" | "this" | "both" | "agent" | "edit")[];
   agent: { by: string; take: string | null; lines: string[] | null; at: number | null } | null;
   resolution: { take: string; lines: string[] | null; by: string | null; at: number | null } | null;
-  offered?: { rung: string; by: string; state: string; why: string | null; lines: string[] | null; explanation: string | null; tests: string | null; signer: null } | null;
+  offered?: {
+    rung: string;
+    by: string;
+    made_by?: { agent?: string; person?: string } | null;
+    state: string;
+    why: string | null;
+    lines: string[] | null;
+    explanation: string | null;
+    tests: string | null;
+    signer: null;
+  } | null;
 }
 
 /** D41's conflicts with main when a test turns them on (`POST /api/mock/review/conflicts`). */
@@ -933,6 +943,7 @@ function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unkn
     ? {
         rung: "agent",
         by: "agent:port for user:ada",
+        made_by: { agent: "port", person: "user:ada" },
         state: "resolved",
         why: null,
         lines: ["use serde_json::{Value, json}; // keeps main's alias"],

@@ -162,7 +162,7 @@ impl Try {
 
     fn view(&self) -> Value {
         json!({
-            "id": self.id, "rung": self.rung.as_str(), "by": self.by, "state": self.state, "why": self.why, "lines": self.lines,
+            "id": self.id, "rung": self.rung.as_str(), "by": self.by, "made_by": crate::ship::made_by_actor(&self.by), "state": self.state, "why": self.why, "lines": self.lines,
             "explanation": self.explanation, "commit": self.commit, "tests": self.tests.map(Tests::as_str), "at": self.at,
         })
     }

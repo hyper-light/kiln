@@ -1137,6 +1137,27 @@ fn made_by(rec: &Records) -> MadeBy {
 }
 
 impl MadeBy {
+    /// Who made one of the conflict ladder's tries (docs/ci.md W26-R17), from its actor's
+    /// principal: an agent's (`agent:<id> for user:kim`) names the agent and the person it acts for;
+    /// a person's (`user:kim`) the person; kiln's own (its structural merge, a remembered resolution)
+    /// neither, its rung saying who. A try isn't a commit until it's accepted; the revision it
+    /// becomes then reads its maker through [`made_by`], as every commit does.
+    fn of_actor(principal: &str) -> MadeBy {
+        if let Some(rest) = principal.strip_prefix("agent:") {
+            let mut words = rest.split(' ');
+            let agent = words.next().filter(|a| !a.is_empty()).map(str::to_owned);
+            let person = match (words.next(), words.next()) {
+                (Some("for"), Some(p)) if !p.is_empty() => Some(p.to_owned()),
+                _ => None,
+            };
+            return MadeBy { agent, person };
+        }
+        if principal.starts_with("user:") {
+            return MadeBy { agent: None, person: Some(principal.to_owned()) };
+        }
+        MadeBy::default()
+    }
+
     /// `{agent?, person?}` (optional fields, W26-R18), or null when kiln knows neither.
     fn json(&self) -> Value {
         if self.agent.is_none() && self.person.is_none() {
@@ -1151,6 +1172,11 @@ impl MadeBy {
         }
         Value::Object(v)
     }
+}
+
+/// [`MadeBy::of_actor`] as the API shows it: `{agent?, person?}`, or null.
+pub(crate) fn made_by_actor(principal: &str) -> Value {
+    MadeBy::of_actor(principal).json()
 }
 
 /// A commit's kind for the facets: its change's (`diff`, `request`), else `commit`.
@@ -1993,6 +2019,16 @@ async fn keep(hub: &Hub, rec: &Records, what: &[&str], to: &str, agent: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W26-R17: who made each of the conflict ladder's tries reads back in MadeBy's shape: an agent's
+    /// offer names the agent and its person, a person's edit the person, kiln's own merge neither.
+    #[test]
+    fn w26_r17_a_ladder_trys_made_by() {
+        assert_eq!(made_by_actor("agent:01a18b4228f7 for user:kim"), json!({ "agent": "01a18b4228f7", "person": "user:kim" }));
+        assert_eq!(made_by_actor("agent:resolver"), json!({ "agent": "resolver" }));
+        assert_eq!(made_by_actor("user:kim"), json!({ "person": "user:kim" }));
+        assert_eq!(made_by_actor("kiln"), Value::Null);
+    }
 
     const C1: &str = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const C2: &str = "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

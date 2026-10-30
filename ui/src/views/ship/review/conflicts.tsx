@@ -14,7 +14,7 @@
  */
 import * as React from "react";
 import { BadgeCheck, Check, GitMerge, Pencil, RotateCcw, X } from "lucide-react";
-import { conflictsApi, type Conflict, type ConflictTake, type LadderTry } from "@/api/review";
+import { conflictsApi, whoSaid, type Conflict, type ConflictTake, type LadderTry } from "@/api/review";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
 
@@ -39,8 +39,10 @@ function sideLines(s: Conflict["main"]): string[] {
 function whoOf(o: LadderTry): string {
   if (o.rung === "structural") return "kiln's structural merge";
   if (o.rung === "remembered") return "a remembered resolution";
-  const name = o.by.replace(/^agent:/, "").split(" ")[0];
-  return name && name !== "kiln" ? `agent ${name}` : "an agent";
+  // Who made it, as Ship's read model says it (made_by), never the raw principal.
+  if (o.made_by?.agent) return whoSaid(`agent:${o.made_by.agent}`);
+  if (o.made_by?.person) return whoSaid(o.made_by.person);
+  return "an agent";
 }
 
 /** A try's resolution, tested: whether a person may use it. */

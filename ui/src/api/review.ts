@@ -479,7 +479,10 @@ export type LadderRung = "structural" | "remembered" | "agent";
 /** One rung's try at a conflict: at work, kept (with why), or a resolution and its tests (W26-R17). */
 export interface LadderTry {
   rung: LadderRung;
+  /** Its actor's principal, as kept; the page reads `made_by`. */
   by: string;
+  /** Who made it, in Ship's shape (ship.rs MadeBy): an agent and the person it acts for, a person, or null for kiln's own. */
+  made_by?: { agent?: string; person?: string } | null;
   state: "working" | "kept" | "resolved";
   why: string | null;
   lines: string[] | null;
