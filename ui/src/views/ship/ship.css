@@ -76,10 +76,16 @@
   align-items: baseline;
   min-width: 0;
 }
+/* The stand word as f-ship and Mission control write it (plan 01a1856fe81375b1bd1d1d86f270a45b,
+   step 6): mono capitals in the stand's colour, a stand under way shimmering (Shimmer). */
 .ship-stand {
   flex: none;
-  font-size: 12.5px;
-  color: #e4e5e7;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: #a1a4ad;
 }
 .ship-stand[data-stand="needs_you"] {
   color: #e2cfae;
@@ -87,6 +93,21 @@
 .ship-stand[data-stand="failing"],
 .ship-stand[data-stand="rolled_back"] {
   color: #e2b9bd;
+}
+.ship-stand[data-stand="landing"],
+.ship-stand[data-stand="checking"],
+.ship-stand[data-stand="building"],
+.ship-stand[data-stand="shipping"],
+.ship-stand[data-stand="replanting"] {
+  color: #cdc6ea;
+}
+.ship-stand[data-stand="in_staging"],
+.ship-stand[data-stand="waiting"] {
+  color: #b8c2d3;
+}
+.ship-stand[data-stand="shipped"],
+.ship-stand[data-stand="fixed"] {
+  color: #bfdccf;
 }
 .ship-text {
   color: #a1a4ad;
@@ -111,12 +132,21 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Its second line holds a flag's height with or without one: a row that gains a flag doesn't grow. */
 .ship-m2 {
   display: flex;
   gap: 6px;
   align-items: center;
   justify-content: flex-end;
+  min-height: 20px;
   overflow: hidden;
+}
+/* Who: a person's or an agent's mark, then the name (f-ship's). */
+.ship-who {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  vertical-align: bottom;
 }
 .ship-change {
   color: #cdc6ea;
@@ -157,7 +187,9 @@
 .ship-fold {
   all: unset;
   cursor: pointer;
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   box-sizing: border-box;
   width: 100%;
   padding: 10px 4px 10px 34px;
@@ -165,6 +197,10 @@
   font-size: 12.5px;
   border-top: 1px solid var(--k-line-2, #1f2125);
   background: rgba(226, 207, 174, 0.02);
+}
+.ship-fold__sha {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
 }
 .ship-fold:hover {
   color: #e4e5e7;
@@ -196,6 +232,7 @@
   grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
+/* A commit page's sections: each a card. */
 .ship-sec {
   border: 1px solid var(--k-line, #2a2c31);
   border-radius: 10px;
@@ -204,13 +241,38 @@
   color: #a1a4ad;
   min-width: 0;
 }
-.ship-sec h3 {
-  margin: 0 0 6px;
+/* An opened commit's sections as f-ship draws them (plan 01a1856fe81375b1bd1d1d86f270a45b, step 7):
+   each its head, the label on the left and its controls on the right, over its card. */
+.ship-open .ship-sec {
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+}
+/* Where its controls don't fit beside its label (Lanes' at 320 px), they go under it, still on the right. */
+.ship-sech {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+  min-height: 32px;
+  margin: 0 0 8px;
+}
+.ship-sech h3 {
+  margin: 0;
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 10px;
+  font-weight: 400;
   letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: #b9bbc2;
+  color: #97999f;
+}
+.ship-sech__ctl {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
 }
 .ship-sec p,
 .ship-sec ul {
@@ -229,6 +291,13 @@
   .ship-r > .ship-pips {
     grid-column: 1;
     grid-row: 2;
+  }
+}
+/* The strip names its stages under its pips, as f-ship does; on a phone, the pips alone (plan
+   01a1856fe81375b1bd1d1d86f270a45b, step 6). */
+@media (max-width: 640px) {
+  .ship-pips .js-l {
+    display: none;
   }
 }
 @media (max-width: 700px) {
@@ -302,7 +371,36 @@
   color: #0b0c0e;
 }
 
-/* The list bar's sort, on the right; on a phone the filter takes the width and the sort sits under it. */
+/* The pace line under the list bar (f-ship's): one line of what's moving, scrolling sideways when it
+   doesn't fit (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5). */
+.ship-pace {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px 16px;
+  margin: 0 0 10px;
+  line-height: 18px;
+  min-height: 18px;
+  color: #8b8e96;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.ship-pace::-webkit-scrollbar {
+  display: none;
+}
+.ship-pace b {
+  font-weight: 450;
+  color: #b9bbc2;
+  font-variant-numeric: tabular-nums;
+}
+.ship-pace__sha {
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+/* The list bar's sort, on the right; on a phone the filter takes the width and the sort sits under it.
+   In the column a phone makes, each is its own height: a flex basis there would be a height (the
+   filter's 260px opened a gap under it). */
 .ship-sort {
   flex: 0 0 auto;
   min-width: 11rem;
@@ -314,6 +412,7 @@
   }
   .ship-facet,
   .ship-sort {
+    flex: none;
     width: 100%;
   }
 }
@@ -338,11 +437,25 @@
   width: 100%;
 }
 /* Its one environment: production in mint, another in grey. */
+/* The environment it runs in, as f-ship's flag: a tab with the flag's mark, production's green,
+   staging's slate. */
 .ship-env {
-  color: #a1a4ad;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px 0 6px;
+  border-radius: 4px 999px 999px 4px;
+  background: rgb(184 194 211 / 0.12);
+  color: #b8c2d3;
   font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
 }
-.ship-env[data-prod] {
+.ship-env[data-env="production"] {
+  background: rgb(191 220 207 / 0.12);
   color: #bfdccf;
 }
 
@@ -382,6 +495,100 @@
     --n: 6;
   }
 }
+/* A stage's card in an opened commit, f-ship's station (plan 01a1856fe81375b1bd1d1d86f270a45b,
+   step 8): its head (glyph, name, how many done or how it stands) over every job it has, each its
+   glyph, name and time. One height whatever it holds, so nothing grows as jobs begin; a long list
+   scrolls inside it. Its edge takes its stage's tone. */
+.ship-stn {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 15rem;
+  min-width: 0;
+  border: 1px solid var(--k-line, #2a2c31);
+  border-radius: 10px;
+  background: #0d0e11;
+}
+.ship-stn[data-state="needs"] {
+  border-color: rgb(226 207 174 / 0.45);
+}
+.ship-stn[data-state="failed"],
+.ship-stn[data-state="partial"],
+.ship-stn[data-state="rolledback"] {
+  border-color: rgb(226 185 189 / 0.4);
+}
+.ship-stn[data-state="running"],
+.ship-stn[data-state="guard"],
+.ship-stn[data-state="replanting"],
+.ship-stn[data-state="soaking"] {
+  border-color: rgb(205 198 234 / 0.35);
+}
+.ship-stn__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+  color: #e4e5e7;
+  font-size: 12.5px;
+}
+.ship-stn__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-stn__n {
+  margin-left: auto;
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ship-stn__parts {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  margin: 0;
+  padding: 6px 4px 8px;
+  overflow-y: auto;
+  list-style: none;
+}
+/* A job: picks what Output shows; the picked one lit. */
+.ship-part {
+  all: unset;
+  box-sizing: border-box;
+  display: grid;
+  width: 100%;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  color: #b9bbc2;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ship-part:hover {
+  background: rgb(255 255 255 / 0.04);
+}
+.ship-part[aria-pressed="true"] {
+  background: rgb(205 198 234 / 0.1);
+  color: #e4e5e7;
+}
+.ship-part:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: -2px;
+}
+.ship-part__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ship-part__v {
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
 .ship-job {
   display: flex;
   min-height: 4.5rem;
@@ -402,12 +609,6 @@
 .ship-job__state {
   color: #a3a5ad;
   font-size: 0.8125rem;
-}
-.ship-jobs__pager {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.25rem;
-  margin-top: 0.5rem;
 }
 .ship-jobs__page {
   display: inline-grid;
@@ -456,29 +657,48 @@
 }
 .ship-output {
   overflow: hidden;
-  border-radius: 0.5rem;
+  border: 1px solid var(--k-line, #2a2c31);
+  border-radius: 10px;
 }
+/* A job with no output yet: the same card, its head, and the word under it. */
 .ship-output--none {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.ship-output--none > p {
+  display: grid;
   place-items: center;
-  border: 1px dashed rgb(255 255 255 / 0.1);
+  margin: 0;
+  color: #6d7078;
 }
 
 /* Output's bar: the job's name, and at its right the copy icon (its step 4). */
 .ship-output__bar {
   display: flex;
-  height: 2rem;
+  height: 2.25rem;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
-  padding: 0 0.25rem 0 0.5rem;
+  padding: 0 0.25rem 0 0.75rem;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
   color: #a3a5ad;
   font-size: 0.8125rem;
 }
 .ship-output__name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* f-ship's word for what the card holds, on the right before copy. */
+.ship-output__streams {
+  flex: none;
+  color: #6d7078;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 /* A row's age, one width as it ticks ("9m ago" to "10m ago"), so the line beside it never moves. */
@@ -519,9 +739,15 @@
   font-size: 0.875rem;
 }
 /* An opened row's way to its commit's page, after the agreed sections. */
-.ship-open__page {
-  margin: 0;
-  font-size: 0.8125rem;
+/* An opened commit's foot, f-ship's: Runs, Diff and its page, on the right. */
+.ship-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.ship-foot__page {
+  color: #cdc6ea;
 }
 
 /* The commit page's sections (its step 2): what failed first, the six stage cards, the trace. */

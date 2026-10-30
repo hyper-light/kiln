@@ -248,6 +248,8 @@ export const api = {
   fixJobTools: (id: string, body: { runner?: string; kind?: string; mode?: string }) => post<{ fix: ToolFix }>(`/api/jobs/${enc(id)}/tools/fix`, body),
   jobLogsUrl: (id: string, step: number) => apiPath(`/api/jobs/${enc(id)}/logs${qs({ step })}`),
   jobLogs: (id: string, step: number) => request<string>("GET", `/api/jobs/${enc(id)}/logs${qs({ step })}`, undefined, { raw: true }),
+  /** When each piece of a step's log arrived (`[offset, unix ms]`, oldest first), and the log's size as they were read. */
+  jobLogTimes: (id: string, step: number) => request<{ times: [number, number][]; size: number }>("GET", `/api/jobs/${enc(id)}/logs/times${qs({ step })}`),
 
   agents: (signal?: AbortSignal) => get<Agent[]>("/api/agents", signal),
   forgetAgent: (name: string) => del<void>(`/api/agents/${enc(name)}`),

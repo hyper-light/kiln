@@ -218,7 +218,7 @@ function Commit({ repo, sha }: { repo: string; sha: string }) {
         </Quiet>
         <Runners detail={c} />
       </section>
-      <section className="ship-sec" aria-label="Runs">
+      <section className="ship-sec" aria-label="Runs" id="runs">
         <h2>Runs</h2>
         {(c.runs ?? []).length === 0 ? (
           <p>No runs yet.</p>

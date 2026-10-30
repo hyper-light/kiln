@@ -1,9 +1,10 @@
 /**
  * A Ship item's per-file diffs (docs/ci.md W26-R07, R13): folding like the agent chat's Changes
- * (each file's header folds it; a diff over 100 lines folds to its first lines and the lines with
- * comments, ⋯ for the gaps), each header's icon opening the whole file in a full-screen view in
- * place (no popup; the file from versions/:n/blob). Threads sit inline on their lines; conflicts
- * sit where they fall; a line's number opens a new thread on it.
+ * (each file's header folds it; each hunk shows with its context, ⋯ between hunks; a diff over 100
+ * lines folds to its first lines and the lines with comments, ⋯ for the gaps), each header's icon
+ * opening the whole file in a full-screen view in place (no popup; the file from versions/:n/blob).
+ * Threads sit inline on their lines; conflicts sit where they fall; a line's number opens a new
+ * thread on it.
  */
 import * as React from "react";
 import { Maximize2, X } from "lucide-react";

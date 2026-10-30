@@ -126,6 +126,20 @@ interface FrameP {
   convo: React.ReactNode;
 }
 
+/**
+ * The Conversation head's agent fixes switch, where the mockup draws it (Ship's mockups plan, step
+ * 13): a repository's setting that lets agents fix code from agents' feedback. Nothing acts on it
+ * until Agents in review builds that, so it shows off and can't be turned on yet, and says why.
+ */
+function AgentFixes() {
+  return (
+    <button type="button" className="rv-switch" role="switch" aria-checked={false} disabled title="Agents fix code from agents' feedback · repository setting. Not yet: Agents in review builds it.">
+      <i aria-hidden="true" />
+      <span>agent fixes</span>
+    </button>
+  );
+}
+
 /** The two sections the Dropdown mounts, in their order: Files, then the Conversation. */
 function Frame(p: FrameP) {
   return (
@@ -138,8 +152,9 @@ function Frame(p: FrameP) {
         {p.search && <SearchBox q={p.search.q} onQ={p.search.onQ} hits={p.search.res} onJump={p.onJump ?? (() => {})} />}
         <div className="rv-files">{p.children}</div>
       </section>
-      <section className="rv-s" aria-label="Conversation">
+      <section className="rv-s rv-s-convo" aria-label="Conversation">
         <h3 className="rv-h">Conversation</h3>
+        <AgentFixes />
         {p.convo}
       </section>
     </>
@@ -303,9 +318,15 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={
-        <Conversation ops={fullOps} linesOf={linesOf} threads={general} draft={draft?.kind === "reply" ? draft.thread : null} setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}>
-          <Description author={d.author} title={d.title} body={d.summary} at={d.created_at} />
-          <ConvoBox ops={fullOps} />
+        <Conversation
+          ops={fullOps}
+          linesOf={linesOf}
+          threads={general}
+          box={<ConvoBox ops={fullOps} />}
+          draft={draft?.kind === "reply" ? draft.thread : null}
+          setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}
+        >
+          <Description item={fullOps.item} author={d.author} title={d.title} body={d.summary} at={d.created_at} />
         </Conversation>
       }
     >
@@ -386,11 +407,11 @@ function HostFiles({ item }: { item: ShipCommit }) {
           ops={fullOps}
           linesOf={linesOf}
           threads={[...convoThreads(pull), ...general]}
+          box={<ConvoBox ops={fullOps} />}
           draft={draft?.kind === "reply" ? draft.thread : null}
           setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}
         >
-          <Description author={pull.author} title={pull.title} body={pull.body} at={pull.updated_at ?? undefined} />
-          <ConvoBox ops={fullOps} />
+          <Description item={fullOps.item} author={pull.author} title={pull.title} body={pull.body} at={pull.updated_at ?? undefined} />
         </Conversation>
       }
     >

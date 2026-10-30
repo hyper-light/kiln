@@ -80,7 +80,8 @@ test("14 agents' commits in 10 s: 55 frames a second or more at 390 px, needs-yo
     await page.request.post("/api/mock/ship/agents?n=14&over=10");
     // All 14 drawn: the release with its ten riders folded under it, and the three agents asking.
     const release = rows.filter({ hasText: "release: production waits on you" });
-    await expect(release.locator(".ship-fold")).toHaveText("Show 10 commits riding with it", { timeout: 30_000 });
+    // f-ship's riders row: how many ride with the approval, the first three of them, then more.
+    await expect(release.locator(".ship-fold")).toHaveText(/^\+10 riding · [0-9a-f]{7} [0-9a-f]{7} [0-9a-f]{7} …$/, { timeout: 30_000 });
     await expect(rows.filter({ hasText: "agent: asks about flake" })).toHaveCount(3);
     const meter = await page.evaluate(() => {
       console.timeStamp("burst-end");

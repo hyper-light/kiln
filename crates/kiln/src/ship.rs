@@ -82,6 +82,98 @@ struct LegRec {
     attempts: Vec<AttemptRec>,
 }
 
+/// A KilnCD deployment of a commit, as Ship reads it: kiln deploys itself through KilnCD, not CI's
+/// deployments (plan 01a1856fe81375b1bd1d1d86f270a45b, step 4). Its app's environment; the commit
+/// it deployed (an image it pinned was built from it, or else its revision names it); how its sync
+/// and the guard's word after it went (they share an op); and when the sync finished (unix seconds).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CdDeploy {
+    pub app: String,
+    pub environment: String,
+    pub sha: String,
+    /// It pinned an image built from the commit (else its revision named it).
+    pub built: bool,
+    pub op: u64,
+    /// `success` or `failure`.
+    pub state: String,
+    pub description: String,
+    pub at: i64,
+}
+
+/// A tag or a revision that names a commit: seven to forty hex digits.
+fn sha_like(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// One app's history as deployments of commits, oldest first: a sync and the guard's word after it
+/// share an op, and either failing fails the deployment.
+fn deploys_of<'a>(app: &str, environment: &str, history: impl IntoIterator<Item = &'a kiln_cd::state::Deployment>) -> Vec<CdDeploy> {
+    let mut out: Vec<CdDeploy> = Vec::new();
+    for h in history {
+        let pinned = h.artifacts.iter().find_map(|a| a.tag.as_deref().filter(|t| sha_like(t)));
+        let (sha, built) = match (pinned, h.revision.as_deref().filter(|r| sha_like(r))) {
+            (Some(t), _) => (t.to_string(), true),
+            (None, Some(r)) => (r.to_string(), false),
+            (None, None) => continue,
+        };
+        match out.last_mut().filter(|d| d.op == h.op && d.sha == sha) {
+            Some(d) => {
+                if !h.succeeded {
+                    d.state = "failure".into();
+                }
+                d.description = h.message.clone();
+            }
+            None => out.push(CdDeploy {
+                app: app.to_string(),
+                environment: environment.to_string(),
+                sha,
+                built,
+                op: h.op,
+                state: if h.succeeded { "success" } else { "failure" }.to_string(),
+                description: h.message.clone(),
+                at: i64::try_from(h.at_ms / 1000).unwrap_or(i64::MAX),
+            }),
+        }
+    }
+    out
+}
+
+/// Every KilnCD app's deployments of commits, by the environment it deploys to (none without
+/// KilnCD).
+pub fn cd_deploys() -> Vec<CdDeploy> {
+    let Some(cd) = crate::cd::get() else { return Vec::new() };
+    let apps: Vec<(String, String)> = cd.apps.read().iter().filter_map(|(id, e)| e.def.environment.clone().map(|env| (id.clone(), env))).collect();
+    cd.store.read(|d| apps.iter().flat_map(|(id, env)| deploys_of(id, env, d.history.get(id).into_iter().flatten())).collect())
+}
+
+/// What KilnCD's deployments read as, to see they changed: a refresh then reads every commit again.
+fn cd_mark(deploys: &[CdDeploy]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    deploys.hash(&mut h);
+    h.finish()
+}
+
+/// KilnCD's deployments of a repository's commits, as Ship's deployment records. In an environment
+/// where an app pinned images built from them, only those count: another app's git syncs there
+/// don't say what runs.
+fn cd_recs(deploys: &[CdDeploy], commits: &[(String, i64, String)]) -> Vec<DeployRec> {
+    let of = |sha: &str| commits.iter().find(|(s, _, _)| s == sha || (sha.len() >= 7 && s.starts_with(sha))).map(|(s, f, _)| (s.clone(), *f));
+    let mine: Vec<(&CdDeploy, String, i64)> = deploys.iter().filter_map(|d| of(&d.sha).map(|(s, f)| (d, s, f))).collect();
+    mine.iter()
+        .filter(|(d, _, _)| d.built || !mine.iter().any(|(x, _, _)| x.built && x.environment == d.environment))
+        .map(|(d, sha, first_row)| DeployRec {
+            environment: d.environment.clone(),
+            production: d.environment.eq_ignore_ascii_case("production"),
+            sha: sha.clone(),
+            first_row: *first_row,
+            state: Some(d.state.clone()),
+            description: Some(d.description.clone()),
+            at: d.at,
+        })
+        .collect()
+}
+
 /// One environment's deployment of a commit: its latest status and when it was set (unix seconds).
 #[derive(Debug, Clone, Default)]
 struct DeployRec {
@@ -121,6 +213,17 @@ struct Records {
     tags: Vec<String>,
     /// The change this commit is of, and what its review is read from (W26-R01).
     change: Option<ChangeRec>,
+    /// What of it was handed to an agent, oldest first (W26-R18).
+    handoffs: Vec<HandoffRec>,
+}
+
+/// A Hand off of a commit (W26-R18, migration 20261029-0100): `checks`, `threads` or `conflicts`,
+/// who took it (an agent's or an attachment's name) and, for a change's, its revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HandoffRec {
+    what: String,
+    to: String,
+    version: Option<u32>,
 }
 
 /// An open thread on a change: its kind, where it is, who opened it and its first words.
@@ -537,10 +640,13 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
 /// (`kiln_ci::turn`, W26-R05), its state read from its facts (`kiln_ci::review::state`). An older
 /// version's head stands superseded; a change request's other commits, and an abandoned change's,
 /// carry none.
-fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
+/// The review of the change `ch` on its commit `sha`; `handed`, its threads or conflicts handed to
+/// its author's agent at this revision (W26-R18), which reads fixing while the revision is live.
+fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>) -> Option<Review> {
     if !ch.head || ch.state == "abandoned" {
         return None;
     }
+    let handed = handed.filter(|_| sha == ch.tip());
     let mut ev: Vec<(i64, u8, turn::Event)> = Vec::new();
     ev.extend(ch.reviewers.iter().map(|(w, at)| (*at, 0, turn::Event::Asked(w.clone()))));
     ev.extend(ch.pushes.iter().filter(|(v, _, _)| *v > 1).map(|(_, rebase_only, at)| (*at, 1, turn::Event::Pushed { rebase_only: *rebase_only })));
@@ -579,7 +685,7 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
         changes_asked: ch.state == "changes-requested",
         open: gate.open,
         conflicts: gate.conflicts,
-        fixing: false,
+        fixing: handed.is_some(),
         policy_met: matches!(ch.state.as_str(), "accepted" | "landing" | "landed"),
     };
     let state = match kiln_ci::review::state(&facts) {
@@ -601,12 +707,18 @@ fn review_of(ch: &ChangeRec, sha: &str) -> Option<Review> {
         ReviewState::Changes => ch.reviews.iter().rev().find(|r| r.1 == "request_changes").map(|r| first_words(&r.3)),
         ReviewState::Conflict => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)),
         ReviewState::Requested => ch.threads.last().map(said),
+        // What its agent was handed: the file in conflict, or whose thread (how many, when several).
+        ReviewState::Fixing => Some(match (handed.map(|h| h.what.as_str()), ch.threads.as_slice()) {
+            (Some("conflicts"), _) => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)).unwrap_or_else(|| "its conflicts".to_string()),
+            (_, [one]) => format!("{}'s thread", shown(&one.by)),
+            (_, many) => format!("{} threads", many.len()),
+        }),
         _ => None,
     }
     .unwrap_or_default();
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
-    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: None, about, superseded_by })
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by })
 }
 
 fn short(sha: &str) -> String {
@@ -615,6 +727,11 @@ fn short(sha: &str) -> String {
 
 fn is_release(pipeline: &str) -> bool {
     pipeline.to_ascii_lowercase().contains("release")
+}
+
+/// A pipeline that builds the commit's image (kiln's own `image`): Build's image, not a check.
+fn is_image(pipeline: &str) -> bool {
+    pipeline.to_ascii_lowercase().contains("image")
 }
 
 /// kiln's own failures (a runner lost, the infrastructure, an image pull, a full disk): not the code's.
@@ -630,6 +747,11 @@ fn attempt_of(status: &str, conclusion: Option<&str>, class: Option<&str>) -> At
         (_, Some("cancelled")) => Attempt::Cancelled,
         (_, Some(_)) if kilns_own(class) => Attempt::KilnError,
         (_, Some(_)) => Attempt::Failed,
+        // v1 says how a job ended in its status, with no conclusion. A job it skipped didn't run
+        // (a dependency failed): it's no pass.
+        ("succeeded", None) => Attempt::Passed,
+        ("failed" | "timed_out", None) => Attempt::Failed,
+        ("cancelled" | "skipped", None) => Attempt::Cancelled,
         _ => Attempt::Queued,
     }
 }
@@ -672,16 +794,18 @@ struct RepoCtx {
     current: Vec<DeployRec>,
     waiting: Option<(String, i64)>,
     commits: Vec<(String, i64, String)>,
+    /// KilnCD's deployments of its commits, oldest first.
+    cd: Vec<DeployRec>,
 }
 
-fn repo_ctx(c: &rusqlite::Connection, repo: &str) -> anyhow::Result<Option<RepoCtx>> {
+fn repo_ctx(c: &rusqlite::Connection, repo: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<RepoCtx>> {
     let found: Option<(String, String)> = c.query_row("SELECT id, name FROM repos WHERE name = ?1 OR id = ?1", [repo], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     let Some((id, name)) = found else { return Ok(None) };
     let mut st = c.prepare(&format!(
         "SELECT {DEPLOY_COLS} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment
            AND (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = e.id ORDER BY s.id DESC LIMIT 1) = 'success')"
     ))?;
-    let current = st.query_map([&id], deploy_row)?.collect::<Result<_, _>>()?;
+    let mut current: Vec<DeployRec> = st.query_map([&id], deploy_row)?.collect::<Result<_, _>>()?;
     let waiting = c
         .query_row(
             "SELECT o.item, o.seq FROM deploy_releases d JOIN ship_order o ON o.repo_id = ?1 AND o.item = json_extract(d.spec, '$.version')
@@ -694,13 +818,22 @@ fn repo_ctx(c: &rusqlite::Connection, repo: &str) -> anyhow::Result<Option<RepoC
     let mut st = c.prepare(&format!(
         "SELECT o.item, o.seq, COALESCE((SELECT MIN(r.branch) FROM runs r WHERE r.repo_id = o.repo_id AND r.sha = o.item), '') FROM ship_order o WHERE o.repo_id = ?1 AND {IS_ITEM} ORDER BY o.seq DESC"
     ))?;
-    let commits = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
-    Ok(Some(RepoCtx { id, name, current, waiting, commits }))
+    let commits: Vec<(String, i64, String)> = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    // What each environment runs now: its newest successful deployment, CI's or KilnCD's.
+    let cd = cd_recs(deploys, &commits);
+    for d in cd.iter().filter(|d| d.state.as_deref() == Some("success")) {
+        match current.iter_mut().find(|x| x.environment.eq_ignore_ascii_case(&d.environment)) {
+            Some(x) if x.at > d.at => {}
+            Some(x) => *x = d.clone(),
+            None => current.push(d.clone()),
+        }
+    }
+    Ok(Some(RepoCtx { id, name, current, waiting, commits, cd }))
 }
 
 /// Reads one commit's records (`sha`: the whole sha, or any unique prefix of seven or more).
-fn load(c: &rusqlite::Connection, repo: &str, sha: &str) -> anyhow::Result<Option<Records>> {
-    let Some(ctx) = repo_ctx(c, repo)? else { return Ok(None) };
+fn load(c: &rusqlite::Connection, repo: &str, sha: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<Records>> {
+    let Some(ctx) = repo_ctx(c, repo, deploys)? else { return Ok(None) };
     let found = ctx.commits.iter().find(|(s, _, _)| s == sha || (sha.len() >= 7 && s.starts_with(sha))).map(|(s, f, _)| (s.clone(), *f));
     match found {
         Some((sha, first_row)) => Ok(Some(load_with(c, &ctx, &sha, first_row)?)),
@@ -717,9 +850,11 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
         .query_map(params![repo_id, sha], |r| Ok(RunRec { id: r.get(0)?, pipeline: r.get(1)?, branch: r.get(2)?, message: r.get(3)?, actor: r.get(4)?, created_at: r.get(5)? }))?
         .collect::<Result<_, _>>()?;
 
+    // The engine's legs are its run's latest attempt's; v1's jobs (no `job_id`, no `run_attempt`:
+    // production's runs, 2026-10-28) are their run's, retried in place.
     let mut st = c.prepare(
         "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at
-         FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND j.job_id IS NOT NULL AND j.run_attempt = r.attempt ORDER BY j.rowid",
+         FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND (j.job_id IS NULL OR j.run_attempt = r.attempt) ORDER BY j.rowid",
     )?;
     let legs: Vec<(String, LegRec)> = st
         .query_map(params![repo_id, sha], |r| {
@@ -742,6 +877,13 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     // This commit's latest deployment in each environment; what each runs now is the repository's.
     let mut st = c.prepare(&format!("SELECT {DEPLOY_COLS} FROM ci_deployments d WHERE d.repo_id = ?1 AND d.sha = ?2 AND d.id = (SELECT MAX(e.id) FROM ci_deployments e WHERE e.repo_id = d.repo_id AND e.environment = d.environment AND e.sha = d.sha)"))?;
     rec.own = st.query_map(params![repo_id, sha], deploy_row)?.collect::<Result<_, _>>()?;
+    for d in ctx.cd.iter().filter(|d| d.sha == sha) {
+        match rec.own.iter_mut().find(|x| x.environment.eq_ignore_ascii_case(&d.environment)) {
+            Some(x) if x.at > d.at => {}
+            Some(x) => *x = d.clone(),
+            None => rec.own.push(d.clone()),
+        }
+    }
     rec.current = ctx.current.clone();
     // Deploy API releases of this commit (by version), and a newer one production waits on.
     let mut st = c.prepare(
@@ -757,6 +899,8 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     let mut st = c.prepare("SELECT tag_name FROM ci_releases WHERE repo_id = ?1 AND target_commitish = ?2 ORDER BY id")?;
     rec.tags = st.query_map(params![repo_id, sha], |r| r.get(0))?.collect::<Result<_, _>>()?;
     rec.change = load_change(c, &repo_id, &sha)?;
+    let mut st = c.prepare("SELECT what, to_name, version FROM ship_handoffs WHERE repo_id = ?1 AND sha = ?2 ORDER BY at, id")?;
+    rec.handoffs = st.query_map(params![repo_id, sha], |r| Ok(HandoffRec { what: r.get(0)?, to: r.get(1)?, version: r.get(2)? }))?.collect::<Result<_, _>>()?;
     Ok(rec)
 }
 
@@ -783,10 +927,15 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
     let run_pipeline: HashMap<&str, &str> = rec.runs.iter().map(|r| (r.id.as_str(), r.pipeline.as_str())).collect();
     let mut checks: Vec<Check> = Vec::new();
     let mut platforms: Vec<Platform> = Vec::new();
+    let mut image_parts: Vec<Part> = Vec::new();
     for leg in &rec.legs {
         let pipeline = run_pipeline.get(leg.run_id.as_str()).copied().unwrap_or_default();
         if is_release(pipeline) {
             platforms.push(Platform { name: leg.name.clone(), state: part_of(&leg.status, leg.conclusion.as_deref()) });
+            continue;
+        }
+        if is_image(pipeline) {
+            image_parts.push(part_of(&leg.status, leg.conclusion.as_deref()));
             continue;
         }
         let attempts: Vec<Attempt> = if leg.reused {
@@ -797,15 +946,27 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
             leg.attempts.iter().map(|a| attempt_of(&a.status, a.conclusion.as_deref(), a.class.as_deref())).collect()
         };
         // A leg names its job and run once it has run (Output streams that job's log).
-        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked");
+        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked" | "skipped");
         let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()), start: leg.started, end: leg.finished };
         match checks.iter_mut().find(|c| c.pipeline == pipeline) {
             Some(c) => c.legs.push(l),
             None => checks.push(Check { pipeline: pipeline.to_string(), legs: vec![l] }),
         }
     }
+    // The image: an image the commit's runs pushed; else what its image pipeline's job says; else
+    // under way while a release (the engine's, which pushes it) builds; else nothing built it.
     let release_running = platforms.iter().any(|p| matches!(p.state, Part::Queued | Part::Running));
-    let image = if !rec.images.is_empty() || !release_running { Part::Passed } else { Part::Running };
+    let image = if !rec.images.is_empty() {
+        Part::Passed
+    } else if let Some(p) = [Part::Failed, Part::Running, Part::Queued, Part::Superseded].into_iter().find(|p| image_parts.contains(p)) {
+        p
+    } else if !image_parts.is_empty() {
+        Part::Passed
+    } else if release_running {
+        Part::Running
+    } else {
+        Part::NotYet
+    };
     let build = Build { platforms, image };
 
     let checks_ok = !matches!(journey::pips(&Journey { checks: checks.clone(), ..empty() }, now).into_iter().find(|p| p.stage == journey::Stage::Checks).map(|p| p.state), Some(journey::Glyph::Failed));
@@ -871,8 +1032,11 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
             .collect(),
     });
 
-    let review = change.and_then(|ch| review_of(ch, &rec.sha));
-    Journey { author, land, checks, build, staging, production, replant, in_production, handled_by: None, fixed_by: None, review }
+    // Handed off (W26-R18): its failure to whoever took it; its review to its author's agent, at this revision.
+    let handled_by = rec.handoffs.iter().rev().find(|h| h.what == "checks").map(|h| h.to.clone());
+    let handed = change.and_then(|ch| rec.handoffs.iter().rev().find(|h| h.what != "checks" && h.version.is_none_or(|v| v == ch.n)));
+    let review = change.and_then(|ch| review_of(ch, &rec.sha, handed));
+    Journey { author, land, checks, build, staging, production, replant, in_production, handled_by, fixed_by: None, review }
 }
 
 fn lower_is(s: &str, want: &str) -> bool {
@@ -897,36 +1061,50 @@ fn empty() -> Journey {
 
 /// What a person can do about a commit from its row, each through the endpoint kiln has for it
 /// (nothing new decides): approve or hold the production release waiting on them (the Deploy
-/// API's approval); retry a failed check (the run's rerun, its failed legs only) or hand it to an
-/// agent (an attachment: an agent looking after the run); retry a runner that didn't replant (its
-/// upgrade, again).
+/// API's approval); hand a failed check to an agent ([`hand_off`]: while no one has it) or retry it
+/// (the run's rerun, its failed legs only); retry a runner that didn't replant (its upgrade,
+/// again). A change whose turn is yours: hand its threads or conflicts to its author's agent, or
+/// review it; while that agent fixes it, neither.
 fn actions(rec: &Records, j: &Journey, yours: bool) -> Vec<Value> {
     let act = |name: &str, method: &str, path: String, body: Value| json!({ "name": name, "method": method, "path": path, "body": body });
+    let hand = || act("hand_off", "POST", "/api/ship/hand-off".to_string(), json!({ "repo": rec.repo, "sha": rec.sha }));
     let mut out = Vec::new();
     if let Some(r) = rec.releases.iter().find(|r| r.state == "waiting") {
         out.push(act("approve", "POST", format!("/api/deploy/releases/{}/approve", r.id), json!({})));
         out.push(act("hold", "POST", format!("/api/deploy/releases/{}/reject", r.id), json!({})));
     }
-    let failed = rec.legs.iter().find(|l| matches!(attempt_of(&l.status, l.conclusion.as_deref(), None), Attempt::Failed) && !is_release(rec.runs.iter().find(|r| r.id == l.run_id).map(|r| r.pipeline.as_str()).unwrap_or_default()));
-    if let Some(leg) = failed {
+    if let Some(leg) = failed_leg(rec) {
+        if j.handled_by.is_none() {
+            out.push(hand());
+        }
         out.push(act("retry", "POST", format!("/api/ci/runs/{}/rerun", leg.run_id), json!({ "mode": "failed" })));
-        out.push(act("hand_off", "POST", "/api/attachments".to_string(), json!({ "repo": rec.repo, "run": leg.run_id })));
     }
     if let (true, Some(r)) = (j.in_production, j.replant.as_ref()) {
         for x in r.runners.iter().filter(|x| x.state == Runner::Failed) {
             out.push(act("retry_runner", "POST", format!("/api/updates/runners/{}", x.name), Value::Null));
         }
     }
-    // A change whose turn is yours: hand it to an agent, or review it (W26-R02's Hand off and Review pair).
+    // W26-R02's Hand off and Review pair, for the one whose turn it is.
     if let (true, Some(ch), Some(r)) = (yours, rec.change.as_ref(), j.review.as_ref())
         && r.superseded_by.is_none()
+        && r.state != ReviewState::Fixing
     {
-        if !out.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("hand_off")) {
-            out.push(act("hand_off", "POST", "/api/attachments".to_string(), json!({ "repo": rec.repo, "diff": ch.name })));
+        if authors_agent(ch).is_some() && (r.conflicts > 0 || !ch.threads.is_empty()) && !out.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("hand_off")) {
+            out.push(hand());
         }
         out.push(act("review", "GET", format!("/api/diffs/{}", ch.name), Value::Null));
     }
     out
+}
+
+/// The commit's first failed check (not a release's platform): what Retry and Hand off are about.
+fn failed_leg(rec: &Records) -> Option<&LegRec> {
+    rec.legs.iter().find(|l| matches!(attempt_of(&l.status, l.conclusion.as_deref(), None), Attempt::Failed) && !is_release(rec.runs.iter().find(|r| r.id == l.run_id).map(|r| r.pipeline.as_str()).unwrap_or_default()))
+}
+
+/// The agent that wrote a change (`agent:<id>`, as its agent token pushed it), if an agent did.
+fn authors_agent(ch: &ChangeRec) -> Option<&str> {
+    ch.author.strip_prefix("agent:").and_then(|s| s.split(' ').next()).filter(|s| !s.is_empty())
 }
 
 /// A commit's kind for the facets: its change's (`diff`, `request`), else `commit`.
@@ -1025,13 +1203,21 @@ struct Rendered {
     others: Value,
     yours: Option<Value>,
     whose: Vec<String>,
+    /// Where it stands, and the agent behind it when one is: what the pace line counts.
+    stand: journey::Stand,
+    agent: Option<String>,
 }
 
 fn render(rec: &Records, runners: &[RunnerSeen], now: i64) -> Rendered {
     let j = journey_of(rec, runners, now);
     let whose = whose(&j);
     let yours = (!whose.is_empty()).then(|| summary_of(rec, &j, now, true));
-    Rendered { others: summary_of(rec, &j, now, false), yours, whose }
+    let stand = journey::standing(&j, now).stand;
+    let agent = match &j.author {
+        Author::Agent { name, .. } => Some(name.clone()),
+        Author::Person(_) => None,
+    };
+    Rendered { others: summary_of(rec, &j, now, false), yours, whose, stand, agent }
 }
 
 /// A leg as the detail shows it; `job` and `run` only once it has run (optional new fields).
@@ -1069,6 +1255,7 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
         Part::Passed => "passed",
         Part::Failed => "failed",
         Part::Superseded => "superseded",
+        Part::NotYet => "none",
     };
     let build = json!({
         "platforms": j.build.platforms.iter().map(|p| json!({ "name": p.name, "state": part(p.state) })).collect::<Vec<_>>(),
@@ -1096,7 +1283,8 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
 
 /// A repository's commits, newest first, a page at a time (`cursor`: the last page's last
 /// `cursor`), of the repositories named in `only` (JSON, those the caller may read), or all.
-pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
+pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, deploys: &[CdDeploy], now: i64) -> Result<Value, Fail> {
+    let deploys = deploys.to_vec();
     let limit = q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(30).clamp(1, 100);
     let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok()).unwrap_or(i64::MAX);
     let repo = q.get("repo").filter(|v| !v.is_empty()).cloned();
@@ -1114,7 +1302,7 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
             let keys: Vec<(String, String)> = st.query_map(params![repo, cursor, limit + 1, only, f.kind, f.host, f.review], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let mut out = Vec::new();
             for (repo, sha) in keys {
-                if let Some(rec) = load(c, &repo, &sha)? {
+                if let Some(rec) = load(c, &repo, &sha, &deploys)? {
                     out.push(rec);
                 }
             }
@@ -1136,9 +1324,9 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
 }
 
 /// One commit of a repository, with the records its stand came from.
-pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, now: i64) -> Result<Value, Fail> {
-    let (repo, sha) = (repo.to_owned(), sha.to_owned());
-    let rec = store.call(move |c| load(c, &repo, &sha)).await.map_err(internal)?;
+pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, deploys: &[CdDeploy], now: i64) -> Result<Value, Fail> {
+    let (repo, sha, deploys) = (repo.to_owned(), sha.to_owned(), deploys.to_vec());
+    let rec = store.call(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?;
     rec.map(|r| detail(&r, &runners, now, viewer)).ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))
 }
 
@@ -1173,6 +1361,8 @@ struct Row {
     whose: Vec<String>,
     kind: &'static str,
     host: Option<String>,
+    stand: journey::Stand,
+    agent: Option<String>,
 }
 
 impl Row {
@@ -1181,7 +1371,7 @@ impl Row {
         let text = |v: &Value| serde_json::to_string(v).map_err(|e| internal(e.into()));
         let (others, yours) = (text(&x.others)?, x.yours.as_ref().map(text).transpose()?);
         let (kind, host) = (kind_of(&rec), rec.change.as_ref().map(|c| c.host.clone()));
-        Ok(Self { rec, others, yours, whose: x.whose, kind, host })
+        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent })
     }
 
     fn json(&self, viewer: Option<&HashSet<String>>) -> &str {
@@ -1198,6 +1388,8 @@ struct Held {
     built: bool,
     at_ms: i64,
     repos: HashMap<String, HeldRepo>,
+    /// KilnCD's deployments as last read ([`cd_mark`]).
+    cd: u64,
 }
 
 /// What a refresh read from the store, in one snapshot.
@@ -1266,16 +1458,19 @@ impl ShipCache {
     /// changed since, the gone dropped. One at a time: while one runs, another returns at once
     /// (its reader gets the model as it is, at most [`FRESH_MS`] old). A failure leaves the last
     /// good model, and the next read tries again.
-    pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], now: i64) -> Result<(), Fail> {
+    pub async fn refresh(&self, store: &crate::store::Store, runners: &[RunnerSeen], deploys: &[CdDeploy], now: i64) -> Result<(), Fail> {
         use std::sync::atomic::Ordering;
         if self.refreshing.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         let _flight = Flight(&self.refreshing);
+        // KilnCD's deployments aren't the store's: when they changed, every commit is read again.
+        let cd = cd_mark(deploys);
         let (built, seq) = {
             let h = self.held.read().map_err(|_| poisoned())?;
-            (h.built, h.seq)
+            (h.built && h.cd == cd, h.seq)
         };
+        let deploys = deploys.to_vec();
         let cap = self.cap;
         let waiting: HashMap<String, Vec<String>> = {
             let h = self.held.read().map_err(|_| poisoned())?;
@@ -1306,7 +1501,7 @@ impl ShipCache {
                 }
                 let mut read = Read { top, loaded: Vec::new(), gone_repos: Vec::new() };
                 for (repo, (mut all, mut shas)) in want {
-                    let Some(ctx) = repo_ctx(&tx, &repo)? else {
+                    let Some(ctx) = repo_ctx(&tx, &repo, &deploys)? else {
                         read.gone_repos.push(repo);
                         continue;
                     };
@@ -1371,6 +1566,7 @@ impl ShipCache {
         h.seq = read.top;
         h.built = true;
         h.at_ms = now;
+        h.cd = cd;
         Ok(())
     }
 
@@ -1424,6 +1620,39 @@ impl ShipCache {
         Ok(Some(out))
     }
 
+    /// The list's pace line for the repositories in view, from memory (plan
+    /// 01a1856fe81375b1bd1d1d86f270a45b, step 5): the commits in flight (landing, checking,
+    /// building) and the agents behind them; what each environment of each repository runs now,
+    /// and how many commits production is behind; and how many of the connected runners run
+    /// production's commit. None until the model is built.
+    pub fn pace(&self, repo: Option<&str>, only: Option<&[String]>, runners: &[RunnerSeen]) -> Option<Value> {
+        let h = self.held.read().ok()?;
+        if !h.built {
+            return None;
+        }
+        let mut repos: Vec<(&String, &HeldRepo)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
+        repos.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let flight: Vec<&Row> = repos.iter().flat_map(|(_, r)| r.rows.values()).filter(|row| matches!(row.stand, journey::Stand::Landing | journey::Stand::Checking | journey::Stand::Building)).collect();
+        let agents: HashSet<&str> = flight.iter().filter_map(|row| row.agent.as_deref()).collect();
+        let runs = |r: &RunnerSeen, sha: &str| r.commit.as_deref().is_some_and(|c| sha.starts_with(c) || c.starts_with(sha));
+        let mut envs = Vec::new();
+        let mut on = Value::Null;
+        for (name, r) in repos {
+            // Staging before production, as a commit goes.
+            let mut current: Vec<&DeployRec> = r.ctx.current.iter().collect();
+            current.sort_by_key(|d| d.production);
+            for d in current {
+                let behind = d.production.then(|| r.ctx.commits.iter().filter(|(_, f, _)| *f > d.first_row).count());
+                envs.push(json!({ "repo": name, "environment": d.environment, "short": short(&d.sha), "behind": behind }));
+                if d.production && on.is_null() && runners.iter().any(|x| runs(x, &d.sha)) {
+                    let live: Vec<&RunnerSeen> = runners.iter().filter(|x| x.connected).collect();
+                    on = json!({ "on": live.iter().filter(|x| runs(x, &d.sha)).count(), "of": live.len() });
+                }
+            }
+        }
+        Some(json!({ "in_flight": flight.len(), "agents": agents.len(), "envs": envs, "runners": on }))
+    }
+
     /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more), if held.
     pub fn detail(&self, repo: &str, sha: &str, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Option<Value> {
         let h = self.held.read().ok()?;
@@ -1470,8 +1699,9 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
     let now = crate::util::now_ms();
     let c = cache();
     let runners = runners_seen(hub).await;
+    let deploys = cd_deploys();
     if c.stale(now)
-        && let Err((_, e)) = c.refresh(&hub.store, &runners, now).await
+        && let Err((_, e)) = c.refresh(&hub.store, &runners, &deploys, now).await
     {
         tracing::warn!("ship: the read model kept its last good state: {e}");
     }
@@ -1481,11 +1711,23 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
         Some(c) => Some(principals(hub, c).await),
         None => None,
     };
-    match c.page(q.get("repo").map(String::as_str).filter(|r| !r.is_empty()), only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
-        Some(body) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(body))),
+    let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
+    match c.page(repo, only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
+        Some(mut body) => {
+            // The pace line's words go with the page (an optional field).
+            if let Some(pace) = c.pace(repo, only.as_deref(), &runners).and_then(|p| serde_json::to_string(&p).ok())
+                && body.ends_with('}')
+            {
+                body.pop();
+                body.push_str(",\"pace\":");
+                body.push_str(&pace);
+                body.push('}');
+            }
+            Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
+        }
         None => {
             let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
-            Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, viewer.as_ref(), runners, now).await?))
+            Ok(srv::json(StatusCode::OK, &list_in(&hub.store, q, only, viewer.as_ref(), runners, &deploys, now).await?))
         }
     }
 }
@@ -1526,8 +1768,9 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     let now = crate::util::now_ms();
     let c = cache();
     let runners = runners_seen(hub).await;
+    let deploys = cd_deploys();
     if c.stale(now)
-        && let Err((_, e)) = c.refresh(&hub.store, &runners, now).await
+        && let Err((_, e)) = c.refresh(&hub.store, &runners, &deploys, now).await
     {
         tracing::warn!("ship: the read model kept its last good state: {e}");
     }
@@ -1537,12 +1780,152 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     };
     let v = match c.detail(repo, sha, &runners, now, viewer.as_ref()) {
         Some(v) => v,
-        None => get_in(&hub.store, repo, sha, viewer.as_ref(), runners, now).await?,
+        None => get_in(&hub.store, repo, sha, viewer.as_ref(), runners, &deploys, now).await?,
     };
     if !visible(&v, only.as_deref()) {
         return Err((StatusCode::NOT_FOUND, "no such commit".to_string()));
     }
     Ok(srv::json(StatusCode::OK, &v))
+}
+
+/// Failure lines the agent a failure is handed to gets with it.
+const HANDED_LINES: usize = 40;
+
+/// `POST /api/ship/hand-off` `{repo, sha}`: the row's Hand off, as review-ship.html draws it
+/// (W26-R18, R02). What the commit has open goes to one agent. Its change's author's agent, while
+/// it runs, gets the change's conflicts, its open threads and its failed checks in one message, the
+/// way its comments reach it (docs/agentic.md C3). A failure with no agent of its own goes to the
+/// agent attached to what failed, as the failure itself wakes it (an incident, W20-R08). Each is
+/// kept (`ship_handoffs`), so the row says who is on it; with nothing open, or no agent to take it,
+/// it says why. As the caller, with `runs.rerun` on the repository, as Retry asks.
+pub async fn hand_off(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    hand_off_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+}
+
+async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (Some(repo), Some(sha)) = (field("repo"), field("sha")) else {
+        return Err((StatusCode::BAD_REQUEST, "`repo` and `sha`: the commit to hand off".to_string()));
+    };
+    if !caller.can("runs.rerun", &crate::authz::Scope::Repo { repo: repo.clone() }) {
+        return Err((StatusCode::FORBIDDEN, format!("handing off needs `runs.rerun` on {repo}")));
+    }
+    let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
+    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let j = journey_of(&rec, &runners_seen(hub).await, crate::util::now_ms());
+    // A change's review is handed at its live revision only; a failure while no one has it.
+    let live = rec.change.as_ref().filter(|_| j.review.as_ref().is_some_and(|r| r.superseded_by.is_none()));
+    let (conflicts, threads) = live.map(|ch| (ch.conflicts.as_slice(), ch.threads.as_slice())).unwrap_or_default();
+    let failed = failed_leg(&rec).filter(|_| j.handled_by.is_none());
+    let at = short(&rec.sha);
+    if conflicts.is_empty() && threads.is_empty() && failed.is_none() {
+        return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
+    }
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let author = rec.change.as_ref().and_then(authors_agent);
+    let running = match author {
+        Some(id) => {
+            let agent = crate::workspace::change::of(hub, id).await.map_or_else(|| id.to_owned(), |r| r.agent);
+            hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited)
+        }
+        None => None,
+    };
+    if let (Some(info), Some(ch)) = (running, rec.change.as_ref()) {
+        let excerpt = match failed {
+            Some(leg) => crate::ci::logsearch::failure(hub, &leg.job, HANDED_LINES).await.ok(),
+            None => None,
+        };
+        let text = handed_text(&rec, ch, conflicts, threads, failed.map(|l| (l, excerpt.as_ref())), &base, &caller.name);
+        if !crate::workspace::follow::deliver(hub, &info.id, text).await {
+            return Err((StatusCode::BAD_GATEWAY, format!("{} didn't get it: kiln couldn't reach it", info.name)));
+        }
+        let what: Vec<&str> = [(!conflicts.is_empty(), "conflicts"), (!threads.is_empty(), "threads"), (failed.is_some(), "checks")].into_iter().filter_map(|(y, w)| y.then_some(w)).collect();
+        keep(hub, &rec, &what, &info.name, Some(&info.id), None, Some(ch.n), &caller.name).await?;
+        return Ok(json!({ "handed": { "to": info.name, "agent": info.id, "what": what } }));
+    }
+    // No agent of its own: a failure goes to what looks after it; a change's review has no one.
+    let Some(leg) = failed else {
+        let name = rec.change.as_ref().map_or_else(|| at.clone(), |ch| ch.name.clone());
+        return Err((
+            StatusCode::CONFLICT,
+            match author {
+                Some(_) => format!("{name}'s agent isn't running now: start an agent on it from Mission control"),
+                None => format!("{name} is its author's own: no agent of its author to hand it to"),
+            },
+        ));
+    };
+    let Some(notice) = crate::ci::notify::failed_notice(hub, &leg.run_id).await else {
+        return Err((StatusCode::NOT_FOUND, format!("no run {} to hand off", leg.run_id)));
+    };
+    let t = crate::ci::attach::failure_of(hub, &notice, "failure").await;
+    let Some(a) = crate::ci::attach::all(hub).await.into_iter().find(|a| crate::ci::attach::looks_after(a, &t.about)) else {
+        return Err((StatusCode::CONFLICT, format!("No agent looks after {repo}: attach one on its page in Repos (an agent woken by failures), and Hand off gives it {at}")));
+    };
+    let Some(i) = crate::ci::attach::wake(hub, &a, &t).await else {
+        return Err((StatusCode::CONFLICT, format!("{} didn't take {at}", a.name)));
+    };
+    let Some(agent) = i.agent.clone() else {
+        return Err((StatusCode::CONFLICT, format!("{} didn't take {at}: {}", a.name, i.why.unwrap_or_else(|| "its incident waits on a person".to_string()))));
+    };
+    keep(hub, &rec, &["checks"], &a.name, Some(&agent), Some(&i.id), None, &caller.name).await?;
+    Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": ["checks"] } }))
+}
+
+/// What a change's author's agent is handed: where its change stands open, and what to do about
+/// each (`excerpt`: the failed check's failure, as `ci::logsearch::failure` gives it).
+fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conflict], threads: &[ThreadRec], failed: Option<(&LegRec, Option<&Value>)>, base: &str, by: &str) -> String {
+    let mut text = format!("{} handed you your change {} (version {}, commit {}) from Ship.", shown(by), ch.name, ch.n, short(&rec.sha));
+    if !conflicts.is_empty() {
+        let places: Vec<String> = conflicts.iter().map(|k| kiln_ci::review::place(Some(&k.file), k.line)).collect();
+        text.push_str(&format!("\n\nIt conflicts with where it lands: {}. Resolve them in a new version (agents.change).", places.join(", ")));
+    }
+    if !threads.is_empty() {
+        text.push_str(&format!("\n\nIts open threads ({}):", threads.len()));
+        for t in threads {
+            let place = match (&t.file, t.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None) => f.clone(),
+                _ => "the conversation".to_string(),
+            };
+            text.push_str(&format!("\n- {place} ({}), {}: {}", t.kind, shown(&t.by), first_words(&t.said)));
+        }
+        text.push_str(&format!("\n\nAnswer each in its thread (ci.diffs.threads {{\"diff\": \"{}\"}} lists them, ci.diffs.reply answers one) and make what they ask in a new version (agents.change).", ch.name));
+    }
+    if let Some((leg, excerpt)) = failed {
+        let run_of = |l: &LegRec| rec.runs.iter().find(|r| r.id == l.run_id).map(|r| r.pipeline.as_str()).unwrap_or_default();
+        let names: Vec<&str> = rec.legs.iter().filter(|l| matches!(attempt_of(&l.status, l.conclusion.as_deref(), None), Attempt::Failed) && !is_release(run_of(l))).map(|l| l.name.as_str()).collect();
+        text.push_str(&format!("\n\nIts checks failed: {}.", names.join(", ")));
+        let lines: Vec<&str> = excerpt.and_then(|f| f.get("lines")).and_then(Value::as_array).into_iter().flatten().filter_map(|l| l.get("text").and_then(Value::as_str)).collect();
+        if !lines.is_empty() {
+            let step = excerpt.and_then(|f| f.get("step_name")).and_then(Value::as_str).map(|n| format!(", step \"{n}\"")).unwrap_or_default();
+            text.push_str(&format!("\n\nWhere {} failed{step}:\n```\n{}\n```", leg.name, lines.join("\n")));
+        }
+        text.push_str(&format!("\n\nThe whole log: ci.legs.logs (leg {}); its failure: ci.legs.failure_excerpt. Fix it in a new version (agents.change).", leg.job));
+    }
+    text.push_str(&format!(" It's at {base}/diffs/{}", ch.name));
+    text
+}
+
+/// Keeps a Hand off of `rec`'s commit, one row for each of `what` (W26-R18): to whom (`to`, its
+/// agent and the incident it opened), the change's revision for its review, by whom, now.
+#[allow(clippy::too_many_arguments)]
+async fn keep(hub: &Hub, rec: &Records, what: &[&str], to: &str, agent: Option<&str>, incident: Option<&str>, version: Option<u32>, by: &str) -> Result<(), Fail> {
+    let (repo, sha, what) = (rec.repo.clone(), rec.sha.clone(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>());
+    let (to, agent, incident, who, at) = (to.to_owned(), agent.map(str::to_owned), incident.map(str::to_owned), by.to_owned(), crate::util::now_unix());
+    let audit = format!("{repo}@{} {} to {to}", short(&sha), what.join(", "));
+    hub.store
+        .call(move |c| {
+            let repo_id: String = c.query_row("SELECT id FROM repos WHERE name = ?1 OR id = ?1", [&repo], |r| r.get(0))?;
+            for w in &what {
+                let v = if w == "checks" { None } else { version };
+                c.execute("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![repo_id, sha, w, to, agent, incident, v, who, at])?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    hub.store.audit(by.to_owned(), "ship.hand_off".into(), audit).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1605,6 +1988,205 @@ mod tests {
         path.iter().try_fold(v, |v, k| v.get(k))
     }
 
+    /// a946ea5 as production keeps it (2026-10-28): v1's runs, whose jobs have no `job_id` and no
+    /// `run_attempt` and say how they ended in their status alone; and C2, its checks passed and
+    /// nothing built.
+    fn production_fixture() -> String {
+        let run = |id: &str, n: i64, pipeline: &str, sha: &str, status: &str| {
+            format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at) VALUES ('{id}', 'kiln', {n}, '{pipeline}', 'push', 'main', '{sha}', 'Mission control: an offline machine', 'user.email', '{status}', {NOW_S});")
+        };
+        let job = |id: &str, run: &str, key: &str, display: &str, status: &str, error: &str, started: Option<i64>, finished: i64| {
+            let started = started.map_or_else(|| "NULL".to_string(), |s| (NOW_S + s).to_string());
+            let display = display.replace('\'', "''");
+            format!("INSERT INTO jobs (id, run_id, key, display, status, error, labels, needs, spec, started_at, finished_at) VALUES ('{id}', '{run}', '{key}', '{display}', '{status}', NULLIF('{error}', ''), '[]', '[]', '{{}}', {started}, {});", NOW_S + finished)
+        };
+        let mut s = String::from("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1);");
+        s += &run("ci", 1426, "ci", C1, "failed");
+        s += &job("j1", "ci", "release-binary", "release build (bare metal)", "skipped", "dependency failed", None, 1660);
+        s += &job("j2", "ci", "rust", "rust lint + test", "failed", "step 4 exited with Some(101)", Some(1583), 3719);
+        s += &job("j3", "ci", "ui", "ui typecheck + lint + build", "failed", "step 2 exited with Some(1)", Some(1598), 1660);
+        s += &job("j4", "ci", "ui-checks", "ui checks (Chromium and WebKit, desktop and phone)", "skipped", "dependency failed", None, 1660);
+        s += &job("j5", "ci", "vendor", "vendored projects (upstream plus kiln's recorded changes)", "failed", "step 3 exited with Some(1)", Some(1586), 1601);
+        s += &run("image", 1427, "image", C1, "succeeded");
+        s += &job("j6", "image", "image", "build and publish kiln's image", "succeeded", "", Some(358), 822);
+        s += &run("release", 1428, "release", C1, "succeeded");
+        s += &job("j7", "release", "linux", "Linux (x86-64, ARM64)", "succeeded", "", Some(292), 1361);
+        s += &job("j8", "release", "macos", "macOS (ARM64), on a Mac", "succeeded", "", Some(292), 949);
+        s += &job("j9", "release", "windows", "Windows (x86-64, cross-built)", "succeeded", "", Some(292), 855);
+        s += &run("ci2", 1429, "ci", C2, "succeeded");
+        s += &job("k1", "ci2", "rust", "rust lint + test", "succeeded", "", Some(10), 900);
+        s
+    }
+
+    /// Plan 01a1856fe81375b1bd1d1d86f270a45b, steps 2 and 3: production's own runs report. Each of
+    /// a946ea5's v1 jobs is a leg as it ended, with its times; its Build is its image pipeline's
+    /// job and its release's platforms. A commit no build ran for isn't built.
+    #[test]
+    fn ship_reports_productions_v1_runs_as_they_ended() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = production_fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let now = (NOW_S + 4000) * 1000;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, Vec::new(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let pip = |v: &Value, stage: &str| v.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).map(|p| text(p, "state")).unwrap_or_default();
+            let checks = field(&one, &["checks"]).and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(checks.iter().map(|c| text(c, "pipeline")).collect::<Vec<_>>(), vec!["ci"], "the image and release pipelines aren't checks");
+            let legs: Vec<(String, String, String, Option<i64>, Option<i64>, bool)> = checks
+                .iter()
+                .flat_map(|c| c.get("legs").and_then(Value::as_array).cloned().unwrap_or_default())
+                .map(|l| (text(&l, "name"), text(&l, "state"), text(&l, "note"), l.get("start").and_then(Value::as_i64), l.get("end").and_then(Value::as_i64), l.get("job").is_some()))
+                .collect();
+            let at = |s: i64| Some(NOW_S + s);
+            assert_eq!(
+                legs,
+                vec![
+                    ("release build (bare metal)".into(), "superseded".into(), "dependency failed".into(), None, at(1660), false),
+                    ("rust lint + test".into(), "failed".into(), "step 4 exited with Some(101)".into(), at(1583), at(3719), true),
+                    ("ui typecheck + lint + build".into(), "failed".into(), "step 2 exited with Some(1)".into(), at(1598), at(1660), true),
+                    ("ui checks (Chromium and WebKit, desktop and phone)".into(), "superseded".into(), "dependency failed".into(), None, at(1660), false),
+                    ("vendored projects (upstream plus kiln's recorded changes)".into(), "failed".into(), "step 3 exited with Some(1)".into(), at(1586), at(1601), true),
+                ]
+            );
+            assert_eq!((pip(&one, "checks"), text(&one, "stand"), text(&one, "line")), ("failed".into(), "needs_you".into(), "rust lint + test · step 4 exited with Some(101)".into()));
+            // Build: the image its image pipeline built, the platforms its release built.
+            assert_eq!(field(&one, &["build", "image", "state"]).and_then(Value::as_str), Some("passed"));
+            let platforms: Vec<(String, String)> =
+                field(&one, &["build", "platforms"]).and_then(Value::as_array).into_iter().flatten().map(|p| (text(p, "name"), text(p, "state"))).collect();
+            assert_eq!(
+                platforms,
+                vec![("Linux (x86-64, ARM64)".into(), "passed".into()), ("macOS (ARM64), on a Mac".into(), "passed".into()), ("Windows (x86-64, cross-built)".into(), "passed".into())]
+            );
+            assert_eq!(pip(&one, "build"), "passed");
+            // A commit no build ran for: not built, its checks passed.
+            let two = get_in(&store, "hyper-light/kiln", C2, None, Vec::new(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&two, "checks"), pip(&two, "build"), field(&two, &["build", "image", "state"]).and_then(Value::as_str)), ("passed".into(), "none".into(), Some("none")));
+            assert_eq!((text(&two, "stand"), text(&two, "line")), ("waiting".into(), "Checks passed".into()));
+            Ok(())
+        })
+    }
+
+    /// Three commits of kiln's own, oldest first, each checked and its image built: C3, C1, C2.
+    fn cd_fixture() -> String {
+        let run = |id: &str, n: i64, pipeline: &str, sha: &str| {
+            format!("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at) VALUES ('{id}', 'kiln', {n}, '{pipeline}', 'push', 'main', '{sha}', 'a commit', 'user.email', 'succeeded', {NOW_S});")
+        };
+        let job = |id: &str, run: &str, key: &str| {
+            format!("INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, started_at, finished_at) VALUES ('{id}', '{run}', '{key}', '{key}', 'succeeded', '[]', '[]', '{{}}', {NOW_S}, {});", NOW_S + 60)
+        };
+        let mut s = String::from("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1);");
+        for (sha, n) in [(C3, 1), (C1, 3), (C2, 5)] {
+            s += &run(&format!("ci{n}"), n, "ci", sha);
+            s += &job(&format!("c{n}"), &format!("ci{n}"), "rust lint + test");
+            s += &run(&format!("im{n}"), n + 1, "image", sha);
+            s += &job(&format!("i{n}"), &format!("im{n}"), "image");
+        }
+        s
+    }
+
+    /// KilnCD's history as kiln-production keeps it (2026-10-28): C3 deployed and held, then C1 at
+    /// `t1`, each sync followed by its guard's word on the same op (the engine numbers its syncs
+    /// afresh when it restarts); and another app in production, its namespaces, syncing C2 from git
+    /// with no image.
+    fn cd_history(t1: i64) -> Vec<CdDeploy> {
+        let entry = |app: &str, op: u64, sha: &str, at: i64, message: &str, image: bool| kiln_cd::state::Deployment {
+            app: app.into(),
+            op,
+            revision: Some(sha.into()),
+            succeeded: true,
+            message: message.into(),
+            at_ms: u64::try_from(at.saturating_mul(1000)).unwrap_or(0),
+            artifacts: if image {
+                vec![kiln_cd::apps::ArtifactRef { name: "image".into(), reference: format!("kiln:{sha}"), repository: "kiln".into(), tag: Some(sha.into()), digest: String::new() }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let (k, t0) = ("default/kiln-production", t1 - 7200);
+        let kiln = [
+            entry(k, 1, C3, t0, "successfully synced (all tasks run)", true),
+            entry(k, 1, C3, t0 + 600, "kiln restarted into kiln:3333333, and stayed healthy for 10m", true),
+            entry(k, 1, C1, t1, "successfully synced (all tasks run)", true),
+            entry(k, 1, C1, t1 + 600, "kiln restarted into kiln:1111111, and stayed healthy for 10m", true),
+        ];
+        let mut out = deploys_of(k, "production", kiln.iter());
+        let namespaces = [entry("default/namespaces", 2, C2, t1 + 900, "successfully synced (all tasks run)", false)];
+        out.extend(deploys_of("default/namespaces", "production", namespaces.iter()));
+        out
+    }
+
+    /// Plan 01a1856fe81375b1bd1d1d86f270a45b, step 4: production as KilnCD keeps it. The commit
+    /// kiln-production runs reads in production (the guard watching for its first ten minutes) and
+    /// replants; the one it replaced reads superseded; the newer one built and waiting. Another
+    /// app's git sync in production says nothing of what runs, and with no staging nothing reads
+    /// in staging. KilnCD's word is read into memory when it changes, though the store didn't.
+    #[test]
+    fn ship_reads_production_from_kilncd() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = cd_fixture();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let t1 = NOW_S - 3600;
+            let deploys = cd_history(t1);
+            assert_eq!(deploys.iter().map(|d| (short(&d.sha), d.built, d.state.as_str())).collect::<Vec<_>>(), vec![
+                (short(C3), true, "success"),
+                (short(C1), true, "success"),
+                (short(C2), false, "success"),
+            ]);
+            let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let pip = |v: &Value, stage: &str| v.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).map(|p| text(p, "state")).unwrap_or_default();
+            let now = NOW_S * 1000;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&one, "production"), text(&one, "stand"), text(&one, "line")), ("healthy".into(), "shipped".into(), "In production · runners 2/2".into()));
+            assert_eq!(field(&one, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));
+            let old = get_in(&store, "hyper-light/kiln", C3, None, runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&old, "production"), text(&old, "stand"), text(&old, "line")), ("passed".into(), "shipped".into(), "Superseded".into()));
+            let newer = get_in(&store, "hyper-light/kiln", C2, None, runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(
+                (pip(&newer, "production"), pip(&newer, "staging"), text(&newer, "stand"), text(&newer, "line")),
+                ("none".into(), "none".into(), "waiting".into(), "Built".into())
+            );
+            // In the guard's ten minutes after the sync: shipping, the guard watching.
+            let watching = get_in(&store, "hyper-light/kiln", C1, None, runners(), &deploys, (t1 + 300) * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!((pip(&watching, "production"), text(&watching, "stand"), text(&watching, "line")), ("guard".into(), "shipping".into(), "Guard watching".into()));
+            // From memory the same; then KilnCD deploys C2, and the next refresh reads it in.
+            let cache = ShipCache::new();
+            let stands = |cache: &ShipCache| -> Vec<(String, String, String)> {
+                let page: Value = cache.page(None, None, &Facets::default(), None, i64::MAX, 10).ok().flatten().and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default();
+                page.get("commits").and_then(Value::as_array).into_iter().flatten().map(|c| (text(c, "short"), text(c, "stand"), text(c, "line"))).collect()
+            };
+            cache.refresh(&store, &runners(), &deploys, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            // Step 5's pace line: nothing in flight, production on C1 one commit behind, both runners on it.
+            assert_eq!(
+                cache.pace(Some("hyper-light/kiln"), None, &runners()),
+                Some(json!({ "in_flight": 0, "agents": 0, "envs": [{ "repo": "hyper-light/kiln", "environment": "production", "short": short(C1), "behind": 1 }], "runners": { "on": 2, "of": 2 } }))
+            );
+            assert_eq!(stands(&cache), vec![
+                (short(C2), "waiting".into(), "Built".into()),
+                (short(C1), "shipped".into(), "In production · runners 2/2".into()),
+                (short(C3), "shipped".into(), "Superseded".into()),
+            ]);
+            let mut later = deploys.clone();
+            later.push(CdDeploy { app: "default/kiln-production".into(), environment: "production".into(), sha: C2.into(), built: true, op: 2, state: "success".into(), description: "successfully synced (all tasks run)".into(), at: NOW_S });
+            cache.refresh(&store, &runners(), &later, now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(stands(&cache), vec![
+                (short(C2), "shipping".into(), "Guard watching".into()),
+                (short(C1), "shipped".into(), "Superseded".into()),
+                (short(C3), "shipped".into(), "Superseded".into()),
+            ]);
+            // Production on C2, behind by nothing; no runner on it yet, so no runners' count.
+            assert_eq!(
+                cache.pace(None, None, &runners()),
+                Some(json!({ "in_flight": 0, "agents": 0, "envs": [{ "repo": "hyper-light/kiln", "environment": "production", "short": short(C2), "behind": 0 }], "runners": null }))
+            );
+            Ok(())
+        })
+    }
+
     #[test]
     fn ship_commits_of_kilns_own_repository_from_its_records() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1613,7 +2195,7 @@ mod tests {
             let sql = fixture();
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let now = NOW_S * 1000;
-            let list = list_in(&store, &HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string())]), None, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let list = list_in(&store, &HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string())]), None, None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let commits = list.get("commits").and_then(Value::as_array).cloned().unwrap_or_default();
             let got: Vec<(String, String, String)> = commits
                 .iter()
@@ -1628,7 +2210,7 @@ mod tests {
                 ]
             );
 
-            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let pip = |stage: &str| one.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).and_then(|p| p.get("state")).and_then(Value::as_str).map(str::to_string);
             assert_eq!(pip("checks").as_deref(), Some("flaky"));
             assert_eq!(pip("staging").as_deref(), Some("healthy"));
@@ -1643,14 +2225,14 @@ mod tests {
             assert!(leg.get("start").and_then(Value::as_i64).is_some(), "a leg that ran says when it started: {leg}");
             assert!(one.get("v").and_then(Value::as_str).is_some_and(|v| v.len() == 16), "a row carries its version: {one}");
 
-            let shipped = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let shipped = get_in(&store, "hyper-light/kiln", C1, None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(field(&shipped, &["replant"]).and_then(Value::as_array).map(Vec::len), Some(2));
             // Every action names an endpoint kiln has: a route in its table, not the unnamed default.
             let mut failed = runners();
             if let Some(r) = failed.get_mut(1) {
                 r.failed = Some("upgrade timed out: no report within 15 minutes".into());
             }
-            let with_failed = list_in(&store, &HashMap::new(), None, None, failed, now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let with_failed = list_in(&store, &HashMap::new(), None, None, failed, &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let acts: Vec<(String, String, String)> = with_failed
                 .get("commits")
                 .and_then(Value::as_array)
@@ -1660,7 +2242,8 @@ mod tests {
                 .map(|a| (a.get("name").and_then(Value::as_str).unwrap_or_default().to_string(), a.get("method").and_then(Value::as_str).unwrap_or_default().to_string(), a.get("path").and_then(Value::as_str).unwrap_or_default().to_string()))
                 .collect();
             let names: Vec<&str> = acts.iter().map(|(n, _, _)| n.as_str()).collect();
-            assert_eq!(names, vec!["retry", "hand_off", "approve", "hold", "retry_runner"]);
+            // Hand off first on a failed check, as the mock draws it (W26-R18).
+            assert_eq!(names, vec!["hand_off", "retry", "approve", "hold", "retry_runner"]);
             let named = |method: &str, path: &str| -> anyhow::Result<bool> {
                 let m = http::Method::from_bytes(method.as_bytes())?;
                 let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -1670,7 +2253,7 @@ mod tests {
             for (name, method, path) in &acts {
                 assert!(named(method, path)?, "{name}: {method} {path} is no route kiln has");
             }
-            let missing = get_in(&store, "hyper-light/kiln", "deadbee", None, runners(), now).await;
+            let missing = get_in(&store, "hyper-light/kiln", "deadbee", None, runners(), &[], now).await;
             assert!(matches!(missing, Err((StatusCode::NOT_FOUND, _))));
             Ok(())
         })
@@ -1708,7 +2291,7 @@ mod tests {
             let (kim, sam): (HashSet<String>, HashSet<String>) = (["user:kim".to_string()].into(), ["user:sam".to_string()].into());
             let list = |q: &[(&str, &str)], viewer: Option<HashSet<String>>| {
                 let (store, q) = (store.clone(), q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>());
-                async move { list_in(&store, &q, None, viewer.as_ref(), runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+                async move { list_in(&store, &q, None, viewer.as_ref(), runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
             };
             let rows = |v: &Value| -> Vec<(String, String, String, String)> {
                 let s = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
@@ -1900,7 +2483,7 @@ mod tests {
                 for fq in facets {
                     let mut q = HashMap::from([("repo".to_string(), "hyper-light/kiln".to_string()), ("limit".to_string(), limit.to_string())]);
                     q.extend(fq.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-                    let want = list_in(store, &q, None, viewer, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                    let want = list_in(store, &q, None, viewer, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                     if let Some(got) = cache.page(Some("hyper-light/kiln"), None, &Facets::from_query(&q), viewer, i64::MAX, limit).map_err(|(_, m)| anyhow::anyhow!(m))? {
                         assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the list of {limit} {fq:?} for {viewer:?} from memory isn't the store's");
                         compared += 1;
@@ -1911,7 +2494,7 @@ mod tests {
                     for c in want.get("commits").and_then(Value::as_array).into_iter().flatten() {
                         let sha = c.get("sha").and_then(Value::as_str).unwrap_or_default();
                         if let Some(got) = cache.detail("hyper-light/kiln", sha, &runners(), now, viewer) {
-                            let want = get_in(store, "hyper-light/kiln", sha, viewer, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                            let want = get_in(store, "hyper-light/kiln", sha, viewer, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                             assert_eq!(got, want, "round {round}: {sha}'s detail for {viewer:?} from memory isn't the store's");
                             compared += 1;
                         }
@@ -1958,7 +2541,7 @@ mod tests {
                 }
                 now += FRESH_MS;
                 let before = cache.applied();
-                cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 assert!(cache.applied() >= before, "the change applied went back");
                 compared += same(&store, &cache, now, round).await?;
             }
@@ -1981,21 +2564,21 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::new();
             let mut now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             for n in 0..40u64 {
                 let sql = ops(500 + n, n % 31, if n.is_multiple_of(2) { C2 } else { C3 });
                 let write = store.call(move |c| Ok(c.execute_batch(&sql)?));
                 now += FRESH_MS;
                 let before = cache.applied();
                 let (ra, rb) = (runners(), runners());
-                let (w, a, b) = futures::join!(write, cache.refresh(&store, &ra, now), cache.refresh(&store, &rb, now));
+                let (w, a, b) = futures::join!(write, cache.refresh(&store, &ra, &[], now), cache.refresh(&store, &rb, &[], now));
                 w?;
                 a.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 b.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 assert!(cache.applied() >= before, "the change applied went back");
                 // Whatever a refresh beside the write missed, the next one brings in.
                 now += FRESH_MS;
-                cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
                 same(&store, &cache, now, usize::try_from(n).unwrap_or(0)).await?;
             }
             Ok(())
@@ -2014,7 +2597,7 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::with_cap(2);
             let now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             for _ in 0..100 {
                 store.call(|c| Ok(c.execute("UPDATE jobs SET conclusion = CASE conclusion WHEN 'success' THEN 'failure' ELSE 'success' END WHERE id = 'l3'", []).map(|_| ())?)).await?;
             }
@@ -2026,12 +2609,12 @@ mod tests {
             let held = cache.page(None, None, &Facets::default(), None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?;
             // The store failing: the refresh says so, memory keeps what it had, and stays stale.
             store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes RENAME TO ship_changes_away")?)).await?;
-            assert!(cache.refresh(&store, &runners(), now + FRESH_MS).await.is_err());
+            assert!(cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.is_err());
             assert_eq!(cache.page(None, None, &Facets::default(), None, i64::MAX, 1).map_err(|(_, m)| anyhow::anyhow!(m))?, held);
             assert!(cache.stale(now + FRESH_MS));
             // Back: the next read brings everything in.
             store.call(|c| Ok(c.execute_batch("ALTER TABLE ship_changes_away RENAME TO ship_changes")?)).await?;
-            cache.refresh(&store, &runners(), now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             same(&store, &cache, now + FRESH_MS, 0).await?;
             Ok(())
         })
@@ -2048,14 +2631,14 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::new();
             let now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let count = |page: Option<String>| -> usize { page.and_then(|p| serde_json::from_str::<Value>(&p).ok()).and_then(|v| v.get("commits").and_then(Value::as_array).map(Vec::len)).unwrap_or(usize::MAX) };
             let other = ["someone/else".to_string()];
             let mine = ["hyper-light/kiln".to_string()];
             assert_eq!(count(cache.page(None, Some(&other), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
             assert_eq!(count(cache.page(Some("hyper-light/kiln"), Some(&other), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 0);
             assert_eq!(count(cache.page(None, Some(&mine), &Facets::default(), None, i64::MAX, 10).map_err(|(_, m)| anyhow::anyhow!(m))?), 3);
-            let one = get_in(&store, "hyper-light/kiln", C1, None, runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert!(visible(&one, None));
             assert!(visible(&one, Some(&mine)));
             assert!(!visible(&one, Some(&other)));
@@ -2075,7 +2658,7 @@ mod tests {
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
             let cache = ShipCache::new();
             let now = NOW_S * 1000;
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let stand = |cache: &ShipCache| -> Option<String> {
                 let page: Value = serde_json::from_str(&cache.page(None, None, &Facets::default(), None, i64::MAX, 10).ok()??).ok()?;
                 page.get("commits")?.as_array()?.iter().find(|c| c.get("short").and_then(Value::as_str) == Some("2222222"))?.get("stand")?.as_str().map(str::to_string)
@@ -2086,7 +2669,7 @@ mod tests {
             assert!(!cache.stale(now + FRESH_MS - 1));
             assert!(cache.stale(now + FRESH_MS));
             let t = std::time::Instant::now();
-            cache.refresh(&store, &runners(), now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let took = t.elapsed();
             println!("ship: a change brought in in {took:?}");
             assert_eq!(stand(&cache).as_deref(), Some("in_staging"));
@@ -2130,7 +2713,7 @@ mod tests {
             let cache = ShipCache::new();
             let now = NOW_S * 1000;
             let t = std::time::Instant::now();
-            cache.refresh(&store, &runners(), now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let build = t.elapsed();
             let time = |f: &dyn Fn() -> usize| -> (f64, f64, f64, usize) {
                 let mut us: Vec<f64> = Vec::new();
@@ -2170,7 +2753,7 @@ mod tests {
         crate::rt::block_on(async move {
             let sql = fixture();
             store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
-            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let one = get_in(&store, "hyper-light/kiln", "2222222", None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let marks = field(&one, &["review"]).and_then(Value::as_array).cloned().unwrap_or_default();
             assert_eq!(marks.len(), 1, "a commit with no change has the one mark: {marks:?}");
             let m = marks.first().cloned().unwrap_or_default();
@@ -2178,5 +2761,208 @@ mod tests {
             assert!(m.get("end") == m.get("at"), "its push is a point: {m}");
             Ok(())
         })
+    }
+
+    /// D41, as `w26_ac01`'s: agent:matrix's diff (for sam) with kim's open question on its version 1.
+    const D41: &str = "4141414aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn d41(author: &str) -> String {
+        let t = NOW_S - 600;
+        format!(
+            "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, created_at, updated_at) VALUES ('d41', 'kiln', 41, 'diff', 'pipeline: dynamic matrices', '{author}', 'agent', 'user:sam', 'needs-review', 'main', {t}, {t});
+             INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('d41', 1, '{D41}', 'p', 'b', 'pipeline: dynamic matrices', '{author}', {t});
+             INSERT INTO review_threads (id, diff_id, version, file, start_line, state, created_by, created_at, kind) VALUES ('th1', 'd41', 1, 'crates/kiln-ci/src/plan/matrix.rs', 42, 'open', 'user:kim', {t}, 'question');
+             INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES ('c1', 'th1', 'user:kim', 'empty matrix meant?', {t}, {t}, 1);"
+        )
+    }
+
+    /// A page's row for the commit `short`: its stand, its line and its actions' names.
+    fn stand_of(page: &Value, short: &str) -> (String, String, Vec<String>) {
+        let s = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        page.get("commits")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|c| s(c, "short") == short)
+            .map(|c| (s(c, "stand"), s(c, "line"), c.get("actions").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("name").and_then(Value::as_str)).map(str::to_string).collect()))
+            .unwrap_or_default()
+    }
+
+    fn row(stand: &str, line: &str, actions: &[&str]) -> (String, String, Vec<String>) {
+        (stand.to_string(), line.to_string(), actions.iter().map(|a| a.to_string()).collect())
+    }
+
+    /// W26-R18: what was handed off says who is on it. A person's failure handed to an agent reads
+    /// "<who> fixing", needs no one and offers Retry alone; a change's threads handed to its
+    /// author's agent read fixing to everyone, with no Hand off and Review pair. From the store,
+    /// and from memory once a refresh reads what the hand-off noted.
+    #[test]
+    fn w26_r18_what_was_handed_off_says_who_is_on_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture() + &d41("agent:matrix");
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let now = NOW_S * 1000;
+            let sam: HashSet<String> = ["user:sam".to_string()].into();
+            let from_store = |viewer: Option<HashSet<String>>| {
+                let store = store.clone();
+                async move { list_in(&store, &HashMap::new(), None, viewer.as_ref(), runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            let cache = ShipCache::new();
+            let from_memory = |cache: &ShipCache, viewer: Option<&HashSet<String>>| -> Value { cache.page(None, None, &Facets::default(), viewer, i64::MAX, 20).ok().flatten().and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default() };
+            cache.refresh(&store, &runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+
+            // Before: each needs its person, with Hand off first (the mock's order).
+            let before = from_store(Some(sam.clone())).await?;
+            assert_eq!(stand_of(&before, "3333333"), row("needs_you", "rust lint + test · assertion failed in sync::reconnect", &["hand_off", "retry"]));
+            assert_eq!(stand_of(&before, "4141414"), row("needs_you", "kim: empty matrix meant? · 1 thread", &["hand_off", "review"]));
+            let hand = before.get("commits").and_then(Value::as_array).into_iter().flatten().filter_map(|c| c.get("actions").and_then(Value::as_array)).flatten().find(|a| a.get("name") == Some(&json!("hand_off"))).cloned().unwrap_or_default();
+            assert_eq!((hand.get("method"), hand.get("path")), (Some(&json!("POST")), Some(&json!("/api/ship/hand-off"))), "one endpoint, which decides: {hand}");
+
+            // Handed off: C3's failure to ci-doctor, D41's thread to its agent at its revision.
+            let sql = format!(
+                "INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at) VALUES ('kiln', '{C3}', 'checks', 'ci-doctor', 'a1', 'i1', NULL, 'user:mei', {NOW_S});
+                 INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at) VALUES ('kiln', '{D41}', 'threads', 'Matrix agent', 'matrix', NULL, 1, 'user:sam', {NOW_S});"
+            );
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let failing = row("failing", "ci-doctor fixing · assertion failed in sync::reconnect", &["retry"]);
+            let fixing = row("checking", "Matrix agent fixing · kim's thread", &[]);
+            for viewer in [Some(sam.clone()), Some(["user:kim".to_string()].into()), None] {
+                let after = from_store(viewer).await?;
+                assert_eq!((stand_of(&after, "3333333"), stand_of(&after, "4141414")), (failing.clone(), fixing.clone()));
+            }
+            cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let held = from_memory(&cache, Some(&sam));
+            assert_eq!((stand_of(&held, "3333333"), stand_of(&held, "4141414")), (failing, fixing), "the hand-off's trigger brought them into memory");
+            Ok(())
+        })
+    }
+
+    /// W26-R18: Hand off gives a person's failure to the agent attached to what failed, as the
+    /// failure itself would (an incident with its agent), and keeps who took it; with no one
+    /// attached, nothing open, or no right to rerun, it says why and keeps nothing.
+    #[test]
+    fn w26_r18_hand_off_gives_a_failure_to_the_agent_attached_to_it() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let h = std::sync::Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let sql = fixture();
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let owner = crate::authz::Caller::owner();
+            let c3 = json!({ "repo": "hyper-light/kiln", "sha": C3 });
+            let refused = |r: Result<Value, Fail>| r.err().map(|(c, m)| (c.as_u16(), m)).unwrap_or_default();
+            let kept = |hub: std::sync::Arc<Hub>| async move { hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ship_handoffs", [], |r| r.get::<_, i64>(0))?)).await };
+
+            let (code, why) = refused(hand_off_in(&hub, &owner, &c3).await);
+            anyhow::ensure!(code == 409 && why.contains("No agent looks after hyper-light/kiln"), "{code}: {why}");
+            let (code, why) = refused(hand_off_in(&hub, &owner, &json!({ "repo": "hyper-light/kiln", "sha": C1 })).await);
+            anyhow::ensure!(code == 409 && why.contains("nothing open"), "{code}: {why}");
+            let (code, _) = refused(hand_off_in(&hub, &owner, &json!({ "repo": "hyper-light/kiln" })).await);
+            anyhow::ensure!(code == 400, "no commit named: {code}");
+            let (code, _) = refused(hand_off_in(&hub, &crate::authz::Caller::peer("user:ro", "viewer"), &c3).await);
+            anyhow::ensure!(code == 403, "no right to rerun: {code}");
+            anyhow::ensure!(kept(std::sync::Arc::clone(&hub)).await? == 0, "nothing kept while refused");
+
+            let folder = tempfile::tempdir()?;
+            let cwd = folder.path().to_string_lossy().into_owned();
+            let cx = crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: owner.clone() };
+            crate::ops::call(cx, "attachments.save", json!({ "name": "ci-doctor", "on": "repo:hyper-light/kiln", "harness": { "kind": "claude", "on": "local", "cwd": cwd }, "wake": ["failure"] }))
+                .await
+                .map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let handed = hand_off_in(&hub, &owner, &c3).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            anyhow::ensure!(handed.pointer("/handed/to") == Some(&json!("ci-doctor")) && handed.pointer("/handed/what") == Some(&json!(["checks"])), "{handed}");
+            let id = handed.pointer("/handed/incident").and_then(Value::as_str).unwrap_or_default();
+            let incident = crate::ci::attach::incident(&hub, id).await.ok_or_else(|| anyhow::anyhow!("no incident {id}"))?;
+            anyhow::ensure!(incident.agent.is_some() && incident.seen.first().and_then(|s| s.run.as_deref()) == Some("r5") && incident.title.contains("failed on main"), "{incident:?}");
+            anyhow::ensure!(kept(std::sync::Arc::clone(&hub)).await? == 1, "kept once");
+
+            // Its row says so; asked again, there's nothing more to hand.
+            let page = list_in(&hub.store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            anyhow::ensure!(stand_of(&page, "3333333") == row("failing", "ci-doctor fixing · assertion failed in sync::reconnect", &["retry"]), "{:?}", stand_of(&page, "3333333"));
+            let (code, why) = refused(hand_off_in(&hub, &owner, &c3).await);
+            anyhow::ensure!(code == 409 && why.contains("nothing open"), "{code}: {why}");
+            Ok(())
+        })
+    }
+
+    /// W26-R18: a change's Hand off goes to its author's agent while it runs: its open threads, in
+    /// one message queued after its turn, and the change reads fixing; once that agent has ended,
+    /// Hand off says to start one.
+    #[cfg(unix)]
+    #[test]
+    fn w26_r18_hand_off_gives_a_changes_threads_to_its_authors_agent() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let h = std::sync::Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            // An agent that stays up and says nothing, keeping what it's given.
+            let dir = tempfile::tempdir()?;
+            let (program, heard) = (dir.path().join("quiet-claude"), dir.path().join("heard.jsonl"));
+            std::fs::write(&program, format!("#!/bin/sh\nexec cat >> '{}'\n", heard.display()))?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Default::default() };
+            let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            let agent = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+            let sql = fixture() + &d41(&format!("agent:{agent}"));
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let owner = crate::authz::Caller::owner();
+            let body = json!({ "repo": "hyper-light/kiln", "sha": D41 });
+
+            // What it's told: the change, each open thread where it is and what it says, how to answer.
+            let rec = hub.store.call(|c| load(c, "hyper-light/kiln", D41, &[])).await?.ok_or_else(|| anyhow::anyhow!("no D41"))?;
+            let ch = rec.change.clone().ok_or_else(|| anyhow::anyhow!("D41 has no change"))?;
+            let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+            let told = handed_text(&rec, &ch, &ch.conflicts, &ch.threads, None, &base, &owner.name);
+            anyhow::ensure!(
+                told.contains("your change D41 (version 1, commit 4141414)") && told.contains("- crates/kiln-ci/src/plan/matrix.rs:42 (question), kim: empty matrix meant?") && told.contains("ci.diffs.reply") && told.ends_with("/diffs/D41"),
+                "{told}"
+            );
+            let handed = hand_off_in(&hub, &owner, &body).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            anyhow::ensure!(handed.pointer("/handed/agent") == Some(&json!(agent)) && handed.pointer("/handed/what") == Some(&json!(["threads"])), "{handed}");
+            // Those very words reach it (its turn isn't under way, so at once).
+            let mut got = String::new();
+            for _ in 0..250 {
+                got = std::fs::read_to_string(&heard).unwrap_or_default();
+                if got.contains("your change D41 (version 1, commit 4141414)") {
+                    break;
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            anyhow::ensure!(got.contains("your change D41 (version 1, commit 4141414)") && got.contains("matrix.rs:42 (question), kim: empty matrix meant?"), "it heard: {got}");
+            let page = list_in(&hub.store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let (stand, line, _) = stand_of(&page, "4141414");
+            anyhow::ensure!(stand == "checking" && line.ends_with("fixing · kim's thread"), "{stand}: {line}");
+
+            // Its agent gone, Hand off has no one to give it to.
+            let cx = crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: owner.clone() };
+            crate::ops::call(cx, "agents.stop", json!({ "agent": agent })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            for _ in 0..500 {
+                if hub.harness.info(&agent).is_some_and(|i| i.status == crate::harness::model::Status::Exited) {
+                    break;
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            hub.store.call(|c| Ok(c.execute("DELETE FROM ship_handoffs", []).map(|_| ())?)).await?;
+            let why = hand_off_in(&hub, &owner, &body).await.err().map(|(c, m)| (c.as_u16(), m)).unwrap_or_default();
+            anyhow::ensure!(why.0 == 409 && why.1.contains("D41's agent isn't running now"), "{why:?}");
+            Ok(())
+        })
+    }
+
+    /// A future run to its end on a thread of its own, within two minutes.
+    fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::rt::block_on(f));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap_or_else(|_| Err(anyhow::anyhow!("not done within two minutes")))
     }
 }
