@@ -807,6 +807,13 @@ const hostPullOf = (number: number) => ({
   ] as HostThreadMock[],
   reviews: [] as { author: string; state: string; body: string; at: number | null }[],
   merge_methods: ["merge", "squash"],
+  signatures: {
+    commits: [
+      { sha: sha(`w23-${number}-1`), state: "verified", reason: "verified", signer: "ada@example.com", verified_at: null, read_at: T0 + 7200 },
+      { sha: sha(`w23-${number}-2`), state: "unverified", reason: "unknown_key", signer: null, verified_at: null, read_at: T0 + 7200 },
+      { sha: sha(`w23-${number}`), state: "unsigned", reason: "unsigned", signer: null, verified_at: null, read_at: T0 + 7200 },
+    ],
+  },
   checks: {
     state: "failure",
     checks: [
@@ -839,7 +846,8 @@ const hostPulls = [
 async function handleHostPulls(req: http.IncomingMessage, res: http.ServerResponse, rest: string[], ctx: Ctx): Promise<boolean> {
   const m = req.method ?? "GET";
   const [n, what] = rest;
-  const summary = (hp: (typeof hostPulls)[number]) => Object.fromEntries(Object.entries(hp).filter(([k]) => !["files", "conversation", "threads", "reviews", "merge_methods", "checks"].includes(k)));
+  const summary = (hp: (typeof hostPulls)[number]) =>
+    Object.fromEntries(Object.entries(hp).filter(([k]) => !["files", "conversation", "threads", "reviews", "merge_methods", "checks", "signatures"].includes(k)));
   if (!n && m === "GET") return (ctx.json(res, 200, { repo: HOST_REPO, pulls: hostPulls.filter((x) => x.state === "open").map(summary) }), true);
   const hp = hostPulls.find((x) => x.number === Number(n));
   if (!hp) return (ctx.err(res, 502, `merge request !${n} (404): 404 Not found`), true);

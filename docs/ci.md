@@ -8903,7 +8903,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   signatures*, below); the CLI signs in with a passkey only through a personal access token (no
   approving a device from the browser yet).
 
-**Built: signatures (R03: commits and pushes; AC03, but what hosts verified).** Plan
+**Built: signatures (R03: commits, pushes and what hosts verified; AC03).** Plan
 `01a17856b1b273268adf6ce8c4f78410`, research `01a18abcef987683938692b8832c1831`.
 
 - *A signed statement.* `kiln_ci::identity::statement`, the record every signature here takes: a
@@ -9005,10 +9005,22 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   an agent binds none).
 - *Hosts.* GitHub, GitLab and Bitbucket don't trust kiln's CA, so a commit signed as kiln, an
   agent or a person through kiln reads "unverified" on them. For a host's pull request, kiln
-  records what the host says it verified of each commit and marks what it couldn't (step 3's host
-  half, through the forge seam).
-- *Not yet.* What hosts verified of a pull request's commits (above); verdicts (R04); lands
-  (R07). A remote naming kiln's server by another name
+  records what the host verified of each commit and marks what it couldn't (step 3's host half),
+  in the forge seam's terms (`verifications`, FORGE-20 in docs/seams.md): verified (and as whom),
+  unverified (and why, in the host's word), unsigned, or unknown. The mirror of pull requests
+  keeps each verdict in `host_verifications` as it reads the pull request: GitHub's
+  `verification` comes on the commits it reads already, at no request more; GitLab is asked of
+  each commit's signature once (`repository/commits/:sha/signature`, its 404 an unsigned
+  commit); Bitbucket verifies none, so each of its commits is kept unknown, saying so. A verdict
+  read again unchanged keeps when kiln first read it. The review page lists them, oldest first,
+  its head last; one kiln hasn't read yet is unknown, saying so. Tests:
+  `w27_r03_kiln_records_what_each_host_verified_of_a_pull_requests_commits` (the mirror against
+  each host's simulator), `w27_r03_githost_reads_a_pull_requests_first_250_commits_in_three_requests`,
+  `w27_r03_githost_asks_gitlab_for_each_commits_signature_once`, and FORGE-20 against each
+  simulator and githost.
+- *Not yet.* A host's pull request isn't judged by `.kiln/review.yaml`'s `signatures:` on what its
+  host verified; the mirror reads a pull request's first 100 commits, so later ones have no
+  verdict; verdicts (R04); lands (R07). A remote naming kiln's server by another name
   than those (another host name for it) keeps the person's credential. A job's push (its
   `GITHUB_TOKEN`) can't sign its commits, so it's refused where signatures are required. Agents
   the server runs itself hold no key of theirs, so what they commit is unsigned.

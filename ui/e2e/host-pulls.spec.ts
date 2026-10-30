@@ -24,6 +24,9 @@ test("a host's merge request: reviewed, commented on line by line, and merged fr
   await expect(page).toHaveURL(new RegExp(`/review/hosts/lundhe%2Fw23/${n}$`));
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   await expect(page.getByLabel("Checks on its head commit")).toContainText(`pipeline #${n * 4}`);
+  // What GitLab verified of each commit (W27-R03): oldest first, the head last.
+  const signed = page.getByLabel("What GitLab verified of its commits").getByRole("listitem");
+  await expect(signed).toHaveText([/Verified as ada@example\.com$/, /Unverified · unknown key$/, /Unsigned$/]);
   await expect(page.getByText("This is the line that fails.")).toBeVisible();
   // A host's files aren't ticked off as viewed here.
   await expect(page.getByText("Viewed", { exact: true })).toHaveCount(0);
