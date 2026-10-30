@@ -186,17 +186,12 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   isolation: isolate;
   border-color: transparent;
 }
-/* Each state's colours (the ring's stops, all the way round) and speeds, which the composer's
-   border wears too (.cp-rim): there its tide is how long its swells take, and its sway how far
-   they carry it. */
-.ag-turn-control,
-.hx-compose-box[data-turn] {
+/* Each state's colours (the ring's stops, all the way round) and speeds. */
+.ag-turn-control {
   --ag-rim: #8d869f, #aca1d5 21%, #d3c6ee 29%, #8a7cae 42%, #b5a7db 68%, #8d869f;
   --ag-glint: rgb(225 215 245 / 35%);
   --ag-current: 24s;
   --ag-spark: 19s;
-  --ag-tide: 9s;
-  --ag-sway: 26px;
 }
 .ag-actions .ag-turn-control:disabled {
   opacity: 1;
@@ -221,51 +216,36 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   background: conic-gradient(transparent 4%, var(--ag-glint) 7%, transparent 10% 33%, var(--ag-glint) 35%, transparent 38% 69%, var(--ag-glint) 73%, transparent 77%);
   animation: ag-rim-shimmer var(--ag-spark) linear infinite reverse;
 }
-.ag-turn-control[data-state="active"],
-.hx-compose-box[data-turn="active"] {
+.ag-turn-control[data-state="active"] {
   --ag-rim: #b8d9d2, #7194c9 8%, #c8e0ef 13%, #a6c4ed 23%, #8677ad 32%, #d7c1ee 37%, #b8a6d5 46%, #d6a2aa 55%, #eed6bc 59%, #a2bfae 66%, #d8cbb0 77%, #a6c4ed 85%, #d6a2aa 91%, #b8d9d2;
   --ag-glint: rgb(245 234 255 / 90%);
   --ag-current: 5.3s;
   --ag-spark: 3.7s;
-  --ag-tide: 5.3s;
-  --ag-sway: 46px;
 }
 /* Waiting for you: Mission control's needs-you sand, restless. */
-.ag-turn-control[data-state="needs"],
-.hx-compose-box[data-turn="needs"] {
+.ag-turn-control[data-state="needs"] {
   --ag-rim: #b08d63, #e2cfae 10%, #f4e6cc 17%, #c9a274 28%, #e9c9a6 38%, #d6a2aa 47%, #f1dcbc 56%, #b99064 66%, #e3c9a0 75%, #f6ead2 83%, #cfae86 91%, #b08d63;
   --ag-glint: rgb(255 241 216 / 75%);
   --ag-current: 8s;
   --ag-spark: 5.4s;
-  --ag-tide: 4.2s;
-  --ag-sway: 32px;
 }
-.ag-turn-control[data-state="stopped"],
-.hx-compose-box[data-turn="stopped"] {
+.ag-turn-control[data-state="stopped"] {
   --ag-rim: #996f77, #d1aaad 23%, #e1bdc0 30%, #a17b83 46%, #c29ba1 73%, #996f77;
   --ag-glint: rgb(233 197 200 / 20%);
   --ag-current: 52s;
   --ag-spark: 43s;
-  --ag-tide: 16s;
-  --ag-sway: 14px;
 }
-.ag-turn-control[data-state="finished"],
-.hx-compose-box[data-turn="finished"] {
+.ag-turn-control[data-state="finished"] {
   --ag-rim: #79978a, #a8c9bc 22%, #d2e6d8 32%, #8aafa0 49%, #b4d0bd 76%, #79978a;
   --ag-glint: rgb(225 240 229 / 30%);
   --ag-current: 32s;
   --ag-spark: 27s;
-  --ag-tide: 12s;
-  --ag-sway: 20px;
 }
-.ag-turn-control[data-state="disconnected"],
-.hx-compose-box[data-turn="disconnected"] {
+.ag-turn-control[data-state="disconnected"] {
   --ag-rim: #555962, #797c84 24%, #898c94 34%, #656872 53%, #777a82 80%, #555962;
   --ag-glint: rgb(163 166 173 / 10%);
   --ag-current: 100s;
   --ag-spark: 83s;
-  --ag-tide: 30s;
-  --ag-sway: 6px;
 }
 @keyframes ag-rim-current {
   to {
@@ -304,199 +284,17 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
     transform: rotate(360deg);
   }
 }
-/* The agent page's composer wears the ring on its border, in the border's own place and width: the
-   ring unrolled, a ring's length of its colours after another all the way round. It moves like a
-   liquid: clockwise at the state's pace, surging and easing as two swells that never fall into
-   step carry it, a second current of the same colours drifting over it as it fades in and out,
-   and the glints running back against it. Each edge has its own strips (only transforms and
-   opacity animate); the four move as one and meet at the corners' 45° lines, so the colours go
-   round them unbroken. */
-.cp-rim {
-  position: absolute;
-  inset: -1px;
-  overflow: hidden;
-  padding: 1px;
-  border-radius: inherit;
-  container: cp-rim / size;
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  pointer-events: none;
-}
-/* An edge, from the corner it starts at going clockwise: x along it, y in from it. A whole number
-   of rings goes round (each about the button's 120px): the box's size is its content box and the
-   border's 1px each side, less 16.4px for the four 7px corners cut at 45°. */
-.cp-rim > i {
-  --rim-n: 16;
-  --rim-w: calc(100cqw + 2px);
-  --rim-h: calc(100cqh + 2px);
-  --rim-around: calc(2 * var(--rim-w) + 2 * var(--rim-h) - 16.4px);
-  --rim-period: calc(var(--rim-around) / var(--rim-n));
-  --rim-glints: calc(var(--rim-around) / (var(--rim-n) - 1));
-  --rim-drift: calc(var(--rim-around) / (var(--rim-n) - 3));
-  /* How far round the box, from the top's start, this edge starts. */
-  --rim-from: 0px;
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: var(--rim-w);
-  height: 8px;
-  transform-origin: 0 0;
-}
-@container cp-rim (width < 760px) {
-  .cp-rim > i {
-    --rim-n: 12;
-  }
-}
-@container cp-rim (width < 520px) {
-  .cp-rim > i {
-    --rim-n: 8;
-  }
-}
-/* The right and left edges, under the top and bottom, which end at the corners' 45° lines. */
-.cp-rim > i:nth-child(1) {
-  --rim-from: calc(var(--rim-w) - 4.1px);
-  width: var(--rim-h);
-  transform: translate(var(--rim-w), 0) rotate(90deg);
-}
-.cp-rim > i:nth-child(2) {
-  --rim-from: calc(2 * var(--rim-w) + var(--rim-h) - 12.3px);
-  width: var(--rim-h);
-  transform: translate(0, var(--rim-h)) rotate(270deg);
-}
-.cp-rim > i:nth-child(3),
-.cp-rim > i:nth-child(4) {
-  clip-path: polygon(0 0, 100% 0, calc(100% - 8px) 8px, 8px 8px);
-}
-.cp-rim > i:nth-child(4) {
-  --rim-from: calc(var(--rim-w) + var(--rim-h) - 8.2px);
-  transform: translate(var(--rim-w), var(--rim-h)) rotate(180deg);
-}
-/* In an edge, a surge holding a swell holding the colours, the second current riding the surge
-   alone, and the glints over them all. A surge or swell sways its own width each way, eased, on
-   periods (and from starting points) that don't divide one another, so it never repeats in sight. */
-.cp-rim b {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: var(--ag-sway);
-  height: 100%;
-  animation: cp-rim-sway calc(2.13 * var(--ag-tide)) ease-in-out calc(-0.71 * var(--ag-tide)) infinite alternate;
-}
-.cp-rim b b {
-  width: calc(0.7 * var(--ag-sway));
-  animation-duration: calc(1.37 * var(--ag-tide));
-  animation-delay: calc(-0.37 * var(--ag-tide));
-}
-/* The colours, the second current and the glints: each a strip sixteen of its periods long, from
-   three before the edge, sliding one period along and starting again where it was. */
-.cp-rim b b::before,
-.cp-rim > i > b::after,
-.cp-rim > i::after {
-  --p: var(--rim-period);
-  position: absolute;
-  top: 0;
-  left: calc(-3 * var(--p));
-  width: calc(16 * var(--p));
-  height: 100%;
-  background: var(--strip) calc(-1 * var(--rim-from)) 0 / var(--p) 100% repeat-x;
-  content: "";
-}
-.cp-rim b b::before {
-  --strip: linear-gradient(90deg, var(--ag-rim));
-  animation: cp-rim-flow var(--ag-current) linear infinite;
-}
-/* The second current: the colours the other way round, slower, coming and going. */
-.cp-rim > i > b::after {
-  --p: var(--rim-drift);
-  --strip: linear-gradient(270deg, var(--ag-rim));
-  animation:
-    cp-rim-flow calc(1.71 * var(--ag-current)) linear infinite,
-    cp-rim-ebb calc(1.53 * var(--ag-tide)) ease-in-out calc(-0.29 * var(--ag-tide)) infinite alternate;
-}
-/* The glints come round one time fewer than the colours, so they meet them somewhere new each time. */
-.cp-rim > i::after {
-  --p: var(--rim-glints);
-  --strip: linear-gradient(90deg, transparent 4%, var(--ag-glint) 7%, transparent 10% 33%, var(--ag-glint) 35%, transparent 38% 69%, var(--ag-glint) 73%, transparent 77%);
-  animation: cp-rim-shimmer var(--ag-spark) linear infinite reverse;
-}
-/* ag-rim-current and ag-rim-shimmer, unrolled: a turn is a period, a sixteenth of the strip. */
-@keyframes cp-rim-flow {
-  from {
-    transform: translateX(-6.25%);
-  }
-}
-@keyframes cp-rim-shimmer {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  17% {
-    opacity: 1;
-  }
-  43% {
-    opacity: 0.3;
-  }
-  71% {
-    opacity: 0.8;
-  }
-  0% {
-    transform: translateX(-6.25%);
-  }
-  21% {
-    transform: translateX(-5.5382%);
-  }
-  47% {
-    transform: translateX(-2.9167%);
-  }
-  68% {
-    transform: translateX(-2.0313%);
-  }
-  100% {
-    transform: translateX(0);
-  }
-}
-@keyframes cp-rim-sway {
-  from {
-    transform: translateX(-100%);
-  }
-  to {
-    transform: translateX(100%);
-  }
-}
-@keyframes cp-rim-ebb {
-  from {
-    opacity: 0.15;
-  }
-  to {
-    opacity: 0.6;
-  }
-}
 :root[data-motion="paused"] .ag-turn-control::before,
-:root[data-motion="paused"] .ag-turn-control::after,
-:root[data-motion="paused"] .cp-rim b,
-:root[data-motion="paused"] .cp-rim b b::before,
-:root[data-motion="paused"] .cp-rim > i > b::after,
-:root[data-motion="paused"] .cp-rim > i::after {
+:root[data-motion="paused"] .ag-turn-control::after {
   animation-play-state: paused;
 }
 @media (prefers-reduced-motion: reduce) {
   .ag-turn-control::before,
-  .ag-turn-control::after,
-  .cp-rim b,
-  .cp-rim b b::before,
-  .cp-rim > i > b::after,
-  .cp-rim > i::after {
+  .ag-turn-control::after {
     animation: none;
   }
-  .ag-turn-control::after,
-  .cp-rim > i::after {
+  .ag-turn-control::after {
     opacity: 0.45;
-  }
-  .cp-rim > i > b::after {
-    opacity: 0.35;
   }
 }
 .ag-actions {
@@ -586,11 +384,6 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .cp .hx-compose-box:focus-within {
   border-color: #47464f;
   box-shadow: none;
-}
-/* On the agent's page the border wears the pause button's ring (.cp-rim, with the button's). */
-.cp .hx-compose-box[data-turn] {
-  position: relative;
-  border-color: transparent;
 }
 /* The field grows to ten lines (four on a phone, where the keyboard takes most of the screen),
    then scrolls inside. A line is 1.55em; 16px is its padding. */

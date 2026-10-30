@@ -16,7 +16,6 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { attachedPreview, useAttachments, type Attachments } from "./controls";
 import type { ReplyTarget } from "./timeline";
-import type { BorderState } from "./head";
 import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, slashAt, type Reply } from "./palette";
 import { commandNames } from "./marks";
 import { ComposeField } from "./compose-field";
@@ -373,19 +372,6 @@ function sendHeld(store: SessionStore, agent: string) {
   if (went.length) useHeld.getState().drop(agent, ...went);
 }
 
-/** The pause button's ring around the box (console.css): its four edges (right, left, top, bottom), each a surge holding a swell. */
-const RIM = (
-  <span className="cp-rim" aria-hidden="true">
-    {[0, 1, 2, 3].map((n) => (
-      <i key={n}>
-        <b>
-          <b />
-        </b>
-      </i>
-    ))}
-  </span>
-);
-
 const NO_QUEUE: QueueItem[] = [];
 const NO_HELD: Held[] = [];
 const NO_FEATURES: string[] = [];
@@ -398,7 +384,6 @@ export function Composer({
   attachments,
   toMain,
   task,
-  turn,
   onView,
   onTerminal,
   replyTo,
@@ -412,8 +397,6 @@ export function Composer({
   toMain?: boolean;
   /** The subagent whose thread is shown (its task's id, or its call's): a message goes to it, as it takes one now (`Task.takes`). */
   task?: string | null;
-  /** The agent page's pause button's state (head.tsx): the box's border wears its ring. */
-  turn?: BorderState;
   /** A command that opens a kiln panel (model, mcp, changes, tasks…). */
   onView?: (view: string) => void;
   /** Open a terminal beside the agent: its shell (`!command`), or its harness's own screen (a command only that screen does). */
@@ -776,8 +759,7 @@ export function Composer({
 
       {/* Files dropped or pasted here are the agent page's to attach (it takes them anywhere on
           the page); taking them here as well attached each one twice. */}
-      <div className="hx-compose-box" data-turn={turn}>
-        {turn && RIM}
+      <div className="hx-compose-box">
         {chips}
         {canOverride && (withOpen || override.model || override.effort) && (
           <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />

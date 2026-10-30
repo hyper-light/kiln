@@ -7,7 +7,7 @@
 import * as React from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
-import { FORCE_STOP_AFTER_MS, harnessApi, useSession, useStopAt, type AgentInfo, type Command, type KindInfo, type Meta, type SessionStore, type State, type Status } from "@/api/harness";
+import { FORCE_STOP_AFTER_MS, harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
 import { useSuspenseResource } from "@/lib/resource";
 import { agentLabel, hasOwnName, modelLabel } from "./derive";
 import { useClock, useListener } from "./dom";
@@ -36,22 +36,6 @@ function turnSignal(status: Status, conn: string, state: State | null, info: Age
   if (workingThrough(status, subs)) return { tone: "active", label: `Working · ${subs} subagent${subs === 1 ? "" : "s"}` };
   if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
   return { tone: "ready", label: "Ready" };
-}
-
-/**
- * The turn control's state for the agent in `store`, as the head shows it (a stop asked of the
- * turn under way, until it takes, included): the agent page's composer wears it on its border.
- * `kiln`: the subagents kiln started for it.
- */
-export function useTurnState(store: SessionStore, kiln: readonly AgentInfo[]): BorderState {
-  const stopAt = useStopAt(store);
-  const working = kilnAtWork(kiln).length;
-  return useSession(store, (s) => {
-    const status = s.state?.status ?? s.info?.status ?? "starting";
-    // Asked to stop, as the head's StoppingControl shows it.
-    if (stopAt != null && (status === "running" || status === "waiting") && s.meta?.features.includes("interrupt")) return s.conn !== "open" ? "disconnected" : "stopped";
-    return turnSignal(status, s.conn, s.state, s.info, working).tone;
-  });
 }
 
 /** State lives on the existing button's border. Its shape, icon and hit area never animate. */
