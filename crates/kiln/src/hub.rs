@@ -1382,6 +1382,15 @@ impl Hub {
         sent
     }
 
+    /// `msg` to runner process `peer` on reach's lane.
+    async fn send_reach(&self, peer: PeerId, msg: &ServerMsg) {
+        #[cfg(test)]
+        self.sent.lock().push((peer, msg.clone()));
+        if let Ok(b) = proto::encode(msg) {
+            self.net.send(peer, proto::LANE_REACH, Kind::Term, b).await;
+        }
+    }
+
     pub(crate) async fn send_peer(&self, peer: PeerId, msg: &ServerMsg) {
         #[cfg(test)]
         self.sent.lock().push((peer, msg.clone()));
@@ -2006,11 +2015,13 @@ impl Hub {
             }
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
             AgentMsg::Reach { to, link, open, data, close } => {
-                // Job pods neither send nor receive reach links.
+                // Job pods neither send nor receive reach links: one's frame is refused, and noted.
                 if self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral) {
+                    let why = format!("a job pod's, for link {link}: job pods neither send nor receive reach links");
+                    self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
                     return Ok(());
                 }
-                let out = {
+                let forwarded = {
                     let (agents, instances) = (&self.agents, &self.instances);
                     self.reach.lock().forward(&agent, peer, crate::reach::relay::Frame { to, link, open, data, close }, |n| {
                         if agents.lock().get(n).is_none_or(|a| a.ephemeral || !a.connected) {
@@ -2019,10 +2030,15 @@ impl Hub {
                         instances.lock().newest_with(n, proto::CAP_REACH)
                     })
                 };
-                for (p, m) in out {
-                    if let Ok(b) = proto::encode(&m) {
-                        self.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
-                    }
+                // One from a runner that isn't an end of the link it names goes nowhere: refused to
+                // it, and noted naming the link's ends.
+                if let crate::reach::relay::Forwarded::NotItsLink { link, ends: (a, b) } = &forwarded {
+                    let why = format!("not its link: link {link} is {a}'s and {b}'s");
+                    self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
+                }
+                let typed = self.instances.lock().get(peer).is_some_and(|i| i.wide & proto::CAP_UNREAD != 0);
+                for (p, m) in forwarded.sends(peer, typed) {
+                    self.send_reach(p, &m).await;
                 }
             }
             AgentMsg::NetDrops { dropped } => {
@@ -2044,6 +2060,20 @@ impl Hub {
                 let on = held.map(crate::wire::unread::Page::Session);
                 let u = crate::wire::unread::Unread { wire, from: self.sender_of(peer), what, code, why };
                 self.note_unread_folded(u, on, folded).await;
+            }
+            // A message on a reach link this runner couldn't read: noted against the runner that
+            // sent it, the link's other end as the relay knows it, on this one's page too. Word of
+            // one about a link the relay doesn't know with those ends is refused, and noted.
+            AgentMsg::LinkUnread { from, link, what, code, why } => {
+                let ends = self.reach.lock().ends(&link);
+                if ends.as_ref().is_some_and(|(a, b)| (*a == agent && *b == from) || (*a == from && *b == agent)) {
+                    let sender = crate::wire::unread::Sender::Runner { name: from, instance: String::new() };
+                    let u = crate::wire::unread::Unread { wire: Wire::ReachLink, from: sender, what, code, why: format!("{why} (as {agent} read it, on link {link})") };
+                    let _ = self.note_unread(u, Some(crate::wire::unread::Page::Runner(agent.clone()))).await;
+                } else {
+                    let why = format!("word of what link {link} couldn't read, of {from}'s, where the relay knows no such link between them");
+                    self.unreadable(peer, Wire::Relay, "LinkUnread".to_owned(), Code::Malformed, why, true).await;
+                }
             }
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
@@ -2185,45 +2215,37 @@ impl Hub {
                     self.reach.lock().announce(agent, a);
                 }
             }
-            FromRunner::ReachAsk { req, ask } => match ask.get("op").and_then(serde_json::Value::as_str) {
-                Some("directory") => {
+            FromRunner::ReachAsk { req, ask } => match *ask {
+                crate::reach::Question::Directory => {
                     let answer = serde_json::json!({ "runners": self.reach_directory() });
                     self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                 }
                 // What the runner holds of other runners' trees and let go: kept, and answered
                 // with the rules it weighs them with (docs/reach.md §5.1).
-                Some("keep") => {
+                crate::reach::Question::Keep { report } => {
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
-                        let answer = hub.copies.heard(&hub, &runner, ask.get("report")).await;
+                        let answer = hub.copies.heard(&hub, &runner, report.as_ref()).await;
                         hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     });
                 }
                 // Which runner holds which object of the runners' caches (docs/ci.md W24-R27).
-                Some(op @ ("holds" | "holders")) => {
-                    let s = |k: &str| ask.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-                    let (repo, digest) = (s("repo"), s("digest"));
-                    let answer = if op == "holds" {
-                        crate::reach::directory::holds(agent, &repo, &digest);
-                        serde_json::json!({})
-                    } else {
-                        let up: Vec<String> = crate::reach::directory::holders(&repo, &digest, agent).into_iter().filter(|r| self.agents.lock().get(r).is_some_and(|a| a.connected)).collect();
-                        serde_json::json!({ "runners": up })
-                    };
-                    self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                crate::reach::Question::Holds { repo, digest } => {
+                    crate::reach::directory::holds(agent, &repo, &digest);
+                    self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: serde_json::json!({}).to_string() }).await;
+                }
+                crate::reach::Question::Holders { repo, digest } => {
+                    let up: Vec<String> = crate::reach::directory::holders(&repo, &digest, agent).into_iter().filter(|r| self.agents.lock().get(r).is_some_and(|a| a.connected)).collect();
+                    self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: serde_json::json!({ "runners": up }).to_string() }).await;
                 }
                 // An agent's MCP server on the runner asks for kiln's operations: answered on
                 // their own, so a slow one holds up nothing else the runner says.
-                Some("registry" | "call" | "page" | "stream") => {
+                ask => {
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
                         let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;
                         hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     });
-                }
-                _ => {
-                    let answer = serde_json::json!({ "error": "unknown reach question" });
-                    self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                 }
             },
             FromRunner::Power(b) => self.on_power(agent, b).await,
@@ -3522,7 +3544,14 @@ pub(crate) mod tests {
     /// record live, and `wide` what it says it can do past Build's 32 bits.
     pub(crate) async fn hub_with_runner(clock: Arc<dyn kiln_seams::Clock>, name: &str, wide: u64) -> anyhow::Result<Arc<Hub>> {
         let hub = scratch_hub_on(clock, |_| {}).await?;
-        hub.peers.lock().insert(1, name.to_owned());
+        join_runner(&hub, 1, name, wide);
+        Ok(hub)
+    }
+
+    /// Runner `name` connected to a test's hub as process `peer`, its Hello taken, its record
+    /// live; it takes reach links, and `wide` is what it says it can do past Build's 32 bits.
+    pub(crate) fn join_runner(hub: &Hub, peer: PeerId, name: &str, wide: u64) {
+        hub.peers.lock().insert(peer, name.to_owned());
         hub.agents.lock().insert(name.to_owned(), live_runner(name, "linux", "x86_64"));
         let hello = Hello {
             protocol: proto::VERSION,
@@ -3538,10 +3567,10 @@ pub(crate) mod tests {
             running: Vec::new(),
             terminal: true,
         };
-        hub.instances.lock().join(1, name, hello, crate::util::now_unix());
-        hub.instances.lock().set_wide(1, wide);
+        hub.instances.lock().join(peer, name, hello, crate::util::now_unix());
+        hub.instances.lock().set_build(peer, "test".into(), proto::CAP_REACH);
+        hub.instances.lock().set_wide(peer, wide);
         hub.wire.set_keeps(name, wide & proto::CAP_WIRE != 0);
-        Ok(hub)
     }
 
     /// `msg`, from runner process `peer` on `lane`, as the net loop hears it.

@@ -205,6 +205,7 @@ classes! {
         AgentMsg::Identity { .. } => Class::Ask,
         AgentMsg::Observe { .. } => OBSERVE,
         AgentMsg::Unread { .. } => Class::Ack,
+        AgentMsg::LinkUnread { .. } => Class::Ack,
     }
 }
 
@@ -274,6 +275,7 @@ classes! {
         ServerMsg::Identity { .. } => Class::Answer,
         ServerMsg::Observe { .. } => OBSERVE,
         ServerMsg::Unread { .. } => Class::Ack,
+        ServerMsg::ReachRefused { .. } => REACH,
     }
 }
 

@@ -269,6 +269,11 @@ pub enum AgentMsg {
     /// [`CAP_UNREAD`]. Appended last, after identities', observe's and headroom's (`Identity`, `Observe`,
     /// `HeadroomStatus`): postcard encodes variants by index.
     Unread { wire: crate::wire::unread::Wire, what: String, code: crate::wire::unread::Code, why: String, folded: u64, session: Option<String> },
+    /// Reach: a message on link `link` this runner couldn't read, from runner `from` (the link's
+    /// other end): what it was (never what it said), a code and why. Its link ended. The server
+    /// notes it against `from`, on this runner's page too. Only to a server announcing
+    /// [`CAP_UNREAD`]. Appended last: postcard encodes variants by index.
+    LinkUnread { from: String, link: String, what: String, code: crate::wire::unread::Code, why: String },
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -748,6 +753,11 @@ pub enum ServerMsg {
     /// Only to runners announcing [`CAP_UNREAD`]. Appended last, after identities', observe's and headroom's
     /// (`Identity`, `Observe`, `Headroom`): postcard encodes variants by index.
     Unread { wire: crate::wire::unread::Wire, what: String, code: crate::wire::unread::Code, why: String, folded: u64 },
+    /// Reach (on [`LANE_REACH`]): a frame of this runner's the relay refused, about link `link` to
+    /// runner `from`: why in a code from a closed set (`crate::reach::relay::Refusal`) and in words.
+    /// To runners announcing [`CAP_UNREAD`], in place of [`ServerMsg::Reach`]'s `close`. Appended
+    /// last: postcard encodes variants by index.
+    ReachRefused { from: String, link: String, code: crate::reach::relay::Refusal, why: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1212,8 +1222,22 @@ mod tests {
         assert_eq!(encode(&down)?.first(), Some(&62));
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (57, 63), "each table has every variant once");
+        // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them.
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (58, 64), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
+        Ok(())
+    }
+
+    /// Typed messages, step 5: what reach's links couldn't read, and the relay's typed refusals,
+    /// are appended last, after step 3's `Unread`s.
+    #[test]
+    fn reachs_word_of_what_couldnt_be_read_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let up = AgentMsg::LinkUnread { from: "mac".into(), link: "L1".into(), what: "variant 99".into(), code: Code::Unknown, why: "Ask has 12 variants".into() };
+        let down = ServerMsg::ReachRefused { from: "linux".into(), link: "L1".into(), code: crate::reach::relay::Refusal::NotAccepted, why: "linux does not accept commands from other runners".into() };
+        assert_eq!((encode(&up)?.first().copied(), encode(&down)?.first().copied()), (Some(57), Some(63)));
+        assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
+        assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         Ok(())
     }
 

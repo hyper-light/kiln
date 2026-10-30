@@ -222,20 +222,26 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
 }
 
 /// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
-/// mode runs on the runner, `crate::reach::mcp`): `{"op": "registry", "session"}` for the
-/// operations, `{"op": "call", "session", "name", "input"}` to run one, or `{"op": "page",
-/// "session", "do", ...}` for a page it shows (`crate::harness::visuals::ask`). The session must be one
-/// kiln knows on that runner, which mustn't be a job's; it acts for whoever started it (the owner
-/// on a kiln nobody else signs in to), audited as `agent:<session>@<runner> for <them>`. The
-/// answer: `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`.
-pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
+/// mode runs on the runner, `crate::reach::mcp`): the operations (`registry`), one run (`call`), or
+/// a page it shows or streams (`page`, `stream`: `crate::harness::visuals::ask`,
+/// `crate::harness::streams::ask`). The session must be one kiln knows on that runner, which
+/// mustn't be a job's; it acts for whoever started it (the owner on a kiln nobody else signs in
+/// to), audited as `agent:<session>@<runner> for <them>`. The answer: `{"registry", "skills"}`,
+/// `{"ok": <answer>}`, or `{"error", "status"?}`.
+pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Question) -> Value {
+    use crate::reach::Question;
     if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
-    let session = ask.get("session").and_then(Value::as_str).unwrap_or("");
-    let terminal = ask.get("terminal").and_then(Value::as_str).unwrap_or("");
+    let (session, terminal) = match ask {
+        Question::Directory => return json!({ "runners": hub.reach_directory() }),
+        Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
+        Question::Page { session, .. } | Question::Stream { session, .. } => (session.as_str(), ""),
+        // The hub answers these itself (`Hub::on_read`).
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => return json!({"error": "not a question for kiln's operations"}),
+    };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
-    let caller = if session.is_empty() && !terminal.is_empty() && ask.get("op").and_then(Value::as_str) == Some("call") {
+    let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
         terminal_caller(hub, terminal, Some(runner)).await
     } else if session.is_empty() || !hub.harness.located_on(session, runner) {
         return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
@@ -246,16 +252,14 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
         Ok(c) => c,
         Err(e) => return json!({"error": e}),
     };
-    let answer = match ask.get("op").and_then(Value::as_str) {
-        Some("registry") => {
+    let answer = match ask {
+        Question::Registry { .. } => {
             let skills: Vec<Value> = skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();
             let tools: Vec<&str> = agent_ops().iter().map(|o| o.name).collect();
             json!({"registry": code::registry(hub), "skills": skills, "agent_tools": tools})
         }
-        Some("call") => {
-            let name = ask.get("name").and_then(Value::as_str).unwrap_or("");
-            let input = ask.get("input").cloned().unwrap_or(Value::Null);
-            match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input).await {
+        Question::Call { name, input, .. } => {
+            match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input.clone()).await {
                 Ok(v) => json!({"ok": v}),
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
             }
@@ -263,9 +267,12 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
         // A page it shows in its conversation (`crate::harness::visuals`), or one it streams
         // live there (`crate::harness::streams`): its own session's, audited as the agent acting
         // for whoever started it.
-        Some(op @ ("page" | "stream")) => {
-            let r = if op == "page" { crate::harness::visuals::ask(hub, session, ask).await } else { crate::harness::streams::ask(hub, session, ask).await };
-            let what = format!("{}.{}", if op == "page" { "pages" } else { "streams" }, ask.get("do").and_then(Value::as_str).unwrap_or("?"));
+        Question::Page { .. } | Question::Stream { .. } => {
+            // What it asks, as its handler reads it: `{"op", "session", "do", ...}`.
+            let page = matches!(ask, Question::Page { .. });
+            let q = serde_json::to_value(ask).unwrap_or_default();
+            let r = if page { crate::harness::visuals::ask(hub, session, &q).await } else { crate::harness::streams::ask(hub, session, &q).await };
+            let what = format!("{}.{}", if page { "pages" } else { "streams" }, q.get("do").and_then(Value::as_str).unwrap_or("?"));
             if what != "pages.measured" {
                 let (principal, on_behalf_of) = crate::audit::who(&caller);
                 let entry = crate::audit::Entry {
@@ -287,7 +294,8 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
                 Err(e) => json!({"error": format!("{e:#}")}),
             }
         }
-        _ => json!({"error": "an unknown question"}),
+        Question::Directory => json!({ "runners": hub.reach_directory() }),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {

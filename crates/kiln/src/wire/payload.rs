@@ -70,9 +70,10 @@ impl Unreadable {
         self
     }
 
-    /// An answer saying why it couldn't be read, for what asked it (`{"error": …}`).
+    /// An answer saying why it couldn't be read, for what asked it: `{"error", "code"}`, the code
+    /// `unknown` for a kind its reader doesn't know.
     pub fn error(&self) -> Value {
-        serde_json::json!({ "error": format!("{} couldn't be read ({}): {}", self.what, self.code.name(), self.why) })
+        serde_json::json!({ "error": format!("{} couldn't be read ({}): {}", self.what, self.code.name(), self.why), "code": self.code.name() })
     }
 }
 
@@ -298,8 +299,8 @@ pub enum FromRunner {
     JobEvent { job: String, event: Box<crate::proto::JobEvent> },
     Facts(Box<kiln_ci::facts::RunnerFacts>),
     ReachHello(crate::reach::relay::Announce),
-    /// `ReachAsk`: a question for the server (`{"op": "directory"}`).
-    ReachAsk { req: u64, ask: Value },
+    /// `ReachAsk`: a question for the server.
+    ReachAsk { req: u64, ask: Box<crate::reach::Question> },
     Convo { msg: Box<crate::convo::feed::Msg>, data: Vec<u8> },
     Power(crate::os::battery::Battery),
     HarnessFileData { req: u64, answer: crate::harness::files::Answer, data: Vec<u8> },
@@ -389,7 +390,8 @@ impl Carries for AgentMsg {
             | AgentMsg::NetDrops { .. }
             | AgentMsg::HarnessHandOver { .. }
             | AgentMsg::HarnessAdopted { .. }
-            | AgentMsg::Unread { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::Unread { .. }
+            | AgentMsg::LinkUnread { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -527,7 +529,8 @@ impl Carries for ServerMsg {
             | ServerMsg::Caps { .. }
             | ServerMsg::Wire(_)
             | ServerMsg::Kept { .. }
-            | ServerMsg::Unread { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::Unread { .. }
+            | ServerMsg::ReachRefused { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -600,7 +603,7 @@ mod tests {
             case("JobEvent", |json| AgentMsg::JobEvent { job: "leg-1".into(), json }, &event, Some(r#"{"seq":2,"t":"teleport"}"#)),
             case("Facts", |json| AgentMsg::Facts { json }, &kiln_ci::facts::RunnerFacts::default(), None),
             case("ReachHello", |json| AgentMsg::ReachHello { json }, &crate::reach::relay::Announce::default(), None),
-            any("ReachAsk", |json| AgentMsg::ReachAsk { req: 3, json }, r#"{"op":"directory"}"#),
+            case("ReachAsk", |json| AgentMsg::ReachAsk { req: 3, json }, &crate::reach::Question::Directory, Some(r#"{"op":"teleport"}"#)),
             case("Convo", |json| AgentMsg::Convo { json, data: Vec::new() }, &crate::convo::feed::Msg::Restore { store: "st".into() }, Some(r#"{"t":"teleport"}"#)),
             case("Power", |json| AgentMsg::Power { json }, &battery, None),
             case("HarnessFileData", |json| AgentMsg::HarnessFileData { req: 4, json, data: Vec::new() }, &crate::harness::files::Answer::default(), None),

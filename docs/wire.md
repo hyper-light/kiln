@@ -281,8 +281,8 @@ What each wire's sender is told. The later steps of the typed-messages plan move
 | `server_item` | The items of the server's channel streams, as a runner reads them. | A NACK, as for `runner_item`, and `AgentMsg::Unread` to a server that says `CAP_UNREAD`. |
 | `runner_payload` | The JSON a runner's frame carries (a session's updates, an inventory), as the server reads it. | On the channel (a session's updates), its item's NACK: `unsupported` for a kind the server doesn't know, `malformed` for the rest. Off it, `ServerMsg::Unread`, if it says `CAP_UNREAD`, and a question it asked (`ReachAsk`) is answered with why. A session's update is kept for the session's page too. |
 | `server_payload` | The JSON the server's frame carries (a session's commands), as a runner reads it. | On the channel (a command), its NACK, as for `runner_payload`. Either way the runner says so (`AgentMsg::Unread`, to a server that says `CAP_UNREAD`), and the server notes it against the runner. A question (`Preview`, `Workspace`) is answered with why, a stream to open is said to have failed, and a session to start is said refused. |
-| `relay` | What runners send the server's relay for one another. | Nothing yet. |
-| `reach_link` | What a runner reads inside a reach link, from the runner at its other end. | Nothing yet: the link ends. |
+| `relay` | What runners send the server's relay for one another. | One from a runner that isn't an end of the link it names, or from a job's pod, goes nowhere: `ServerMsg::Unread`, `malformed`, if it says `CAP_UNREAD`, and noted naming the link's ends. The relay's other refusals are said with a code (`ReachRefused`) to a runner that says `CAP_UNREAD`, in words (`Reach`'s `close`) to one from before. |
+| `reach_link` | What a runner reads inside a reach link, from the runner at its other end. | `Say::Unread` or `Ask::Unread` in the link, then the link ends; a runner from before ends it on that as on any garbage. The server hears of it (`AgentMsg::LinkUnread`, if it says `CAP_UNREAD`) and notes it against the runner that sent it, on both runners' pages. |
 | `session_up` | The session socket: what a page sends up. | A nack, `malformed`. |
 | `session_down` | The session socket: what a page couldn't read of what came down. | Nothing yet. |
 | `terminal_up` | A terminal's socket (a session's, a runner's, a CI leg's): what a page sends up. | Nothing yet. |
@@ -515,6 +515,7 @@ Four edges are left, and the lab steers clear of each:
 | `Identity` | ask | A CSR for a key the runner process made and keeps: for itself, an agent session it holds at an epoch, or a leg it runs (ci.md W27-R01). The server answers with `Identity`. | New: on each connection for the process's own, to a server announcing `CAP_IDENTITY`. |
 | `Observe` | carried (observe's group) | The runner's replica of observe's group (docs/observe.md §5): hyper-raft's messages, which it acknowledges and resends, and the writes it takes, offered to the leader until they commit. | Only from a runner announcing `CAP_OBSERVE`, on lane 5. |
 | `Unread` | ack | A frame of the server's the runner couldn't read: on which wire, what it was, why, how many more went untold before it, and the agent session it was about, when that much of it could be read ("What can't be read"). The server notes it against the runner, and on that session's page too. | New: to a server announcing `CAP_UNREAD`. |
+| `LinkUnread` | ack | A message on a reach link the runner couldn't read: the runner that sent it (the link's other end), the link, what it was, a code and why ("What can't be read"). The server notes it against that runner, as the relay knows the link's ends, on both runners' pages. | New: to a server announcing `CAP_UNREAD`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -583,6 +584,7 @@ Four edges are left, and the lab steers clear of each:
 | `Identity` | answer | The certificate kiln's CA issued for an `Identity` the runner asked for, or why there's none (ci.md W27-R01). | New: to runners that say `CAP_IDENTITY`. |
 | `Observe` | carried (observe's group) | To the runner's replica: hyper-raft's messages, and the leader's word on the writes it took. | Only to a runner announcing `CAP_OBSERVE`, on lane 5. |
 | `Unread` | ack | A frame of the runner's the server couldn't read: on which wire, what it was, why, and how many more went untold before it ("What can't be read"). | New: to runners announcing `CAP_UNREAD`. |
+| `ReachRefused` | carried (reach link) | A reach frame of the runner's the relay refused: its link, the runner it was for, why in a code (`taken`, `to_itself`, `too_many`, `not_offered`, `not_accepted`, `not_connected`, `closed`) and in words. | New: to runners announcing `CAP_UNREAD`, in place of `Reach`'s `close`. |
 
 ## Commands to a session: `Command`
 

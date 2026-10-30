@@ -18,6 +18,70 @@ pub mod serve;
 pub mod sync;
 pub mod wire;
 
+/// What a runner asks the server, for itself or one of its agent sessions
+/// ([`crate::proto::AgentMsg::ReachAsk`], read by `crate::wire::payload_of`), answered with
+/// [`crate::proto::ServerMsg::ReachAnswer`]. A kind the server doesn't know is refused `unknown`,
+/// and its asker answered so.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Question {
+    /// The runners it may reach, and their identities.
+    Directory,
+    /// kiln's operations and skills, for an agent session's MCP server (`crate::mcp::runner_ask`),
+    /// or a person's kiln shell (`terminal`).
+    Registry {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        session: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        terminal: String,
+    },
+    /// One of kiln's operations, run for an agent session or a person's kiln shell.
+    Call {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        session: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        terminal: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    /// A page an agent session shows in its conversation (`crate::harness::visuals::ask`): what
+    /// it asks, kept as it came.
+    Page {
+        #[serde(default)]
+        session: String,
+        #[serde(flatten)]
+        rest: serde_json::Map<String, serde_json::Value>,
+    },
+    /// A page an agent session streams live there (`crate::harness::streams::ask`).
+    Stream {
+        #[serde(default)]
+        session: String,
+        #[serde(flatten)]
+        rest: serde_json::Map<String, serde_json::Value>,
+    },
+    /// What the runner holds of other runners' trees and let go (docs/reach.md §5.1), answered
+    /// with the rules it weighs them with (`crate::reach::copies`).
+    Keep {
+        #[serde(default)]
+        report: Option<serde_json::Value>,
+    },
+    /// That the runner holds an object of the runners' caches (docs/ci.md W24-R27).
+    Holds {
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        digest: String,
+    },
+    /// The runners that hold an object of the runners' caches, connected now.
+    Holders {
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        digest: String,
+    },
+}
+
 /// The MCP servers whose tools are reach's: a runner's own kiln server (`kiln`, `crate::reach::mcp`),
 /// and `kiln-reach` (`kiln_reach` as Codex names it) as sessions from before it called it.
 fn ours(server: &str) -> bool {

@@ -135,6 +135,16 @@ is pinged; at 45 s it is replaced.
 Nothing on the runner waits on reach (its input is unbounded, bounded in practice by the windows),
 and reach never waits on the runner: output to the server is batched, many messages per frame.
 
+A message either side can't read (a kind its build doesn't know, or bytes that aren't one) is
+answered in the link with what it was, a code and why (`Say::Unread`, `Ask::Unread`, appended last),
+and the link ends; a runner from before ends it on that as it would on any garbage, and its session
+goes on on a new link. The runner that couldn't read it tells the server (`AgentMsg::LinkUnread`, to
+one that says `CAP_UNREAD`), which notes it against the runner that sent it, checking the link's ends
+against its relay's (docs/wire.md, "What can't be read"). What the relay refuses it says with a code
+too (`ServerMsg::ReachRefused`): a link id taken, a link to itself, too many links, a runner that
+doesn't take links or doesn't accept them, one not connected, a link closed. A frame from a runner
+that isn't one of a link's ends, or from a job's pod, goes nowhere, and is noted.
+
 ### 4.2 Runs
 
 Shell text, run by `bash -c` (`sh` where there is none; on Windows, Git for Windows' bash, found on

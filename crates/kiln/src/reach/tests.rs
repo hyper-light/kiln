@@ -26,6 +26,11 @@ enum Ctl {
 struct Lab {
     mac: Handle,
     linux: Handle,
+    /// What the runners sent the "server" that isn't reach's frames or questions.
+    said: async_channel::Receiver<(&'static str, AgentMsg)>,
+    /// Each link that ended, as the relay saw it end (a close sent on it, or a connection lost
+    /// under it), in order.
+    ended: Arc<Mutex<Vec<String>>>,
     /// What linux is handed to take over.
     adoptions: async_channel::Receiver<node::Adoption>,
     ctl: async_channel::Sender<Ctl>,
@@ -79,7 +84,9 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
     // Each runner's current connection, as the server would number them.
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
     let (ctl_tx, ctl_rx) = async_channel::unbounded::<Ctl>();
-    let (m, l) = (mac.clone(), linux.clone());
+    let (said_tx, said) = async_channel::unbounded();
+    let ended: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (m, l, e) = (mac.clone(), linux.clone(), Arc::clone(&ended));
     crate::rt::spawn(async move {
         let mut relay = Relay::default();
         relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: 1 });
@@ -93,6 +100,9 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
                         Ok(Ctl::Drop(name)) => {
                             let peer = peers.lock().get(name).copied().unwrap_or(0);
                             for (to, sm) in relay.lost(peer, "disconnected") {
+                                if let ServerMsg::Reach { link, .. } = &sm {
+                                    e.lock().push(link.clone());
+                                }
                                 deliver(&peers, &handle_of, to, sm).await;
                             }
                             peers.lock().remove(name);
@@ -119,8 +129,11 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
             let Some(from_peer) = peers.lock().get(from).copied() else { continue };
             match msg {
                 AgentMsg::Reach { to, link, open, data, close } => {
+                    if close.is_some() {
+                        e.lock().push(link.clone());
+                    }
                     let p = Arc::clone(&peers);
-                    let out = relay.forward(from, from_peer, Frame { to, link, open, data, close }, move |n| p.lock().get(n).copied());
+                    let out = relay.forward(from, from_peer, Frame { to, link, open, data, close }, move |n| p.lock().get(n).copied()).sends(from_peer, false);
                     for (to, sm) in out {
                         deliver(&peers, &handle_of, to, sm).await;
                     }
@@ -134,13 +147,18 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
                     };
                     handle_of(from).feed(In::Answer { req, answer }).await;
                 }
-                _ => {}
+                other => {
+                    let _ = said_tx.send((from, other)).await;
+                }
             }
         }
     });
     mac.feed(In::Server(true)).await;
     linux.feed(In::Server(true)).await;
-    Ok(Lab { mac, linux, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors, using })
+    // The "server" takes word of what a link couldn't read.
+    mac.feed(In::Unread(true)).await;
+    linux.feed(In::Unread(true)).await;
+    Ok(Lab { mac, linux, said, ended, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors, using })
 }
 
 async fn deliver(peers: &Mutex<HashMap<&'static str, u64>>, handle_of: &impl Fn(&str) -> Handle, to: u64, sm: ServerMsg) {
@@ -151,10 +169,15 @@ async fn deliver(peers: &Mutex<HashMap<&'static str, u64>>, handle_of: &impl Fn(
 
 /// Run `req` from mac through the local driver; every event until the end.
 async fn run_from_mac(lab: &Lab, req: RunReq, mid: impl Fn(&Ev) -> Option<Ctl>) -> anyhow::Result<Vec<Ev>> {
+    run_from(lab, "mac", req, mid).await
+}
+
+/// Run `req` from runner `me` (mac or linux) through the local driver; every event until the end.
+async fn run_from(lab: &Lab, me: &'static str, req: RunReq, mid: impl Fn(&Ev) -> Option<Ctl>) -> anyhow::Result<Vec<Ev>> {
     let (ev_tx, ev_rx) = async_channel::unbounded();
     let (_ctl_tx, ctl_rx) = async_channel::unbounded();
-    let mac = lab.mac.clone();
-    crate::rt::spawn(async move { local::run(&mac, "mac", req, ev_tx, ctl_rx).await });
+    let handle = if me == "mac" { lab.mac.clone() } else { lab.linux.clone() };
+    crate::rt::spawn(async move { local::run(&handle, me, req, ev_tx, ctl_rx).await });
     let mut evs = Vec::new();
     loop {
         match crate::rt::timeout(Duration::from_secs(60), ev_rx.recv()).await {
@@ -693,4 +716,189 @@ fn a_peers_1_gib_object_comes_over_the_link_and_a_corrupted_copy_is_refused() ->
         anyhow::ensure!(bad.from.is_none() && bad.refused == ["linux"] && !fresh.has(&digest), "{bad:?}");
         Ok(())
     })
+}
+
+/// What a runner's node says of `peer` now (`key`: its `link`, or the `error` its last link
+/// ended on), as its status says.
+async fn of_peer(h: &Handle, peer: &str, key: &str) -> anyhow::Result<Option<String>> {
+    let s = h.status().await?;
+    let peers = s.get("peers").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    Ok(peers.iter().find(|p| p.get("runner").and_then(serde_json::Value::as_str) == Some(peer)).and_then(|p| p.get(key)).and_then(serde_json::Value::as_str).map(str::to_owned))
+}
+
+/// The link a runner's node has to `peer` now, as its status says.
+async fn link_to(h: &Handle, peer: &str) -> anyhow::Result<Option<String>> {
+    of_peer(h, peer, "link").await
+}
+
+/// Typed messages, step 5: a message a runner can't read inside a link is answered `Unread`
+/// there, and that link ends, alone: the link between the two the other way goes on. The runner
+/// that couldn't read it tells the server, naming the runner that sent it, and the server's row
+/// names both.
+#[cfg(unix)]
+#[test]
+fn a_message_a_runner_cant_read_in_a_link_is_answered_unread_and_only_its_link_ends() -> anyhow::Result<()> {
+    use crate::hub::tests::{hear, join_runner, refused_rows, scratch_hub_on};
+    use crate::proto::{CAP_UNREAD, LANE_CONTROL, LANE_REACH};
+    use crate::wire::unread::{Code, Page, Wire};
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        // A link each way: mac runs on linux, and linux on mac.
+        let evs = run_from(&lab, "mac", RunReq { target: "linux/amd64".into(), command: "echo there".into(), ..RunReq::default() }, |_| None).await?;
+        assert_eq!(output(&evs, false), "there\n", "{evs:?}");
+        let evs = run_from(&lab, "linux", RunReq { target: "macos/aarch64".into(), command: "echo back".into(), ..RunReq::default() }, |_| None).await?;
+        assert_eq!(output(&evs, false), "back\n", "{evs:?}");
+        let (garbled, other) = (link_to(&lab.mac, "linux").await?, link_to(&lab.linux, "mac").await?);
+        anyhow::ensure!(garbled.is_some() && other.is_some() && garbled != other, "a link each way: {garbled:?} {other:?}");
+        // Mac sends linux a message of a kind no runner has (variant 99) on its link.
+        lab.mac.garble("linux", vec![0, 0, 0, 1, 99]).await;
+        let (from, said) = loop {
+            let (from, m) = crate::rt::timeout(Duration::from_secs(20), lab.said.recv()).await??;
+            if matches!(m, AgentMsg::LinkUnread { .. }) {
+                break (from, m);
+            }
+        };
+        match &said {
+            AgentMsg::LinkUnread { from: sender, link, what, code, why } => {
+                assert_eq!((from, sender.as_str(), Some(link), what.as_str(), *code), ("linux", "mac", garbled.as_ref(), "variant 99", Code::Unknown), "{why}");
+            }
+            other => anyhow::bail!("the server heard {other:?}"),
+        }
+        // Mac was answered Unread, and its link ended on that word, not on a close alone; linux's
+        // link to mac goes on.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while link_to(&lab.mac, "linux").await? == garbled && std::time::Instant::now() < deadline {
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::ensure!(link_to(&lab.mac, "linux").await? != garbled, "the garbled link ended");
+        let ended_on = of_peer(&lab.mac, "linux", "error").await?.unwrap_or_default();
+        anyhow::ensure!(ended_on.starts_with("linux couldn't read variant 99 (unknown)"), "mac's link ended on {ended_on:?}, not on linux's Unread");
+        anyhow::ensure!(link_to(&lab.linux, "mac").await? == other, "the other link goes on");
+        // The server, told so on reach's lane, notes it against mac, the runner that sent it,
+        // naming linux, which couldn't read it, on both runners' pages, as its relay knows the
+        // link between them.
+        let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
+        join_runner(&hub, 1, "mac", CAP_UNREAD);
+        join_runner(&hub, 2, "linux", CAP_UNREAD);
+        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1 })? }).await?;
+        let link = garbled.clone().unwrap_or_default();
+        hear(&hub, 1, LANE_REACH, &AgentMsg::Reach { to: "linux".into(), link: link.clone(), open: true, data: Vec::new(), close: None }).await?;
+        hear(&hub, 2, LANE_REACH, &said).await?;
+        let rows = refused_rows(&hub, "runner:mac").await?;
+        anyhow::ensure!(rows.iter().any(|(t, r, d)| t == "reach_link" && r == "unknown" && d.starts_with("variant 99") && d.contains(&format!("as linux read it, on link {link}"))), "{rows:?}");
+        for name in ["mac", "linux"] {
+            let shown = hub.refusals.lock().kept(&Page::Runner(name.into())).is_some_and(|k| k.counts.iter().any(|c| c.wire == Wire::ReachLink && c.code == Code::Unknown));
+            anyhow::ensure!(shown, "on {name}'s page");
+        }
+        // And mac reaches linux again, on a new link.
+        let evs = run_from(&lab, "mac", RunReq { target: "linux/amd64".into(), command: "echo again".into(), ..RunReq::default() }, |_| None).await?;
+        assert_eq!(output(&evs, false), "again\n", "{evs:?}");
+        anyhow::ensure!(link_to(&lab.linux, "mac").await? == other, "the other link still goes on");
+        // Of every link that ended in the test, as the relay saw them end, only the garbled one.
+        let ended: std::collections::BTreeSet<String> = lab.ended.lock().iter().cloned().collect();
+        let others = ended.iter().filter(|l| Some(*l) != garbled.as_ref()).count();
+        anyhow::ensure!(ended.contains(&link) && others == 0, "links dropped beside the garbled one: {others} (ended: {ended:?})");
+        Ok(())
+    })
+}
+
+/// Typed messages, step 5, on the server: what its relay can't take is refused typed and noted,
+/// while the link goes on (a frame from a runner that isn't one of a link's ends, a job pod's);
+/// its other refusals carry their code to a runner that takes word of them; word of what a link
+/// couldn't read is noted against the runner that sent it, on both runners' pages, and refused
+/// when the relay knows no such link between them; a question it doesn't know is answered
+/// `unknown`.
+#[test]
+fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::Result<()> {
+    use crate::hub::tests::{hear, join_runner, refused_rows, scratch_hub_on};
+    use crate::proto::{CAP_UNREAD, CAP_WIRE, LANE_CONTROL, LANE_REACH};
+    use crate::wire::unread::{Code, Kept, Page, Wire};
+    crate::rt::block_on(async {
+        let clock = kiln_seams::clock::SimClock::new();
+        let hub = scratch_hub_on(Arc::new(clock.clone()), |_| {}).await?;
+        for (peer, name) in [(1, "mac"), (2, "linux"), (3, "intruder")] {
+            join_runner(&hub, peer, name, CAP_UNREAD | CAP_WIRE);
+        }
+        let hello = AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1 })? };
+        hear(&hub, 1, LANE_CONTROL, &hello).await?;
+        hear(&hub, 2, LANE_CONTROL, &hello).await?;
+        let frame = |to: &str, open: bool| AgentMsg::Reach { to: to.into(), link: "L1".into(), open, data: b"x".to_vec(), close: None };
+        hear(&hub, 1, LANE_REACH, &frame("linux", true)).await?;
+        anyhow::ensure!(hub.reach.lock().ends("L1") == Some(("mac".into(), "linux".into())), "the link is open");
+        let told = |hub: &crate::hub::Hub, to: u64| {
+            hub.sent.lock().iter().rev().find_map(|(p, m)| match m {
+                ServerMsg::Unread { wire, code, why, .. } if *p == to => Some((*wire, *code, why.clone())),
+                _ => None,
+            })
+        };
+        // A third runner's frame on it goes nowhere: refused to it, typed, and noted naming the
+        // link's ends, while the link goes on.
+        clock.advance(Duration::from_millis(100));
+        hear(&hub, 3, LANE_REACH, &frame("linux", false)).await?;
+        let t = told(&hub, 3);
+        anyhow::ensure!(t.as_ref().is_some_and(|(w, c, why)| *w == Wire::Relay && *c == Code::Malformed && why.contains("link L1 is mac's and linux's")), "{t:?}");
+        anyhow::ensure!(hub.reach.lock().links() == 1, "the link goes on");
+        let rows = refused_rows(&hub, "runner:intruder").await?;
+        anyhow::ensure!(rows.iter().any(|(t, r, d)| t == "relay" && r == "malformed" && d.contains("link L1 is mac's and linux's")), "{rows:?}");
+        let shown = |name: &str, wire: Wire, code: Code| hub.refusals.lock().kept(&Page::Runner(name.into())).is_some_and(|k| k.counts.iter().any(|c| c.wire == wire && c.code == code));
+        anyhow::ensure!(shown("intruder", Wire::Relay, Code::Malformed), "on the intruder's page");
+        // The relay's other refusals carry their code to a runner that takes word of them.
+        hear(&hub, 1, LANE_REACH, &frame("linux", true)).await?;
+        anyhow::ensure!(hub.sent.lock().iter().any(|(p, m)| *p == 1 && matches!(m, ServerMsg::ReachRefused { code: super::relay::Refusal::Taken, .. })), "a link id taken, said so");
+        // A runner from before (no CAP_UNREAD) is told in words, as before, and nothing new; its
+        // frame on a link not its own still goes nowhere and is noted.
+        join_runner(&hub, 4, "old", CAP_WIRE);
+        hear(&hub, 4, LANE_REACH, &frame("linux", true)).await?;
+        let to_old: Vec<ServerMsg> = hub.sent.lock().iter().filter(|(p, _)| *p == 4).map(|(_, m)| m.clone()).collect();
+        anyhow::ensure!(matches!(to_old.as_slice(), [ServerMsg::Reach { open: false, close: Some(why), .. }] if why.contains("taken")), "{to_old:?}");
+        clock.advance(Duration::from_millis(100));
+        hear(&hub, 4, LANE_REACH, &frame("linux", false)).await?;
+        anyhow::ensure!(hub.sent.lock().iter().filter(|(p, _)| *p == 4).count() == 1, "the old runner is told nothing new");
+        anyhow::ensure!(shown("old", Wire::Relay, Code::Malformed) && hub.reach.lock().links() == 1, "noted on its page, and the link goes on");
+        // A job pod's frame: refused, and noted.
+        if let Some(a) = hub.agents.lock().get_mut("intruder") {
+            a.ephemeral = true;
+        }
+        clock.advance(Duration::from_millis(100));
+        hear(&hub, 3, LANE_REACH, &frame("mac", true)).await?;
+        let t = told(&hub, 3);
+        anyhow::ensure!(t.as_ref().is_some_and(|(_, _, why)| why.contains("job pod")), "{t:?}");
+        // Word of what a link couldn't read: noted against the runner that sent it, on both
+        // runners' pages.
+        clock.advance(Duration::from_millis(100));
+        hear(&hub, 2, LANE_CONTROL, &AgentMsg::LinkUnread { from: "mac".into(), link: "L1".into(), what: "variant 99".into(), code: Code::Unknown, why: "Ask has 12 variants".into() }).await?;
+        let total = |name: &str| hub.refusals.lock().kept(&Page::Runner(name.into())).map(Kept::total);
+        anyhow::ensure!((total("mac"), total("linux")) == (Some(1), Some(1)), "{:?} {:?}", total("mac"), total("linux"));
+        let rows = refused_rows(&hub, "runner:mac").await?;
+        anyhow::ensure!(rows.iter().any(|(t, r, d)| t == "reach_link" && r == "unknown" && d.contains("as linux read it, on link L1")), "{rows:?}");
+        // About a link the relay doesn't know between them: refused, and nothing against linux.
+        clock.advance(Duration::from_millis(100));
+        hear(&hub, 3, LANE_CONTROL, &AgentMsg::LinkUnread { from: "linux".into(), link: "L1".into(), what: "variant 9".into(), code: Code::Malformed, why: "cut short".into() }).await?;
+        let t = told(&hub, 3);
+        anyhow::ensure!(t.as_ref().is_some_and(|(w, _, why)| *w == Wire::Relay && why.contains("no such link")), "{t:?}");
+        anyhow::ensure!(total("linux") == Some(1), "nothing against linux");
+        // A question the server doesn't know is answered unknown.
+        hear(&hub, 1, LANE_CONTROL, &AgentMsg::ReachAsk { req: 9, json: r#"{"op":"teleport"}"#.into() }).await?;
+        let answer = hub.sent.lock().iter().find_map(|(p, m)| match m {
+            ServerMsg::ReachAnswer { req: 9, json } if *p == 1 => serde_json::from_str::<serde_json::Value>(json).ok(),
+            _ => None,
+        });
+        anyhow::ensure!(answer.as_ref().and_then(|a| a.get("code")).and_then(serde_json::Value::as_str) == Some("unknown"), "{answer:?}");
+        anyhow::ensure!(shown("mac", Wire::RunnerPayload, Code::Unknown), "the unknown question on mac's page");
+        Ok(())
+    })
+}
+
+/// The relay knows a link's ends while it's open, and a while after it closed.
+#[test]
+fn a_links_ends_are_known_open_and_lately_closed() {
+    let mut r = Relay::default();
+    r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
+    let peers = |n: &str| (n == "linux").then_some(20).or((n == "mac").then_some(10));
+    r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: true, data: Vec::new(), close: None }, peers);
+    assert_eq!(r.ends("L1"), Some(("mac".into(), "linux".into())));
+    r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: false, data: Vec::new(), close: Some("done".into()) }, peers);
+    assert_eq!(r.links(), 0);
+    assert_eq!(r.ends("L1"), Some(("mac".into(), "linux".into())), "kept a while after it closed");
+    assert_eq!(r.ends("L2"), None);
 }

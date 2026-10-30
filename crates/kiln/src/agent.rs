@@ -2786,8 +2786,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             headroom_sent = Some(json);
                         }
                         server_unread = caps & proto::CAP_UNREAD != 0;
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Unread(server_unread)).await;
+                        }
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                        }
+                    }
+                    // The relay refused a frame of this runner's reach links: as a close, its code
+                    // said in the log.
+                    ServerMsg::ReachRefused { from, link, code, why } => {
+                        tracing::debug!(%from, %link, code = code.name(), %why, "the relay refused a reach frame");
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Frame { from, link, open: false, data: Vec::new(), close: Some(why) }).await;
                         }
                     }
                     // The server couldn't read a frame of this runner's: it keeps it for this
