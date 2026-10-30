@@ -179,6 +179,9 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
     std::fs::create_dir_all(work.join(".github/workflows"))?;
     std::fs::write(work.join(".github/workflows/ci.yml"), "on: pull_request\njobs:\n  test:\n    runs-on: local\n    steps:\n      - run: echo tested\n")?;
     std::fs::write(work.join("README.md"), "app\n")?;
+    // The author's own rebase is what this tests: kiln doesn't replay the stack first (W26-R16).
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "fresh:\n  replay: false\n")?;
     must(git(&home, &work, &["add", "."]), "add")?;
     must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
     must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
@@ -224,21 +227,17 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
     must(git(&home, &work, &["branch", "-qf", "stack", "HEAD"]), "keep it")?;
     must(git(&home, &work, &["checkout", "-q", "stack"]), "back")?;
 
-    // The trunk moves; kiln replays the stack onto it as rebase-only versions (W26-R16), and the
-    // author's own rebase onto it is the same patches on the same base: nothing new.
+    // The trunk moves; the stack, rebased onto it, gets rebase-only versions. (kiln doesn't replay
+    // it first: this repository's `fresh: replay: false`, so the author's rebase is what's seen.)
     must(git(&home, &work, &["checkout", "-q", "main"]), "main")?;
     std::fs::write(work.join("z.txt"), "elsewhere\n")?;
     must(git(&home, &work, &["add", "z.txt"]), "add")?;
     must(git(&home, &work, &["commit", "-qm", "trunk moves"]), "commit")?;
     must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main"]), "the owner moves trunk")?;
-    until(60, "the stack replayed onto the moved trunk", || {
-        let d3 = api(&s, &dev, "GET", "/api/diffs/D3")?;
-        Ok((versions(&d3).len() < 2).then(|| d3.to_string()))
-    })?;
     must(git(&home, &work, &["checkout", "-q", "stack"]), "stack")?;
     must(git(&home, &work, &["rebase", "-q", "main"]), "rebase")?;
     let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "the rebase")?;
-    for want in ["D1 v2 (unchanged)", "D2 v3 (unchanged)", "D3 v2 (unchanged)"] {
+    for want in ["D1 v2 (rebased", "D2 v3 (rebased", "D3 v2 (rebased"] {
         assert!(out.contains(want), "{want} in {out}");
     }
     assert_eq!(versions(&api(&s, &dev, "GET", "/api/diffs/D2")?), [(1, false), (2, false), (3, true)]);

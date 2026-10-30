@@ -1035,6 +1035,9 @@ pub struct Version {
     pub why: Option<String>,
     /// The thread it answers (a suggestion's).
     pub thread: Option<String>,
+    /// A revision kiln replayed as the trunk moved (W26-R16) runs no checks of its own: the version
+    /// whose checks it shows, the latest before it that isn't a replay.
+    pub checks_from: Option<u32>,
 }
 
 const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title, d.summary, d.author, d.author_kind, d.state, d.trunk, d.stack_id, pd.number, d.topic, d.created_at, d.updated_at, d.branch, d.author_for, d.kiln_change,
@@ -1112,9 +1115,19 @@ pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>
                     started_by,
                     why: r.get(9)?,
                     thread: r.get(10)?,
+                    checks_from: None,
                 })
             })?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            let mut out = rows.collect::<Result<Vec<_>, _>>()?;
+            let mut tested = None;
+            for v in &mut out {
+                if v.why.as_deref() == Some(kiln_ci::fresh::WHY) {
+                    v.checks_from = tested;
+                } else {
+                    tested = Some(v.n);
+                }
+            }
+            Ok(out)
         })
         .await
 }

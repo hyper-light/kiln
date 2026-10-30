@@ -3,9 +3,11 @@
 //! goes onto the trunk's new tip, or onto the replay of the open change below it. A burst of moves
 //! is one move, from where the trunk was to where it is now ([`collapse`]); a change already on the
 //! tip, with nothing below it replayed, stays as it is ([`plan`]). A clean replay is a rebase-only
-//! revision (why: [`WHY`]), so approvals stay; a conflicted one goes up the conflict ladder
-//! (W26-R17), and the changes above it wait on it ([`Plan::waits_on`]). Nothing is pushed and no
-//! agent is sent unless `.kiln/review.yaml`'s `fresh:` says so ([`then`]), and turning automatic
+//! revision (why: [`WHY`]), so approvals stay; a conflicted one is kept as a conflicted revision
+//! and goes up the conflict ladder (W26-R17), and the changes above it replay onto that revision,
+//! as jj's do: a conflict never holds up the stack above it ([`Plan::above_conflict`] says which
+//! conflict each sits on). Nothing is pushed and no agent is sent unless `.kiln/review.yaml`'s
+//! `fresh:` says so ([`then`]), and turning automatic
 //! pushes on says plainly what it costs ([`auto_push_warning`]). The collision radar names two open
 //! changes that change the same lines of a file, on the trunk's lines, once for each pair and file
 //! ([`collisions`]); and a change says how fresh it is in words ([`Freshness::words`]). The server
@@ -33,14 +35,24 @@ pub enum Push {
     Auto,
 }
 
-/// `fresh:` of `.kiln/review.yaml`. Both are off until a repository declares them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `fresh:` of `.kiln/review.yaml`. Replays in kiln's own copy are on; pushing them and sending
+/// agents are off until a repository declares them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Settings {
+    /// Open changes are replayed onto the trunk as it moves, in kiln's own copy (`false`: they stay
+    /// where their authors put them, until they rebase).
+    pub replay: bool,
     pub push: Push,
     /// A conflicting replay sends an agent to a runner that has the repository, to resolve it there
     /// (its resolution still goes up the conflict ladder, W26-R17).
     pub conflict_agents: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { replay: true, push: Push::Manual, conflict_agents: false }
+    }
 }
 
 /// What turning automatic pushes on means, in plain words: shown on the change that turns it on and
@@ -125,9 +137,10 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The change `id` waits on, given the replays that conflicted: the lowest conflicted change
-    /// under it in its stack (itself, if it conflicted). `None`: nothing under it conflicted.
-    pub fn waits_on(&self, id: &str, conflicted: &BTreeSet<String>) -> Option<String> {
+    /// The conflicted replay under change `id` in its stack, given the replays that conflicted: the
+    /// nearest one below it (`None`: it sits on clean replays, or on the tip). It still replays, onto
+    /// that kept conflicted revision; this is what it says it sits on.
+    pub fn above_conflict(&self, id: &str, conflicted: &BTreeSet<String>) -> Option<String> {
         let below: BTreeMap<&str, &str> = self
             .replays
             .iter()
@@ -136,8 +149,7 @@ impl Plan {
                 Onto::Tip(_) => None,
             })
             .collect();
-        let mut lowest = None;
-        let mut at = Some(id);
+        let mut at = below.get(id).copied();
         let mut steps = 0usize;
         while let Some(c) = at {
             steps += 1;
@@ -145,11 +157,11 @@ impl Plan {
                 break;
             }
             if conflicted.contains(c) {
-                lowest = Some(c.to_owned());
+                return Some(c.to_owned());
             }
             at = below.get(c).copied();
         }
-        lowest
+        None
     }
 }
 
@@ -215,11 +227,13 @@ pub enum Outcome {
     Conflicted,
 }
 
-/// What follows a replay, as `settings` say.
+/// What follows a replay, as `settings` say. Either way it's a new revision, which the changes above
+/// it replay onto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Then {
-    /// A new revision: rebase-only, its why [`WHY`] (a clean replay).
-    pub revision: bool,
+    /// The revision is rebase-only, its why [`WHY`] (a clean replay), so approvals stay; a
+    /// conflicted one is kept as a conflicted revision, which they don't.
+    pub rebase_only: bool,
     /// Push it to the change's branch now (`push: auto`, a clean replay of a change with a branch).
     pub push: bool,
     /// It goes up the conflict ladder (W26-R17).
@@ -232,8 +246,8 @@ pub struct Then {
 /// pull request's; a kiln diff has none).
 pub fn then(settings: Settings, outcome: Outcome, branch: bool) -> Then {
     match outcome {
-        Outcome::Clean => Then { revision: true, push: branch && settings.push == Push::Auto, ladder: false, agent: false },
-        Outcome::Conflicted => Then { revision: false, push: false, ladder: true, agent: settings.conflict_agents },
+        Outcome::Clean => Then { rebase_only: true, push: branch && settings.push == Push::Auto, ladder: false, agent: false },
+        Outcome::Conflicted => Then { rebase_only: false, push: false, ladder: true, agent: settings.conflict_agents },
     }
 }
 
@@ -333,8 +347,8 @@ pub enum Freshness {
     Conflicted { tip: String },
     /// Being replayed onto the tip.
     Replaying { tip: String },
-    /// Waits on the change below it, whose replay conflicts.
-    Waits { on: String },
+    /// Replayed cleanly onto the conflicted revision of the change below it.
+    AboveConflict { below: String, tip: String },
 }
 
 fn short(sha: &str) -> &str {
@@ -349,7 +363,7 @@ impl Freshness {
             Freshness::Clean { tip } => format!("replays clean on {trunk}@{}", short(tip)),
             Freshness::Conflicted { tip } => format!("conflicts on {trunk}@{}", short(tip)),
             Freshness::Replaying { tip } => format!("replaying onto {trunk}@{}", short(tip)),
-            Freshness::Waits { on } => format!("waits on {on}"),
+            Freshness::AboveConflict { below, tip } => format!("replays clean on {below}'s conflicts on {trunk}@{}", short(tip)),
         }
     }
 }
@@ -449,30 +463,34 @@ mod tests {
         // A kiln diff has no branch to push; a conflicted replay is never pushed.
         assert!(!then(auto, Outcome::Clean, false).push);
         assert!(!then(auto, Outcome::Conflicted, true).push);
-        // A clean replay is a revision either way.
-        assert!(then(manual, Outcome::Clean, false).revision);
+        // A clean replay is rebase-only; a conflicted one isn't.
+        assert!(then(manual, Outcome::Clean, false).rebase_only);
+        assert!(!then(manual, Outcome::Conflicted, false).rebase_only);
     }
 
     #[test]
     fn w26_r16_conflict_agents_off_by_default() {
         let off = then(Settings::default(), Outcome::Conflicted, true);
-        assert_eq!(off, Then { revision: false, push: false, ladder: true, agent: false });
+        assert_eq!(off, Then { rebase_only: false, push: false, ladder: true, agent: false });
         let on = Settings { conflict_agents: true, ..Settings::default() };
         assert!(then(on, Outcome::Conflicted, false).agent);
         assert!(!then(on, Outcome::Clean, false).agent);
     }
 
     #[test]
-    fn w26_r16_above_a_conflict_waits() {
+    fn w26_r16_above_a_conflict_still_replays_onto_it() {
         let changes = [diff("D40", None, OLD), diff("D41", Some("D40"), OLD), diff("D42", Some("D41"), OLD), diff("D43", Some("D42"), OLD)];
         let p = plan(&tips(), &changes);
+        // The plan is the same whatever conflicts: each change onto the one below's revision.
+        assert_eq!(p.replays.len(), 4);
         let conflicted = BTreeSet::from(["D41".to_owned()]);
-        assert_eq!(p.waits_on("D40", &conflicted), None);
-        assert_eq!(p.waits_on("D41", &conflicted).as_deref(), Some("D41"));
-        assert_eq!(p.waits_on("D43", &conflicted).as_deref(), Some("D41"));
-        // Two conflicts: a change waits on the lowest.
+        assert_eq!(p.above_conflict("D40", &conflicted), None);
+        assert_eq!(p.above_conflict("D41", &conflicted), None, "D41 itself sits on D40's clean replay");
+        assert_eq!(p.above_conflict("D42", &conflicted).as_deref(), Some("D41"));
+        assert_eq!(p.above_conflict("D43", &conflicted).as_deref(), Some("D41"));
+        // Two conflicts: a change sits on the nearest.
         let both = BTreeSet::from(["D41".to_owned(), "D42".to_owned()]);
-        assert_eq!(p.waits_on("D43", &both).as_deref(), Some("D41"));
+        assert_eq!(p.above_conflict("D43", &both).as_deref(), Some("D42"));
     }
 
     fn touch(change: &str, stack: &str, file: &str, start: u32, end: u32) -> Touch {
@@ -523,18 +541,19 @@ mod tests {
         assert_eq!(Freshness::Clean { tip: tip.clone() }.words("main"), "replays clean on main@4c1e2a");
         assert_eq!(Freshness::Conflicted { tip: tip.clone() }.words("main"), "conflicts on main@4c1e2a");
         assert_eq!(Freshness::Replaying { tip: tip.clone() }.words("main"), "replaying onto main@4c1e2a");
-        assert_eq!(Freshness::Current { tip }.words("main"), "on main@4c1e2a");
-        assert_eq!(Freshness::Waits { on: "D42".into() }.words("main"), "waits on D42");
+        assert_eq!(Freshness::Current { tip: tip.clone() }.words("main"), "on main@4c1e2a");
+        assert_eq!(Freshness::AboveConflict { below: "D42".into(), tip: tip.clone() }.words("main"), "replays clean on D42's conflicts on main@4c1e2a");
         assert_eq!(Freshness::Clean { tip: "ab".into() }.words("main"), "replays clean on main@ab");
     }
 
     #[test]
     fn w26_r16_policy_parses_and_defaults_off() -> Result<(), String> {
         use crate::land::Policy;
-        assert_eq!(Policy::parse("")?.fresh, Settings { push: Push::Manual, conflict_agents: false });
+        assert_eq!(Policy::parse("")?.fresh, Settings { replay: true, push: Push::Manual, conflict_agents: false });
         assert_eq!(Policy::parse("land:\n  approvals: 2\n")?.fresh, Settings::default());
         let on = Policy::parse("fresh:\n  push: auto\n  conflict-agents: true\n")?;
-        assert_eq!(on.fresh, Settings { push: Push::Auto, conflict_agents: true });
+        assert_eq!(on.fresh, Settings { replay: true, push: Push::Auto, conflict_agents: true });
+        assert!(!Policy::parse("fresh:\n  replay: false\n")?.fresh.replay);
         assert!(Policy::parse("fresh:\n  push: sometimes\n").is_err());
         Ok(())
     }

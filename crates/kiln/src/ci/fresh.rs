@@ -111,6 +111,12 @@ async fn contains(hub: &Hub, path: &str, ancestor: &str, commit: &str) -> bool {
 pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::Result<Round> {
     let Some(path) = super::hosting::native_path(hub, repo) else { return Ok(Round::default()) };
     let path = path.to_string_lossy().into_owned();
+    // `.kiln/review.yaml` as the trunk has it now: a repository can keep its changes where their
+    // authors put them.
+    let (policy, _) = super::review::policy(hub, &path, trunk).await;
+    if !policy.fresh.replay {
+        return Ok(Round::default());
+    }
     let found = open_changes(hub, repo, trunk).await?;
     if found.is_empty() {
         return Ok(Round::default());

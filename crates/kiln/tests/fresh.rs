@@ -203,6 +203,7 @@ fn w26_ac07_main_moves_under_stacks_and_a_change_request() -> anyhow::Result<()>
         let v = replayed(&format!("/api/diffs/{d}"))?.unwrap_or_default();
         assert_eq!((text(&v, "why"), v.get("rebase_only"), text(&v, "pushed_by"), text(&v, "base")), ("replayed", Some(&json!(true)), "kiln", tip.as_str()), "{d}: {v}");
         assert_eq!(text(&v, "parent"), below, "{d} goes onto the one below's replay: {v}");
+        assert_eq!(v.get("checks_from"), Some(&json!(1)), "{d}'s checks are v1's, not its own: {v}");
         let commit = text(&v, "commit").to_owned();
         assert_eq!(rev(&x.bare, &["rev-parse", &format!("refs/kiln/diffs/{d}/v2")])?, commit, "{d}'s replay is kept at its ref");
         let who = rev(&x.bare, &["log", "-1", "--format=%an <%ae>|%cn|%s", &commit])?;
@@ -258,5 +259,29 @@ fn w26_ac07_ten_diff_stack_within_60s() -> anyhow::Result<()> {
     let p95 = took.get(took.len() * 95 / 100 - 1).copied().unwrap_or_default();
     eprintln!("W26-AC07: 10-diff stack replayed after main moved: p95 {p95:?} over {} moves (max {:?})", took.len(), took.last());
     assert!(p95 <= Duration::from_secs(60), "p95 {p95:?}");
+    Ok(())
+}
+
+/// W26-R16 with W26-R03: once kiln has replayed a stack onto the moved trunk, its author's own
+/// rebase onto the same tip is the same patches on the same base, found to be the replays: nothing
+/// new. (A repository with `fresh: replay: false` sees the author's rebase as rebase-only versions:
+/// hosting's w14_ac01_stacks and identity's w26_ac08.)
+#[test]
+fn w26_r16_a_hand_rebase_after_the_replay_reads_unchanged() -> anyhow::Result<()> {
+    let x = setup(&[("a.txt", b"a\n"), ("b.txt", b"b\n")])?;
+    x.commit(&[("a.txt", b"a, D1\n")], "D1: a")?;
+    x.commit(&[("b.txt", b"b, D2\n")], "D2: b")?;
+    must(git(&x.home, &x.work, &["push", "origin", "HEAD:refs/for/main"]), "the stack")?;
+    x.main_moves(&[("z.txt", b"elsewhere\n")], "main moves")?;
+    until(60, "D1 and D2 replayed", || {
+        let n = versions(&x.s, &x.kim, "/api/diffs/D2")?.len();
+        Ok((n < 2).then(|| format!("D2 has {n} versions")))
+    })?;
+    must(git(&x.home, &x.work, &["pull", "-q", "--rebase", "origin", "main"]), "the author's own rebase")?;
+    let out = must(git(&x.home, &x.work, &["push", "origin", "HEAD:refs/for/main"]), "the rebase")?;
+    for want in ["D1 v2 (unchanged)", "D2 v2 (unchanged)"] {
+        assert!(out.contains(want), "{want} in {out}");
+    }
+    assert_eq!(versions(&x.s, &x.kim, "/api/diffs/D2")?.len(), 2);
     Ok(())
 }
