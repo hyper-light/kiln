@@ -1665,7 +1665,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R05 Durability.** The dispatcher records an assignment in SQLite (batched transactions,
   flushed at most every 5 ms) before it sends `Assign`, so a crash never runs a leg twice
   unknowingly; runners re-announce running legs on reconnect (today's `Hello.running`), which
-  re-adopts them.
+  re-adopts them. The record is the grant (W05-R34): its runner, its attempt and its fence, on the
+  leg and on the attempt; a restart takes each running leg's grant back with its fence.
 
 **Requirements: concurrency, priorities, fairness**
 
@@ -1917,6 +1918,17 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   held, leaves the fleet until it's back, and each grant it held is lost, said so (`Lost`). A
   draining runner takes no new grant, its grants run to their end, and its capacity leaves the
   fleet's; undrained, it takes work again.
+- **W05-R36 Writes fenced** (docs/needs.md §8, G2, E3.3). What a runner writes about a leg is taken
+  only under the leg's live grant: granted, neither ended nor lost. A lease runner names the grant
+  in each (its steps, events, result, refusals, output: W05-R34), and the server takes it only
+  while that's the leg's grant and that runner's; one from before leases is taken while the leg
+  is its own, as before. From a grant's loss on, what it writes is refused, so nothing it writes
+  after the leg's next attempt starts is taken: not into the next attempt's steps, events or log,
+  and its result ends nothing. The store holds to it too: an attempt's end under a grant is
+  recorded only while that grant is the leg's, running, so one that races a new grant changes
+  nothing. A refused write is taken as a frame (not sent again), counted
+  (`kiln_ci_refused_writes_total`), said once a grant, and its runner told once to stop that grant
+  (`Stop`).
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),
@@ -6262,6 +6274,8 @@ with W11-AC03's tenants).
   - **Prometheus** (`/metrics`):
     - `kiln_ci_cache_total{result}`;
     - `kiln_ci_attempts_total{conclusion,class}`;
+    - `kiln_ci_refused_writes_total{what}`: runners' writes refused under a grant that isn't their
+      leg's live one (W05-R36), by what they were (`result`, `event`, `step`, `log`);
     - `kiln_ci_wait_seconds_total{reason}`;
     - `kiln_ci_rollup_lag_seconds`.
   - **Tests.** AC01 checks hand-computed paths: a diamond, a long job against a chain, ties, a

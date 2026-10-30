@@ -74,8 +74,9 @@ pub enum Msg {
     Leased { agent: String, peer: hyper_transport::PeerId, seq: u64, held: Vec<crate::proto::Grant> },
     /// A runner's probes reported (W13-R01): it is routed by what they found.
     RunnerFacts { agent: String },
-    Event { agent: String, leg: String, json: String },
-    Finished { agent: String, result: JobResult },
+    /// What a runner says about a leg, and the grant it says it under (a lease runner, W05-R36).
+    Event { agent: String, leg: String, json: String, grant: Option<crate::proto::Grant> },
+    Finished { agent: String, result: JobResult, grant: Option<crate::proto::Grant> },
     /// A repository deleted (its runs' records with it): its runs end here, their legs stopped
     /// where they run.
     RepoDeleted {
@@ -529,6 +530,18 @@ fn with_docker(options: serde_json::Value, docker: &str) -> serde_json::Value {
     serde_json::Value::Object(o)
 }
 
+/// A lease runner's write under a grant that isn't its leg's live one (docs/ci.md W05-R36): refused,
+/// counted, said once a grant, and its runner told once to stop that grant. The frame was taken
+/// (acknowledged as a frame is), so it isn't sent again.
+pub(crate) async fn refuse_write(hub: &Hub, agent: &str, g: &crate::proto::Grant, what: &'static str) {
+    crate::metrics::global().ci_refused_writes.inc(&[what]);
+    if hub.ci.first_refusal(g) {
+        tracing::warn!(leg = %g.leg, attempt = g.attempt, epoch = g.epoch, grant = g.n, runner = agent, what, "refused a write under a grant that isn't the leg's any more (lost, or the leg granted again); its runner is told to stop it");
+        let stop = ServerMsg::Stop { grant: g.clone(), reason: "its grant isn't the leg's any more: lost, or the leg granted again".into() };
+        hub.command_start(agent, &stop).await.log_when_answered(crate::hub::LOG_WITHIN);
+    }
+}
+
 /// The hub's handle on the dispatcher.
 pub struct Handle {
     tx: async_channel::Sender<Msg>,
@@ -537,6 +550,12 @@ pub struct Handle {
     /// Legs the dispatcher owns, so the hub hands their messages here and not to v1.
     legs: Arc<Mutex<HashSet<String>>>,
     runs: Arc<Mutex<HashSet<String>>>,
+    /// Each leg's live grant (docs/ci.md W05-R34, R36): the runner it was given to, its attempt and
+    /// its fence, from the claim until it ends or is lost. What a lease runner writes about the leg
+    /// is taken only under it; the dispatcher keeps it, the hub reads it for the output it takes.
+    grants: Arc<Mutex<HashMap<String, (String, u32, Fence)>>>,
+    /// Grants a write was refused under, each said once (W05-R36).
+    refused: Mutex<HashSet<(String, Fence)>>,
     /// Failed legs kept to look into: the runner keeping each, and until when (W17-R02).
     kept: Mutex<HashMap<String, (String, i64)>>,
     /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09).
@@ -554,7 +573,7 @@ pub struct Restored {
 impl Default for Handle {
     fn default() -> Self {
         let (tx, rx) = async_channel::unbounded();
-        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), kept: Mutex::default(), restored: Mutex::default() }
+        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), grants: Arc::default(), refused: Mutex::default(), kept: Mutex::default(), restored: Mutex::default() }
     }
 }
 
@@ -578,6 +597,42 @@ impl Handle {
     /// Whether `job` is one of the engine's legs.
     pub fn is_leg(&self, job: &str) -> bool {
         self.legs.lock().contains(job)
+    }
+
+    /// Whether `grant` is its leg's live grant, `agent`'s (docs/ci.md W05-R36): what a lease runner
+    /// writes about the leg under it is taken only then.
+    pub fn live(&self, agent: &str, grant: &crate::proto::Grant) -> bool {
+        self.grants.lock().get(&grant.leg).is_some_and(|(a, attempt, fence)| a == agent && *attempt == grant.attempt && *fence == grant.fence())
+    }
+
+    /// Whether `leg` runs under a grant with a fence (W05-R34): a lease runner names it in what it
+    /// writes about the leg, so its word unnamed isn't taken.
+    pub fn fenced(&self, leg: &str) -> bool {
+        self.grants.lock().get(leg).is_some_and(|(_, _, fence)| *fence != Fence::default())
+    }
+
+    /// `leg`'s live grant from now: `agent`'s, at an attempt, under a fence; or none (it ended, was
+    /// lost or refused, or waits for its next).
+    fn grant(&self, leg: &str, now: Option<(String, u32, Fence)>) {
+        let mut g = self.grants.lock();
+        match now {
+            Some(x) => {
+                g.insert(leg.to_owned(), x);
+            }
+            None => {
+                g.remove(leg);
+            }
+        }
+    }
+
+    /// Whether a write under `grant` is the first refused (W05-R36): it's said, and its runner told,
+    /// once a grant.
+    fn first_refusal(&self, grant: &crate::proto::Grant) -> bool {
+        let mut r = self.refused.lock();
+        if r.len() > 10_000 {
+            r.clear();
+        }
+        r.insert((grant.leg.clone(), grant.fence()))
     }
 
     /// A failed leg kept on `agent` until `until` (W17-R02): its events and logs (a step rerun in
@@ -1175,8 +1230,8 @@ impl Dispatch {
                 }
                 Ok(())
             }
-            Msg::Event { agent, leg, json } => self.event(&agent, &leg, &json).await,
-            Msg::Finished { agent, result } => self.finished(&agent, result).await,
+            Msg::Event { agent, leg, json, grant } => self.event(&agent, &leg, &json, grant.as_ref()).await,
+            Msg::Finished { agent, result, grant } => self.finished(&agent, result, grant).await,
             Msg::RepoDeleted { repo } => {
                 self.repo_deleted(&repo).await;
                 Ok(())
@@ -1188,6 +1243,7 @@ impl Dispatch {
                 let fence = named.unwrap_or(now);
                 if fence == now {
                     self.hub.release_slot(&agent, &leg);
+                    self.hub.ci.grant(&leg, None);
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.agent = None;
                     }
@@ -1391,6 +1447,11 @@ impl Dispatch {
         self.commands(cmds).await;
     }
 
+    /// Whether `g` is the live grant of its leg, `agent`'s, as the dispatcher has it (W05-R36).
+    fn live(&self, agent: &str, g: &crate::proto::Grant) -> bool {
+        self.legs.get(&g.leg).is_some_and(|l| l.agent.as_deref() == Some(agent) && l.attempt == g.attempt && l.fence == g.fence())
+    }
+
     /// The fence `agent`'s grant `g` is renewed by, if it's the agent's own now (W05-R34): by its
     /// fence; or, adopted after a restart with no fence kept (the store keeps one from E3.7), by its
     /// leg, as an older runner's are.
@@ -1409,7 +1470,7 @@ impl Dispatch {
                 continue;
             }
             let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.to_owned()), peak_rss: None, cpu_seconds: None };
-            if let Err(e) = runs::attempt_finished(&self.hub, &leg, attempt, end).await {
+            if let Err(e) = runs::attempt_finished(&self.hub, &leg, attempt, None, end).await {
                 tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the attempt could not be recorded");
             }
             cmds.extend(self.sched.handle(Input::AttemptFinished { leg, attempt, outcome: Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }) }, now_ms()));
@@ -2229,6 +2290,7 @@ impl Dispatch {
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.fence = fence;
                     }
+                    self.hub.ci.grant(&leg, Some((runner.clone(), attempt, fence)));
                     self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot, grant: Some((fence, lease_loss)) }).await
                 }
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
@@ -2280,6 +2342,7 @@ impl Dispatch {
                     Ok(())
                 }
                 Command::Retry { leg, attempt, at } => {
+                    self.hub.ci.grant(&leg, None);
                     if let Some(l) = self.legs.get_mut(&leg) {
                         l.attempt = attempt;
                         l.seq = 0;
@@ -2313,10 +2376,11 @@ impl Dispatch {
                 Command::Adopted { leg, from, outcome } => self.adopted(&leg, &from, outcome).await,
                 // A grant the scheduler took back (W05-R34): its attempt ended so, and its runner
                 // holds it no more; the `Retry` or `Settled` that follows does the rest.
-                Command::Lost { leg, attempt, runner, why, .. } => {
+                Command::Lost { leg, attempt, runner, fence, why } => {
                     self.hub.release_slot(&runner, &leg);
+                    self.hub.ci.grant(&leg, None);
                     let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.why().to_owned()), peak_rss: None, cpu_seconds: None };
-                    runs::attempt_finished(&self.hub, &leg, attempt, end).await
+                    runs::attempt_finished(&self.hub, &leg, attempt, Some(fence), end).await.map(|_| ())
                 }
             };
             if let Err(e) = r {
@@ -2515,7 +2579,7 @@ impl Dispatch {
         // In a `k8s` pool's pod it runs in the pod's own container (W13-R07): a terminal into it is
         // an exec into the pod, not a shell on a machine (W17-R01).
         let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
-        runs::claim(&self.hub, leg, runner, recorded, attempt).await?;
+        runs::claim(&self.hub, leg, runner, recorded, attempt, grant.map(|(f, _)| f).unwrap_or_default()).await?;
         // The run's first leg to start: `workflow_run` `in_progress`.
         if let Some(run) = self.legs.get(leg).map(|l| l.run.clone()) {
             let first = self.runs.get_mut(&run).is_some_and(|r| !std::mem::replace(&mut r.in_progress, true));
@@ -2547,6 +2611,7 @@ impl Dispatch {
         match pending.at_once().filter(|a| **a != crate::wire::commands::Answer::Sent).cloned() {
             Some(a) => {
                 self.hub.release_slot(runner, leg);
+                self.hub.ci.grant(leg, None);
                 if let Some(l) = self.legs.get_mut(leg) {
                     l.agent = None;
                 }
@@ -2803,7 +2868,15 @@ impl Dispatch {
     }
 
     /// What a runner says about a leg while it runs (W06, §2.5).
-    async fn event(&mut self, agent: &str, leg: &str, json: &str) -> anyhow::Result<()> {
+    async fn event(&mut self, agent: &str, leg: &str, json: &str, grant: Option<&crate::proto::Grant>) -> anyhow::Result<()> {
+        // Under the grant it names, taken only while that's the leg's live grant, this runner's
+        // (W05-R36): the hub let it by, and it may have been lost or granted again since.
+        if let Some(g) = grant
+            && (g.leg != leg || !self.live(agent, g))
+        {
+            refuse_write(&self.hub, agent, g, "event").await;
+            return Ok(());
+        }
         if let (Ok(Seq { seq: Some(seq) }), Some(l)) = (serde_json::from_str::<Seq>(json), self.legs.get_mut(leg)) {
             if seq <= l.seq {
                 return Ok(());
@@ -2888,7 +2961,15 @@ impl Dispatch {
     }
 
     /// A leg's attempt ended on its runner: the scheduler decides on a retry, else the plan hears.
-    async fn finished(&mut self, agent: &str, r: JobResult) -> anyhow::Result<()> {
+    async fn finished(&mut self, agent: &str, r: JobResult, grant: Option<crate::proto::Grant>) -> anyhow::Result<()> {
+        // Under the grant it names, taken only while that's the leg's live grant, this runner's
+        // (W05-R36): an attempt lost, or the leg granted again since, ends nothing.
+        if let Some(g) = &grant
+            && (g.leg != r.job || !self.live(agent, g))
+        {
+            refuse_write(&self.hub, agent, g, "result").await;
+            return Ok(());
+        }
         self.hub.release_slot(agent, &r.job);
         // Gone with its repository: its slot is free now, and there's nothing to write.
         if let Some(attempt) = self.legs.get(&r.job).filter(|l| l.gone).map(|l| l.attempt) {
@@ -2906,7 +2987,7 @@ impl Dispatch {
             tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the job token could not be revoked");
         }
         let Some(l) = self.legs.get(&r.job) else { return Ok(()) };
-        let attempt = l.attempt;
+        let attempt = grant.as_ref().map_or(l.attempt, |g| g.attempt);
         let gate = l.spec.def().and_then(|j| j.kiln.bench_gate.clone());
         let mut outcome = match r.status {
             Status::Succeeded | Status::Skipped => Outcome::Success,
@@ -2935,6 +3016,7 @@ impl Dispatch {
                 Err(e) => super::results::annotate(&self.hub, &r.job, "warning", "bench-gate", &e).await,
             }
         }
+        self.hub.ci.grant(&r.job, None);
         if let Some(l) = self.legs.get_mut(&r.job) {
             l.agent = None;
             if let Some(e) = &r.error {
@@ -2948,8 +3030,17 @@ impl Dispatch {
             Outcome::Failed(f) => (if f.class == FailureClass::Timeout { "timed_out" } else { "failure" }, Some(f.class.as_str())),
         };
         let end = runs::AttemptEnd { conclusion, class, exit_code: r.exit_code, error: r.error.clone(), peak_rss: r.peak_rss, cpu_seconds: r.cpu_seconds };
-        if let Err(e) = runs::attempt_finished(&self.hub, &r.job, attempt, end).await {
-            tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the attempt could not be recorded");
+        // The store takes it only while its grant is the leg's, running (W05-R36): one that raced
+        // a new grant ends nothing.
+        match runs::attempt_finished(&self.hub, &r.job, attempt, grant.as_ref().map(crate::proto::Grant::fence), end).await {
+            Ok(false) => {
+                if let Some(g) = &grant {
+                    refuse_write(&self.hub, agent, g, "result").await;
+                }
+                return Ok(());
+            }
+            Ok(true) => {}
+            Err(e) => tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the attempt could not be recorded"),
         }
         let cmds = self.sched.handle(Input::AttemptFinished { leg: r.job.clone(), attempt, outcome }, now_ms());
         self.commands(cmds).await;
@@ -2959,6 +3050,7 @@ impl Dispatch {
     /// A leg gone with its repository that ended (or was lost with its runner): out of the
     /// dispatcher, and its slot the scheduler's to give.
     async fn forget_gone(&mut self, leg: &str, attempt: u32) {
+        self.hub.ci.grant(leg, None);
         self.legs.remove(leg);
         self.hub.ci.legs.lock().remove(leg);
         self.hub.logs.finish(leg);
@@ -2996,6 +3088,8 @@ impl Dispatch {
 
     /// The leg is done for good: its row, then its plan (W04-R02).
     async fn settled(&mut self, leg: &str, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
+        // Done for good: it holds no grant (W05-R36).
+        self.hub.ci.grant(leg, None);
         let c = match &outcome {
             Outcome::Success => PlanC::Success,
             Outcome::Cancelled => PlanC::Cancelled,
@@ -3164,10 +3258,15 @@ impl Dispatch {
         }
         // The legs as the store has them.
         let run_owned = run.to_owned();
-        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>);
+        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>, Fence);
         let rows: Vec<Row> = self.hub.store.call(move |c| {
-            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
-            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?)
+            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs, grant_epoch, grant_n FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
+            // Its grant's fence (W05-R34), none from an older build's claim.
+            let fence = |e: Option<i64>, n: Option<i64>| match (e.and_then(|e| u64::try_from(e).ok()), n.and_then(|n| u64::try_from(n).ok())) {
+                (Some(epoch), Some(n)) => Fence { epoch, n },
+                _ => Fence::default(),
+            };
+            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, fence(r.get(8)?, r.get(9)?))))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
         // Legs that ended before their report reached the log (the server stopped in between):
@@ -3181,7 +3280,7 @@ impl Dispatch {
                 (r.1.clone(), LegReport { conclusion: Some(conclusion_of(r.6.as_deref())), outputs, ..LegReport::default() })
             })
             .collect();
-        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5)).collect();
+        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>, Fence)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.8)).collect();
         let event = v.get("event").and_then(|e| serde_json::from_value::<Event>(e.clone()).ok()).unwrap_or_else(|| Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() });
         let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
         let path = run_path(&input.github);
@@ -3215,7 +3314,7 @@ impl Dispatch {
         let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
-        for (id, key, status, agent, attempt, leg) in legs {
+        for (id, key, status, agent, attempt, leg, fence) in legs {
             st.keys.insert(key.clone(), id.clone());
             let s = Status::parse(&status);
             if s.is_terminal() {
@@ -3245,7 +3344,7 @@ impl Dispatch {
                     env_url: None,
                     seq: 0,
                     gone: false,
-                    fence: Fence::default(),
+                    fence,
                 },
             );
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
@@ -3260,7 +3359,8 @@ impl Dispatch {
                 // hold one of its slots for good.
                 // Its grant gets a lease from now (W05-R34): the timer for its expiry is kept.
                 (Status::Running, Some(a)) => {
-                    for c in self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1), fence: Fence::default() }, now_ms()) {
+                    self.hub.ci.grant(&id, Some((a.clone(), attempt.max(1), fence)));
+                    for c in self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1), fence }, now_ms()) {
                         if let Command::Timer { at } = c {
                             self.timers.insert(at);
                         }
@@ -3598,6 +3698,32 @@ mod tests {
             assert!(cfg.sched.classes().is_err(), "{bad}");
         }
         Ok(())
+    }
+
+    /// W05-R36: a lease runner's write is taken under its leg's live grant alone: not under its
+    /// leg's earlier attempt's (the retry on the same runner, W05-R16's fallback), not under
+    /// another grant of the same attempt (granted again after a refusal), not from another runner,
+    /// and not once the grant is over. A refusal under a grant is said once.
+    #[test]
+    fn w05_r36_a_write_is_taken_under_its_legs_live_grant_alone() {
+        use crate::proto::Grant;
+        use kiln_ci::sched::Fence;
+        let h = super::Handle::default();
+        let grant = |attempt, n| Grant { leg: "L".into(), attempt, epoch: 0, n };
+        h.grant("L", Some(("a".into(), 1, Fence { epoch: 0, n: 4 })));
+        assert!(h.live("a", &grant(1, 4)) && h.fenced("L"));
+        h.grant("L", Some(("a".into(), 2, Fence { epoch: 0, n: 5 })));
+        assert!(!h.live("a", &grant(1, 4)), "attempt 1's grant, attempt 2 now on the same runner");
+        assert!(!h.live("a", &grant(2, 4)), "attempt 2 under attempt 1's fence");
+        assert!(!h.live("b", &grant(2, 5)), "another runner");
+        assert!(h.live("a", &grant(2, 5)));
+        h.grant("L", Some(("a".into(), 2, Fence { epoch: 0, n: 6 })));
+        assert!(!h.live("a", &grant(2, 5)), "the same attempt, granted again");
+        h.grant("L", None);
+        assert!(!h.live("a", &grant(2, 6)) && !h.fenced("L"), "its grant over");
+        h.grant("M", Some(("a".into(), 1, Fence::default())));
+        assert!(!h.fenced("M"), "a grant an older build made has no fence");
+        assert!(h.first_refusal(&grant(1, 4)) && !h.first_refusal(&grant(1, 4)) && h.first_refusal(&grant(2, 5)), "said once a grant");
     }
 
     /// W05-R34: `[sched] lease` and `lock_delay` are read as durations, kiln's 60 s and 15 s when

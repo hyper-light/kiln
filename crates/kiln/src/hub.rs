@@ -1442,15 +1442,17 @@ impl Hub {
             // A leg's output fenced by its grant (docs/ci.md W05-R34), on a lane of its own.
             NetEvent::Frame { peer, kind: Kind::Log, lane: proto::LANE_FENCED_LOGS, data } => {
                 let chunk: proto::FencedLog = proto::decode(&data)?;
-                if self.owns_job(peer, &chunk.grant.leg) {
+                if self.takes(peer, &chunk.grant.leg, Some(&chunk.grant)) {
                     self.logs.append(&chunk.grant.leg, chunk.idx, &chunk.data);
+                } else if let Some(agent) = self.agent_of(peer) {
+                    crate::ci::dispatch::refuse_write(self, &agent, &chunk.grant, "log").await;
                 }
             }
             // Bulk frames are job output, but on the conversation feed's and the files' lanes
             // (messages, in bulk).
             NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => {
                 let chunk: proto::LogChunk = proto::decode(&data)?;
-                if self.owns_job(peer, &chunk.job) {
+                if self.takes(peer, &chunk.job, None) {
                     self.logs.append(&chunk.job, chunk.idx, &chunk.data);
                 }
             }
@@ -1622,6 +1624,26 @@ impl Hub {
     }
 
     async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
+        self.on_agent_msg_under(peer, msg, None).await
+    }
+
+    /// Whether this runner process's word about `job` is taken (docs/ci.md W05-R36). Under the
+    /// grant it names (a lease runner's), while that's the leg's live grant and this runner's;
+    /// unnamed (a runner from before leases, a v1 job's, a kept leg's step rerun), while the job
+    /// is its own, as before. A lease runner names the grant of a leg it holds one for in all it
+    /// sends about it, so its unnamed word about such a leg isn't taken.
+    fn takes(&self, peer: PeerId, job: &str, grant: Option<&proto::Grant>) -> bool {
+        match grant {
+            Some(g) => g.leg == job && self.agent_of(peer).is_some_and(|a| self.ci.live(&a, g)),
+            None => {
+                let leases = self.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & proto::CAP_LEASES != 0);
+                self.owns_job(peer, job) && !(leases && self.ci.fenced(job))
+            }
+        }
+    }
+
+    /// A runner's message, under the grant a `Fenced` one named (W05-R36).
+    async fn on_agent_msg_under(self: &Arc<Self>, peer: PeerId, msg: AgentMsg, grant: Option<proto::Grant>) -> anyhow::Result<()> {
         if let AgentMsg::Hello(h) = msg {
             return self.on_hello(peer, h).await;
         }
@@ -1667,29 +1689,35 @@ impl Hub {
                 self.record_sample(&agent, s);
             }
             AgentMsg::StepStarted { job, idx } => {
-                if self.owns_job(peer, &job) {
+                if self.takes(peer, &job, grant.as_ref()) {
                     self.store.step_update(job.clone(), idx, Status::Running, None).await?;
                     self.logs.step(&job, idx, "running");
                     self.emit_job(&job).await;
+                } else if let Some(g) = &grant {
+                    crate::ci::dispatch::refuse_write(self, &agent, g, "step").await;
                 }
             }
             AgentMsg::StepFinished { job, idx, status, exit_code } => {
-                if self.owns_job(peer, &job) {
+                if self.takes(peer, &job, grant.as_ref()) {
                     self.store.step_update(job.clone(), idx, status, exit_code).await?;
                     self.logs.step(&job, idx, status.as_str());
                     metrics::global().steps_finished.inc(&[status.as_str()]);
                     self.emit_job(&job).await;
+                } else if let Some(g) = &grant {
+                    crate::ci::dispatch::refuse_write(self, &agent, g, "step").await;
                 }
             }
             AgentMsg::JobSample { .. } => {}
             AgentMsg::JobFinished(r) => {
                 let job = r.job.clone();
-                if self.owns_job(peer, &r.job) {
+                if self.takes(peer, &r.job, grant.as_ref()) {
                     if self.ci_leg(&r.job).await {
-                        self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
+                        self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r, grant });
                     } else {
                         self.job_done(&agent, r).await?;
                     }
+                } else if let Some(g) = &grant {
+                    crate::ci::dispatch::refuse_write(self, &agent, g, "result").await;
                 }
                 // Heard (taken, or not this runner's to give any more): it needn't send it again.
                 if self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_RECEIVED != 0) {
@@ -1697,13 +1725,15 @@ impl Hub {
                 }
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
-                if self.owns_job(peer, &job) {
+                if self.takes(peer, &job, None) {
                     self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job, fence: None });
                 }
             }
-            // A lease runner's refusal, naming the grant it refuses (W05-R34).
+            // A lease runner's refusal, naming the grant it refuses (W05-R34): taken while that's
+            // the leg's live grant (W05-R36); one come late, after it was lost or granted again,
+            // refuses nothing.
             AgentMsg::Refused { grant, .. } if self.ci.is_leg(&grant.leg) => {
-                if self.owns_job(peer, &grant.leg) {
+                if self.takes(peer, &grant.leg.clone(), Some(&grant)) {
                     let fence = Some(grant.fence());
                     self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: grant.leg, fence });
                 }
@@ -1716,9 +1746,9 @@ impl Hub {
             }
             // What a lease runner sends about a leg, fenced by the grant it runs under (W05-R34):
             // taken as what it carries. A fenced message carries no other.
-            AgentMsg::Fenced { msg, .. } => {
+            AgentMsg::Fenced { grant, msg } => {
                 if !matches!(*msg, AgentMsg::Fenced { .. }) {
-                    Box::pin(self.on_agent_msg(peer, *msg)).await?;
+                    Box::pin(self.on_agent_msg_under(peer, *msg, Some(grant))).await?;
                 }
             }
             AgentMsg::Reject { job, reason } => {
@@ -1870,8 +1900,10 @@ impl Hub {
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             AgentMsg::JobEvent { job, json } => {
-                if self.owns_job(peer, &job) {
-                    self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json });
+                if self.takes(peer, &job, grant.as_ref()) {
+                    self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json, grant });
+                } else if let Some(g) = &grant {
+                    crate::ci::dispatch::refuse_write(self, &agent, g, "event").await;
                 }
             }
             // A pool's executor it was asked to start (docs/ci.md W13-R09).

@@ -175,34 +175,40 @@ fn close_wait(c: &rusqlite::Connection, leg: &str, now: i64) -> anyhow::Result<(
     Ok(())
 }
 
-/// A leg the scheduler gave a runner.
-pub async fn claim(hub: &Hub, leg: &str, agent: &str, executor: &str, attempt: u32) -> anyhow::Result<()> {
+/// A leg the scheduler gave a runner, under the grant `fence` (W05-R05, R34): in the store before
+/// its `Assign` goes, so a restart finds it running there under that grant.
+pub async fn claim(hub: &Hub, leg: &str, agent: &str, executor: &str, attempt: u32, fence: kiln_ci::sched::Fence) -> anyhow::Result<()> {
     let (leg, agent, executor) = (leg.to_owned(), agent.to_owned(), executor.to_owned());
-    hub.store
-        .call(move |c| {
-            let tx = crate::store::tx(c)?;
-            let now = crate::util::now_unix();
-            close_wait(&tx, &leg, now)?;
-            // The attempt (W19-R01); one before it that never reported ended with its runner.
-            tx.execute("UPDATE ci_attempts SET status = 'done', conclusion = 'failure', failure_class = 'runner-lost', finished_at = ?3 WHERE leg_id = ?1 AND number < ?2 AND status = 'running'", params![leg, attempt, now])?;
-            tx.execute(
-                "INSERT INTO ci_attempts (id, leg_id, number, status, runner, executor, queued_at, started_at) VALUES (?1, ?2, ?3, 'running', ?4, ?5, (SELECT queued_at FROM jobs WHERE id = ?2), ?6)
-                 ON CONFLICT (leg_id, number) DO UPDATE SET status = 'running', runner = excluded.runner, executor = excluded.executor, queued_at = excluded.queued_at, started_at = excluded.started_at,
-                   conclusion = NULL, failure_class = NULL, finished_at = NULL, exit_code = NULL, error = NULL",
-                params![crate::util::new_id(), leg, attempt, agent, executor, now],
-            )?;
-            tx.execute(
-                "UPDATE jobs SET status = 'running', agent = ?2, executor = ?3, attempt = ?4, started_at = ?5, finished_at = NULL, exit_code = NULL, error = NULL, wait_reason = NULL, wait_since = NULL WHERE id = ?1",
-                params![leg, agent, executor, attempt, now],
-            )?;
-            tx.execute(
-                "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, ?2) WHERE id = (SELECT run_id FROM jobs WHERE id = ?1) AND status IN ('queued', 'pending')",
-                params![leg, now],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+    hub.store.call(move |c| claim_on(c, &leg, &agent, &executor, attempt, fence, crate::util::now_unix())).await
+}
+
+/// A fence's numbers as SQLite keeps them.
+fn sql(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+fn claim_on(c: &mut rusqlite::Connection, leg: &str, agent: &str, executor: &str, attempt: u32, fence: kiln_ci::sched::Fence, now: i64) -> anyhow::Result<()> {
+    let tx = crate::store::tx(c)?;
+    let (epoch, n) = (sql(fence.epoch), sql(fence.n));
+    close_wait(&tx, leg, now)?;
+    // The attempt (W19-R01); one before it that never reported ended with its runner.
+    tx.execute("UPDATE ci_attempts SET status = 'done', conclusion = 'failure', failure_class = 'runner-lost', finished_at = ?3 WHERE leg_id = ?1 AND number < ?2 AND status = 'running'", params![leg, attempt, now])?;
+    tx.execute(
+        "INSERT INTO ci_attempts (id, leg_id, number, status, runner, executor, queued_at, started_at, grant_epoch, grant_n) VALUES (?1, ?2, ?3, 'running', ?4, ?5, (SELECT queued_at FROM jobs WHERE id = ?2), ?6, ?7, ?8)
+         ON CONFLICT (leg_id, number) DO UPDATE SET status = 'running', runner = excluded.runner, executor = excluded.executor, queued_at = excluded.queued_at, started_at = excluded.started_at,
+           conclusion = NULL, failure_class = NULL, finished_at = NULL, exit_code = NULL, error = NULL, grant_epoch = excluded.grant_epoch, grant_n = excluded.grant_n",
+        params![crate::util::new_id(), leg, attempt, agent, executor, now, epoch, n],
+    )?;
+    tx.execute(
+        "UPDATE jobs SET status = 'running', agent = ?2, executor = ?3, attempt = ?4, started_at = ?5, finished_at = NULL, exit_code = NULL, error = NULL, wait_reason = NULL, wait_since = NULL, grant_epoch = ?6, grant_n = ?7 WHERE id = ?1",
+        params![leg, agent, executor, attempt, now, epoch, n],
+    )?;
+    tx.execute(
+        "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, ?2) WHERE id = (SELECT run_id FROM jobs WHERE id = ?1) AND status IN ('queued', 'pending')",
+        params![leg, now],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// How an attempt ended (W19-R01): its conclusion and, when it failed, why.
@@ -215,19 +221,31 @@ pub struct AttemptEnd {
     pub cpu_seconds: Option<f64>,
 }
 
-pub async fn attempt_finished(hub: &Hub, leg: &str, attempt: u32, end: AttemptEnd) -> anyhow::Result<()> {
+/// An attempt's end, recorded (W19-R01). Under a grant (`fence`, a runner's word, W05-R36), only
+/// while that grant is still the leg's and running: an attempt whose grant was lost, or granted
+/// again since, records nothing, and `false` says so. Without one (the scheduler's own word, or a
+/// runner from before leases), as asked.
+pub async fn attempt_finished(hub: &Hub, leg: &str, attempt: u32, fence: Option<kiln_ci::sched::Fence>, end: AttemptEnd) -> anyhow::Result<bool> {
     let leg = leg.to_owned();
-    crate::metrics::global().ci_attempts.inc(&[end.conclusion, end.class.unwrap_or("")]);
+    let (conclusion, class) = (end.conclusion, end.class);
+    let recorded = hub.store.call(move |c| attempt_finished_on(c, &leg, attempt, fence, &end, crate::util::now_unix())).await?;
+    if recorded {
+        crate::metrics::global().ci_attempts.inc(&[conclusion, class.unwrap_or("")]);
+    }
+    Ok(recorded)
+}
+
+fn attempt_finished_on(c: &rusqlite::Connection, leg: &str, attempt: u32, fence: Option<kiln_ci::sched::Fence>, end: &AttemptEnd, now: i64) -> anyhow::Result<bool> {
     let rss = end.peak_rss.and_then(|r| i64::try_from(r).ok());
-    hub.store
-        .call(move |c| {
-            c.execute(
-                "UPDATE ci_attempts SET status = 'done', conclusion = ?3, failure_class = ?4, exit_code = ?5, error = ?6, peak_rss = ?7, cpu_seconds = ?8, finished_at = ?9 WHERE leg_id = ?1 AND number = ?2",
-                params![leg, attempt, end.conclusion, end.class, end.exit_code, end.error, rss, end.cpu_seconds, crate::util::now_unix()],
-            )?;
-            Ok(())
-        })
-        .await
+    let (epoch, n) = fence.map_or((None, None), |f| (Some(sql(f.epoch)), Some(sql(f.n))));
+    let changed = c.execute(
+        "UPDATE ci_attempts SET status = 'done', conclusion = ?3, failure_class = ?4, exit_code = ?5, error = ?6, peak_rss = ?7, cpu_seconds = ?8, finished_at = ?9
+         WHERE leg_id = ?1 AND number = ?2
+           AND (?10 IS NULL OR (status = 'running' AND grant_epoch = ?10 AND grant_n = ?11
+                AND EXISTS (SELECT 1 FROM jobs WHERE id = ?1 AND status = 'running' AND attempt = ?2 AND grant_epoch = ?10 AND grant_n = ?11)))",
+        params![leg, attempt, end.conclusion, end.class, end.exit_code, end.error, rss, end.cpu_seconds, now, epoch, n],
+    )?;
+    Ok(changed > 0)
 }
 
 /// A leg waiting again: a retry, or a runner that refused it.
@@ -453,5 +471,51 @@ pub async fn run_of(hub: &Hub, leg: &str) -> anyhow::Result<Option<Run>> {
     match run {
         Some(r) => hub.store.run(r).await,
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use kiln_ci::sched::Fence;
+
+    use super::{AttemptEnd, attempt_finished_on, claim_on};
+
+    fn ended() -> AttemptEnd {
+        AttemptEnd { conclusion: "success", class: None, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None }
+    }
+
+    /// W05-R36: the store refuses an attempt's end under a grant that isn't the leg's now. Granted
+    /// again (a new attempt, or the same attempt after a refusal), the leg's old grant's end
+    /// changes nothing, and its grant's own is taken; the claim keeps the fence on the leg and on
+    /// its attempt.
+    #[test]
+    fn w05_r36_the_store_refuses_a_write_racing_a_new_grant() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db");
+        drop(crate::store::Store::open(&path)?);
+        let mut c = rusqlite::Connection::open(&path)?;
+        c.execute_batch(
+            "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/x', '', 0);
+             INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run', 'r', 1, 'ci', 'push', 'main', 'abc', 'queued', 0);
+             INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec) VALUES ('leg', 'run', 'k', 'k', 'queued', '[]', '[]', '{}');",
+        )?;
+        let (first, again, second) = (Fence { epoch: 0, n: 1 }, Fence { epoch: 0, n: 3 }, Fence { epoch: 0, n: 4 });
+        claim_on(&mut c, "leg", "a", "host", 1, first, 10)?;
+        let kept: (i64, i64) = c.query_row("SELECT grant_epoch, grant_n FROM ci_attempts WHERE leg_id = 'leg' AND number = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        assert_eq!(kept, (0, 1));
+        // Refused and granted again under the same attempt: the first grant's end is refused.
+        claim_on(&mut c, "leg", "a", "host", 1, again, 20)?;
+        assert!(!attempt_finished_on(&c, "leg", 1, Some(first), &ended(), 30)?, "the first grant's end, after it was granted again");
+        // Lost, and its next attempt granted: neither the old grant's end nor one naming the new
+        // attempt under the old fence is taken; the new grant's is.
+        claim_on(&mut c, "leg", "b", "host", 2, second, 40)?;
+        assert!(!attempt_finished_on(&c, "leg", 1, Some(again), &ended(), 50)?, "attempt 1's grant, after attempt 2 started");
+        assert!(!attempt_finished_on(&c, "leg", 2, Some(again), &ended(), 50)?, "attempt 2 under another grant's fence");
+        let status: String = c.query_row("SELECT status FROM ci_attempts WHERE leg_id = 'leg' AND number = 2", [], |r| r.get(0))?;
+        assert_eq!(status, "running", "nothing about the leg changed");
+        assert!(attempt_finished_on(&c, "leg", 2, Some(second), &ended(), 60)?, "its own grant's end");
+        // The scheduler's own word, with no fence, is recorded as asked.
+        assert!(attempt_finished_on(&c, "leg", 1, None, &ended(), 70)?);
+        Ok(())
     }
 }
