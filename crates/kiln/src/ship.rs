@@ -1089,7 +1089,7 @@ fn actions(rec: &Records, j: &Journey, yours: bool) -> Vec<Value> {
         && r.superseded_by.is_none()
         && r.state != ReviewState::Fixing
     {
-        if authors_agent(ch).is_some() && (r.conflicts > 0 || !ch.threads.is_empty()) && !out.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("hand_off")) {
+        if made_by(rec).agent.is_some() && (r.conflicts > 0 || !ch.threads.is_empty()) && !out.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("hand_off")) {
             out.push(hand());
         }
         out.push(act("review", "GET", format!("/api/diffs/{}", ch.name), Value::Null));
@@ -1105,6 +1105,46 @@ fn failed_leg(rec: &Records) -> Option<&LegRec> {
 /// The agent that wrote a change (`agent:<id>`, as its agent token pushed it), if an agent did.
 fn authors_agent(ch: &ChangeRec) -> Option<&str> {
     ch.author.strip_prefix("agent:").and_then(|s| s.split(' ').next()).filter(|s| !s.is_empty())
+}
+
+/// Who made a commit, as far as kiln knows: the agent session that made it, and the person it traces
+/// back to (a kiln principal, `user:ada`). Ship asks this one place: Hand off goes to `agent`
+/// (W26-R18), Files' ask asks it (the UI reads `made_by`), and a commit with neither is a person's
+/// or no one's kiln knows. Today it's a kiln change's author and author_for; for a lone commit,
+/// production's runs record only git's author name, so nothing. Chain of Ownership (Ada,
+/// 2026-10-29: any conversation or action traced back to its human initiator) fills it for every
+/// commit, and what reads it follows unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MadeBy {
+    agent: Option<String>,
+    person: Option<String>,
+}
+
+fn made_by(rec: &Records) -> MadeBy {
+    match rec.change.as_ref() {
+        Some(ch) => match authors_agent(ch) {
+            Some(agent) => MadeBy { agent: Some(agent.to_owned()), person: ch.author_for.clone().filter(|p| !p.is_empty()) },
+            None => MadeBy { agent: None, person: Some(ch.author.clone()).filter(|p| !p.is_empty()) },
+        },
+        None => MadeBy::default(),
+    }
+}
+
+impl MadeBy {
+    /// `{agent?, person?}` (optional fields, W26-R18), or null when kiln knows neither.
+    fn json(&self) -> Value {
+        if self.agent.is_none() && self.person.is_none() {
+            return Value::Null;
+        }
+        let mut v = serde_json::Map::new();
+        if let Some(a) = &self.agent {
+            v.insert("agent".into(), json!(a));
+        }
+        if let Some(p) = &self.person {
+            v.insert("person".into(), json!(p));
+        }
+        Value::Object(v)
+    }
 }
 
 /// A commit's kind for the facets: its change's (`diff`, `request`), else `commit`.
@@ -1179,6 +1219,7 @@ fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
         "cursor": rec.first_row,
         "kind": kind_of(rec), "host": ch.map(|c| c.host.clone()), "change": change,
         "fold_under": ch.map(ChangeRec::tip).filter(|tip| *tip != rec.sha),
+        "made_by": made_by(rec).json(),
         "actions": actions(rec, j, yours),
     });
     with_version(row)
@@ -1822,8 +1863,9 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
         return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
     }
     let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let author = rec.change.as_ref().and_then(authors_agent);
-    let running = match author {
+    // Its maker's agent, from the one place Ship reads it (made_by: Chain of Ownership fills it in time).
+    let author = made_by(&rec).agent;
+    let running = match author.as_deref() {
         Some(id) => {
             let agent = crate::workspace::change::of(hub, id).await.map_or_else(|| id.to_owned(), |r| r.agent);
             hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited)
@@ -2837,6 +2879,40 @@ mod tests {
             assert_eq!((stand_of(&held, "3333333"), stand_of(&held, "4141414")), (failing, fixing), "the hand-off's trigger brought them into memory");
             Ok(())
         })
+    }
+
+    /// Who made each commit, from the one place Ship reads it (made_by, W26-R18; Chain of Ownership
+    /// fills it for every commit in time): an agent's change says its agent and the person it acts
+    /// for; a person's change, its person; a lone commit, nothing yet (git's author name isn't a
+    /// kiln principal).
+    #[test]
+    fn w26_r18_made_by_says_who_made_each_commit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture() + &d41("agent:matrix");
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let made = |short: &str| page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("short") == Some(&json!(short))).and_then(|c| c.get("made_by").cloned());
+            assert_eq!(made("4141414"), Some(json!({ "agent": "matrix", "person": "user:sam" })), "an agent's change: its agent, for its person");
+            assert_eq!(made("3333333"), Some(Value::Null), "a lone commit: git's author name names no one kiln knows");
+            let sql = fixture_person_change();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let lee = page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("short") == Some(&json!("5151515"))).and_then(|c| c.get("made_by").cloned());
+            assert_eq!(lee, Some(json!({ "person": "user:lee" })), "a person's change: its person, and no agent");
+            Ok(())
+        })
+    }
+
+    /// D51: lee's own diff, a person's change.
+    fn fixture_person_change() -> String {
+        let t = NOW_S - 300;
+        let sha = "5151515aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        format!(
+            "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, state, trunk, created_at, updated_at) VALUES ('d51', 'kiln', 51, 'diff', 'sched: lee', 'user:lee', 'human', 'needs-review', 'main', {t}, {t});
+             INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('d51', 1, '{sha}', 'p', 'b', 'sched: lee', 'user:lee', {t});"
+        )
     }
 
     /// W26-R18: Hand off gives a person's failure to the agent attached to what failed, as the

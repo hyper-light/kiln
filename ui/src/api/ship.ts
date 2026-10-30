@@ -58,6 +58,12 @@ export interface ShipCommit {
   change?: ShipChange | null;
   /** The change's tip this commit folds under. */
   fold_under?: string | null;
+  /**
+   * Who made it, as far as kiln knows (ship.rs's made_by, W26-R18): the agent session that made it,
+   * and the person it traces back to. Hand off goes to `agent`, and Files' ask asks it. Today only a
+   * kiln change says it; Chain of Ownership fills it for every commit in time.
+   */
+  made_by?: { agent?: string; person?: string } | null;
   actions?: ShipAction[];
   /** A hash of what the row shows (W26-R06): the same row, the same `v`. */
   v?: string;
