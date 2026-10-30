@@ -1310,6 +1310,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut server_identity = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
     let mut identity_asked: HashMap<String, Instant> = HashMap::new();
+    // A session still without its identity is asked for again on heartbeats, 10 s on and doubling
+    // to 5 minutes: when it was last, and how many times.
+    let mut identity_again: HashMap<String, (Instant, u32)> = HashMap::new();
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
@@ -3582,6 +3585,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         limit_config = config;
                         hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                    }
+                }
+                // Each session this process holds without its identity, asked for again: its first
+                // ask can come before kiln has heard of the session ("kiln knows no agent session
+                // yet"), and a session quiet since would wait for its next update for good (docs/ci.md
+                // W27-R01; tests/identities.rs's chains and keys failed so under load).
+                identity_again.retain(|s, _| session_epochs.contains_key(s));
+                if server_identity && connected {
+                    for (session, epoch) in session_epochs.clone() {
+                        if crate::runner::identity::cert(&crate::runner::identity::slot("agent", Some(&session), Some(epoch))).is_some() {
+                            identity_again.remove(&session);
+                            continue;
+                        }
+                        let (at, n) = identity_again.get(&session).copied().unwrap_or((Instant::now(), 0));
+                        if n == 0 || at.elapsed() >= Duration::from_secs(10).saturating_mul(1u32 << n.min(5)).min(Duration::from_secs(300)) {
+                            ask_agent_identity(&uplink, &mut identity_asked, &session, epoch).await;
+                            identity_again.insert(session, (Instant::now(), n.saturating_add(1)));
+                        }
                     }
                 }
                 if connected {
