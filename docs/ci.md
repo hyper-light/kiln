@@ -8824,8 +8824,10 @@ research `01a17947fdad71e5a4f15866e3541c41`.
 - *Keys stay put.* Every kind is issued from a CSR only (`Pki::issue_identity`). A runner process
   makes keys in its own memory for itself, for each agent session it holds at each epoch, and for
   each leg it runs, and asks for their certificates over its channel (`AgentMsg::Identity`,
-  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). The server's and CD's keys are made in
-  `<data>/pki`, each in its own 0600 file (`server-signing.key`, `cd-signing.key`), apart from the
+  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). An ephemeral runner (a `k8s` pool's pod, a
+  v1 job's) does too, enrolled by kiln (`…/person/kiln/machine/<pod>/…`), so its one leg signs as
+  the leg (`w27_r01_an_ephemeral_runner_and_its_leg_have_identities`). The server's and CD's keys
+  are made in `<data>/pki`, each in its own 0600 file (`server-signing.key`, `cd-signing.key`), apart from the
   TLS leaf, and certified for 90 days (`kiln://<org>/server`; CD's `kiln://<org>/server/cd`, acting
   for the server). The server looks at them as it starts, every 6 hours while it runs and after any
   revocation: one with less than 30 days left is renewed, and one revoked is replaced at once, a new

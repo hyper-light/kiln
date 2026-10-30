@@ -2301,8 +2301,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     ServerMsg::Caps { caps } => {
                         // An identity of this process's own, for a key it made and keeps, certified
-                        // on each connection (docs/ci.md W27-R01).
-                        server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
+                        // on each connection (docs/ci.md W27-R01); an ephemeral runner's too (a `k8s`
+                        // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
+                        server_identity = caps & proto::CAP_IDENTITY != 0;
                         if server_identity {
                             match crate::runner::identity::ask("runner", None, None) {
                                 Ok(json) => {
