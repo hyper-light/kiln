@@ -1222,7 +1222,12 @@ impl Scheduler {
                         let name = self.runners.get(&runner).map_or_else(|| runner.clone(), |r| r.input.view.name.clone());
                         self.set_reason(&leg, WaitReason::Pinned { runner: name, state: PinnedState::Busy }, &mut out);
                     } else {
-                        if let Some(l) = self.legs.get_mut(&leg) {
+                        // Refused by a runner away or draining (an assignment that couldn't reach
+                        // it): that says nothing of the leg, and it may take it once it's back
+                        // (W05-R35), so the leg isn't kept off it; whichever runner is first takes
+                        // it.
+                        let away = self.runners.get(&runner).is_some_and(|r| r.draining || !r.connected);
+                        if let Some(l) = self.legs.get_mut(&leg).filter(|_| !away) {
                             l.avoid = Some((runner.clone(), Off::Refused));
                         }
                         self.enqueue(&leg, now, &mut out);

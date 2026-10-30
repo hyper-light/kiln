@@ -45,8 +45,9 @@
 //! - The best runner (W05-R23, without preferences): least loaded, then most free slots, then
 //!   name.
 //! - Attempts end: success and failure settle the leg; `runner-lost` is retried once, then settles
-//!   (W05-R16); a runner refusing a leg puts it back in the queue, same attempt (W05-R02); a runner
-//!   lost loses its legs, and comes back with none. A leg that comes back from a runner still
+//!   (W05-R16); a runner refusing a leg puts it back in the queue, same attempt, kept off that
+//!   runner unless it was draining (W05-R02, R35); a runner lost loses its legs, and comes back
+//!   with none. A leg that comes back from a runner still
 //!   connected takes W05-R04's two looks in their order: it's offered to the runners it may run on,
 //!   then the runner it left takes what fits it.
 //! - Grants (W05-R34): each placement is a grant, its fence the case's epoch and the placement's
@@ -432,10 +433,14 @@ impl Reference {
                 }
                 let left = self.runner_of(leg);
                 self.settle(leg, now);
+                // A runner draining refused it for that, not for the leg: the leg isn't kept off it.
+                let away = left.as_ref().and_then(|r| self.runners.get(r)).is_some_and(|r| r.draining || !r.connected);
                 if let Some(l) = self.legs.get_mut(leg)
                     && let Some(runner) = &left
                 {
-                    l.avoid = Some((runner.clone(), Off::Refused));
+                    if !away {
+                        l.avoid = Some((runner.clone(), Off::Refused));
+                    }
                     self.enqueue(leg, now);
                     self.offer(leg, now);
                     self.fill(runner, now);

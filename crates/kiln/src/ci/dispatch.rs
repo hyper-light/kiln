@@ -2617,7 +2617,10 @@ impl Dispatch {
                 }
                 runs::requeue(&self.hub, leg, attempt, Some(format!("the assignment could not be delivered: {}", a.words()))).await?;
                 let fence = self.legs.get(leg).map(|l| l.fence).unwrap_or_default();
-                let cmds = self.sched.handle(Input::Rejected { leg: leg.to_owned(), fence }, now_ms());
+                // Its runner is away: it takes nothing new until it's back (its hello), and the leg
+                // isn't kept off it for this (W05-R35); the grant goes back, the same attempt.
+                let mut cmds = self.sched.handle(Input::RunnerDraining { runner: runner.to_owned() }, now_ms());
+                cmds.extend(self.sched.handle(Input::Rejected { leg: leg.to_owned(), fence }, now_ms()));
                 Box::pin(self.commands(cmds)).await;
             }
             None => pending.log_when_answered(crate::hub::LOG_WITHIN),

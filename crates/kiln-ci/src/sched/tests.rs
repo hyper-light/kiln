@@ -2652,3 +2652,21 @@ fn w05_r35_draining_and_lost_runners() {
     let c = s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 3);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "y" && runner == "b")), "{c:?}");
 }
+
+/// W05-R35: a runner away or draining that refuses a leg (an assignment that couldn't reach it)
+/// doesn't keep the leg off it: undrained, it takes the leg back, where a refusal from a runner at
+/// work keeps the leg off it for another.
+#[test]
+fn w05_r35_a_draining_runners_refusal_doesnt_keep_the_leg_off_it() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let first = fence(&s, "x");
+    s.handle(Input::RunnerDraining { runner: "a".into() }, 1);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: first }, 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "it takes nothing new while away: {c:?}");
+    assert!(!matches!(s.reason("x"), Some(WaitReason::OtherRunner { .. })), "{:?}", s.reason("x"));
+    let c = s.handle(Input::RunnerChanged(Box::new(linux("a", 1))), 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "x" && runner == "a")), "back, it takes the leg again: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
