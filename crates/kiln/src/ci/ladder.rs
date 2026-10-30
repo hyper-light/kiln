@@ -1,0 +1,609 @@
+//! The conflict ladder (docs/ci.md W26-R17), the server's part. A conflicted replay (W26-R12's,
+//! kept by `conflicts`) goes up `kiln_ci::ladder`'s rungs: what each rung makes of a conflict is a
+//! candidate revision committed through `revision::commit` (as kiln, or as the agent that made it:
+//! the path W27-R03 signs), kept at `refs/kiln/resolve/<diff>/<resolution>`, the conflicts it
+//! doesn't resolve taking main's side, and tested by the workflows the land queue runs on a
+//! candidate (`on: merge_group` or kiln's `on: land`) before it counts. Once every conflict has
+//! one, they're committed and tested together (`…/<replay>/whole`); then a person accepts them,
+//! unless the repository turned automatic resolution on. Accepted, they're the change's new
+//! version (why `conflict resolved`), and each is remembered by its hunk's key for the next time
+//! the same conflict comes, on any change of the repository.
+//!
+//! The ladder moves when a replay conflicts (`kick`), when a candidate's tests finish, and every
+//! few seconds; what it decides is kept per replay (`review_ladders`, migration 20261029-2300) and
+//! said on the change page.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use http::StatusCode;
+use kiln_ci::ladder::{self, Author, Candidate, Rung, State, Step, Switches, Tests, Tried};
+use kiln_ci::trigger::{Event, Source};
+use rusqlite::{OptionalExtension as _, params};
+use serde_json::{Value, json};
+
+use super::Fail;
+use super::conflicts::{self, ForLadder, Replay};
+use super::diffs::{self, Diff};
+use crate::authz::{Caller, Scope};
+use crate::gitops::{self, LS_REMOTE_TIMEOUT};
+use crate::hub::Hub;
+use crate::wire::events::{ConflictChange, ServerEvent};
+
+/// The rungs this kiln runs.
+const CAN: &[Rung] = &[Rung::Remembered];
+
+fn fail(e: anyhow::Error) -> Fail {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+fn refused(m: impl Into<String>) -> Fail {
+    (StatusCode::CONFLICT, m.into())
+}
+
+fn kicker() -> &'static crate::rt::Notify {
+    static KICK: OnceLock<crate::rt::Notify> = OnceLock::new();
+    KICK.get_or_init(crate::rt::Notify::new)
+}
+
+/// The diffs whose ladder is to move.
+fn kicked() -> &'static parking_lot::Mutex<BTreeSet<String>> {
+    static K: OnceLock<parking_lot::Mutex<BTreeSet<String>>> = OnceLock::new();
+    K.get_or_init(Default::default)
+}
+
+/// Moves diff `id`'s ladder: its replay conflicted, or a person resolved one of its conflicts.
+pub fn kick(id: &str) {
+    kicked().lock().insert(id.to_owned());
+    kicker().notify();
+}
+
+/// The ladder, for as long as the server runs: kicked, and every few seconds for tests under way.
+pub async fn run_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    loop {
+        if let Err(e) = tick(&hub).await {
+            tracing::warn!(error = %format!("{e:#}"), "the conflict ladder stumbled");
+        }
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            () = kicker().notified().fuse() => {}
+            () = crate::rt::sleep(Duration::from_secs(3)).fuse() => {}
+        }
+    }
+}
+
+async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    let mut ids: BTreeSet<String> = std::mem::take(&mut *kicked().lock());
+    // Tests under way: a candidate's (`r`) or a whole's (`w`), its diff, commit and workflows.
+    let pending: Vec<(String, String, String, String, Option<String>)> = hub
+        .store
+        .call(|c| {
+            let mut st = c.prepare(
+                "SELECT 'r', id, diff_id, commit_sha, started FROM review_resolutions WHERE tests = 'pending' AND commit_sha IS NOT NULL
+                 UNION ALL SELECT 'w', replay_id, diff_id, whole_sha, whole_started FROM review_ladders WHERE whole_tests = 'pending' AND whole_sha IS NOT NULL",
+            )?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await?;
+    for (what, id, diff_id, sha, started) in pending {
+        let Some(d) = diffs::find(hub, &diff_id).await? else { continue };
+        let started: Vec<String> = started.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).and_then(|v| v.get("workflows").cloned()).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        let tests = tests_of(hub, &d.repo, &sha, &started).await;
+        if tests == Tests::Pending {
+            continue;
+        }
+        let (now, t) = (crate::util::now_unix(), tests.as_str());
+        hub.store
+            .call(move |c| {
+                let sql = if what == "r" { "UPDATE review_resolutions SET tests = ?2, updated_at = ?3 WHERE id = ?1" } else { "UPDATE review_ladders SET whole_tests = ?2, updated_at = ?3 WHERE replay_id = ?1" };
+                c.execute(sql, params![id, t, now])?;
+                Ok(())
+            })
+            .await?;
+        ids.insert(diff_id);
+    }
+    for id in ids {
+        let Some(d) = diffs::find(hub, &id).await? else { continue };
+        if let Err((_, why)) = climb(hub, &d).await {
+            tracing::info!(diff = %d.name, %why, "the conflict ladder couldn't move this change");
+        }
+    }
+    Ok(())
+}
+
+/// How the workflows `started` on `sha` have done: none started is none to run.
+async fn tests_of(hub: &Hub, repo: &str, sha: &str, started: &[String]) -> Tests {
+    if started.is_empty() {
+        return Tests::NoneToRun;
+    }
+    let Ok(checks) = super::review::checks_on(hub, repo, sha).await else { return Tests::Pending };
+    let stem = |p: &str| p.rsplit('/').next().unwrap_or(p).trim_end_matches(".yml").trim_end_matches(".yaml").to_owned();
+    let mut out = Tests::Passed;
+    for w in started {
+        match checks.get(w).or_else(|| checks.get(&stem(w))) {
+            Some(Some(c)) if kiln_ci::land::passed(c) => {}
+            Some(Some(_)) => return Tests::Failed,
+            _ => out = Tests::Pending,
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------------ records
+
+/// A rung's try at a conflict, as kept.
+#[derive(Debug, Clone)]
+struct Try {
+    id: String,
+    conflict: String,
+    rung: Rung,
+    by: String,
+    state: String,
+    why: Option<String>,
+    lines: Option<Vec<String>>,
+    explanation: Option<String>,
+    commit: Option<String>,
+    tests: Option<Tests>,
+    at: i64,
+}
+
+impl Try {
+    fn candidate(&self) -> Candidate {
+        let tried = match self.state.as_str() {
+            "working" => Tried::Working,
+            "resolved" => Tried::Resolved { tests: self.tests.unwrap_or(Tests::Pending) },
+            _ => Tried::Kept { why: self.why.clone().unwrap_or_default() },
+        };
+        Candidate { rung: self.rung, by: self.by.clone(), tried }
+    }
+
+    fn view(&self) -> Value {
+        json!({
+            "id": self.id, "rung": self.rung.as_str(), "by": self.by, "state": self.state, "why": self.why, "lines": self.lines,
+            "explanation": self.explanation, "commit": self.commit, "tests": self.tests.map(Tests::as_str), "at": self.at,
+        })
+    }
+}
+
+async fn tries(hub: &Hub, replay: &str) -> Result<Vec<Try>, Fail> {
+    let id = replay.to_owned();
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT id, conflict_id, rung, made_by, state, why, lines, explanation, commit_sha, tests, created_at FROM review_resolutions WHERE replay_id = ?1 ORDER BY created_at, rowid")?;
+            let rows = st.query_map([&id], |r| {
+                Ok(Try {
+                    id: r.get(0)?,
+                    conflict: r.get(1)?,
+                    rung: Rung::parse(&r.get::<_, String>(2)?).unwrap_or(Rung::Person),
+                    by: r.get(3)?,
+                    state: r.get(4)?,
+                    why: r.get(5)?,
+                    lines: r.get::<_, Option<String>>(6)?.and_then(|t| serde_json::from_str(&t).ok()),
+                    explanation: r.get(7)?,
+                    commit: r.get(8)?,
+                    tests: r.get::<_, Option<String>>(9)?.as_deref().and_then(Tests::parse),
+                    at: r.get(10)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(fail)
+}
+
+/// A replay's ladder, as kept.
+#[derive(Debug, Clone, Default)]
+struct Kept {
+    state: Option<String>,
+    why: Vec<String>,
+    whole: Option<String>,
+    /// The resolutions the whole was made of.
+    whole_of: Vec<String>,
+    whole_tests: Option<Tests>,
+    accepted_by: Option<String>,
+    accepted_at: Option<i64>,
+    version: Option<u32>,
+}
+
+async fn kept(hub: &Hub, replay: &str) -> Result<Kept, Fail> {
+    let id = replay.to_owned();
+    let row = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row("SELECT state, why, whole_sha, whole_started, whole_tests, accepted_by, accepted_at, version FROM review_ladders WHERE replay_id = ?1", [&id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<u32>>(7)?,
+                ))
+            })
+            .optional()?)
+        })
+        .await
+        .map_err(fail)?;
+    let Some((state, why, whole, started, tests, accepted_by, accepted_at, version)) = row else { return Ok(Kept::default()) };
+    let started: Value = started.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let whole_of = started.get("of").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    Ok(Kept {
+        state: Some(state),
+        why: why.as_deref().and_then(|w| serde_json::from_str(w).ok()).unwrap_or_default(),
+        whole,
+        whole_of,
+        whole_tests: tests.as_deref().and_then(Tests::parse),
+        accepted_by,
+        accepted_at,
+        version,
+    })
+}
+
+async fn save(hub: &Hub, d: &Diff, replay: &str, state: State, why: &[String]) -> Result<(), Fail> {
+    let (rid, did, st, why, now) = (replay.to_owned(), d.id.clone(), state.as_str(), json!(why).to_string(), crate::util::now_unix());
+    let changed = hub
+        .store
+        .call(move |c| {
+            let before: Option<(String, Option<String>)> = c.query_row("SELECT state, why FROM review_ladders WHERE replay_id = ?1", [&rid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            if before.as_ref().is_some_and(|(s, w)| s == st && w.as_deref() == Some(why.as_str())) {
+                return Ok(false);
+            }
+            c.execute(
+                "INSERT INTO review_ladders (replay_id, diff_id, state, why, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (replay_id) DO UPDATE SET state = excluded.state, why = excluded.why, updated_at = excluded.updated_at",
+                params![rid, did, st, why, now],
+            )?;
+            Ok(true)
+        })
+        .await
+        .map_err(fail)?;
+    if changed {
+        hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { state: Some(format!("ladder:{}", state.as_str())), ..conflicts::changed(d, replay) })));
+    }
+    Ok(())
+}
+
+/// A repository's switches (off until turned on).
+async fn switches_of(hub: &Hub, repo_id: &str) -> Switches {
+    let id = repo_id.to_owned();
+    hub.store
+        .call(move |c| Ok(c.query_row("SELECT send_agent, automatic FROM review_ladder_switches WHERE repo_id = ?1", [&id], |r| Ok(Switches { send_agent: r.get(0)?, automatic: r.get(1)? })).optional()?))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// The language a file's hunks are remembered under: its extension (a file without one, its
+/// name).
+fn language_of(file: &str) -> String {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    name.rsplit_once('.').map_or(name, |(_, ext)| ext).to_lowercase()
+}
+
+/// Remembers `lines` as the resolution of the hunk whose sides are `main` and `this` in `file`, in
+/// repository `repo_id`, accepted by `by` (W26-R17's rung 2).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remember(hub: &Hub, repo_id: &str, file: &str, main: &[String], this: &[String], lines: &[String], by: &str, resolution: Option<&str>) {
+    let key = ladder::key(&language_of(file), main, this);
+    let (repo, lines, by, resolution, now) = (repo_id.to_owned(), json!(lines).to_string(), by.to_owned(), resolution.map(str::to_owned), crate::util::now_unix());
+    let done = hub
+        .store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO review_remembered (repo_id, hunk_key, lines, resolution_id, accepted_by, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (repo_id, hunk_key) DO UPDATE SET lines = excluded.lines, resolution_id = excluded.resolution_id, accepted_by = excluded.accepted_by, accepted_at = excluded.accepted_at",
+                params![repo, key, lines, resolution, by, now],
+            )?;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = done {
+        tracing::warn!(error = %format!("{e:#}"), %file, "a resolution wasn't remembered");
+    }
+}
+
+/// The resolution remembered for a hunk, and who accepted it.
+async fn remembered(hub: &Hub, repo_id: &str, c: &ForLadder) -> Result<Option<(Vec<String>, String)>, Fail> {
+    let (repo, key) = (repo_id.to_owned(), ladder::key(&language_of(&c.file), &c.main, &c.this));
+    hub.store
+        .call(move |db| {
+            let got: Option<(String, String)> = db.query_row("SELECT lines, accepted_by FROM review_remembered WHERE repo_id = ?1 AND hunk_key = ?2", params![repo, key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            if got.is_some() {
+                db.execute("UPDATE review_remembered SET used = used + 1 WHERE repo_id = ?1 AND hunk_key = ?2", params![repo, key])?;
+            }
+            Ok(got.and_then(|(lines, by)| serde_json::from_str::<Vec<String>>(&lines).ok().map(|l| (l, by))))
+        })
+        .await
+        .map_err(fail)
+}
+
+// ------------------------------------------------------------------ the climb
+
+/// One move of `d`'s ladder: each conflict tries its next rung, the resolutions are tested
+/// together once each has one, and where the repository allows a tested whole goes on.
+pub(crate) async fn climb(hub: &Arc<Hub>, d: &Diff) -> Result<(), Fail> {
+    let Some(replay) = conflicts::current(hub, d).await?.filter(|r| r.state == "conflicted") else { return Ok(()) };
+    let (repo_id, _) = conflicts::home(hub, d).await?;
+    let views = conflicts::for_ladder(hub, &replay.id).await?;
+    let all = tries(hub, &replay.id).await?;
+    let before = kept(hub, &replay.id).await?;
+    if before.accepted_by.is_some() {
+        return Ok(());
+    }
+    let sw = switches_of(hub, &repo_id).await;
+    let author = if d.author_kind == "agent" { Author::Agent { live: false } } else { Author::Person };
+    let conflicts: Vec<ladder::Conflict> = views
+        .iter()
+        .map(|v| ladder::Conflict { id: v.id.clone(), place: v.place.clone(), text: v.text, candidates: all.iter().filter(|t| t.conflict == v.id).map(Try::candidate).collect(), taken: v.taken })
+        .collect();
+    // The whole stands only for the resolutions it was made of.
+    let first = ladder::next(&conflicts, author, sw, CAN, None);
+    let ready = ready(&first.steps, &all);
+    let whole = if before.whole.is_some() && before.whole_of == ready.keys().cloned().collect::<Vec<_>>() { before.whole_tests } else { None };
+    let next = ladder::next(&conflicts, author, sw, CAN, whole);
+    for (id, step) in &next.steps {
+        if let (Step::Try { rung }, Some(v)) = (step, views.iter().find(|v| &v.id == id)) {
+            attempt(hub, d, &replay, &repo_id, v, *rung, &ready).await?;
+            kick(&d.id);
+        }
+    }
+    match next.state {
+        State::TestWhole => test_whole(hub, d, &replay, &ready).await?,
+        State::GoesOn if !ready.is_empty() => {
+            let by = super::cr::By { pushed_by: "kiln".into(), author: ("kiln".into(), "kiln"), started_by: None };
+            finish(hub, d, &replay, &views, &all, "kiln", by).await?;
+        }
+        _ => {}
+    }
+    save(hub, d, &replay.id, next.state, &next.why).await
+}
+
+/// Each conflict's resolution whose tests passed: its try, by conflict id.
+fn ready<'a>(steps: &[(String, Step)], all: &'a [Try]) -> BTreeMap<String, &'a Try> {
+    let mut out = BTreeMap::new();
+    for (id, s) in steps {
+        if let Step::Ready { rung, .. } = s
+            && let Some(t) = all.iter().rfind(|t| &t.conflict == id && t.rung == *rung && t.state == "resolved" && t.tests.is_some_and(Tests::count))
+        {
+            out.insert(id.clone(), t);
+        }
+    }
+    out
+}
+
+fn picks(ready: &BTreeMap<String, &Try>) -> HashMap<String, Vec<String>> {
+    ready.iter().filter_map(|(id, t)| t.lines.clone().map(|l| (id.clone(), l))).collect()
+}
+
+/// `rung`'s try at conflict `c`, recorded: kept with why, or a candidate committed, kept and
+/// under test.
+async fn attempt(hub: &Hub, d: &Diff, replay: &Replay, repo_id: &str, c: &ForLadder, rung: Rung, ready: &BTreeMap<String, &Try>) -> Result<(), Fail> {
+    let made: Result<(Vec<String>, String), String> = match rung {
+        Rung::Remembered => match remembered(hub, repo_id, c).await? {
+            Some((lines, by)) => Ok((lines, format!("remembered from {by}'s resolution"))),
+            None => Err("nothing is remembered for this conflict".to_owned()),
+        },
+        _ => Err(format!("{} isn't on this kiln's ladder", rung.named())),
+    };
+    let id = crate::util::new_id();
+    let (lines, explanation) = match made {
+        Ok(m) => m,
+        Err(why) => return record(hub, &id, replay, d, c, rung, "kiln", "kept", Some(&why), None, None).await,
+    };
+    let mut p = picks(ready);
+    p.insert(c.id.clone(), lines.clone());
+    let sha = conflicts::candidate(hub, d, replay, &p, "kiln", &[]).await?;
+    let git_ref = format!("refs/kiln/resolve/{}/{id}", d.name);
+    keep_ref(hub, d, &git_ref, &sha).await?;
+    let started = test(hub, d, replay, &sha, &git_ref).await?;
+    record(hub, &id, replay, d, c, rung, "kiln", "resolved", None, Some((&lines, &explanation)), Some((&sha, &started))).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record(hub: &Hub, id: &str, replay: &Replay, d: &Diff, c: &ForLadder, rung: Rung, by: &str, state: &str, why: Option<&str>, made: Option<(&[String], &str)>, commit: Option<(&str, &[String])>) -> Result<(), Fail> {
+    let tests = commit.map(|(_, started)| if started.is_empty() { Tests::NoneToRun } else { Tests::Pending });
+    let row = (
+        id.to_owned(),
+        replay.id.clone(),
+        c.id.clone(),
+        d.id.clone(),
+        rung.as_str(),
+        by.to_owned(),
+        state.to_owned(),
+        why.map(str::to_owned),
+        made.map(|(l, _)| json!(l).to_string()),
+        made.map(|(_, e)| e.to_owned()),
+        commit.map(|(s, _)| s.to_owned()),
+        commit.map(|(_, w)| json!({ "workflows": w }).to_string()),
+        tests.map(Tests::as_str),
+    );
+    let now = crate::util::now_unix();
+    hub.store
+        .call(move |db| {
+            db.execute(
+                "INSERT INTO review_resolutions (id, replay_id, conflict_id, diff_id, rung, made_by, state, why, lines, explanation, commit_sha, started, tests, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11, row.12, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(fail)?;
+    hub.store.audit(by.to_owned(), "diffs.conflict.ladder".into(), format!("{} {} v{} ({}): {}, {state}{}", d.repo, d.name, replay.version, c.place, rung.named(), why.map(|w| format!(": {w}")).unwrap_or_default())).await;
+    Ok(())
+}
+
+async fn keep_ref(hub: &Hub, d: &Diff, git_ref: &str, sha: &str) -> Result<(), Fail> {
+    let (_, path) = conflicts::home(hub, d).await?;
+    gitops::run_git(hub, &["-C", &path, "update-ref", git_ref, sha], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    Ok(())
+}
+
+/// Starts the change's tests on candidate `sha` (kept at `git_ref`): the workflows the land queue
+/// runs on a candidate, with the replay's base as what it's measured from. Their paths.
+async fn test(hub: &Hub, d: &Diff, replay: &Replay, sha: &str, git_ref: &str) -> Result<Vec<String>, Fail> {
+    let (repo, path) = diffs::home(hub, d).await?;
+    let ctx = super::events::facts(hub, &repo).await.repo;
+    let tip = super::land::commit_of(hub, &path, sha).await;
+    let kiln = kiln_ci::trigger::context::Person { name: "kiln".into(), email: String::new(), username: Some("kiln[bot]".into()) };
+    let mut payload = kiln_ci::trigger::context::merge_group(&ctx, &d.trunk, &replay.onto, &tip, git_ref, &kiln);
+    if let Some(p) = payload.as_object_mut() {
+        p.insert("kiln".into(), json!({ "ladder": { "diff": d.name, "replay": replay.id, "version": replay.version } }));
+    }
+    let mg = Event { name: "merge_group".into(), action: "checks_requested".into(), repo: repo.name.clone(), git_ref: git_ref.to_owned(), sha: sha.to_owned(), base_ref: Some(d.trunk.clone()), actor: "kiln".into(), trusted: true, source: Source::Native, payload, ..Event::default() };
+    let landing = Event { name: "land".into(), action: String::new(), ..mg.clone() };
+    super::land::start_checks(hub, &repo, &(mg, landing)).await.map_err(fail)
+}
+
+/// Every conflict's resolution, committed together and under test.
+async fn test_whole(hub: &Hub, d: &Diff, replay: &Replay, ready: &BTreeMap<String, &Try>) -> Result<(), Fail> {
+    let agents: Vec<&str> = ready.values().filter(|t| t.rung == Rung::Agent).map(|t| t.by.as_str()).collect::<BTreeSet<_>>().into_iter().collect();
+    let sha = conflicts::candidate(hub, d, replay, &picks(ready), "kiln", &agents).await?;
+    let git_ref = format!("refs/kiln/resolve/{}/{}/whole", d.name, replay.id);
+    keep_ref(hub, d, &git_ref, &sha).await?;
+    let started = test(hub, d, replay, &sha, &git_ref).await?;
+    let tests = if started.is_empty() { Tests::NoneToRun } else { Tests::Pending };
+    let of: Vec<&String> = ready.keys().collect();
+    let (rid, did, sha2, st, t, now) = (replay.id.clone(), d.id.clone(), sha.clone(), json!({ "workflows": started, "of": of }).to_string(), tests.as_str(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO review_ladders (replay_id, diff_id, state, whole_sha, whole_started, whole_tests, updated_at) VALUES (?1, ?2, 'test_whole', ?3, ?4, ?5, ?6)
+                 ON CONFLICT (replay_id) DO UPDATE SET whole_sha = excluded.whole_sha, whole_started = excluded.whole_started, whole_tests = excluded.whole_tests, updated_at = excluded.updated_at",
+                params![rid, did, sha2, st, t, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(fail)?;
+    kick(&d.id);
+    Ok(())
+}
+
+/// The tested whole of `replay` as `d`'s new version, accepted by `me`; each resolution in it
+/// remembered.
+async fn finish(hub: &Arc<Hub>, d: &Diff, replay: &Replay, views: &[ForLadder], all: &[Try], me: &str, by: super::cr::By) -> Result<u32, Fail> {
+    let k = kept(hub, &replay.id).await?;
+    let sha = k.whole.clone().ok_or_else(|| refused(format!("{}: its resolutions aren't tested together yet", d.name)))?;
+    let n = conflicts::accept(hub, d, replay, &sha, me, by).await?;
+    let (repo_id, _) = conflicts::home(hub, d).await?;
+    for id in &k.whole_of {
+        let (Some(t), Some(v)) = (all.iter().rfind(|t| &t.conflict == id && t.state == "resolved"), views.iter().find(|v| &v.id == id)) else { continue };
+        if let Some(lines) = &t.lines {
+            remember(hub, &repo_id, &v.file, &v.main, &v.this, lines, me, Some(&t.id)).await;
+        }
+    }
+    let (rid, me2, now) = (replay.id.clone(), me.to_owned(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            c.execute("UPDATE review_ladders SET state = 'accepted', accepted_by = ?2, accepted_at = ?3, version = ?4, updated_at = ?3 WHERE replay_id = ?1", params![rid, me2, now, n])?;
+            Ok(())
+        })
+        .await
+        .map_err(fail)?;
+    hub.store.audit(me.to_owned(), "diffs.conflicts.accept".into(), format!("{} {} v{n}: {} resolutions accepted ({sha})", d.repo, d.name, k.whole_of.len())).await;
+    Ok(n)
+}
+
+// ------------------------------------------------------------------ the API
+
+/// `GET /api/diffs/:id/conflicts/ladder`: where `d`'s conflicted replay is on the ladder: its state
+/// and why, each conflict's tries, and the resolutions tested together.
+pub async fn view(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
+    let Some(replay) = conflicts::current(hub, d).await?.filter(|r| r.state == "conflicted") else { return Ok(json!({ "diff": d.name, "replay": null })) };
+    let (repo_id, _) = conflicts::home(hub, d).await?;
+    let all = tries(hub, &replay.id).await?;
+    let k = kept(hub, &replay.id).await?;
+    let sw = switches_of(hub, &repo_id).await;
+    let mut by: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for t in &all {
+        by.entry(t.conflict.as_str()).or_default().push(t.view());
+    }
+    Ok(json!({
+        "diff": d.name, "replay": replay.id, "version": replay.version,
+        "state": k.state, "why": k.why,
+        "conflicts": by,
+        "whole": k.whole.as_ref().map(|sha| json!({ "commit": sha, "of": k.whole_of, "tests": k.whole_tests.map(Tests::as_str) })),
+        "accepted": k.accepted_by.as_ref().map(|who| json!({ "by": who, "at": k.accepted_at, "version": k.version, "signer": Value::Null })),
+        "switches": { "send_agent": sw.send_agent, "automatic": sw.automatic },
+    }))
+}
+
+/// `POST /api/diffs/:id/conflicts/accept`: a person accepts the resolutions the ladder offers (all
+/// of them, tested together): `d`'s new version, its why `conflict resolved`. An agent can't.
+pub async fn accept(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, Fail> {
+    conflicts::may_change(caller, d)?;
+    let (me, agent) = super::review::who(caller);
+    if agent {
+        return Err((StatusCode::FORBIDDEN, format!("{}: a person accepts a conflict's resolution", d.name)));
+    }
+    let replay = conflicts::current(hub, d).await?.filter(|r| r.state == "conflicted").ok_or_else(|| refused(format!("{} goes onto where it lands cleanly: nothing to accept", d.name)))?;
+    let k = kept(hub, &replay.id).await?;
+    if k.state.as_deref() != Some(State::Offered.as_str()) {
+        let why = if k.why.is_empty() { "nothing is offered yet".to_owned() } else { k.why.join("; ") };
+        return Err(refused(format!("{}: {why}", d.name)));
+    }
+    let views = conflicts::for_ladder(hub, &replay.id).await?;
+    let all = tries(hub, &replay.id).await?;
+    let by = super::cr::By { pushed_by: caller.name.clone(), author: diffs::author_of(&caller.name, Some(caller.kind)), started_by: caller.started_by() };
+    let n = finish(hub, d, &replay, &views, &all, &me, by).await?;
+    Ok(json!({ "diff": d.name, "version": n, "why": conflicts::WHY, "accepted_by": me, "replay": replay.id }))
+}
+
+/// `GET` or `PUT /api/repos/:repo/ladder`: a repository's switches, `send_agent` and `automatic`
+/// (both off by default). Changing them takes `diffs.land` on the repository.
+pub async fn switches(hub: &Hub, repo: &str, caller: &Caller, body: Option<&Value>) -> Result<Value, Fail> {
+    let repos = hub.store.repos().await.map_err(fail)?;
+    let r = repos.into_iter().find(|r| r.name == repo).ok_or((StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
+    let scope = Scope::Repo { repo: r.name.clone() };
+    if !caller.can("diffs.read", &scope) {
+        return Err((StatusCode::FORBIDDEN, "reading a repository's ladder needs `diffs.read`".into()));
+    }
+    if let Some(body) = body {
+        if !caller.can("diffs.land", &scope) {
+            return Err((StatusCode::FORBIDDEN, "changing a repository's ladder needs `diffs.land`".into()));
+        }
+        let was = switches_of(hub, &r.id).await;
+        let flag = |k: &str, was: bool| body.get(k).map_or(Ok(was), |v| v.as_bool().ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}`: true or false"))));
+        let sw = Switches { send_agent: flag("send_agent", was.send_agent)?, automatic: flag("automatic", was.automatic)? };
+        let (id, by, now) = (r.id.clone(), caller.name.clone(), crate::util::now_unix());
+        hub.store
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO review_ladder_switches (repo_id, send_agent, automatic, set_by, set_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (repo_id) DO UPDATE SET send_agent = excluded.send_agent, automatic = excluded.automatic, set_by = excluded.set_by, set_at = excluded.set_at",
+                    params![id, sw.send_agent, sw.automatic, by, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(fail)?;
+        hub.store.audit(caller.name.clone(), "repo.ladder".into(), format!("{}: send an agent {}, automatic resolution {}", r.name, if sw.send_agent { "on" } else { "off" }, if sw.automatic { "on" } else { "off" })).await;
+    }
+    let sw = switches_of(hub, &r.id).await;
+    Ok(json!({
+        "repo": r.name, "send_agent": sw.send_agent, "automatic": sw.automatic,
+        "says": {
+            "send_agent": "When a change's conflicts are left after kiln's merge and what it remembers, kiln sends an agent to a runner that has this repository, in a workspace of its own, to resolve them and run their tests.",
+            "automatic": "A resolution whose tests pass goes on without a person: it becomes the change's new version by itself. While this is off, a person confirms each one.",
+        },
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::language_of;
+
+    #[test]
+    fn w26_r17_a_files_language_is_its_extension() {
+        assert_eq!(language_of("plan/expand.rs"), "rs");
+        assert_eq!(language_of("ui/App.TSX"), "tsx");
+        assert_eq!(language_of("Makefile"), "makefile");
+    }
+}

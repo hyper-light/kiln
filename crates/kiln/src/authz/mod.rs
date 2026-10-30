@@ -385,6 +385,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
     r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    // The conflict ladder (W26-R17): accepting what it offers changes the code, as Commit resolution does.
+    r("POST", "/api/diffs/*/conflicts/accept", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
@@ -395,6 +397,9 @@ pub static ROUTES: &[Rule] = &[
     // The caller's own notifications, marked read (W19-R06).
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    // A repository's ladder switches (W26-R17): changing them is a maintainer's.
+    r("GET", "/api/repos/*/ladder", "diffs.read", At::Repo(2)),
+    r("PUT", "/api/repos/*/ladder", "diffs.land", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
     r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),
@@ -406,6 +411,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/accept", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),

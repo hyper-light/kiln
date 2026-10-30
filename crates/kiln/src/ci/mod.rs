@@ -31,6 +31,7 @@ pub mod images;
 pub mod inbox;
 pub mod pools;
 pub mod insights;
+pub mod ladder;
 pub mod land;
 pub mod integrations;
 pub mod load;

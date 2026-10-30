@@ -1664,6 +1664,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["repos", repo, "submit"]) => ok(submit_patches(hub, repo, caller, body).await?),
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
+        (&Method::GET, ["repos", repo, "ladder"]) => ok(super::ladder::switches(hub, repo, caller, None).await?),
+        (&Method::PUT, ["repos", repo, "ladder"]) => ok(super::ladder::switches(hub, repo, caller, Some(body)).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => {
             let mut v = super::review::inbox(hub, caller).await?;
@@ -1742,6 +1744,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 // Its conflicts with where it lands, resolved where they fall, then committed (W26-R12).
                 (&Method::GET, ["conflicts"]) => ok(super::conflicts::list(hub, &d).await?),
                 (&Method::POST, ["conflicts", "commit"]) => ok(super::conflicts::commit(hub, &d, caller).await?),
+                (&Method::GET, ["conflicts", "ladder"]) => ok(super::ladder::view(hub, &d).await?),
+                (&Method::POST, ["conflicts", "accept"]) => ok(super::ladder::accept(hub, &d, caller).await?),
                 (&Method::POST, ["conflicts", id, "resolution"]) => ok(super::conflicts::resolve(hub, &d, id, caller, body).await?),
                 (&Method::DELETE, ["conflicts", id, "resolution"]) => ok(super::conflicts::undo(hub, &d, id, caller).await?),
                 (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),

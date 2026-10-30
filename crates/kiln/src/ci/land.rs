@@ -740,7 +740,7 @@ async fn apply(hub: &Hub, path: &str, tip: &str, e: &Entry) -> Result<Applied, R
 }
 
 /// A commit as payloads describe it: its tree, message, and who and when.
-async fn commit_of(hub: &Hub, path: &str, sha: &str) -> kiln_ci::trigger::context::Commit {
+pub(crate) async fn commit_of(hub: &Hub, path: &str, sha: &str) -> kiln_ci::trigger::context::Commit {
     use kiln_ci::trigger::context::{Commit, Person};
     let o = gitops::run_git(hub, &["-C", path, "show", "-s", "--format=%T%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%B", sha], LS_REMOTE_TIMEOUT).await.unwrap_or_default();
     let text = String::from_utf8_lossy(&o).into_owned();
@@ -767,7 +767,7 @@ fn candidate_events(ctx: &kiln_ci::trigger::context::Repo, repo: &Repo, trunk: &
 }
 
 /// Starts the candidate's workflows: those whose `on` takes `merge_group` or `land`. Their paths.
-async fn start_checks(hub: &Hub, repo: &Repo, events: &(Event, Event)) -> anyhow::Result<Vec<String>> {
+pub(crate) async fn start_checks(hub: &Hub, repo: &Repo, events: &(Event, Event)) -> anyhow::Result<Vec<String>> {
     if !hub.ci.enabled() {
         return Ok(Vec::new());
     }
