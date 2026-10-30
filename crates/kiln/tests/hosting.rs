@@ -4106,13 +4106,18 @@ fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
     let (st, r) = http(s.port, "PATCH", &format!("/api/comments/{cid}"), &kim, Some(&json!({ "state": "resolved" })))?;
     anyhow::ensure!(st == 200, "kim resolves: {r}");
 
-    // Main moves on the same line: replayed, the replay conflicts; resolved and committed (v3).
+    // Main moves on the same line: replayed, the replay conflicts and is kept with its conflicts (v3,
+    // W26-R16); resolved and committed (v4).
     must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "owner"]), "the owner's clone")?;
     let owner = dir.path().join("owner");
     std::fs::write(owner.join("expand.rs"), "fn expand(m: &Matrix) {\n    let first = 100;\n}\n")?;
     must(git(&home, &owner, &["add", "-A"]), "add")?;
     must(git(&home, &owner, &["commit", "-qm", "main moves"]), "commit")?;
     must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
+    until(60, "D1 v3 kept with its conflicts", || {
+        let d = api(&s, &kim, "GET", "/api/diffs/D1")?;
+        Ok((d.pointer("/versions/2/why") != Some(&json!("replayed with conflicts"))).then(|| d.to_string()))
+    })?;
     let got = api(&s, &kim, "GET", "/api/diffs/D1/conflicts")?;
     assert_eq!(got.pointer("/replay/state"), Some(&json!("conflicted")), "{got}");
     let list = got.get("conflicts").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -4124,14 +4129,14 @@ fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
     }
     let (st, r) = post(&s, &dev, "/api/diffs/D1/conflicts/commit", &json!({}))?;
     anyhow::ensure!(st == 200, "commit resolution: {r}");
-    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(3)), "conflict resolved"), "{r}");
+    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(4)), "conflict resolved"), "{r}");
     let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
     anyhow::ensure!(st == 200, "accept: {r}");
 
     // The change's tip carries the Review lane group, oldest first.
     let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
-    let tip = d.pointer("/versions/2/commit").and_then(Value::as_str).unwrap_or_default().to_owned();
-    assert_eq!(d.pointer("/versions/2/n"), Some(&json!(3)), "{d}");
+    let tip = d.pointer("/versions/3/commit").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert_eq!(d.pointer("/versions/3/n"), Some(&json!(4)), "{d}");
     let one = api(&s, &dev, "GET", &format!("/api/ship/commits/acme/app/{tip}"))?;
     let marks = one.get("review").and_then(Value::as_array).cloned().unwrap_or_default();
     assert!(marks.len() >= 6, "a mark per event: {marks:?}");
@@ -4160,9 +4165,9 @@ fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
     let replay = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("replay")).cloned().unwrap_or_default();
     assert_eq!((replay.get("by"), replay.get("state"), replay.get("note")), (Some(&json!("kiln")), Some(&json!("passed")), Some(&json!("onto main"))), "{replay}");
     let resolution = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("resolution")).cloned().unwrap_or_default();
-    assert!(by(&resolution).ends_with("user:dev") && resolution.get("revision") == Some(&json!(3)), "{resolution}");
+    assert!(by(&resolution).ends_with("user:dev") && resolution.get("revision") == Some(&json!(4)), "{resolution}");
     let verdict = marks.last().cloned().unwrap_or_default();
-    assert!(verdict.get("kind") == Some(&json!("approval")) && by(&verdict).ends_with("user:rev") && verdict.get("state") == Some(&json!("approved")) && verdict.get("revision") == Some(&json!(3)), "{verdict}");
+    assert!(verdict.get("kind") == Some(&json!("approval")) && by(&verdict).ends_with("user:rev") && verdict.get("state") == Some(&json!("approved")) && verdict.get("revision") == Some(&json!(4)), "{verdict}");
 
     // A commit with no change has the one mark, its push — covered in ship.rs's
     // w26_r14_a_commit_with_no_change_carries_its_push (a bare trunk commit gets no runs here).

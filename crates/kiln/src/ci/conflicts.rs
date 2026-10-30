@@ -78,9 +78,12 @@ pub struct Replay {
     pub resolved_version: Option<u32>,
     pub resolved_by: Option<String>,
     pub resolved_at: Option<i64>,
+    /// The version that keeps it as a revision (its conflict markers in), when kiln replayed it as
+    /// its trunk moved (W26-R16): the changes above it are on that version.
+    pub kept_version: Option<u32>,
 }
 
-const REPLAY_COLUMNS: &str = "id, version, commit_sha, onto, onto_name, tree, state, created_by, created_at, resolved_version, resolved_by, resolved_at";
+const REPLAY_COLUMNS: &str = "id, version, commit_sha, onto, onto_name, tree, state, created_by, created_at, resolved_version, resolved_by, resolved_at, kept_version";
 
 fn replay_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Replay> {
     Ok(Replay {
@@ -96,6 +99,7 @@ fn replay_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Replay> {
         resolved_version: r.get(9)?,
         resolved_by: r.get(10)?,
         resolved_at: r.get(11)?,
+        kept_version: r.get(12)?,
     })
 }
 
@@ -475,13 +479,51 @@ async fn record(hub: &Hub, d: &Diff, v: &Version, onto: &Onto, tree: &str, found
     Ok(replay)
 }
 
+/// The replay a kept conflicted revision (version `n` of `diff_id`) keeps.
+async fn kept_by(hub: &Hub, diff_id: &str, n: u32) -> Result<Option<Replay>, Fail> {
+    let id = diff_id.to_owned();
+    hub.store
+        .call(move |c| Ok(c.query_row(&format!("SELECT {REPLAY_COLUMNS} FROM review_replays WHERE diff_id = ?1 AND kept_version = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1"), params![id, n], replay_row).optional()?))
+        .await
+        .map_err(fail)
+}
+
+/// The version of `d` a replay starts from: its latest, or, when that's a conflicted replay kept as a
+/// revision (W26-R16), the version that replay is of (its markers are never replayed again).
+pub(crate) async fn source(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Option<Version>, Fail> {
+    let Some(latest) = versions.last() else { return Ok(None) };
+    if latest.why.as_deref() != Some(kiln_ci::fresh::WHY_CONFLICTED) {
+        return Ok(Some(latest.clone()));
+    }
+    let Some(r) = kept_by(hub, &d.id, latest.n).await? else { return Ok(Some(latest.clone())) };
+    Ok(versions.iter().find(|v| v.n == r.version).cloned().or_else(|| Some(latest.clone())))
+}
+
+/// A conflicted replay kiln made as `d`'s trunk moved (W26-R16): `v` replayed onto `onto` (named
+/// `onto_name`; on trunk commit `base`; onto the open diff `below`), as git merged it (`m`), kept with
+/// each conflict where it falls, as W26-R12's are; the version that keeps it names it as it goes in
+/// (`diffs::NewVersion::keeps`).
+pub(crate) async fn keep(hub: &Hub, path: &str, d: &Diff, v: &Version, onto: (&str, &str, &str, Option<String>), m: &Merged) -> Result<Replay, Fail> {
+    let found = found(hub, path, m).await?;
+    let (commit, name, base, below) = onto;
+    let onto = Onto { name: name.to_owned(), commit: commit.to_owned(), base: base.to_owned(), below };
+    record(hub, d, v, &onto, &m.tree, found).await
+}
+
 /// The replay of `d`'s latest revision onto where it goes now, made and kept when it's new. `None`
-/// when there's nothing to replay: the revision is on it already, or `d` is closed or landing.
+/// when there's nothing to replay: the revision is on it already, or `d` is closed or landing. A
+/// latest revision that keeps a conflicted replay (W26-R16) is that replay, which holds the gate
+/// until a resolution is committed.
 pub async fn current(hub: &Hub, d: &Diff) -> Result<Option<Replay>, Fail> {
     if !State::parse(&d.state).is_some_and(|s| s.is_open() && s != State::Landing) {
         return Ok(None);
     }
     let Some(latest) = diffs::versions(hub, d).await.map_err(fail)?.pop() else { return Ok(None) };
+    if latest.why.as_deref() == Some(kiln_ci::fresh::WHY_CONFLICTED)
+        && let Some(r) = kept_by(hub, &d.id, latest.n).await?
+    {
+        return Ok(Some(r));
+    }
     let (_, path) = diffs::home(hub, d).await?;
     let onto = onto_of(hub, d, &path).await?;
     if let Some(r) = kept_replay(hub, &d.id, latest.n, &onto.commit).await? {
@@ -778,8 +820,19 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
         return Err(refused(open.join("; ")));
     }
     let (repo, path) = diffs::home(hub, d).await?;
-    let latest = diffs::versions(hub, d).await.map_err(fail)?.pop().filter(|v| v.n == replay.version).ok_or_else(|| refused(format!("{} has a newer revision: look again", d.name)))?;
-    let onto = onto_of(hub, d, &path).await?;
+    let all = diffs::versions(hub, d).await.map_err(fail)?;
+    // A conflicted replay kiln kept as a revision (W26-R16) resolves from the version it replayed,
+    // onto what it was replayed onto.
+    let kept = all.last().is_some_and(|v| replay.kept_version == Some(v.n));
+    let latest = match kept {
+        true => all.iter().find(|v| v.n == replay.version).cloned(),
+        false => all.last().cloned().filter(|v| v.n == replay.version),
+    }
+    .ok_or_else(|| refused(format!("{} has a newer revision: look again", d.name)))?;
+    let onto = match kept {
+        true => Onto { name: replay.onto_name.clone(), commit: replay.onto.clone(), base: all.iter().find(|v| Some(v.n) == replay.kept_version).map(|v| v.base.clone()).unwrap_or_default(), below: onto_of(hub, d, &path).await?.below },
+        false => onto_of(hub, d, &path).await?,
+    };
     if onto.commit != replay.onto {
         return Err(refused(format!("{} moved: look again", onto.name)));
     }
@@ -813,7 +866,7 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
             let made = revision::commit(hub, &path, &revision::Commit { tree: &tree, parents: &[onto.commit.as_str()], author: (author, Some(date)), by: &caller.name, co_authors: &agents, message: &message }).await.map_err(internal)?;
             let patch = diffs::git_run(hub, &["-C", &path, "show", "--no-color", &made.sha], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
             let patch_id = diffs::git_with_input(hub, &["-C", &path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
-            let nv = diffs::NewVersion { commit: made.sha.clone(), parent: onto.commit.clone(), base: onto.base.clone(), patch_id, message: made.message.clone(), note: None, rebase_only: false, pushed_by: caller.name.clone(), parent_diff: onto.below.clone() };
+            let nv = diffs::NewVersion { commit: made.sha.clone(), parent: onto.commit.clone(), base: onto.base.clone(), patch_id, message: made.message.clone(), note: None, rebase_only: false, pushed_by: caller.name.clone(), parent_diff: onto.below.clone(), why: None, keeps: None };
             (diffs::add_version(hub, &repo, &path, d, nv).await.map_err(fail)?, made)
         }
     };
@@ -827,6 +880,10 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
     hub.store.audit(caller.name.clone(), "diffs.conflicts.commit".into(), format!("{} {} v{n}: {} conflicts resolved onto {} ({})", d.repo, d.name, rows.len(), onto.name, made.sha)).await;
     // What waits on the gate asks it again: an automatic merge goes once it clears.
     super::land::kick();
+    // The changes above it, on its conflicted revision, are replayed onto the resolution (W26-R16).
+    if kept {
+        super::fresh::moved(hub, &repo, &d.trunk, "", &onto.base);
+    }
     hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { version: Some(n), state: Some("resolved".to_owned()), by: Some(me.clone()), ..changed(d, &replay.id) })));
     Ok(json!({ "diff": d.name, "version": n, "why": WHY, "commit": made.sha, "by": me, "signer": made.signer, "replay": replay.id, "conflicts": rows.len() }))
 }

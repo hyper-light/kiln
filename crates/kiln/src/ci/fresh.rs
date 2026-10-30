@@ -31,7 +31,15 @@ use crate::store::Repo;
 #[derive(Default)]
 pub struct Queue {
     moves: parking_lot::Mutex<Vec<(String, Move)>>,
+    /// Repositories (by id) and trunks whose open changes changed: the collision radar looks again.
+    changed: parking_lot::Mutex<BTreeSet<(String, String)>>,
     kick: Notify,
+}
+
+/// An open change of `trunk` in `repo` has a new revision: the collision radar looks again.
+pub fn changed(hub: &Hub, repo: &Repo, trunk: &str) {
+    hub.fresh.changed.lock().insert((repo.id.clone(), trunk.to_owned()));
+    hub.fresh.kick.notify();
 }
 
 /// Trunk `trunk` of `repo` moved from `before` to `after`: its open changes are replayed onto it.
@@ -44,6 +52,7 @@ pub fn moved(hub: &Hub, repo: &Repo, trunk: &str, before: &str, after: &str) {
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         let queued = std::mem::take(&mut *hub.fresh.moves.lock());
+        let mut looks = std::mem::take(&mut *hub.fresh.changed.lock());
         let mut by_repo: BTreeMap<String, Vec<Move>> = BTreeMap::new();
         for (repo, m) in queued {
             by_repo.entry(repo).or_default().push(m);
@@ -56,6 +65,13 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
                     Ok(r) => tracing::info!(repo = %repo.name, trunk = %m.trunk, tip = %m.after, replayed = r.replayed, conflicted = r.conflicted, waiting = r.waiting, "open changes replayed onto the trunk"),
                     Err(e) => tracing::warn!(repo = %repo.name, trunk = %m.trunk, error = %format!("{e:#}"), "open changes couldn't be replayed onto the trunk"),
                 }
+                looks.insert((repo.id.clone(), m.trunk.clone()));
+            }
+        }
+        for (repo_id, trunk) in looks {
+            let Some(repo) = hub.store.repos().await.ok().and_then(|rs| rs.into_iter().find(|r| r.id == repo_id)) else { continue };
+            if let Err(e) = radar(&hub, &repo, &trunk).await {
+                tracing::warn!(repo = %repo.name, %trunk, error = %format!("{e:#}"), "the collision radar didn't look");
             }
         }
         futures::select_biased! {
@@ -76,7 +92,11 @@ pub struct Round {
 /// One open diff or change request, as a round reads it.
 struct Open {
     diff: Diff,
+    /// Its latest revision: what the changes above it are on.
     latest: Version,
+    /// The revision a replay starts from: its latest, or the one a kept conflicted revision is a
+    /// replay of (its markers are never replayed again).
+    source: Version,
 }
 
 /// The open changes of `trunk` in `repo`, each with its latest revision, by number; and the
@@ -95,9 +115,11 @@ async fn open_changes(hub: &Hub, repo: &Repo, trunk: &str) -> anyhow::Result<Vec
     let mut out = Vec::new();
     for (id, below, _) in rows.iter().filter(|(id, _, _)| open.contains(id.as_str())) {
         let Some(diff) = diffs::find(hub, id).await? else { continue };
-        let Some(latest) = diffs::versions(hub, &diff).await?.pop() else { continue };
+        let all = diffs::versions(hub, &diff).await?;
+        let Some(latest) = all.last().cloned() else { continue };
+        let source = conflicts::source(hub, &diff, &all).await.map_err(|(_, why)| anyhow::anyhow!(why))?.unwrap_or_else(|| latest.clone());
         let below = below.clone().filter(|b| open.contains(b.as_str()));
-        out.push((Open { diff, latest }, below));
+        out.push((Open { diff, latest, source }, below));
     }
     Ok(out)
 }
@@ -122,11 +144,13 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
     if found.is_empty() {
         return Ok(Round::default());
     }
+    let latest_of: HashMap<&str, &str> = found.iter().map(|(o, _)| (o.diff.id.as_str(), o.latest.commit.as_str())).collect();
     let mut changes = Vec::with_capacity(found.len());
     for (o, below) in &found {
         let on = if contains(hub, &path, tip, &o.latest.commit).await { tip.to_owned() } else { o.latest.base.clone() };
         let kind = if o.diff.kind == "change_request" { Kind::Request } else { Kind::Diff };
-        changes.push(Change { id: o.diff.id.clone(), kind, trunk: trunk.to_owned(), below: below.clone(), on });
+        let on_below = below.as_deref().and_then(|b| latest_of.get(b)).is_none_or(|b| *b == o.latest.parent);
+        changes.push(Change { id: o.diff.id.clone(), kind, trunk: trunk.to_owned(), below: below.clone(), on, on_below });
     }
     let tips = BTreeMap::from([(trunk.to_owned(), tip.to_owned())]);
     let p = plan::plan(&tips, &changes);
@@ -135,18 +159,19 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
     }
     let by_id: HashMap<&str, &Open> = found.iter().map(|(o, _)| (o.diff.id.as_str(), o)).collect();
     let tip_name = format!("{trunk}@{}", tip.get(..7).unwrap_or(tip));
-    // Each change replayed cleanly this round: its new commit, for the changes above it.
+    // Each change replayed this round, cleanly or kept with its conflicts: its new commit, for the
+    // changes above it.
     let mut replayed: HashMap<String, String> = HashMap::new();
     let mut made: Vec<(Diff, NewVersion)> = Vec::new();
     let mut conflicted: BTreeSet<String> = BTreeSet::new();
     let mut waiting = 0usize;
     for r in &p.replays {
         let Some(o) = by_id.get(r.id.as_str()) else { continue };
-        let (onto, below) = match &r.onto {
-            Onto::Tip(t) => (t.clone(), None),
-            Onto::Below(b) => match replayed.get(b) {
-                Some(c) => (c.clone(), Some(b.clone())),
-                // What's below it conflicted or couldn't be replayed: it waits.
+        let (onto, onto_name, below) = match &r.onto {
+            Onto::Tip(t) => (t.clone(), trunk.to_owned(), None),
+            Onto::Below(b) => match replayed.get(b).map(String::as_str).or_else(|| latest_of.get(b.as_str()).copied()) {
+                Some(c) => (c.to_owned(), by_id.get(b.as_str()).map(|x| format!("{} v{}", x.diff.name, x.latest.n)).unwrap_or_else(|| b.clone()), Some(b.clone())),
+                // What's below it couldn't be replayed: it waits for the next round.
                 None => {
                     waiting += 1;
                     continue;
@@ -154,7 +179,7 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
             },
         };
         let request = o.diff.kind == "change_request";
-        let (clean, merged) = match conflicts::merge_tree(hub, &path, &onto, &o.latest, request).await {
+        let (clean, merged) = match conflicts::merge_tree(hub, &path, &onto, &o.source, request).await {
             Ok(x) => x,
             Err((_, why)) => {
                 tracing::warn!(repo = %repo.name, diff = %o.diff.name, %why, "a change's replay didn't run");
@@ -162,15 +187,30 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
                 continue;
             }
         };
-        if !clean {
-            conflicted.insert(o.diff.id.clone());
-            continue;
-        }
-        match commit(hub, &path, o, &onto, &merged.tree, &tip_name).await {
+        // Clean or not, it's a revision: a conflicted one is git's merge with its markers in, kept
+        // so the changes above it still move (as jj's do), its conflicts holding its gate.
+        match commit(hub, &path, o, &onto, &merged.tree, &tip_name, clean).await {
             Ok((sha, message, patch_id)) => {
                 replayed.insert(o.diff.id.clone(), sha.clone());
-                let note = Some(format!("replayed onto {tip_name}"));
-                made.push((o.diff.clone(), NewVersion { commit: sha, parent: onto, base: tip.to_owned(), patch_id, message, note, rebase_only: true, pushed_by: "kiln".into(), parent_diff: below }));
+                let note = Some(if clean { format!("replayed onto {tip_name}") } else { format!("replayed onto {tip_name} with conflicts") });
+                // A conflicting replay is kept where its conflicts fall first (W26-R12's records),
+                // so its revision, going in with its name on it, never shows without them.
+                let keeps = if clean {
+                    None
+                } else {
+                    conflicted.insert(o.diff.id.clone());
+                    match conflicts::keep(hub, &path, &o.diff, &o.source, (&onto, &onto_name, tip, below.clone()), &merged).await {
+                        Ok(r) => Some(r.id),
+                        Err((_, why)) => {
+                            tracing::warn!(repo = %repo.name, diff = %o.diff.name, %why, "a conflicting replay couldn't be kept");
+                            replayed.remove(&o.diff.id);
+                            waiting += 1;
+                            continue;
+                        }
+                    }
+                };
+                let why = Some(if clean { plan::WHY } else { plan::WHY_CONFLICTED }.to_owned());
+                made.push((o.diff.clone(), NewVersion { commit: sha, parent: onto, base: tip.to_owned(), patch_id, message, note, rebase_only: clean, pushed_by: "kiln".into(), parent_diff: below, why, keeps }));
             }
             Err(e) => {
                 tracing::warn!(repo = %repo.name, diff = %o.diff.name, error = %e, "a change's replay couldn't be committed");
@@ -182,40 +222,33 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
     // the land queue's candidate tests it on the trunk as it lands.
     let numbers = diffs::add_versions(hub, repo, &path, made.clone(), false).await?;
     for ((d, v), n) in made.iter().zip(&numbers) {
-        // Why the revision exists (W26-R04).
-        revision::record(hub, &d.id, *n, &v.commit, &revision::Why { why: plan::WHY, thread: None, comment: None, note: None }).await?;
+        let clean = !conflicted.contains(&d.id);
         // Pushed now only where the repository turned automatic pushes on (`fresh.push: auto`).
-        if plan::then(policy.fresh, plan::Outcome::Clean, d.branch.is_some() && d.kind == "change_request").push {
+        if clean && plan::then(policy.fresh, plan::Outcome::Clean, d.branch.is_some() && d.kind == "change_request").push {
             match move_branch(hub, repo, &path, d, &v.commit).await {
                 Ok(branch) => hub.store.audit("kiln".into(), "review.fresh.push".into(), format!("{} {} v{n}: {branch} moved to its replay, automatically (.kiln/review.yaml's fresh.push: auto)", repo.name, d.name)).await,
                 Err(why) => tracing::info!(repo = %repo.name, diff = %d.name, %why, "a replay wasn't pushed automatically"),
             }
         }
     }
-    // A conflicting replay is kept where it falls, for the ladder; the ones above it wait.
-    for id in &conflicted {
-        if let Some(o) = by_id.get(id.as_str())
-            && let Err((_, why)) = conflicts::current(hub, &o.diff).await
-        {
-            tracing::warn!(repo = %repo.name, diff = %o.diff.name, %why, "a conflicting replay couldn't be kept");
-        }
-    }
-    if !made.is_empty() || !conflicted.is_empty() {
-        hub.store.audit("kiln".into(), "review.fresh".into(), format!("{} {tip_name}: {} replayed, {} conflicted, {waiting} waiting", repo.name, made.len(), conflicted.len())).await;
+    let clean = made.len().saturating_sub(conflicted.len());
+    if !made.is_empty() {
+        hub.store.audit("kiln".into(), "review.fresh".into(), format!("{} {tip_name}: {clean} replayed clean, {} kept with conflicts, {waiting} waiting", repo.name, conflicted.len())).await;
         super::land::kick();
     }
-    Ok(Round { replayed: made.len(), conflicted: conflicted.len(), waiting })
+    Ok(Round { replayed: clean, conflicted: conflicted.len(), waiting })
 }
 
-/// The commit of a clean replay of `o` onto `onto` (tree `tree`), made by kiln through
-/// `revision::commit`: a diff's commit with its author, date and message kept (its `Kiln-Change`
-/// line with it); a change request's branch merged with where it goes. Its SHA, message and
-/// patch-id.
-async fn commit(hub: &Hub, path: &str, o: &Open, onto: &str, tree: &str, tip_name: &str) -> Result<(String, String, String), String> {
-    let v = &o.latest;
+/// The commit of a replay of `o` onto `onto` (tree `tree`: a conflicted one's has git's markers in),
+/// made by kiln through `revision::commit`: a diff's commit with its author, date and message kept
+/// (its `Kiln-Change` line with it); a change request's branch merged with where it goes. Its SHA,
+/// message and patch-id.
+async fn commit(hub: &Hub, path: &str, o: &Open, onto: &str, tree: &str, tip_name: &str, clean: bool) -> Result<(String, String, String), String> {
+    let v = &o.source;
     let made = match &o.diff.branch {
         Some(branch) if o.diff.kind == "change_request" => {
-            let message = format!("Merge {tip_name} into {branch}\n\nReplayed by kiln as {} moved.\n", o.diff.trunk);
+            let with = if clean { "" } else { ", with conflicts to resolve" };
+            let message = format!("Merge {tip_name} into {branch}\n\nReplayed by kiln as {} moved{with}.\n", o.diff.trunk);
             revision::commit(hub, path, &revision::Commit { tree, parents: &[v.commit.as_str(), onto], author: ("kiln", None), by: "kiln", co_authors: &[], message: &message }).await?
         }
         _ => {
@@ -395,4 +428,139 @@ pub async fn update(hub: &Hub, d: &Diff, caller: &crate::authz::Caller) -> Resul
     let branch = move_branch(hub, &repo, &path, d, &latest.commit).await.map_err(|why| (StatusCode::CONFLICT, why))?;
     hub.store.audit(caller.name.clone(), "review.fresh.update".into(), format!("{} {} v{}: {branch} moved to its replay ({})", d.repo, d.name, latest.n, latest.commit)).await;
     Ok(serde_json::json!({ "change": d.name, "version": latest.n, "branch": branch, "head": latest.commit, "by": caller.name }))
+}
+
+/// `git diff -U0` from `from` to `to` in the repository at `path`.
+async fn unified(hub: &Hub, path: &str, from: &str, to: &str) -> String {
+    gitops::run_git(hub, &["-C", path, "diff", "-U0", "--no-color", "--no-ext-diff", from, to], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default()
+}
+
+/// Where `commit` left the trunk at `tip`: their merge base.
+async fn fork(hub: &Hub, path: &str, tip: &str, commit: &str) -> Option<String> {
+    gitops::run_git(hub, &["-C", path, "merge-base", tip, commit], LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).trim().to_owned()).filter(|s| !s.is_empty())
+}
+
+/// The collision radar (W26-R16): every open change of `trunk` in `repo` (kiln's diffs and change
+/// requests; a mirrored repository's pull requests), the lines each changes (a diff its own patch's,
+/// a branch's from where it left the trunk), and each pair from different stacks that change the same
+/// lines of a file told to both their authors, once a pair and file (`kiln_ci::fresh::collisions`),
+/// now rather than once one lands. A pair that no longer overlaps is marked gone.
+pub async fn radar(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<usize> {
+    let (path, native) = match super::hosting::native_path(hub, repo) {
+        Some(p) => (p.to_string_lossy().into_owned(), true),
+        None => (gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned(), false),
+    };
+    let Ok(tip) = gitops::run_git(hub, &["-C", &path, "rev-parse", "--verify", "--quiet", &format!("refs/heads/{trunk}^{{commit}}")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()) else {
+        return Ok(0);
+    };
+    // (its name, its author, its stack's bottom, the diff of its lines)
+    let mut changes: Vec<(String, String, String, String)> = Vec::new();
+    if native {
+        let found = open_changes(hub, repo, trunk).await?;
+        let below: HashMap<String, String> = found.iter().filter_map(|(o, b)| b.clone().map(|b| (o.diff.id.clone(), b))).collect();
+        let names: HashMap<String, String> = found.iter().map(|(o, _)| (o.diff.id.clone(), o.diff.name.clone())).collect();
+        for (o, _) in &found {
+            let mut bottom = o.diff.id.clone();
+            for _ in 0..1000 {
+                match below.get(&bottom) {
+                    Some(b) => bottom = b.clone(),
+                    None => break,
+                }
+            }
+            let text = if o.diff.kind == "change_request" {
+                match fork(hub, &path, &tip, &o.latest.commit).await {
+                    Some(f) => unified(hub, &path, &f, &o.latest.commit).await,
+                    None => continue,
+                }
+            } else {
+                unified(hub, &path, &o.latest.parent, &o.latest.commit).await
+            };
+            changes.push((o.diff.name.clone(), o.diff.author_for.clone().unwrap_or_else(|| o.diff.author.clone()), names.get(&bottom).cloned().unwrap_or(bottom), text));
+        }
+    } else {
+        let authors: HashMap<(String, i64), String> = {
+            let rid = repo.id.clone();
+            hub.store
+                .call(move |c| {
+                    let mut st = c.prepare("SELECT host, number, author FROM host_pulls WHERE repo_id = ?1")?;
+                    let rows = st.query_map([&rid], |r| Ok(((r.get::<_, String>(0)?, r.get::<_, i64>(1)?), r.get::<_, String>(2)?)))?.filter_map(Result::ok).collect();
+                    Ok(rows)
+                })
+                .await?
+        };
+        for p in open_pulls(hub, repo, trunk).await? {
+            let Some(f) = fork(hub, &path, &tip, &p.head).await else { continue };
+            let name = format!("pull:{}:{}", p.host, p.number);
+            let author = authors.get(&(p.host.clone(), p.number)).map(|a| format!("{}:{a}", p.host)).unwrap_or_default();
+            changes.push((name.clone(), author, name, unified(hub, &path, &f, &p.head).await));
+        }
+    }
+    let touches: Vec<plan::Touch> = changes
+        .iter()
+        .flat_map(|(name, _, stack, text)| plan::old_lines(text).into_iter().map(move |(file, start, end)| plan::Touch { change: name.clone(), stack: stack.clone(), file, start, end }))
+        .collect();
+    let now_overlapping: BTreeSet<(String, String, String)> = plan::collisions(&touches, &BTreeSet::new()).iter().map(plan::Collision::key).collect();
+    let (rid, t) = (repo.id.clone(), trunk.to_owned());
+    let told: BTreeSet<(String, String, String)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT a, b, file FROM review_collisions WHERE repo_id = ?1 AND trunk = ?2 AND gone_at IS NULL")?;
+            let rows = st.query_map([&rid, &t], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.filter_map(Result::ok).collect();
+            Ok(rows)
+        })
+        .await?;
+    let found = plan::collisions(&touches, &told);
+    let gone: Vec<(String, String, String)> = told.difference(&now_overlapping).cloned().collect();
+    let (rid, t, rows) = (repo.id.clone(), trunk.to_owned(), found.clone());
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let now = crate::util::now_unix();
+            for k in &gone {
+                tx.execute("UPDATE review_collisions SET gone_at = ?5 WHERE repo_id = ?1 AND a = ?2 AND b = ?3 AND file = ?4", rusqlite::params![rid, k.0, k.1, k.2, now])?;
+            }
+            for c in &rows {
+                tx.execute(
+                    "INSERT INTO review_collisions (repo_id, trunk, a, b, file, start_line, end_line, told_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT (repo_id, a, b, file) DO UPDATE SET trunk = excluded.trunk, start_line = excluded.start_line, end_line = excluded.end_line, told_at = excluded.told_at, gone_at = NULL",
+                    rusqlite::params![rid, t, c.a, c.b, c.file, c.start, c.end, now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    let author: HashMap<&str, &str> = changes.iter().map(|(n, a, _, _)| (n.as_str(), a.as_str())).collect();
+    for c in &found {
+        let lines = if c.start == c.end { format!("line {}", c.start) } else { format!("lines {}–{}", c.start, c.end) };
+        for (me, other) in [(&c.a, &c.b), (&c.b, &c.a)] {
+            let said = format!("{me} and {other} both change {} {lines}", c.file);
+            let who = author.get(me.as_str()).map(|a| vec![(*a).to_owned()]).unwrap_or_default();
+            crate::rt::spawn(super::notify::diff_event(Arc::clone(hub), repo.name.clone(), "change.collision", me.clone(), String::new(), trunk.to_owned(), "kiln".into(), said, who, None));
+        }
+    }
+    Ok(found.len())
+}
+
+/// `GET /api/diffs/:id/collisions` (W26-R16): the open changes `d` changes the same lines as, now.
+pub async fn collisions_of(hub: &Hub, d: &Diff) -> anyhow::Result<serde_json::Value> {
+    let (name, repo) = (d.name.clone(), d.repo.clone());
+    let Some(r) = hub.store.repos().await?.into_iter().find(|r| r.name == repo) else { return Ok(serde_json::json!({ "collisions": [] })) };
+    let rid = r.id;
+    let rows: Vec<serde_json::Value> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT a, b, file, start_line, end_line, told_at FROM review_collisions WHERE repo_id = ?1 AND (a = ?2 OR b = ?2) AND gone_at IS NULL ORDER BY file, start_line")?;
+            let rows = st
+                .query_map([&rid, &name], |r| {
+                    let (a, b): (String, String) = (r.get(0)?, r.get(1)?);
+                    let with = if a == name { b } else { a };
+                    Ok(serde_json::json!({ "with": with, "file": r.get::<_, String>(2)?, "start": r.get::<_, i64>(3)?, "end": r.get::<_, i64>(4)?, "told_at": r.get::<_, i64>(5)? }))
+                })?
+                .filter_map(Result::ok)
+                .collect();
+            Ok(rows)
+        })
+        .await?;
+    Ok(serde_json::json!({ "collisions": rows }))
 }

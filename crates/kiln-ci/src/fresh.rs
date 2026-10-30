@@ -20,6 +20,10 @@ use serde::{Deserialize, Serialize};
 /// The why of a revision kiln replays (W26-R04).
 pub const WHY: &str = "replayed";
 
+/// The why of a conflicted replay kept as a revision (its conflict markers in), for the changes above
+/// it to replay onto and for the conflict ladder (W26-R17) to resolve.
+pub const WHY_CONFLICTED: &str = "replayed with conflicts";
+
 /// The most changes one plan walks through a stack; a stack deeper than this (or one that loops)
 /// is refused, never followed for ever.
 const MAX_DEPTH: usize = 1000;
@@ -127,6 +131,9 @@ pub struct Change {
     pub below: Option<String>,
     /// The trunk commit its latest revision (or the last replay kept of it) is on.
     pub on: String,
+    /// Its latest revision is on the latest revision of the change below it (none below: true). A
+    /// change whose below got a new revision since (a resolution, a push) is replayed onto it.
+    pub on_below: bool,
 }
 
 /// Where a replay goes.
@@ -187,9 +194,10 @@ impl Plan {
 
 /// What to replay now that each trunk is at `tips` (trunk → its tip): every open change of a trunk
 /// that moved, stack by stack, bottom first, each in the order `changes` gives the stacks' bottoms.
-/// A change goes onto the tip when nothing open is below it, else onto the replay of the one below;
-/// one already on the tip with nothing below it replayed stays as it is. A change whose trunk has no
-/// tip here isn't planned.
+/// A stack's bottom goes onto the tip unless it's on it already; a change above goes onto the one
+/// below it (its replay this round, else its latest revision) when that one was replayed or it isn't
+/// on its latest revision, and otherwise stays as it is. A change whose trunk has no tip here isn't
+/// planned.
 pub fn plan(tips: &BTreeMap<String, String>, changes: &[Change]) -> Plan {
     let by_id: BTreeMap<&str, &Change> = changes.iter().map(|c| (c.id.as_str(), c)).collect();
     let mut above: BTreeMap<&str, Vec<&Change>> = BTreeMap::new();
@@ -214,11 +222,11 @@ pub fn plan(tips: &BTreeMap<String, String>, changes: &[Change]) -> Plan {
                 out.refused.push((c.id.clone(), format!("{}'s stack is deeper than {MAX_DEPTH} changes", c.id)));
                 continue;
             }
-            let replayed = if below_replayed {
-                let below = c.below.clone().unwrap_or_default();
-                out.replays.push(Replay { id: c.id.clone(), onto: Onto::Below(below) });
+            let below = c.below.clone().filter(|b| by_id.contains_key(b.as_str()));
+            let replayed = if let Some(b) = below.filter(|_| below_replayed || !c.on_below) {
+                out.replays.push(Replay { id: c.id.clone(), onto: Onto::Below(b) });
                 true
-            } else if c.on != *tip {
+            } else if c.below.as_deref().is_none_or(|b| !by_id.contains_key(b)) && c.on != *tip {
                 out.replays.push(Replay { id: c.id.clone(), onto: Onto::Tip(tip.clone()) });
                 true
             } else {
@@ -396,7 +404,7 @@ mod tests {
     const TIP: &str = "5d0e7b000000";
 
     fn diff(id: &str, below: Option<&str>, on: &str) -> Change {
-        Change { id: id.into(), kind: Kind::Diff, trunk: "main".into(), below: below.map(Into::into), on: on.into() }
+        Change { id: id.into(), kind: Kind::Diff, trunk: "main".into(), below: below.map(Into::into), on: on.into(), on_below: true }
     }
 
     fn tips() -> BTreeMap<String, String> {
@@ -414,7 +422,7 @@ mod tests {
             diff("D42", Some("D41"), OLD),
             diff("D41", Some("D40"), OLD),
             diff("D40", None, OLD),
-            Change { id: "pull:github:488".into(), kind: Kind::Pull, trunk: "main".into(), below: None, on: OLD.into() },
+            Change { id: "pull:github:488".into(), kind: Kind::Pull, trunk: "main".into(), below: None, on: OLD.into(), on_below: true },
         ];
         let p = plan(&tips(), &changes);
         assert_eq!(
@@ -447,6 +455,16 @@ mod tests {
         // D40 moved: D41 above it replays onto it, though D41 was on the tip.
         let changes = [diff("D40", None, OLD), diff("D41", Some("D40"), TIP)];
         assert_eq!(order(&plan(&tips(), &changes)), [("D40", Onto::Tip(TIP.into())), ("D41", Onto::Below("D40".into()))]);
+    }
+
+    #[test]
+    fn w26_r16_a_change_whose_below_moved_replays_onto_it() {
+        // D40 got a new revision (a resolution) and is on the tip; D41 is still on D40's old one.
+        let mut d41 = diff("D41", Some("D40"), TIP);
+        d41.on_below = false;
+        let p = plan(&tips(), &[diff("D40", None, TIP), d41, diff("D42", Some("D41"), TIP)]);
+        assert_eq!(order(&p), [("D41", Onto::Below("D40".into())), ("D42", Onto::Below("D41".into()))]);
+        assert_eq!(p.current, ["D40"]);
     }
 
     #[test]

@@ -106,6 +106,7 @@ struct Setup {
     s: Server,
     home: std::path::PathBuf,
     bare: std::path::PathBuf,
+    dev: String,
     kim: String,
     work: std::path::PathBuf,
     owner: std::path::PathBuf,
@@ -130,7 +131,7 @@ fn setup(files: &[(&str, &[u8])]) -> anyhow::Result<Setup> {
     must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
     must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "owner"]), "the owner's clone")?;
     let owner = dir.path().join("owner");
-    Ok(Setup { _dir: dir, s, home, bare, kim, work, owner })
+    Ok(Setup { _dir: dir, s, home, bare, dev, kim, work, owner })
 }
 
 impl Setup {
@@ -157,7 +158,9 @@ impl Setup {
 /// once. D1, D2 and D3 each get v2: rebase-only, why `replayed`, pushed by kiln, each on the one
 /// below's replay, D1 on main's tip, their author and message kept and kiln their committer, kept at
 /// `refs/kiln/diffs/<D>/v2`; D2 stays accepted. CR4 gets v2, topic merged with main, its branch not
-/// moved. D5's replay is kept as conflicted, and D6 waits: no new version. No branch but main moved.
+/// moved. D5's replay conflicts: it's kept as v2 with its markers (its gate holding) and D6 still
+/// moves, onto it; once D5's conflict is resolved and committed, D6 moves onto the resolution. No
+/// branch but main moved.
 #[test]
 fn w26_ac07_main_moves_under_stacks_and_a_change_request() -> anyhow::Result<()> {
     let x = setup(&[("a.txt", b"a\n"), ("b.txt", b"b\n"), ("c.txt", b"c\n"), ("t.txt", b"t\n"), ("x.txt", b"x\n"), ("main.txt", b"main\n")])?;
@@ -219,13 +222,33 @@ fn w26_ac07_main_moves_under_stacks_and_a_change_request() -> anyhow::Result<()>
     let parents = rev(&x.bare, &["log", "-1", "--format=%P", text(&v, "commit")])?;
     assert_eq!(parents, format!("{} {tip}", rev(&x.bare, &["rev-parse", "refs/heads/topic"])?), "{v}");
 
-    // D5 conflicts and is kept so; D6 above it waits.
+    // D5 conflicts: kept as a revision with its markers, its gate holding; D6 above it still moves,
+    // onto that revision.
     until(30, "D5's conflicted replay", || {
         let got = ok(s, &x.kim, "GET", "/api/diffs/D5/conflicts", None)?;
         Ok((got.pointer("/replay/state") != Some(&json!("conflicted"))).then(|| got.to_string()))
     })?;
-    assert_eq!(versions(s, &x.kim, "/api/diffs/D5")?.len(), 1);
-    assert_eq!(versions(s, &x.kim, "/api/diffs/D6")?.len(), 1, "D6 waits on D5");
+    let d5 = replayed("/api/diffs/D5")?.unwrap_or_default();
+    assert_eq!((text(&d5, "why"), d5.get("rebase_only")), ("replayed with conflicts", Some(&json!(false))), "{d5}");
+    let d6 = replayed("/api/diffs/D6")?.unwrap_or_default();
+    assert_eq!((text(&d6, "why"), text(&d6, "parent")), ("replayed", text(&d5, "commit")), "D6 moves onto D5's conflicted revision: {d6}");
+    let gate = ok(s, &x.kim, "GET", "/api/diffs/D5/comments", None)?;
+    assert_eq!(gate.pointer("/gate/verdict"), Some(&json!("hold")), "{gate}");
+
+    // D5's conflict resolved and committed: D6 is replayed onto the resolution.
+    let got = ok(s, &x.dev, "GET", "/api/diffs/D5/conflicts", None)?;
+    let id = got.pointer("/conflicts/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    ok(s, &x.dev, "POST", &format!("/api/diffs/D5/conflicts/{id}/resolution"), Some(&json!({ "take": "this" })))?;
+    let r = ok(s, &x.dev, "POST", "/api/diffs/D5/conflicts/commit", Some(&json!({})))?;
+    let resolved = text(&r, "commit").to_owned();
+    assert_eq!((text(&r, "why"), r.get("version")), ("conflict resolved", Some(&json!(3))), "{r}");
+    assert_eq!(rev(&x.bare, &["log", "-1", "--format=%P", &resolved])?, tip, "the resolution goes onto main's tip");
+    until(60, "D6 replayed onto D5's resolution", || {
+        let v = versions(s, &x.kim, "/api/diffs/D6")?.pop().unwrap_or_default();
+        Ok((text(&v, "parent") != resolved).then(|| v.to_string()))
+    })?;
+    let gate = ok(s, &x.kim, "GET", "/api/diffs/D5/comments", None)?;
+    assert_ne!(gate.pointer("/gate/verdict"), Some(&json!("hold")), "{gate}");
 
     // No branch moved but main.
     let after = branches(&x.bare)?;
@@ -384,5 +407,45 @@ fn w26_r16_turning_auto_push_on_warns() -> anyhow::Result<()> {
         assert!(said.contains(words), "{words}: {said}");
     }
     ok(&x.s, &x.kim, "POST", "/api/diffs/D1/review", Some(&json!({ "action": "accept", "force": true })))?;
+    Ok(())
+}
+
+/// W26-R16's collision radar: two open changes from different stacks that change the same lines of
+/// a file are named to each other now, not once one lands (`GET /api/diffs/:id/collisions`); one
+/// stacked on the other isn't a collision; a change that moves off those lines is no longer one.
+#[test]
+fn w26_r16_collision_radar_names_both_changes() -> anyhow::Result<()> {
+    let body: String = (1..=80).map(|i| format!("line {i}\n")).collect();
+    let x = setup(&[("sched/fair.rs", body.as_bytes())])?;
+    let s = &x.s;
+    let edit = |from: u32, to: u32, tag: &str| -> String { (1..=80).map(|i| if (from..=to).contains(&i) { format!("line {i}, {tag}\n") } else { format!("line {i}\n") }).collect() };
+    // D1 changes lines 40–58; D2, on top of it, too (one stack: no collision).
+    x.commit(&[("sched/fair.rs", edit(40, 58, "D1").as_bytes())], "D1: fair")?;
+    x.commit(&[("other.rs", b"x\n")], "D2: other, above D1")?;
+    must(git(&x.home, &x.work, &["push", "origin", "HEAD:refs/for/main"]), "D1 and D2")?;
+    // D3, its own stack, changes 45–70.
+    must(git(&x.home, &x.work, &["checkout", "-qb", "d3", "origin/main"]), "branch")?;
+    x.commit(&[("sched/fair.rs", edit(45, 70, "D3").as_bytes())], "D3: fair too")?;
+    let sha = must(git(&x.home, &x.work, &["rev-parse", "HEAD"]), "rev")?.trim().to_owned();
+    must(git(&x.home, &x.work, &["push", "-o", &format!("change={sha}:new"), "origin", "HEAD:refs/for/main"]), "D3")?;
+    let listed = |d: &str| -> anyhow::Result<Vec<Value>> { Ok(ok(s, &x.kim, "GET", &format!("/api/diffs/{d}/collisions"), None)?.get("collisions").and_then(Value::as_array).cloned().unwrap_or_default()) };
+    until(30, "D1 and D3 named to each other", || {
+        let one = listed("D1")?;
+        Ok((one.len() != 1).then(|| format!("{one:?}")))
+    })?;
+    let one = listed("D1")?.pop().unwrap_or_default();
+    assert_eq!((text(&one, "with"), text(&one, "file"), one.get("start"), one.get("end")), ("D3", "sched/fair.rs", Some(&json!(45)), Some(&json!(58))), "{one}");
+    let three = listed("D3")?;
+    assert_eq!(three.iter().map(|c| text(c, "with")).collect::<Vec<_>>(), ["D1"], "{three:?}");
+    assert!(listed("D2")?.is_empty(), "D2 is in D1's stack and touches other lines");
+    // D3 moves off those lines: no longer a collision.
+    write(&x.work, &[("sched/fair.rs", edit(75, 80, "D3").as_bytes())])?;
+    must(git(&x.home, &x.work, &["commit", "-q", "--amend", "-a", "--no-edit"]), "amend")?;
+    let sha = must(git(&x.home, &x.work, &["rev-parse", "HEAD"]), "rev")?.trim().to_owned();
+    must(git(&x.home, &x.work, &["push", "-o", &format!("change={sha}:D3"), "origin", "HEAD:refs/for/main"]), "D3 again")?;
+    until(30, "D1 and D3 no longer named", || {
+        let one = listed("D1")?;
+        Ok((!one.is_empty()).then(|| format!("{one:?}")))
+    })?;
     Ok(())
 }

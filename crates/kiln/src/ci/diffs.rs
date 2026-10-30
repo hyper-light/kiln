@@ -670,6 +670,8 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
             None,
         ));
     }
+    // The collision radar looks again (W26-R16).
+    super::fresh::changed(hub, s.repo, s.trunk);
     // Their checks, unless a job's token pushed them (it starts no run, as on GitHub).
     if by_job(s.pushed_by) {
         return Ok(out);
@@ -884,10 +886,13 @@ pub(crate) async fn add_versions(hub: &Arc<Hub>, repo: &Repo, path: &str, made: 
                 // The same commits, rebased: whom the version before came from (W10-R02's `secrets.use`).
                 let by: Option<String> = tx.query_row("SELECT started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [id], |r| r.get(0)).optional()?.flatten();
                 tx.execute(
-                    "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now, by],
+                    "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by, why) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now, by, nv.why],
                 )?;
                 tx.execute("UPDATE diffs SET parent_diff = ?2, updated_at = ?3 WHERE id = ?1", params![id, nv.parent_diff, now])?;
+                if let Some(replay) = &nv.keeps {
+                    tx.execute("UPDATE review_replays SET kept_version = ?2 WHERE id = ?1", params![replay, n])?;
+                }
                 out.push((n, by));
             }
             tx.commit()?;
@@ -926,6 +931,11 @@ pub(crate) struct NewVersion {
     pub rebase_only: bool,
     pub pushed_by: String,
     pub parent_diff: Option<String>,
+    /// Why it exists, kept with it (W26-R04); none: said after, by `revision::record`.
+    pub why: Option<String>,
+    /// The conflicted replay it keeps as a revision (W26-R16), named in the same transaction so the
+    /// gate never sees it without its conflicts.
+    pub keeps: Option<String>,
 }
 
 /// `pull_request` `closed` for a diff that landed (`merged`) or was abandoned (W03-R09's table).
@@ -1777,6 +1787,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 // Its conflicts with where it lands, resolved where they fall, then committed (W26-R12).
                 (&Method::GET, ["conflicts"]) => ok(super::conflicts::list(hub, &d).await?),
                 (&Method::POST, ["conflicts", "commit"]) => ok(super::conflicts::commit(hub, &d, caller).await?),
+                // W26-R16: the open changes it changes the same lines as.
+                (&Method::GET, ["collisions"]) => ok(super::fresh::collisions_of(hub, &d).await.map_err(fail)?),
                 // W26-R16: Update moves a change's branch to its replay.
                 (&Method::POST, ["update"]) => ok(super::fresh::update(hub, &d, caller).await?),
                 (&Method::POST, ["conflicts", id, "resolution"]) => ok(super::conflicts::resolve(hub, &d, id, caller, body).await?),
