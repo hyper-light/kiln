@@ -3,9 +3,11 @@ import { test } from "node:test";
 import type { AgentInfo, SubagentBrief, Task } from "../src/api/harness.ts";
 import { standOf, subagentsLine } from "../src/views/harness/mission-rows.ts";
 import {
+  askWords,
   classOf,
   isSubagent,
   stopperOf,
+  subagentAsks,
   subagentPlaceholder,
   subagentRunning,
   subagentsAtWork,
@@ -133,4 +135,37 @@ test("over a subagent's thread the composer writes to it only while it takes mes
   assert.equal(subagentPlaceholder("steer", false), "Steer the subagent — it reads this at its next step");
   assert.equal(subagentPlaceholder("now", false), "Stop the subagent and say…");
   assert.equal(subagentPlaceholder("queue", true), "Queue a message for when the subagent finishes (the main agent passes it on)");
+});
+
+test("its subagents that wait on you, longest waiting first: those kiln started, and its harness's own by the requests that name them", () => {
+  const q = { id: "q", tool: "question" as const, tool_name: "AskUserQuestion", title: "Which goes first?", at: 300 };
+  const step = agent({ id: "s2", name: "Step 2: Exec through a seed", parent: "owner", subagent: true, status: "waiting", approvals: [q] });
+  const idle = agent({ id: "s3", name: "Step 3: UI", parent: "owner", subagent: true });
+  const shell = (id: string, agentId: string | undefined, at: number) => ({ id, tool: "shell" as const, tool_name: "Bash", title: "npm test", at, agent: agentId });
+  const tasks = [
+    task({ id: "a37155", tool_id: "toolu_figs", description: "Check every figure", class: "agent" }),
+    task({ id: "019a-child", tool_id: "call_child", description: "Read the backoff code", class: "agent" }),
+    task({ id: "b7x4k2", description: "Serve the mock", class: "shell" }),
+  ];
+  const asks = subagentAsks(
+    "owner",
+    [shell("p-own", undefined, 50), shell("p-claude", "a37155", 200), shell("p-claude-2", "a37155", 250), shell("p-codex", "Read the backoff code", 100), shell("p-gone", "nobody", 10)],
+    tasks,
+    [step, idle],
+    new Map(),
+  );
+  // The agent's own request isn't a subagent's; one names a subagent once (its first); one naming none it has isn't shown.
+  assert.deepEqual(
+    asks.map((a) => [a.ap.id, a.name, a.who, a.thread]),
+    [
+      ["p-codex", "Read the backoff code", "owner", "call_child"],
+      ["p-claude", "Check every figure", "owner", "toolu_figs"],
+      ["q", "Step 2: Exec through a seed", "s2", "s2"],
+    ],
+  );
+  // Answered here, it no longer waits.
+  assert.deepEqual(subagentAsks("owner", [], tasks, [step], new Map([["q", 1]])), []);
+  assert.equal(askWords(q), "Asks: Which goes first?");
+  assert.equal(askWords({ tool: "plan", tool_name: "ExitPlanMode", title: "Plan" }), "Proposes a plan");
+  assert.equal(askWords({ tool: "shell", tool_name: "Bash", title: "npm test" }), "Bash: npm test");
 });

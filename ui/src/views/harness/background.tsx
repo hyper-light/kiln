@@ -6,18 +6,20 @@
 import * as React from "react";
 import { Fold } from "./fold";
 import { ChevronRight, Square } from "lucide-react";
-import { harnessApi, useSession, type AgentInfo, type Command, type SessionStore, type State, type Task } from "@/api/harness";
+import { harnessApi, useSession, type AgentInfo, type Approval, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+import { answer, useAnswered } from "./answered";
 import { agentLabel, duration, tildify } from "./derive";
 import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
 import { Shimmer } from "./signals";
-import { classOf, isSubagent, kilnAtWork, kilnStatus, LEFT, stopperOf, subagentRunning, subagentTasksAtWork } from "./tasks";
+import { askWords, classOf, isSubagent, kilnAtWork, kilnStatus, LEFT, stopperOf, subagentAsks, subagentRunning, subagentTasksAtWork, type SubagentAsk } from "./tasks";
 
 const NO_AGENTS: readonly AgentInfo[] = [];
+const NO_APPROVALS: Approval[] = [];
 
 const BACKGROUND = new Set(["shell", "monitor", "mcp"]);
 export const isBackground = (t: Task) => BACKGROUND.has(classOf(t));
@@ -254,7 +256,8 @@ export function BackgroundStrip({ state, onView }: { state: State | null; onView
 /**
  * By the composer: what's running besides the agent itself — its subagents, and the shells and
  * monitors it started — as one line that opens in place. A subagent opens its thread; a shell or
- * monitor shows its output right there, following it while it runs. Each stops from its row.
+ * monitor shows its output right there, following it while it runs. Each stops from its row. A
+ * subagent that waits on you says so on the line, and has a row under it, answered there.
  */
 const NO_TASKS: Task[] = [];
 const NO_FEATURES: string[] = [];
@@ -444,15 +447,78 @@ function KilnItem({ a, mixed, onOpenTask }: { a: AgentInfo; mixed: boolean; onOp
   );
 }
 
-export function ActivityLine({ store, onOpenTask, kiln = NO_AGENTS }: { store: SessionStore; onOpenTask: (toolId: string) => void; kiln?: readonly AgentInfo[] }) {
+/**
+ * One of its subagents waiting on you, over the composer, drawn as Mission control's row that needs
+ * you: its name, the word and what it asks, and the answer, which goes to that subagent. A question
+ * opens its thread, where it waits at the end; the row itself and Review do too.
+ */
+function NeedsRow({ ask, onOpenTask }: { ask: SubagentAsk; onOpenTask: (toolId: string) => void }) {
+  const { ap } = ask;
+  const open = () => onOpenTask(ask.thread);
+  const decide = (decision: "allow" | "deny") => void answer(ask.who, { type: "approve", id: ap.id, decision }).catch((e: unknown) => toast.error(`Couldn't answer ${ask.name}`, errorMessage(e)));
+  return (
+    <div className="sa-row" role="group" aria-label={`${ask.name} needs you`}>
+      <button type="button" className="sa-main" onClick={open}>
+        <span className="sa-name">{ask.name}</span>
+        <span className="sa-line">
+          <span className="sa-word">
+            <i aria-hidden="true" />
+            Needs you
+          </span>
+          <span className="sa-text">{askWords(ap)}</span>
+        </span>
+      </button>
+      <span className="sa-acts">
+        {ap.tool === "question" ? (
+          <Button size="xs" onClick={open}>
+            Answer
+          </Button>
+        ) : (
+          <>
+            <Button size="xs" onClick={() => decide("allow")}>
+              {ap.tool === "plan" ? "Approve" : "Allow"}
+            </Button>
+            {ap.tool !== "plan" && (
+              <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
+                Deny
+              </Button>
+            )}
+            <button type="button" className="sa-link" onClick={open}>
+              Review
+            </button>
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+/** `inThread`: the subagent whose thread is shown (its request is there, so it has no row here). */
+export function ActivityLine({
+  store,
+  onOpenTask,
+  kiln = NO_AGENTS,
+  inThread = null,
+}: {
+  store: SessionStore;
+  onOpenTask: (toolId: string) => void;
+  kiln?: readonly AgentInfo[];
+  inThread?: string | null;
+}) {
   const [open, setOpen] = React.useState(false);
   const [shown, setShown] = React.useState<string | null>(null);
   const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
+  const approvals = useSession(store, (s) => s.state?.approvals ?? NO_APPROVALS);
+  const done = useAnswered();
   const subs = subagentTasksAtWork(tasks);
   // The subagents kiln started for its goals or plan steps, with its harness's own.
   const others = kilnAtWork(kiln);
   const bg = tasks.filter((t) => !isSubagent(t) && isLive(t));
   if (subs.length + others.length + bg.length === 0) return null;
+  // Those that wait on you: said on the line, and each (two at most) in a row of its own under it.
+  const asks = subagentAsks(store.id, approvals, tasks, kiln, done);
+  const needs = asks.length === 0 ? "" : subs.length + others.length === 1 ? "Needs you" : `${asks.length} need${asks.length === 1 ? "s" : ""} you`;
+  const rows = asks.filter((a) => a.thread !== inThread).slice(0, 2);
   const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
   const of = (cls: string) => bg.filter((t) => classOf(t) === cls).length;
   const shells = of("shell");
@@ -471,41 +537,59 @@ export function ActivityLine({ store, onOpenTask, kiln = NO_AGENTS }: { store: S
     { kind: "mcp" as const, text: count(other, "background call"), live: true },
   ].filter((s) => s.text);
   return (
-    <div className="al" data-open={open || undefined}>
-      <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span className="al-summary">
-          {segments.map((s, i) => (
-            <span key={s.kind} className="al-seg">
-              {i > 0 && <span className="al-sep">·</span>}
-              {s.kind === "agent" ? (
-                <Shimmer on={s.live} className="al-mark">
-                  <KindGlyph kind="agent" />
-                  {s.text}
-                </Shimmer>
-              ) : (
-                <>
-                  <KindGlyph kind={s.kind} live={s.live} />
-                  {s.text}
-                </>
-              )}
-            </span>
+    <>
+      <div className="al" data-open={open || undefined}>
+        <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
+          <span className="al-summary">
+            {segments.map((s, i) => (
+              <span key={s.kind} className="al-seg">
+                {i > 0 && <span className="al-sep">·</span>}
+                {s.kind === "agent" ? (
+                  <Shimmer on={s.live} className="al-mark">
+                    <KindGlyph kind="agent" />
+                    {s.text}
+                  </Shimmer>
+                ) : (
+                  <>
+                    <KindGlyph kind={s.kind} live={s.live} />
+                    {s.text}
+                  </>
+                )}
+              </span>
+            ))}
+            {needs && (
+              <span className="al-seg">
+                <span className="al-sep">·</span>
+                <span className="al-needs">
+                  <i aria-hidden="true" />
+                  {needs}
+                </span>
+              </span>
+            )}
+          </span>
+          <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
+        </button>
+        {open && (
+          <ul className="al-list">
+            {subs.map((t) => (
+              <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
+            ))}
+            {others.map((a) => (
+              <KilnItem key={a.id} a={a} mixed={mixed} onOpenTask={onOpenTask} />
+            ))}
+            {bg.map((t) => (
+              <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
+            ))}
+          </ul>
+        )}
+      </div>
+      {rows.length > 0 && (
+        <div className="sa">
+          {rows.map((a) => (
+            <NeedsRow key={a.ap.id} ask={a} onOpenTask={onOpenTask} />
           ))}
-        </span>
-        <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
-      </button>
-      {open && (
-        <ul className="al-list">
-          {subs.map((t) => (
-            <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
-          ))}
-          {others.map((a) => (
-            <KilnItem key={a.id} a={a} mixed={mixed} onOpenTask={onOpenTask} />
-          ))}
-          {bg.map((t) => (
-            <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
-          ))}
-        </ul>
+        </div>
       )}
-    </div>
+    </>
   );
 }

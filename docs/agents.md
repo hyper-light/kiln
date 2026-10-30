@@ -512,7 +512,11 @@ Subagents setting, pause point, environment and program. The agent's row works t
 carries what one asks you (answered as that one's); its chat lists them with its harness's own
 (the line by its composer, Tools → Subagents), each opening its thread in place, and a subagent's
 own page opens there too (`?own=1` keeps it a page of its own). One whose agent has gone is a row
-of its own.
+of its own. A subagent that waits on you, either kind (its harness's own by the requests naming it,
+`Approval.agent`), says so on the line by its agent's composer, and has a row over the composer
+(two at most), drawn as Mission Control's row that needs you: its name, what it asks, and the
+answer, given as that subagent's. A question opens its thread, as the row and Review do; on its
+agent's page, a subagent kiln started has no card of its own for it.
 The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
