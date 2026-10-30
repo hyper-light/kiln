@@ -329,6 +329,7 @@ classes! {
         Update::Reply { .. } => Class::Answer,
         Update::Inbox { .. } => Class::Answer,
         Update::Reset { .. } => Class::Stream,
+        Update::ChangesPatch { .. } => Class::Stream,
     }
 }
 

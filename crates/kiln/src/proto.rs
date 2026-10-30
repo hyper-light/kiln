@@ -407,6 +407,11 @@ pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
 /// server that says it issues them ([`ServerMsg::Identity`]).
 pub const CAP_IDENTITY: u64 = 1 << 38;
 
+/// [`ServerMsg::Caps`] capability: the server takes a session's changeset as what changed in it
+/// (`crate::harness::core::Update::ChangesPatch`), merged into its copy, so a runner sends the files
+/// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
+pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]

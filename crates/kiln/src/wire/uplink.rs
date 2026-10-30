@@ -13,18 +13,27 @@
 //! and the stream's generation: `s:<session>#<boot>.<gen>`. A new process's streams are new, and
 //! a stream that starts over (its backlog grew past [`ROOM`], or the server lost what it had) is
 //! new too. The server lets go of the one it replaces.
+//!
+//! A stream's picture goes whole, however large ([`Updates::picture`]): [`ROOM`] and
+//! [`TOTAL_ROOM`] bound only the backlog after it. A long session's snapshot is larger than
+//! [`ROOM`]; counted against it, its stream went stale while its picture was pushed, started over
+//! at the next frame from the server with the same picture, and so on without end: the server
+//! never heard from the session again (a stop, a force stop, its inbox's answers), and the runner
+//! built the snapshot again at every frame.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use super::channel::{Event, Frame, Sender};
 
-/// What one stream keeps unanswered, at the most. Past it the stream starts over with its picture
-/// once the server is back, rather than keep a backlog without end while the server is away.
+/// What one stream keeps unanswered past its picture, at the most. Past it the stream starts over
+/// with its picture once the server is back, rather than keep a backlog without end while the
+/// server is away.
 pub const ROOM: usize = 8 << 20;
-/// What all of a runner's streams keep unanswered together, at the most: past it, the stream an
-/// item is pushed to starts over as one past its own room does. Many busy sessions and a long
-/// outage never hold more than this.
+/// What all of a runner's streams keep unanswered past their pictures together, at the most: past
+/// it, the stream an item is pushed to starts over as one past its own room does. Many busy
+/// sessions and a long outage never hold more than this (a stream starts over only while the
+/// server is there, so an outage holds no new pictures).
 pub const TOTAL_ROOM: usize = 64 << 20;
 /// How long an update sent on a live link waits for its answer before it goes again.
 pub const PATIENCE: Duration = Duration::from_secs(15);
@@ -94,7 +103,8 @@ impl Updates {
     }
 
     /// Starts `key`'s stream, or starts it over under its next generation: the caller pushes its
-    /// picture next (a session's snapshot, a terminal's replay), then its items as they come.
+    /// picture next (a session's snapshot, a terminal's replay: [`Updates::picture`]), then its
+    /// items as they come ([`Updates::push`]).
     pub fn start(&mut self, key: &str) {
         let next = match self.generation.get(key) {
             Some(g) => {
@@ -116,12 +126,25 @@ impl Updates {
             return false;
         }
         let stream = self.stream(key);
-        let over = self.tx.bytes().saturating_add(body.len()) > self.total;
+        let over = self.tx.backlog().saturating_add(body.len()) > self.total;
         if over || self.tx.push(&stream, body).is_err() {
             self.stale.insert(key.to_owned());
             self.tx.drop_stream(&stream);
             return false;
         }
+        true
+    }
+
+    /// One item of `key`'s picture, pushed after [`Updates::start`] and before its other items: it
+    /// goes whatever the stream's room and the total, which bound what comes after the picture (a
+    /// picture larger than the room went stale as it was pushed, every time). False when its stream
+    /// isn't taking items: not started, or starting over.
+    pub fn picture(&mut self, key: &str, body: Vec<u8>) -> bool {
+        if !self.started(key) || self.stale.contains(key) {
+            return false;
+        }
+        let stream = self.stream(key);
+        self.tx.push_picture(&stream, body);
         true
     }
 
@@ -224,7 +247,7 @@ mod tests {
     fn start(u: &mut Updates, key: &str, snapshot: usize) {
         u.start(key);
         for n in 0..snapshot {
-            assert!(u.push(key, format!("snap {n}").into_bytes()));
+            assert!(u.picture(key, format!("snap {n}").into_bytes()));
         }
     }
 
@@ -318,6 +341,52 @@ mod tests {
         assert_eq!(u.unanswered(), 0, "what it kept went with it");
         start(&mut u, "s:x", 1);
         assert!(u.push("s:x", vec![0; 16]));
+    }
+
+    /// A session whose snapshot is larger than a stream's room (a long Codex session's was 10 to
+    /// 16 MB against 8 MiB): its stream starts over with all of it, and the server gets it whole.
+    /// Counted against the room, the picture went stale as it was pushed, and the stream started
+    /// over at each frame from the server with the same picture, the server never hearing from the
+    /// session again.
+    #[test]
+    fn a_snapshot_larger_than_the_room_starts_its_stream_over_once() {
+        let base = Instant::now();
+        let mut u = Updates::with("boot1", 64, PATIENCE);
+        let mut s = Server::new();
+        start(&mut u, "s:x", 1);
+        u.on_frame(s.rx.have());
+        // Its backlog passes its room while the server doesn't answer: it starts over.
+        while u.push("s:x", vec![0; 16]) {}
+        assert_eq!(u.take_stale(), vec!["s:x".to_owned()]);
+        // Its snapshot now is ten times the room.
+        let mut session: Vec<Vec<u8>> = (0..40).map(|n| format!("snapshot part {n:02}").into_bytes()).collect();
+        u.start("s:x");
+        for part in &session {
+            assert!(u.picture("s:x", part.clone()), "a picture always goes");
+        }
+        // What follows the picture has the room to itself, the picture not answered yet.
+        assert!(u.push("s:x", update(0)));
+        session.push(update(0));
+        for a in s.take(u.poll(base)) {
+            u.on_frame(a);
+        }
+        assert!(u.take_stale().is_empty(), "it doesn't start over again");
+        assert_eq!(s.mirror.get("x"), Some(&session), "the server has the session whole");
+        assert_eq!(u.unanswered(), 0);
+    }
+
+    /// Other streams' pictures don't count against the total: only backlogs do.
+    #[test]
+    fn the_total_bounds_backlogs_not_pictures() {
+        let mut u = Updates::bounded("boot1", 1 << 20, 100, PATIENCE);
+        u.start("s:a");
+        assert!(u.picture("s:a", vec![0; 500]));
+        start(&mut u, "s:b", 0);
+        assert!(u.push("s:b", vec![0; 60]), "a's picture leaves b the total");
+        assert!(u.push("s:a", vec![0; 30]));
+        // Together past the total: the one pushed to starts over.
+        assert!(!u.push("s:b", vec![0; 30]));
+        assert_eq!(u.take_stale(), vec!["s:b".to_owned()]);
     }
 
     #[test]

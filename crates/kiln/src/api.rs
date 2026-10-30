@@ -5154,8 +5154,9 @@ struct Takes {
     /// `z=gzip`: each snapshot packed. What a long conversation sends on attach is most of what it
     /// ever sends, and on a slow link a tenth of it arrives ten times sooner.
     packed: bool,
-    /// `patch=state`: a state as only what changed in it (`state_patch`), after the snapshot's.
-    patches: bool,
+    /// `patch=state`: a state as only what changed in it (`state_patch`), after the snapshot's;
+    /// `patch=changes`: a changeset so (`changes_patch`).
+    patches: crate::harness::registry::Patches,
     /// `after=<born>.<rev>`: it had the session through that revision of this server's copy
     /// (docs/wire.md, "Revisions"), and gets only what it lacks when the copy can say.
     after: Option<(u64, u64)>,
@@ -5168,7 +5169,7 @@ impl Takes {
             .and_then(|q| q.split('&').find_map(|x| x.strip_prefix("after=")))
             .and_then(|v| v.split_once('.'))
             .and_then(|(b, r)| Some((b.parse().ok()?, r.parse().ok()?)));
-        Self { packed: has("z=gzip"), patches: has("patch=state"), after }
+        Self { packed: has("z=gzip"), patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") }, after }
     }
 }
 
@@ -5610,13 +5611,17 @@ mod tests {
 
     #[test]
     fn a_viewer_takes_what_its_query_asks_for() {
+        use crate::harness::registry::Patches;
         let t = Takes::of(Some("z=gzip&patch=state"));
-        assert!(t.packed && t.patches);
+        assert!(t.packed && t.patches == Patches { state: true, changes: false });
         let t = Takes::of(Some("patch=state"));
-        assert!(!t.packed && t.patches);
+        assert!(!t.packed && t.patches.state);
         let t = Takes::of(None);
-        assert!(!t.packed && !t.patches);
+        assert!(!t.packed && t.patches == Patches::default());
         assert!(!Takes::of(Some("z=gzipped&patch=states")).packed);
+        // A changeset as what changed in it, asked for on its own or with a state's.
+        assert_eq!(Takes::of(Some("z=gzip&patch=state&patch=changes")).patches, Patches { state: true, changes: true });
+        assert_eq!(Takes::of(Some("patch=changes")).patches, Patches { state: false, changes: true });
     }
 
     #[test]

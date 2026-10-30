@@ -25,7 +25,8 @@
 //!   name), so a receiver never mistakes a new item for an old one; a receiver that says it has
 //!   less than it had answered lost what it kept, and its sender is told (`Event::Regressed`).
 //! - **Room.** A stream keeps at most so many bytes unanswered: past that its producer waits
-//!   ([`Full`]), and nothing is shed.
+//!   ([`Full`]), and nothing is shed. What a stream starts with, its picture of what it carries
+//!   now ([`Sender::push_picture`]), is taken whatever its size: the room bounds what comes after.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -120,6 +121,8 @@ enum Wanted {
 struct Pending {
     seq: Seq,
     body: Vec<u8>,
+    /// Part of its stream's picture ([`Sender::push_picture`]): not counted against the room.
+    picture: bool,
     /// When it was last sent since the link came up; `None`: not yet.
     sent: Option<Instant>,
     wanted: Wanted,
@@ -128,8 +131,8 @@ struct Pending {
 }
 
 impl Pending {
-    fn new(seq: Seq, body: Vec<u8>) -> Self {
-        Self { seq, body, sent: None, wanted: Wanted::No, went_for_want: None }
+    fn new(seq: Seq, body: Vec<u8>, picture: bool) -> Self {
+        Self { seq, body, picture, sent: None, wanted: Wanted::No, went_for_want: None }
     }
 
     /// Not sent on this link yet: it goes as if new.
@@ -147,18 +150,40 @@ struct Out {
     answered: Seq,
     pending: VecDeque<Pending>,
     bytes: usize,
+    /// Of `bytes`, its picture's: the room bounds only the rest, its backlog.
+    picture: usize,
 }
 
 impl Default for Out {
     fn default() -> Self {
-        Self { next: 1, answered: 0, pending: VecDeque::new(), bytes: 0 }
+        Self { next: 1, answered: 0, pending: VecDeque::new(), bytes: 0, picture: 0 }
+    }
+}
+
+impl Out {
+    /// What it keeps unanswered past its picture.
+    fn backlog(&self) -> usize {
+        self.bytes.saturating_sub(self.picture)
+    }
+
+    /// The next item, its number.
+    fn queue(&mut self, body: Vec<u8>, picture: bool) -> Seq {
+        let seq = self.next;
+        self.next = self.next.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(body.len());
+        if picture {
+            self.picture = self.picture.saturating_add(body.len());
+        }
+        self.pending.push_back(Pending::new(seq, body, picture));
+        seq
     }
 }
 
 /// The sending side of the streams to one peer.
 pub struct Sender {
     streams: BTreeMap<String, Out>,
-    /// The most bytes a stream keeps unanswered (an item larger than that goes alone).
+    /// The most bytes a stream keeps unanswered past its picture (an item larger than that goes
+    /// alone).
     room: usize,
     /// How long an item sent on a live link waits for its answer before it goes again: an answer
     /// lost below the channel (a frame shed) is made up for.
@@ -173,25 +198,29 @@ impl Sender {
     }
 
     /// Queues `body` as the next item of `stream`: its number, or [`Full`] while the stream
-    /// keeps as much unanswered as it may.
+    /// keeps as much unanswered past its picture as it may.
     pub fn push(&mut self, stream: &str, body: Vec<u8>) -> Result<Seq, Full> {
         let o = self.streams.entry(stream.to_owned()).or_default();
-        if !o.pending.is_empty() && o.bytes.saturating_add(body.len()) > self.room {
+        if o.backlog() > 0 && o.backlog().saturating_add(body.len()) > self.room {
             return Err(Full);
         }
-        let seq = o.next;
-        o.next = o.next.saturating_add(1);
-        o.bytes = o.bytes.saturating_add(body.len());
-        o.pending.push_back(Pending::new(seq, body));
-        Ok(seq)
+        Ok(o.queue(body, false))
+    }
+
+    /// Queues `body` as the next item of `stream`'s picture, what it starts with (a session's
+    /// snapshot, a terminal's replay): taken whatever its size, as a stream whose picture didn't
+    /// fit its room could never start. The room bounds what's pushed after it.
+    pub fn push_picture(&mut self, stream: &str, body: Vec<u8>) -> Seq {
+        self.streams.entry(stream.to_owned()).or_default().queue(body, true)
     }
 
     /// Picks a durable stream up after a restart: the number its next item gets, and what it
     /// had sent and not had answered (`crate::wire::keep`), in order.
     pub fn restore(&mut self, stream: &str, next: Seq, pending: Vec<(Seq, Vec<u8>)>) {
         let o = self.streams.entry(stream.to_owned()).or_default();
-        o.pending = pending.into_iter().map(|(seq, body)| Pending::new(seq, body)).collect();
+        o.pending = pending.into_iter().map(|(seq, body)| Pending::new(seq, body, false)).collect();
         o.bytes = o.pending.iter().map(|p| p.body.len()).sum();
+        o.picture = 0;
         o.answered = o.pending.front().map_or(next.saturating_sub(1), |p| p.seq.saturating_sub(1));
         o.next = next.max(o.pending.back().map_or(1, |p| p.seq.saturating_add(1)));
     }
@@ -294,6 +323,9 @@ impl Sender {
             };
             if let Some(p) = o.pending.pop_front() {
                 o.bytes = o.bytes.saturating_sub(p.body.len());
+                if p.picture {
+                    o.picture = o.picture.saturating_sub(p.body.len());
+                }
             }
             events.push(Event::Answered { stream: has.stream.clone(), seq, outcome });
         }
@@ -325,6 +357,11 @@ impl Sender {
     /// The bytes every stream keeps unanswered, together.
     pub fn bytes(&self) -> usize {
         self.streams.values().map(|o| o.bytes).sum()
+    }
+
+    /// The bytes every stream keeps unanswered past its picture, together.
+    pub fn backlog(&self) -> usize {
+        self.streams.values().map(Out::backlog).sum()
     }
 }
 
@@ -675,6 +712,23 @@ mod tests {
         s.on_frame(Frame::Have(Vec::new()));
         s.on_frame(Frame::Ack(Has { stream: "a".into(), upto: 1, nacks: Vec::new() }));
         assert!(s.push("a", vec![0; 8]).is_ok());
+    }
+
+    /// A stream's picture goes whatever its size: one larger than the room could never start its
+    /// stream. The room bounds what's pushed after it, numbered after it.
+    #[test]
+    fn a_picture_larger_than_the_room_goes_and_the_room_bounds_what_follows() {
+        let mut s = Sender::new(10, Duration::from_secs(10));
+        let picture: Vec<Seq> = (0..4).map(|_| s.push_picture("a", vec![0; 8])).collect();
+        assert_eq!(picture, vec![1, 2, 3, 4]);
+        assert_eq!((s.bytes(), s.backlog()), (32, 0));
+        assert_eq!(s.push("a", vec![0; 8]), Ok(5), "the room is what follows the picture's");
+        assert_eq!(s.push("a", vec![0; 8]), Err(Full));
+        // The picture and what followed it answered: room again, and nothing kept.
+        s.on_frame(Frame::Have(Vec::new()));
+        s.on_frame(Frame::Ack(Has { stream: "a".into(), upto: 5, nacks: Vec::new() }));
+        assert_eq!((s.bytes(), s.backlog()), (0, 0));
+        assert_eq!(s.push("a", vec![0; 8]), Ok(6));
     }
 
     #[test]
