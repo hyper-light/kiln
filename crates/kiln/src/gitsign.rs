@@ -126,9 +126,13 @@ pub fn program(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// [`program`] in this user's kiln state (`<state>/kiln/bin`).
+/// [`program`] in this user's kiln state, in a folder of this binary's own (`<state>/kiln/git-sign/
+/// <its path's hash>`): two kilns of one user (a runner and a test's, a CLI and a runner) never
+/// take each other's.
 pub fn installed() -> anyhow::Result<std::path::PathBuf> {
-    program(&crate::os::state_home().join("kiln").join("bin"))
+    let exe = std::env::current_exe().context("this binary's path")?;
+    let tag: String = sha2::Sha256::digest(exe.to_string_lossy().as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect();
+    program(&crate::os::state_home().join("kiln").join("git-sign").join(tag))
 }
 
 /// git's configuration that signs every commit with [`NAME`] as `key`, each `(name, value)`.

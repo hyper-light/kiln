@@ -532,6 +532,49 @@ fn nowhere(paths: &[std::path::PathBuf], key_pem: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R03, AC03: an agent's commit is signed as the agent, for its person, never with the
+/// person's key: git in the agent's session (the fake harness acting on a message, as an agent's
+/// tool would) commits with the git the runner set up for it; the runner holding the session's key
+/// signs through `kiln-git-sign`, and the commit verifies to kiln's root as the agent at its epoch,
+/// on its runner.
+#[test]
+fn w27_ac03_an_agents_commit_verifies_as_the_agent() -> anyhow::Result<()> {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    use kiln_ci::identity::gitsig;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let root = root(&s)?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    // What the agent does with the message: a commit in its folder, its git as the runner set it.
+    let act = dir.path().join("act.sh");
+    std::fs::write(&act, "#!/bin/sh\ngit init -q -b main 2>/dev/null\ngit -c user.name=agent -c user.email=agent@kiln commit -q --allow-empty -m \"the agent's\" >> act.out 2>&1\necho \"exit $?\" >> act.out\n")?;
+    std::fs::set_permissions(&act, std::fs::Permissions::from_mode(0o755))?;
+    let act_path = act.to_string_lossy().into_owned();
+    let (_main, log) = agents::runner_with(dir.path(), s.port, "box-a", None, TALK, &[("FAKE_CLAUDE_ACT", &act_path)])?;
+    agents::connected(s.port, &s.admin, "box-a", &log, Duration::from_secs(60))?;
+    let id = agents::open_session(s.port, &s.admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let epoch = format!("/agent/{id}/epoch/");
+    until_identities(&s, "agent", Duration::from_secs(60), |l| l.iter().any(|i| field(i, "subject").contains(&epoch) && !field(i, "verified").is_empty()))?;
+    let (st, said) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/command"), &s.admin, Some(&serde_json::json!({"type": "send", "id": "commit", "text": "commit it"})))?;
+    anyhow::ensure!((200..300).contains(&st), "send: {st} {said}");
+    let done = || std::fs::read_to_string(cwd.join("act.out")).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done().contains("exit ") {
+        anyhow::ensure!(Instant::now() < deadline, "the agent never committed: {}", std::fs::read_to_string(&log).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    anyhow::ensure!(done().contains("exit 0"), "the agent's commit failed: {}", done());
+    let out = std::process::Command::new("git").arg("-C").arg(&cwd).args(["cat-file", "commit", "HEAD"]).output()?;
+    let sig = gitsig::signature_of(&out.stdout).ok_or_else(|| anyhow::anyhow!("the agent's commit isn't signed: {}", String::from_utf8_lossy(&out.stdout)))?;
+    let v = gitsig::verify(&gitsig::payload(&out.stdout), &sig, &root, &revocations_now(&s)?, unix_now()?)?;
+    assert!(matches!(&v.identity.actor, Actor::Agent { agent, held_by: Some(h), .. } if *agent == id && h.machine == "box-a"), "as the agent, on its runner: {v}");
+    assert!(!v.identity.is_person("admin"), "never as its person: {v}");
+    assert_eq!(v.acts_for(), vec![Identity::new("hyper-light", Actor::Person { name: "admin".into() })], "for its person");
+    Ok(())
+}
+
 /// W27-R03, AC03: a person's commit is signed with their key, on their device. sam signs in
 /// (`kiln login`); git, set up as `kiln clone` sets it up, signs a commit through `kiln-git-sign`
 /// with that device's key; the commit's signature verifies to kiln's root as sam, never as anyone
