@@ -208,6 +208,9 @@ fn w26_ac07_main_moves_under_stacks_and_a_change_request() -> anyhow::Result<()>
         assert_eq!(text(&v, "parent"), below, "{d} goes onto the one below's replay: {v}");
         assert_eq!(v.get("checks_from"), Some(&json!(1)), "{d}'s checks are v1's, not its own: {v}");
         assert_eq!(v.get("same_patch"), Some(&json!(true)), "{d}'s diff is v1's exactly: {v}");
+        // Ship's Review lanes mark it as kiln's replay, its revision v2 (W26-R14).
+        let marks = ok(s, &x.kim, "GET", &format!("/api/ship/commits/acme/app/{}", text(&v, "commit")), None)?.get("review").and_then(Value::as_array).cloned().unwrap_or_default();
+        assert!(marks.iter().any(|m| text(m, "kind") == "replay" && m.get("revision") == Some(&json!(2)) && text(m, "by") == "kiln"), "{d}: {marks:?}");
         let commit = text(&v, "commit").to_owned();
         assert_eq!(rev(&x.bare, &["rev-parse", &format!("refs/kiln/diffs/{d}/v2")])?, commit, "{d}'s replay is kept at its ref");
         let who = rev(&x.bare, &["log", "-1", "--format=%an <%ae>|%cn|%s", &commit])?;

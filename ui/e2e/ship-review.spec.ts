@@ -185,3 +185,11 @@ test("Files says how fresh the change is, and Update stays in place, disabled wi
   const [bar, sec] = await Promise.all([fresh.boundingBox(), row.locator(".rv-s").first().boundingBox()]);
   expect(bar && sec && bar.x >= sec.x - 1 && bar.x + bar.width <= sec.x + sec.width + 1).toBeTruthy();
 });
+
+test("a change's row ends its line with how fresh it is, and keeps one row's height (W26-R16)", async ({ page }) => {
+  await page.goto("/ship");
+  const row = page.locator(".ship-row", { hasText: "sched: fair shares" }).first();
+  await expect(row.locator(".ship-text").first()).toHaveText(/ · replays clean on main@4c1e2a$/);
+  const heights = await page.locator(".ship-row:not(.ship-open) .ship-main").evaluateAll((els) => els.slice(0, 6).map((e) => Math.round(e.getBoundingClientRect().height)));
+  expect(new Set(heights).size).toBe(1);
+});
