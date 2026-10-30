@@ -207,9 +207,13 @@ fn peer_pid(_s: &std::os::unix::net::UnixStream) -> Option<u32> {
 /// name and directory (a local server's own agent) never takes it from a live one ([`Kept`]).
 pub fn path(name: &str, home: &std::path::Path) -> PathBuf {
     let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(32).collect();
-    // Two kiln processes on one machine (a server and runners, or test instances) never share one.
-    let tag = crate::util::sha256_hex(home.to_string_lossy().as_bytes());
-    runtime_path(&format!("harness-{safe}-{}.sock", tag.get(..8).unwrap_or("0")))
+    runtime_path(&format!("harness-{safe}-{}.sock", tag_of(home)))
+}
+
+/// What a socket's name says of the state directory `home` it was made for, so two kiln processes
+/// on one machine (a server and runners, or test instances) never share one.
+pub(crate) fn tag_of(home: &std::path::Path) -> String {
+    crate::util::sha256_hex(home.to_string_lossy().as_bytes()).get(..8).unwrap_or("0").to_owned()
 }
 
 /// `file` in the user's runtime directory for sockets (else a private one in /tmp).
@@ -322,7 +326,7 @@ fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
 /// Whether a live process answers at `path`. Without waiting: a connection the listener hasn't
 /// taken yet (its queue full) is a live one's.
 #[cfg(unix)]
-fn answers(path: &std::path::Path) -> bool {
+pub(crate) fn answers(path: &std::path::Path) -> bool {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr};
     use std::os::fd::AsRawFd as _;
     let Ok(addr) = UnixAddr::new(path) else { return false };
@@ -340,6 +344,61 @@ pub(crate) fn held(path: &std::path::Path, ours: Option<(u64, u64)>) -> Held {
         Some(f) if Some(f) == ours => Held::Ours,
         Some(_) if answers(path) => Held::Theirs,
         _ => Held::Dead,
+    }
+}
+
+/// How old a socket's file must be before a sweep may take it as left behind: a process binds its
+/// file a moment before it listens on it.
+#[cfg(unix)]
+const LEFT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often a process sweeps its sockets' folder while it runs.
+#[cfg(unix)]
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Removes the kiln sockets in `dir` (`harness-*.sock`, `reach-*.sock`) nothing answers on whose
+/// files are older than `min_age`: each was left by a process that ended without removing it, as a
+/// test's or a lab's runner does when it's killed, and nothing binds its path again. A socket a live
+/// process serves answers, so it stays. How many went.
+#[cfg(unix)]
+pub(crate) fn sweep(dir: &std::path::Path, min_age: std::time::Duration) -> usize {
+    use std::os::unix::fs::FileTypeExt as _;
+    let mut gone = 0;
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("harness-") || name.starts_with("reach-")) || !name.ends_with(".sock") {
+            continue;
+        }
+        let path = e.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        let old = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age >= min_age);
+        if meta.file_type().is_socket() && old && !answers(&path) && std::fs::remove_file(&path).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// [`sweep`] of the folder `path` is in, on a thread of its own, at most once per [`SWEEP_EVERY`]
+/// in this process: when it first binds a socket, then while it serves them.
+#[cfg(unix)]
+fn sweep_now_and_then(path: &std::path::Path) {
+    static LAST: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+    {
+        let mut last = LAST.lock();
+        if last.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let Some(dir) = path.parent().map(std::path::Path::to_path_buf) else { return };
+    let spawned = std::thread::Builder::new().name("kiln-socket-sweep".into()).spawn(move || {
+        let gone = sweep(&dir, LEFT_AFTER);
+        if gone > 0 {
+            tracing::info!(dir = %dir.display(), gone, "removed the sockets of kiln processes that ended without removing them");
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "the socket sweep couldn't start; it's tried again later");
     }
 }
 
@@ -393,6 +452,7 @@ impl Kept {
     /// log.
     pub(crate) fn new(path: PathBuf, take: bool, what: &'static str) -> anyhow::Result<Self> {
         let bound = bind(&path, take)?;
+        sweep_now_and_then(&path);
         if bound.is_none() {
             tracing::info!(path = %path.display(), "{what}: another kiln process serves this machine's socket; this one serves it once that one stops");
         }
@@ -410,6 +470,7 @@ impl Kept {
         if self.looked.elapsed() < if self.theirs { LOOK_THEIRS } else { LOOK } {
             return false;
         }
+        sweep_now_and_then(&self.path);
         self.look()
     }
 
@@ -528,6 +589,31 @@ pub fn serve_with(_host: &Arc<Host>, _path: PathBuf, _forward: Option<Forward>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2026-10-29 outage left 1,532 sockets of ended test and lab runners in the runtime
+    /// folder: a sweep takes those nothing answers on, and leaves a live one, a young one (bound,
+    /// not yet listening), and anything not a kiln socket.
+    #[cfg(unix)]
+    #[test]
+    fn sockets_nothing_answers_on_are_swept_and_live_ones_stay() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let ended = |name: &str| -> anyhow::Result<PathBuf> {
+            let p = dir.path().join(name);
+            drop(UnixListener::bind(&p)?);
+            Ok(p)
+        };
+        let (dead_reach, dead_harness) = (ended("reach-lab-0-deadbeef.sock")?, ended("harness-lab-0-deadbeef.sock")?);
+        let live = dir.path().join("reach-adacachy-4b48ed43.sock");
+        let _listening = UnixListener::bind(&live)?;
+        let (foreign, notes) = (ended("someone-else.sock")?, dir.path().join("reach-notes.sock"));
+        std::fs::write(&notes, "not a socket")?;
+        anyhow::ensure!(sweep(dir.path(), std::time::Duration::from_secs(3600)) == 0, "a young socket went");
+        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 2, "not just the two ended kiln sockets went");
+        anyhow::ensure!(!dead_reach.exists() && !dead_harness.exists(), "an ended runner's socket stayed");
+        anyhow::ensure!(live.exists() && foreign.exists() && notes.exists(), "a live socket, another program's or a plain file went");
+        Ok(())
+    }
 
     /// One request on the socket at `path`, from this process (on the blocking pool: the socket is
     /// served on the runtime). Linux's, as the one test that asks is (on macOS it was never used,

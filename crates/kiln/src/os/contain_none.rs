@@ -31,6 +31,12 @@ impl Group {
     pub fn kill(&self) {}
 
     pub fn remove(&self) {}
+
+    pub fn release(&self) {}
+}
+
+pub fn job_group(_job: &str) -> Option<Group> {
+    None
 }
 
 pub fn hold_agents() {}
