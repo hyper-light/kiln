@@ -260,6 +260,8 @@ fn w08_r10_a_rebased_diff_reuses_what_it_did_not_touch() -> anyhow::Result<()> {
         Ok(body.contains("\"last_polled_at\":null").then_some(body))
     })?;
     std::fs::write(work.join(".kiln/pull.yaml"), PULL)?;
+    // The author's own rebase is what this tests: kiln doesn't replay the diff first (W26-R16).
+    std::fs::write(work.join(".kiln/review.yaml"), "fresh:\n  replay: false\n")?;
     std::fs::write(work.join("src/version"), "1\n")?;
     std::fs::write(work.join("docs/note"), "first\n")?;
     git(&home, &work, &["add", "."])?;
