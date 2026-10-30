@@ -953,7 +953,7 @@ fn runner(d: &mut Draw, n: u64) -> RunnerIn {
     let slots = 1 + u32::try_from(d.below(3)).unwrap_or(0);
     // Sized half the time, and now and then with a GPU or two (fair share's fourth dimension).
     let capacity = (d.below(2) == 0).then(|| Resources { cpu: Cpus::whole(2 + d.below(7)), mem: (4 + d.below(29)) * GIB, gpu: if d.below(3) == 0 { 1 + u32::try_from(d.below(2)).unwrap_or(0) } else { 0 }, ..Resources::default() });
-    RunnerIn { id, view, slots, capacity, executor: None }
+    RunnerIn { id, view, slots, capacity, executor: None, draining: false }
 }
 
 fn leg(d: &mut Draw, n: u64) -> LegIn {

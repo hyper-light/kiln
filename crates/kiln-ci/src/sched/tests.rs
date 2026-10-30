@@ -18,6 +18,7 @@ fn linux(name: &str, slots: u32) -> RunnerIn {
         slots,
         capacity: None,
         executor: None,
+        draining: false,
     }
 }
 
@@ -2694,5 +2695,26 @@ fn w05_r05_a_grant_not_written_goes_back_to_its_queue() {
     assert!(again.is_some_and(|f| f != first), "the same attempt, to the same runner, under a new grant: {c:?}");
     let c = s.handle(Input::Ungranted { leg: "x".into(), fence: first }, 2 + super::state::REFUSED_AGAIN_MS);
     assert!(c.is_empty() && again == Some(fence(&s, "x")), "a late word about the grant that wasn't changes nothing: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R35: a runner's drain comes with what it is: a `RunnerChanged` (a probe's report) or a
+/// `RunnerUp` (its hello) that says it draining keeps it so, with no grant made in between; one
+/// that says it isn't is its undrain. Draining, what it runs runs on.
+#[test]
+fn w05_r35_a_runner_said_draining_stays_drained_through_its_changes() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let held = fence(&s, "x");
+    let drained = || RunnerIn { draining: true, ..linux("a", 2) };
+    s.handle(Input::RunnerChanged(Box::new(drained())), 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "drained, nothing new: {c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(drained())), 3);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "back, still drained: {c:?}");
+    assert_eq!(fence(&s, "x"), held, "x runs on under its grant");
+    let c = s.handle(Input::RunnerChanged(Box::new(linux("a", 2))), 4);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "y" && runner == "a")), "undrained, it takes y: {c:?}");
     assert_eq!(s.check_grants(), Ok(()));
 }

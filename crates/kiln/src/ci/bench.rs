@@ -143,6 +143,7 @@ fn scheduler_once() -> (f64, f64, f64) {
             slots: 4,
             capacity: None,
             executor: None,
+            draining: false,
         };
         s.handle(Input::RunnerUp(Box::new(r)), 0);
     }

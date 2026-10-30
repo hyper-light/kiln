@@ -1920,6 +1920,17 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   held, leaves the fleet until it's back, and each grant it held is lost, said so (`Lost`). A
   draining runner takes no new grant, its grants run to their end, and its capacity leaves the
   fleet's; undrained, it takes work again.
+  - The engine hears of every runner's loss: once its connection is gone past its grace (45 s)
+    and no process of it is left, whatever it held, once until it's back; and a runner forgotten.
+    A runner process that goes while another of its machine stays loses only the grants it held,
+    each lost at the end of its grace when the hub knew it was that process's; one it didn't know
+    of runs out its lease, since nobody renews it. The other process's grants run on.
+  - An operator's drain (`POST /api/agents/:name/drain`) reaches the engine, and so does a runner
+    draining on its own: one that refuses what it's sent draining or about to upgrade, and an
+    ephemeral runner its job done. An operator's drain comes with what the hub says of the runner
+    (a probe's report, its hello), so only the undrain takes it back. A runner that drained on its
+    own takes work again once the hub says what it is again (its hello, or a probe's report); if
+    it still drains, its next refusal drains it again. A leg refused so isn't kept off it.
 - **W05-R36 Writes fenced** (docs/needs.md §8, G2, E3.3). What a runner writes about a leg is taken
   only under the leg's live grant: granted, neither ended nor lost. A lease runner names the grant
   in each (its steps, events, result, refusals, output: W05-R34), and the server takes it only

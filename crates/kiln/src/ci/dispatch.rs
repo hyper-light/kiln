@@ -66,7 +66,17 @@ pub enum Msg {
     Start(Box<Start>),
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
+    /// A runner gone past its grace, no process of it left, whatever it held (W05-R35): it leaves
+    /// the scheduler's fleet until it's back, and its grants are lost.
     RunnerLost { agent: String },
+    /// A runner draining (W05-R35): its operator drained it, or it drains on its own (it refused
+    /// what it was sent, draining or upgrading). It keeps what it runs and takes nothing new until
+    /// it's back or undrained (`RunnerFacts`, which says it as the hub has it).
+    RunnerDraining { agent: String },
+    /// A machine's runner process gone past its grace while another of its processes keeps the
+    /// machine connected (W05-R35): the legs that process ran are lost; the machine, and what its
+    /// other processes run, stay.
+    LegsLost { agent: String, legs: Vec<String> },
     /// A runner's heartbeat named the legs it runs: it renews their grants (W05-R34).
     Renew { agent: String, running: Vec<String> },
     /// A lease runner's process `peer` renews the grants it names (W05-R34): it's answered which of
@@ -87,6 +97,8 @@ pub enum Msg {
         leg: String,
         /// The grant it refused, as a lease runner names it (W05-R34); else the leg's now.
         fence: Option<Fence>,
+        /// It refused it draining or upgrading: it drains on its own (W05-R35).
+        draining: bool,
     },
     Cancel {
         run: String,
@@ -609,6 +621,13 @@ impl Handle {
     /// What the dispatcher rebuilt as it started, once it has.
     pub fn restored(&self) -> Option<Restored> {
         *self.restored.lock()
+    }
+
+    /// A test's: what's sent to the dispatcher from now on, to read.
+    #[cfg(test)]
+    pub(crate) fn listen(&self) -> Option<async_channel::Receiver<Msg>> {
+        self.on.store(true, Ordering::Relaxed);
+        self.rx.lock().take()
     }
 
     /// Whether `job` is one of the engine's legs.
@@ -1244,6 +1263,20 @@ impl Dispatch {
                 self.commands(cmds).await;
                 Ok(())
             }
+            Msg::RunnerDraining { agent } => {
+                let cmds = self.sched.handle(Input::RunnerDraining { runner: agent }, now_ms());
+                self.commands(cmds).await;
+                Ok(())
+            }
+            // Each of those legs that's the machine's here still: lost now, as its process was
+            // (W05-R35). One the hub didn't know was that process's runs out its lease, as nobody
+            // renews it.
+            Msg::LegsLost { agent, legs } => {
+                let gone: Vec<(String, u32)> = legs.into_iter().filter_map(|id| self.legs.get(&id).filter(|l| l.agent.as_deref() == Some(agent.as_str())).map(|l| (id, l.attempt))).collect();
+                let cmds = self.lose(gone, "its runner process went away and didn't come back").await;
+                self.commands(cmds).await;
+                Ok(())
+            }
             // Each grant it names that's its own: renewed by the scheduler, then this runner process
             // told which aren't its own any more.
             Msg::Leased { agent, peer, seq, held } => {
@@ -1272,7 +1305,13 @@ impl Dispatch {
                 self.repo_deleted(&repo).await;
                 Ok(())
             }
-            Msg::Rejected { agent, leg, fence: named } => {
+            Msg::Rejected { agent, leg, fence: named, draining } => {
+                // Refused draining or upgrading: the runner drains on its own (W05-R35), so it gets
+                // nothing new until it's back, and the leg isn't kept off it for this.
+                if draining {
+                    let cmds = self.sched.handle(Input::RunnerDraining { runner: agent.clone() }, now_ms());
+                    self.commands(cmds).await;
+                }
                 // A lease runner's refusal of a grant that isn't the leg's now (one sent late)
                 // changes nothing (W05-R34): the scheduler sees it's not, and the leg's runner stays.
                 let now = self.legs.get(&leg).map(|l| l.fence).unwrap_or_default();
@@ -1446,7 +1485,9 @@ impl Dispatch {
 
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        // Drained by its operator, it stays so whatever else changed (W05-R35); undrained, this is
+        // its undrain.
+        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral), draining: a.draining };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         self.commands(cmds).await;
     }
@@ -1464,7 +1505,8 @@ impl Dispatch {
             self.hub.command_start(agent, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await.log_when_answered(crate::hub::LOG_WITHIN);
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
-        let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        // Back, it takes work again, unless its operator drained it (W05-R35).
+        let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral), draining: a.draining };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         cmds.extend(self.lose(gone, "the runner lost it").await);
         self.commands(cmds).await;
@@ -3853,7 +3895,7 @@ mod tests {
             ends.push(("cancelled", t));
 
             let t = running(&mut d, "refused", 3).await?;
-            d.handle(super::Msg::Rejected { agent: "a".into(), leg: "refused".into(), fence: Some(Fence { epoch: 0, n: 3 }) }).await;
+            d.handle(super::Msg::Rejected { agent: "a".into(), leg: "refused".into(), fence: Some(Fence { epoch: 0, n: 3 }), draining: false }).await;
             ends.push(("refused", t));
 
             let t = running(&mut d, "expired", 4).await?;
@@ -3888,6 +3930,167 @@ mod tests {
                 assert!(revoked(&hub, t).await?, "{end}: its job token is revoked");
             }
             assert_eq!(ends.len(), 9);
+            Ok(())
+        })
+    }
+
+    /// A runner of the hub's, `slots` of them, labelled as the legs [`queue`] makes ask.
+    fn runner(name: &str, slots: u32) -> crate::hub::AgentLive {
+        crate::hub::AgentLive { labels: vec!["kiln".into()], slots, ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
+    }
+
+    /// `leg`, one of the dispatcher's (the hub knows it as such), as `assign` leaves it once sent
+    /// to `agent`.
+    fn track(d: &mut super::Dispatch, leg: &str, agent: &str) {
+        let spec = super::placeholder_spec(&std::sync::Arc::new(kiln_ci::wf::Workflow::default()), "build");
+        let l = super::LegSt { run: "R".into(), key: leg.into(), spec, attempt: 1, agent: Some(agent.into()), report: kiln_ci::plan::LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false, fence: kiln_ci::sched::Fence::default() };
+        d.legs.insert(leg.to_owned(), l);
+        d.hub.ci.legs.lock().insert(leg.to_owned());
+    }
+
+    /// `leg` queued in the scheduler, and what it decided done.
+    async fn queue(d: &mut super::Dispatch, leg: &str) {
+        let route = kiln_ci::sched::routing::LegRoute { labels: vec!["kiln".into()], ..kiln_ci::sched::routing::LegRoute::default() };
+        let l = kiln_ci::sched::LegIn { id: leg.into(), run: "R".into(), repo: "acme/x".into(), route, ..kiln_ci::sched::LegIn::default() };
+        let cmds = d.sched.handle(kiln_ci::sched::Input::LegQueued(Box::new(l)), super::now_ms());
+        d.commands(cmds).await;
+    }
+
+    /// `leg`'s live grant: its runner, attempt and fence.
+    fn granted(hub: &crate::hub::Hub, leg: &str) -> Option<(String, u32, kiln_ci::sched::Fence)> {
+        hub.ci.grants.lock().get(leg).cloned()
+    }
+
+    /// What the hub told the dispatcher since it was last read.
+    fn said(rx: &async_channel::Receiver<super::Msg>) -> Vec<super::Msg> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// W05-R35: a runner gone past its grace leaves the scheduler's fleet whatever it held. The
+    /// hub tells the dispatcher it's lost, once, though it ran nothing; it gets no Assign after;
+    /// back (its hello), it gets work again.
+    #[test]
+    fn w05_r35_a_runner_without_legs_lost_leaves_the_fleet() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let rx = hub.ci.listen().ok_or_else(|| anyhow::anyhow!("listened to already"))?;
+            let mut d = dispatcher(&hub);
+            hub.agents.lock().insert("idle".into(), runner("idle", 2));
+            d.runner_up("idle", &[]).await;
+            if let Some(a) = hub.agents.lock().get_mut("idle") {
+                a.connected = false;
+                a.lost_at = std::time::Instant::now().checked_sub(crate::hub::AGENT_GRACE + std::time::Duration::from_secs(1));
+            }
+            hub.check_lost_agents().await;
+            hub.check_lost_agents().await;
+            let told = said(&rx);
+            assert!(matches!(told.as_slice(), [super::Msg::RunnerLost { agent }] if agent == "idle"), "told once: {told:?}");
+            for m in told {
+                d.handle(m).await;
+            }
+            queue(&mut d, "x").await;
+            assert_eq!(granted(&hub, "x"), None, "no Assign to a runner lost");
+            if let Some(a) = hub.agents.lock().get_mut("idle") {
+                a.connected = true;
+                a.lost_at = None;
+            }
+            d.handle(super::Msg::RunnerUp { agent: "idle".into(), running: Vec::new() }).await;
+            assert_eq!(granted(&hub, "x").map(|g| g.0), Some("idle".to_owned()), "back, it gets the leg");
+            Ok(())
+        })
+    }
+
+    /// W05-R35, the example of docs/needs.md E3.6: machine M runs processes P1 (legs A and B) and
+    /// P2 (leg C), a blue/green hand-over. P1 goes and doesn't come back within its grace: A and B
+    /// are lost (their grants over, their attempts ended as their runner's loss and tried again),
+    /// while C runs on under its grant, and M stays in the fleet (no RunnerLost).
+    #[test]
+    fn w05_r35_a_machines_lost_process_loses_only_its_grants() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let rx = hub.ci.listen().ok_or_else(|| anyhow::anyhow!("listened to already"))?;
+            let mut d = dispatcher(&hub);
+            hub.agents.lock().insert("m".into(), runner("m", 3));
+            d.runner_up("m", &[]).await;
+            for leg in ["a", "b", "c"] {
+                track(&mut d, leg, "m");
+                queue(&mut d, leg).await;
+            }
+            let c = granted(&hub, "c").ok_or_else(|| anyhow::anyhow!("c granted"))?;
+            assert!(["a", "b"].iter().all(|l| granted(&hub, l).is_some_and(|g| g.0 == "m")) && c.0 == "m");
+            if let Some(a) = hub.agents.lock().get_mut("m") {
+                a.running = vec!["a".into(), "b".into(), "c".into()];
+            }
+            let past = std::time::Instant::now().checked_sub(crate::hub::AGENT_GRACE + std::time::Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("a time past its grace"))?;
+            hub.lost_instance(7, "m", past, vec!["a".into(), "b".into()]);
+            hub.check_lost_agents().await;
+            let told = said(&rx);
+            assert!(matches!(told.as_slice(), [super::Msg::LegsLost { agent, legs }] if agent == "m" && *legs == ["a", "b"]), "the process's legs, not its machine: {told:?}");
+            assert_eq!(hub.agents.lock().get("m").map(|a| a.running.clone()), Some(vec!["c".to_owned()]), "their slots free");
+            for m in told {
+                d.handle(m).await;
+            }
+            for leg in ["a", "b"] {
+                assert!(granted(&hub, leg).is_none_or(|g| g.1 == 2), "{leg}'s first grant lost");
+                assert_eq!(d.legs.get(leg).map(|l| l.attempt), Some(2), "{leg} tried again");
+            }
+            assert_eq!(granted(&hub, "c"), Some(c.clone()), "C runs on under its grant");
+            assert!(d.live("m", &crate::proto::Grant::of("c", 1, c.2)), "and what it writes is taken");
+            Ok(())
+        })
+    }
+
+    /// W05-R35, the example of docs/needs.md E3.6: an operator drains runner R, which holds two
+    /// legs. R gets no third, while both run on under their grants, and finish; a probe's report
+    /// doesn't take the drain back; after the undrain R gets work again. A runner that refuses work
+    /// draining or upgrading drains on its own: the leg it refused isn't kept off it, it gets
+    /// nothing new, and back (its hello) it takes the leg.
+    #[test]
+    fn w05_r35_draining_reaches_the_engine() -> anyhow::Result<()> {
+        use kiln_ci::sched::{Input, Outcome};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let rx = hub.ci.listen().ok_or_else(|| anyhow::anyhow!("listened to already"))?;
+            let mut d = dispatcher(&hub);
+            hub.agents.lock().insert("r".into(), runner("r", 3));
+            d.runner_up("r", &[]).await;
+            for leg in ["a", "b"] {
+                track(&mut d, leg, "r");
+                queue(&mut d, leg).await;
+            }
+            assert!(hub.set_draining("r", true).await);
+            let told = said(&rx);
+            assert!(matches!(told.as_slice(), [super::Msg::RunnerDraining { agent }] if agent == "r"), "{told:?}");
+            for m in told {
+                d.handle(m).await;
+            }
+            track(&mut d, "c", "r");
+            queue(&mut d, "c").await;
+            assert_eq!(granted(&hub, "c"), None, "drained, it gets no third");
+            d.handle(super::Msg::RunnerFacts { agent: "r".into() }).await;
+            assert_eq!(granted(&hub, "c"), None, "a probe's report doesn't undrain it");
+            for leg in ["a", "b"] {
+                let g = granted(&hub, leg).ok_or_else(|| anyhow::anyhow!("{leg} runs on"))?;
+                assert!(g.0 == "r" && d.live("r", &crate::proto::Grant::of(leg, 1, g.2)), "{leg} runs on under its grant");
+                let cmds = d.sched.handle(Input::AttemptFinished { leg: leg.into(), attempt: 1, outcome: Outcome::Success }, super::now_ms());
+                d.commands(cmds).await;
+            }
+            assert!(!d.legs.contains_key("a") && !d.legs.contains_key("b"), "both finished, drained");
+            assert!(hub.set_draining("r", false).await);
+            let told = said(&rx);
+            assert!(matches!(told.as_slice(), [super::Msg::RunnerFacts { agent }] if agent == "r"), "its undrain is the runner as it is: {told:?}");
+            for m in told {
+                d.handle(m).await;
+            }
+            assert_eq!(granted(&hub, "c").map(|g| g.0), Some("r".to_owned()), "undrained, it gets work again");
+            // On its own: it refuses a leg, upgrading.
+            track(&mut d, "e", "r");
+            queue(&mut d, "e").await;
+            let e = granted(&hub, "e").ok_or_else(|| anyhow::anyhow!("e granted"))?;
+            d.handle(super::Msg::Rejected { agent: "r".into(), leg: "e".into(), fence: Some(e.2), draining: true }).await;
+            assert_eq!(granted(&hub, "e"), None, "draining on its own, it gets nothing new");
+            d.handle(super::Msg::RunnerUp { agent: "r".into(), running: vec!["c".into()] }).await;
+            assert_eq!(granted(&hub, "e").map(|g| g.0), Some("r".to_owned()), "back, it takes the leg it refused");
             Ok(())
         })
     }

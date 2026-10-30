@@ -4,7 +4,8 @@
 //! a runner from before leases, which says nothing of them. W05-R36, built with `chaos`: a runner
 //! cut off past its leg's lease gets the leg's next attempt when it's back, and what it sends then
 //! about the attempt it lost is refused. W10-R03, built with `chaos`: the lost attempt's tokens die
-//! with its grant, and the next attempt's are taken.
+//! with its grant, and the next attempt's are taken. W05-R35: an operator's drain reaches the
+//! engine.
 
 #![cfg(unix)]
 
@@ -378,5 +379,52 @@ fn w05_r37_a_runner_cut_off_stops_its_stop_grants_at_its_lease_end() -> anyhow::
         anyhow::ensure!(Instant::now() < deadline, "the finish grant ran on to its end: {:?}\n{}", legs()?, s.log());
         std::thread::sleep(Duration::from_millis(500));
     }
+    Ok(())
+}
+
+/// W05-R35, the example of docs/needs.md E3.6: an operator drains the server's runner while it
+/// runs legs `a` and `b` (`POST /api/agents/:name/drain`). It gets no third: `c`, which waits for
+/// `a`, doesn't start when `a` ends, though the runner has room; `a` and `b` finish. Undrained, it
+/// takes `c`, and the run succeeds.
+#[test]
+fn w05_r35_an_operators_drain_reaches_the_engine() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let marks = dir.path().join("marks");
+    std::fs::create_dir_all(&marks)?;
+    let step = |name: &str, secs: u32| format!("      - run: |\n          touch \"{}/{name}.started\"\n          sleep {secs}\n", marks.display());
+    let workflow = format!(
+        "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n{}  b:\n    runs-on: local\n    steps:\n{}  c:\n    runs-on: local\n    needs: [a]\n    steps:\n{}",
+        step("a", 8),
+        step("b", 8),
+        step("c", 0)
+    );
+    let s = push_workflow(dir.path(), &[], &workflow)?;
+    let started = |name: &str| marks.join(format!("{name}.started")).exists();
+    until(&s, 120, "a and b running", || Ok((!(started("a") && started("b"))).then(|| s.log())))?;
+    let (_, agents) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
+    let agents: Value = serde_json::from_str(&agents)?;
+    let name = agents.as_array().and_then(|a| a.first()).or_else(|| agents.pointer("/agents/0")).and_then(|a| a.get("name")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let drain = |on: bool| http(s.port, "POST", &format!("/api/agents/{name}/drain"), &s.admin, Some(&json!({ "draining": on })));
+    let (st, body) = drain(true)?;
+    anyhow::ensure!(st == 204, "drained: {st} {body}");
+    // a and b finish; c, ready once a ends, doesn't start while the runner is drained.
+    let state = |job: &str| -> anyhow::Result<Value> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/lease&limit=5", &s.admin, None)?;
+        let run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+        let legs = serde_json::from_str::<Value>(&detail)?.get("legs").cloned().unwrap_or_default();
+        Ok(legs.as_array().into_iter().flatten().find(|l| l.get("key").and_then(Value::as_str) == Some(job) || l.get("name").and_then(Value::as_str) == Some(job)).and_then(|l| l.get("status")).cloned().unwrap_or_default())
+    };
+    until(&s, 120, "a and b finished", || {
+        let (a, b) = (state("a")?, state("b")?);
+        Ok((!(a == json!("succeeded") && b == json!("succeeded"))).then(|| format!("a {a}, b {b}")))
+    })?;
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(!started("c"), "drained, the runner takes no third leg: c is {}\n{}", state("c")?, s.log());
+    let (st, body) = drain(false)?;
+    anyhow::ensure!(st == 204, "undrained: {st} {body}");
+    let (about, _) = ended(&s, 120)?;
+    assert!(started("c"), "undrained, it takes c");
+    assert_eq!(about.pointer("/run/conclusion"), Some(&json!("success")), "{about}");
     Ok(())
 }

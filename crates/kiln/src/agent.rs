@@ -87,6 +87,11 @@ fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::ru
 /// Why an outpost turns a job down (an older server may still hand it one).
 const OUTPOST_TAKES_NO_JOBS: &str = "an outpost takes no jobs";
 
+/// Why a runner draining, or about to upgrade, turns a job down: the server takes either as the
+/// runner draining on its own (docs/ci.md W05-R35). Older runners say the same words.
+pub(crate) const REFUSED_DRAINING: &str = "draining";
+pub(crate) const REFUSED_UPGRADING: &str = "upgrading";
+
 #[derive(Serialize, Deserialize)]
 pub struct EnrollRequest {
     pub token: String,
@@ -2392,7 +2397,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
@@ -3086,7 +3091,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
                             // To a server that takes leases, naming the grant refused (W05-R34).
                             let refusal = match a.fence {
                                 Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: reason.into() },

@@ -420,6 +420,9 @@ pub struct Hub {
     /// Runner processes that went away while their machine stayed connected through another
     /// one, with when and the jobs they held (requeued if they do not come back in time).
     lost_instances: Mutex<HashMap<PeerId, (String, Instant, Vec<String>)>>,
+    /// Runners gone past their grace that the CI engine was told of (`RunnerLost`, W05-R35): each
+    /// once, until it's back.
+    lost_told: Mutex<HashSet<String>>,
     /// Agent sessions on their way from a machine's older runner processes to its newest
     /// (`crate::handovers`).
     pub(crate) handovers: Mutex<crate::handovers::Handovers>,
@@ -553,6 +556,7 @@ impl Hub {
             joins: crate::join::Requests::default(),
             instances: Mutex::new(crate::instances::Instances::default()),
             lost_instances: Mutex::new(HashMap::new()),
+            lost_told: Mutex::new(HashSet::new()),
             handovers: Mutex::new(crate::handovers::Handovers::default()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
@@ -1320,12 +1324,18 @@ impl Hub {
             a.draining = draining;
             a.clone()
         };
+        // The CI engine too (W05-R35): drained, it gives the runner nothing new and lets what it
+        // runs finish; undrained, the runner as it is now, which takes work again.
+        let agent = agent.to_owned();
+        self.ci.send(if draining { crate::ci::dispatch::Msg::RunnerDraining { agent } } else { crate::ci::dispatch::Msg::RunnerFacts { agent } });
         self.emit_agent(&snapshot);
         self.wake.notify();
         true
     }
 
     pub async fn forget_agent(&self, agent: &str) -> anyhow::Result<()> {
+        // It leaves the CI engine's fleet, and what it held is lost (W05-R35).
+        self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: agent.to_owned() });
         let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
         peers.extend(self.instances.lock().of(agent));
         peers.sort_unstable();
@@ -1563,6 +1573,13 @@ impl Hub {
         }
     }
 
+    /// A test's: runner process `peer` of machine `name` went away at `at`, holding `jobs`, while
+    /// another kept the machine connected.
+    #[cfg(test)]
+    pub(crate) fn lost_instance(&self, peer: PeerId, name: &str, at: Instant, jobs: Vec<String>) {
+        self.lost_instances.lock().insert(peer, (name.to_owned(), at, jobs));
+    }
+
     async fn requeue_agent_jobs(&self, name: &str, reason: &str) {
         let jobs: Vec<String> = {
             let mut g = self.agents.lock();
@@ -1576,7 +1593,8 @@ impl Hub {
                 None => vec![],
             }
         };
-        if jobs.iter().any(|j| self.ci.is_leg(j)) {
+        // The CI engine hears of it whatever it held (W05-R35), once until it's back.
+        if self.lost_told.lock().insert(name.to_owned()) {
             self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() });
         }
         for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
@@ -1724,18 +1742,19 @@ impl Hub {
                     self.send_peer(peer, &ServerMsg::Received { job }).await;
                 }
             }
-            AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
+            AgentMsg::Reject { job, reason } if self.ci.is_leg(&job) => {
                 if self.takes(peer, &job, None) {
-                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job, fence: None });
+                    let draining = drains_on_its_own(&reason);
+                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job, fence: None, draining });
                 }
             }
             // A lease runner's refusal, naming the grant it refuses (W05-R34): taken while that's
             // the leg's live grant (W05-R36); one come late, after it was lost or granted again,
             // refuses nothing.
-            AgentMsg::Refused { grant, .. } if self.ci.is_leg(&grant.leg) => {
+            AgentMsg::Refused { grant, reason } if self.ci.is_leg(&grant.leg) => {
                 if self.takes(peer, &grant.leg.clone(), Some(&grant)) {
-                    let fence = Some(grant.fence());
-                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: grant.leg, fence });
+                    let (fence, draining) = (Some(grant.fence()), drains_on_its_own(&reason));
+                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: grant.leg, fence, draining });
                 }
             }
             AgentMsg::Refused { .. } => {}
@@ -2358,6 +2377,7 @@ impl Hub {
         )
         .await;
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
+        self.lost_told.lock().remove(&name);
         self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() });
         // Older processes of this machine take no new jobs; what they run, they keep.
         for p in &joined.drain {
@@ -2564,6 +2584,7 @@ impl Hub {
             self.emit_agent(&a);
             if a.ephemeral {
                 self.command_start(agent, &ServerMsg::Drain).await.log_when_answered(LOG_WITHIN);
+                self.ci.send(crate::ci::dispatch::Msg::RunnerDraining { agent: agent.to_owned() });
             }
         }
         self.emit_job(&r.job).await;
@@ -2929,7 +2950,7 @@ impl Hub {
         Ok(())
     }
 
-    async fn check_lost_agents(&self) {
+    pub(crate) async fn check_lost_agents(&self) {
         // Jobs of a runner process that went away while its machine stayed connected through
         // another one, and did not come back in time.
         let expired: Vec<(String, Vec<String>)> = {
@@ -2938,8 +2959,14 @@ impl Hub {
             peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
         };
         for (name, jobs) in expired {
-            if jobs.iter().any(|j| self.ci.is_leg(j)) {
-                self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.clone() });
+            // Its legs are lost, not its machine's (W05-R35): another process keeps the machine,
+            // and runs on what it holds.
+            let legs: Vec<String> = jobs.iter().filter(|j| self.ci.is_leg(j) && self.agents.lock().get(&name).is_some_and(|a| a.running.contains(*j))).cloned().collect();
+            for j in &legs {
+                self.release_slot(&name, j);
+            }
+            if !legs.is_empty() {
+                self.ci.send(crate::ci::dispatch::Msg::LegsLost { agent: name.clone(), legs });
             }
             for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
                 let still = self.agents.lock().get(&name).is_some_and(|a| a.running.contains(&j));
@@ -2963,6 +2990,15 @@ impl Hub {
             .collect();
         for name in lost {
             self.requeue_agent_jobs(&name, "agent did not reconnect").await;
+        }
+        // Those that held nothing leave the CI engine's fleet too (W05-R35), each once.
+        let idle: Vec<String> = {
+            let g = self.agents.lock();
+            let mut told = self.lost_told.lock();
+            g.values().filter(|a| !a.connected && a.lost_at.is_some_and(|t| t.elapsed() > AGENT_GRACE) && told.insert(a.name.clone())).map(|a| a.name.clone()).collect()
+        };
+        for agent in idle {
+            self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent });
         }
         self.agents.lock().retain(|_, a| {
             !(a.ephemeral && !a.connected && a.running.is_empty() && a.lost_at.is_some_and(|t| t.elapsed() > AGENT_GRACE))
@@ -3069,6 +3105,12 @@ pub(crate) fn hold_on(a: &mut AgentLive, job: &str, incoming: kiln_ci::sched::st
         kiln_ci::sched::state::Incoming::Whole => a.exclusive = true,
         kiln_ci::sched::state::Incoming::Ordinary => {}
     }
+}
+
+/// Whether a runner's refusal says it drains on its own (docs/ci.md W05-R35): it's draining, or
+/// about to upgrade.
+fn drains_on_its_own(reason: &str) -> bool {
+    reason == crate::agent::REFUSED_DRAINING || reason == crate::agent::REFUSED_UPGRADING
 }
 
 #[cfg(test)]
@@ -3229,6 +3271,14 @@ pub(crate) mod tests {
         assert!(fits(&["linux"], "linux", "x86_64", &["Linux"]), "`Linux` against `linux`");
         assert!(fits(&["Linux"], "linux", "x86_64", &["linux"]), "`linux` against `Linux`");
         assert!(!fits(&["baremetal"], "macos", "aarch64", &["baremetal", "linux"]), "a Mac isn't Linux");
+    }
+
+    /// W05-R35: a runner's refusal, draining or about to upgrade, says it drains on its own; one
+    /// for want of room, or an outpost's, doesn't.
+    #[test]
+    fn w05_r35_a_refusal_draining_or_upgrading_drains_its_runner() {
+        assert!(drains_on_its_own("draining") && drains_on_its_own("upgrading"));
+        assert!(!drains_on_its_own("no free slot") && !drains_on_its_own("an outpost takes no jobs"));
     }
 
     /// A connected runner on `os`/`arch` that hosts agents (its terminals on), for a test's hub.

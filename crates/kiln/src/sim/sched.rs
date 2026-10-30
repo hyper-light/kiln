@@ -176,7 +176,7 @@ struct Sim {
 
 fn runner_in(id: &str, slots: u32, threads: u32, mem: u64) -> RunnerIn {
     let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), cpu: Cpu { threads, cores: threads, ..Cpu::default() }, mem: Mem { total: mem, free: mem }, ..RunnerFacts::default() };
-    RunnerIn { id: id.into(), view: RunnerView { name: id.into(), labels: vec!["kiln".into()], facts, caps: 0, pool: None }, slots, capacity: None, executor: None }
+    RunnerIn { id: id.into(), view: RunnerView { name: id.into(), labels: vec!["kiln".into()], facts, caps: 0, pool: None }, slots, capacity: None, executor: None, draining: false }
 }
 
 /// What the runners' rule (W05-R03) lets a runner of `slots` and `size` hold, counted plainly:

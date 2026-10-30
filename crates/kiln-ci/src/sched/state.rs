@@ -583,6 +583,10 @@ pub struct RunnerIn {
     /// other's; `Some("")` when the server doesn't know whose it is (one left from before a
     /// restart), which takes none.
     pub executor: Option<String>,
+    /// Draining (W05-R35): it keeps running what it holds and takes nothing new, as its operator
+    /// had it. Said with the rest of it, so that a `RunnerChanged` or `RunnerUp` doesn't take back
+    /// a drain, and one with `false` is its undrain.
+    pub draining: bool,
 }
 
 /// How an attempt ended.
@@ -2729,7 +2733,8 @@ impl Scheduler {
             }
         }
         let (running, used) = self.runners.get(&id).map(|x| (x.running.clone(), x.used)).unwrap_or_default();
-        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false });
+        let draining = r.draining;
+        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining });
         self.refresh_fleet();
         self.refresh_eligibility(&id);
         self.release_holds(now, out);

@@ -89,7 +89,7 @@ fn runner(d: &mut Draw, id: &str) -> RunnerIn {
     let slots = 1 + u32::try_from(d.below(4)).unwrap_or(0);
     let capacity = (d.below(2) == 0).then(|| Resources { cpu: Cpus::whole(2 + d.below(15)), mem: (4 + d.below(61)) * GIB, gpu: if d.below(4) == 0 { 1 + u32::try_from(d.below(4)).unwrap_or(0) } else { 0 }, ..Resources::default() });
     let facts = RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() };
-    RunnerIn { id: id.into(), view: RunnerView { name: id.into(), labels: vec!["kiln".into()], facts, caps: 0, pool: None }, slots, capacity, executor: None }
+    RunnerIn { id: id.into(), view: RunnerView { name: id.into(), labels: vec!["kiln".into()], facts, caps: 0, pool: None }, slots, capacity, executor: None, draining: false }
 }
 
 /// A leg, how long it runs, and how its first attempts fail.
