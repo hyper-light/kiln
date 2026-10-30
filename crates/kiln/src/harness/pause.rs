@@ -511,7 +511,7 @@ pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
 /// the stop point (which starts a pause), and room on its machine for it to go to work
 /// (`Core::has_room`: at work already, it has).
 pub fn open(core: &mut Core) -> bool {
-    !core.hold && !at_threshold(core) && core.has_room()
+    !core.hold && !at_threshold(core) && core.has_room() && crate::headroom::admit(&core.session_id, crate::headroom::Class::Agent)
 }
 
 /// The job an `Effect::Checkpoint` comes back under (`run_done`), followed by the pause's start.

@@ -398,3 +398,14 @@ export const discoveryApi = {
   /** Open (rate-limited): what an invited machine polls. */
   invited: (instance: string, signal?: AbortSignal) => get<{ invited: boolean; ca: string }>(`/api/join/invited${qs({ instance })}`, signal),
 };
+
+/* ---------------------------- headroom (Runners → Headroom) ---------------------------- */
+
+import type { HeadroomSettings, HeadroomView } from "./types";
+
+export const headroomApi = {
+  /** Every runner that runs headroom or has settings for it. */
+  list: (signal?: AbortSignal) => get<HeadroomView[]>("/api/headroom", signal),
+  get: (runner: string, signal?: AbortSignal) => get<HeadroomView>(`/api/runners/${enc(runner)}/headroom`, signal),
+  save: (runner: string, settings: HeadroomSettings) => request<HeadroomView>("PUT", `/api/runners/${enc(runner)}/headroom`, settings),
+};

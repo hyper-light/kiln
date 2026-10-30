@@ -84,6 +84,7 @@ unsafe extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
     fn OpenThread(access: u32, inherit: i32, tid: u32) -> Handle;
     fn ResumeThread(thread: Handle) -> u32;
+    fn SuspendThread(thread: Handle) -> u32;
     fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
     fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
     fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
@@ -228,24 +229,50 @@ impl Group {
     }
 }
 
-/// Lets the threads of process `pid` (created suspended) run.
-pub(crate) fn resume(pid: u32) {
+/// Calls `f` on every thread of the processes `pids` (one snapshot of the system's threads), and
+/// says which processes had a thread it reached.
+fn each_thread(pids: &[u32], f: unsafe extern "system" fn(Handle) -> u32) -> Vec<u32> {
+    let mut reached = Vec::new();
     // SAFETY: a snapshot of the system's threads; no process id is needed for threads.
-    let Some(snap) = Owned::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else { return };
+    let Some(snap) = Owned::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else { return reached };
     let mut entry = ThreadEntry { size: u32::try_from(std::mem::size_of::<ThreadEntry>()).unwrap_or(0), ..ThreadEntry::default() };
     // SAFETY: the snapshot's handle and an entry whose size is set.
     let mut more = unsafe { Thread32First(snap.0, &raw mut entry) } != 0;
     while more {
-        if entry.owner_process_id == pid {
+        if pids.contains(&entry.owner_process_id) {
             // SAFETY: a thread id the snapshot listed.
             if let Some(t) = Owned::new(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) }) {
-                // SAFETY: a thread handle opened to resume it.
-                unsafe { ResumeThread(t.0) };
+                // SAFETY: a thread handle opened to suspend and resume it.
+                if unsafe { f(t.0) } != u32::MAX && !reached.contains(&entry.owner_process_id) {
+                    reached.push(entry.owner_process_id);
+                }
             }
         }
         // SAFETY: as above.
         more = unsafe { Thread32Next(snap.0, &raw mut entry) } != 0;
     }
+    reached
+}
+
+/// Lets the threads of process `pid` (created suspended) run.
+pub(crate) fn resume(pid: u32) {
+    each_thread(&[pid], ResumeThread);
+}
+
+/// Stops every thread of the processes `pids` (each once: a thread's suspensions count, so each is
+/// undone by one [`resume_all`]), and says which it stopped.
+pub(crate) fn suspend_all(pids: &[u32]) -> Vec<u32> {
+    each_thread(pids, SuspendThread)
+}
+
+/// Undoes one [`suspend_all`] of the processes `pids`.
+pub(crate) fn resume_all(pids: &[u32]) {
+    each_thread(pids, ResumeThread);
+}
+
+/// The sessions with a job now.
+pub fn sessions() -> Vec<String> {
+    jobs().lock().keys().cloned().collect()
 }
 
 /// The agent session process `pid` belongs to by its job, when it's in one of this runner's.

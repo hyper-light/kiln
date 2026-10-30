@@ -52,6 +52,9 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_INSTANCE",
     "KILN_LOG",
     "KILN_CHAOS",
+    // A gate's own git config (ci/gate.sh sets it): it overrides the HOME a test's kiln is given,
+    // and actions/checkout edits a .gitconfig in the HOME it sets for git, which it then misses.
+    "GIT_CONFIG_GLOBAL",
 ];
 
 /// This build's `kiln`, as a test starts it: with none of [`NOT_INHERITED`] (what the test sets

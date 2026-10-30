@@ -96,6 +96,8 @@ pub enum ServerEvent {
     /// How many agent sessions a runner has at work at once changed (set here, or what it said it
     /// holds): refetch it.
     AgentLimit { runner: String },
+    /// A runner's headroom changed (settings, or what the runner reported): refetch it.
+    Headroom { runner: String },
     /// An agent's change request opened or moved on.
     AgentChange { agent: String, change: Box<crate::workspace::change::Record> },
     /// An agent session kiln runs appeared or changed.
