@@ -347,6 +347,25 @@ pub enum JobRetry {
     Refused(String),
 }
 
+/// What [`Store::cancel_jobs`] did to one job (docs/ci.md W26-R21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobCancel {
+    Cancelled,
+    NoSuchJob,
+    /// Why it wasn't cancelled: it had finished.
+    Refused(String),
+}
+
+/// What [`Store::cancel_jobs`] did: each job named and what became of it; the ones that were
+/// running, with the runner each ran on, to be told to stop; and the jobs skipped because a job
+/// they need was cancelled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobsCancelled {
+    pub jobs: Vec<(String, JobCancel)>,
+    pub running: Vec<(String, Option<String>)>,
+    pub skipped: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "JobStep"))]
@@ -1279,60 +1298,115 @@ impl Store {
     pub async fn retry_job(&self, id: String, placement: Option<kiln_ci::sched::Placement>) -> anyhow::Result<JobRetry> {
         self.call(move |c| {
             let tx = crate::store::tx(c)?;
+            let out = retry_job_in(&tx, &id, placement, crate::util::now_unix(), None)?;
+            if matches!(out, JobRetry::Again { .. }) {
+                tx.commit()?;
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Whether `run` is the CI engine's (it has a plan), finished or not: its jobs are legs, run
+    /// again and stopped through the engine (docs/ci.md W26-R21).
+    pub async fn is_engine_run(&self, run: String) -> anyhow::Result<bool> {
+        self.call(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_plans WHERE run_id = ?1)", [&run], |r| r.get::<_, bool>(0))?)).await
+    }
+
+    /// Jobs of one v1 run run again together (docs/ci.md W26-R21), each as [`Store::retry_job`]
+    /// runs one, passed ones too, in one transaction: a job before the jobs that need it, so one
+    /// the set names that an earlier retry in it already sent back to wait is again with it, not
+    /// refused for not having finished. Each job named, and what became of it.
+    pub async fn retry_jobs(&self, run_id: String, jobs: Vec<String>) -> anyhow::Result<Vec<(String, JobRetry)>> {
+        self.call(move |c| {
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
-            let found: Option<(String, String, String, u32)> =
-                tx.query_row("SELECT run_id, key, status, attempt FROM jobs WHERE id = ?1 AND job_id IS NULL", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
-            let Some((run_id, key, status, attempt)) = found else { return Ok(JobRetry::NoSuchJob) };
-            let status = Status::parse(&status);
-            if !status.is_terminal() {
-                return Ok(JobRetry::Refused(format!("`{key}` hasn't finished: it's {}", status.as_str())));
-            }
-            if status == Status::Skipped {
-                return Ok(JobRetry::Refused(format!("`{key}` was skipped: retry the job it needs, or the run")));
-            }
-            let jobs: Vec<(String, String, Status, Vec<String>)> = {
-                let mut st = tx.prepare("SELECT id, key, status, needs FROM jobs WHERE run_id = ?1")?;
-                let rows = st.query_map([&run_id], |r| Ok((r.get(0)?, r.get(1)?, Status::parse(&r.get::<_, String>(2)?), from_json::<Vec<String>>(&r.get::<_, String>(3)?))))?;
+            // The run's jobs, to put each named one after those it needs, directly or not.
+            let all: Vec<(String, String, Vec<String>)> = {
+                let mut st = tx.prepare("SELECT id, key, needs FROM jobs WHERE run_id = ?1 AND job_id IS NULL")?;
+                let rows = st.query_map([&run_id], |r| Ok((r.get(0)?, r.get(1)?, from_json::<Vec<String>>(&r.get::<_, String>(2)?))))?;
                 rows.collect::<Result<_, _>>()?
             };
-            // Every job that needs it, directly or not, by key.
-            let mut needing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            let mut next = vec![key.clone()];
-            while let Some(k) = next.pop() {
-                for (_, jk, _, needs) in &jobs {
-                    if needs.contains(&k) && needing.insert(jk.clone()) {
-                        next.push(jk.clone());
+            let needs_of: std::collections::HashMap<&str, &Vec<String>> = all.iter().map(|(_, k, n)| (k.as_str(), n)).collect();
+            let depth = |key: &str| {
+                let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+                let mut next = vec![key];
+                while let Some(k) = next.pop() {
+                    for n in needs_of.get(k).map(|v| v.as_slice()).unwrap_or_default() {
+                        if seen.insert(n.as_str()) {
+                            next.push(n.as_str());
+                        }
                     }
                 }
-            }
-            if let Some((_, k, ..)) = jobs.iter().find(|(_, k, s, _)| needing.contains(k) && *s == Status::Running) {
-                return Ok(JobRetry::Refused(format!("`{k}` needs `{key}` and is running: wait for it, or cancel the run")));
-            }
-            const AGAIN: &str = "status = 'pending', attempt = attempt + 1, agent = NULL, executor = NULL, queued_at = NULL, started_at = NULL,
-                finished_at = NULL, exit_code = NULL, error = NULL, peak_rss = NULL, cpu_seconds = NULL";
-            let placement = placement.filter(|p| !p.is_empty()).map(|p| json(&p));
-            tx.execute(&format!("UPDATE jobs SET {AGAIN}, placement = ?2 WHERE id = ?1"), params![id, placement])?;
-            let mut waiting = Vec::new();
-            for (jid, _, s, _) in jobs.iter().filter(|(_, k, ..)| needing.contains(k)) {
-                if s.is_terminal() {
-                    tx.execute(&format!("UPDATE jobs SET {AGAIN}, placement = NULL WHERE id = ?1"), [jid])?;
-                } else if *s == Status::Queued {
-                    tx.execute("UPDATE jobs SET status = 'pending', queued_at = NULL WHERE id = ?1", [jid])?;
-                } else {
+                seen.len()
+            };
+            let key_of: std::collections::HashMap<&str, &str> = all.iter().map(|(id, k, _)| (id.as_str(), k.as_str())).collect();
+            let mut order: Vec<(usize, usize, String)> = jobs.into_iter().enumerate().map(|(i, id)| (key_of.get(id.as_str()).map_or(0, |k| depth(k)), i, id)).collect();
+            order.sort();
+            let mut sent_back: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut out = Vec::new();
+            for (_, _, id) in order {
+                if sent_back.contains(&id) {
+                    let attempt: u32 = tx.query_row("SELECT attempt FROM jobs WHERE id = ?1", [&id], |r| r.get(0))?;
+                    out.push((id, JobRetry::Again { run: run_id.clone(), attempt, waiting: Vec::new() }));
                     continue;
                 }
-                waiting.push(jid.clone());
+                let r = retry_job_in(&tx, &id, None, now, Some(&run_id))?;
+                if let JobRetry::Again { waiting, .. } = &r {
+                    sent_back.extend(waiting.iter().cloned());
+                }
+                out.push((id, r));
             }
-            let again: Vec<&String> = std::iter::once(&id).chain(&waiting).collect();
-            tx.execute(
-                "UPDATE steps SET status = 'pending', started_at = NULL, finished_at = NULL, exit_code = NULL WHERE job_id IN (SELECT value FROM json_each(?1))",
-                [json(&again)],
-            )?;
-            tx.execute("UPDATE runs SET status = 'queued', finished_at = NULL, error = NULL WHERE id = ?1 AND status IN ('succeeded','failed','cancelled','skipped','timed_out')", [&run_id])?;
-            // It, its needs succeeded, is queued at once.
-            advance_run(&tx, &run_id, now)?;
-            tx.commit()?;
-            Ok(JobRetry::Again { run: run_id, attempt: attempt.saturating_add(1), waiting })
+            if out.iter().any(|(_, r)| matches!(r, JobRetry::Again { .. })) {
+                tx.commit()?;
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Jobs of one v1 run stopped (docs/ci.md W26-R21): each named one that hasn't finished is
+    /// cancelled with `reason`, the jobs waiting on them are skipped ("dependency cancelled"), and
+    /// the run's other jobs go on. A job that already finished is refused, saying how it ended.
+    pub async fn cancel_jobs(&self, run_id: String, jobs: Vec<String>, reason: String) -> anyhow::Result<JobsCancelled> {
+        self.call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let now = crate::util::now_unix();
+            let skipped_before: std::collections::BTreeSet<String> = {
+                let mut st = tx.prepare("SELECT id FROM jobs WHERE run_id = ?1 AND status = 'skipped'")?;
+                let rows = st.query_map([&run_id], |r| r.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let mut out = JobsCancelled::default();
+            for id in jobs {
+                let found: Option<(String, String, Option<String>)> = tx
+                    .query_row("SELECT key, status, agent FROM jobs WHERE id = ?1 AND run_id = ?2 AND job_id IS NULL", params![id, run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                let Some((key, status, agent)) = found else {
+                    out.jobs.push((id, JobCancel::NoSuchJob));
+                    continue;
+                };
+                let status = Status::parse(&status);
+                if status.is_terminal() {
+                    out.jobs.push((id, JobCancel::Refused(format!("`{key}` already finished: it's {}", status.as_str()))));
+                    continue;
+                }
+                if status == Status::Running {
+                    out.running.push((id.clone(), agent));
+                }
+                tx.execute("UPDATE jobs SET status = 'cancelled', finished_at = ?2, error = ?3 WHERE id = ?1", params![id, now, reason])?;
+                tx.execute("UPDATE steps SET status = 'cancelled' WHERE job_id = ?1 AND status IN ('pending','running')", [&id])?;
+                out.jobs.push((id, JobCancel::Cancelled));
+            }
+            if out.jobs.iter().any(|(_, r)| *r == JobCancel::Cancelled) {
+                advance_run(&tx, &run_id, now)?;
+                let mut st = tx.prepare("SELECT id FROM jobs WHERE run_id = ?1 AND status = 'skipped'")?;
+                let now_skipped: Vec<String> = st.query_map([&run_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                out.skipped = now_skipped.into_iter().filter(|j| !skipped_before.contains(j)).collect();
+                drop(st);
+                tx.commit()?;
+            }
+            Ok(out)
         })
         .await
     }
@@ -1674,11 +1748,71 @@ fn steps_of(c: &Connection, job_id: &str) -> rusqlite::Result<Vec<Step>> {
 
 /// Promote pending jobs whose dependencies all succeeded, skip those with a failed dependency, and
 /// settle the run when every job is terminal.
+/// [`Store::retry_job`]'s work in the caller's transaction (it commits): the job `id` again,
+/// and every job that needs it back to wait for it. `in_run`: the run it must belong to.
+fn retry_job_in(tx: &Connection, id: &str, placement: Option<kiln_ci::sched::Placement>, now: i64, in_run: Option<&str>) -> anyhow::Result<JobRetry> {
+    let found: Option<(String, String, String, u32)> =
+        tx.query_row("SELECT run_id, key, status, attempt FROM jobs WHERE id = ?1 AND job_id IS NULL", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+    let Some((run_id, key, status, attempt)) = found.filter(|(r, ..)| in_run.is_none_or(|want| want == r)) else { return Ok(JobRetry::NoSuchJob) };
+    let status = Status::parse(&status);
+    if !status.is_terminal() {
+        return Ok(JobRetry::Refused(format!("`{key}` hasn't finished: it's {}", status.as_str())));
+    }
+    if status == Status::Skipped {
+        return Ok(JobRetry::Refused(format!("`{key}` was skipped: retry the job it needs, or the run")));
+    }
+    let jobs: Vec<(String, String, Status, Vec<String>)> = {
+        let mut st = tx.prepare("SELECT id, key, status, needs FROM jobs WHERE run_id = ?1")?;
+        let rows = st.query_map([&run_id], |r| Ok((r.get(0)?, r.get(1)?, Status::parse(&r.get::<_, String>(2)?), from_json::<Vec<String>>(&r.get::<_, String>(3)?))))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    // Every job that needs it, directly or not, by key.
+    let mut needing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut next = vec![key.clone()];
+    while let Some(k) = next.pop() {
+        for (_, jk, _, needs) in &jobs {
+            if needs.contains(&k) && needing.insert(jk.clone()) {
+                next.push(jk.clone());
+            }
+        }
+    }
+    if let Some((_, k, ..)) = jobs.iter().find(|(_, k, s, _)| needing.contains(k) && *s == Status::Running) {
+        return Ok(JobRetry::Refused(format!("`{k}` needs `{key}` and is running: wait for it, or cancel the run")));
+    }
+    const AGAIN: &str = "status = 'pending', attempt = attempt + 1, agent = NULL, executor = NULL, queued_at = NULL, started_at = NULL,
+        finished_at = NULL, exit_code = NULL, error = NULL, peak_rss = NULL, cpu_seconds = NULL";
+    let placement = placement.filter(|p| !p.is_empty()).map(|p| json(&p));
+    tx.execute(&format!("UPDATE jobs SET {AGAIN}, placement = ?2 WHERE id = ?1"), params![id, placement])?;
+    let mut waiting = Vec::new();
+    for (jid, _, s, _) in jobs.iter().filter(|(_, k, ..)| needing.contains(k)) {
+        if s.is_terminal() {
+            tx.execute(&format!("UPDATE jobs SET {AGAIN}, placement = NULL WHERE id = ?1"), [jid])?;
+        } else if *s == Status::Queued {
+            tx.execute("UPDATE jobs SET status = 'pending', queued_at = NULL WHERE id = ?1", [jid])?;
+        } else {
+            continue;
+        }
+        waiting.push(jid.clone());
+    }
+    let id = id.to_owned();
+    let again: Vec<&String> = std::iter::once(&id).chain(&waiting).collect();
+    tx.execute(
+        "UPDATE steps SET status = 'pending', started_at = NULL, finished_at = NULL, exit_code = NULL WHERE job_id IN (SELECT value FROM json_each(?1))",
+        [json(&again)],
+    )?;
+    tx.execute("UPDATE runs SET status = 'queued', finished_at = NULL, error = NULL WHERE id = ?1 AND status IN ('succeeded','failed','cancelled','skipped','timed_out')", [&run_id])?;
+    // It, its needs succeeded, is queued at once.
+    advance_run(tx, &run_id, now)?;
+    Ok(JobRetry::Again { run: run_id, attempt: attempt.saturating_add(1), waiting })
+}
+
 const DEP_FAILED: &str = "dependency failed";
+/// Why a job is skipped when every job it needs that didn't succeed was cancelled (docs/ci.md W26-R21).
+const DEP_CANCELLED: &str = "dependency cancelled";
 
 fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option<Status>> {
     loop {
-        let jobs: Vec<(String, String, Vec<String>)> = {
+        let jobs: Vec<(String, String, &str)> = {
             let mut st = tx.prepare("SELECT id, key, status, needs, COALESCE(error, '') FROM jobs WHERE run_id = ?1")?;
             let rows = st.query_map([run_id], |r| {
                 Ok((
@@ -1697,6 +1831,8 @@ fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option
                 // A job skipped because its own dependency failed propagates the failure.
                 if st == Status::Skipped && error == DEP_FAILED {
                     st = Status::Failed;
+                } else if st == Status::Skipped && error == DEP_CANCELLED {
+                    st = Status::Cancelled;
                 }
                 status_by_key.insert(key.clone(), st);
                 v.push((id, key, status, needs));
@@ -1712,9 +1848,10 @@ fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option
                     .map(|n| status_by_key.get(n).copied().unwrap_or(Status::Succeeded))
                     .collect();
                 if states.iter().any(|s| s.is_terminal() && !s.is_success()) {
-                    changes.push((id, "skipped".to_owned(), needs));
+                    let cancelled = states.iter().all(|s| !s.is_terminal() || s.is_success() || *s == Status::Cancelled);
+                    changes.push((id, "skipped".to_owned(), if cancelled { DEP_CANCELLED } else { DEP_FAILED }));
                 } else if states.iter().all(|s| s.is_success()) {
-                    changes.push((id, "queued".to_owned(), needs));
+                    changes.push((id, "queued".to_owned(), DEP_FAILED));
                 }
             }
             changes
@@ -1722,7 +1859,7 @@ fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option
         if jobs.is_empty() {
             break;
         }
-        for (id, status, _) in &jobs {
+        for (id, status, why) in &jobs {
             if status == "queued" {
                 tx.execute(
                     "UPDATE jobs SET status = 'queued', queued_at = ?2 WHERE id = ?1",
@@ -1731,7 +1868,7 @@ fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option
             } else {
                 tx.execute(
                     "UPDATE jobs SET status = 'skipped', finished_at = ?2, error = ?3 WHERE id = ?1",
-                    params![id, now, DEP_FAILED],
+                    params![id, now, why],
                 )?;
                 tx.execute("UPDATE steps SET status = 'skipped' WHERE job_id = ?1", [id])?;
             }
@@ -1997,6 +2134,126 @@ mod tests {
             let jc = job(&c).await?;
             assert_eq!((jc.status, jc.placement), (Status::Queued, None));
             assert_eq!(s.run("run1".into()).await?.map(|r| (r.status, r.finished_at)), Some((Status::Queued, None)));
+            Ok(())
+        })
+    }
+
+    /// A v1 run with `yaml`'s jobs, on a store of its own: the store, and each job's id by key.
+    async fn w26_r21_run(yaml: &str) -> anyhow::Result<(Store, std::collections::HashMap<String, String>)> {
+        let s = Store::in_memory()?;
+        let repo = s
+            .upsert_repo(Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+            .await?;
+        let p = pipeline::parse(yaml)?;
+        let planned = pipeline::plan(&p, &pipeline::Context::default())?;
+        let run = Run {
+            id: "run1".into(),
+            repo_id: repo.id.clone(),
+            repo_name: repo.name.clone(),
+            number: 0,
+            pipeline: "ci".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "abc".into(),
+            message: String::new(),
+            author: String::new(),
+            status: Status::Queued,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        s.create_run(run, planned).await?;
+        let ids = s.jobs("run1".into(), false).await?.into_iter().map(|j| (j.key, j.id)).collect();
+        Ok((s, ids))
+    }
+
+    /// W26-R21: some of a v1 run's jobs run again together, a passed one too: each on its next
+    /// attempt with the jobs that need it back to wait; one the set names that another named
+    /// one's retry already sent back is again with it, not refused; an unknown one is refused.
+    #[test]
+    fn w26_r21_a_set_of_jobs_retried_together() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (s, ids) = w26_r21_run("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {needs: [a], steps: [{run: y}]}\n  c: {steps: [{run: z}]}\n  d: {needs: [c], steps: [{run: w}]}\n").await?;
+            let id = |k: &str| ids.get(k).cloned().unwrap_or_default();
+            let (a, b, c, d) = (id("a"), id("b"), id("c"), id("d"));
+            // a fails (b is skipped with it); c and then d pass: the run fails.
+            assert!(s.claim_job(a.clone(), "ag1".into(), "baremetal".into()).await?);
+            s.finish_job(a.clone(), Status::Failed, Some(1), None, None, None).await?;
+            assert!(s.claim_job(c.clone(), "ag1".into(), "baremetal".into()).await?);
+            s.finish_job(c.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            assert!(s.claim_job(d.clone(), "ag1".into(), "baremetal".into()).await?);
+            let (_, settled) = s.finish_job(d.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            assert_eq!(settled, Some(Status::Failed));
+            // b, the failed a, the passed c and one that isn't the run's, together.
+            let out: std::collections::HashMap<String, JobRetry> = s.retry_jobs("run1".into(), vec![b.clone(), a.clone(), c.clone(), "nope".into()]).await?.into_iter().collect();
+            assert_eq!(out.get(&a), Some(&JobRetry::Again { run: "run1".into(), attempt: 1, waiting: vec![b.clone()] }));
+            assert_eq!(out.get(&c), Some(&JobRetry::Again { run: "run1".into(), attempt: 1, waiting: vec![d.clone()] }));
+            assert_eq!(out.get(&b), Some(&JobRetry::Again { run: "run1".into(), attempt: 1, waiting: vec![] }), "b was sent back by a's retry");
+            assert_eq!(out.get("nope"), Some(&JobRetry::NoSuchJob));
+            let status = |j: &str| {
+                let (s, j) = (s.clone(), j.to_owned());
+                async move { s.job(j).await?.map(|j| (j.status, j.attempt)).ok_or_else(|| anyhow::anyhow!("no job")) }
+            };
+            assert_eq!(status(&a).await?, (Status::Queued, 1));
+            assert_eq!(status(&c).await?, (Status::Queued, 1));
+            assert_eq!(status(&b).await?, (Status::Pending, 1));
+            assert_eq!(status(&d).await?, (Status::Pending, 1));
+            assert_eq!(s.run("run1".into()).await?.map(|r| (r.status, r.finished_at)), Some((Status::Queued, None)));
+            // Nothing the set names can run again: nothing changes.
+            assert!(matches!(s.retry_jobs("run1".into(), vec![a.clone()]).await?.as_slice(), [(_, JobRetry::Refused(why))] if why.contains("hasn't finished")));
+            Ok(())
+        })
+    }
+
+    /// W26-R21: some of a v1 run's jobs stopped, the run going on: a running one and a queued one
+    /// cancelled (the running one's runner to be told), the jobs that need them skipped with
+    /// "dependency cancelled", a finished one refused saying how it ended, the others going on.
+    #[test]
+    fn w26_r21_a_set_of_jobs_cancelled_the_run_going_on() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (s, ids) = w26_r21_run("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {needs: [a], steps: [{run: y}]}\n  c: {steps: [{run: z}]}\n  d: {needs: [c], steps: [{run: w}]}\n  e: {steps: [{run: v}]}\n  f: {steps: [{run: u}]}\n").await?;
+            let id = |k: &str| ids.get(k).cloned().unwrap_or_default();
+            let (a, b, c, d, e, f) = (id("a"), id("b"), id("c"), id("d"), id("e"), id("f"));
+            // a runs on ag1; e has passed; c and f wait in the queue.
+            assert!(s.claim_job(a.clone(), "ag1".into(), "baremetal".into()).await?);
+            assert!(s.claim_job(e.clone(), "ag2".into(), "baremetal".into()).await?);
+            s.finish_job(e.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            let done = s.cancel_jobs("run1".into(), vec![a.clone(), c.clone(), e.clone(), "nope".into()], "cancelled by ada".into()).await?;
+            let each: std::collections::HashMap<String, JobCancel> = done.jobs.into_iter().collect();
+            assert_eq!(each.get(&a), Some(&JobCancel::Cancelled));
+            assert_eq!(each.get(&c), Some(&JobCancel::Cancelled));
+            assert!(matches!(each.get(&e), Some(JobCancel::Refused(why)) if why.contains("already finished: it's succeeded")), "{:?}", each.get(&e));
+            assert_eq!(each.get("nope"), Some(&JobCancel::NoSuchJob));
+            assert_eq!(done.running, vec![(a.clone(), Some("ag1".to_owned()))]);
+            let mut skipped = done.skipped.clone();
+            skipped.sort();
+            let mut want = vec![b.clone(), d.clone()];
+            want.sort();
+            assert_eq!(skipped, want);
+            let job = |j: &str| {
+                let (s, j) = (s.clone(), j.to_owned());
+                async move { s.job(j).await?.ok_or_else(|| anyhow::anyhow!("no job")) }
+            };
+            let (ja, jb, jd, jf) = (job(&a).await?, job(&b).await?, job(&d).await?, job(&f).await?);
+            assert_eq!((ja.status, ja.error.as_deref()), (Status::Cancelled, Some("cancelled by ada")));
+            assert_eq!((jb.status, jb.error.as_deref()), (Status::Skipped, Some("dependency cancelled")));
+            assert_eq!((jd.status, jd.error.as_deref()), (Status::Skipped, Some("dependency cancelled")));
+            // The run goes on: f is still queued, and the run ends once it does.
+            assert_eq!(jf.status, Status::Queued);
+            assert_eq!(s.run("run1".into()).await?.map(|r| r.status), Some(Status::Running));
+            assert!(s.claim_job(f.clone(), "ag2".into(), "baremetal".into()).await?);
+            let (_, settled) = s.finish_job(f.clone(), Status::Succeeded, Some(0), None, None, None).await?;
+            assert_eq!(settled, Some(Status::Cancelled));
+            // A failed need beside a cancelled one: the job is skipped as a failure's.
+            let (s, ids) = w26_r21_run("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  c: {steps: [{run: z}]}\n  g: {needs: [a, c], steps: [{run: y}]}\n").await?;
+            let id = |k: &str| ids.get(k).cloned().unwrap_or_default();
+            assert!(s.claim_job(id("a"), "ag1".into(), "baremetal".into()).await?);
+            s.finish_job(id("a"), Status::Failed, Some(1), None, None, None).await?;
+            // g was skipped by a's failure already; nothing for the cancel of c to change there.
+            s.cancel_jobs("run1".into(), vec![id("c")], "cancelled".into()).await?;
+            assert_eq!(s.job(id("g")).await?.and_then(|j| j.error), Some("dependency failed".to_owned()));
             Ok(())
         })
     }

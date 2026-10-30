@@ -8568,6 +8568,19 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R20 Hosts.** What each host can do (stacks, queues, updating a stale change, batched reviews,
   merging) is a seam in `crates/kiln-seams`, with a simulator per host and a conformance suite, kept
   within the hosts' rate limits (webhooks, and polling with ETags).
+- **W26-R21 Any set of jobs.** Any set of a run's jobs runs again or stops, on either engine, passed
+  jobs included:
+  - Retrying a set gives each its next attempt, and the jobs that need it run again after it.
+  - Cancelling a set stops each job that hasn't finished. The jobs that need it are skipped as
+    "dependency cancelled", and the run's other jobs go on.
+  - Each job named answers what became of it, or why not: it hasn't finished, it already finished,
+    it isn't the run's.
+  - `POST /api/runs/:id/retry` and `/cancel` take `jobs`, and so does the engine's
+    `/api/ci/runs/:id/cancel`; the engine's `/rerun` takes `{ mode: "set", jobs }`. Without `jobs`,
+    each does what it did.
+  - On the engine, a set's rerun is one new attempt of a finished run, `kiln_ci::plan::rerun`'s
+    `Mode::Set`. Legs cancelled one by one go through the plan (`on_cancel_legs`), logged, so a
+    restart replays them.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8612,6 +8625,14 @@ repository):
 - **W26-AC11 Both kinds.** A branch pull request and a stack of three diffs each go from first
   push to landed: the stack's commits land in stack order, each reviewed on its own; the branch's
   commits land together under its review. *Integration test on real git.*
+- **W26-AC12 Any set of jobs.** On both engines, over HTTP: a set cancelled stops those jobs, skips
+  what needs them as "dependency cancelled" and lets the rest go on. Run again, the same set's jobs
+  take their next attempts with what needs them. What can't be done says why, and without `jobs`
+  nothing changes.
+  *`tests/job_sets.rs` `w26_r21_any_set_of_a_runs_jobs_run_again_or_stopped_on_both_engines`;
+  store `w26_r21_a_set_of_jobs_retried_together` and `w26_r21_a_set_of_jobs_cancelled_the_run_going_on`;
+  `kiln-ci` `w26_r21_a_set_runs_again_each_and_what_needs_it` and
+  `w26_r21_cancelling_some_legs_stops_them_and_skips_what_needs_them_the_rest_go_on`.*
 
 **Progress.** In progress. R06 to R15, each Ship item's dropdown owning its review, are built
 (Review plan step 3, kiln plan `01a17856b1aa77df93c0ef014cda0a71`, with the CI/CD Integration
@@ -9367,8 +9388,8 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/repos/:repo/heads` | `ci.uploads.heads` (the commits a pack can leave out) | runs.read | W17 |
 | POST | `/api/ci/repos/:repo/packs?sha=` | `ci.uploads.pack` (a working tree's commit, as a thin pack) | runs.trigger | W17 |
 | POST | `/api/ci/repos/:repo/local-runs` | `ci.runs.local` (`{ sha, ref, event, payload?, workflows?, job?, matrix?, inputs?, vars?, secrets? }`; untrusted unless the owner's) | runs.trigger | W17 |
-| POST | `/api/ci/runs/:id/cancel` | `ci.runs.cancel` | runs.cancel | W05 |
-| POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job, job?, debug?, fresh_actions?, no_reuse?, cold? }`) | runs.rerun | W05, W24 |
+| POST | `/api/ci/runs/:id/cancel` | `ci.runs.cancel` (`{ jobs? }`: just those legs, the run going on) | runs.cancel | W05, W26 |
+| POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job\|set, job?, jobs?, debug?, fresh_actions?, no_reuse?, cold? }`; `set` runs `jobs` again) | runs.rerun | W05, W24, W26 |
 | POST | `/api/ci/runs/:id/approve` | `ci.runs.approve` (untrusted run or environment) | runs.approve | W15, W18 |
 | GET | `/api/ci/runs/:id/{summary,annotations,artifacts,tests,flow,metrics,attestations}` (built; the actions it pinned come with the run) | `ci.runs.summary`, `ci.runs.annotations`, `ci.artifacts.list`, `ci.tests.run`, `ci.runs.flow`, `ci.metrics.run`, `ci.runs.attestations` | runs.read | W06, W08, W16, W04, W18 |
 | GET | `/api/ci/legs/:id/tests` · `/api/ci/repos/:repo/tests?sort=failing\|slowest\|flaky` | `ci.tests.leg`, `ci.tests.repo` | runs.read | W16 |

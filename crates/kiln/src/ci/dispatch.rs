@@ -84,6 +84,14 @@ pub enum Msg {
         run: String,
         reason: String,
     },
+    /// Some of a run's legs cancelled by their ids, the run going on (docs/ci.md W26-R21): each
+    /// leg and whether it was, or why not.
+    CancelLegs {
+        run: String,
+        legs: Vec<String>,
+        reason: String,
+        reply: async_channel::Sender<Vec<(String, Result<(), String>)>>,
+    },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
@@ -1129,6 +1137,16 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
+            Msg::CancelLegs { run, legs, reason, reply } => match self.cancel_legs(&run, &legs, &reason).await {
+                Ok(each) => {
+                    let _ = reply.try_send(each);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = reply.try_send(legs.iter().map(|l| (l.clone(), Err(format!("{e:#}")))).collect());
+                    Err(e)
+                }
+            },
             Msg::ApproveRun { run, by, approve, reply } => {
                 let r = self.approve_run(&run, &by, approve).await;
                 let _ = reply.try_send(*r.as_ref().unwrap_or(&false));
@@ -3026,6 +3044,51 @@ impl Dispatch {
         Box::pin(self.actions(run, acts)).await
     }
 
+    /// Some of a run's legs cancelled by their ids, the run going on (docs/ci.md W26-R21): each
+    /// one of the run that hasn't finished goes to its plan by its key, logged so a restart cancels
+    /// it again; the others say why not.
+    async fn cancel_legs(&mut self, run: &str, ids: &[String], reason: &str) -> anyhow::Result<Vec<(String, Result<(), String>)>> {
+        let (run_owned, wanted) = (run.to_owned(), ids.to_vec());
+        let rows: Vec<(String, String, String)> = self
+            .hub
+            .store
+            .call(move |c| {
+                let mut st = c.prepare("SELECT id, key, status FROM jobs WHERE run_id = ?1 AND id IN (SELECT value FROM json_each(?2))")?;
+                let rows = st.query_map(rusqlite::params![run_owned, serde_json::to_string(&wanted).unwrap_or_default()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        let mut each = Vec::new();
+        let mut keys = Vec::new();
+        for id in ids {
+            match rows.iter().find(|(r, ..)| r == id) {
+                None => each.push((id.clone(), Err("not a leg of this run".to_owned()))),
+                Some((_, key, status)) if crate::store::Status::parse(status).is_terminal() => each.push((id.clone(), Err(format!("`{key}` already finished: it's {status}")))),
+                Some((_, key, _)) => {
+                    keys.push(key.clone());
+                    each.push((id.clone(), Ok(())));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Ok(each);
+        }
+        let Some(r) = self.runs.get_mut(run) else {
+            return Ok(ids.iter().map(|i| (i.clone(), Err("the run isn't going: nothing of it can be cancelled".to_owned()))).collect());
+        };
+        r.seq += 1;
+        let seq = r.seq;
+        let files = Arc::clone(&r.files);
+        let timing = Arc::clone(&r.timing);
+        let tree = Arc::clone(&r.tree);
+        let acts = r.plan.on_cancel_legs(&keys, reason, &Source { files: &files, timing: &timing, tree: &tree });
+        for key in &keys {
+            runs::log(&self.hub, run, seq, "cancel_leg", Some(key.clone()), Some(serde_json::json!({ "reason": reason }).to_string())).await?;
+        }
+        Box::pin(self.actions(run, acts)).await?;
+        Ok(each)
+    }
+
     /// Rebuilds unfinished runs by replaying their plans' logs (W05-R25); legs that were running
     /// wait for their runner to say it still has them.
     async fn restore(&mut self) -> anyhow::Result<()> {
@@ -3086,6 +3149,15 @@ impl Dispatch {
             match kind.as_str() {
                 "cancel" => {
                     for act in plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree }) {
+                        if let PlanAction::Cancel { leg, reason, .. } = act {
+                            cancelled.push((leg, reason));
+                        }
+                    }
+                }
+                // Legs cancelled one by one (W26-R21), the run going on.
+                "cancel_leg" => {
+                    let why = report.as_deref().and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()).and_then(|v| v.get("reason").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_else(|| "cancelled".to_owned());
+                    for act in plan.on_cancel_legs(&leg.iter().cloned().collect::<Vec<_>>(), &why, &Source { files: &files, timing: &timing, tree: &tree }) {
                         if let PlanAction::Cancel { leg, reason, .. } = act {
                             cancelled.push((leg, reason));
                         }

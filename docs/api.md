@@ -87,8 +87,8 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | DELETE | `/api/places/tasks/:id` | forget a task that is over |
 | GET | `/api/runs?repo=&limit=50&before=` | `Run[]` newest first |
 | GET | `/api/runs/:id` | `{ run: Run, jobs: Job[] }` |
-| POST | `/api/runs/:id/cancel` | |
-| POST | `/api/runs/:id/retry` | `{ only_failed: bool }` |
+| POST | `/api/runs/:id/cancel` | `{ jobs?: [ids] }`: the run, or just those of its jobs, the run going on → 200 `{ run, jobs: [{ job, cancelled, why? }] }` (W26-R21); without `jobs` → 204 |
+| POST | `/api/runs/:id/retry` | `{ only_failed: bool, jobs?: [ids] }`: with `jobs`, just those, passed ones too, each with the jobs that need it → 200 `{ kind, run, jobs: [{ job, again, attempt?, waiting?, why? }] }` (W26-R21) |
 | GET | `/api/ci/legs/:id/runners` | where a finished job could run again: `{ kind, ran_on, elsewhere, retry: { can, why }, runners: [{ name, connected, draining, busy, slots, able, why }] }` ([ci.md](ci.md) W05-R28) |
 | POST | `/api/ci/legs/:id/retry` | `{ runner?, elsewhere? }`: a finished job again, on any runner that can run it, on any but the one it ran on, or on `runner` → 201 (a pipeline's job: its next attempt in its run, with the jobs that need it) |
 | GET | `/api/jobs/:id` | `Job` with `spec` (and `placement`, `{ runner }` or `{ avoid }`, while a retry placed it) |

@@ -111,6 +111,12 @@ impl Run {
         self.apply(acts);
     }
 
+    fn cancel_legs(&mut self, keys: &[&str]) {
+        let keys: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+        let acts = self.plan.on_cancel_legs(&keys, "cancelled from Ship", &self.src);
+        self.apply(acts);
+    }
+
     fn spec(&self, key: &str) -> LegSpec {
         let s = self.specs.get(key).cloned();
         assert!(s.is_some(), "no leg `{key}`: {:?}", self.specs.keys().collect::<Vec<_>>());
@@ -254,6 +260,27 @@ fn cancelling_runs_only_what_still_holds() {
     r.finish("cleanup", S);
     r.finish("oncancel", S);
     assert_eq!(r.finished, Some(Conclusion::Cancelled));
+}
+
+#[test]
+fn w26_r21_cancelling_some_legs_stops_them_and_skips_what_needs_them_the_rest_go_on() {
+    let body = "  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    needs: a\n    runs-on: x\n    steps: [{run: b}]\n  c:\n    runs-on: x\n    steps: [{run: c}]\n  d:\n    needs: c\n    runs-on: x\n    steps: [{run: d}]\n";
+    let mut r = Run::gha(&jobs(body));
+    // Only `a` is cancelled: `c` (running) is left as it is.
+    r.cancel_legs(&["a"]);
+    assert_eq!(r.cancels, vec!["a"]);
+    r.finish("a", Conclusion::Cancelled);
+    assert!(r.logged("b skipped"), "{:?}", r.log);
+    // The run goes on: `c` finishes and `d` runs after it.
+    r.finish("c", S);
+    assert!(r.queued.contains(&"d".to_owned()), "{:?}", r.queued);
+    r.finish("d", S);
+    assert_eq!(r.finished, Some(Conclusion::Cancelled), "a run with a cancelled job ends cancelled, as GitHub's does");
+    // Naming a leg that already finished, or none that exists, changes nothing.
+    let mut r = Run::gha(&jobs(body));
+    r.finish("c", S);
+    r.cancel_legs(&["c", "nope"]);
+    assert!(r.cancels.is_empty(), "{:?}", r.cancels);
 }
 
 #[test]

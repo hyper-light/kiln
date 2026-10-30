@@ -228,6 +228,82 @@ pub async fn runners(hub: &Hub, id: &str) -> Result<Response, Fail> {
     ))
 }
 
+/// Jobs of one run run again together (docs/ci.md W26-R21), passed ones too:
+/// - a `.kiln/` pipeline's (v1) in their run, each with the jobs that need it
+///   ([`crate::store::Store::retry_jobs`]);
+/// - legs of the CI engine's as one new attempt of their run, which runs them and what needs
+///   them again, for real (none takes an earlier result over).
+///
+/// Each job named answers what became of it.
+pub async fn retry_set(hub: &Hub, run: &str, ids: &[String], by: &str) -> Result<Value, Fail> {
+    if hub.ci.is_run(run) || hub.store.is_engine_run(run.to_owned()).await.map_err(internal)? {
+        let mut legs = Vec::new();
+        let mut each = Vec::new();
+        for id in ids {
+            match job_of(hub, id).await {
+                Ok(j) if j.run == run && !j.status.is_terminal() => each.push(json!({ "job": id, "again": false, "why": format!("`{}` hasn't finished: it's {}", j.key, j.status.as_str()) })),
+                Ok(j) if j.run == run => {
+                    legs.push(super::dispatch::RerunMode::Leg { job: j.job.clone().unwrap_or_default(), key: j.key.clone() });
+                    each.push(json!({ "job": id, "again": true }));
+                }
+                _ => each.push(json!({ "job": id, "again": false, "why": "not a job of this run" })),
+            }
+        }
+        if legs.is_empty() {
+            return Ok(json!({ "kind": "ci", "run": run, "jobs": each }));
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        hub.ci.send(super::dispatch::Msg::Rerun { run: run.to_owned(), mode: super::dispatch::RerunMode::Set(legs), debug: false, keep_failed: None, actions: None, no_reuse: true, cold: false, placed: HashMap::new(), by: by.to_owned(), reply: tx });
+        return match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
+            Ok(Ok(Ok(attempt))) => {
+                hub.store.audit(by.to_owned(), "ci.runs.retry_jobs".into(), format!("{run}: {}", ids.join(", "))).await;
+                Ok(json!({ "kind": "ci", "run": run, "attempt": attempt, "jobs": each }))
+            }
+            Ok(Ok(Err(e))) => Err(conflict(e)),
+            _ => Err((StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned())),
+        };
+    }
+    let out = hub.store.retry_jobs(run.to_owned(), ids.to_vec()).await.map_err(internal)?;
+    let mut each = Vec::new();
+    for (id, r) in &out {
+        match r {
+            JobRetry::Again { attempt, waiting, .. } => {
+                mark(hub, id, &format!("retried by {by}: its next attempt follows")).await;
+                for w in waiting {
+                    mark(hub, w, "run again with a job it needs: its next attempt follows").await;
+                    hub.emit_job(w).await;
+                }
+                hub.emit_job(id).await;
+                each.push(json!({ "job": id, "again": true, "attempt": attempt, "waiting": waiting }));
+            }
+            JobRetry::NoSuchJob => each.push(json!({ "job": id, "again": false, "why": "not a job of this run" })),
+            JobRetry::Refused(why) => each.push(json!({ "job": id, "again": false, "why": why })),
+        }
+    }
+    hub.emit_run(run).await;
+    hub.wake.notify();
+    hub.store.audit(by.to_owned(), "runs.retry_jobs".into(), format!("{run}: {}", ids.join(", "))).await;
+    Ok(json!({ "kind": "pipeline", "run": run, "jobs": each }))
+}
+
+/// Jobs of one run stopped, the run going on (docs/ci.md W26-R21): [`Hub::cancel_jobs`], each
+/// job named answering what became of it.
+pub async fn cancel_set(hub: &Hub, run: &str, ids: Vec<String>, by: &str) -> Result<Value, Fail> {
+    use crate::store::JobCancel;
+    let what = ids.join(", ");
+    let each = hub.cancel_jobs(run, ids, &format!("cancelled by {by}")).await.map_err(internal)?;
+    hub.store.audit(by.to_owned(), "runs.cancel_jobs".into(), format!("{run}: {what}")).await;
+    let jobs: Vec<Value> = each
+        .iter()
+        .map(|(j, r)| match r {
+            JobCancel::Cancelled => json!({ "job": j, "cancelled": true }),
+            JobCancel::NoSuchJob => json!({ "job": j, "cancelled": false, "why": "not a job of this run" }),
+            JobCancel::Refused(why) => json!({ "job": j, "cancelled": false, "why": why }),
+        })
+        .collect();
+    Ok(json!({ "run": run, "jobs": jobs }))
+}
+
 /// `POST /api/ci/legs/:id/retry` with `{ runner?, elsewhere? }` (W05-R28): a finished job again,
 /// on any runner that can run it, on any but the one its last attempt ran on, or on the one
 /// named. A leg of the engine's is a new attempt of its run (the leg, and the jobs that need it,

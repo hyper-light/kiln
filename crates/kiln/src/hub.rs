@@ -2904,6 +2904,43 @@ impl Hub {
         Ok(())
     }
 
+    /// Some of a run's jobs stopped, the run going on (docs/ci.md W26-R21): each named one that
+    /// hasn't finished is cancelled, the jobs that need it are skipped, and a running one's runner
+    /// is told to stop it, as [`Hub::cancel_run`] tells them. A CI engine run's legs are cancelled
+    /// through its plan. Each job named and what became of it.
+    pub async fn cancel_jobs(&self, run_id: &str, jobs: Vec<String>, reason: &str) -> anyhow::Result<Vec<(String, crate::store::JobCancel)>> {
+        use crate::store::JobCancel;
+        if self.ci.is_run(run_id) || self.store.is_engine_run(run_id.to_owned()).await? {
+            let (tx, rx) = async_channel::bounded(1);
+            self.ci.send(crate::ci::dispatch::Msg::CancelLegs { run: run_id.to_owned(), legs: jobs, reason: reason.to_owned(), reply: tx });
+            let each = crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await.map_err(|_| anyhow::anyhow!("the CI dispatcher didn't answer"))??;
+            return Ok(each.into_iter().map(|(leg, r)| (leg, r.map_or_else(JobCancel::Refused, |()| JobCancel::Cancelled))).collect());
+        }
+        let done = self.store.cancel_jobs(run_id.to_owned(), jobs, reason.to_owned()).await?;
+        for (job, agent) in &done.running {
+            if let Some(agent) = agent {
+                self.command_start(agent, &ServerMsg::Cancel { job: job.clone(), reason: reason.into() }).await.log_when_answered(LOG_WITHIN);
+                self.release_slot(agent, job);
+            }
+            self.logs.finish(job);
+            if let Some(Some(k)) = self.k8s.get() {
+                k.delete_job_pods(job).await;
+            }
+        }
+        for (job, r) in &done.jobs {
+            if *r == JobCancel::Cancelled {
+                self.emit_job(job).await;
+            }
+        }
+        for job in &done.skipped {
+            self.emit_job(job).await;
+        }
+        self.emit_run(run_id).await;
+        self.update_slot_gauges();
+        self.wake.notify();
+        Ok(done.jobs)
+    }
+
     // ------------------------------------------------------------ scheduler
 
     /// Assign queued jobs to agents (or launch pods) until nothing more fits. Runs on every wake
