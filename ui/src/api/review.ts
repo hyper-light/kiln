@@ -50,6 +50,17 @@ export interface DiffVersion {
   why?: string | null;
   /** The thread it answers (a suggestion's). */
   thread?: string | null;
+  /** A revision kiln replayed as its trunk moved runs no checks of its own: the version whose checks it shows (W26-R16). */
+  checks_from?: number | null;
+}
+
+/** How fresh a change is on its trunk (W26-R16): its words, Update's state, and where a replay's checks come from. */
+export interface Freshness {
+  /** `replays clean on main@4c1e2a`, `conflicts on main@4c1e2a`, `replaying onto main@4c1e2a`. */
+  words: string;
+  tip: string;
+  update: { can: boolean; why_not: string | null };
+  checks_from: number | null;
 }
 
 export interface DiffRun {
@@ -85,6 +96,8 @@ export interface DiffDetail extends Diff {
   reviewers: Reviewer[];
   runs: DiffRun[];
   commits?: { sha: string; title?: string; subject?: string; author?: string }[];
+  /** How fresh it is on its trunk (W26-R16); null once it's closed. */
+  fresh?: Freshness | null;
 }
 
 export interface ChangedFile {
@@ -492,6 +505,11 @@ export interface ConflictsCommitted {
   replay: string;
   conflicts: number;
 }
+
+/** Update (W26-R16): a change request's branch moved to its replay, with a lease. */
+export const freshApi = {
+  update: (key: string) => request<{ change: string; version: number; branch: string; head: string }>("POST", `/api/diffs/${enc(key)}/update`, {}),
+};
 
 export const conflictsApi = {
   list: (key: string, signal?: AbortSignal) => request<Conflicts>("GET", `/api/diffs/${enc(key)}/conflicts`, undefined, { signal }),

@@ -35,6 +35,7 @@ import { Conversation, ConvoBox, Description } from "./convo";
 import { FileDiff, makeLinesOf, useThreadMap, WholeFile, type FilesCtx } from "./diffs";
 import { rowsOf } from "./fold";
 import { GateRow, HostGateRow } from "./gate";
+import { FreshRow } from "./fresh";
 import type { DraftPlace, Ops } from "./ops";
 import { applyThreadPatch, pendingComment, pendingThread, type ThreadPatch } from "./ops";
 import { counted, useStable } from "./perf";
@@ -326,7 +327,12 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   return (
     <Frame
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · v${version}${ch.latest > version ? ` of ${ch.latest}` : ""}`}
-      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} />}
+      bar={
+        <>
+          <GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} />
+          {d.fresh && <FreshRow fresh={d.fresh} diffKey={key} />}
+        </>
+      }
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={

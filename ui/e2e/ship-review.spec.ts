@@ -170,3 +170,18 @@ test("every way to resolve a conflict, then Commit resolution clears the gate (W
   await expect(row.locator(".rv-cf")).toHaveCount(0);
   await expect(row.getByRole("button", { name: /^Approve/ })).toBeVisible();
 });
+
+test("Files says how fresh the change is, and Update stays in place, disabled with why, for a diff (W26-R16)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  const fresh = row.locator(".rv-bar[data-fresh]");
+  await expect(fresh.locator(".rv-k[data-k='fresh']")).toHaveText(/^replays clean on main@[0-9a-f]{6}$/);
+  // A replay runs no checks of its own: they're carried, and said to be.
+  await expect(fresh.locator(".rv-k[data-k='checks']")).toHaveText("checks from v1");
+  const update = fresh.getByRole("button", { name: /^Update/ });
+  await expect(update).toBeVisible();
+  await expect(update).toBeDisabled();
+  await expect(update).toHaveAttribute("title", "a diff has no branch: its replay is its latest revision");
+  // It sits on the gate row's line beneath, inside the section: nothing pokes out sideways.
+  const [bar, sec] = await Promise.all([fresh.boundingBox(), row.locator(".rv-s").first().boundingBox()]);
+  expect(bar && sec && bar.x >= sec.x - 1 && bar.x + bar.width <= sec.x + sec.width + 1).toBeTruthy();
+});
