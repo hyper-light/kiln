@@ -85,7 +85,13 @@ replaced while it runs. The new build comes up beside it, and takes over only on
 3. Once it's ready, the runner hands it every agent session and terminal over a local socket.
    Their processes keep running: pipes and PTYs are passed across, not reopened. A reply that was
    streaming goes on, and background commands never stop. Whatever reaches the old runner
-   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build.
+   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build. The
+   server's word on a hand-over (hand a session to the newest process, or let go of one) doesn't:
+   it names the process it's for, its machine, instance and epoch, signed by the server
+   (docs/ci.md W27-R08), and any other process refuses it, and kiln records that. The old runner
+   keeps such a word and refuses one about a session it handed to the new build, and the new build
+   refuses one passed on to it. Once kiln certifies the new build for a session, it sends that
+   session's words to the new build.
 4. The supervisor promotes the new build, and the server sends it new work from then on. The old
    runner finishes the jobs it's running (jobs aren't moved yet), then exits. The supervisor keeps
    the new build, and starts it again after a restart or reboot.

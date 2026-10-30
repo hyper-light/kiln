@@ -615,6 +615,74 @@ pub fn to_value(b: &Body) -> Value {
     serde_json::to_value(b).unwrap_or(Value::Null)
 }
 
+/// A hand-over's word's payload type ([`Word`]).
+pub const PAYLOAD_WORD: &str = "application/vnd.kiln.word+json";
+
+/// A hand-over's word kiln's server sends one runner process about an agent session (W27-R08: hand
+/// it to the machine's newest process; the server's word on such a hand-over), signed by the
+/// server as [`PAYLOAD_WORD`]: the process it's for, and the epoch that process holds the session
+/// at as kiln knows it. The statement's subject is the word itself, by its digest. Any other
+/// process refuses it (the 14:18 drop: a word for the runner being upgraded, passed on to its new
+/// build, let go of six sessions there).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Word {
+    /// [`VERSION`].
+    pub v: u32,
+    /// Its signer, kiln's server, as its certificate names it (as [`Body::by`]).
+    #[serde(default)]
+    pub by: String,
+    pub session: String,
+    pub machine: String,
+    pub instance: String,
+    pub epoch: u64,
+}
+
+/// Why a hand-over's word isn't this process's to apply.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Misaddressed {
+    #[error("it isn't signed as kiln's server's word: {0}")]
+    Unsigned(String),
+    #[error("it's a word about session {said}, not {session}")]
+    AnotherSession { said: String, session: String },
+    #[error("it's not the word kiln signed: the word itself changed")]
+    Changed,
+    #[error("it's for {machine} (instance {instance}) at epoch {epoch}, not this process, {here}")]
+    AnotherProcess { machine: String, instance: String, epoch: u64, here: String },
+}
+
+/// Whether hand-over's word `command` (as sent), signed as `word` (checked: [`statement::verify`]),
+/// is for this process: runner process `instance` of `machine`, which holds session `session` at
+/// epoch `epoch` (none: at none, as once it let go, when only the process is checked). kiln's
+/// server, `server`, alone signs words. The word, or why not.
+pub fn addressed(word: &Checked, server: &str, session: &str, command: &[u8], machine: &str, instance: &str, epoch: Option<u64>) -> Result<Word, Misaddressed> {
+    let unsigned = |why: String| Misaddressed::Unsigned(why);
+    if word.payload_type != PAYLOAD_WORD {
+        return Err(unsigned(format!("it's a {} statement", word.payload_type)));
+    }
+    if word.custodian != server {
+        return Err(unsigned(format!("{} signed it, not kiln's server", word.custodian)));
+    }
+    let w: Word = serde_json::from_value(word.statement.body.clone()).map_err(|e| unsigned(e.to_string()))?;
+    if w.v != VERSION || w.by != word.custodian {
+        return Err(unsigned(format!("its body (version {}, by {}) isn't one kiln reads", w.v, w.by)));
+    }
+    if w.session != session {
+        return Err(Misaddressed::AnotherSession { said: w.session, session: session.to_owned() });
+    }
+    let digest = chain::hex(&<sha2::Sha256 as sha2::Digest>::digest(command));
+    if !word.statement.subject.iter().any(|t| t.digest.get("sha256").is_some_and(|d| d.eq_ignore_ascii_case(&digest))) {
+        return Err(Misaddressed::Changed);
+    }
+    if w.machine != machine || w.instance != instance || epoch.is_some_and(|e| e != w.epoch) {
+        let here = match epoch {
+            Some(e) => format!("{machine} (instance {instance}) at epoch {e}"),
+            None => format!("{machine} (instance {instance}), which holds it at no epoch"),
+        };
+        return Err(Misaddressed::AnotherProcess { machine: w.machine, instance: w.instance, epoch: w.epoch, here });
+    }
+    Ok(w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,6 +1086,33 @@ mod tests {
         assert!(matches!(by(next)?, Ok(b) if b.by == next));
         assert!(matches!(by("kiln://hyper-light/person/ada/agent/01a1751c/epoch/2")?, Err(Break::Unreadable { .. })));
         assert!(matches!(by("kiln://hyper-light/person/ada/agent/01a1751d/epoch/1")?, Err(Break::Unreadable { .. })));
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 4, the 14:18 drop): a hand-over's word is applied only
+    /// by the process it's for, at the epoch kiln says it holds the session at: not by another
+    /// instance (a new build it was passed on to), not at an epoch the process has left, not when
+    /// the word changed or is about another session, and not when kiln's server didn't sign it.
+    #[test]
+    fn w27_r08_a_hand_overs_word_is_only_its_processs() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (server, cd) = (Signer::new(&ca, SERVER)?, Signer::new(&ca, CD)?);
+        let command = br#"{"type":"handed_over"}"#;
+        let word = |by: &Signer, epoch: u64, said: &[u8]| -> anyhow::Result<Checked> {
+            let body = serde_json::to_value(Word { v: VERSION, by: String::new(), session: "s1".into(), machine: "fedora".into(), instance: "main".into(), epoch })?;
+            let subject = Subject { name: "a hand-over's word about session s1".into(), digest: BTreeMap::from([("sha256".to_owned(), chain::hex(&Sha256::digest(said)))]), ..Subject::default() };
+            Ok(verify(&by.sign(PAYLOAD_WORD, &Statement { subject: vec![subject], ..Statement::new(body) })?, &ca.der, &[], AT)?)
+        };
+        let for_main = word(&server, 3, command)?;
+        assert!(addressed(&for_main, SERVER, "s1", command, "fedora", "main", Some(3)).is_ok_and(|w| w.instance == "main" && w.epoch == 3));
+        assert!(addressed(&for_main, SERVER, "s1", command, "fedora", "main", None).is_ok(), "once it let go, the process alone is checked");
+        let passed_on = addressed(&for_main, SERVER, "s1", command, "fedora", "01a17502", Some(4));
+        assert!(matches!(&passed_on, Err(Misaddressed::AnotherProcess { instance, epoch: 3, .. }) if instance == "main"), "{passed_on:?}");
+        assert_eq!(passed_on.map_err(|e| e.to_string()).err().as_deref(), Some("it's for fedora (instance main) at epoch 3, not this process, fedora (instance 01a17502) at epoch 4"));
+        assert!(matches!(addressed(&for_main, SERVER, "s1", command, "fedora", "main", Some(4)), Err(Misaddressed::AnotherProcess { .. })), "an epoch it has left");
+        assert!(matches!(addressed(&for_main, SERVER, "s1", br#"{"type":"move_to"}"#, "fedora", "main", Some(3)), Err(Misaddressed::Changed)));
+        assert!(matches!(addressed(&for_main, SERVER, "s2", command, "fedora", "main", Some(3)), Err(Misaddressed::AnotherSession { .. })));
+        assert!(matches!(addressed(&word(&cd, 3, command)?, SERVER, "s1", command, "fedora", "main", Some(3)), Err(Misaddressed::Unsigned(_))), "CD doesn't speak for the server");
         Ok(())
     }
 

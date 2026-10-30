@@ -838,13 +838,13 @@ async fn gone_within(pid: u32, patience: Duration) -> bool {
 /// server's frames about them that reached it meanwhile, until that runner ends. Terminals are
 /// taken on this runner's loop (`tx`), which also hears once everything is in.
 #[cfg(unix)]
-async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: String) -> anyhow::Result<()> {
+async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: Me) -> anyhow::Result<()> {
     use crate::bluegreen::Frame;
     use base64::Engine as _;
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
     let c = Arc::clone(&conn);
-    let custody = crate::runner::custody::signs();
-    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me, custody }, &[])).await??;
+    let (custody, instance) = (crate::runner::custody::signs(), me.instance.clone());
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance, custody }, &[])).await??;
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
@@ -908,7 +908,7 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
                 continue;
             }
             Frame::Forward { data } => {
-                if let Ok(d) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) {
+                if let Some(d) = passed_on(&data, &me) {
                     let _ = tx.send(Bg::Forwarded(d)).await;
                 }
                 continue;
@@ -923,6 +923,62 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
         crate::rt::blocking(move || c.send(&ack, &[])).await??;
     }
     Ok(())
+}
+
+/// This runner process, as a hand-over's word names the process it's for (docs/ci.md W27-R08): its
+/// machine and instance, and kiln's root, which the server's signature on a word chains to.
+#[cfg(unix)]
+struct Me {
+    machine: String,
+    instance: String,
+    root: Vec<u8>,
+}
+
+/// The session a server frame is a hand-over's word about (a local MoveTo, a HandedOver: about the
+/// hold of the process it's sent to, never another's).
+#[cfg(unix)]
+fn hand_overs_word(msg: &ServerMsg) -> Option<&str> {
+    let ServerMsg::HarnessCmd { session, json } = msg else { return None };
+    crate::runner::custody::hand_overs_word(json).then_some(session.as_str())
+}
+
+/// (The runner being upgraded, blue/green.) Whether a server frame goes on to the new build: what
+/// it's about, when that was handed there, or is new while this runner hands everything over or
+/// retires (`leaving`); else nothing, and this runner takes it. A hand-over's word stays here
+/// ([`hand_overs_word`]): about a session handed over, it was meant for this runner's hold.
+#[cfg(unix)]
+fn goes_on(msg: &ServerMsg, moved: &std::collections::HashSet<crate::instances::Owned>, leaving: bool) -> Option<crate::instances::Owned> {
+    if hand_overs_word(msg).is_some() {
+        return None;
+    }
+    let opens = leaving && matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. });
+    crate::instances::Owned::of(msg).filter(|w| opens || moved.contains(w))
+}
+
+/// (The new build's runner.) A server frame the runner being upgraded passed on: its bytes, taken
+/// as the server's own. Not a hand-over's word ([`hand_overs_word`]), which was meant for that
+/// runner (one from before this build passes those on too): refused, and kiln told whom it was for.
+#[cfg(unix)]
+fn passed_on(data: &str, me: &Me) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let d = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
+    if let Ok(m) = proto::decode::<ServerMsg>(&d)
+        && let Some(session) = hand_overs_word(&m)
+        && let ServerMsg::HarnessCmd { json, .. } = &m
+    {
+        if crate::runner::custody::word_for_me(session, json, true, &me.root, &me.machine, &me.instance, None).is_ok() {
+            crate::runner::custody::refused_word(session, None, "a hand-over's word passed on by the runner this one took over from: that runner's, not this one's");
+        }
+        return None;
+    }
+    Some(d)
+}
+
+/// Whether an agent session this runner doesn't hold is gone, as it says when asked about it: not
+/// one it handed to its new build (blue/green), which runs it now.
+#[cfg(unix)]
+fn gone_here(session: &str, moved: &std::collections::HashSet<crate::instances::Owned>) -> bool {
+    !moved.contains(&crate::instances::Owned::Agent(session.to_owned()))
 }
 
 /// (The new build's runner.) An agent session handed over: with its harness process, whose pipes
@@ -1061,6 +1117,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // A microVM's leg reaches the server as this runner does, so it trusts the same CA (W13-R05).
     #[cfg(target_os = "linux")]
     let microvm_ca = ca.clone();
+    // kiln's root, which a hand-over's word the server signs chains to (docs/ci.md W27-R08).
+    let root = ca.clone();
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -2304,9 +2362,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // About something handed to the new build (blue/green), or new while this runner
                 // hands everything over or retires: it goes there.
                 #[cfg(unix)]
-                let opens = matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. }) && (retiring || moving.as_ref().is_some_and(|m| m.handing));
-                #[cfg(unix)]
-                if let Some(what) = crate::instances::Owned::of(&msg).filter(|w| moved.contains(w) || opens) {
+                if let Some(what) = goes_on(&msg, &moved, retiring || moving.as_ref().is_some_and(|m| m.handing)) {
                     moved.insert(what.clone());
                     match (&forward, moving.as_mut()) {
                         (Some(f), _) => {
@@ -2485,7 +2541,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // connected and welcomed, it says it's ready, and takes everything.
                         #[cfg(unix)]
                         if let Some(path) = take_over.take() {
-                            let (h, tx, me) = (harness.clone(), bg_tx.clone(), instance_id.clone());
+                            let (h, tx, me) = (harness.clone(), bg_tx.clone(), Me { machine: o.name.clone(), instance: instance_id.clone(), root: root.clone() });
                             crate::rt::spawn(async move {
                                 if let Err(e) = take_over_from(path, h, tx.clone(), me).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
@@ -2738,7 +2794,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::HarnessCmd { session, json } => {
                         use crate::wire::channel::Refusal;
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
+                        // A hand-over's word (docs/ci.md W27-R08): applied only by the process it's
+                        // for, at the epoch it holds the session at here; refused otherwise, and
+                        // kiln told.
+                        let epoch_here = harness.as_ref().and_then(|h| h.get(&session)).map(|s| s.epoch());
+                        let for_me = crate::runner::custody::word_for_me(&session, &json, server_custody, &root, &o.name, &instance_id, epoch_here);
+                        // One about a session this runner handed to its new build (blue/green): that
+                        // build's now, whoever kiln still counts.
+                        #[cfg(unix)]
+                        let for_me = for_me.and_then(|()| {
+                            if !crate::runner::custody::hand_overs_word(&json) || gone_here(&session, &moved) {
+                                return Ok(());
+                            }
+                            let why = "it's about a session this runner handed to its machine's new build, which holds it now".to_owned();
+                            let word = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v.get("word").and_then(serde_json::Value::as_str).map(str::to_owned));
+                            crate::runner::custody::refused_word(&session, word.as_deref(), &why);
+                            Err(why)
+                        });
                         match serde_json::from_str::<crate::harness::model::Command>(&json) {
+                            Ok(_) if for_me.is_err() => {
+                                let why = for_me.as_ref().err().map(String::as_str).unwrap_or_default();
+                                refuse(&mut answer_after, Refusal::Refused, format!("a hand-over's word not for this process: {why}"));
+                            }
                             // The server's word on a hand-over to this machine's newer runner
                             // process: never "gone here", even once this process has let go.
                             Ok(crate::harness::model::Command::HandedOver { error, unsure, by_newest, none_newer }) => {
@@ -2757,8 +2834,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             Ok(_) => {
                                 refuse(&mut answer_after, Refusal::Unknown, format!("no session {session} here"));
+                                #[cfg(unix)]
+                                let gone = gone_here(&session, &moved);
+                                #[cfg(not(unix))]
+                                let gone = true;
                                 // Gone here (e.g. stopped while the server was away): say so.
-                                if let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
+                                if gone && let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
                                     uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
                                 }
                             }
@@ -4567,6 +4648,68 @@ mod tests {
             anyhow::ensure!(none.is_none() && matches!(whole.get(1), Some(Update::Reset { .. })) && whole.len() == 6);
             Ok(())
         })
+    }
+
+    /// fedora, 2026-10-25 14:18 (W27-R08; the Transfers plan's step 4, which this fix's
+    /// fix/upgrade-keeps-agents 7940fcafec, unsigned, came before): a blue/green upgrade's new build
+    /// let go of six agent sessions it had just taken over. The server, still counting the old
+    /// runner as their holder, asked it to hand them to the newest (a local MoveTo), then told it
+    /// to let go (HandedOver); it passed both on, and the new build did as they said with its own
+    /// copy. A hand-over's word is for the process it's sent to: it stays with the old runner, and
+    /// the new build refuses one passed on anyway (the next upgrade's old runner may run a build
+    /// from before this). Everything else about a session handed over goes on.
+    #[cfg(unix)]
+    #[test]
+    fn w27_ac05_a_hand_overs_word_for_the_runner_being_upgraded_never_reaches_the_new_build() -> anyhow::Result<()> {
+        use crate::handovers::Word;
+        use crate::harness::model::{Command, SendMode};
+        use crate::instances::Owned;
+        use base64::Engine as _;
+        let cmd = |c: &Command| -> anyhow::Result<ServerMsg> { Ok(ServerMsg::HarnessCmd { session: "s1".into(), json: serde_json::to_string(c)? }) };
+        let send = Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None };
+        let moved: std::collections::HashSet<Owned> = [Owned::Agent("s1".into())].into_iter().collect();
+        let me = Me { machine: "box".into(), instance: "01a17502".into(), root: Vec::new() };
+        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true })?)];
+        for w in [Word::Taken, Word::Refused("no room".into()), Word::NotPassed("x".into()), Word::Unsure("x".into()), Word::NoneNewer("x".into())] {
+            words.push((format!("HandedOver ({w:?})"), cmd(&w.command())?));
+        }
+        let on = [
+            ("a person's message", cmd(&send)?),
+            ("a message for its epoch", ServerMsg::HarnessSend { session: "s1".into(), epoch: 2, json: serde_json::to_string(&send)? }),
+            ("an interrupt", cmd(&Command::Interrupt)?),
+            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false })?),
+            ("a close", ServerMsg::HarnessClose { session: "s1".into() }),
+        ];
+        let b64 = |m: &ServerMsg| -> anyhow::Result<String> { Ok(base64::engine::general_purpose::STANDARD.encode(proto::encode(m)?)) };
+        let mut wrong = vec![];
+        for (what, m) in &words {
+            if [false, true].into_iter().any(|leaving| goes_on(m, &moved, leaving).is_some()) {
+                wrong.push(format!("{what} went on to the new build"));
+            }
+            if passed_on(&b64(m)?, &me).is_some() {
+                wrong.push(format!("the new build took {what} passed on"));
+            }
+        }
+        for (what, m) in &on {
+            if goes_on(m, &moved, false) != Some(Owned::Agent("s1".into())) {
+                wrong.push(format!("{what} stayed with the runner being upgraded"));
+            }
+            if passed_on(&b64(m)?, &me) != Some(proto::encode(m)?) {
+                wrong.push(format!("the new build dropped {what} passed on"));
+            }
+        }
+        anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("; "));
+        // Asked to hand over a session it handed to the new build, the old runner refuses: it
+        // doesn't say the session closed, as it would of one gone here.
+        anyhow::ensure!(!gone_here("s1", &moved), "a hand-over's word for a session handed to the new build said it closed");
+        anyhow::ensure!(gone_here("s2", &moved));
+        // As before: a frame about something this runner kept stays, and a session opened while it
+        // hands everything over goes on.
+        let open = ServerMsg::HarnessOpen { session: "s2".into(), json: "{}".into() };
+        anyhow::ensure!(goes_on(&ServerMsg::HarnessClose { session: "s2".into() }, &moved, true).is_none() && goes_on(&open, &moved, false).is_none());
+        anyhow::ensure!(goes_on(&open, &moved, true) == Some(Owned::Agent("s2".into())));
+        anyhow::ensure!(passed_on("not base64!", &me).is_none());
+        Ok(())
     }
 
     fn said(id: usize, text: String) -> Event {

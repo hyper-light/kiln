@@ -173,6 +173,18 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
         return tracing::debug!(%machine, "an unreadable custody record");
     };
     let came_from = format!("runner {machine} (instance {instance})");
+    // A hand-over's word it refused, not being the process it was for (W27-R08; the 14:18 drop).
+    if let Some(r) = bundle.get("refused_word") {
+        let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let word: Option<Value> = r.get("word").and_then(Value::as_str).and_then(|w| serde_json::from_str(w).ok());
+        let signer = word.as_ref().and_then(|w| statement::verify(w, &hub.pki.ca_der, &[], crate::util::now_unix()).ok()).map(|c| c.custodian).unwrap_or_default();
+        let why = format!("session {}: {}", text("session"), text("why"));
+        let refusal = Refusal { digest: word.as_ref().map(digest_of).unwrap_or_default(), act: "a hand-over's word".into(), signer, why: why.clone(), envelope: word.map(|w| w.to_string()).unwrap_or_default(), came_from, at: crate::util::now_unix() };
+        if let Err(e) = refuse(&hub.store, refusal).await {
+            tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "a refused hand-over's word couldn't be recorded");
+        }
+        return tracing::info!(target: "kiln.custody", %machine, %instance, %why, "a runner process refused a hand-over's word not for it");
+    }
     match take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &bundle, &came_from, crate::util::now_unix()).await {
         Ok(Ok(t)) => tracing::info!(target: "kiln.custody", %machine, %instance, digest = %t.digest, again = t.again, broke = t.broke.as_deref().unwrap_or(""), "took a custody record"),
         Ok(Err(why)) => tracing::info!(target: "kiln.custody", %machine, %instance, %why, "refused a custody record"),
@@ -184,6 +196,11 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
 /// `identities::own_identities` keeps certified), its body naming it: its bundle. Only kiln's
 /// server signs takes.
 pub fn server_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow::Result<Value> {
+    server_signed_as(pki, PAYLOAD_CUSTODY, s)
+}
+
+/// [`server_signed`], as `payload_type`.
+fn server_signed_as(pki: &crate::pki::Pki, payload_type: &str, s: &statement::Statement) -> anyhow::Result<Value> {
     use anyhow::Context as _;
     use rcgen::SigningKey as _;
     let read = |f: &str| std::fs::read_to_string(pki.dir().join(f)).with_context(|| format!("kiln's server's {f}"));
@@ -194,8 +211,36 @@ pub fn server_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow:
         o.insert("by".into(), Value::String(server_uri(&pki.organization())));
     }
     let payload = statement::payload(&s)?;
-    let signature = key.sign(&statement::to_sign(PAYLOAD_CUSTODY, &payload))?;
-    Ok(statement::bundle(PAYLOAD_CUSTODY, &payload, &signature, &crate::pki::der_of(&cert)?))
+    let signature = key.sign(&statement::to_sign(payload_type, &payload))?;
+    Ok(statement::bundle(payload_type, &payload, &signature, &crate::pki::der_of(&cert)?))
+}
+
+/// A hand-over's word (`command`, a session command's JSON) as kiln's server sends it to runner
+/// process `instance` of `machine`, which holds session `session` at `epoch` as kiln knows it
+/// (docs/ci.md W27-R08; the Transfers plan's step 4): the command with the server's signature over
+/// it and whom it's for (`kiln_ci::identity::custody::Word`) beside it, as `word`. A runner from
+/// before reads the command alone. What's signed is the command as [`unworded`] writes it.
+pub fn word(pki: &crate::pki::Pki, session: &str, command: &str, machine: &str, instance: &str, epoch: u64) -> anyhow::Result<String> {
+    use sha2::Digest as _;
+    let mut v: Value = serde_json::from_str(command)?;
+    let digest: String = sha2::Sha256::digest(unworded(&v).as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let body = serde_json::to_value(custody::Word { v: statement::VERSION, by: String::new(), session: session.to_owned(), machine: machine.to_owned(), instance: instance.to_owned(), epoch })?;
+    let subject = statement::Subject { name: format!("a hand-over's word about session {session}"), digest: BTreeMap::from([("sha256".to_owned(), digest)]), ..statement::Subject::default() };
+    let bundle = server_signed_as(pki, custody::PAYLOAD_WORD, &statement::Statement { subject: vec![subject], ..statement::Statement::new(body) })?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("word".into(), Value::String(bundle.to_string()));
+    }
+    Ok(v.to_string())
+}
+
+/// The command a hand-over's word signs (`v`, as sent): its JSON without the word, as `serde_json`
+/// writes it again, which the server and the runner write alike.
+pub fn unworded(v: &Value) -> String {
+    let mut v = v.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("word");
+    }
+    v.to_string()
 }
 
 /// kiln's take of agent session `session` as it leaves epoch `epoch` (its timeline `events`), for
@@ -880,6 +925,41 @@ mod tests {
         assert_eq!(at_epoch("kiln://o/person/p/agent/s1/epoch/3/machine/m/instance/i", 4).as_deref(), Some("kiln://o/person/p/agent/s1/epoch/4"));
         assert_eq!(at_epoch("kiln://o/person/p/machine/m/instance/i", 4), None);
         Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 4, the 14:18 drop): a hand-over's word as kiln's server
+    /// sends it is applied only by the process it's for, at the epoch it holds the session at: not
+    /// by another instance (a new build it was passed on to), not at an epoch the process left,
+    /// not changed on the way, and not unsigned from a server that signs words. From a server that
+    /// doesn't, it goes as before; and a command that isn't a hand-over's word isn't checked.
+    #[test]
+    fn w27_r08_a_hand_overs_word_goes_only_to_its_process() -> anyhow::Result<()> {
+        use crate::harness::model::Command;
+        use crate::runner::custody::word_for_me;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            crate::identities::own_identities(&store, &pki).await?;
+            let root = pki.ca_der.clone();
+            let command = serde_json::to_string(&Command::HandedOver { error: None, unsure: false, by_newest: false, none_newer: false })?;
+            let worded = word(&pki, "s1", &command, "fedora", "main", 3)?;
+            let check = |json: &str, instance: &str, epoch: Option<u64>| word_for_me("s1", json, true, &root, "fedora", instance, epoch);
+            assert_eq!(check(&worded, "main", Some(3)), Ok(()), "for this process at its epoch");
+            assert_eq!(check(&worded, "main", None), Ok(()), "for this process, which let go of it");
+            let passed = check(&worded, "01a17502", Some(4));
+            assert!(passed.as_ref().is_err_and(|w| w.contains("for fedora (instance main) at epoch 3, not this process, fedora (instance 01a17502) at epoch 4")), "{passed:?}");
+            assert!(check(&worded, "main", Some(4)).is_err(), "an epoch it left");
+            let mut changed: Value = serde_json::from_str(&worded)?;
+            if let Some(o) = changed.as_object_mut() {
+                o.insert("error".into(), json!("let go of it"));
+            }
+            assert!(check(&changed.to_string(), "main", Some(3)).is_err_and(|w| w.contains("changed")));
+            assert!(check(&command, "main", Some(3)).is_err_and(|w| w.contains("isn't signed")), "unsigned, from a server that signs words");
+            assert_eq!(word_for_me("s1", &command, false, &root, "fedora", "main", Some(3)), Ok(()), "unsigned, from a server from before");
+            assert_eq!(check(&serde_json::to_string(&Command::Interrupt)?, "01a17502", None), Ok(()), "not a hand-over's word");
+            Ok(())
+        })
     }
 
     /// A taken statement, or the refusal as an error.

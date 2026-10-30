@@ -77,6 +77,8 @@ struct State {
     receipts: BTreeMap<(String, u64), String>,
     outbox: VecDeque<String>,
     sent: VecDeque<String>,
+    /// What's sent once, not again after a reconnect: a hand-over's word refused here.
+    once: VecDeque<String>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -238,7 +240,56 @@ pub fn certified(session: &str, epoch: u64) -> bool {
     STATE.lock().waiting.remove(&(session.to_owned(), epoch)).is_some_and(|w| w.blue_green)
 }
 
-/// The records to send now, oldest first: each kept, to send again after a reconnect.
+/// Whether session command `json` the server sent is a hand-over's word (a local `MoveTo`: hand
+/// it to this machine's newest process; `HandedOver`: the server's word on such a hand-over): about
+/// the hold of the process it's sent to, never another's.
+pub fn hand_overs_word(json: &str) -> bool {
+    use crate::harness::model::Command;
+    matches!(serde_json::from_str::<Command>(json), Ok(Command::MoveTo { local: true, .. } | Command::HandedOver { .. }))
+}
+
+/// Whether hand-over's word `json`, about session `session`, is this process's to apply (docs/ci.md
+/// W27-R08; the 14:18 drop): signed by kiln's server (its chain to kiln's root, `root`), for this
+/// process (runner process `instance` of `machine`), at the epoch it holds the session at here
+/// (`epoch`; none: at none, as once it let go, when only the process is checked). Any other command
+/// is this process's as before; so is a hand-over's word from a server that doesn't sign them
+/// (`signs`: it doesn't announce `CAP_CUSTODY`), or to this process when it doesn't say it checks
+/// them (a test build's `unsigned`, as a runner from before: kiln sends it words unsigned). Why
+/// not, when it isn't: kiln is told, and records it with whom the word was for.
+pub fn word_for_me(session: &str, json: &str, signs: bool, root: &[u8], machine: &str, instance: &str, epoch: Option<u64>) -> Result<(), String> {
+    if !hand_overs_word(json) || !self::signs() {
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let word = v.get("word").and_then(Value::as_str);
+    let checked = match word {
+        None if !signs => return Ok(()),
+        None => Err("it isn't signed: kiln signs every word it says of a hand-over".to_owned()),
+        Some(w) => addressed(session, &v, w, root, machine, instance, epoch),
+    };
+    if let Err(why) = &checked {
+        refused_word(session, word, why);
+    }
+    checked
+}
+
+fn addressed(session: &str, v: &Value, word: &str, root: &[u8], machine: &str, instance: &str, epoch: Option<u64>) -> Result<(), String> {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    let bundle: Value = serde_json::from_str(word).map_err(|e| format!("its signature can't be read: {e}"))?;
+    let c = statement::verify(&bundle, root, &[], crate::util::now_unix()).map_err(|e| e.to_string())?;
+    // kiln's server alone signs words, under kiln's root.
+    let server = if Identity::parse(&c.custodian).is_ok_and(|i| matches!(i.actor, Actor::Server)) { c.custodian.clone() } else { String::new() };
+    kiln_ci::identity::custody::addressed(&c, &server, session, crate::custody::unworded(v).as_bytes(), machine, instance, epoch).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// A hand-over's word refused here, because `why`: kiln is told, and records it.
+pub fn refused_word(session: &str, word: Option<&str>, why: &str) {
+    tracing::warn!(target: "kiln.custody", %session, %why, "a hand-over's word refused: it isn't this process's");
+    STATE.lock().once.push_back(serde_json::json!({ "refused_word": { "session": session, "why": why, "word": word } }).to_string());
+}
+
+/// The records to send now, oldest first: each kept, to send again after a reconnect, but a
+/// refusal of a hand-over's word, sent once.
 pub fn drain() -> Vec<String> {
     let mut st = STATE.lock();
     let out: Vec<String> = st.outbox.drain(..).collect();
@@ -248,7 +299,8 @@ pub fn drain() -> Vec<String> {
     while st.sent.len() > KEEP {
         st.sent.pop_front();
     }
-    out
+    let once: Vec<String> = st.once.drain(..).collect();
+    out.into_iter().chain(once).collect()
 }
 
 /// What was sent, to send again after a reconnect (the server takes each once).

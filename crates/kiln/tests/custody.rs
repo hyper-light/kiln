@@ -411,7 +411,7 @@ fn said_of(dir: &Path, port: u16, admin: &str, id: &str) -> String {
         .iter()
         .map(|n| {
             let text = std::fs::read_to_string(n).unwrap_or_default();
-            let lines: Vec<&str> = text.lines().filter(|l| l.contains(id) || ["custody", "took over", "taking over", "hand", "mov", "newest", "upgrad", "promot", "WARN", "ERROR"].iter().any(|w| l.contains(w))).collect();
+            let lines: Vec<&str> = text.lines().filter(|l| l.contains(id) || ["custody", "took over", "taking over", "hand", "mov", "newest", "upgrad", "promot", "panicked", "fatal", "WARN", "ERROR"].iter().any(|w| l.contains(w))).collect();
             format!("{}:\n{}", n.display(), lines.get(lines.len().saturating_sub(60)..).unwrap_or(&[]).join("\n"))
         })
         .collect();
@@ -740,14 +740,17 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
 
 /// The hand-overs kiln recorded as unsigned, for session `id`, once there are `n`.
 #[cfg(feature = "chaos")]
-fn unsigned_of(port: u16, admin: &str, id: &str, n: usize) -> anyhow::Result<Vec<Value>> {
+fn unsigned_of(dir: &Path, port: u16, admin: &str, id: &str, n: usize) -> anyhow::Result<Vec<Value>> {
+    let mut seen = Value::Null;
     until(Duration::from_secs(120), || {
         let (st, body) = http(port, "GET", "/api/transfers/unsigned", admin, None)?;
         anyhow::ensure!(st == 200, "{st} {body}");
         let v: Value = serde_json::from_str(&body)?;
         let mine: Vec<Value> = v.get("unsigned").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|u| field(u, "session") == id).collect();
+        seen = Value::Array(mine.clone());
         Ok((mine.len() >= n).then_some(mine))
     })
+    .map_err(|e| anyhow::anyhow!("{n} unsigned hand-overs {e}: {seen}: {}", said_of(dir, port, admin, id)))
 }
 
 /// W27-R08 (the Transfers plan's step 3): a runner from before signed hand-overs (a test build's
@@ -769,13 +772,84 @@ fn w27_r08_session_hand_overs_with_runners_from_before_go_unsigned() -> anyhow::
     let e0 = first_epoch(port, admin, &id)?;
     // To a newer runner, from one from before: it signed no hand-on.
     let _z1 = instance(dir.path(), port, "box-a", "z1")?;
-    let one = unsigned_of(port, admin, &id, 1)?;
+    let one = unsigned_of(dir.path(), port, admin, &id, 1)?;
     let first = one.iter().find(|u| u.get("epoch") == Some(&json!(e0 + 1))).cloned().unwrap_or_default();
     assert!(field(&first, "gave").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/box-a/instance/main")) && field(&first, "why").contains("signed no hand-on"), "{one:?}");
     // From the newer runner to another from before: it signed no receipt.
     let _z2 = instance_with(dir.path(), port, "box-a", "z2", Some("unsigned"), &[])?;
-    let two = unsigned_of(port, admin, &id, 2)?;
+    let two = unsigned_of(dir.path(), port, admin, &id, 2)?;
     let second = two.iter().find(|u| u.get("epoch") == Some(&json!(e0 + 2))).cloned().unwrap_or_default();
     assert!(field(&second, "gave").ends_with(&format!("/agent/{id}/epoch/{}/machine/box-a/instance/z1", e0 + 1)) && field(&second, "why").contains("signed no receipt"), "{two:?}");
     Ok(())
 }
+
+/// W27-AC05 (the Transfers plan's step 4): the 14:18 drop played again. Seven sessions on a machine
+/// upgraded blue/green; as kiln certifies each at its next epoch for the new build, the server also
+/// tells the runner it took them over from what it told it before transfers named a session's
+/// holder (a test build's `stale_words`): hand each to the newest, and that it was taken. Every
+/// such word is refused, and recorded naming whom it was for and the runner that refused it; none
+/// is applied, and the new build holds all seven.
+#[cfg(feature = "chaos")]
+#[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
+    const SESSIONS: usize = 7;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let s = common::start_env(dir.path(), &Options::default(), false, &[("KILN_CHAOS", "stale_words")])?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    let before_build = dir.path().join("kiln-before");
+    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_kiln"))?;
+    bytes.push(0);
+    std::fs::write(&before_build, bytes)?;
+    std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &[])?;
+    agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    let mut sessions = Vec::new();
+    for _ in 0..SESSIONS {
+        let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+        let e0 = first_epoch(port, admin, &id)?;
+        sessions.push((id, e0));
+    }
+    let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
+    anyhow::ensure!(st == 202, "{st} {body}");
+    // Each goes on at its next epoch in the new build, which received it.
+    for (id, e0) in &sessions {
+        let v = until(Duration::from_secs(300), || {
+            let (st, body) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None)?;
+            let v: Value = if st == 200 { serde_json::from_str(&body)? } else { Value::Null };
+            Ok((v.get("unbroken") == Some(&json!(true)) && field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/box-a/", e0 + 1))).then_some(v))
+        })
+        .map_err(|e| anyhow::anyhow!("session {id}: {e}: {}", said_of(dir.path(), port, admin, id)))?;
+        assert!(!field(&v, "held_by").ends_with("/instance/main"), "held by the new build: {v}");
+    }
+    // The stale words: each refused, and recorded naming whom it was for and who refused it.
+    let refused = until(Duration::from_secs(60), || {
+        let (st, body) = http(port, "GET", "/api/transfers/refused", admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let words: Vec<Value> = v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| field(r, "act") == "a hand-over's word").collect();
+        Ok((words.len() >= 2 * SESSIONS).then_some(words))
+    })
+    .map_err(|e| anyhow::anyhow!("{e}: {}", sessions.first().map(|(id, _)| said_of(dir.path(), port, admin, id)).unwrap_or_default()))?;
+    for (id, _) in &sessions {
+        let of: Vec<&Value> = refused.iter().filter(|r| field(r, "why").contains(id.as_str())).collect();
+        assert_eq!(of.len(), 2, "both stale words about session {id} refused: {refused:?}");
+        assert!(of.iter().all(|r| field(r, "came_from") == "runner box-a (instance main)" && field(r, "why").contains("handed to its machine's new build")), "{of:?}");
+    }
+    // None applied: every session still runs, held by the new build.
+    std::thread::sleep(Duration::from_secs(5));
+    for (id, e0) in &sessions {
+        let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}"), admin, None)?;
+        anyhow::ensure!(st == 200, "session {id}: {st} {body}");
+        let i: Value = serde_json::from_str(&body).unwrap_or_default();
+        let status = i.get("status").or_else(|| i.pointer("/info/status")).and_then(Value::as_str).unwrap_or_default();
+        assert!(!matches!(status, "exited" | "closed"), "session {id} went on: {i}");
+        let (_, chain) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None)?;
+        let v: Value = serde_json::from_str(&chain).unwrap_or_default();
+        assert!(field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/box-a/", e0 + 1)) && !field(&v, "held_by").ends_with("/instance/main"), "{v}");
+    }
+    Ok(())
+}
+

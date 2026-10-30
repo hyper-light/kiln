@@ -8901,7 +8901,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   browser yet).
 
 **Built: custody, and agent sessions handed over signed (R08, in part).** Plan
-`01a17856b1b477eda14a574ae312a123`, its steps 1 to 3; research `01a18abf2d28762d92104dca2fbfbf89`.
+`01a17856b1b477eda14a574ae312a123`, its steps 1 to 4; research `01a18abf2d28762d92104dca2fbfbf89`.
 
 - *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
   things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
@@ -8945,6 +8945,18 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   session where it was, the hand-on lapsing), then asks for the next epoch with its receipt, and
   once that's certified goes on at it in place: its state says so, and nothing the server's copy
   has is sent again.
+- *Words about a hand-over* (hand a session to the machine's newest process, the server's word
+  on such a hand-over) name the process they're for, its machine, instance and the epoch kiln last
+  certified it at, signed by the server (`kiln_ci::identity::custody::Word`, `addressed`; the word
+  goes beside the command as `word`, which a runner from before ignores). A runner that checks them
+  (`CAP_CUSTODY`) applies one only if it's that process at that epoch (once it let go of the
+  session, only the process is checked), and refuses any other, or an unsigned one, telling kiln,
+  which records whom it was for and who refused it. The runner a blue/green upgrade replaces keeps
+  such words and refuses one about a session it handed to the new build; the new build refuses one
+  passed on to it (the 14:18 drop: such words, passed on, let go of six sessions in the new build).
+  Once kiln certifies a process for a session, it sends that session's words there. A test
+  build's `stale_words` (the server's) sends the old holder its stale words, to play the drop
+  again.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -8962,13 +8974,18 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   resume from kiln's copy, each walking unbroken with both sides signed; in a release build (an
   upgrade downloads the server's own kiln, and a debug one is larger than kiln serves) a blue/green
   upgrade sending nothing again and `w27_r08_session_hand_overs` (moved, upgraded, taken over,
-  resumed: four verified transfers); with `chaos`, runners from before going unsigned. Nightly:
-  `.kiln/custody-lab.yaml`.
-- *Not yet.* The server's words about a hand-over aren't addressed to one process (step 4); acts
-  aren't yet refused on every channel when signed at an epoch left, and a runner's Open at a later
-  epoch still raises it before its transfer is recorded (step 5); work handed between agents,
-  changes, review requests, carried approvals, promotions, replant, artifacts, machines and
-  intermediaries (steps 6 to 16).
+  resumed: four verified transfers); with `chaos`, runners from before going unsigned, and
+  `w27_ac05_the_1418_drop_played_again` (seven sessions upgraded blue/green, the old runner told
+  to hand each on and that it was taken: every such word refused and recorded, all seven held by
+  the new build). `custody::w27_r08_a_hand_overs_word_goes_only_to_its_process`, kiln-ci's
+  `w27_r08_a_hand_overs_word_is_only_its_processs`, and
+  `agent::w27_ac05_a_hand_overs_word_for_the_runner_being_upgraded_never_reaches_the_new_build`
+  (fix/upgrade-keeps-agents' test, come over). Nightly: `.kiln/custody-lab.yaml`.
+- *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
+  the session at its next epoch); acts aren't yet refused on every channel when signed at an epoch
+  left, and a runner's Open at a later epoch still raises it before its transfer is recorded (step
+  5); work handed between agents, changes, review requests, carried approvals, promotions,
+  replant, artifacts, machines and intermediaries (steps 6 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 
