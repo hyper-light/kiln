@@ -40,6 +40,8 @@ struct Pull {
     reviews: Vec<(String, &'static str)>,
     comments: Vec<(String, String)>,
     updated: i64,
+    /// The branch it goes onto: main, or another's (`b7`) in a stack.
+    base: String,
 }
 
 /// A host's pull request API on a port of its own.
@@ -168,7 +170,7 @@ impl Sim {
             .collect();
         match self.host {
             Host::Github => json!({ "number": p.number, "title": p.title, "user": { "login": p.author }, "state": "open", "draft": false, "merged_at": null,
-                "head": { "ref": format!("b{}", p.number), "sha": p.head }, "base": { "ref": "main" }, "html_url": format!("{web}/{}/pull/{}", self.name, p.number),
+                "head": { "ref": format!("b{}", p.number), "sha": p.head }, "base": { "ref": p.base }, "html_url": format!("{web}/{}/pull/{}", self.name, p.number),
                 "updated_at": stamp(p.updated), "requested_reviewers": reviewers }),
             Host::Gitlab => json!({ "iid": p.number, "title": p.title, "author": { "username": p.author }, "state": "opened", "draft": false, "source_branch": format!("b{}", p.number),
                 "sha": p.head, "target_branch": "main", "web_url": format!("{web}/{}/-/merge_requests/{}", self.name, p.number), "updated_at": stamp(p.updated), "reviewers": reviewers }),
@@ -243,7 +245,7 @@ fn sha(prefix: u64, n: u64) -> String {
 }
 
 fn pull(n: u64, t: i64) -> Pull {
-    Pull { number: n, title: format!("change {n}"), author: "ada".into(), head: sha(n, 1), commits: vec![sha(n, 900)], requested: vec!["bob".into()], reviews: vec![], comments: vec![], updated: t }
+    Pull { number: n, title: format!("change {n}"), author: "ada".into(), head: sha(n, 1), commits: vec![sha(n, 900)], requested: vec!["bob".into()], reviews: vec![], comments: vec![], updated: t, base: "main".into() }
 }
 
 fn until(secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Result<Option<String>>) -> anyhow::Result<()> {
@@ -566,5 +568,55 @@ fn w26_r16_a_pull_request_is_pushed_automatically_when_declared() -> anyhow::Res
         let u = gh.updates.lock().map(|u| u.clone()).unwrap_or_default();
         Ok((u != vec![(7, head.clone())]).then(|| format!("{u:?}")))
     })?;
+    Ok(())
+}
+
+/// W26-R16 on a host's stack: #8 goes onto #7's branch (b7), as GitHub's stacked pull requests do.
+/// When main moves, #7 is replayed onto it and #8 onto #7's replay, in kiln's mirror; Update on #8
+/// is GitHub's update-branch, which merges #8's base as GitHub has it (b7), not kiln's replay: a
+/// stack updates bottom first.
+#[test]
+fn w26_r16_a_hosts_stack_replays_each_onto_the_one_below() -> anyhow::Result<()> {
+    let (dir, srv, gh, head7, work, bare) = pull_on_github(None)?;
+    // #8 on b7.
+    git(&work, &["checkout", "-qb", "b8"])?;
+    std::fs::write(work.join("g.txt"), "eight\n")?;
+    git(&work, &["add", "g.txt"])?;
+    git(&work, &["commit", "-qm", "#8 on #7"])?;
+    git(&work, &["push", "-q", "origin", "HEAD:refs/pull/8/head"])?;
+    git(&bare, &["update-server-info"])?;
+    let head8 = git(&work, &["rev-parse", "HEAD"])?;
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    gh.add(Pull { head: head8.clone(), commits: vec![], base: "b7".into(), ..pull(8, now) });
+    until(60, "#8 mirrored into Ship", || {
+        let (_, body) = http(srv.port, "GET", "/api/ship/commits?repo=acme/gh", &srv.admin, None)?;
+        Ok((!body.contains(&head8)).then(|| body.chars().take(300).collect()))
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    // main moves.
+    git(&work, &["checkout", "-q", "main"])?;
+    std::fs::write(work.join("z.txt"), "elsewhere\n")?;
+    git(&work, &["add", "z.txt"])?;
+    git(&work, &["commit", "-qm", "main moves"])?;
+    git(&work, &["push", "-q", "origin", "HEAD:main"])?;
+    git(&bare, &["update-server-info"])?;
+    let tip = git(&work, &["rev-parse", "HEAD"])?;
+
+    let replay = |n: u64| -> Option<String> {
+        let mirror = find_dir(dir.path(), "acme__gh.git")?;
+        git(&mirror, &["rev-parse", "--verify", "--quiet", &format!("refs/kiln/pulls/github/{n}/replays/1")]).ok().filter(|c| !c.is_empty())
+    };
+    until(60, "#7 and #8 replayed", || Ok((replay(7).is_none() || replay(8).is_none()).then(|| srv.log())))?;
+    let mirror = find_dir(dir.path(), "acme__gh.git").ok_or_else(|| anyhow::anyhow!("no mirror"))?;
+    let (r7, r8) = (replay(7).unwrap_or_default(), replay(8).unwrap_or_default());
+    assert_eq!(git(&mirror, &["log", "-1", "--format=%P", &r7])?, format!("{head7} {tip}"), "#7: main merged into its head");
+    assert_eq!(git(&mirror, &["log", "-1", "--format=%P|%cn|%s", &r8])?, format!("{head8} {r7}|kiln|Merge #7 into #8"), "#8: #7's replay merged into its head");
+    assert_eq!(git(&mirror, &["show", &format!("{r8}:z.txt")])?, "elsewhere", "#8's replay has main's move, through #7's");
+
+    // Update on #8: GitHub's update-branch against #8's head.
+    let (st, body) = http(srv.port, "POST", "/api/ci/repos/acme%2Fgh/pulls/8/update", &srv.admin, Some(&json!({})))?;
+    assert_eq!(st, 200, "{body}");
+    assert!(gh.updates.lock().map(|u| u.contains(&(8, head8.clone()))).unwrap_or(false));
     Ok(())
 }
