@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use super::chain::{self, Revocation, Verified};
-use crate::attest::{self, Subject};
+use crate::attest;
 
 /// A custody record's payload type: a thing received, handed on, passed on or taken, by its
 /// digest (the Transfers plan's body).
@@ -47,12 +47,29 @@ pub const VERSION: u32 = 1;
 /// The most delegations a statement acts under, one under another.
 pub const MAX_UNDER: usize = 16;
 
+/// What a statement is about: a thing named by its digests, as in-toto's ResourceDescriptor names
+/// one (its name, its digest set, its size and annotations).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subject {
+    pub name: String,
+    /// Its digests, algorithm to lowercase hex (in-toto's digest set): more than one names the same
+    /// thing, as a checkout's `gitCommit` and `gitTree`, or a log's `sha256` and the head of its
+    /// chunks' chain.
+    pub digest: BTreeMap<String, String>,
+    /// Its size in bytes, when it's known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// What else is said of it (in-toto's annotations): a capped log's chunk count, a report's path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, Value>,
+}
+
 /// What a statement says, signed: its payload, as JSON.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Statement {
     /// [`VERSION`].
     pub v: u32,
-    /// What it's about, each by its digests (in-toto's subjects).
+    /// What it's about, each by its digests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject: Vec<Subject>,
     /// The earlier statements it follows, by their digests ([`digest`]).
@@ -87,7 +104,7 @@ impl Statement {
             if s.digest.is_empty() {
                 return Err(format!("its subject {:?} has no digest", s.name));
             }
-            if let Some((alg, _)) = s.digest.iter().find(|(alg, hex)| !is_hex(hex) || (alg.as_str() == "sha256" && hex.len() != 64)) {
+            if let Some((alg, _)) = s.digest.iter().find(|(alg, hex)| !digest_ok(alg, hex)) {
                 return Err(format!("its subject {:?} has a malformed {alg} digest", s.name));
             }
         }
@@ -113,6 +130,20 @@ impl Statement {
 
 fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether `hex` is a digest of `algorithm`: lowercase hex, as long as the algorithm's are where
+/// kiln knows them (git's objects by SHA-1 or SHA-256).
+fn digest_ok(algorithm: &str, hex: &str) -> bool {
+    let lengths: &[usize] = match algorithm {
+        "sha1" => &[40],
+        "sha256" => &[64],
+        "sha384" => &[96],
+        "sha512" => &[128],
+        "gitCommit" | "gitTree" | "gitBlob" | "gitTag" => &[40, 64],
+        _ => &[],
+    };
+    is_hex(hex) && (lengths.is_empty() || lengths.contains(&hex.len()))
 }
 
 fn is_digest(s: &str) -> bool {
@@ -424,7 +455,7 @@ mod tests {
     }
 
     fn subject(name: &str, c: char) -> Subject {
-        Subject { name: name.into(), digest: BTreeMap::from([("sha256".to_owned(), sha(c))]) }
+        Subject { name: name.into(), digest: BTreeMap::from([("sha256".to_owned(), sha(c))]), ..Subject::default() }
     }
 
     /// A custody record of `kind` about `what`, following `follows`, numbered `seq` on `stream`.
@@ -540,10 +571,12 @@ mod tests {
         let sam = signer(&ca, SAM)?;
         let follows = format!("sha256:{}", sha('e'));
         let good = custody("taken", subject("image", 'd'), &[follows.as_str()], "deploy", 2);
-        let with_digest = |alg: &str, hex: &str| Statement { subject: vec![Subject { name: "image".into(), digest: BTreeMap::from([(alg.to_owned(), hex.to_owned())]) }], ..good.clone() };
+        let with_digest = |alg: &str, hex: &str| Statement { subject: vec![Subject { name: "image".into(), digest: BTreeMap::from([(alg.to_owned(), hex.to_owned())]), ..Subject::default() }], ..good.clone() };
         for (s, why) in [
             (Statement { v: 2, ..good.clone() }, "version 2"),
-            (Statement { subject: vec![Subject { name: "image".into(), digest: BTreeMap::new() }], ..good.clone() }, "\"image\" has no digest"),
+            (Statement { subject: vec![Subject { name: "image".into(), ..Subject::default() }], ..good.clone() }, "\"image\" has no digest"),
+            (with_digest("gitCommit", "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c"), "malformed gitCommit digest"),
+            (with_digest("sha512", &sha('a')), "malformed sha512 digest"),
             (with_digest("sha256", "abc"), "malformed sha256 digest"),
             (with_digest("gitCommit", "4C1E2A90"), "malformed gitCommit digest"),
             (Statement { follows: vec![sha('e')], ..good.clone() }, "isn't a statement's digest"),
@@ -580,6 +613,30 @@ mod tests {
             let got = verify(&bad, &ca.der, &[], AT);
             assert!(matches!(&got, Err(Refusal::Malformed(w)) if w.contains(why)), "{why}: {got:?}");
         }
+        Ok(())
+    }
+
+    /// A checkout named by its commit and its tree, a capped log by its bytes' digest and the head of
+    /// its chunks' chain, with its size and annotations (in-toto's ResourceDescriptor): kept as signed.
+    #[test]
+    fn w27_r03_a_subject_names_a_thing_by_several_digests() -> anyhow::Result<()> {
+        let ca = ca("kiln CA")?;
+        let digests = |d: &[(&str, &str)]| d.iter().map(|(a, h)| ((*a).to_owned(), (*h).to_owned())).collect::<BTreeMap<_, _>>();
+        let checkout = Subject { name: "checkout".into(), digest: digests(&[("gitCommit", "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"), ("gitTree", "4b825dc642cb6eb9a060e54bf8d69288fbee4904")]), ..Subject::default() };
+        let log = Subject {
+            name: "log/build".into(),
+            digest: digests(&[("sha256", &sha('a')), ("kiln-log-v1", &sha('b'))]),
+            size: Some(1_048_576),
+            annotations: BTreeMap::from([("chunks".to_owned(), json!(64)), ("capped".to_owned(), json!(true))]),
+        };
+        // A repository of SHA-256 objects names its commits by 64 digits.
+        let sha256_repo = Subject { name: "checkout".into(), digest: digests(&[("gitCommit", &sha('c'))]), ..Subject::default() };
+        let s = Statement { subject: vec![checkout, log, sha256_repo], stream: Some("legs".into()), seq: Some(1), ..Statement::new(json!({ "kind": "handed-on" })) };
+        let (b, _) = signer(&ca, JUPITER)?.sign(PAYLOAD_CUSTODY, &s)?;
+        assert_eq!(verify(&b, &ca.der, &[], AT)?.statement, s, "kept as signed");
+        let raw = serde_json::to_value(&s)?;
+        assert_eq!((raw.pointer("/subject/1/size"), raw.pointer("/subject/1/annotations/chunks")), (Some(&json!(1_048_576)), Some(&json!(64))));
+        assert_eq!((raw.pointer("/subject/0/size"), raw.pointer("/subject/0/annotations")), (None, None), "nothing said of what isn't known");
         Ok(())
     }
 
