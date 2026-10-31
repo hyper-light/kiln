@@ -13,6 +13,7 @@ import { Check, Copy, MoreHorizontal, Pencil, Quote, Reply, RotateCcw, ShieldChe
 import { whoSaid, type Thread, type ThreadComment } from "@/api/review";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { relativeTime } from "@/lib/format";
+import { copyText } from "@/views/terminal/clipboard";
 import { CommentText } from "./comment";
 import { ReviewComposer } from "./composer";
 import { draftKey, replyAt, useDraftSet } from "./draft";
@@ -35,13 +36,11 @@ function usePressCopy(text: string) {
   const t = React.useRef(0);
   const at = React.useRef({ x: 0, y: 0 });
   const copy = React.useCallback(() => {
-    void navigator.clipboard?.writeText(text).then(
-      () => {
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1400);
-      },
-      () => {},
-    );
+    void copyText(text).then((ok) => {
+      if (!ok) return;
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    });
   }, [text]);
   const end = () => window.clearTimeout(t.current);
   return {
@@ -96,7 +95,7 @@ function Menu({
   return (
     <div className="rv-menu" role="menu" aria-label="Comment actions">
       {icon("Reply", "Reply", onReply, <Reply size={14} aria-hidden="true" />)}
-      {icon("Copy", "Copy", () => void navigator.clipboard?.writeText(c.body).catch(() => {}), <Copy size={14} aria-hidden="true" />)}
+      {icon("Copy", "Copy", () => void copyText(c.body), <Copy size={14} aria-hidden="true" />)}
       {icon("Quote", "Quote", onQuote, <Quote size={14} aria-hidden="true" />)}
       {ops.kiln && (mine ? icon("Edit", "Edit", onEdit, <Pencil size={14} aria-hidden="true" />) : icon("Edit", "Only its author edits a comment", () => {}, <Pencil size={14} aria-hidden="true" />))}
       {ops.kiln &&
