@@ -390,11 +390,19 @@ pub(crate) async fn stored_route(hub: &Hub, leg: &str) -> anyhow::Result<Option<
     Ok(Some(route_with(&spec, &wf.name.clone().unwrap_or_default(), &repo, &event, trusted, &actions, &hub.cfg.ci)))
 }
 
+/// A leg's durations as the engine counts them, in milliseconds (docs/needs.md, E1): its job's
+/// median and p90 seconds from history (W05-R10, R38), and its timeout.
+fn durations(costs: &HashMap<String, super::insights::JobCost>, job: &str, timeout_minutes: u32) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let (cost, ms) = (costs.get(job), kiln_ci::sched::units::ms_of_secs);
+    (cost.and_then(|c| ms(c.p50)), cost.and_then(|c| ms(c.p90)), Some(u64::from(timeout_minutes).saturating_mul(60_000)))
+}
+
 /// What the scheduler gets of a leg: its route, priority, concurrency group and retries; and for
 /// placement (W24-R18), its lane, how long it runs cold (`warm`: what runners last said they hold
 /// warm), its job's container and workflow file, and its job's `prefer:`.
 fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci, warm: &HashMap<String, (u64, kiln_ci::work::slots::WorkState)>) -> LegIn {
     let job = spec.def();
+    let (cost, p90, timeout) = durations(&r.costs, &spec.job, spec.timeout_minutes);
     let route = route_with(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, r.trusted, &r.actions, cfg);
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
@@ -441,8 +449,11 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         exclusive: job.is_some_and(|j| j.kiln.exclusive),
         group,
         retry,
-        // History's seconds, in the engine's milliseconds (docs/needs.md, E1).
-        cost: r.costs.get(&spec.job).copied().and_then(kiln_ci::sched::units::ms_of_secs),
+        // History's seconds, in the engine's milliseconds (docs/needs.md, E1), and its timeout:
+        // when a grant of it is expected to end, and when its runner stops it (W05-R38).
+        cost,
+        p90,
+        timeout,
         // On a `k8s` pool, a pod of its own, its containers in it (W13-R07); a kiln-dialect leg
         // that sets its `toolchain:`, `image:` or `resources:`, v1's job pod (W02-R06).
         own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty() || (spec.workflow.dialect == Some(kiln_ci::expr::Dialect::Kiln) && super::pools::sets_pod(j))),
@@ -765,8 +776,9 @@ struct RunSt {
     tree: Arc<HashMap<String, Vec<String>>>,
     /// How many combinations its plan had removed when they were last saved (W04-R29).
     removed: usize,
-    /// Each job's median seconds lately: what the scheduler expects its legs to cost (W05-R10).
-    costs: Arc<HashMap<String, f64>>,
+    /// Each job's median and p90 seconds lately: what the scheduler expects its legs to cost
+    /// (W05-R10), and when a grant of one is expected to end (W05-R38).
+    costs: Arc<HashMap<String, super::insights::JobCost>>,
     /// An outside contributor's run waiting for a maintainer (W18-R06): the concurrency group
     /// it joins once approved.
     awaiting: Option<Awaiting>,
@@ -3767,6 +3779,16 @@ fn work_slots(a: &crate::hub::AgentLive) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// W05-R38, docs/needs.md E4.1: a leg gives the engine its job's median and p90 from
+    /// history, and its timeout, in milliseconds; a job with no history, its timeout alone.
+    #[test]
+    fn w05_r38_a_leg_carries_its_p90_and_its_timeout() {
+        use super::super::insights::JobCost;
+        let costs: std::collections::HashMap<String, JobCost> = [("build".to_owned(), JobCost { p50: 360.0, p90: 540.0 })].into_iter().collect();
+        assert_eq!(super::durations(&costs, "build", 45), (Some(360_000), Some(540_000), Some(2_700_000)));
+        assert_eq!(super::durations(&costs, "lint", 360), (None, None, Some(21_600_000)));
+    }
+
     /// W05-R30, docs/needs.md E2.3: in W05-R09's event mode a leg's class is its run's event's, in
     /// W28-R64's intent mode its intent's.
     #[test]

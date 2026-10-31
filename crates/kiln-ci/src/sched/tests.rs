@@ -2811,3 +2811,43 @@ fn w05_r25_a_leg_queued_after_a_restart_keeps_its_attempt() {
     s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 5);
     assert_eq!(s.grant("y").map(|g| g.0), Some(1));
 }
+
+/// W05-R38, docs/needs.md E4.1: a grant's expected end is its start plus its p90, moved on once
+/// it has passed to its start plus twice the time it has run, never past its hard end, its start
+/// plus its timeout. Its grant over, it has neither.
+#[test]
+fn w05_r38_a_grant_s_ends_follow_its_p90_and_its_timeout() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("r", 1))), 0);
+    let at = |h: i64, m: i64| (h * 60 + m) * MIN;
+    let l = LegIn { p90: Some(4 * 60_000), timeout: Some(30 * 60_000), ..leg("a", "acme/x", 60) };
+    s.handle(Input::LegQueued(Box::new(l)), at(10, 0));
+    let looked: Vec<(i64, i64)> = [at(10, 3), at(10, 5), at(10, 11), at(10, 23)].into_iter().filter_map(|t| s.due("a", t)).collect();
+    assert_eq!(looked, vec![(at(10, 4), at(10, 30)), (at(10, 10), at(10, 30)), (at(10, 22), at(10, 30)), (at(10, 30), at(10, 30))]);
+    assert_eq!(s.check_grants(), Ok(()));
+    s.handle(Input::AttemptFinished { leg: "a".into(), attempt: 1, outcome: Outcome::Success }, at(10, 24));
+    assert_eq!(s.due("a", at(10, 24)), None);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R38: without a p90, a grant's expected end is its cost's; with neither, its timeout's,
+/// 360 minutes when its job says none. A grant a restart rebuilds (W05-R25) goes from when the
+/// store says it started, and may be past its expected end already.
+#[test]
+fn w05_r38_ends_without_history() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("r", 3))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(2 * 60_000), ..leg("costed", "acme/x", 60) })), 1_000);
+    s.handle(Input::LegQueued(Box::new(leg("unknown", "acme/x", 60))), 1_000);
+    assert_eq!(s.due("costed", 1_000), Some((1_000 + 2 * MIN, 1_000 + 360 * MIN)));
+    assert_eq!(s.due("unknown", 1_000), Some((1_000 + 360 * MIN, 1_000 + 360 * MIN)));
+    assert_eq!(s.check_grants(), Ok(()));
+    let mut t = Scheduler::with_epoch(Config::default(), 2);
+    t.handle(Input::RunnerUp(Box::new(linux("r", 3))), 0);
+    let adopted = LegIn { p90: Some(10 * 60_000), timeout: Some(60 * 60_000), started: Some(5 * MIN), ..leg("adopted", "acme/x", 60) };
+    t.handle(Input::LegRunning { leg: Box::new(adopted), runner: "r".into(), attempt: 1, fence: Fence { epoch: 1, n: 1 } }, 8 * MIN);
+    assert_eq!(t.due("adopted", 8 * MIN), Some((15 * MIN, 65 * MIN)));
+    // Looked at at 16 minutes, past its expected end: 5 + 2 x 11.
+    assert_eq!(t.due("adopted", 16 * MIN), Some((27 * MIN, 65 * MIN)));
+    assert_eq!(t.check_grants(), Ok(()));
+}

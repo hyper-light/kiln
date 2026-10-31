@@ -504,6 +504,12 @@ pub struct LegIn {
     pub retry: Option<RetryPolicy>,
     /// How long it's expected to take (history, W19).
     pub cost: Option<Ms>,
+    /// How long it takes at its 90th percentile (history, W19): when a grant of it is expected
+    /// to end, as reservations go by it (W05-R38).
+    pub p90: Option<Ms>,
+    /// Its job's `timeout-minutes`: its runner stops it past that (W05-R38).
+    /// [`DEFAULT_TIMEOUT_MS`] when unsaid.
+    pub timeout: Option<Ms>,
     pub prefer: Vec<Preference>,
     /// It has a `container:` or `services:`, or is a kiln-dialect leg that sets `toolchain:`,
     /// `image:` or `resources:`: on a hosted pool (`k8s`), it runs in an executor made for it (a
@@ -832,6 +838,9 @@ enum State {
 /// How long a leg a person's retry placed on a runner waits when that runner refuses it (W05-R28).
 pub const REFUSED_AGAIN_MS: i64 = 15_000;
 
+/// A leg's timeout when its job says none (W05-R38): 360 minutes, GitHub's.
+pub const DEFAULT_TIMEOUT_MS: Ms = 360 * 60_000;
+
 /// Why a leg stays off a runner (W05-R16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Off {
@@ -884,6 +893,42 @@ struct Leg {
     /// Not queued before then (W05-R34): a stop item queued again at a later attempt, as after a
     /// restart, waits out the lease of any earlier grant a runner cut off still holds.
     not_before: Option<i64>,
+    /// While it runs, its grant's two ends (W05-R38).
+    due: Option<Due>,
+}
+
+/// A running grant's two ends (W05-R38), unix ms: when it's expected to end, the end
+/// reservations go by, and when it ends at the latest. Its median-based end, which ranks
+/// runners (W24-R18), is [`Leg::ends`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Due {
+    /// When it started.
+    from: i64,
+    /// Its start plus its p90, else its cost, else its timeout; never past `hard`.
+    expected: i64,
+    /// Its start plus its timeout: its runner stops it then.
+    hard: i64,
+}
+
+impl Due {
+    /// The ends of a grant of `l` started at `from`.
+    fn of(l: &LegIn, from: i64) -> Due {
+        let hard = later(from, l.timeout.unwrap_or(DEFAULT_TIMEOUT_MS));
+        let expected = l.p90.or(l.cost).map_or(hard, |ms| later(from, ms).min(hard));
+        Due { from, expected, hard }
+    }
+
+    /// The ends as looked at at `now`: an expected end that has passed, the grant still running,
+    /// moves on to its start plus twice the time it has run, never past its hard end. The
+    /// prediction is corrected once it's proved wrong, its kill-time kept apart (Tsafrir, Etsion
+    /// and Feitelson, EASY++).
+    fn at(self, now: i64) -> Due {
+        if self.expected > now {
+            return self;
+        }
+        let ran = now.saturating_sub(self.from).max(0);
+        Due { expected: self.from.saturating_add(ran.saturating_mul(2)).min(self.hard), ..self }
+    }
 }
 
 /// A leg's wait for a busy runner where it would finish sooner (W24-R18).
@@ -1486,7 +1531,7 @@ impl Scheduler {
         };
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, fence: Fence::default(), expires: None, not_before },
+            Leg { input, req, sig, state: State::Pending, attempt, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, fence: Fence::default(), expires: None, not_before, due: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1624,6 +1669,8 @@ impl Scheduler {
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
         let (work, run, priority, started) = (input.work.clone(), input.run.clone(), input.priority, input.started);
+        // Its ends from when it started, as the store has it, else from now (W05-R38).
+        let due = Due::of(&input, started.unwrap_or(now));
         self.legs.insert(
             id.clone(),
             Leg {
@@ -1650,6 +1697,7 @@ impl Scheduler {
                 fence,
                 expires,
                 not_before: None,
+                due: Some(due),
             },
         );
         if let Some(at) = expires {
@@ -2327,6 +2375,7 @@ impl Scheduler {
         l.ends = expected.map(|ms| later(now, ms));
         l.last_runner = Some(runner.to_owned());
         l.started = Some(now);
+        l.due = Some(Due::of(&l.input, now));
         // Its grant (W05-R34): the next fence of this epoch, living a lease unless renewed.
         let expires = self.cfg.lease.map(|ms| later(now, ms));
         self.fences += 1;
@@ -2363,8 +2412,12 @@ impl Scheduler {
 
     fn release(&mut self, id: &str, now: i64) -> Option<String> {
         self.settle_charge(id, now);
-        // Its grant is over: it expires no more (W05-R34).
-        if let Some(at) = self.legs.get_mut(id).and_then(|l| l.expires.take()) {
+        // Its grant is over: it expires no more (W05-R34), and has no ends (W05-R38).
+        let expired = self.legs.get_mut(id).and_then(|l| {
+            l.due = None;
+            l.expires.take()
+        });
+        if let Some(at) = expired {
             self.leases.remove(&(at, id.to_owned()));
         }
         let l = self.legs.get(id)?;
@@ -3592,6 +3645,12 @@ impl Scheduler {
         Some((l.attempt, held))
     }
 
+    /// A running leg's ends as looked at at `now` (W05-R38): when it's expected to end (its p90's
+    /// end, moved on once it has passed) and when it ends at the latest (its timeout's).
+    pub fn due(&self, id: &str, now: i64) -> Option<(i64, i64)> {
+        self.legs.get(id).and_then(|l| l.due).map(|d| d.at(now)).map(|d| (d.expected, d.hard))
+    }
+
     /// Legs queued now (for metrics).
     pub fn queued(&self) -> usize {
         self.sigs.values().map(Sig::len).sum()
@@ -3618,11 +3677,19 @@ impl Scheduler {
     /// The grants' invariants (W05-R34, docs/needs.md G2's half in the engine), checked after every
     /// input in tests: each running leg holds one grant, its fence its own, made in this epoch (no
     /// later than the last fence) or an earlier one, expiring as the expiry index has it when
-    /// leases are on; the index holds nothing else; and no leg runs on two runners or twice on one.
+    /// leases are on; the index holds nothing else; no leg runs on two runners or twice on one;
+    /// and each running leg's ends go in order, from its start to its expected end to its hard end
+    /// (W05-R38), a leg not running having none.
     #[cfg(test)]
     pub(super) fn check_grants(&self) -> Result<(), String> {
         let (mut indexed, mut fences) = (BTreeSet::new(), BTreeSet::new());
         for (id, l) in self.legs.iter() {
+            match (&l.state, l.due) {
+                (State::Assigned { .. }, Some(d)) if d.from <= d.expected && d.expected <= d.hard => {}
+                (State::Assigned { .. }, due) => return Err(format!("{id} runs with ends {due:?}")),
+                (_, Some(d)) => return Err(format!("{id} isn't running but has ends {d:?}")),
+                (_, None) => {}
+            }
             match (&l.state, l.expires) {
                 (State::Assigned { runner }, expires) => {
                     if l.fence > (Fence { epoch: self.epoch, n: self.fences }) {

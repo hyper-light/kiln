@@ -1982,6 +1982,17 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   (W05-R36). The runner doesn't apply an `Assign`, a `Stop` or a `Renewed` from an epoch older
   than the newest it has seen (`StaleEpoch`). Self-fencing narrows the window: the guarantee
   rests on fencing (G2), since a runner that is itself paused can't stop anything.
+- **W05-R38 A grant's two ends** (docs/needs.md §5, E4.1). A leg brings its job's p90 duration over
+  two weeks, from the W19 rollup its median cost comes from (W05-R10), and its `timeout-minutes`.
+  A running grant keeps two ends beside the median-based one that ranks runners (W24-R18). Its
+  expected end, the one a reservation is to go by (docs/needs.md §5), is its start plus its p90,
+  else its cost, else its timeout. Its hard end, when its runner stops it, is its start plus its
+  timeout (360 minutes when its job says none). An expected end that has passed, the grant still
+  running, is moved on when it's looked at, to its start plus twice the time it has run, never
+  past its hard end: a prediction corrected once it's proved wrong, its kill-time kept apart
+  (Tsafrir, Etsion and Feitelson's EASY++). No timer waits for it. A grant a restart rebuilds
+  (W05-R25) goes from the start the store has. Nothing decides on these ends yet: placement is as
+  it was.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),
