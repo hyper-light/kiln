@@ -2701,6 +2701,10 @@ impl Hub {
             self.command_peers(&name, vec![*p], &ServerMsg::Drain).await.log_when_answered(LOG_WITHIN);
         }
         self.newest_changed(&name).await;
+        // The copy of the conversation store a mirror keeps goes with its machine's newest process:
+        // its feed goes on there now, not once the machine connects again (the old one handed it the
+        // copy, `crate::bluegreen::Frame::Stores`, or it starts one).
+        self.mirrors_seen();
         self.wake.notify();
     }
 

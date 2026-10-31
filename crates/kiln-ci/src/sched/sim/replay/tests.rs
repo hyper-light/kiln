@@ -277,9 +277,11 @@ fn burst() -> Trace {
     t
 }
 
-/// W25 step 1: a commit without a result of its own is covered by a later one's pass, or by a later
-/// failure in the step already failing at its base; a new failure bisects the commits it may have
-/// come from, in ceil(log2(n + 1)) runs, and answers them when the bisection ends.
+/// W25 step 1, W28-R53: a commit without a result of its own is covered by a later one's pass, or
+/// by a later failure in the step already failing at its base; a new failure bisects its suspects,
+/// the commits since its base that changed the job's inputs, the failing one among them, in
+/// ceil(log2 n) runs for n of them, and answers them when the bisection ends: the culprit named,
+/// the rest cleared.
 #[test]
 fn w25_s1_p3_covers_and_bisects() {
     // The last push passes: the three before it are covered by it.
@@ -291,14 +293,36 @@ fn w25_s1_p3_covers_and_bisects() {
     let t = with_end(with_end(burst(), 0, "failed", Some("test")), 4, "failed", Some("test"));
     let v = verdicts(&t, &replay(&t, &Policy::p3(), 1));
     assert!(v.iter().skip(1).take(3).all(|x| x.is_some_and(|x| x.kind == Kind::Covered)), "{v:?}");
-    // A new failure: three suspects, bisected in two runs of the job (3300-4300, 4300-5300).
+    // A new failure: four suspects (the failing run's commit among them), bisected in two runs of
+    // the job (3300-4300, 4300-5300). None of the three before it would have failed: the failing
+    // run is the culprit, and they are cleared.
     let t = with_end(burst(), 4, "failed", Some("test"));
     let out = replay(&t, &Policy::p3(), 1);
-    assert_eq!(out.bisections.iter().map(|b| (b.suspects.clone(), b.done)).collect::<Vec<_>>(), vec![(vec![1, 2, 3], Some(5300))]);
+    assert_eq!(out.bisections.iter().map(|b| (b.suspects.clone(), b.done, b.culprit)).collect::<Vec<_>>(), vec![(vec![1, 2, 3, 4], Some(5300), Some(4))]);
     let v = verdicts(&t, &out);
-    assert!(v.iter().skip(1).take(3).all(|x| *x == Some(verdict::Verdict { at: 5300, kind: Kind::Bisected })), "{v:?}");
+    assert!(v.iter().skip(1).take(3).all(|x| *x == Some(verdict::Verdict { at: 5300, kind: Kind::Covered })), "{v:?}");
+    assert_eq!(v.get(4).copied().flatten(), Some(verdict::Verdict { at: 5300, kind: Kind::Culprit }));
     // Without verdicts (P2) the suspects have none.
     assert!(verdicts(&t, &replay(&t, &Policy::p2(), 1)).iter().skip(1).take(3).all(Option::is_none));
+}
+
+/// W28-R52, R53: a commit that didn't change a job's inputs is no suspect of its new failure; the
+/// one suspect left is the culprit at once, with no bisection run.
+#[test]
+fn w28_r53_suspects_are_the_commits_that_changed_the_jobs_inputs() {
+    let mut t = with_end(burst(), 4, "failed", Some("test"));
+    // Runs 1 to 3 build the inputs run 0 did; run 4 changes them.
+    for c in [1, 2, 3] {
+        let same = t.commits.first().cloned().unwrap_or_default();
+        if let Some(x) = t.commits.get_mut(c) {
+            *x = same;
+        }
+    }
+    let out = replay(&t, &Policy::p3(), 1);
+    assert_eq!(out.bisections.iter().map(|b| (b.suspects.clone(), b.culprit)).collect::<Vec<_>>(), vec![(vec![4], Some(4))]);
+    assert!(out.execs.iter().all(|e| e.bisect.is_none()), "one suspect needs no bisection run");
+    let v = verdicts(&t, &out);
+    assert_eq!(v.get(4).copied().flatten().map(|x| x.kind), Some(Kind::Culprit));
 }
 
 /// W25 step 1: coalescing holds a push only while its pools are saturated, each hold at most
@@ -412,6 +436,31 @@ fn w25_s1_readme_holds_the_report() -> Result<(), String> {
     Ok(())
 }
 
+/// W28-AC51's rest: the late commits the report counts are those `late_runs` names, each with what
+/// held it (a pod's run and job, or the job that answered it at last), and `late_table` lists each.
+#[test]
+fn w28_ac51_the_late_commits_are_named() -> Result<(), String> {
+    let t = week()?;
+    let p = Policy::p4();
+    let o = replay(&t, &p, 1);
+    let named = report::late_runs(&t, &o, "ci");
+    assert_eq!(report::late(&t, &o, "ci").iter().sum::<usize>(), named.len());
+    assert!(!named.is_empty(), "P4 leaves some of ci's commits late on the week");
+    for l in &named {
+        assert!(t.runs.get(l.run).is_some_and(|r| r.workflow == "ci" && r.branch == "main" && r.is_push()), "run {}", l.run);
+        match l.cause {
+            1 => assert!(l.pod.as_ref().is_some_and(|(r, _, _)| t.runs.get(*r).is_some()), "{l:?}"),
+            2 | 3 | 5 => assert!(l.answer.is_some(), "{l:?}"),
+            _ => {}
+        }
+    }
+    let table = report::late_table(&t, &p, &[1]);
+    for l in &named {
+        assert!(table.contains(&format!("\n| {} | ", l.run)), "run {} isn't in\n{table}", l.run);
+    }
+    Ok(())
+}
+
 /// W28-AC45: P2, deciding through `kiln_ci::sched::demand` (W28-R48), wastes at most 5% of the
 /// runner time it uses on the recorded week, the median over seeds 1-8.
 #[test]
@@ -428,5 +477,88 @@ fn w28_ac45_p2_through_the_demand_table_wastes_at_most_5_percent() -> Result<(),
     shares.sort_by(f64::total_cmp);
     let median = shares.get(shares.len() / 2).copied().ok_or("no seeds")?;
     assert!(median <= 0.05, "P2 wastes {:.2}% of runner time (median over seeds 1-8)", median * 100.0);
+    Ok(())
+}
+
+/// A lane of `lane`'s kind with three jobs a run: `rust` (8 min), `ui` (25 min) and `ui-checks`
+/// after both, a push every `every` seconds until `until`, on `slots` runner slots.
+fn tail_lane(every: i64, until: i64, slots: u32) -> Trace {
+    let mut commits = Vec::new();
+    let mut runs = Vec::new();
+    for i in 0..(until / every) {
+        let at = i * every;
+        commits.push(Commit { keys: BTreeMap::from([("lane".to_owned(), format!("{i:04}"))]) });
+        let j = |key: &str, needs: &[&str], took: i64| Job {
+            key: key.into(),
+            labels: vec!["runner".into()],
+            needs: needs.iter().map(|x| (*x).to_owned()).collect(),
+            class: Some("lane".into()),
+            queued: Some(at),
+            started: Some(at),
+            finished: Some(at + took),
+            status: "succeeded".into(),
+            ..Job::default()
+        };
+        let jobs = vec![j("rust", &[], 480), j("ui", &[], 1500), j("ui-checks", &["rust", "ui"], 300)];
+        runs.push(Run { workflow: "lane".into(), event: "push".into(), branch: "main".into(), group: Some("lane".into()), cancel_in_progress: true, at, commit: usize::try_from(i).unwrap_or(0), status: "succeeded".into(), finished: Some(at + 1800), jobs });
+    }
+    Trace { end: until + 4 * 3600, measured: None, pools: vec![machine("runners", &["runner"], slots)], commits, runs }
+}
+
+/// W25 step 5's step 2, test (W28-AC51's synthetic lane): a push every 10 min for 3 hours, rust
+/// 8 min, ui-checks starting 25 min after its push. P3 keeps what a lane has under way, so every
+/// commit has a direct or covered verdict within 60 min, and ui-checks runs at least once an hour.
+#[test]
+fn w28_ac51_a_steady_lane_keeps_its_tail_jobs() {
+    let (every, until) = (600, 3 * 3600);
+    for slots in [3, 4, 8] {
+        let t = tail_lane(every, until, slots);
+        let out = replay(&t, &Policy::p3(), 1);
+        let v = verdicts(&t, &out);
+        for (r, x) in v.iter().enumerate() {
+            let at = t.runs.get(r).map_or(0, |run| run.at);
+            assert!(x.is_some_and(|x| x.at - at <= 3600 && matches!(x.kind, Kind::Direct | Kind::Covered)), "{slots} slots: run {r}, pushed at {at} s: {x:?}");
+        }
+        let mut starts: Vec<i64> = out.execs.iter().filter(|e| t.runs.get(e.run).and_then(|r| r.jobs.get(e.job)).is_some_and(|j| j.key == "ui-checks")).filter_map(|e| e.started).collect();
+        starts.sort_unstable();
+        for hour in 0..3 {
+            assert!(starts.iter().any(|s| (hour * 3600..(hour + 1) * 3600).contains(s)), "{slots} slots: no ui-checks in hour {hour}: {starts:?}");
+        }
+        // P2 withdraws a run's later jobs with each push: ui-checks runs once, for the last push,
+        // and every commit before it waits past the hour.
+        let out = replay(&t, &Policy::p2(), 1);
+        let v = verdicts(&t, &out);
+        let late = v.iter().enumerate().filter(|(r, x)| !x.is_some_and(|x| x.at - t.runs.get(*r).map_or(0, |run| run.at) <= 3600)).count();
+        let ui = out.execs.iter().filter(|e| e.started.is_some() && t.runs.get(e.run).and_then(|r| r.jobs.get(e.job)).is_some_and(|j| j.key == "ui-checks")).count();
+        assert_eq!((late, ui), (v.len() - 1, 1), "{slots} slots, P2");
+    }
+}
+
+
+/// The median of `xs` (the upper one of an even count's two, as the report's quantile is near).
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    xs.get(xs.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// W28-AC81 (W25 step 5's step 2): on the recorded week, with W28-R80's overflow at its default,
+/// P3 gives at least 95% of ci's commits a direct or covered verdict within 60 min and wastes at
+/// most 2.4 runner-h, the medians over seeds 1-8; release's, the image's and the bench's shares are
+/// no lower than P3's without it; and P4 with it meets W28-AC51's 95%.
+#[test]
+fn w28_ac81_the_week_with_overflow() -> Result<(), String> {
+    let t = week()?;
+    let per = |p: &Policy| -> Vec<Outcome> { SEEDS.iter().map(|s| replay(&t, p, *s)).collect() };
+    let (with, without, p4) = (per(&Policy::p3_overflow()), per(&Policy::p3()), per(&Policy::p4_overflow()));
+    let soon = |outs: &[Outcome], wf: &str| median(outs.iter().map(|o| report::workflow(&t, o, wf).soon).collect());
+    let wasted = median(with.iter().map(|o| report::row(&t, o).wasted_h).collect());
+    assert!(soon(&with, "ci") >= 0.95, "P3 + overflow: ci {:.3}", soon(&with, "ci"));
+    assert!(wasted <= 2.4, "P3 + overflow wastes {wasted:.2} runner-h");
+    for wf in ["release", "image", "bench"] {
+        assert!(soon(&with, wf) >= soon(&without, wf), "{wf}: {:.3} with the overflow, {:.3} without", soon(&with, wf), soon(&without, wf));
+    }
+    assert!(soon(&p4, "ci") >= 0.95, "P4 + overflow: ci {:.3}", soon(&p4, "ci"));
+    // Without it, P3 stays short: the week's late pods hold it (the README's account).
+    assert!(soon(&without, "ci") < 0.95);
     Ok(())
 }

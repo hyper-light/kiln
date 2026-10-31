@@ -620,11 +620,14 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.wait",
-            summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn. Messages other agents send you don't wait behind your turn while you wait: it returns early once one is in your queue, with them in `messages` (who sent each, `from` and `name`, and its `text`), taken out of your queue since they're delivered now (a program's waits in code mode don't hand them over unless they pass `hand_over: true`, and then must return them). You needn't wait: kiln tells you when each agent you started settles; wait when you can't go on without it.",
-            read_only: true,
+            summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn. Messages other agents send you don't wait behind your turn while you wait: it returns early once one is in your queue, with them in `messages` (who sent each, `from` and `name`, and its `text`), taken out of your queue since they're delivered now (a program's waits in code mode don't hand them over unless they pass `hand_over: true`, and then must return them). So a wait is a change, not a read: what it hands over leaves your queue. You needn't wait: kiln tells you when each agent you started settles; wait when you can't go on without it.",
+            // Not read-only: it takes delivery of the waiter's own messages, which then live only in
+            // its answer. A client may run a read-only tool beside others, again or ahead of time and
+            // drop the answer; this one's would be lost with it.
+            read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsWait>(),
-            route: |_| Ok((Method::GET, path(&["api", "harness", "agents", "wait"]))),
+            route: |_| Ok((Method::POST, path(&["api", "harness", "agents", "wait"]))),
             run: |cx, v| Box::pin(wait_for(cx, v)),
         },
         Op {
@@ -932,6 +935,15 @@ mod tests {
         }
         let sends = list_ops().into_iter().find(|o| o.name == "agents.send").map(|o| o.input.schema()).unwrap_or_default();
         assert_eq!(sends.pointer("/properties/mode/enum"), Some(&json!(["queue", "steer", "now"])), "a message is all an agent sends another");
+    }
+
+    /// A wait takes delivery of the waiter's own messages: a change, so no client takes it for a
+    /// read it may repeat or drop. Reading a result marks only what the caller saw: a read.
+    #[test]
+    fn a_wait_is_a_change_and_a_result_a_read() {
+        let op = |name: &str| list_ops().into_iter().find(|o| o.name == name);
+        assert!(op("agents.wait").is_some_and(|o| !o.read_only && !o.destructive && (o.route)(&json!({})).is_ok_and(|(m, _)| m == Method::POST)));
+        assert!(op("agents.result").is_some_and(|o| o.read_only && (o.route)(&json!({"agent": "a"})).is_ok_and(|(m, _)| m == Method::GET)));
     }
 
     #[test]

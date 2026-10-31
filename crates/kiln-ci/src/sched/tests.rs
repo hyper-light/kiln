@@ -543,13 +543,46 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
-    // With no other runner, it waits for one, and says so.
+    // With no other runner that could take it, it's asked again in a while, on the same attempt,
+    // and says so (W05-R16).
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
     s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
-    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
-    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true, asked: false }));
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "not at once: {c:?}");
+    let again = 1 + super::state::REFUSED_AGAIN_MS;
+    assert!(c.contains(&Command::Timer { at: again }), "{c:?}");
+    assert_eq!(s.reason("x"), Some(&WaitReason::Retry { at: again }));
+    let c = s.handle(Input::Tick, again);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "x" && runner == "a")), "{c:?}");
+}
+
+/// W05-R16, found by W28 step 3's replay: the only runner that could take a leg refused it (an
+/// assignment that couldn't reach it, away for a moment, comes back refused too). It's offered to
+/// that runner again in a while, as v1 offers a declined job again, as often as it refuses,
+/// instead of waiting for a runner that never comes: production's adacachy is the only runner
+/// with `local`, which image.yaml, release.yaml's builds and ci.yaml's release-binary ask for.
+#[test]
+fn w05_r16_the_only_runner_that_refused_a_leg_is_asked_again() {
+    let mut s = Scheduler::new(Config::default());
+    let mut local = linux("adacachy", 2);
+    local.view.labels = vec!["baremetal".into(), "local".into()];
+    s.handle(Input::RunnerUp(Box::new(local)), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("other", 2))), 0);
+    let image = LegIn { route: LegRoute { labels: vec!["baremetal".into(), "local".into()], ..LegRoute::default() }, ..leg("image", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(image)), 0);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "image" && runner == "adacachy")), "{c:?}");
+    let mut t = 0;
+    for _ in 0..2 {
+        t += 1;
+        let c = s.handle(Input::Rejected { leg: "image".into() }, t);
+        assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "image")), "not to the runner without `local`: {c:?}");
+        let again = t + super::state::REFUSED_AGAIN_MS;
+        assert_eq!(s.reason("image"), Some(&WaitReason::Retry { at: again }));
+        let c = s.handle(Input::Tick, again);
+        assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "image" && runner == "adacachy")), "{c:?}");
+        t = again;
+    }
 }
 
 /// W05-R16: the default retry after `runner-lost` goes to another runner when one could take it,
@@ -2068,4 +2101,174 @@ fn a_hold_ends_with_its_runner_or_its_leg() {
     // big is cancelled: nothing is held.
     s.handle(Input::LegCancelled { leg: "big".into(), reason: "the run was cancelled".into() }, 64_000);
     assert!(s.held("b").is_none());
+}
+
+// ------------------------------------------------------------------ overflow (W28-R80)
+
+/// A `k8s` pool whose legs may go, `after` their pods are late, to Linux runners with cargo.
+fn overflow_pool(after: &str) -> Result<super::pools::Pool, String> {
+    let overflow = super::pools::OverflowSpec { hosts: "os == linux && tools has cargo".into(), after: Some(after.into()) };
+    PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], max: Some(4), idle_timeout: Some("1m".into()), overflow: Some(overflow), ..PoolSpec::default() }.pool()
+}
+
+/// A Linux runner, bare metal, with cargo or without.
+fn metal(name: &str, slots: u32, cargo: bool) -> RunnerIn {
+    let mut r = linux(name, slots);
+    r.view.labels = vec!["baremetal".into()];
+    if cargo {
+        r.view.facts.tools.insert("cargo".into(), "1.99.1".into());
+    }
+    r
+}
+
+/// A leg of the pool with a pod of its own (a kiln-dialect job that sets `toolchain:` and
+/// `resources:`, W02-R06), asking 2 CPUs.
+fn rust_leg(id: &str) -> LegIn {
+    LegIn { own_executor: true, request: Resources { cpu: 2.0, ..Resources::default() }, ..pod_leg(id) }
+}
+
+/// W28-R80: a leg whose pod hasn't started `after` it was queued goes to a runner of the
+/// overflow's `hosts` that has room, on the host, asking what it asks of a runner; its pod, still
+/// starting, stops; it says why, and its routing shows the overflow's checks. A runner without
+/// what `hosts` asks never takes it.
+#[test]
+fn w28_r80_a_late_pod_overflows_to_a_runner_that_can_take_it() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![overflow_pool("5m")?], ..Config::default() });
+    sim.executor_start_ms = 20 * MIN;
+    sim.runner(0, metal("bare", 4, false));
+    sim.runner(0, metal("forge", 4, true));
+    sim.leg(1, rust_leg("rust"), 10 * MIN);
+    sim.run(5 * MIN);
+    assert!(sim.assigned.is_empty(), "it waits for its pod until `after`: {:?}", sim.assigned);
+    sim.run(5 * MIN + 2);
+    let a = sim.assigned.iter().find(|a| a.leg == "rust").ok_or("not placed")?;
+    assert_eq!((a.runner.as_str(), a.at), ("forge", 5 * MIN + 1), "on the runner with cargo, `after` it was queued");
+    assert_eq!(sim.executors_stopped.len(), 1, "the pod started for it stops: {:?}", sim.executors_stopped);
+    let (_, leg, why) = sim.overflows.first().ok_or("no overflow said")?;
+    assert_eq!(leg, "rust");
+    assert!(why.contains("pool pods") && why.contains("5 min") && why.contains("os == linux && tools has cargo"), "{why}");
+    let o = sim.sched.overflowed("rust").ok_or("no overflow kept")?;
+    assert_eq!((o.pool.as_str(), o.waited_s, o.at), ("pods", 300, 5 * MIN + 1));
+    // Its routing: the overflow's checks, runner by runner.
+    let ex = sim.sched.explain("rust");
+    let of = |name: &str| ex.iter().find(|e| e.name == name).map(|e| e.eligible);
+    assert_eq!((of("forge"), of("bare")), (Some(true), Some(false)), "{ex:?}");
+    assert!(ex.iter().any(|e| e.name == "bare" && e.checks.iter().any(|c| !c.pass && c.requirement.contains("tools has cargo"))), "{ex:?}");
+    sim.run(16 * MIN);
+    assert_eq!(sim.settled.iter().map(|(_, l, o)| (l.as_str(), o.clone())).collect::<Vec<_>>(), [("rust", Outcome::Success)]);
+    // The pod that came up late, unknown now, is told to go and takes nothing.
+    sim.run(30 * MIN);
+    assert_eq!(sim.assigned.len(), 1, "{:?}", sim.assigned);
+    Ok(())
+}
+
+/// W28-R80: a pod that starts within `after` runs its leg, and nothing overflows; nor does a
+/// pool without `overflow`, however late its pods.
+#[test]
+fn w28_r80_pods_on_time_and_pools_without_overflow_keep_their_legs() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![overflow_pool("5m")?], ..Config::default() });
+    sim.executor_start_ms = 2 * MIN;
+    sim.runner(0, metal("forge", 4, true));
+    sim.leg(1, rust_leg("rust"), MIN);
+    sim.run(10 * MIN);
+    let on: Vec<&str> = sim.assigned.iter().map(|a| a.runner.as_str()).collect();
+    assert!(on.len() == 1 && on.iter().all(|r| r.starts_with("pod-")), "in its pod: {on:?}");
+    assert!(sim.overflows.is_empty() && sim.sched.overflowed("rust").is_none(), "{:?}", sim.overflows);
+
+    let plain = PoolSpec { overflow: None, name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], max: Some(4), ..PoolSpec::default() }.pool()?;
+    let mut sim = Sim::new(Config { pools: vec![plain], ..Config::default() });
+    sim.executor_start_ms = 30 * MIN;
+    sim.runner(0, metal("forge", 4, true));
+    sim.leg(1, rust_leg("rust"), MIN);
+    sim.run(29 * MIN);
+    assert!(sim.assigned.is_empty() && sim.overflows.is_empty(), "{:?}", sim.assigned);
+    sim.run(40 * MIN);
+    assert!(sim.assigned.iter().all(|a| a.runner.starts_with("pod-")) && sim.assigned.len() == 1, "{:?}", sim.assigned);
+    Ok(())
+}
+
+/// W28-R80: past `after` with no overflow runner free, the leg keeps waiting for its pod and looks
+/// again every 30 s: it goes once one frees, or runs in its pod if that comes first.
+#[test]
+fn w28_r80_no_room_keeps_it_waiting_for_its_pod() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![overflow_pool("5m")?], ..Config::default() });
+    sim.executor_start_ms = 20 * MIN;
+    sim.runner(0, metal("forge", 1, true));
+    let mut busy = leg("busy", "acme/x", 50);
+    busy.route.labels = vec!["baremetal".into()];
+    sim.leg(0, busy, 7 * MIN);
+    sim.leg(1, rust_leg("rust"), MIN);
+    sim.run(7 * MIN - 1);
+    assert!(sim.assigned.iter().all(|a| a.leg != "rust") && sim.overflows.is_empty(), "no room before 7 min: {:?}", sim.assigned);
+    assert!(sim.executors_stopped.is_empty(), "its pod still starts: {:?}", sim.executors_stopped);
+    sim.run(8 * MIN);
+    let a = sim.assigned.iter().find(|a| a.leg == "rust").ok_or("not placed")?;
+    assert_eq!(a.runner, "forge");
+    assert!((7 * MIN..=7 * MIN + 30_001).contains(&a.at), "within 30 s of forge freeing: {} ms", a.at);
+
+    // Its pod first: it runs there.
+    let mut sim = Sim::new(Config { pools: vec![overflow_pool("5m")?], ..Config::default() });
+    sim.executor_start_ms = 6 * MIN;
+    sim.runner(0, metal("forge", 1, true));
+    let mut busy = leg("busy", "acme/x", 50);
+    busy.route.labels = vec!["baremetal".into()];
+    sim.leg(0, busy, 30 * MIN);
+    sim.leg(1, rust_leg("rust"), MIN);
+    sim.run(10 * MIN);
+    let a = sim.assigned.iter().find(|a| a.leg == "rust").ok_or("not placed")?;
+    assert!(a.runner.starts_with("pod-") && sim.overflows.is_empty(), "{a:?} {:?}", sim.overflows);
+    Ok(())
+}
+
+/// W28-R80: a leg overflows only where its own requirements hold too (`requires`, here an
+/// architecture no overflow runner has), and an untrusted leg only when `host` is among its
+/// executors (W18-R07): otherwise it waits for its pod.
+#[test]
+fn w28_r80_never_to_a_runner_lacking_its_requirements() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![overflow_pool("1m")?], ..Config::default() });
+    sim.executor_start_ms = 20 * MIN;
+    sim.runner(0, metal("forge", 4, true));
+    let mut arm = rust_leg("arm");
+    arm.route.requires = vec!["arch == aarch64".into()];
+    sim.leg(1, arm, MIN);
+    let mut untrusted = rust_leg("fork");
+    untrusted.route.untrusted = Some(super::routing::Untrusted { executors: vec!["k8s".into()], rootful_docker: false });
+    sim.leg(1, untrusted, MIN);
+    sim.run(19 * MIN);
+    assert!(sim.assigned.is_empty() && sim.overflows.is_empty(), "{:?} {:?}", sim.assigned, sim.overflows);
+    // With host among its executors, the untrusted one may go.
+    let mut sim = Sim::new(Config { pools: vec![overflow_pool("1m")?], ..Config::default() });
+    sim.executor_start_ms = 20 * MIN;
+    sim.runner(0, metal("forge", 4, true));
+    let mut untrusted = rust_leg("fork");
+    untrusted.route.untrusted = Some(super::routing::Untrusted { executors: vec!["k8s".into(), "host".into()], rootful_docker: false });
+    sim.leg(1, untrusted, MIN);
+    sim.run(2 * MIN);
+    assert_eq!(sim.assigned.iter().map(|a| a.runner.as_str()).collect::<Vec<_>>(), ["forge"]);
+    Ok(())
+}
+
+/// W28-R80: `overflow` is a `k8s` pool's, names its runners, and `after` is a duration (2 min
+/// when left out).
+#[test]
+fn w28_r80_the_overflow_as_configured() -> Result<(), String> {
+    let spec = |executor: &str, hosts: &str, after: Option<&str>| PoolSpec {
+        name: "p".into(),
+        executor: executor.into(),
+        image: Some("img".into()),
+        labels: vec!["p".into()],
+        overflow: Some(super::pools::OverflowSpec { hosts: hosts.into(), after: after.map(str::to_owned) }),
+        ..PoolSpec::default()
+    };
+    let o = spec("k8s", "os == linux", None).pool()?.overflow.ok_or("none")?;
+    assert_eq!((o.after_ms, o.hosts.first().map(|(s, _)| s.as_str())), (120_000, Some("os == linux")));
+    assert_eq!(spec("k8s", "os == linux", Some("90s")).pool()?.overflow.map(|o| o.after_ms), Some(90_000));
+    let err = |s: PoolSpec| s.pool().err().unwrap_or_default();
+    assert!(err(spec("docker", "os == linux", None)).contains("`overflow` sends a `k8s` pool's legs"), "{}", err(spec("docker", "os == linux", None)));
+    assert!(err(spec("k8s", " ", None)).contains("`overflow.hosts`"));
+    assert!(err(spec("k8s", "os ==", None)).contains("`overflow.hosts`"));
+    assert!(err(spec("k8s", "os == linux", Some("soon"))).contains("`overflow.after` is a duration"));
+    let toml_err = toml::from_str::<PoolSpec>("name = \"p\"\nexecutor = \"k8s\"\nlabels = [\"p\"]\noverflow = { hosts = \"os == linux\", later = \"5m\" }\n").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(toml_err.contains("later"), "unknown keys are refused: {toml_err}");
+    Ok(())
 }
