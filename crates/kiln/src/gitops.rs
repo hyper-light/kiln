@@ -766,7 +766,7 @@ mod tests {
             );
             std::fs::write(&held, script)?;
             std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755))?;
-            git_at(&hub, &mirror, &["config", "remote.origin.uploadpack", &held.to_string_lossy()]).await?;
+            git_at(&hub, &mirror, &["config", &format!("remote.{}.uploadpack", repo.clone_url), &held.to_string_lossy()]).await?;
             // As git writes a small fetch by default, whatever this machine's git says.
             for (k, v) in [("fetch.unpackLimit", "100000"), ("fetch.fsckObjects", "false"), ("core.fsyncMethod", "fsync")] {
                 git_at(&hub, &mirror, &["config", k, v]).await?;

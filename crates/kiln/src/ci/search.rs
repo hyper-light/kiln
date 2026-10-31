@@ -506,6 +506,7 @@ mod tests {
                 std::fs::create_dir_all(parent)?;
             }
             run_git(w, &["clone", "-q", "--bare", ".", &mirror.to_string_lossy()])?;
+            run_git(&mirror, &["remote", "set-url", "origin", &repo.clone_url])?;
             run_git(&mirror, &["update-ref", "refs/heads/main", "HEAD~1"])?;
             let (id, h) = (repo.id.clone(), head.clone());
             hub.store

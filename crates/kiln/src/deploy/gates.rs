@@ -616,7 +616,7 @@ mod tests {
             d.hub.store.call(|c|{
                 c.execute("INSERT INTO repos(id,name,clone_url,created_at) VALUES('flow-repo','acme/flow','local',0)",[])?;
                 c.execute("INSERT INTO runs(id,repo_id,number,pipeline,event,branch,sha,status,created_at,actor) VALUES('flow-run','flow-repo',1,'ship','push','main','sha','queued',0,'builder')",[])?;
-                c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('flow-job','flow-run','ship','ship','queued','[]','[]',?1)",crate::sql::params![r#"{"environment":{"name":"prod"}}"#])?;
+                c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,leg) VALUES('flow-job','flow-run','ship','ship','queued','[]','[]',?1,?1)",crate::sql::params![r#"{"environment":{"name":"prod"}}"#])?;
                 c.execute("INSERT INTO ci_environments(repo_id,name,protection,source,created_at,created_by) VALUES('flow-repo','prod',?1,'kiln',0,'admin')",crate::sql::params![r#"{"policy":{"scope":{"kind":"server"},"name":"release-prod"}}"#])?;
                 Ok(())
             }).await?;

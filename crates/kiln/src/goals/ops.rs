@@ -795,6 +795,17 @@ mod tests {
         })
     }
 
+    /// Wait for this missing-program fixture to stand stopped before its first goal is sent.
+    async fn fixture_exited(hub: &Arc<crate::hub::Hub>, id: &str) -> anyhow::Result<()> {
+        for _ in 0..200 {
+            if hub.harness.info(id).is_some_and(|i| i.status == crate::harness::model::Status::Exited) {
+                return Ok(());
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::bail!("fixture agent never reached Exited")
+    }
+
     /// A hub whose agent's harness is a program that isn't there (it stands stopped, and a message
     /// waits in its queue), as the tests above have it.
     async fn stopped_agent() -> anyhow::Result<(Arc<crate::hub::Hub>, String, tempfile::TempDir)> {
@@ -815,6 +826,7 @@ mod tests {
         let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
         let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
         let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
+        fixture_exited(&hub, &a.id).await?;
         Ok((hub, a.id, folder))
     }
 
@@ -964,6 +976,7 @@ mod tests {
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
             let id = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
+            fixture_exited(&hub, &id).await?;
             let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let agent = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)? };
             call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three", "four"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
@@ -1093,6 +1106,7 @@ mod tests {
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
             let id = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
+            fixture_exited(&hub, &id).await?;
             let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let agent = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)? };
             call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three", "four"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;

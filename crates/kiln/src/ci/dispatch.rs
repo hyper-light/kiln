@@ -4283,8 +4283,58 @@ mod tests {
                 held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(),
                 in_commands: false, pods: HashSet::new(), absent_after: None, decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(),
             };
+            // U01: fresh unbound native rows must still refuse before any legacy
+            // import. Full restore imports first, so exercise its retained guard directly.
+            let held_rows = || {
+                let hub = Arc::clone(&hub);
+                async move {
+                    hub.store.call(|c| {
+                        let mut q = c.prepare("SELECT j.run_id, h.job, h.attempt, h.agent, h.execution, h.until_at, h.allocation, h.transferred, h.released FROM ci_retained_ownership h JOIN jobs j ON j.id = h.job WHERE j.run_id IN ('damaged','recoverable') ORDER BY j.run_id, j.key")?;
+                        Ok(q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, i64>(5)?, r.get::<_, String>(6)?, r.get::<_, bool>(7)?, r.get::<_, bool>(8)?)))?.collect::<Result<Vec<_>, _>>()?)
+                    }).await
+                }
+            };
+            assert!(held_rows().await?.is_empty(), "unbound refusal starts without durable ownership");
+            let mut unbound = dispatcher();
+            unbound.restore_admission().await?;
+            let refused = unbound.restore_retained().await.err().ok_or_else(|| anyhow::anyhow!("unbound legacy native restore did not require drain"))?;
+            // The concrete error type is private to retained.rs; its exact public
+            // display identifies that production refusal without changing visibility.
+            assert_eq!(refused.to_string(), "LegacyNativeAssignmentsRequireDrain: restored native Running work lacks original physical ownership; drain every pre-feature assignment and old writer before activation");
+            assert!(held_rows().await?.is_empty() && unbound.admission.retained.is_empty(), "refusal cannot invent retained or ordinary ownership");
+            drop(unbound);
+            // Model uncertainty that already predates logical import, using the real
+            // conservative writer. Neither quarantine claims an execution or stop proof.
+            quarantine_run(&hub, "damaged").await?;
+            quarantine_run(&hub, "recoverable").await?;
+            let quarantine_rows = held_rows().await?;
+            assert_eq!(quarantine_rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["damaged", "recoverable"]);
+            let damaged_job = hub.store.jobs("damaged".into(), false).await?.into_iter().find(|j| j.key == "z").map(|j| j.id).ok_or_else(|| anyhow::anyhow!("missing damaged fixture job"))?;
+            let mut quarantines = Vec::new();
+            for (run, job, attempt, agent, execution, until, json, transferred, released) in &quarantine_rows {
+                let (expected_job, expected_host) = if run == "damaged" { (damaged_job.as_str(), "quarantined-runner") } else { (running.as_str(), "old-runner") };
+                assert_eq!((job.as_str(), agent.as_str(), *attempt, *until), (expected_job, expected_host, 1, 0));
+                assert!(execution.is_none() && *transferred && !*released, "legacy uncertainty is held, never authenticated stopped proof");
+                assert!(ordinary::journal_json(json)?.is_none(), "quarantine cannot fabricate an ordinary owner");
+                let allocation: kiln_ci::sched::state::Allocation = serde_json::from_str(json)?;
+                assert_eq!(allocation.mode, kiln_ci::sched::state::ReservationMode::Whole);
+                assert_eq!(allocation.runner, *agent);
+                assert_eq!(allocation.request, Default::default());
+                assert_eq!(allocation.repo, "quarantine");
+                assert!(allocation.parent_binding.is_none() && allocation.id.starts_with("retained-"));
+                quarantines.push(allocation);
+            }
+            let assert_quarantines = |d: &Dispatch| {
+                assert_eq!(d.admission.retained.len(), 2, "exactly the two pre-existing uncertainty allocations are adopted");
+                for allocation in &quarantines {
+                    assert!(d.admission.retained.contains(&allocation.id), "logical completion cannot free either uncertain host");
+                    assert_eq!(d.sched.allocation(&allocation.id, 1, allocation.id.clone()), Some(allocation.clone()), "the same Scheduler retains the exact original whole-host quarantine");
+                }
+            };
             let mut d = dispatcher();
             d.restore().await?;
+            assert_eq!(held_rows().await?, quarantine_rows, "logical import preserves both original uncertainty rows");
+            assert_quarantines(&d);
             let damaged = hub.store.run("damaged".into()).await?.ok_or_else(|| anyhow::anyhow!("missing damaged run"))?;
             assert_eq!(damaged.status, Status::Failed);
             assert!(damaged.error.as_deref().is_some_and(|e| e.contains("stored specification")), "{damaged:?}");
@@ -4302,6 +4352,8 @@ mod tests {
             let mut d = dispatcher();
             d.restore().await?;
             d.drain_completions().await;
+            assert_eq!(held_rows().await?, quarantine_rows, "durable logical success is not physical stop proof");
+            assert_quarantines(&d);
             let after = hub.store.jobs("recoverable".into(), false).await?;
             assert_eq!(after.len(), before.len(), "replay never duplicates historical jobs");
             assert_eq!(after.iter().find(|j| j.id == dependent).map(|j| j.status), Some(Status::Queued));
@@ -4314,6 +4366,8 @@ mod tests {
             d.completion("old-runner", &running, receipt.1).await?;
             assert_eq!(hub.store.jobs("recoverable".into(), false).await?.len(), before.len(), "receipt replay is idempotent");
             assert!(!super::super::legacy::import_run(&hub, "recoverable").await?, "migration is idempotent");
+            assert_eq!(held_rows().await?, quarantine_rows, "receipt replay cannot release the quarantine rows");
+            assert_quarantines(&d);
             // A canonical run can crash after saving the prerequisite's plan report and before
             // inserting its next leg. Replay must execute that missing durable action as well.
             let absent = dependent.clone();
@@ -4329,6 +4383,8 @@ mod tests {
             drop(d);
             let mut d = dispatcher();
             d.restore().await?;
+            assert_eq!(held_rows().await?, quarantine_rows, "a further restart keeps both uncertainty allocations held");
+            assert_quarantines(&d);
             let resumed = hub.store.jobs("recoverable".into(), false).await?;
             assert_eq!(resumed.len(), before.len());
             assert_eq!(resumed.iter().find(|j| j.key == "a").map(|j| j.status), Some(Status::Queued));
