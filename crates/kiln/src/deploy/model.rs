@@ -60,6 +60,10 @@ pub struct Environment {
     /// How kiln drives Argo CD here (§8.3), when it's the provider.
     #[serde(default)]
     pub argocd: ArgoSettings,
+    /// Made as production (docs/ci.md W27-R11): new, it requires a verified chain to deploy
+    /// (`gates.require_chain`) unless its gates say otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub production: bool,
 }
 
 /// How kiln drives an Argo CD environment's Applications (docs/deploy-api.md §8.3).
@@ -135,6 +139,11 @@ pub struct Gates {
     /// W18-R04).
     #[serde(default, alias = "require-provenance", skip_serializing_if = "Option::is_none")]
     pub require_provenance: Option<Provenance>,
+    /// What a new version deploys, or a rollback puts back, verifies by kiln verify back to whoever
+    /// made it (docs/ci.md W27-R11): a release whose chain breaks is refused, naming the link.
+    /// Without it each release still says whether its chain verifies.
+    #[serde(default, alias = "require-chain", skip_serializing_if = "Option::is_none")]
+    pub require_chain: Option<bool>,
     /// Held, and why (an incident, a holiday): no release goes until it's lifted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freeze: Option<String>,

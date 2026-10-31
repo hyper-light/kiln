@@ -107,21 +107,47 @@ impl Target {
 /// Walks the chain back from `target` (docs/ci.md W27-R10): each link with whether it holds or why
 /// not, the first that doesn't named, and how long the walk took.
 pub async fn verify(hub: &Hub, target: &Target) -> Result<Value, Fail> {
+    match target {
+        Target::Deploy(id) => {
+            let r = release_of(hub, id).await?;
+            walk(hub, target.words(), Start::Release(&r)).await
+        }
+        Target::Artifact(digest) => walk(hub, target.words(), Start::Artifact(digest)).await,
+        Target::Commit { repo, sha } => walk(hub, target.words(), Start::Commit { repo, sha }).await,
+        Target::Change(key) => walk(hub, target.words(), Start::Change(key)).await,
+    }
+}
+
+/// [`verify`] of release `r` as it's asked for, before kiln records it: what an environment's gates
+/// walk (docs/ci.md W27-R11).
+pub async fn release(hub: &Hub, r: &Release) -> Result<Value, Fail> {
+    walk(hub, format!("deploy {}/{}@{}", r.environment, r.app, r.version.as_deref().unwrap_or("?")), Start::Release(r)).await
+}
+
+/// Where a walk starts.
+enum Start<'a> {
+    Release(&'a Release),
+    Artifact(&'a str),
+    Commit { repo: &'a str, sha: &'a str },
+    Change(&'a str),
+}
+
+async fn walk(hub: &Hub, words: String, start: Start<'_>) -> Result<Value, Fail> {
     let started = Instant::now();
     // Every statement under a checkpoint: one signed now when any entry came after the last.
     let refused = crate::trail::checkpoint(hub, true).await.err().map(|e| format!("{e:#}"));
     let under = crate::trail::checkpoints(&hub.store, 1).await.map_err(internal)?.into_iter().next();
     let revocations = crate::identities::revocations(&hub.store).await.map_err(internal)?;
     let mut w = Walk { hub, org: hub.pki.organization(), revocations, under, refused, links: Vec::new(), lands: HashMap::new(), held_lands: HashMap::new(), policies: HashMap::new(), walked: BTreeSet::new() };
-    match target {
-        Target::Deploy(id) => Box::pin(w.deploy(id)).await?,
-        Target::Artifact(digest) => {
+    match start {
+        Start::Release(r) => Box::pin(w.deploy(r)).await.map_err(internal)?,
+        Start::Artifact(digest) => {
             if let Some(built) = w.artifact(digest, digest).await.map_err(internal)? {
                 Box::pin(w.commit(&built.repo, &built.path, &built.trunk, &built.commit)).await.map_err(internal)?;
             }
         }
-        Target::Commit { repo, sha } => Box::pin(w.commit_of(repo, sha)).await?,
-        Target::Change(key) => Box::pin(w.change(key)).await?,
+        Start::Commit { repo, sha } => Box::pin(w.commit_of(repo, sha)).await?,
+        Start::Change(key) => Box::pin(w.change(key)).await?,
     }
     let root = crate::util::sha256_hex(&hub.pki.ca_der);
     w.links.push(Link::holds(format!("kiln's root, {} (sha256 {}…): every signature above verifies to it", w.org, root.get(..16).unwrap_or(&root))));
@@ -132,7 +158,7 @@ pub async fn verify(hub: &Hub, target: &Target) -> Result<Value, Fail> {
         (k, why) => json!({ "size": k.as_ref().map(|k| k.size), "refused": why }),
     };
     Ok(json!({
-        "target": target.words(),
+        "target": words,
         "verified": broken.is_none(),
         "broken": broken,
         "links": links,
@@ -517,30 +543,30 @@ impl Walk<'_> {
         Ok(list)
     }
 
-    /// Release `id`: the release, as kiln's deploy records have it; each artifact it runs; and the
-    /// commits each brings since the release before it.
-    async fn deploy(&mut self, id: &str) -> Result<(), Fail> {
-        let r = release_of(self.hub, id).await?;
+    /// Release `r`: the release, as kiln's deploy records have it (or as it's asked for, before
+    /// they do); each artifact it runs; and the commits each brings since the release before it.
+    async fn deploy(&mut self, r: &Release) -> anyhow::Result<()> {
         let words = format!("deploy {}/{}@{}", r.environment, r.app, r.version.clone().unwrap_or_else(|| r.id.to_string()));
         if r.artifacts.is_empty() {
             self.links.push(Link::broken(words, "it names no artifact: kiln has nothing it runs to walk back from"));
             return Ok(());
         }
         // Deploys sign with Ship's plan (W27-R07): until then, the release is kiln's record of it.
-        self.links.push(Link::holds(format!("{words} (release {}), as kiln's deploy records have it", r.id)));
-        let before = previous(self.hub, &r).await.map_err(internal)?;
+        let kept = if r.id == 0 { "as it's asked for".to_owned() } else { format!("(release {}), as kiln's deploy records have it", r.id) };
+        self.links.push(Link::holds(format!("{words} {kept}")));
+        let before = previous(self.hub, r).await?;
         for (name, a) in &r.artifacts {
             if a.digest.is_empty() {
                 self.links.push(Link::broken(format!("artifact {name}"), format!("it's deployed by its tag ({}:{}), not its digest", a.repository, a.tag)));
                 continue;
             }
-            let Some(built) = self.artifact(&a.digest, &format!("{name} {}", short_digest(&a.digest))).await.map_err(internal)? else { continue };
+            let Some(built) = self.artifact(&a.digest, &format!("{name} {}", short_digest(&a.digest))).await? else { continue };
             let since = match before.as_ref().and_then(|b| b.artifacts.get(name)).filter(|p| !p.digest.is_empty()) {
                 Some(p) => self.built_from(&p.digest).await,
                 None => None,
             };
-            for c in self.brought(&built.repo, &built.path, &built.trunk, &built.commit, since).await.map_err(internal)? {
-                Box::pin(self.commit(&built.repo, &built.path, &built.trunk, &c)).await.map_err(internal)?;
+            for c in self.brought(&built.repo, &built.path, &built.trunk, &built.commit, since).await? {
+                Box::pin(self.commit(&built.repo, &built.path, &built.trunk, &c)).await?;
             }
         }
         Ok(())
@@ -637,10 +663,11 @@ async fn release_of(hub: &Hub, id: &str) -> Result<Release, Fail> {
 }
 
 /// The release of `r`'s app in its environment that ran before it: the newest earlier one that
-/// went out.
+/// went out (any recorded, for `r` asked for and not recorded yet: its id 0).
 async fn previous(hub: &Hub, r: &Release) -> anyhow::Result<Option<Release>> {
     let q = ReleaseQuery { app: Some(r.app.clone()), environment: Some(r.environment.clone()), limit: 1000, ..ReleaseQuery::default() };
-    Ok(crate::deploy::store::releases(&*hub.records, q).await?.into_iter().find(|p| p.id < r.id && matches!(p.state, State::Succeeded | State::Superseded | State::RolledBack)))
+    let earlier = |p: &Release| p.id != r.id && (r.id == 0 || p.id < r.id);
+    Ok(crate::deploy::store::releases(&*hub.records, q).await?.into_iter().find(|p| earlier(p) && matches!(p.state, State::Succeeded | State::Superseded | State::RolledBack)))
 }
 
 /// The trunk's review policy as it stood at `base`, where a land began: its `.kiln/review.yaml`

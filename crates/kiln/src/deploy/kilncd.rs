@@ -298,6 +298,7 @@ mod tests {
             agents: Default::default(),
             argocd: Default::default(),
             owners: Default::default(),
+            production: false,
         }
     }
 

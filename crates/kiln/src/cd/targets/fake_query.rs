@@ -839,6 +839,7 @@ pub fn released_to(provider: &str, place: &Value, spec: Value, version: &str, fi
         agents: Default::default(),
         argocd: Default::default(),
         owners: Default::default(),
+        production: false,
     };
     let reg = Registration { app: "shop".into(), environment: "staging".into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None };
     let file = ReleaseFile {

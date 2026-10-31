@@ -274,9 +274,14 @@ fn note(view: &mut Value, key: &str, v: Value) {
     }
 }
 
-pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<Environment, Fail> {
+pub async fn put_environment(d: &Deploy, who: &Who, mut e: Environment) -> Result<Environment, Fail> {
     let actor = who.name.as_str();
     dns_label("environment", &e.name)?;
+    // Made as production, a new environment requires a verified chain to deploy unless its gates
+    // say otherwise (docs/ci.md W27-R11); one from before keeps what it has.
+    if e.production && e.gates.require_chain.is_none() && store::environment(&*d.records, &e.name).await.map_err(internal)?.is_none() {
+        e.gates.require_chain = Some(true);
+    }
     // What agents may do is a person's to say.
     if who.agent {
         let before = store::environment(&*d.records, &e.name).await.map_err(internal)?.map(|b| b.agents).unwrap_or_default();
@@ -2884,6 +2889,7 @@ mod tests {
             agents: super::super::model::AgentPolicy { deploy: agents_deploy, approve: false },
             argocd: Default::default(),
             owners: Default::default(),
+            production: false,
         }
     }
 

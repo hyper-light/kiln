@@ -1,9 +1,10 @@
-//! kiln verify (docs/ci.md W27-R10, AC07), end to end. Sam's signed commits, each a diff kim
-//! accepts on her laptop and the gate passes, land through main's queue (its commits kiln's own,
-//! signed as kiln); main is built by a leg that signs, attesting what it built; and that's released
-//! to prod. kiln verify walks the release back to sam, link by link, within 2 s for 10 commits, and
-//! names the link each tamper breaks: an artifact rebuilt, a forged review, a trail entry edited, a
-//! commit pushed to main without the queue.
+//! kiln verify (docs/ci.md W27-R10, R11; AC07, AC08), end to end. Sam's signed commits, each a diff
+//! kim accepts on her laptop and the gate passes, land through main's queue (its commits kiln's
+//! own, signed as kiln); main is built by a leg that signs, attesting what it built; and that's
+//! released to prod. kiln verify walks the release back to sam, link by link, within 2 s for 10
+//! commits, and names the link each tamper breaks: an artifact rebuilt, a forged review, a trail
+//! entry edited, a commit pushed to main without the queue. A production environment refuses a
+//! release whose chain doesn't verify.
 
 mod common;
 
@@ -320,5 +321,43 @@ fn w27_ac07_kiln_verify_names_each_broken_link() -> anyhow::Result<()> {
     assert!(links(&first).first().is_some_and(|x| x.ends_with(" on main, signed by sam")), "on main and sam's: {first:#}");
     let (ok, said) = cli(s, "commit", &format!("acme/app@{hot}"))?;
     assert!(!ok && said.contains("the chain breaks at") && said.contains("wasn't tested"), "kiln verify commit: {said}");
+    Ok(())
+}
+
+/// The chain gate's result on release `r` (as the deploy API answers it).
+fn chain_gate(r: &Value) -> Value {
+    r.get("gates").and_then(Value::as_array).into_iter().flatten().find(|g| g.get("gate") == Some(&json!("chain"))).cloned().unwrap_or_default()
+}
+
+/// W27-AC08: a production environment refuses a deploy whose chain doesn't verify, naming the
+/// link, and takes one whose chain does; an environment from before keeps what it has. `live`,
+/// made as production, requires the chain from the start: the rebuilt image is refused at its
+/// artifact, main's build taken with its chain verified. `staging`, made before, takes the rebuilt
+/// one, saying its chain doesn't verify; made production since, it still doesn't require it.
+#[test]
+fn w27_ac08_production_refuses_an_unverified_chain() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let shop = shop(dir.path(), 1)?;
+    let s = &shop.s;
+    let require_chain = |env: &str| -> anyhow::Result<Option<Value>> { Ok(get(s, &format!("/api/deploy/environments/{env}"))?.pointer("/gates/require_chain").cloned()) };
+    let ask = |env: &str, version: &str, digest: &str| json!({ "app": "app", "environment": env, "version": version, "artifacts": { "app": { "repository": "registry.example/acme/app", "tag": version, "digest": digest } } });
+    let rebuilt = format!("sha256:{}", "ab".repeat(32));
+
+    post(s, "/api/deploy/environments", Some(&json!({ "name": "live", "provider": "kilncd", "production": true })))?;
+    post(s, "/api/deploy/apps/app/environments/live", Some(&json!({})))?;
+    assert_eq!(require_chain("live")?, Some(json!(true)), "made as production, it requires the chain");
+    let (st, body) = http(s.port, "POST", "/api/deploy/releases", &s.admin, Some(&ask("live", "1.0.1", &rebuilt)))?;
+    assert!(st == 409 && body.contains("live requires a verified chain (require_chain): the chain breaks at artifact app sha256:abababababab"), "the rebuilt image, refused at its artifact: {st} {body}");
+    let taken = post(s, "/api/deploy/releases", Some(&ask("live", "1.0.0", &shop.digest)))?;
+    let gate = chain_gate(&taken);
+    assert!(gate.get("passed") == Some(&json!(true)) && text(&gate, "detail").starts_with("its chain verifies"), "main's build, its chain verified: {taken:#}");
+
+    assert_eq!(require_chain("staging")?, None, "from before, it doesn't require the chain");
+    let said = post(s, "/api/deploy/releases", Some(&ask("staging", "1.0.1", &rebuilt)))?;
+    let gate = chain_gate(&said);
+    assert!(gate.get("passed") == Some(&json!(false)) && text(&gate, "detail").ends_with("(not required here)") && text(&gate, "detail").contains("the chain breaks at artifact app"), "taken, saying its chain doesn't verify: {said:#}");
+    let (st, body) = http(s.port, "PUT", "/api/deploy/environments/staging", &s.admin, Some(&json!({ "name": "staging", "provider": "kilncd", "production": true })))?;
+    anyhow::ensure!((200..300).contains(&st), "staging made production: {st} {body}");
+    assert_eq!(require_chain("staging")?, None, "made production since, it keeps what it had");
     Ok(())
 }
