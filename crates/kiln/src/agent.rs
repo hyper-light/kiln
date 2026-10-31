@@ -1222,11 +1222,12 @@ fn configured_host_database(config: &crate::config::Config, state: &Path, work: 
     Ok(config.server.data_dir.join("kiln.db"))
 }
 
-/// Replicated runners share the server's canonical transcript rows. Only the existing
-/// server archive owner may prune them; an ordinary standalone runner keeps its policy.
-pub(crate) fn runner_conversation_upkeep(replicated_transport: bool) -> crate::convo::store::Upkeep {
+/// U05/U15: every runner uses the host's canonical transcript rows. Its own actor does
+/// not hold the server archive's prune barrier, regardless of replication transport.
+/// Only the existing server archive owner may prune those shared rows.
+pub(crate) fn runner_conversation_upkeep() -> crate::convo::store::Upkeep {
     let mut upkeep = crate::config::Conversations::default().upkeep();
-    if replicated_transport { upkeep.keep_closed = None; }
+    upkeep.keep_closed = None;
     upkeep
 }
 
@@ -1710,7 +1711,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
         let conversations_on = crate::convo::enabled();
         let conversation_sources = if conversations_on { crate::server::legacy_conversation_sources(&o.state_dir)? } else { Vec::new() };
         let conversation_host = name.clone();
-        let conversation_upkeep = runner_conversation_upkeep(replicated_transport);
+        let conversation_upkeep = runner_conversation_upkeep();
         let scope = format!("runner/{name}/{instance_id}");
         let namespace = runner_records_namespace(&name, o.instance.as_deref());
         let machine_namespace = runner_machine_namespace(&name);
