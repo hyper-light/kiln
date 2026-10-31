@@ -1,6 +1,6 @@
 # Amphora, vendored
 
-Upstream: https://github.com/hyper-light/amphora at `060cc1c04c36ed3c5551e789f76f6cffa95b41f2`. Kiln uses one copy, excluding upstream nested vendor and bench trees.
+Upstream: https://github.com/hyper-light/amphora at `29be700ba8f42d573cd2ee0c4e7c414095238025`. Kiln uses one copy, excluding upstream nested vendor and bench trees.
 
 | Files | Change | Why | Recorded as |
 |---|---|---|---|

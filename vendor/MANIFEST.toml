@@ -131,7 +131,7 @@ own = ["UPSTREAM.md"]
 [projects.amphora]
 kind = "git"
 repository = "https://github.com/hyper-light/amphora"
-commit = "060cc1c04c36ed3c5551e789f76f6cffa95b41f2"
+commit = "29be700ba8f42d573cd2ee0c4e7c414095238025"
 path = "vendor/amphora"
 exclude = ["vendor", "bench"]
 own = ["UPSTREAM.md"]
