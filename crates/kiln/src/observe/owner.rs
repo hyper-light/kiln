@@ -817,6 +817,15 @@ fn cut_after() -> Duration {
     *AFTER.get_or_init(|| std::env::var("KILN_OBSERVE_CUT_AFTER_MS").ok().and_then(|v| v.parse().ok()).map_or(group::CUT_AFTER, Duration::from_millis))
 }
 
+/// The log's size since its last cut that cuts it (`kiln_obs::group::due`: half a cadence); a test
+/// that needs its whole log replayed after a restart sets `KILN_OBSERVE_CUT_BYTES` above what it
+/// writes (tests/observe_replay.rs: a cut part-way through its points left a tail too short to catch
+/// a query in, on a loaded machine).
+fn cut_bytes() -> Option<u64> {
+    static BYTES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| std::env::var("KILN_OBSERVE_CUT_BYTES").ok().and_then(|v| v.parse().ok()))
+}
+
 /// Which member each machine is, as the server keeps it (`<observe>/members.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Members {
@@ -1730,7 +1739,7 @@ impl Owner {
         if rep.waiting.is_none() && rep.r.applied().index > rep.cut {
             rep.waiting = Some(now);
         }
-        let due = asked || group::due(&rep.r);
+        let due = asked || cut_bytes().map_or_else(|| group::due(&rep.r), |b| rep.r.is_stalled() || rep.r.compactable_bytes() >= b);
         if due && rep.r.compact(keep, now, &self.waker).unwrap_or(false) {
             self.compact_asked = false;
             rep.compacted = rep.r.applied().index;
