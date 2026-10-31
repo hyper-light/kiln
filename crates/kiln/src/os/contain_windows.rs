@@ -4,6 +4,10 @@
 //! leaves a job only if the job lets it break away, and these don't. Listing an agent's processes
 //! is asking its job; whose a process is, asking each job whether it holds it; ending them all,
 //! terminating the job. Like every job kiln makes, it ends with the runner (`KILL_ON_JOB_CLOSE`).
+//!
+//! A CI step's processes are held the same way, in a job of the step's own ([`Tree`]), so a job
+//! paused in Ship is suspended where it runs (docs/ci.md W26-R22): every process in it
+//! (`NtSuspendProcess`), and let go on after (`NtResumeProcess`), [`hold`].
 
 #![allow(unsafe_code)]
 
@@ -42,6 +46,35 @@ struct ExtendedLimits {
     peak_job_memory_used: usize,
 }
 
+/// `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`.
+#[repr(C)]
+#[derive(Default)]
+struct Accounting {
+    total_user_time: i64,
+    total_kernel_time: i64,
+    this_period_total_user_time: i64,
+    this_period_total_kernel_time: i64,
+    total_page_fault_count: u32,
+    total_processes: u32,
+    active_processes: u32,
+    total_terminated_processes: u32,
+}
+
+/// `PROCESSENTRY32W`.
+#[repr(C)]
+struct ProcessEntry {
+    size: u32,
+    usage: u32,
+    process_id: u32,
+    default_heap_id: usize,
+    module_id: u32,
+    threads: u32,
+    parent_process_id: u32,
+    pri_class_base: i32,
+    flags: u32,
+    exe_file: [u16; 260],
+}
+
 /// `THREADENTRY32`.
 #[repr(C)]
 #[derive(Default)]
@@ -62,14 +95,21 @@ const _: () = {
     assert!(offset_of!(BasicLimits, limit_flags) == 16);
     assert!(size_of::<ExtendedLimits>() == 144);
     assert!(size_of::<ThreadEntry>() == 28);
+    assert!(size_of::<Accounting>() == 48);
+    assert!(size_of::<ProcessEntry>() == 568);
+    assert!(offset_of!(ProcessEntry, parent_process_id) == 32);
 };
 
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: i32 = 1;
 const JOB_OBJECT_BASIC_PROCESS_ID_LIST: i32 = 3;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
 const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 /// The most of a job's processes listed at once.
 const MOST_LISTED: usize = 4096;
 
@@ -88,7 +128,11 @@ unsafe extern "system" {
     fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
     fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
     fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
+    fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
+    fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
+    fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
 }
 
 /// A handle kiln owns, closed when dropped.
@@ -167,11 +211,7 @@ impl Group {
         let name = name_of(session)?;
         // SAFETY: a NUL-terminated name; no security attributes.
         let job = Owned::new(unsafe { CreateJobObjectW(std::ptr::null(), name.as_ptr()) })?;
-        let mut limits = ExtendedLimits::default();
-        limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let size = u32::try_from(std::mem::size_of::<ExtendedLimits>()).unwrap_or(0);
-        // SAFETY: the job's handle, and a whole JOBOBJECT_EXTENDED_LIMIT_INFORMATION of that size.
-        if unsafe { SetInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, (&raw const limits).cast(), size) } == 0 {
+        if !ends_with_runner(&job) {
             tracing::warn!(session, "an agent's job couldn't be set to end with the runner: its processes have no group");
             return None;
         }
@@ -194,19 +234,7 @@ impl Group {
 
     /// Every process in it now.
     pub fn pids(&self) -> Vec<u32> {
-        // JOBOBJECT_BASIC_PROCESS_ID_LIST: two counts, then the ids (pointer-sized).
-        let mut buf: Vec<usize> = vec![0; 2 + MOST_LISTED];
-        let len = u32::try_from(buf.len() * std::mem::size_of::<usize>()).unwrap_or(0);
-        let mut returned = 0u32;
-        // SAFETY: the job's handle and a buffer of `len` bytes.
-        if unsafe { QueryInformationJobObject(self.job.0, JOB_OBJECT_BASIC_PROCESS_ID_LIST, buf.as_mut_ptr().cast(), len, &raw mut returned) } == 0 {
-            return Vec::new();
-        }
-        // The counts are two DWORDs packed into the first pointer-sized slot on 64-bit Windows.
-        let header = buf.first().copied().unwrap_or(0) as u64;
-        let listed = usize::try_from(if cfg!(target_pointer_width = "64") { header >> 32 } else { buf.get(1).copied().unwrap_or(0) as u64 }).unwrap_or(0);
-        let start = if cfg!(target_pointer_width = "64") { 1 } else { 2 };
-        buf.iter().skip(start).take(listed.min(MOST_LISTED)).filter_map(|p| u32::try_from(*p).ok()).collect()
+        pids_in(&self.job)
     }
 
     /// Whether `pid` is in it.
@@ -227,6 +255,144 @@ impl Group {
     pub fn remove(&self) {
         jobs().lock().remove(&self.session);
     }
+}
+
+/// Sets job `job` to end what's in it once its last handle closes: with the runner, at the latest.
+fn ends_with_runner(job: &Owned) -> bool {
+    let mut limits = ExtendedLimits::default();
+    limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let size = u32::try_from(std::mem::size_of::<ExtendedLimits>()).unwrap_or(0);
+    // SAFETY: the job's handle, and a whole JOBOBJECT_EXTENDED_LIMIT_INFORMATION of that size.
+    unsafe { SetInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, (&raw const limits).cast(), size) != 0 }
+}
+
+/// Every process in job `job` now.
+fn pids_in(job: &Owned) -> Vec<u32> {
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST: two counts, then the ids (pointer-sized).
+    let mut buf: Vec<usize> = vec![0; 2 + MOST_LISTED];
+    let len = u32::try_from(buf.len() * std::mem::size_of::<usize>()).unwrap_or(0);
+    let mut returned = 0u32;
+    // SAFETY: the job's handle and a buffer of `len` bytes.
+    if unsafe { QueryInformationJobObject(job.0, JOB_OBJECT_BASIC_PROCESS_ID_LIST, buf.as_mut_ptr().cast(), len, &raw mut returned) } == 0 {
+        return Vec::new();
+    }
+    // The counts are two DWORDs packed into the first pointer-sized slot on 64-bit Windows.
+    let header = buf.first().copied().unwrap_or(0) as u64;
+    let listed = usize::try_from(if cfg!(target_pointer_width = "64") { header >> 32 } else { buf.get(1).copied().unwrap_or(0) as u64 }).unwrap_or(0);
+    let start = if cfg!(target_pointer_width = "64") { 1 } else { 2 };
+    buf.iter().skip(start).take(listed.min(MOST_LISTED)).filter_map(|p| u32::try_from(*p).ok()).collect()
+}
+
+/// A CI step's processes held together (docs/ci.md W26-R22): a job of the step's own, which it's put
+/// in before it runs anything (created suspended), so whatever it starts is in it however that's
+/// parented. Its processes are listed, ended at once, and told how much CPU they used; like every
+/// job kiln makes, it ends what's left in it with its last handle, the runner's at the latest.
+#[derive(Clone)]
+pub struct Tree {
+    job: Arc<Owned>,
+}
+
+impl std::fmt::Debug for Tree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tree").finish_non_exhaustive()
+    }
+}
+
+impl Tree {
+    /// A new job of a step's own.
+    pub fn new() -> Option<Tree> {
+        // SAFETY: no name, no security attributes.
+        let job = Owned::new(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
+        ends_with_runner(&job).then(|| Tree { job: Arc::new(job) })
+    }
+
+    /// Puts process `process` (created suspended, so it has run nothing yet) in the job.
+    pub(crate) fn assign(&self, process: Handle) -> bool {
+        // SAFETY: the job's handle and a process handle its creator holds.
+        unsafe { AssignProcessToJobObject(self.job.0, process) != 0 }
+    }
+
+    /// Every process in it now.
+    pub fn pids(&self) -> Vec<u32> {
+        pids_in(&self.job)
+    }
+
+    /// Ends every process in it at once.
+    pub fn kill(&self) {
+        // SAFETY: the job's handle.
+        unsafe { TerminateJobObject(self.job.0, 1) };
+    }
+
+    /// The CPU time its processes have used, all told, those ended included, in 100 ns units.
+    pub fn cpu(&self) -> u64 {
+        let mut info = Accounting::default();
+        let len = u32::try_from(std::mem::size_of::<Accounting>()).unwrap_or(0);
+        // SAFETY: the job's handle and a whole JOBOBJECT_BASIC_ACCOUNTING_INFORMATION of that size.
+        if unsafe { QueryInformationJobObject(self.job.0, JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION, (&raw mut info).cast(), len, std::ptr::null_mut()) } == 0 {
+            return 0;
+        }
+        u64::try_from(info.total_user_time.saturating_add(info.total_kernel_time)).unwrap_or(0)
+    }
+}
+
+/// `NTSTATUS NtSuspendProcess(HANDLE)` and `NtResumeProcess`.
+type NtProcessFn = unsafe extern "system" fn(Handle) -> i32;
+
+/// ntdll's `name`, looked up once into `slot`: `NtSuspendProcess` and `NtResumeProcess`, which
+/// every Windows kiln runs on has (undocumented, unchanged since XP); every process has ntdll.
+fn nt(name: &std::ffi::CStr, slot: &'static OnceLock<usize>) -> Option<NtProcessFn> {
+    let p = *slot.get_or_init(|| {
+        let dll: Vec<u16> = "ntdll.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: a NUL-terminated name; only the system directory is searched.
+        let module = unsafe { LoadLibraryExW(dll.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+        if module.is_null() {
+            return 0;
+        }
+        // SAFETY: a loaded module (never freed) and a NUL-terminated name.
+        unsafe { GetProcAddress(module, name.as_ptr()) as usize }
+    });
+    // SAFETY: ntdll's NtSuspendProcess or NtResumeProcess, whose signature the type spells out.
+    (p != 0).then(|| unsafe { std::mem::transmute::<usize, NtProcessFn>(p) })
+}
+
+/// Process `pid` suspended where it is (`suspend`: `NtSuspendProcess`, each of its threads, counted,
+/// so one let-go undoes one suspension) or let go on once (`NtResumeProcess`); whether it was
+/// reached: one that has ended isn't.
+pub(crate) fn hold(pid: u32, suspend: bool) -> bool {
+    static SUSPEND: OnceLock<usize> = OnceLock::new();
+    static RESUME: OnceLock<usize> = OnceLock::new();
+    let Some(f) = (if suspend { nt(c"NtSuspendProcess", &SUSPEND) } else { nt(c"NtResumeProcess", &RESUME) }) else { return false };
+    // SAFETY: opening a process to suspend or resume it.
+    let Some(process) = Owned::new(unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid) }) else { return false };
+    // SAFETY: a process handle opened for that; an NTSTATUS of 0 or more is success.
+    unsafe { f(process.0) >= 0 }
+}
+
+/// Process `root` and every process under it now, by each one's parent (one snapshot of the
+/// system's processes): what a step on a pty started, which ConPTY starts outside any job. One whose
+/// parent ended before it was looked at isn't reached.
+pub(crate) fn tree_of(root: u32) -> Vec<u32> {
+    let mut all: Vec<(u32, u32)> = Vec::new();
+    // SAFETY: a snapshot of the system's processes.
+    if let Some(snap) = Owned::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) {
+        let size = u32::try_from(std::mem::size_of::<ProcessEntry>()).unwrap_or(0);
+        let mut entry = ProcessEntry { size, usage: 0, process_id: 0, default_heap_id: 0, module_id: 0, threads: 0, parent_process_id: 0, pri_class_base: 0, flags: 0, exe_file: [0; 260] };
+        // SAFETY: the snapshot's handle and an entry whose size is set.
+        let mut more = unsafe { Process32FirstW(snap.0, &raw mut entry) } != 0;
+        while more {
+            all.push((entry.process_id, entry.parent_process_id));
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snap.0, &raw mut entry) } != 0;
+        }
+    }
+    let mut out = vec![root];
+    let mut i = 0;
+    while let Some(p) = out.get(i).copied() {
+        let kids: Vec<u32> = all.iter().filter(|(pid, parent)| *parent == p && *pid != p && !out.contains(pid)).map(|(pid, _)| *pid).collect();
+        out.extend(kids);
+        i += 1;
+    }
+    out
 }
 
 /// Calls `f` on every thread of the processes `pids` (one snapshot of the system's threads), and

@@ -2129,8 +2129,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    // Pause and Resume freeze a job in place where processes can be stopped (W26-R22).
-                    let freeze = if cfg!(unix) { proto::CAP_FREEZE } else { 0 };
+                    // Pause and Resume freeze a job in place (W26-R22): its processes stopped on Unix,
+                    // suspended on Windows.
+                    let freeze = if cfg!(any(unix, windows)) { proto::CAP_FREEZE } else { 0 };
                     if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_UNREAD | freeze }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }

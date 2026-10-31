@@ -225,6 +225,7 @@ mod tests {
     use super::*;
 
     /// `sh -c command` here, as a runner's terminal runs it: what it printed, and how it ended.
+    #[cfg(unix)]
     fn sh(command: &str) -> anyhow::Result<(String, bool)> {
         let out = std::process::Command::new("sh").args(["-c", command]).output()?;
         Ok((String::from_utf8_lossy(&out.stdout).into_owned(), out.status.success()))

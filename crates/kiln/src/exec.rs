@@ -441,7 +441,7 @@ impl Exec {
         let mut running = crate::runner::cpus::spawn_on(&self.assign.job_id, move || crate::proc::spawn_group(cmd))?;
         let pgid = running.pgid;
         if let Some(f) = crate::runner::freeze::of(&self.assign.job_id) {
-            f.group(pgid);
+            f.step(&running);
         }
         let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
         let _pinned = crate::runner::cpus::Step::new(&self.assign.job_id, pgid);

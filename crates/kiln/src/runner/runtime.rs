@@ -2810,7 +2810,7 @@ impl Leg {
         let mut running = super::cpus::spawn_on(&job, move || crate::proc::spawn_group(cmd))?;
         st.groups.push(running.pgid);
         if let Some(f) = super::freeze::of(&self.a.job_id) {
-            f.group(running.pgid);
+            f.step(&running);
         }
         let _pinned = super::cpus::Step::new(&self.a.job_id, running.pgid);
         let mut oom_at = oom_after.map(|d| Instant::now() + d);

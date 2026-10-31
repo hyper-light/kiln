@@ -8588,10 +8588,16 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     in a cgroup of the job's own (`kiln-jobs-<pid>/<job>` under the runner's), joined before they
     run anything, and that's frozen (`cgroup.freeze`), whatever they started. Elsewhere on Unix,
     and on Linux without a cgroup v2 the runner may write, its steps' process groups are stopped
-    (SIGSTOP). Its job container is paused (`docker pause`). Resume undoes each.
+    (SIGSTOP). On Windows each of its steps is in a job object of its own, put in it before it ran
+    anything (created suspended), so whatever it starts is there however that's parented, and a
+    step on a pty (which ConPTY starts outside any job) is followed by its process tree: every one
+    of their processes is suspended where it is (`NtSuspendProcess`), listed again until none is
+    new, and exactly those are let go on (`NtResumeProcess`). A step that starts while its job is
+    frozen is frozen as it starts. Its job container is paused (`docker pause`). Resume undoes each.
   - The runner is asked with `ServerMsg::Freeze` (appended last), only a runner that says it can
-    (`CAP_FREEZE`, bit 43: Unix). Its answer comes once it's done, or why not. Pausing a job on any
-    other runner (Windows, a kiln from before Pause) is refused saying so, and nothing is sent.
+    (`CAP_FREEZE`, bit 43: Unix and Windows). Its answer comes once it's done, or why not. Pausing
+    a job on any other runner (a kiln from before Pause came to its platform) is refused saying so,
+    and nothing is sent.
   - Its time limits stop while it's paused: the job's and a step's on the runner, and v1's
     `timeout_minutes` on the server, which leaves out the paused while (`paused_at`, `paused_ms`).
   - A waiting job paused isn't dispatched until it's resumed: v1's queue skips it; the engine's

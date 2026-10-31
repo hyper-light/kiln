@@ -488,8 +488,8 @@ pub struct IdentityGiven {
 pub const CAP_UNREAD: u64 = 1 << 41;
 
 /// [`AgentMsg::Caps`] capability: the runner freezes a job it runs where it runs, and lets it go on
-/// (Pause and Resume, docs/ci.md W26-R22; [`ServerMsg::Freeze`]). Runners on Unix say it; a server
-/// sends `Freeze` to no other. Bit 42 is kept for W27's agent git credential (`CAP_AGENT_GIT`).
+/// (Pause and Resume, docs/ci.md W26-R22; [`ServerMsg::Freeze`]). Runners on Unix and Windows say
+/// it; a server sends `Freeze` to no other. Bit 42 is kept for W27's agent git credential (`CAP_AGENT_GIT`).
 pub const CAP_FREEZE: u64 = 1 << 43;
 
 /// See [`AgentMsg::Instance`].

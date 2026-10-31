@@ -3007,7 +3007,7 @@ impl Hub {
             // Only the runner process that holds it, and only one that can freeze a job in place.
             let caps = self.instances.lock().wide_caps_for(agent, &crate::instances::Owned::Job(t.id.clone()));
             if caps & crate::proto::CAP_FREEZE == 0 {
-                return Err(format!("its runner {agent} can't freeze a job in place: it runs Windows, or a kiln from before Pause"));
+                return Err(format!("its runner {agent} can't freeze a job in place: it runs a kiln from before Pause came to its platform"));
             }
             let answer = self.command(agent, &ServerMsg::Freeze { job: t.id.clone(), frozen: paused }, FREEZE_WITHIN).await;
             if let Some((_, why)) = answer.failure(agent) {
@@ -3769,8 +3769,8 @@ pub(crate) mod tests {
         assert!(!fits(&["baremetal"], "macos", "aarch64", &["baremetal", "linux"]), "a Mac isn't Linux");
     }
 
-    /// W26-R22: a runner that doesn't say it can freeze a job in place (`CAP_FREEZE`: one on
-    /// Windows, or from before Pause) is asked nothing: pausing its running job is refused, saying
+    /// W26-R22: a runner that doesn't say it can freeze a job in place (`CAP_FREEZE`: one from
+    /// before Pause came to its platform) is asked nothing: pausing its running job is refused, saying
     /// why, and the job stays as it was. One that says it is asked, and its job reads paused (a
     /// test's runner takes the command as one before the channel did, unanswered). A waiting job is
     /// held with no word to any runner, and resumed; one that has ended is refused, and so is
