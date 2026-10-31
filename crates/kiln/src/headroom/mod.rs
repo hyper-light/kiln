@@ -329,7 +329,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let _ = std::fs::create_dir_all(&ctx.dir);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(kick);
     let specs = |s: &Settings| -> Vec<probes::Spec> { targets(s, &ctx).into_iter().map(|t| probes::Spec { tolerance: Duration::from_millis(u64::from(t.tolerance_ms())), name: t.name, probe: t.probe }).collect() };
-    let engine_targets = |s: &Settings| -> Vec<Target> { targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, served: t.probe.served(), name: t.name }).collect() };
+    let engine_targets = |s: &Settings| -> Vec<Target> { targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, name: t.name }).collect() };
     let learned_path = ctx.dir.join(LEARNED);
     let learned: Learned = read_json(&learned_path).unwrap_or_default();
     let mut engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
