@@ -510,6 +510,12 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {
         return kiln::headroom::guard_main(std::env::args_os().nth(2));
     }
+    // git's update hook in a push to a repository kiln hosts (docs/ci.md W27-R03): its commits'
+    // signatures checked before any ref moves; it needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::ci::pushsig::HOOK_ARG) {
+        let args: Vec<String> = std::env::args_os().skip(2).map(|a| a.to_string_lossy().into_owned()).collect();
+        return kiln::ci::pushsig::hook_main(&args);
+    }
     // `kiln rustc` (docs/ci.md W24-R09): cargo runs a `RUSTC_WRAPPER` as `<wrapper> <rustc> <args>`,
     // so this binary as one, or `kiln rustc <rustc> <args>`.
     {
@@ -523,6 +529,11 @@ fn main() -> ExitCode {
         if let Some(from) = from {
             return kiln::runner::rustc::main(argv.get(from..).unwrap_or_default());
         }
+    }
+    // git's signing program (docs/ci.md W27-R03): this binary, by the name git runs it as.
+    if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == kiln::gitsign::NAME) {
+        let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+        return kiln::gitsign::main(&args);
     }
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {

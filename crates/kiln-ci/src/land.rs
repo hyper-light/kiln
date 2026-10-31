@@ -115,6 +115,8 @@ pub struct Policy {
     /// Branches (globs) that are never deleted or rewritten, and that only those who may land
     /// push (W14-R02's branch protection).
     pub protected: Vec<String>,
+    /// Whose signatures a push's commits must carry (docs/ci.md W27-R03).
+    pub signatures: Signatures,
 }
 
 impl Policy {
@@ -122,6 +124,42 @@ impl Policy {
     pub fn protects(&self, branch: &str) -> bool {
         !self.protected.is_empty() && Patterns::new(&self.protected).is_ok_and(|p| p.matches(branch))
     }
+}
+
+/// `signatures:` of `.kiln/review.yaml` (docs/ci.md W27-R03): whether the commits a push brings
+/// must be signed by someone kiln verifies, and whose signatures each ref takes
+/// (`crate::identity::push` judges a push by it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Signatures {
+    /// `required`: a ref is refused when a commit it brings isn't signed, doesn't verify, or is
+    /// signed by someone it doesn't take; `warn`: it's taken, each such commit named. Unset: the
+    /// repository's own, as it was made (a new repository requires, one from before warns).
+    pub mode: Option<SignatureMode>,
+    /// Whose signatures refs take, the first rule naming a ref deciding: a ref no rule names takes
+    /// any of its organization's people, their agents, and kiln.
+    pub signers: Vec<Signers>,
+}
+
+/// [`Signatures::mode`]; by default, what a new repository requires.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SignatureMode {
+    #[default]
+    Required,
+    Warn,
+}
+
+/// One rule of [`Signatures::signers`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Signers {
+    /// The refs it's for (globs): branches by name, as `protected` names them, so a trunk's rule
+    /// is its review submissions' too (`refs/for/<trunk>`); tags as `tags/<name>`.
+    pub refs: Vec<String>,
+    /// Whose signatures they take: `people`, `agents` (any person's), `kiln` (its server and CD),
+    /// a person by name (`ada`), or a person's agents (`ada/agents`).
+    pub by: Vec<String>,
 }
 
 impl Policy {

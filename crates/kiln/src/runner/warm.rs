@@ -380,6 +380,14 @@ fn head(repo: &Path) -> Option<String> {
     git(repo, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
+/// The commit the repository at `repo` has checked out and its tree, as git computes them from
+/// what it holds (docs/ci.md W27-R05: a leg's receipt of its checkout).
+pub fn head_and_tree(repo: &Path) -> Option<(String, String)> {
+    let commit = head(repo)?;
+    let tree = git(repo, &["rev-parse", "--verify", "--quiet", "HEAD^{tree}"]).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())?;
+    Some((commit, tree))
+}
+
 /// This runner's mirror of `repo` (v1's `<work>/git/<repository>.git`, or under `KILN_GIT_CACHE`),
 /// when it has one.
 pub fn mirror_of(work: &Path, repo: &str) -> Option<PathBuf> {

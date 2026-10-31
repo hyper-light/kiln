@@ -335,6 +335,20 @@ pub async fn step_started(hub: &Hub, leg: &str, idx: u32, name: &str, kind: &str
         .await
 }
 
+/// A leg's step's status from how it ended (`JobEventV2::StepFinished`): its conclusion, a failure
+/// `continue-on-error` let pass being its outcome's. The server records it so, and the leg signs it
+/// so (docs/ci.md W27-R05).
+pub fn step_status(outcome: kiln_ci::wire::Conclusion, conclusion: kiln_ci::wire::Conclusion) -> Status {
+    use kiln_ci::wire::Conclusion;
+    match conclusion {
+        Conclusion::Success if outcome == Conclusion::Failure => Status::Failed,
+        Conclusion::Success => Status::Succeeded,
+        Conclusion::Failure => Status::Failed,
+        Conclusion::Cancelled => Status::Cancelled,
+        Conclusion::Skipped => Status::Skipped,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn step_finished(hub: &Hub, leg: &str, idx: u32, status: Status, outcome: &str, conclusion: &str, exit_code: Option<i32>, outputs: String) -> anyhow::Result<()> {
     let (leg, outcome, conclusion) = (leg.to_owned(), outcome.to_owned(), conclusion.to_owned());

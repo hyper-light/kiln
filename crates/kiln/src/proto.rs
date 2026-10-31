@@ -262,6 +262,17 @@ pub enum AgentMsg {
     /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
     /// encodes variants by index.
     HeadroomStatus { json: String },
+    /// A leg's records, signed as the leg on its runner at its end under the server's delegation of
+    /// it (docs/ci.md W27-R05): a JSON array of Sigstore bundles, its results (kiln's statement of
+    /// them, `kiln_ci::attest::leg`) and its custody records (a receipt of each thing it received,
+    /// then its hand-on of what it made). Sent before its [`AgentMsg::JobFinished`] and again with
+    /// it until the server says it's received. Only to a server announcing [`CAP_LEG_SIGNS`].
+    /// Appended last: postcard encodes variants by index.
+    LegResults { job: String, bundles: String },
+    /// A leg's answer to [`ServerMsg::SignAsLeg`]: the provenance kiln wrote of what it built, signed
+    /// as the leg (a Sigstore bundle), or why it isn't (docs/ci.md W27-R06). Appended last: postcard
+    /// encodes variants by index.
+    LegSignature { job: String, nonce: String, bundle: Option<String>, error: Option<String> },
     /// Custody (docs/ci.md W27-R08, `crate::custody`): a signed custody record or delegation, its
     /// Sigstore bundle as JSON, that this runner process or a session it holds signed, or carried
     /// (a giver's hand-on, from the package it took). Only to a server announcing [`CAP_CUSTODY`].
@@ -428,11 +439,24 @@ pub const CAP_HEADROOM: u64 = 1 << 39;
 /// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
 pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 
+/// [`ServerMsg::Caps`] capability: the server gives an agent session its own git credential for
+/// kiln's repositories (the operation `agents.credential`, docs/ci.md W27-R03), so a runner sets its
+/// sessions' git to push as the agent. Without it, a runner leaves their pushes as they were.
+/// (Bit 41 is main's `CAP_UNREAD`.)
+pub const CAP_AGENT_GIT: u64 = 1 << 42;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: a leg signs as itself what it hands on
+/// (docs/ci.md W27-R05, R06). A runner that says its legs sign their results at their end
+/// ([`AgentMsg::LegResults`]) and the provenance kiln writes of what they built when asked
+/// ([`ServerMsg::SignAsLeg`]); a server that says it takes them. (Bit 41 is main's `CAP_UNREAD`,
+/// 42 `CAP_AGENT_GIT`.)
+pub const CAP_LEG_SIGNS: u64 = 1 << 43;
+
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: custody (docs/ci.md W27-R08). A runner
 /// that says it signs its agent sessions' hand-overs (a hand-on as it lets one go, a receipt as it
 /// takes one) and sends them ([`AgentMsg::Custody`]); a server that says it takes them
-/// (`crate::custody::take`).
-pub const CAP_CUSTODY: u64 = 1 << 41;
+/// (`crate::custody::take`). (Bit 41 is main's `CAP_UNREAD`, 42 `CAP_AGENT_GIT`, 43 `CAP_LEG_SIGNS`.)
+pub const CAP_CUSTODY: u64 = 1 << 44;
 
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -455,6 +479,12 @@ pub struct IdentityAsk {
     /// bundles with the certificate it issues and records with the hand-on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Unbundled>,
+    /// `leg`: the leg signs its records at its end and, asked ([`ServerMsg::SignAsLeg`]), the
+    /// provenance kiln writes of what it built (docs/ci.md W27-R05, R06). Said of the leg, since
+    /// an ephemeral runner (a `k8s` pool's pod) says nothing of itself past `Build`'s caps; an
+    /// older runner says nothing, and is asked nothing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub signs: bool,
 }
 
 /// A statement signed with a key kiln hasn't certified yet ([`IdentityAsk::receipt`]): its DSSE
@@ -478,6 +508,10 @@ pub struct IdentityGiven {
     pub uri: String,
     pub cert_pem: Option<String>,
     pub error: Option<String>,
+    /// A leg's: the server's delegation of the leg to it, by its digest, for its records to name
+    /// in `under` (docs/ci.md W27-R05, R06). Older servers send none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
 }
 
 /// See [`AgentMsg::Instance`].
@@ -741,6 +775,11 @@ pub enum ServerMsg {
     /// for the runner's next start. Only to runners announcing [`CAP_HEADROOM`]. Appended last:
     /// postcard encodes variants by index.
     Headroom { json: String },
+    /// The provenance kiln wrote of what leg `job` built for its attest step's report `nonce`
+    /// (`payload` of `payload_type`, an in-toto statement), for the leg to sign as itself when it's
+    /// of what the leg reported (docs/ci.md W27-R06); it answers [`AgentMsg::LegSignature`]. Only to
+    /// runners announcing [`CAP_LEG_SIGNS`]. Appended last: postcard encodes variants by index.
+    SignAsLeg { job: String, nonce: String, payload_type: String, payload: Vec<u8> },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -972,6 +1011,28 @@ mod tests {
         Ok(())
     }
 
+    /// W27-R05, R06: a leg's signed results and its signature of provenance come after every
+    /// older variant, and the server's ask after its own; an older peer never gets them (they go
+    /// only to one announcing CAP_LEG_SIGNS).
+    #[test]
+    fn w27_r05_leg_signing_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last = encode(&AgentMsg::HeadroomStatus { json: String::new() })?;
+        let results = AgentMsg::LegResults { job: "j".into(), bundles: "[]".into() };
+        let signature = AgentMsg::LegSignature { job: "j".into(), nonce: "n".into(), bundle: None, error: Some("no attest report".into()) };
+        for (m, after) in [(results, 1u8), (signature, 2)] {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last.first().map(|i| i + after), "{m:?}");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        let headroom = encode(&ServerMsg::Headroom { json: String::new() })?;
+        let ask = ServerMsg::SignAsLeg { job: "j".into(), nonce: "n".into(), payload_type: kiln_ci::attest::PAYLOAD_TYPE.into(), payload: b"{}".to_vec() };
+        let b = encode(&ask)?;
+        assert_eq!(b.first().copied(), headroom.first().map(|i| i + 1));
+        assert_eq!(decode::<ServerMsg>(&b)?, ask);
+        assert!(CAP_LEG_SIGNS.is_power_of_two() && CAP_LEG_SIGNS > CAP_AGENT_GIT && CAP_LEG_SIGNS > CAP_CHANGES_PATCH);
+        Ok(())
+    }
+
     #[test]
     fn the_channel_is_appended_after_every_older_variant() -> anyhow::Result<()> {
         use crate::wire::channel::{Frame, Has, Nack, Refusal};
@@ -1095,16 +1156,18 @@ mod tests {
         assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
     }
 
-    /// W27-R08: custody records come after every older variant, and their bit is a new one.
+    /// W27-R08: custody records come after every older variant (the legs' signing, W27-R05, last
+    /// before them), and their bit is a new one: past main's `CAP_UNREAD` (41), `CAP_AGENT_GIT`
+    /// (42) and `CAP_LEG_SIGNS` (43).
     #[test]
     fn w27_r08_custody_is_appended_after_headroom() -> anyhow::Result<()> {
-        let headroom = encode(&AgentMsg::HeadroomStatus { json: "{}".into() })?;
+        let legs = encode(&AgentMsg::LegSignature { job: "j".into(), nonce: "n".into(), bundle: None, error: None })?;
         let custody = AgentMsg::Custody { json: "{}".into() };
         let b = encode(&custody)?;
-        assert_eq!(b.first().copied(), headroom.first().map(|i| i + 1), "AgentMsg::Custody comes right after HeadroomStatus");
+        assert_eq!(b.first().copied(), legs.first().map(|i| i + 1), "AgentMsg::Custody comes right after LegSignature");
         assert_eq!(decode::<AgentMsg>(&b)?, custody);
-        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH;
-        assert!(CAP_CUSTODY.is_power_of_two() && CAP_CUSTODY == 1 << 41 && CAP_CUSTODY & before == 0);
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_AGENT_GIT | CAP_LEG_SIGNS;
+        assert!(CAP_CUSTODY.is_power_of_two() && CAP_CUSTODY == 1 << 44 && CAP_CUSTODY & before == 0);
         Ok(())
     }
 

@@ -11,11 +11,17 @@
 //! squash keeps one change and absorbs the rest; and kiln asks only when it can't tell.
 //!
 //! Actors' identities, and the chain of whom each acts for, are [`chain`] (W27-R01); what they sign,
-//! and how kiln checks it as of the time it took it, [`statement`] (W27-R03 to R08's base); and the
-//! chain of custody of what changes hands, hop by hop, [`custody`] (W27-R08).
+//! and how kiln checks it as of the time it took it, [`statement`] (W27-R03 to R08's base); a commit's
+//! signature in git's x509 form, [`gitsig`], and in its SSH form, [`sshsig`], against keys people
+//! bound to their identities (W27-R03); whether a push's commits are signed as a repository's
+//! policy says, [`push`] (W27-R03); and the chain of custody of what changes hands, hop by hop,
+//! [`custody`] (W27-R08).
 
 pub mod chain;
 pub mod custody;
+pub mod gitsig;
+pub mod push;
+pub mod sshsig;
 pub mod statement;
 
 use std::cmp::Reverse;

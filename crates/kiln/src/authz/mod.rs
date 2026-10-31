@@ -342,6 +342,10 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/identity", SIGNED_IN, At::Server),
+    // W27-R03: the SSH keys one signs commits with.
+    r("GET", "/api/me/ssh-signers", SIGNED_IN, At::Server),
+    r("POST", "/api/me/ssh-signers", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/ssh-signers", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
     r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/password", SIGNED_IN, At::Server),

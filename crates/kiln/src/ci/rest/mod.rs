@@ -134,8 +134,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::GET, ["git", "refs", r @ ..]) => Ok(repos::git_refs_older(&s, &r.join("/")).await),
             (&Method::GET, ["statuses", r]) => records::statuses(&s, r, false).await,
             (&Method::GET, ["contents", path @ ..]) => Ok(repos::contents(&s, &path.join("/"), q.get("ref").map(String::as_str), raw).await),
-            (&Method::GET, ["tarball", r @ ..]) => repos::archive(&s, &r.join("/"), false).await,
-            (&Method::GET, ["zipball", r @ ..]) => repos::archive(&s, &r.join("/"), true).await,
+            (&Method::GET, ["tarball", r @ ..]) => repos::archive(&s, &r.join("/"), false, &claims.leg).await,
+            (&Method::GET, ["zipball", r @ ..]) => repos::archive(&s, &r.join("/"), true, &claims.leg).await,
             (&Method::GET, ["compare", bh @ ..]) => Ok(repos::compare(&s, &bh.join("/")).await),
             // A person's access here, as actions check it before they act for the run's actor.
             (&Method::GET, ["collaborators", login, "permission"]) => repos::collaborator_permission(&s, login).await,

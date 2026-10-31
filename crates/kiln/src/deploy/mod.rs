@@ -100,7 +100,8 @@ pub fn not_running() -> String {
 
 /// Runs the service until the server shuts down: the worker that follows releases.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    let hosted = host::Hosted::new(&crate::ci::hosting::root(&hub));
+    // CD's commits, signed as CD (W27-R03).
+    let hosted = host::Hosted::new(&crate::ci::hosting::root(&hub)).signing_as(Arc::clone(&hub.pki), "cd");
     // Release repositories from before they were native ones move into kiln's hosted root.
     for repo in hosted.adopt(&hub.cfg.server.data_dir.join("deploy").join("repos")) {
         tracing::info!(%repo, "deploy: a release repository moved into kiln's hosted root");

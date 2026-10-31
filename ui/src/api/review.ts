@@ -352,6 +352,20 @@ export interface HostThread {
   comments: HostComment[];
 }
 
+/** What a repository's host verified of a commit's signature, as kiln keeps it (W27-R03). */
+export interface HostSignature {
+  sha: string;
+  /** `unknown`: the host verifies none (Bitbucket), or kiln hasn't read it yet. */
+  state: "verified" | "unverified" | "unsigned" | "unknown";
+  /** The host's own word for it (GitHub's reason, GitLab's status), or why it can't say. */
+  reason: string;
+  /** Who the host says signed it, once verified. */
+  signer: string | null;
+  verified_at: number | null;
+  /** When kiln read it (none: not yet). */
+  read_at: number | null;
+}
+
 export interface HostPullDetail extends HostPull {
   files: { path: string; old_path: string | null; status: string; additions: number | null; deletions: number | null; patch: string | null }[];
   conversation: HostComment[];
@@ -360,6 +374,8 @@ export interface HostPullDetail extends HostPull {
   merge_methods: string[];
   /** Every provider's runs of its head commit, from kiln's own tables. */
   checks: { state?: "success" | "failure" | "pending" | "none"; checks?: HostCheck[]; error?: string };
+  /** What the host verified of each of its commits, oldest first, its head last. */
+  signatures: { commits?: HostSignature[]; error?: string };
 }
 
 /** Who acted on the host: you, with the account you signed in with, or kiln's credentials there. */

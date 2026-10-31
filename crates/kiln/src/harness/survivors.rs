@@ -138,6 +138,24 @@ pub fn session_of(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String
     if sessions.is_empty() {
         return None;
     }
+    if let Some(id) = session_by_process(pid, sessions) {
+        return Some(id);
+    }
+    // Started by one and parented elsewhere since (it daemonized): its mark says whose it is.
+    let env = refreshed(Some(&[pid]), true);
+    let prefix = format!("{MARK}=");
+    let marked = env.process(Pid::from_u32(pid))?.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str())).map(str::to_owned))?;
+    sessions.iter().any(|(id, _)| *id == marked).then_some(marked)
+}
+
+/// The agent session process `pid` belongs to by the process alone: its session's group of
+/// processes, else a harness among its ancestors. Never by its environment's mark, which any
+/// process can set: what signs as an agent asks this (W27-R03). Blocking.
+pub fn session_by_process(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String> {
+    use sysinfo::Pid;
+    if sessions.is_empty() {
+        return None;
+    }
     // In a session's group of processes: one look says whose it is.
     if let Some(id) = crate::os::contain::session_of(pid)
         && sessions.iter().any(|(s, _)| *s == id)
@@ -156,11 +174,7 @@ pub fn session_of(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String
             _ => break,
         }
     }
-    // Started by one and parented elsewhere since (it daemonized): its mark says whose it is.
-    let env = refreshed(Some(&[pid]), true);
-    let prefix = format!("{MARK}=");
-    let marked = env.process(Pid::from_u32(pid))?.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str())).map(str::to_owned))?;
-    sessions.iter().any(|(id, _)| *id == marked).then_some(marked)
+    None
 }
 
 /// What one look at a session's processes found.
@@ -556,6 +570,29 @@ mod tests {
         assert!(theirs.iter().all(|p| seen.below.contains(p)), "{theirs:?} under the harness: {:?}", seen.below);
         assert!(seen.apart.is_empty(), "{:?}", seen.apart);
         assert!(!seen.under.iter().any(|r| r.pid == helper.id() || theirs.contains(&r.pid)), "a helper's work isn't noted as the agent's: {:?}", seen.under);
+        Ok(())
+    }
+
+    /// W27-R03: what signs as an agent is told by its process alone. A process outside every
+    /// session that sets an agent's mark is that agent's to `session_of` (whose work it is), but
+    /// never to `session_by_process` (whom it signs as); one under the session's harness is.
+    #[cfg(unix)]
+    #[test]
+    fn w27_r03_only_a_sessions_own_process_signs_as_its_agent() -> anyhow::Result<()> {
+        // The marked session's harness: a process that's no one's ancestor here.
+        let mut harness = std::process::Command::new("sleep").arg("30").spawn()?;
+        let mut outsider = std::process::Command::new("sleep").arg("30").env(MARK, "s-marked").spawn()?;
+        let marked_sessions = vec![("s-marked".to_owned(), Some(harness.id()))];
+        let (marked, strict) = (session_of(outsider.id(), &marked_sessions), session_by_process(outsider.id(), &marked_sessions));
+        // This test's process plays another session's harness: what it starts is under it.
+        let mine = session_by_process(outsider.id(), &[("s-mine".to_owned(), Some(std::process::id()))]);
+        for p in [&mut harness, &mut outsider] {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
+        assert_eq!(marked.as_deref(), Some("s-marked"), "the mark says whose work it is");
+        assert_eq!(strict, None, "but it signs as no agent");
+        assert_eq!(mine.as_deref(), Some("s-mine"), "a process under the session's harness signs as its agent");
         Ok(())
     }
 }

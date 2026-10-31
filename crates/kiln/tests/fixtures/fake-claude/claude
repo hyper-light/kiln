@@ -15,7 +15,9 @@ then a result, said started and completed as Claude Code says it (`command_lifec
 user message's uuid), so kiln sends the next. As Claude Code does, it answers control requests as
 they come, a turn under way or not; user messages wait their turn. Each message's id is its own (this process's, this turn's, its line's), as Claude
 Code's are, so a second turn's lines are new events, not the first's again. It calls no model and
-reads no account.
+reads no account. With FAKE_CLAUDE_ACT set, each user message's text is given to that program (on
+its stdin, in the session's folder) before the turn's lines, as an agent would act on it (the
+conflict ladder's tests, docs/ci.md W26-R17).
 """
 import json
 import os
@@ -129,6 +131,12 @@ def main():
         if os.path.exists(said):
             with open(said, "a") as f:
                 f.write(json.dumps({"pid": os.getpid(), "uuid": m.get("uuid"), "message": m.get("message")}) + "\n")
+        act = os.environ.get("FAKE_CLAUDE_ACT")
+        if act:
+            content = (m.get("message") or {}).get("content")
+            text = content if isinstance(content, str) else "\n".join(b.get("text", "") for b in content or [] if isinstance(b, dict))
+            import subprocess
+            subprocess.run([act], input=text.encode(), cwd=os.getcwd())
         command = m.get("uuid")
         if command is not None:
             out({"type": "command_lifecycle", "command_uuid": command, "state": "started", "uuid": str(uuid.uuid4()), "session_id": session})

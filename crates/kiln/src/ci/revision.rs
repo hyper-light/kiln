@@ -1,8 +1,9 @@
 //! A revision kiln commits for someone (docs/ci.md W26-R04, R10, R12): a suggestion applied, a
-//! conflict resolved. Every such commit goes through [`commit`], the one path W27-R03 signs: as
-//! whoever made it (a person with their key, an agent as the agent for its person). Until it does,
-//! the commit is unsigned and [`Made`] says so; the machine's own git configuration never signs it
-//! with a key that isn't theirs. [`record`] keeps the revision's why with its version.
+//! conflict resolved. Every such commit goes through [`commit`], which signs it as kiln's server
+//! (W27-R03, [`sign_as_kiln`]): it's made by kiln, whoever asked for it, and whoever asked signs
+//! their own act (a verdict, an acceptance). [`Made`] names the signer; the machine's own git
+//! configuration never signs it with a key that isn't kiln's. [`record`] keeps the revision's why
+//! with its version.
 
 use rusqlite::params;
 
@@ -73,7 +74,28 @@ pub(crate) async fn commit(hub: &Hub, path: &str, c: &Commit<'_>) -> Result<Made
     if !r.ok {
         return Err(String::from_utf8_lossy(&r.err).trim().to_owned());
     }
-    Ok(Made { sha: String::from_utf8_lossy(&r.out).trim().to_owned(), message, signer: None })
+    let unsigned = String::from_utf8_lossy(&r.out).trim().to_owned();
+    match sign_as_kiln(hub, path, &unsigned, "server").await {
+        Ok((sha, signer)) => Ok(Made { sha, message, signer: Some(signer) }),
+        Err(e) => {
+            tracing::warn!(commit = %unsigned, error = %format!("{e:#}"), "a commit kiln made isn't signed");
+            Ok(Made { sha: unsigned, message, signer: None })
+        }
+    }
+}
+
+/// Signs commit `sha` of the repository at `path` as kiln's `kind` (`server`, or `cd`), W27-R03:
+/// the commit written again with its `gpgsig` header in git's x509 form, its new SHA and the
+/// signer's identity. The key stays in its file ([`crate::identities::sign_own`]).
+pub(crate) async fn sign_as_kiln(hub: &Hub, path: &str, sha: &str, kind: &str) -> anyhow::Result<(String, String)> {
+    let raw = super::diffs::git_run(hub, &["-C", path, "cat-file", "commit", sha], &[], Vec::new()).await?;
+    anyhow::ensure!(raw.ok, "git cat-file: {}", String::from_utf8_lossy(&raw.err).trim());
+    let signed = crate::identities::signed_commit(&raw.out, |m| crate::identities::sign_own(&hub.pki, kind, m))?;
+    let w = super::diffs::git_run(hub, &["-C", path, "hash-object", "-t", "commit", "-w", "--stdin"], &[], signed).await?;
+    anyhow::ensure!(w.ok, "git hash-object: {}", String::from_utf8_lossy(&w.err).trim());
+    let actor = if kind == "cd" { kiln_ci::identity::chain::Actor::Cd } else { kiln_ci::identity::chain::Actor::Server };
+    let signer = kiln_ci::identity::chain::Identity::new(hub.pki.organization(), actor).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((String::from_utf8_lossy(&w.out).trim().to_owned(), signer))
 }
 
 /// Why a revision exists (W26-R04), kept with its version.

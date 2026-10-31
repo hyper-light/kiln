@@ -1296,6 +1296,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Jobs' results the server hasn't said it has (`ServerMsg::Received`), each encoded, by job:
     // sent again after a reconnect, so one sent as the connection dropped isn't lost.
     let mut unreceived: HashMap<String, (Instant, Vec<u8>)> = HashMap::new();
+    // Each leg's signed results (`AgentMsg::LegResults`), encoded, by job: sent again with its
+    // result, before it, until the server says it has that (docs/ci.md W27-R05).
+    let mut signed_unreceived: HashMap<String, Vec<u8>> = HashMap::new();
     // Each job's events (`AgentMsg::JobEvent`, numbered by their `seq`), encoded, until its result
     // is received, by job: sent again after a reconnect too, to a server that takes each once (it
     // said so: `receipts`). The count goes on after (a kept leg's step rerun, W17-R04).
@@ -1386,6 +1389,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The server issues identities (docs/ci.md W27-R01): this process's sessions' epochs, and
     // when each identity was last asked for.
     let mut server_identity = false;
+    // And takes what legs sign as themselves of what they hand on (docs/ci.md W27-R05, R06).
+    let mut server_signs = false;
     // The server takes custody records (docs/ci.md W27-R08).
     let mut server_custody = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
@@ -2178,6 +2183,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // again below. A server that never says (one older than receipts) has them for a
                 // while only.
                 unreceived.retain(|_, (at, _)| at.elapsed() < UNRECEIVED_FOR);
+                signed_unreceived.retain(|job, _| unreceived.contains_key(job));
                 let mut running: Vec<String> = jobs.keys().cloned().collect();
                 running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
                 let msg = AgentMsg::Hello(hello(running));
@@ -2215,7 +2221,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
                     let custody = if crate::runner::custody::signs() { proto::CAP_CUSTODY } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | custody }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | custody }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2302,6 +2308,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_work = false;
                 work_said = None;
                 server_identity = false;
+                server_signs = false;
                 server_limit = false;
                 limit_said = None;
                 if let Some(s) = &sync {
@@ -2391,8 +2398,33 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     ServerMsg::Caps { caps } => {
                         // An identity of this process's own, for a key it made and keeps, certified
-                        // on each connection (docs/ci.md W27-R01).
-                        server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
+                        // on each connection (docs/ci.md W27-R01); an ephemeral runner's too (a `k8s`
+                        // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
+                        server_identity = caps & proto::CAP_IDENTITY != 0;
+                        server_signs = server_identity && caps & proto::CAP_LEG_SIGNS != 0;
+                        crate::runner::identity::set_enabled(server_identity);
+                        // Its sessions' git pushes to kiln as their agents (W27-R03), where the
+                        // server gives them a credential of their own: at the URL this runner
+                        // reaches it at, and where it says it's reached (`/api/me`).
+                        let git = caps & proto::CAP_AGENT_GIT != 0;
+                        crate::runner::identity::set_kiln_git(if git { vec![o.server_url.clone()] } else { Vec::new() });
+                        if git {
+                            let (http, base) = (Arc::clone(&http), o.server_url.trim_end_matches('/').to_owned());
+                            crate::rt::spawn(async move {
+                                let me = async {
+                                    let v: serde_json::Value = http.get(&format!("{base}/api/me")).timeout(std::time::Duration::from_secs(10)).send().await?.json(1 << 20).await?;
+                                    anyhow::Ok(v)
+                                };
+                                match me.await {
+                                    Ok(v) => {
+                                        let public = v.get("public_url").and_then(serde_json::Value::as_str).map(str::to_owned);
+                                        let doors = v.get("origins").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|o| o.as_str().map(str::to_owned));
+                                        crate::runner::identity::also_kiln_git(public.into_iter().chain(doors).collect());
+                                    }
+                                    Err(e) => tracing::debug!(error = %format!("{e:#}"), "where the server is reached wasn't said: agents' git takes their credential at this runner's URL alone"),
+                                }
+                            });
+                        }
                         // Custody records sent before go again: the server takes each once.
                         server_custody = caps & proto::CAP_CUSTODY != 0 && !o.ephemeral;
                         crate::runner::custody::server_checks(server_custody);
@@ -2472,6 +2504,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
                                 }
                             }
+                        }
+                        for data in signed_unreceived.values() {
+                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
                         }
                         for (_, data) in unreceived.values() {
                             net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
@@ -2880,6 +2915,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    // The provenance kiln wrote of what a leg built, signed as the leg when it's of
+                    // what the leg reported (docs/ci.md W27-R06).
+                    ServerMsg::SignAsLeg { job, nonce, payload_type, payload } => {
+                        let (bundle, error) = match crate::runner::signed::sign_provenance(&job, &nonce, &payload_type, &payload) {
+                            Ok(b) => (Some(b), None),
+                            Err(e) => (None, Some(e)),
+                        };
+                        uplink.msg(AgentMsg::LegSignature { job, nonce, bundle, error }).await;
+                    }
                     // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
                     ServerMsg::HarnessSend { session, epoch, json } => {
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
@@ -3245,15 +3289,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // About one of this machine's agents' folders: the session says which, so
                         // a question can only be about a folder an agent here works in.
                         let up = uplink.0.clone();
+                        // What it commits of the agent's work is signed as the agent, with the
+                        // key this process holds for its session at its epoch (W27-R03).
                         let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
                             let ws = s.spec.lock().workspace.clone();
                             let info = s.info();
-                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws)
+                            let sign = crate::runner::identity::enabled().then(|| crate::runner::identity::slot("agent", Some(&session), Some(info.epoch)));
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, sign)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, work, ws)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), &json).await,
+                                Some((cwd, work, ws, sign)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), &json, sign.as_deref()).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });
@@ -3328,6 +3375,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // A new attempt: its events count from one.
                         journal.remove(&id);
                         unreceived.remove(&id);
+                        signed_unreceived.remove(&id);
+                        crate::runner::signed::forget(&id);
+                        // What it was given, as it came: its receipt's (docs/ci.md W27-R05).
+                        if server_identity {
+                            crate::runner::signed::assigned(&id, &json);
+                        }
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
@@ -3508,6 +3561,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Received { job } if job.is_empty() => receipts = true,
                     ServerMsg::Received { job } => {
                         unreceived.remove(&job);
+                        signed_unreceived.remove(&job);
                         if let Some((_, _, events)) = journal.get_mut(&job) {
                             events.clear();
                         }
@@ -3596,6 +3650,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         *json = format!("{{\"seq\":{seq}{}{rest}", if rest.trim_start().starts_with('}') { "" } else { "," });
                     }
                     journaled = Some(job.clone());
+                }
+                // What a leg hands on, folded in as it's sent, for it to sign at its end (docs/ci.md
+                // W27-R05, R06): its logs' chunks, its steps' ends, its attest steps' subjects.
+                match &up {
+                    Up::Log(c) => crate::runner::signed::log(&c.job, c.idx, &c.data),
+                    Up::Msg(AgentMsg::StepFinished { job, idx, status, exit_code }) => crate::runner::signed::step(job, *idx, *status, *exit_code),
+                    Up::Msg(AgentMsg::JobEvent { job, json }) if json.contains("\"t\":\"attest\"") || json.contains("\"t\":\"step_finished\"") => crate::runner::signed::event(job, json),
+                    _ => {}
                 }
                 let (lane, kind, data) = match &up {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
@@ -3709,6 +3771,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 if jobs.remove(&r.job).is_some() {
                     crate::runner::cpus::pins().release(&r.job);
+                    // The leg signs what it received and hands on while it still holds its key
+                    // (docs/ci.md W27-R05): its records go before its result, and again with it.
+                    if server_signs {
+                        match crate::runner::signed::sign_records(&r.job, &r) {
+                            Ok(bundles) => {
+                                let signed = AgentMsg::LegResults { job: r.job.clone(), bundles };
+                                if let Ok(b) = proto::encode(&signed) {
+                                    signed_unreceived.insert(r.job.clone(), b);
+                                }
+                                uplink.msg(signed).await;
+                            }
+                            Err(e) => tracing::warn!(job = %r.job, error = %format!("{e:#}"), "the leg's records couldn't be signed"),
+                        }
+                    } else {
+                        crate::runner::signed::forget(&r.job);
+                    }
                     // The leg's key goes with it (docs/ci.md W27-R01).
                     crate::runner::identity::forget(&crate::runner::identity::slot("leg", Some(&r.job), None));
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
@@ -4100,8 +4178,9 @@ fn note_announced(announced: &mut std::collections::HashSet<String>, session: &s
 
 /// Sends what the channel has to send now.
 /// Asks for agent session `session`'s identity at `epoch` (docs/ci.md W27-R01), unless this
-/// process holds one or asked in the last 5 s: a session kiln hasn't heard of yet is refused, and
-/// asked for again as it goes on.
+/// process holds one or asked in the last 5 s. Asked as the session opens, the ask can reach kiln
+/// before the Open: kiln waits for it (`identities::OPEN_WAIT`), and what's refused is asked for
+/// again as the session goes on.
 async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, Instant>, session: &str, epoch: u64) {
     // Taken over blue/green: its next epoch's, once this runner is promoted (docs/ci.md W27-R08).
     let Some(epoch) = crate::runner::custody::to_ask(session, epoch) else { return };

@@ -77,12 +77,37 @@ impl From<anyhow::Error> for CommitError {
 #[derive(Debug, Clone)]
 pub struct Hosted {
     root: PathBuf,
+    /// Who signs the commits it makes (W27-R03): kiln's CD, where deploying makes them.
+    signer: Option<Signer>,
+}
+
+/// Kiln's own signer for a [`Hosted`]'s commits: its PKI and which of its identities (`cd`).
+#[derive(Clone)]
+struct Signer(std::sync::Arc<crate::pki::Pki>, &'static str);
+
+impl std::fmt::Debug for Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Signer({})", self.1)
+    }
 }
 
 impl Hosted {
     /// The repositories under `root` (`crate::ci::hosting::root`).
     pub fn new(root: &Path) -> Self {
-        Self { root: root.to_owned() }
+        Self { root: root.to_owned(), signer: None }
+    }
+
+    /// The same repositories, every commit made in them signed as kiln's `kind` (`cd`, W27-R03).
+    pub fn signing_as(self, pki: std::sync::Arc<crate::pki::Pki>, kind: &'static str) -> Self {
+        Self { signer: Some(Signer(pki, kind)), ..self }
+    }
+
+    /// Commit `sha` in `dir` signed as this one's signer (its new SHA), or as it is with none.
+    fn signed(&self, dir: &Path, sha: String) -> anyhow::Result<String> {
+        let Some(Signer(pki, kind)) = &self.signer else { return Ok(sha) };
+        let raw = git(dir, &["cat-file", "commit", &sha], None, &[])?;
+        let signed = crate::identities::signed_commit(&raw, |m| crate::identities::sign_own(pki, kind, m))?;
+        Ok(text(git(dir, &["hash-object", "-t", "commit", "-w", "--stdin"], Some(&signed), &[])?))
     }
 
     /// A repository's directory. A name is `owner/name`, each of letters, digits, `-`, `_` and
@@ -226,7 +251,7 @@ impl Hosted {
             {
                 return Ok(Committed::Unchanged(parent.to_owned()));
             }
-            let mut args = vec!["commit-tree".to_owned(), tree];
+            let mut args = vec!["commit-tree".to_owned(), "--no-gpg-sign".to_owned(), tree];
             if let Some(parent) = expected {
                 args.extend(["-p".to_owned(), parent.to_owned()]);
             }
@@ -238,7 +263,7 @@ impl Hosted {
             ];
             let ident: Vec<(&str, &std::ffi::OsStr)> = ident.iter().map(|(k, v)| (*k, std::ffi::OsStr::new(*v))).collect();
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            Ok(Committed::New(text(git(&dir, &args, Some(message.as_bytes()), &ident)?)))
+            Ok(Committed::New(self.signed(&dir, text(git(&dir, &args, Some(message.as_bytes()), &ident)?))?))
         })();
         let _ = std::fs::remove_file(&index);
         let _ = std::fs::remove_dir_all(&work);
@@ -369,7 +394,7 @@ impl Hosted {
             let tree = said.lines().next().unwrap_or_default().trim().to_owned();
             let ident = [("GIT_AUTHOR_NAME", author.name.as_str()), ("GIT_AUTHOR_EMAIL", author.email.as_str()), ("GIT_COMMITTER_NAME", "kiln"), ("GIT_COMMITTER_EMAIL", "kiln@localhost")];
             let ident: Vec<(&str, &std::ffi::OsStr)> = ident.iter().map(|(k, v)| (*k, std::ffi::OsStr::new(*v))).collect();
-            let sha = text(git(&dir, &["commit-tree", &tree, "-p", &head, "-p", commit], Some(message.as_bytes()), &ident)?);
+            let sha = self.signed(&dir, text(git(&dir, &["commit-tree", "--no-gpg-sign", &tree, "-p", &head, "-p", commit], Some(message.as_bytes()), &ident)?))?;
             (sha.clone(), Merged::Merge(sha))
         };
         // The compare-and-swap: only if `into` is still where it was read.

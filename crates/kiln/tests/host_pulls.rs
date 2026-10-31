@@ -1,8 +1,9 @@
 //! The hosts' pull requests mirrored into Ship's read model (docs/ci.md W26-R01, R20, AC01, AC09):
 //! against simulators of GitHub's, GitLab's and Bitbucket's pull request APIs, shaped as each host
 //! shapes them, kiln mirrors each open pull request (its head, its other commits, its reviewers,
-//! reviews and threads) and Ship shows it by commit. Each simulator counts the requests its host
-//! would count, answering 304 to a matching `If-None-Match` without counting it, as GitHub does.
+//! reviews and threads) and Ship shows it by commit, and what the host verified of each commit's
+//! signature (W27-R03). Each simulator counts the requests its host would count, answering 304 to a
+//! matching `If-None-Match` without counting it, as GitHub does.
 
 #![cfg(unix)]
 
@@ -52,7 +53,14 @@ struct Sim {
     counted: AtomicUsize,
     /// Requests answered 304, which it doesn't.
     free: AtomicUsize,
+    /// The paths of those it counted.
+    asked: Mutex<Vec<String>>,
+    /// Signed commits: whether the host verified each, its word for it, and who signed it.
+    signed: Mutex<BTreeMap<String, (bool, &'static str, &'static str)>>,
 }
+
+/// When GitHub verified a signed commit, as it was pushed.
+const VERIFIED_AT: i64 = 1_800_000_000;
 
 fn stamp(t: i64) -> String {
     kiln::deploy::repo::rfc3339(t)
@@ -61,7 +69,16 @@ fn stamp(t: i64) -> String {
 impl Sim {
     fn start(host: Host, name: &str) -> anyhow::Result<Arc<Sim>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
-        let sim = Arc::new(Sim { host, name: name.into(), port: listener.local_addr()?.port(), pulls: Mutex::default(), counted: AtomicUsize::new(0), free: AtomicUsize::new(0) });
+        let sim = Arc::new(Sim {
+            host,
+            name: name.into(),
+            port: listener.local_addr()?.port(),
+            pulls: Mutex::default(),
+            counted: AtomicUsize::new(0),
+            free: AtomicUsize::new(0),
+            asked: Mutex::default(),
+            signed: Mutex::default(),
+        });
         let s = Arc::clone(&sim);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -85,6 +102,29 @@ impl Sim {
 
     fn counted(&self) -> usize {
         self.counted.load(Ordering::Relaxed)
+    }
+
+    /// Commit `sha` signed: `verified` by the host or not, in its word, by `by`.
+    fn sign(&self, sha: &str, verified: bool, word: &'static str, by: &'static str) {
+        if let Ok(mut m) = self.signed.lock() {
+            m.insert(sha.to_owned(), (verified, word, by));
+        }
+    }
+
+    /// The counted requests whose paths hold `part`.
+    fn asked(&self, part: &str) -> usize {
+        self.asked.lock().map(|a| a.iter().filter(|p| p.contains(part)).count()).unwrap_or(0)
+    }
+
+    /// One of a pull request's commits as GitHub lists it, with what it verified of it (as pushed,
+    /// at [`VERIFIED_AT`]).
+    fn gh_commit(&self, sha: &str) -> Value {
+        let signed = self.signed.lock().ok().and_then(|m| m.get(sha).copied());
+        let verification = match signed {
+            Some((verified, reason, _)) => json!({ "verified": verified, "reason": reason, "signature": "-----BEGIN PGP SIGNATURE-----", "payload": "tree", "verified_at": if verified { json!(stamp(VERIFIED_AT)) } else { Value::Null } }),
+            None => json!({ "verified": false, "reason": "unsigned", "signature": null, "payload": null, "verified_at": null }),
+        };
+        json!({ "sha": sha, "commit": { "verification": verification }, "committer": signed.filter(|(v, ..)| *v).map(|(.., by)| json!({ "login": by })) })
     }
 
     fn serve(&self, stream: std::net::TcpStream) -> anyhow::Result<()> {
@@ -121,6 +161,9 @@ impl Sim {
             return Ok(());
         }
         self.counted.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut a) = self.asked.lock() {
+            a.push(path);
+        }
         write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nETag: {tag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len())?;
         Ok(())
     }
@@ -176,6 +219,13 @@ impl Sim {
         if auth != token {
             return (401, json!({ "message": "401 Unauthorized" }));
         }
+        // GitLab's signature of a commit: what it verified of it, or a 404 where it's unsigned.
+        if let Some(sha) = path.strip_prefix(&format!("/api/v4/projects/{}/repository/commits/", self.name.replace('/', "%2F"))).and_then(|r| r.strip_suffix("/signature")).filter(|_| self.host == Host::Gitlab && method == "GET") {
+            return match self.signed.lock().ok().and_then(|m| m.get(sha).copied()) {
+                Some((verified, status, by)) => (200, json!({ "signature_type": "PGP", "verification_status": status, "gpg_key_user_email": if verified { json!(by) } else { Value::Null }, "commit_source": "gitaly" })),
+                None => (404, json!({ "message": "404 Signature Not Found" })),
+            };
+        }
         let Ok(pulls) = self.pulls.lock() else { return (500, Value::Null) };
         let Some(rest) = path.strip_prefix(&self.prefix()).filter(|_| method == "GET") else { return (404, json!({ "message": "Not Found" })) };
         if rest.is_empty() {
@@ -187,7 +237,7 @@ impl Sim {
         let what = segs.next().unwrap_or_default();
         let body = match (self.host, what) {
             (_, "") => self.pull_json(p),
-            (Host::Github, "commits") => json!(p.commits.iter().chain(std::iter::once(&p.head)).map(|s| json!({ "sha": s })).collect::<Vec<_>>()),
+            (Host::Github, "commits") => json!(p.commits.iter().chain(std::iter::once(&p.head)).map(|s| self.gh_commit(s)).collect::<Vec<_>>()),
             (Host::Gitlab, "commits") => json!(std::iter::once(&p.head).chain(p.commits.iter().rev()).map(|s| json!({ "id": s })).collect::<Vec<_>>()),
             (Host::Bitbucket, "commits") => json!({ "values": std::iter::once(&p.head).chain(p.commits.iter().rev()).map(|s| json!({ "hash": s })).collect::<Vec<_>>() }),
             (Host::Github, "reviews") => json!(
@@ -392,5 +442,75 @@ fn w26_ac09_fifty_pull_requests_an_hour_within_600_github_requests() -> anyhow::
     // The mirror ends as GitHub is: every head, every review, every thread.
     let want: BTreeMap<i64, (String, i64, i64)> = sim.pulls.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.values().map(|p| (i64::try_from(p.number).unwrap_or(0), (p.head.clone(), i64::try_from(p.reviews.len()).unwrap_or(0), i64::try_from(p.comments.len()).unwrap_or(0)))).collect();
     assert_eq!(got, want);
+    Ok(())
+}
+
+/// W27-R03: for a host's pull request kiln records what the host verified of each of its commits
+/// and marks what it couldn't. GitHub's verdicts come on the commits the mirror reads already (no
+/// request more); GitLab is asked of each commit's signature once (a push later asks of its new
+/// commit alone); Bitbucket verifies none, so each of its commits is kept unknown, saying so. Read
+/// back as the review page has them: each commit oldest first, the head last.
+#[test]
+fn w27_r03_kiln_records_what_each_host_verified_of_a_pull_requests_commits() -> anyhow::Result<()> {
+    let t0: i64 = 1_800_000_000;
+    for host in [Host::Github, Host::Gitlab, Host::Bitbucket] {
+        let dir = tempfile::tempdir()?;
+        let store = kiln::store::Store::open(&dir.path().join("kiln.db"))?;
+        let sim = Sim::start(host, "acme/app")?;
+        let (good, unknown_key, head, pushed) = (sha(5, 900), sha(5, 901), sha(5, 1), sha(5, 2));
+        sim.add(Pull { commits: vec![good.clone(), unknown_key.clone()], ..pull(5, t0) });
+        let (word, signer, base, auth, mhost, hword) = match host {
+            Host::Github => ("valid", "ada", format!("http://127.0.0.1:{}", sim.port), "Bearer ghs_t", mirror::Host::Github, "github"),
+            Host::Gitlab => ("verified", "ada@example.com", format!("http://127.0.0.1:{}/api/v4", sim.port), "Bearer glpat-t", mirror::Host::Gitlab, "gitlab"),
+            Host::Bitbucket => ("verified", "ada", format!("http://127.0.0.1:{}/2.0", sim.port), "Bearer bb-t", mirror::Host::Bitbucket, "bitbucket"),
+        };
+        sim.sign(&good, true, word, signer);
+        sim.sign(&unknown_key, false, "unknown_key", "");
+        let fetch = mirror::Http { base, authorization: auth.into() };
+        let r = Mirrored { repo_id: "r".into(), host: mhost, name: "acme/app".into() };
+        let (sim2, head2, pushed2) = (Arc::clone(&sim), head.clone(), pushed.clone());
+        let kept = kiln::rt::block_on(async move {
+            let (sim, head, pushed) = (sim2, head2, pushed2);
+            let mut st = State::default();
+            let mut now = t0 * 1000;
+            // Until each commit has a verdict kept: `want` commits, the last `last`.
+            let settle = async |st: &mut State, now: &mut i64, want: usize, last: &str| -> anyhow::Result<Vec<Value>> {
+                for _ in 0..120 {
+                    mirror::step(&store, &r, &fetch, st, *now).await?;
+                    let got = mirror::signatures(&store, "r", hword, 5).await?;
+                    if got.len() == want && got.last().is_some_and(|v| s(v, "/sha") == last) && got.iter().all(|v| !v.get("read_at").is_none_or(Value::is_null)) {
+                        return Ok(got);
+                    }
+                    *now += 1000;
+                }
+                anyhow::bail!("{hword}: no verdict on each of {want} commits")
+            };
+            let first = settle(&mut st, &mut now, 3, &head).await?;
+            let asked_first = sim.asked("/signature");
+            sim.change(5, |p| {
+                p.commits.push(p.head.clone());
+                p.head = pushed.clone();
+                p.updated = t0 + 30;
+            });
+            st.mirror.hook(5, now);
+            let second = settle(&mut st, &mut now, 4, &pushed).await?;
+            anyhow::Ok((first, asked_first, second))
+        })?;
+        let (first, asked_first, second) = kept;
+        let said: Vec<(&str, &str, &str, &str)> = first.iter().map(|v| (s(v, "/sha"), s(v, "/state"), s(v, "/reason"), s(v, "/signer"))).collect();
+        let want: Vec<(&str, &str, &str, &str)> = match host {
+            Host::Bitbucket => [&good, &unknown_key, &head].iter().map(|c| (c.as_str(), "unknown", "Bitbucket verifies no commit's signature", "")).collect(),
+            _ => vec![(good.as_str(), "verified", word, signer), (unknown_key.as_str(), "unverified", "unknown_key", ""), (head.as_str(), "unsigned", "unsigned", "")],
+        };
+        assert_eq!(said, want, "{hword}: each commit's verdict, oldest first, the head last");
+        let at = first.first().and_then(|v| v.get("verified_at")).and_then(Value::as_i64);
+        assert_eq!(at, (host == Host::Github).then_some(VERIFIED_AT), "{hword}: when the host verified it, where it says");
+        assert_eq!(second.iter().map(|v| s(v, "/sha")).collect::<Vec<_>>(), vec![good.as_str(), unknown_key.as_str(), head.as_str(), pushed.as_str()], "{hword}: after a push");
+        assert_eq!(second.get(..3), Some(first.as_slice()), "{hword}: verdicts kept as first read");
+        match host {
+            Host::Gitlab => assert_eq!((asked_first, sim.asked("/signature")), (3, 4), "GitLab: each commit's signature asked once"),
+            _ => assert_eq!(sim.asked("/signature"), 0, "{hword}: no request more for its verdicts"),
+        }
+    }
     Ok(())
 }

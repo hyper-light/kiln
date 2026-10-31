@@ -86,6 +86,15 @@ struct Checkout {
     filter: Option<String>,
 }
 
+/// What a checkout got, for the leg's receipt of it (docs/ci.md W27-R05).
+enum Got {
+    /// With git: fetched from the server's facade, or there already (a warm workspace's
+    /// repository, this runner's mirror).
+    Git { fetched: bool },
+    /// The commit's tarball from the server, by its SHA-256.
+    Tarball(String),
+}
+
 /// A secret or variable `name` set to `true` (W06-R13: `ACTIONS_STEP_DEBUG`, `ACTIONS_RUNNER_DEBUG`).
 fn debug_flag(a: &AssignmentV2, name: &str) -> bool {
     let truthy = |v: &str| v.eq_ignore_ascii_case("true");
@@ -1124,6 +1133,13 @@ impl Leg {
             Some(c) => c.images().await,
             None => Vec::new(),
         };
+        // Each received by the leg, by its content-addressed id, from its registry (docs/ci.md W27-R05).
+        for (role, image, id) in &images {
+            let Some(hex) = id.strip_prefix("sha256:") else { continue };
+            let mut what = crate::runner::signed::thing(format!("image/{role}"), [("sha256", hex.to_owned())]);
+            what.annotations.insert("image".into(), image.clone().into());
+            crate::runner::signed::received(&self.a.job_id, what, crate::runner::signed::Giver::Elsewhere(format!("docker://{image}")), &format!("its {role} image"));
+        }
         let env: BTreeMap<&String, String> = st.env.iter().map(|(k, v)| (k, crate::util::truncate(&st.masker.mask(v), 1000).to_owned())).collect();
         let body = serde_json::json!({
             "machine": fingerprint(&self.a.executor.kind), "version": env!("CARGO_PKG_VERSION"), "executor": self.a.executor.kind,
@@ -1663,9 +1679,35 @@ impl Leg {
         }
     }
 
-    /// Checks `c.git_ref` out from the server's mirror into the workspace (or `c.path` below it),
-    /// through the git facade with the job's token; with no git, the commit's tarball.
+    /// [`Self::fetch_checkout`], then the leg's receipt of what it checked out (docs/ci.md
+    /// W27-R05): git's commit and tree, from the server or from what this runner held; or the
+    /// server's tarball by its SHA-256, with the commit it was asked for.
     async fn checkout(&self, st: &State, idx: u32, c: &Checkout) -> anyhow::Result<()> {
+        use crate::runner::signed::{Giver, received, thing};
+        let got = self.fetch_checkout(st, idx, c).await?;
+        // The run's commit in the workspace is what kiln handed the leg (its delegation names it);
+        // another ref, or another place, is the leg's own doing.
+        let root = c.path.is_empty() || c.path == ".";
+        let name = if root && c.git_ref == self.a.sha { "checkout".to_owned() } else { format!("checkout/{}@{}", if root { "." } else { c.path.as_str() }, c.git_ref) };
+        let (what, from) = match got {
+            Got::Tarball(sha256) => {
+                let mut t = thing(name, [("sha256", sha256)]);
+                t.annotations.insert("commit".into(), c.git_ref.clone().into());
+                (t, Giver::Server)
+            }
+            Got::Git { fetched } => {
+                let dir = if root { st.layout.workspace.clone() } else { st.layout.workspace.join(&c.path) };
+                let Some((commit, tree)) = crate::rt::blocking(move || super::warm::head_and_tree(&dir)).await.ok().flatten() else { return Ok(()) };
+                (thing(name, [("gitCommit", commit), ("gitTree", tree)]), if fetched { Giver::Server } else { Giver::Runner })
+            }
+        };
+        received(&self.a.job_id, what, from, "its checkout");
+        Ok(())
+    }
+
+    /// Checks `c.git_ref` out from the server's mirror into the workspace (or `c.path` below it),
+    /// through the git facade with the job's token; with no git, the commit's tarball. What it got.
+    async fn fetch_checkout(&self, st: &State, idx: u32, c: &Checkout) -> anyhow::Result<Got> {
         use base64::Engine as _;
         let a = &self.a;
         let sha = Some(c.git_ref.clone()).filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("the run has no commit"))?;
@@ -1726,7 +1768,9 @@ impl Leg {
                     set.extend(c.sparse.iter().map(String::as_str));
                     steps.push(set);
                 }
-                if !in_place || (!have && mirror.is_none()) {
+                // Fetched from the server, or there already: the warm workspace's, this runner's mirror's.
+                let fetched = !in_place || (!have && mirror.is_none());
+                if fetched {
                     steps.push(fetch.clone());
                 }
                 if !in_place {
@@ -1763,7 +1807,7 @@ impl Leg {
                 if !crate::rt::blocking(move || pack_refs(&dir)).await.unwrap_or(false) {
                     tracing::debug!(workspace = %w, "git pack-refs failed: the checkout keeps no packed-refs");
                 }
-                let Some(x) = warm.filter(|_| in_place) else { return Ok(()) };
+                let Some(x) = warm.filter(|_| in_place) else { return Ok(Got::Git { fetched }) };
                 // In place: only the files that differ are written, the rest keep their mtimes, and
                 // everything but the kept folders is cleaned. A ref (not a SHA) was fetched first.
                 let target = if is_sha(&sha) { sha.clone() } else { "FETCH_HEAD".to_owned() };
@@ -1775,7 +1819,7 @@ impl Leg {
                         let via = if mirror.is_some() { " from this runner's mirror" } else { "" };
                         let kept = if x.kept.is_empty() { String::new() } else { format!("; kept: {}", x.kept.join(", ")) };
                         self.note(idx, &format!("Checked out {}{via} in place{over}: {} files changed{kept}.", short(&sha), done.changed)).await;
-                        return Ok(());
+                        return Ok(Got::Git { fetched });
                     }
                     Err(e) => {
                         self.note(idx, &format!("The warm workspace couldn't be checked out in place ({e:#}): it starts over, its kept folders left.")).await;
@@ -1813,8 +1857,9 @@ impl Leg {
             bytes.extend_from_slice(&c);
             anyhow::ensure!(bytes.len() < 8 << 30, "the commit is over 8 GiB");
         }
+        let sha256 = crate::util::sha256_hex(&bytes);
         crate::rt::blocking(move || unpack_tree(&bytes, &ws)).await??;
-        Ok(())
+        Ok(Got::Tarball(sha256))
     }
 
     /// Starts `step` in the background when it says so (W06-R17): on a copy of the leg's state,
@@ -2228,6 +2273,8 @@ impl Leg {
                     continue;
                 }
             };
+            // The leg hands the report on by its digest, which it signs at its end (docs/ci.md W27-R05).
+            let digest = crate::util::sha256_hex(&body);
             let url = format!("{base}/_kiln/test-results?step={idx}&format={}&path={}&root={}", crate::ci::cli::enc(&format), crate::ci::cli::enc(f), crate::ci::cli::enc(&root.to_string_lossy()));
             let sent = async {
                 let resp = self.http.put(&url).bearer(&self.a.runtime.runtime_token).body(body).timeout(Duration::from_secs(120)).send().await?;
@@ -2245,6 +2292,7 @@ impl Leg {
                     continue;
                 }
             };
+            crate::runner::signed::report(&self.a.job_id, idx, f, &digest);
             let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
             let (fails, errors) = (n("failed"), n("errors"));
             failed += fails + errors;
@@ -3421,6 +3469,9 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
 
 /// One Node runtime download at a time (they share `<work>/_externals`).
 static NODE_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// Beside an action kept under `<work>/_actions`: its tarball's SHA-256 (hex), for the receipts of
+/// the legs that use it (docs/ci.md W27-R05).
+const ACTION_SHA256: &str = ".kiln-sha256";
 static ACTION_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
 /// How many times a step asks the internet for what it needs (a Node build) before it fails, as
@@ -3510,10 +3561,12 @@ impl Leg {
         let dir = self.work_dir.join("_actions").join(r.repo.replace("..", "_")).join(key);
         let done = dir.join(".kiln-complete");
         if done.exists() {
+            self.got_action(r, &dir, crate::runner::signed::Giver::Runner);
             return Ok(dir);
         }
         let _g = ACTION_LOCK.lock().await;
         if done.exists() {
+            self.got_action(r, &dir, crate::runner::signed::Giver::Runner);
             return Ok(dir);
         }
         let mut resp = self.http.get(&r.url).bearer(&self.a.runtime.runtime_token).timeout(Duration::from_secs(300)).send().await?;
@@ -3525,16 +3578,33 @@ impl Leg {
             bytes.extend_from_slice(&c);
             anyhow::ensure!(bytes.len() < 1 << 30, "the action is over 1 GiB");
         }
-        let d = dir.clone();
+        let (d, sha256) = (dir.clone(), crate::util::sha256_hex(&bytes));
         crate::rt::blocking(move || -> anyhow::Result<()> {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d)?;
             tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice())).unpack(&d)?;
+            std::fs::write(d.join(ACTION_SHA256), sha256.as_bytes())?;
             std::fs::write(d.join(".kiln-complete"), b"")?;
             Ok(())
         })
         .await??;
+        self.got_action(r, &dir, crate::runner::signed::Giver::Server);
         Ok(dir)
+    }
+
+    /// The leg's receipt of action `r`, kept in `dir` (docs/ci.md W27-R05): by its pinned commit,
+    /// and its tarball's SHA-256 when this runner kept that (one fetched by an older runner has
+    /// only its pin), from whoever gave it to the leg.
+    fn got_action(&self, r: &kiln_ci::wire::ActionRef, dir: &Path, from: crate::runner::signed::Giver) {
+        let mut digests = vec![("gitCommit", r.sha.clone())];
+        if let Some(d) = std::fs::read_to_string(dir.join(ACTION_SHA256)).ok().map(|d| d.trim().to_owned()).filter(|d| d.len() == 64) {
+            digests.push(("sha256", d));
+        }
+        let mut what = crate::runner::signed::thing(format!("action/{}", r.repo), digests);
+        if !r.path.is_empty() {
+            what.annotations.insert("path".into(), r.path.clone().into());
+        }
+        crate::runner::signed::received(&self.a.job_id, what, from, &format!("its action {}@{}", r.repo, r.sha));
     }
 
     /// A Node runtime for `using` (W07-R05): `node24` on Node 24; `node20`, `node16` and
@@ -4284,6 +4354,11 @@ impl Leg {
             match super::cache::restore(&self.cache_service(), &keys, &paths.version(), &scope, local.as_ref(), &archive, look_only).await {
                 Ok(Some(found)) => {
                     exact = found.key.eq_ignore_ascii_case(&key);
+                    // Received by the leg, by the digest it checked it whole by (docs/ci.md W27-R05).
+                    if let Some(d) = &found.digest {
+                        let what = crate::runner::signed::thing(format!("cache/{}", found.key), [("sha256", d.clone())]);
+                        crate::runner::signed::received(&self.a.job_id, what, crate::runner::signed::Giver::Server, &format!("its cache {}", found.key));
+                    }
                     if !look_only {
                         let (a, p, staging) = (archive.clone(), paths.clone(), st.layout.temp.join(format!("kiln-cache-{}", crate::util::new_id())));
                         crate::rt::blocking(move || super::cache::unpack(&a, &p, &staging)).await??;
@@ -4386,7 +4461,13 @@ impl Leg {
             self.annotate(idx, "warning", "Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.").await;
         } else {
             match super::cache::save(&self.cache_service(), &key, &paths.version(), &scope, local.as_ref(), &archive).await {
-                Ok(Some(s)) => self.note(idx, &format!("Cache saved with key: {key} ({} chunks; {} of {} bytes sent)", s.chunks, s.uploaded, s.size)).await,
+                Ok(Some(s)) => {
+                    // Handed on by the leg, by its digest (docs/ci.md W27-R05).
+                    let mut what = crate::runner::signed::thing(format!("cache/{key}"), [("sha256", s.digest.clone())]);
+                    what.size = Some(s.size);
+                    crate::runner::signed::handed_on(&self.a.job_id, what);
+                    self.note(idx, &format!("Cache saved with key: {key} ({} chunks; {} of {} bytes sent)", s.chunks, s.uploaded, s.size)).await;
+                }
                 Ok(None) => self.note(idx, &format!("Another job saved key {key} first: nothing more to save")).await,
                 Err(e) => self.annotate(idx, "warning", &format!("Failed to save: {e:#}")).await,
             }

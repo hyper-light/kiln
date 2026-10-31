@@ -157,6 +157,10 @@ pub struct Ci {
     /// key = "/etc/kiln/land_ed25519"   # an SSH private key; with format = "openpgp", a key id
     /// ```
     pub land_signing: Option<LandSigning>,
+    /// Whether a new repository kiln hosts requires the commits pushed to it to be signed by
+    /// someone kiln verifies (`required`, the default) or only warns (`warn`), where its
+    /// `.kiln/review.yaml` doesn't say (docs/ci.md W27-R03). Repositories from before warn.
+    pub signatures: kiln_ci::land::SignatureMode,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
