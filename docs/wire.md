@@ -450,9 +450,10 @@ takes a new bit, never one that means something already, even in the other direc
 | 39 | `CAP_HEADROOM` | `AgentMsg::Caps`, `ServerMsg::Caps` | headroom: the runner keeps its machine's from settings the server sends and says how it does, the server takes that (`Headroom`, `HeadroomStatus`; docs/headroom.md) |
 | 40 | `CAP_CHANGES_PATCH` | `ServerMsg::Caps` | the server takes a session's changeset as what changed in it (`Update::ChangesPatch`), so a runner sends the files an agent touched, not the whole changeset |
 | 41 | `CAP_UNREAD` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side takes word that a frame of its couldn't be read (`Unread`, "What can't be read") |
-| 43 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix runners say it |
+| 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
 
-Bit 42 is kept for W27's agent git credential (`CAP_AGENT_GIT`), on its way. Bits from 44 are free.
+Bits 42 to 52 are kept for lines on their way: W27's agent git credential, leg signing and custody
+(`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and the unification's. Bits from 54 are free.
 Take the next one, and add its row here in the same change.
 
 ## The lab

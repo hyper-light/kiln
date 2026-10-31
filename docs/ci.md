@@ -8598,7 +8598,7 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     new, and exactly those are let go on (`NtResumeProcess`). A step that starts while its job is
     frozen is frozen as it starts. Its job container is paused (`docker pause`). Resume undoes each.
   - The runner is asked with `ServerMsg::Freeze` (appended last), only a runner that says it can
-    (`CAP_FREEZE`, bit 43: Unix and Windows). Its answer comes once it's done, or why not. Pausing
+    (`CAP_FREEZE`, bit 53: Unix and Windows). Its answer comes once it's done, or why not. Pausing
     a job on any other runner (a kiln from before Pause came to its platform) is refused saying so,
     and nothing is sent.
   - Its time limits stop while it's paused: the job's and a step's on the runner, and v1's
