@@ -29,6 +29,7 @@ import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
 import { handleReap } from "./reap.ts";
+import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
@@ -1508,6 +1509,8 @@ const server = http.createServer(async (req, res) => {
     if (await handleKeep(req, res, url, { json, body })) return;
     // ---- the reaper's policies (W24-R31) ----
     if (await handleReap(req, res, url, { json, body })) return;
+    // ---- experiments from an agent's question (docs/ci.md W20-R11) ----
+    if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 

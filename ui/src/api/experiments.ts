@@ -56,6 +56,8 @@ export interface ExRun {
   round: number;
   criterion: string;
   run?: string;
+  /** The machine a command ran on beside the agent that asked (none for a CI run). */
+  on?: string;
   conclusion?: string;
   why?: string;
   metrics: Record<string, number>;
@@ -111,12 +113,26 @@ export interface ExperimentRow {
   created_at: number;
 }
 
-/** Where an experiment from an agent's question runs: its folder's repository and the workflows that can measure one. */
+/** What an agent suggested measuring its question's options by (`experiments.suggest`). */
+export interface ExSuggested {
+  /** The question, as asked (none: its next). */
+  question?: string;
+  criteria: ExCriterion[];
+  at: number;
+}
+
+/** Where an experiment from an agent's question runs: its folder's repository, the machine its checks run on, the workflows that can measure one (CI's engine on), and what the agent suggested. */
 export interface ExperimentWhere {
   repo: string;
   branch: string;
   workflows: string[];
   may: boolean;
+  /** The machine each variant's checks run on, in a worktree of its own there. */
+  machine?: string;
+  /** Whether CI's engine is on: a pipeline is offered only then. */
+  ci?: boolean;
+  /** Newest first. */
+  suggested?: ExSuggested[];
 }
 
 export const experimentsApi = {

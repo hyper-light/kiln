@@ -11,9 +11,9 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { diffStats, relPath, tildify } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
-import { experimentsApi, experimentWhereRes } from "@/api/experiments";
+import { experimentsApi, experimentWhereRes, type ExCriterion } from "@/api/experiments";
 import { useRes } from "@/lib/data";
-import { answersToClaude, Choices, type ChoiceAnswer, type ChoiceQuestion, type ChoicesProps, type ExperimentSpec } from "./choices";
+import { answersToClaude, Choices, type ChoiceAnswer, type ChoiceQuestion, type ChoicesProps, type Criterion, type ExperimentSpec } from "./choices";
 import { Prose, ToolIcon } from "./parts";
 import { SavePlan } from "@/views/plans/save";
 import { Highlighted } from "@/components/code/highlighted";
@@ -84,8 +84,22 @@ function optionName(label: string, taken: string[]): string {
   return name;
 }
 
-/** The dialog's criteria, as an experiment takes them. */
-function criteriaOf(spec: ExperimentSpec) {
+/** An experiment's criterion (one an agent suggested), as the setup takes it. */
+export function criterionFrom(c: ExCriterion): Criterion {
+  if (c.kind === "pipeline") return { kind: "pipeline", pipeline: c.workflow ?? "", required: c.required };
+  if (c.kind === "command") return { kind: "command", command: c.command ?? "", required: c.required };
+  const t = c.threshold;
+  const threshold =
+    t?.better !== undefined
+      ? { type: "relative" as const, value: Math.round(t.better * 1000) / 10 }
+      : (t?.at_most ?? t?.at_least) !== undefined
+        ? { type: "absolute" as const, value: t?.at_most ?? t?.at_least ?? NaN }
+        : undefined;
+  return { kind: "metric", metric: c.metric ?? c.name, better: c.better ?? "lower", ...(threshold && { threshold }), required: c.required };
+}
+
+/** The setup's criteria, as an experiment takes them. */
+export function criteriaOf(spec: ExperimentSpec) {
   return spec.criteria.map((c, i) => {
     if (c.kind === "pipeline") return { name: `pipeline-${i + 1}`, kind: "pipeline", workflow: c.pipeline ?? "", required: c.required ?? true };
     if (c.kind === "command") return { name: `command-${i + 1}`, kind: "command", command: c.command ?? "", required: c.required ?? true };
@@ -138,7 +152,7 @@ function WithExperiment({
         criteria: criteriaOf(spec),
         repetitions: spec.repetitions,
         max_parallel: spec.maxParallel,
-        ...(spec.budgetMinutes && { budget_minutes: spec.budgetMinutes }),
+        ...(spec.budgetSeconds && { budget_seconds: spec.budgetSeconds }),
         decide: spec.decide,
       });
       answer([
@@ -156,7 +170,12 @@ function WithExperiment({
   };
   return (
     <>
-      {render({ onExperiment: (spec, others) => void start(spec, others), pipelines: where.workflows })}
+      {render({
+        onExperiment: (spec, others) => void start(spec, others),
+        pipelines: where.workflows,
+        machine: where.machine,
+        suggested: where.suggested?.map((s) => ({ question: s.question, criteria: s.criteria.map(criterionFrom) })),
+      })}
       {error && <p className="text-[12.5px] text-[#d1aaad]">{error}</p>}
     </>
   );
