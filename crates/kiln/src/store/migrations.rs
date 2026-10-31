@@ -20,7 +20,9 @@ use anyhow::bail;
 use crate::sql::{Connection, OptionalExtension as _, params};
 
 /// The newest schema epoch this build reads and writes: at least every shipped migration's.
-pub const SCHEMA_EPOCH: u32 = 3;
+// U05: epoch 3 writers append only files and cannot maintain accepted-prefix authority.
+// This reader fence is separate from the ordinary publisher epoch and physical writer drain.
+pub const SCHEMA_EPOCH: u32 = 4;
 
 /// The database's `min_reader_epoch`, as last read or raised here (0: none said).
 static MIN_READER: AtomicU32 = AtomicU32::new(0);
@@ -249,6 +251,13 @@ mod tests {
         let store=crate::store::Store::open(&path)?;
         let before=store.now(|c| {
             c.execute("INSERT INTO kv(k,v) VALUES('migration-reopen','kept')",[])?;
+            c.execute("INSERT INTO ci_log_accepted_views(job,view,job_order,root,qualification) VALUES('migration-reopen','retained-prefix',123,?1,'historical_snapshot_then_legacy_observed_job_view')",["0".repeat(64)])?;
+            c.execute("INSERT INTO ci_log_accepted_ops(operation,job,view,expected_revision,expected_root,staged_revision,staged_root,staged_bytes,staged_chunks,step,input_key,input_hash,input_bytes,origin,baseline_host,baseline_bytes,baseline_state,input_ready,status,receipt_revision,receipt_root) VALUES('reopen-copy','migration-reopen','retained-prefix',0,?1,0,?1,0,0,1,'reopen-input',?1,0,'server-memo-copy','migration',0,'ready',1,'no_bytes',0,?1)",["0".repeat(64)])?;
+            c.execute("INSERT INTO ci_log_accepted_copy(operation,request_hash,source_job,descriptor,active,target_attempt,effect,result_hash,result_bytes,result_ready,metadata_applied,object_cursor,objects_complete) VALUES('reopen-copy',?1,'original-source',?2,0,1,?1,?3,0,1,1,1,1)",params!["0".repeat(64),r#"{"NoBytes":{"job":"original-source","step":1,"qualification":"no_captured_bytes_no_delivery_claim"}}"#,crate::util::sha256_hex(b"")])?;
+            c.execute("INSERT INTO ci_log_copy_objects(operation,digest,size) VALUES('reopen-copy',?1,7)",["a".repeat(64)])?;
+            c.execute("INSERT INTO ci_log_accepted_pins(key,view,operation,hash,bytes,put_started,ready,ambiguous) VALUES('reopen-uncertain','retained-prefix','reopen-copy',?1,1,1,1,1)",["b".repeat(64)])?;
+            let refused=check_against(c,3,MIGRATIONS).err().map(|e|e.to_string()).unwrap_or_default();
+            assert!(refused.contains("needs a kiln of schema epoch 4 or newer, and this is 3"),"epoch-3 file-only writers must refuse: {refused}");
             assert!(apply_list(c, MIGRATIONS)?.is_empty(),"the complete shipped history reapplied a migration");
             snapshot(c)
         })?;
@@ -258,6 +267,11 @@ mod tests {
         let after=reopened.now(|c| {
             assert!(apply_list(c, MIGRATIONS)?.is_empty(),"reopen reapplied a shipped migration");
             assert_eq!(c.query_row("SELECT v FROM kv WHERE k='migration-reopen'",[],|r|r.get::<_,String>(0))?,"kept");
+            assert_eq!(c.query_row("SELECT view,job_order,revision,root FROM ci_log_accepted_views WHERE job='migration-reopen'",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?,("retained-prefix".into(),123,0,"0".repeat(64)),"roll-forward retains exact accepted authority metadata");
+            assert_eq!(c.query_row("SELECT source_job,target_attempt,result_ready,metadata_applied,object_cursor,objects_complete FROM ci_log_accepted_copy WHERE operation='reopen-copy'",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u32>(1)?,r.get::<_,bool>(2)?,r.get::<_,bool>(3)?,r.get::<_,u64>(4)?,r.get::<_,bool>(5)?)))?,("original-source".into(),1,true,true,1,true));
+            assert_eq!(c.query_row("SELECT size FROM ci_log_copy_objects WHERE operation='reopen-copy'",[],|r|r.get::<_,u64>(0))?,7,"flat target output custody survives roll-forward");
+            assert!(c.query_row("SELECT ambiguous FROM ci_log_accepted_pins WHERE key='reopen-uncertain'",[],|r|r.get::<_,bool>(0))?,"an uncertain physical PUT lifetime cannot be normalized away on reopen");
+            assert_eq!(read_min_reader(c)?,4,"reader epoch never falls on reopen; already-open older writers still require an external physical drain");
             snapshot(c)
         })?;
         assert_eq!(after,before,"reopen changed the shipped schema or migration receipts");
@@ -326,7 +340,7 @@ mod tests {
             assert_eq!(numbers, ["CR3", "D1", "D2", "D4"]);
             let changes: i64 = c.query_row("SELECT COUNT(*) FROM changes", [], |r| r.get(0))?;
             assert_eq!(changes, 4);
-            assert_eq!(read_min_reader(c)?, 0, "no epoch raised: older builds still open it");
+            assert_eq!(read_min_reader(c)?, 4, "the full migration suffix includes the later U05 accepted-prefix reader fence");
             Ok(())
         })
     }
@@ -355,7 +369,7 @@ mod tests {
             assert!(c.execute("INSERT INTO revocations (serial, subject, at, by) VALUES ('0a', 'fedora-2', 1, 'ada')", []).is_err(), "a revocation says why");
             let (at, reason, by): (i64, String, String) = c.query_row("SELECT at, reason, by FROM revocations WHERE serial = '0a'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             assert_eq!((at, reason.as_str(), by.as_str()), (1_790_000_000, "runner forgotten", "ada"));
-            assert_eq!(read_min_reader(c)?, 0, "no epoch raised: older builds still open it");
+            assert_eq!(read_min_reader(c)?, 4, "the full migration suffix includes the later U05 accepted-prefix reader fence");
             Ok(())
         })
     }

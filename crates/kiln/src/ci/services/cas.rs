@@ -63,8 +63,12 @@ struct Guard {
 
 static GUARD: LazyLock<Guard> = LazyLock::new(|| Guard { stripes: (0..STRIPES).map(|_| async_lock::Mutex::new(())).collect(), uploading: Mutex::default() });
 
+fn stripe_index(digest: &str) -> usize {
+    digest.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b))) % STRIPES
+}
+
 fn stripe(digest: &str) -> &'static async_lock::Mutex<()> {
-    let n = digest.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b))) % STRIPES;
+    let n = stripe_index(digest);
     // `n` is below STRIPES, the length.
     GUARD.stripes.get(n).unwrap_or_else(|| first_stripe())
 }
@@ -116,6 +120,62 @@ async fn record(hub: &Hub, digest: &str, size: u64) -> anyhow::Result<bool> {
             Ok(was)
         })
         .await
+}
+
+/// U05/W24-R07: a bounded page of a memo copy's output objects. The accepted-copy owner keeps the
+/// manifest cursor and completion state; this helper only pins one page under CAS collection's
+/// existing locks and canonical SQL transaction.
+pub(crate) const COPY_OBJECT_PAGE: usize = 32;
+
+/// Keeps `objects` for the original accepted-copy operation. The caller must not publish its
+/// log copy, release its source lease or return its saved success until every manifest page has
+/// a durable acknowledgement. An elapsed Store deadline has unknown outcome: retry the same
+/// operation/page and retain its staged refs. Byte reads and tree parsing happen outside this
+/// helper and outside the shared writer.
+pub(crate) async fn pin_copy_objects(
+    store: &crate::store::Store,
+    operation: &str,
+    objects: &[kiln_ci::work::memo::Digest],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!objects.is_empty() && objects.len() <= COPY_OBJECT_PAGE, "a copy object page holds 1..={COPY_OBJECT_PAGE} objects");
+    let mut objects = objects.to_vec();
+    objects.sort_unstable();
+    for object in &objects {
+        anyhow::ensure!(is_digest(&object.hash) && object.hash.bytes().all(|b| !b.is_ascii_uppercase()), "a copy object must have a lowercase SHA-256");
+        anyhow::ensure!(i64::try_from(object.size_bytes).is_ok(), "a copy object size exceeds the SQL bound");
+    }
+    for adjacent in objects.windows(2) {
+        let [left, right] = adjacent else { continue };
+        anyhow::ensure!(left.hash != right.hash || left.size_bytes == right.size_bytes, "a copy page gives conflicting sizes for one digest");
+    }
+    objects.dedup();
+    let mut stripes: Vec<usize> = objects.iter().map(|object| stripe_index(&object.hash)).collect();
+    stripes.sort_unstable();
+    stripes.dedup();
+    let mut held = Vec::with_capacity(stripes.len());
+    for index in stripes {
+        let lock = GUARD.stripes.get(index).ok_or_else(|| anyhow::anyhow!("the CAS stripe is absent"))?;
+        held.push(lock.lock().await);
+    }
+    let operation = operation.to_owned();
+    let result = store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        // The accepted owner verifies this exact original copy, its current target row/view
+        // and an unretired authority. It must refuse an absent, mismatched or refused operation.
+        crate::logs::accepted::require_copy_object_pin(&tx, &operation)?;
+        for object in &objects {
+            let size = i64::try_from(object.size_bytes)?;
+            let stored: Option<i64> = tx.query_row("SELECT size FROM cas_index WHERE digest = ?1", [&object.hash], |row| row.get(0)).optional()?;
+            anyhow::ensure!(stored == Some(size), "copy output {} is absent or has another size", object.hash);
+            let pinned: Option<i64> = tx.query_row("SELECT size FROM ci_log_copy_objects WHERE operation = ?1 AND digest = ?2", params![operation, object.hash], |row| row.get(0)).optional()?;
+            anyhow::ensure!(pinned.is_none_or(|old| old == size), "copy output {} has a conflicting original pin", object.hash);
+            tx.execute("INSERT INTO ci_log_copy_objects (operation, digest, size) VALUES (?1, ?2, ?3) ON CONFLICT (operation, digest) DO NOTHING", params![operation, object.hash, size])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }).await;
+    drop(held);
+    result
 }
 
 /// Puts a file's content into the store and records it; the file is left as it is. Content kept
@@ -294,7 +354,8 @@ const UNREFERENCED: &str = "digest NOT IN (SELECT object FROM ci_caches WHERE ob
    AND digest NOT IN (SELECT object FROM test_reports)
    AND 'sha256:' || digest NOT IN (SELECT digest FROM registry_blobs)
    AND digest NOT IN (SELECT digest FROM proxy_cache)
-   AND digest NOT IN (SELECT substr(key, -64) FROM work_records WHERE family = 'work.object')";
+   AND digest NOT IN (SELECT substr(key, -64) FROM work_records WHERE family = 'work.object')
+   AND NOT EXISTS (SELECT 1 FROM ci_log_copy_objects AS held_copy WHERE held_copy.digest = cas_index.digest)";
 
 /// Lets go of objects nothing refers to, unused for an hour (an upload in progress may be about to
 /// refer to one): each one's record, then its bytes, under its digest's lock.

@@ -2682,7 +2682,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             }
             event @ (Ev::Net(Some(NetEvent::Frame { .. })) | Ev::Forwarded(_) | Ev::OrdinaryInput(_)) => {
                 let (data, origin) = match event {
-                    Ev::Net(Some(NetEvent::Frame { data, connection, .. })) => (data, connection),
+                    Ev::Net(Some(NetEvent::Frame { data, connection, .. })) => (data.into_vec(), connection),
                     Ev::Forwarded(data) => (data, None),
                     Ev::OrdinaryInput(ticket) => {
                         answer_after=Some((ticket.stream().into(),ticket.seq(),None));

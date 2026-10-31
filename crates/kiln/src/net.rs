@@ -35,6 +35,9 @@ use hyper_transport::{
 
 use crate::pki::Leaf;
 
+mod receive;
+pub(crate) use receive::FrameBytes;
+
 /// The server is always peer 1 from an agent's point of view.
 pub const SERVER_PEER: PeerId = 1;
 
@@ -42,6 +45,8 @@ pub const SERVER_PEER: PeerId = 1;
 pub enum Class {
     Interactive,
     Bulk,
+    // U05: sender-role classification only; no wire kind or peer API changes.
+    BulkFromAgent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -68,13 +73,14 @@ impl Classes for Kiln {
     fn rank(class: Class) -> u8 {
         match class {
             Class::Interactive => 0,
-            Class::Bulk => 1,
+            Class::Bulk | Class::BulkFromAgent => 1,
         }
     }
 
-    fn class_of(kind: Kind, _role: Role) -> Option<Class> {
+    fn class_of(kind: Kind, role: Role) -> Option<Class> {
         Some(match kind {
             Kind::Control | Kind::Term => Class::Interactive,
+            Kind::Log if role==Role::Agent => Class::BulkFromAgent,
             Kind::Log => Class::Bulk,
         })
     }
@@ -82,9 +88,13 @@ impl Classes for Kiln {
     fn frame_bound(class: Class) -> u64 {
         match class {
             Class::Interactive => 1 << 20,
-            Class::Bulk => 4 << 20,
+            Class::Bulk | Class::BulkFromAgent => 4 << 20,
         }
     }
+
+    // Explicit U05 policy: Agent-Bulk waits for its finite grant partition, instead of
+    // skipping legal legacy frames under budget pressure. Server-Bulk remains as before.
+    fn lossless(class:Class)->bool {class==Class::BulkFromAgent}
 
     fn kind_code(kind: Kind) -> u16 {
         match kind {
@@ -268,6 +278,8 @@ pub enum Out {
     Connect { addr: SocketAddr },
     /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
     Rebuild,
+    /// Wake only: exact receive-grant state remains in the original accountant.
+    ReceiveReleased,
     /// A test build's fault (`crate::runner::chaos`: `shed=`, `twice=`, `late=`): frames dropped,
     /// sent twice or sent late as [`Shed`] says, from now on, beside the faults said before.
     Shed(Shed),
@@ -415,7 +427,7 @@ impl Named for AgentBook {
 }
 
 /// What `ep` measures now: its counts, and each named peer it has a connection to.
-fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Fixed, D>) -> QuicSample {
+fn sample<B:hyper_transport::Budget<Class>,D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, B, D>) -> QuicSample {
     let st = ep.stats();
     let mut out = QuicSample {
         connections: st.connections as u64,
@@ -440,7 +452,7 @@ pub enum NetEvent {
     Connected { peer: PeerId, epoch: u64, name: Option<String>, binding: Option<[u8; 32]>, admission: ApplicationPermit },
     Closed { peer: PeerId, epoch: u64, reason: String, admission: ApplicationPermit },
     Unreachable { peer: PeerId, reason: String, admission: ApplicationPermit },
-    Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>, connection: Option<Connection>, admission: ApplicationPermit },
+    Frame { peer: PeerId, lane: u32, kind: Kind, data: FrameBytes, connection: Option<Connection>, admission: ApplicationPermit },
 }
 
 impl NetEvent {
@@ -608,7 +620,8 @@ fn start_with(spec:Spec,routes:Option<std::collections::HashSet<String>>)->anyho
     for (key,why) in &spec.revoked_keys { policy.revoked_keys.entry(key.clone()).or_insert_with(||why.clone()); }
     let state=Arc::new(Mutex::new(policy));
     let owner=Arc::clone(&state);
-    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx,owner))?;
+    let receives=spec.server.then(||receive::Owner::new(tx.downgrade()));
+    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx,owner,receives))?;
     Ok((NetHandle { tx,state }, erx))
 }
 
@@ -620,20 +633,30 @@ enum Exit {
     Rebuild { redial: bool },
 }
 
-fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel::Sender<NetEvent>,state:SharedState) {
+fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel::Sender<NetEvent>,state:SharedState,receives:Option<receive::Owner>) {
     let spec = Arc::new(spec);
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
     let config = crate::rt::runtime_config(1, 1024);
     let mut backoff = Duration::from_millis(200);
     loop {
+        if rx.is_closed() && rx.is_empty() {return}
         let started = Instant::now();
+        // Declared before LocalRuntime: its Shard/root/Driver/Endpoint are fully dropped
+        // before Generation retires only the grants not held by exact external Arcs.
+        let generation=match receives.as_ref().map(receive::Owner::begin).transpose() {
+            Ok(generation)=>generation,
+            Err(error)=>{if rx.is_closed(){return}tracing::error!(error=%format!("{error:#}"),"receive authority fenced; no endpoint capacity manufactured");std::thread::sleep(Duration::from_secs(1));continue}
+        };
+        let budget=generation.as_ref().map(|g|g.budget.clone());
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&state)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&state),budget))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
+        // Each match arm above has dropped its LocalRuntime already, including ShardGone.
+        drop(generation);
         match outcome {
             Ok(Ok(Exit::Closed)) => return,
             Ok(Ok(Exit::Rebuild { redial })) => {
@@ -666,7 +689,7 @@ enum Dial {
     Connected,
 }
 
-type ServerDriver = Driver<Kiln, Fixed, ServerBook>;
+type ServerDriver = Driver<Kiln, receive::Budget, ServerBook>;
 type AgentDriver = Driver<Kiln, Fixed, AgentBook>;
 
 enum AnyDriver {
@@ -684,13 +707,13 @@ macro_rules! with_driver {
 }
 
 /// Builds the endpoint and binds its socket; must run on the net thread's shard.
-fn build(spec: &Spec,state:SharedState) -> anyhow::Result<AnyDriver> {
+fn build(spec: &Spec,state:SharedState,budget:Option<receive::Budget>) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
-    let budget = Fixed::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
     let io = Io { batch: 64 };
     let now = Instant::now();
     if spec.server {
+        let budget=budget.ok_or_else(||anyhow::anyhow!("server receive accountant is absent"))?;
         let cfg = Config { tls, role: Role::Server, limits: limits(true), congestion: Default::default() };
         drop(state_lock(&state)?);
         let book = ServerBook { state, ..ServerBook::default() };
@@ -699,6 +722,7 @@ fn build(spec: &Spec,state:SharedState) -> anyhow::Result<AnyDriver> {
         let d = Driver::bind(ep, spec.bind, io).map_err(|e| anyhow::anyhow!("bind {}: {e}", spec.bind))?;
         Ok(AnyDriver::Server(d))
     } else {
+        let budget=Fixed::new(256<<20,256);
         let cfg = Config { tls, role: Role::Agent, limits: limits(false), congestion: Default::default() };
         let ep = Endpoint::<Kiln, _, _>::new(cfg, budget, AgentBook, now)
             .map_err(|r| anyhow::anyhow!("endpoint: {r}"))?;
@@ -938,8 +962,9 @@ async fn run_loop(
     rx: async_channel::Receiver<Out>,
     etx: async_channel::Sender<NetEvent>,
     state: SharedState,
+    budget:Option<receive::Budget>,
 ) -> anyhow::Result<Exit> {
-    let mut driver = build(&spec,Arc::clone(&state))?;
+    let mut driver = build(&spec,Arc::clone(&state),budget.clone())?;
     // The replacement endpoint is built with the canonical policy before this ACK is emitted.
     {
         let mut policy=state_lock(&state)?;
@@ -969,6 +994,7 @@ async fn run_loop(
     }
     let mut outbox = Outbox::default();
     let mut events: Vec<NetEvent> = Vec::with_capacity(64);
+    let mut held=std::collections::BTreeSet::new();
 
     enum Ev {
         Cmd(Option<Out>),
@@ -1155,6 +1181,7 @@ async fn run_loop(
                             }
                         }
                         Out::Rebuild => rebuilding=Some(true),
+                        Out::ReceiveReleased => {}
                     }
                 }
                 if let Some(redial)=rebuilding { return Ok(Exit::Rebuild {redial}); }
@@ -1168,9 +1195,11 @@ async fn run_loop(
             Ev::Driver(ev) => {
                 let ev = ev.map_err(|e| anyhow::anyhow!("driver: {e}"))?;
                 with_driver!(&mut driver, d => {
-                    on_event(d.endpoint(), ev, &mut events, &mut outbox,&state);
+                    on_event(d.endpoint(), ev, &mut events, &mut outbox,&state,budget.as_ref());
+                    sync_holds(d.endpoint(),budget.as_ref(),&mut held);
                     while let Some(ev) = d.endpoint().poll_event() {
-                        on_event(d.endpoint(), ev, &mut events, &mut outbox,&state);
+                        on_event(d.endpoint(), ev, &mut events, &mut outbox,&state,budget.as_ref());
+                        sync_holds(d.endpoint(),budget.as_ref(),&mut held);
                     }
                     if !outbox.is_empty() {
                         flush_outbox(d.endpoint(), &mut outbox);
@@ -1204,6 +1233,7 @@ async fn run_loop(
                 });
             }
         }
+        with_driver!(&mut driver,d=>sync_holds(d.endpoint(),budget.as_ref(),&mut held));
         for ev in events.drain(..) {
             if !spec.server {
                 match &ev {
@@ -1244,12 +1274,21 @@ fn permit_for<D:PeerNames>(directory:&D,peer:PeerId,state:&SharedState)->Applica
     ApplicationPermit {initialized,key:directory.key_of(peer)}
 }
 
+fn sync_holds<B:hyper_transport::Budget<Class>,D:Directory<Role=Role>>(ep:&mut Endpoint<Kiln,B,D>,budget:Option<&receive::Budget>,held:&mut std::collections::BTreeSet<(PeerId,u32)>) {
+    let Some(budget)=budget else {return};
+    let wanted=budget.holds();
+    for (peer,lane) in held.difference(&wanted).copied().collect::<Vec<_>>() {let _=ep.release_lane(peer,lane);held.remove(&(peer,lane));}
+    for (peer,lane) in &wanted {if ep.hold_lane(*peer,*lane).is_ok(){held.insert((*peer,*lane));}}
+    ep.retry_reserving();
+}
+
 fn on_event<B, D>(
     ep: &mut Endpoint<Kiln, B, D>,
     ev: Event<Kiln>,
     out: &mut Vec<NetEvent>,
     outbox: &mut Outbox,
     state: &SharedState,
+    budget:Option<&receive::Budget>,
 ) where
     B: hyper_transport::Budget<Class>,
     D: Directory<Role = Role> + PeerNames,
@@ -1264,8 +1303,15 @@ fn on_event<B, D>(
             let mut binding = [0u8; 32];
             let connection = ep.export_keying_material_at(peer, epoch, BINDING_LABEL, b"", &mut binding).ok().map(|()| Connection::new(peer, epoch, binding));
             crate::metrics::global().quic_streams.inc();
-            out.push(NetEvent::Frame { peer, lane, kind, data: frame.bytes().to_vec(), connection,admission:permit_for(ep.directory(),peer,state) });
-            ep.release(frame);
+            let admission=permit_for(ep.directory(),peer,state);
+            let data=if kind==Kind::Log && lane!=crate::proto::LANE_CONVO && lane!=crate::proto::LANE_FILES {
+                if let Some(budget)=budget {
+                    let bytes=budget.retain(frame,peer,lane,connection,admission.clone());
+                    // Boolean lane gate; completions only change the exact aggregate ledger.
+                    let _=ep.hold_lane(peer,lane);bytes
+                }else{let bytes=FrameBytes::from(frame.bytes().to_vec());ep.release(frame);bytes}
+            }else{let bytes=FrameBytes::from(frame.bytes().to_vec());ep.release(frame);bytes};
+            out.push(NetEvent::Frame {peer,lane,kind,data,connection,admission});
         }
         Event::Closed { peer, epoch, refusal } => {
             outbox.forget(peer, "closed");
@@ -1783,6 +1829,45 @@ mod tests {
 
     #[test]
     fn agent_and_server_exchange_frames_and_survive_rebuilds() -> anyhow::Result<()> {
+        // U05: reuse the existing transport rebuild fixture. Exact RAII grant ownership
+        // survives zero-byte and maximum-size legal frames; spare byte debt is not a count
+        // of owners. No public wire kind, peer API or second delivery queue is involved.
+        use hyper_transport::Budget as _;
+        let (commands,closed)=async_channel::bounded(1);
+        let receives=receive::Owner::new(commands.downgrade());
+        let generation=receives.begin()?;let mut budget=generation.budget.clone();
+        let empty=budget.reserve(0,hyper_transport::Lane::Class(Class::BulkFromAgent))?;
+        let empty=budget.retain(empty,77,crate::proto::LANE_LOGS,None,ApplicationPermit::agent());
+        let second=budget.reserve(0,hyper_transport::Lane::Class(Class::BulkFromAgent))?;
+        let second=budget.retain(second,77,crate::proto::LANE_LOGS,None,ApplicationPermit::agent());
+        drop(generation);
+        let next=receives.begin()?;
+        drop(empty);
+        assert!(receives.holds().contains(&(77,crate::proto::LANE_LOGS)),"one old completion cannot clear another zero-byte owner");
+        let mut current=next.budget.clone();
+        let full=current.reserve(Kiln::frame_bound(Class::BulkFromAgent),hyper_transport::Lane::Class(Class::BulkFromAgent))?;
+        let full=current.retain(full,77,crate::proto::LANE_LOGS,None,ApplicationPermit::agent());
+        drop(second);
+        assert!(receives.holds().contains(&(77,crate::proto::LANE_LOGS)),"old generation cannot clear the replacement generation's exact hold");
+        let mut retained=vec![full];
+        for _ in 1..receive::BULK_GRANTS {
+            let frame=current.reserve(0,hyper_transport::Lane::Class(Class::BulkFromAgent))?;
+            retained.push(current.retain(frame,77,crate::proto::LANE_LOGS,None,ApplicationPermit::agent()));
+        }
+        assert!(current.reserve(0,hyper_transport::Lane::Class(Class::BulkFromAgent)).is_err(),"complete/queued/retained Agent Bulk shares the same finite grant partition");
+        let interactive=current.reserve(1,hyper_transport::Lane::Class(Class::Interactive))?;current.release(interactive);
+        // Other Bulk keeps its exact immediate release, independent of job custody.
+        let other=current.reserve(1,hyper_transport::Lane::Class(Class::Bulk))?;current.release(other);
+        drop(next);retained.clear();
+        assert!(receives.holds().is_empty());
+        let final_generation=receives.begin()?;let mut final_budget=final_generation.budget.clone();
+        let small=final_budget.reserve(2,hyper_transport::Lane::Class(Class::BulkFromAgent))?;
+        let small=final_budget.retain(small,77,crate::proto::LANE_LOGS,None,ApplicationPermit::agent());
+        assert!(small.capacity()>=usize::try_from(Kiln::frame_bound(Class::BulkFromAgent))?,"small retained grant must charge the real recycled allocation, not its2logical bytes");
+        let held=small.clone();drop(small);assert!(receives.holds().contains(&(77,crate::proto::LANE_LOGS)));drop(held);
+        assert!(receives.holds().is_empty());drop(final_generation);
+        drop(commands);
+        assert!(closed.is_closed(),"retained accountant wake custody cannot keep the command channel alive");
         let _ = tracing_subscriber::fmt().with_env_filter("debug").with_test_writer().try_init();
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;

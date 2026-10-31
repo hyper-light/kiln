@@ -8,16 +8,19 @@ use super::{MAX_INDEXED, SEGMENT_LINES};
 pub(super) const GRAMS_PER_BATCH: usize = 128;
 pub(super) const BLOCK_DOCS: i64 = 64;
 
-/// Job rowids are chronology only. The stable leg plus attempt and captured finish tuple
-/// owns the content; a retry or an integer-rowid reuse cannot publish an old preparation.
+/// Terminal attempt/finish/row eligibility is separate from observed byte authority.
+/// A published accepted view owns its immutable revision; legacy delivery remains
+/// unsequenced across attempts. Neither retry nor row reuse can publish stale preparation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Source {
     attempt: i64,
     finished: i64,
     order: i64,
+    prefix: Option<crate::logs::accepted::Prefix>,
 }
 
 fn source(c: &Connection, leg: &str) -> anyhow::Result<Option<Source>> {
+    let prefix=crate::logs::accepted::prefix(c,leg)?;
     Ok(c.query_row(
         "SELECT j.attempt,j.finished_at,j.rowid FROM jobs j JOIN runs r ON r.id=j.run_id WHERE j.id=?1 AND j.finished_at IS NOT NULL
         AND r.provider='kiln' AND j.status IN ('succeeded','failed','cancelled','skipped','timed_out')",
@@ -27,44 +30,41 @@ fn source(c: &Connection, leg: &str) -> anyhow::Result<Option<Source>> {
                 attempt: r.get(0)?,
                 finished: r.get(1)?,
                 order: r.get(2)?,
+                prefix:prefix.clone(),
             })
         },
     )
     .optional()?)
 }
 
+fn prefix_parts(prefix:Option<&crate::logs::accepted::Prefix>)->(Option<&str>,Option<i64>,Option<&str>) {
+    match prefix {Some(p)=>(Some(&p.view),Some(p.revision),Some(&p.root)),None=>(None,None,None)}
+}
+fn row_prefix(r:&crate::sql::Row<'_>,at:usize)->crate::sql::Result<Option<crate::logs::accepted::Prefix>> {
+    r.get::<_,Option<String>>(at)?.map(|view|Ok(crate::logs::accepted::Prefix{view,revision:r.get(at+1)?,root:r.get(at+2)?})).transpose()
+}
+
 /// Called inside the canonical terminal-job transaction. Duplicate exact-source delivery
 /// keeps its version/cursor. A changed attempt first retires old documents in bounded pages.
 pub(super) fn enqueue(c: &Connection, leg: &str, background: bool) -> anyhow::Result<()> {
     let Some(src) = source(c, leg)? else { return Ok(()) };
-    let indexed: Option<(Option<i64>, Option<i64>, Option<i64>)> = c
-        .query_row("SELECT source_attempt,source_finished,source_order FROM ci_log_indexed WHERE leg=?1", [leg], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
-        .optional()?;
-    if indexed == Some((Some(src.attempt), Some(src.finished), Some(src.order))) {
-        return Ok(());
-    }
-    let pending: Option<(Option<i64>, Option<i64>, Option<i64>)> = c
-        .query_row("SELECT source_attempt,source_finished,source_order FROM ci_log_index_progress WHERE leg=?1", [leg], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
-        .optional()?;
-    if pending == Some((Some(src.attempt), Some(src.finished), Some(src.order))) {
-        if !background {
-            c.execute("UPDATE ci_log_index_progress SET background=0 WHERE leg=?1", [leg])?;
-        }
+    let (view,revision,root)=prefix_parts(src.prefix.as_ref());
+    let indexed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_indexed WHERE leg=?1 AND source_attempt IS ?2 AND source_finished IS ?3 AND source_order IS ?4 AND source_view IS ?5 AND source_revision IS ?6 AND source_root IS ?7)",params![leg,src.attempt,src.finished,src.order,view,revision,root],|r|r.get(0))?;
+    if indexed {return Ok(())}
+    let pending:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_index_progress WHERE leg=?1 AND source_attempt IS ?2 AND source_finished IS ?3 AND source_order IS ?4 AND source_view IS ?5 AND source_revision IS ?6 AND source_root IS ?7)",params![leg,src.attempt,src.finished,src.order,view,revision,root],|r|r.get(0))?;
+    if pending {
+        if !background {c.execute("UPDATE ci_log_index_progress SET background=0 WHERE leg=?1",[leg])?;}
         return Ok(());
     }
     let old: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_docs WHERE leg=?1)", [leg], |r| r.get(0))?;
     c.execute("DELETE FROM ci_log_indexed WHERE leg=?1", [leg])?;
     c.execute(
-        "INSERT INTO ci_log_index_progress (leg,version,source_attempt,source_finished,source_order,pruning,restart,background)
-        VALUES (?1,?2,?3,?4,?5,?6,?6,?7)
+        "INSERT INTO ci_log_index_progress (leg,version,source_attempt,source_finished,source_order,pruning,restart,background,source_view,source_revision,source_root)
+        VALUES (?1,?2,?3,?4,?5,?6,?6,?7,?8,?9,?10)
         ON CONFLICT(leg) DO UPDATE SET version=excluded.version,source_attempt=excluded.source_attempt,source_finished=excluded.source_finished,
-        source_order=excluded.source_order,pruning=excluded.pruning,restart=excluded.restart,background=excluded.background,
+        source_order=excluded.source_order,source_view=excluded.source_view,source_revision=excluded.source_revision,source_root=excluded.source_root,pruning=excluded.pruning,restart=excluded.restart,background=excluded.background,
         step=0,segment=0,bytes=0,first_row=NULL,last_row=NULL,next_doc=0",
-        params![leg, crate::util::new_id(), src.attempt, src.finished, src.order, old, background],
+        params![leg, crate::util::new_id(), src.attempt, src.finished, src.order, old, background,view,revision,root],
     )?;
     Ok(())
 }
@@ -119,6 +119,7 @@ pub(super) struct Document {
     pub ordinal: i64,
     pub attempt: i64,
     pub after: Option<i64>,
+    pub prefix: Option<crate::logs::accepted::Prefix>,
 }
 
 pub(super) fn bitmap(bytes: &[u8]) -> anyhow::Result<u64> {
@@ -179,10 +180,11 @@ pub(super) fn load(c: &Connection, id: i64) -> anyhow::Result<Option<(Document, 
     );
     let row: Option<(String, Document)> = tx
         .query_row(
-            "SELECT d.text,d.index_version,d.leg,d.order_finished,d.order_leg,d.order_doc,d.source_attempt,p.after_gram
-        FROM ci_log_docs d JOIN ci_log_search_pending p ON p.doc=d.id JOIN jobs j ON j.id=d.leg JOIN runs r ON r.id=j.run_id
+            "SELECT d.text,d.index_version,d.leg,d.order_finished,d.order_leg,d.order_doc,d.source_attempt,p.after_gram,d.source_view,d.source_revision,d.source_root
+        FROM ci_log_docs d JOIN ci_log_search_pending p ON p.doc=d.id JOIN jobs j ON j.id=d.leg JOIN runs r ON r.id=j.run_id LEFT JOIN ci_log_accepted_views a ON a.job=j.id AND a.revision>0 AND a.retired=0
         WHERE d.id=?1 AND r.provider='kiln' AND j.status IN ('succeeded','failed','cancelled','skipped','timed_out')
           AND d.source_attempt=j.attempt AND d.order_finished=j.finished_at AND d.order_leg=j.rowid
+          AND d.source_view IS a.view AND d.source_revision IS a.revision AND d.source_root IS a.root
           AND NOT EXISTS(SELECT 1 FROM ci_log_index_progress x WHERE x.leg=d.leg AND x.pruning=1)
           AND NOT EXISTS(SELECT 1 FROM ci_log_search_ready r WHERE r.doc=d.id AND r.version=d.index_version)",
             [id],
@@ -198,6 +200,7 @@ pub(super) fn load(c: &Connection, id: i64) -> anyhow::Result<Option<(Document, 
                         ordinal: r.get(5)?,
                         attempt: r.get(6)?,
                         after: r.get(7)?,
+                        prefix:row_prefix(r,8)?,
                     },
                 ))
             },
@@ -215,25 +218,29 @@ pub(super) fn load(c: &Connection, id: i64) -> anyhow::Result<Option<(Document, 
 }
 
 fn current(c: &Connection, d: &Document) -> anyhow::Result<bool> {
+    let (view,revision,root)=prefix_parts(d.prefix.as_ref());
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ci_log_docs d JOIN ci_log_search_pending p ON p.doc=d.id JOIN jobs j ON j.id=d.leg JOIN runs r ON r.id=j.run_id
+        "SELECT EXISTS(SELECT 1 FROM ci_log_docs d JOIN ci_log_search_pending p ON p.doc=d.id JOIN jobs j ON j.id=d.leg JOIN runs r ON r.id=j.run_id LEFT JOIN ci_log_accepted_views a ON a.job=j.id AND a.revision>0 AND a.retired=0
          WHERE d.id=?1 AND d.index_version=?2 AND d.leg=?3 AND d.order_finished=?4 AND d.order_leg=?5 AND d.order_doc=?6
-           AND p.after_gram IS ?7 AND d.source_attempt=?8 AND j.attempt=d.source_attempt AND j.finished_at=d.order_finished AND j.rowid=d.order_leg
+           AND p.after_gram IS ?7 AND d.source_attempt=?8 AND d.source_view IS ?9 AND d.source_revision IS ?10 AND d.source_root IS ?11 AND j.attempt=d.source_attempt AND j.finished_at=d.order_finished AND j.rowid=d.order_leg
+           AND d.source_view IS a.view AND d.source_revision IS a.revision AND d.source_root IS a.root
            AND r.provider='kiln' AND j.status IN ('succeeded','failed','cancelled','skipped','timed_out')
            AND NOT EXISTS (SELECT 1 FROM ci_log_index_progress x WHERE x.leg=d.leg AND x.pruning=1))",
-        params![d.id, d.version, d.leg, d.finished, d.leg_order, d.ordinal, d.after, d.attempt],
+        params![d.id, d.version, d.leg, d.finished, d.leg_order, d.ordinal, d.after, d.attempt,view,revision,root],
         |r| r.get(0),
     )?)
 }
 
 pub(super) fn refresh(c: &Connection, d: &Document) -> anyhow::Result<Option<Document>> {
+    let (view,revision,root)=prefix_parts(d.prefix.as_ref());
     let after: Option<Option<i64>> = c
         .query_row(
-            "SELECT p.after_gram FROM ci_log_search_pending p JOIN ci_log_docs s ON s.id=p.doc JOIN jobs j ON j.id=s.leg JOIN runs r ON r.id=j.run_id
-        WHERE s.id=?1 AND s.index_version=?2 AND s.leg=?3 AND s.order_finished=?4 AND s.order_leg=?5 AND s.order_doc=?6 AND r.provider='kiln' AND s.source_attempt=?7 AND j.attempt=s.source_attempt AND j.finished_at=s.order_finished AND j.rowid=s.order_leg
+            "SELECT p.after_gram FROM ci_log_search_pending p JOIN ci_log_docs s ON s.id=p.doc JOIN jobs j ON j.id=s.leg JOIN runs r ON r.id=j.run_id LEFT JOIN ci_log_accepted_views a ON a.job=j.id AND a.revision>0 AND a.retired=0
+        WHERE s.id=?1 AND s.index_version=?2 AND s.leg=?3 AND s.order_finished=?4 AND s.order_leg=?5 AND s.order_doc=?6 AND r.provider='kiln' AND s.source_attempt=?7 AND s.source_view IS ?8 AND s.source_revision IS ?9 AND s.source_root IS ?10 AND j.attempt=s.source_attempt AND j.finished_at=s.order_finished AND j.rowid=s.order_leg
+          AND s.source_view IS a.view AND s.source_revision IS a.revision AND s.source_root IS a.root
           AND j.status IN ('succeeded','failed','cancelled','skipped','timed_out')
           AND NOT EXISTS(SELECT 1 FROM ci_log_index_progress x WHERE x.leg=s.leg AND x.pruning=1)",
-            params![d.id, d.version, d.leg, d.finished, d.leg_order, d.ordinal, d.attempt],
+            params![d.id, d.version, d.leg, d.finished, d.leg_order, d.ordinal, d.attempt,view,revision,root],
             |r| r.get(0),
         )
         .optional()?;
@@ -293,12 +300,13 @@ pub(super) fn post(c: &Connection, d: &Document, grams: &[i64], done: bool) -> a
 pub(super) struct LegPlan {
     pub leg: String,
     pub version: String,
-    pub step: u32,
+    pub step: u64,
     pub segment: usize,
     pub actual_step: u32,
     pub finished: i64,
     pub leg_order: i64,
     pub attempt: i64,
+    pub prefix:Option<crate::logs::accepted::Prefix>,
 }
 pub(super) enum Work {
     Post(i64),
@@ -310,20 +318,20 @@ pub(super) enum Work {
 pub(super) fn leg(c: &Connection, leg: &str) -> anyhow::Result<Work> {
     let tx = crate::store::tx(c)?;
     let Some(src) = source(&tx, leg)? else { return Ok(Work::Idle) };
-    let progress: Option<(String, u32, usize, bool, Option<i64>, Option<i64>, Option<i64>)> = tx
+    let progress: Option<(String, u64, usize, bool, Option<i64>, Option<i64>, Option<i64>,Option<crate::logs::accepted::Prefix>)> = tx
         .query_row(
-            "SELECT version,step,segment,pruning,source_attempt,source_finished,source_order FROM ci_log_index_progress WHERE leg=?1",
+            "SELECT version,step,segment,pruning,source_attempt,source_finished,source_order,source_view,source_revision,source_root FROM ci_log_index_progress WHERE leg=?1",
             [leg],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,row_prefix(r,7)?)),
         )
         .optional()?;
-    let Some((version, step, segment, pruning, attempt, finished, order)) = progress else {
+    let Some((version, step, segment, pruning, attempt, finished, order,prefix)) = progress else {
         return Ok(Work::Idle);
     };
     if pruning {
         return Ok(Work::Idle);
     }
-    if (attempt, finished, order) != (Some(src.attempt), Some(src.finished), Some(src.order)) {
+    if (attempt, finished, order) != (Some(src.attempt), Some(src.finished), Some(src.order)) || prefix!=src.prefix {
         enqueue(&tx, leg, false)?;
         tx.commit()?;
         return Ok(Work::Idle);
@@ -340,12 +348,12 @@ pub(super) fn leg(c: &Connection, leg: &str) -> anyhow::Result<Work> {
         tx.commit()?;
         return Ok(Work::Post(doc));
     }
-    let next: Option<u32> = tx
-        .query_row("SELECT idx FROM steps WHERE job_id=?1 AND idx>=?2 ORDER BY idx LIMIT 1", params![leg, step], |r| r.get(0))
-        .optional()?;
+    let next:Option<u32>=if let Some(prefix)=&src.prefix {
+        tx.query_row("SELECT step FROM ci_log_accepted_steps WHERE view=?1 AND step>=?2 AND first_revision<=?3 ORDER BY step LIMIT 1",params![prefix.view,step,prefix.revision],|r|r.get(0)).optional()?
+    }else{tx.query_row("SELECT idx FROM steps WHERE job_id=?1 AND idx>=?2 ORDER BY idx LIMIT 1",params![leg,step],|r|r.get(0)).optional()?};
     let Some(actual_step) = next else {
         tx.execute(
-            "INSERT OR REPLACE INTO ci_log_indexed (leg,at,bytes,first_row,last_row,source_attempt,source_finished,source_order) SELECT leg,?2,bytes,first_row,last_row,source_attempt,source_finished,source_order FROM ci_log_index_progress WHERE leg=?1",
+            "INSERT OR REPLACE INTO ci_log_indexed (leg,at,bytes,first_row,last_row,source_attempt,source_finished,source_order,source_view,source_revision,source_root) SELECT leg,?2,bytes,first_row,last_row,source_attempt,source_finished,source_order,source_view,source_revision,source_root FROM ci_log_index_progress WHERE leg=?1",
             params![leg, crate::util::now_unix()],
         )?;
         tx.execute("DELETE FROM ci_log_index_progress WHERE leg=?1", [leg])?;
@@ -357,11 +365,12 @@ pub(super) fn leg(c: &Connection, leg: &str) -> anyhow::Result<Work> {
         leg: leg.into(),
         version,
         step,
-        segment: if step == actual_step { segment } else { 0 },
+        segment: if step == u64::from(actual_step) { segment } else { 0 },
         actual_step,
         finished,
         leg_order,
         attempt: src.attempt,
+        prefix:src.prefix,
     }))
 }
 
@@ -370,12 +379,15 @@ pub(super) fn leg(c: &Connection, leg: &str) -> anyhow::Result<Work> {
 pub(super) fn stage(c: &Connection, p: &LegPlan, body: &str, last_segment: bool, raw_bytes: u64) -> anyhow::Result<bool> {
     anyhow::ensure!(body.len() <= MAX_INDEXED, "log-index payload exceeds 8 MiB");
     let tx = crate::store::tx(c)?;
+    let (view,revision,root)=prefix_parts(p.prefix.as_ref());
     let valid: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ci_log_index_progress x JOIN jobs j ON j.id=x.leg
+        "SELECT EXISTS(SELECT 1 FROM ci_log_index_progress x JOIN jobs j ON j.id=x.leg LEFT JOIN ci_log_accepted_views a ON a.job=j.id AND a.revision>0 AND a.retired=0
         WHERE x.leg=?1 AND x.version=?2 AND x.step=?3 AND x.segment=?4 AND x.pruning=0 AND j.finished_at=?5 AND j.rowid=?6 AND j.attempt=?7
           AND x.source_attempt=j.attempt AND x.source_finished=j.finished_at AND x.source_order=j.rowid
+          AND x.source_view IS ?8 AND x.source_revision IS ?9 AND x.source_root IS ?10
+          AND x.source_view IS a.view AND x.source_revision IS a.revision AND x.source_root IS a.root
           AND j.status IN ('succeeded','failed','cancelled','skipped','timed_out'))",
-        params![p.leg, p.version, p.step, p.segment, p.finished, p.leg_order, p.attempt],
+        params![p.leg, p.version, p.step, p.segment, p.finished, p.leg_order, p.attempt,view,revision,root],
         |r| r.get(0),
     )?;
     if !valid {
@@ -393,8 +405,8 @@ pub(super) fn stage(c: &Connection, p: &LegPlan, body: &str, last_segment: bool,
         let ordinal: i64 = tx.query_row("SELECT next_doc FROM ci_log_index_progress WHERE leg=?1", [&p.leg], |r| r.get(0))?;
         anyhow::ensure!(ordinal.checked_add(1).is_some(), "log-index document ordinal exhausted");
         tx.execute(
-            "INSERT INTO ci_log_docs (text,leg,step,line,index_version,order_finished,order_leg,order_doc,source_attempt) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![body, p.leg, p.actual_step, line, crate::util::new_id(), p.finished, p.leg_order, ordinal, p.attempt],
+            "INSERT INTO ci_log_docs (text,leg,step,line,index_version,order_finished,order_leg,order_doc,source_attempt,source_view,source_revision,source_root) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![body, p.leg, p.actual_step, line, crate::util::new_id(), p.finished, p.leg_order, ordinal, p.attempt,view,revision,root],
         )?;
         let id = tx.last_insert_rowid();
         tx.execute(
@@ -405,9 +417,9 @@ pub(super) fn stage(c: &Connection, p: &LegPlan, body: &str, last_segment: bool,
         Some(id)
     };
     let (step, segment, bytes) = if last_segment {
-        (p.actual_step.checked_add(1).ok_or_else(|| anyhow::anyhow!("log-index step overflow"))?, 0, i64::try_from(raw_bytes)?)
+        (u64::from(p.actual_step)+1, 0, i64::try_from(raw_bytes)?)
     } else {
-        (p.actual_step, p.segment.checked_add(1).ok_or_else(|| anyhow::anyhow!("log-index segment overflow"))?, 0)
+        (u64::from(p.actual_step), p.segment.checked_add(1).ok_or_else(|| anyhow::anyhow!("log-index segment overflow"))?, 0)
     };
     tx.execute(
         "UPDATE ci_log_index_progress SET step=?2,segment=?3,bytes=bytes+?4,first_row=COALESCE(first_row,?5),last_row=COALESCE(?5,last_row),next_doc=next_doc+CASE WHEN ?5 IS NULL THEN 0 ELSE 1 END WHERE leg=?1",
@@ -450,8 +462,9 @@ pub(super) fn prune(c: &Connection, leg: &str, version: &str) -> anyhow::Result<
     let Some((doc, doc_version, finished, leg_order, ordinal)) = row else {
         tx.execute("DELETE FROM ci_log_indexed WHERE leg=?1", [leg])?;
         let restart: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ci_log_index_progress x JOIN jobs j ON j.id=x.leg
+            "SELECT EXISTS(SELECT 1 FROM ci_log_index_progress x JOIN jobs j ON j.id=x.leg LEFT JOIN ci_log_accepted_views a ON a.job=j.id AND a.revision>0 AND a.retired=0
             WHERE x.leg=?1 AND x.version=?2 AND x.restart=1 AND x.source_attempt=j.attempt AND x.source_finished=j.finished_at AND x.source_order=j.rowid
+              AND x.source_view IS a.view AND x.source_revision IS a.revision AND x.source_root IS a.root
               AND j.status IN ('succeeded','failed','cancelled','skipped','timed_out'))",
             params![leg, version],
             |r| r.get(0),
@@ -573,9 +586,10 @@ pub(super) fn index_step(c: &Connection, leg: &str, step: u32, text: &str) -> an
         let version = crate::util::new_id();
         let ordinal: i64 = c.query_row("SELECT COALESCE(MAX(order_doc)+1,0) FROM ci_log_docs WHERE leg=?1", [leg], |r| r.get(0))?;
         let src = source(c, leg)?.ok_or_else(|| anyhow::anyhow!("fixture has no current terminal source"))?;
+        let (view,revision,root)=prefix_parts(src.prefix.as_ref());
         c.execute(
-            "INSERT INTO ci_log_docs (text,leg,step,line,index_version,order_doc,source_attempt,order_finished,order_leg) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![body, leg, step, i64::try_from(n * SEGMENT_LINES + 1)?, version, ordinal, src.attempt, src.finished, src.order],
+            "INSERT INTO ci_log_docs (text,leg,step,line,index_version,order_doc,source_attempt,order_finished,order_leg,source_view,source_revision,source_root) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![body, leg, step, i64::try_from(n * SEGMENT_LINES + 1)?, version, ordinal, src.attempt, src.finished, src.order,view,revision,root],
         )?;
         let id = c.last_insert_rowid();
         c.execute("INSERT INTO ci_log_search_pending (doc) VALUES (?1)", [id])?;
@@ -594,128 +608,63 @@ pub(super) fn index_step(c: &Connection, leg: &str, step: u32, text: &str) -> an
 /// Streaming form of plain(): only the normalized prefix and a rewritten line are retained.
 /// ANSI and UTF-8 state cross read boundaries. A trailing CR keeps the last displayed line;
 /// a later non-CR character replaces it. No giant raw line or full raw log is allocated.
-pub(crate) fn plain_reader(mut input: impl std::io::Read, limit: usize) -> std::io::Result<String> {
-    struct Plain {
-        out: String,
-        line: String,
-        limit: usize,
-        full: bool,
-        cr: bool,
-        esc: bool,
-        csi: bool,
-        done: bool,
+pub(crate) struct Plain {
+    out:String,line:String,limit:usize,full:bool,cr:bool,esc:bool,csi:bool,done:bool,carry:Vec<u8>,
+}
+impl Plain {
+    pub(crate) fn new(limit:usize)->Self {
+        Self{out:String::new(),line:String::new(),limit,full:false,cr:false,esc:false,csi:false,done:limit==0,carry:Vec::new()}
     }
-    impl Plain {
-        fn put(&mut self, c: char) {
-            if self.done {
-                return;
+    pub(crate) fn done(&self)->bool {self.done}
+    fn put(&mut self,c:char) {
+        if self.done {return}
+        if self.csi {if ('@'..='~').contains(&c){self.csi=false}return}
+        if self.esc {self.esc=false;if c=='[' {self.csi=true;return}}
+        if c=='\x1b' {self.esc=true;return}
+        match c {
+            '\r'=>self.cr=true,
+            '\n'=>{
+                self.out.push_str(&self.line);self.line.clear();self.cr=false;
+                if self.full || self.out.len()>=self.limit {self.done=true;return}
+                self.out.push('\n');if self.out.len()>=self.limit {self.done=true}
             }
-            if self.csi {
-                if ('@'..='~').contains(&c) {
-                    self.csi = false
-                }
-                return;
-            }
-            if self.esc {
-                self.esc = false;
-                if c == '[' {
-                    self.csi = true;
-                    return;
-                }
-            }
-            if c == '\x1b' {
-                self.esc = true;
-                return;
-            }
-            match c {
-                '\r' => self.cr = true,
-                '\n' => {
-                    self.out.push_str(&self.line);
-                    self.line.clear();
-                    self.cr = false;
-                    if self.full || self.out.len() >= self.limit {
-                        self.done = true;
-                        return;
-                    }
-                    self.out.push('\n');
-                    if self.out.len() >= self.limit {
-                        self.done = true
-                    }
-                }
-                _ => {
-                    if self.cr {
-                        self.line.clear();
-                        self.full = false;
-                        self.cr = false
-                    }
-                    if !self.full {
-                        if self.out.len() + self.line.len() + c.len_utf8() <= self.limit {
-                            self.line.push(c)
-                        } else {
-                            self.full = true
-                        }
-                    }
-                }
+            _=>{
+                if self.cr {self.line.clear();self.full=false;self.cr=false}
+                if !self.full {if self.out.len()+self.line.len()+c.len_utf8()<=self.limit {self.line.push(c)}else{self.full=true}}
             }
         }
     }
-    let mut plain = Plain {
-        out: String::new(),
-        line: String::new(),
-        limit,
-        full: false,
-        cr: false,
-        esc: false,
-        csi: false,
-        done: limit == 0,
-    };
-    let mut carry = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    while !plain.done {
-        let n = input.read(&mut chunk)?;
-        if n == 0 {
-            if !carry.is_empty() {
-                plain.put('\u{fffd}')
-            }
-            break;
-        }
-        carry.extend_from_slice(chunk.get(..n).unwrap_or_default());
-        let mut at = 0;
-        loop {
-            let rest = carry.get(at..).unwrap_or_default();
-            match std::str::from_utf8(rest) {
-                Ok(text) => {
-                    for c in text.chars() {
-                        plain.put(c)
-                    }
-                    at = carry.len();
-                    break;
-                }
-                Err(e) => {
-                    let good = e.valid_up_to();
-                    if let Ok(text) = std::str::from_utf8(rest.get(..good).unwrap_or_default()) {
-                        for c in text.chars() {
-                            plain.put(c)
-                        }
-                    }
-                    at += good;
-                    match e.error_len() {
-                        Some(bad) => {
-                            plain.put('\u{fffd}');
-                            at += bad
-                        }
-                        None => break,
+    pub(crate) fn feed(&mut self,bytes:&[u8]) {
+        // Keep only an incomplete UTF-8 scalar between bounded input pages.
+        for chunk in bytes.chunks(64*1024) {
+            if self.done {break}
+            let mut carry=std::mem::take(&mut self.carry);carry.extend_from_slice(chunk);
+            let mut at=0;
+            loop {
+                let rest=carry.get(at..).unwrap_or_default();
+                match std::str::from_utf8(rest) {
+                    Ok(text)=>{for c in text.chars(){self.put(c)}at=carry.len();break}
+                    Err(error)=>{
+                        let good=error.valid_up_to();
+                        if let Ok(text)=std::str::from_utf8(rest.get(..good).unwrap_or_default()){for c in text.chars(){self.put(c)}}
+                        at+=good;
+                        match error.error_len(){Some(bad)=>{self.put('\u{fffd}');at+=bad}None=>break}
                     }
                 }
+                if self.done {break}
             }
-            if plain.done {
-                break;
-            }
+            carry.drain(..at);self.carry=carry;
         }
-        carry.drain(..at);
     }
-    if !plain.done {
-        plain.out.push_str(&plain.line)
+    pub(crate) fn finish(mut self)->String {
+        if !self.done {if !self.carry.is_empty(){self.put('\u{fffd}')}self.out.push_str(&self.line)}self.out
     }
-    Ok(plain.out)
+}
+
+/// Same streaming normalizer for historical files and immutable accepted chunks. No raw
+/// full-file allocation; ANSI/UTF-8/CR state survives file and object read boundaries.
+pub(crate) fn plain_reader(mut input:impl std::io::Read,limit:usize)->std::io::Result<String> {
+    let mut plain=Plain::new(limit);let mut bytes=[0u8;64*1024];
+    while !plain.done() {let n=input.read(&mut bytes)?;if n==0 {break}plain.feed(bytes.get(..n).unwrap_or_default());}
+    Ok(plain.finish())
 }

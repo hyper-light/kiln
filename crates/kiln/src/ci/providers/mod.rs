@@ -172,8 +172,16 @@ pub async fn record(hub: &Hub, repo: &Repo, provider: &str, run: &ExtRun, jobs: 
                 drop(q);
                 for (leg, ext) in kept {
                     if !ext.is_some_and(|e| listed.contains(&e)) {
+                        // U05/W24-R07: an omitted provider job still owns its source metadata
+                        // through the original copy's metadata marker. Other omitted jobs progress.
+                        let source_held: bool = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM ci_log_accepted_copy x WHERE x.source_job=?1 AND x.active=1)",
+                            [&leg], |r| r.get(0),
+                        )?;
+                        if source_held { continue; }
                         tx.execute("DELETE FROM steps WHERE job_id = ?1", [&leg])?;
                         tx.execute("DELETE FROM jobs WHERE id = ?1", [&leg])?;
+                        tx.execute("INSERT INTO ci_log_deferred_delete(job) VALUES(?1) ON CONFLICT(job) DO NOTHING", [&leg])?;
                         super::logsearch::stage_pruned(&tx,&leg)?;
                     }
                 }

@@ -912,7 +912,7 @@ mod tests {
         while let Ok(m) = rx.try_recv() {
             match m {
                 Up::Log(c) => {
-                    hub.logs.append(&c.job, c.idx, &c.data);
+                    hub.logs.append_server(c.job.clone(), c.idx, c.data.clone()).await?;
                     logs.entry(c.idx).or_default().push_str(&String::from_utf8_lossy(&c.data));
                 }
                 Up::Msg(AgentMsg::JobEvent { json, .. }) => events.push(serde_json::from_str(&json)?),

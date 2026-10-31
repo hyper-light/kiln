@@ -31,7 +31,7 @@ use crate::hub::Hub;
 /// Lines per indexed segment: a hit's place is its segment, then the line within it.
 pub const SEGMENT_LINES: usize = 100;
 /// A step's log past this isn't indexed beyond it (the log keeps it).
-const MAX_INDEXED: usize = 8 << 20;
+pub(crate) const MAX_INDEXED: usize = 8 << 20;
 
 fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
@@ -45,7 +45,7 @@ pub fn plain(raw: &[u8]) -> String {
 }
 
 mod index;
-pub(crate) use index::plain_reader;
+pub(crate) use index::{plain_reader,Plain};
 #[cfg(test)]
 use index::index_step;
 
@@ -81,6 +81,10 @@ pub struct Hit {
     pub text: String,
     /// Where the match is in `text` (bytes).
     pub at: usize,
+    /// Legacy producer delivery is unsequenced: this qualifies the observed search view,
+    /// never an attempt-bound close or producer completeness.
+    pub source_qualification:String,
+    pub accepted_revision:Option<i64>,
 }
 
 /// Matching lines across runs, newest first (at most five a segment, `limit` in all).
@@ -106,12 +110,13 @@ pub fn search(c: &Connection, q: &Query) -> anyhow::Result<Vec<Hit>> {
     let mut next = c.prepare_cached(&continued)?;
     let mut document = c.prepare_cached(
         "SELECT s.leg,s.step,s.line,s.text,j.run_id,j.key,r.number,r.repo_id,COALESCE(r.workflow_id,r.pipeline,''),r.branch,r.conclusion,r.created_at,
-        (SELECT name FROM steps WHERE job_id=j.id AND idx=s.step)
+        (SELECT name FROM steps WHERE job_id=j.id AND idx=s.step),s.source_view,s.source_revision
         FROM ci_log_doc_order o JOIN ci_log_docs s ON s.id=o.doc AND s.index_version=o.version JOIN ci_log_search_ready ready ON ready.doc=s.id AND ready.version=s.index_version
-        JOIN jobs j ON j.id=s.leg JOIN runs r ON r.id=j.run_id
+        JOIN jobs j ON j.id=s.leg JOIN runs r ON r.id=j.run_id LEFT JOIN ci_log_accepted_views a ON a.job=j.id AND a.revision>0 AND a.retired=0
         WHERE o.ordinal=?1 AND o.leg=?2
           AND r.provider='kiln' AND j.status IN ('succeeded','failed','cancelled','skipped','timed_out')
           AND j.attempt=s.source_attempt AND j.finished_at=s.order_finished AND j.rowid=s.order_leg
+          AND s.source_view IS a.view AND s.source_revision IS a.revision AND s.source_root IS a.root
           AND s.order_finished=?9 AND s.order_leg=?10
           AND NOT EXISTS(SELECT 1 FROM ci_log_index_progress x WHERE x.leg=s.leg AND x.pruning=1)
           AND (?3 IS NULL OR r.repo_id=?3) AND (?4 IS NULL OR r.workflow_id=?4) AND (?5 IS NULL OR r.branch=?5)
@@ -164,10 +169,11 @@ pub fn search(c: &Connection, q: &Query) -> anyhow::Result<Vec<Hit>> {
                             r.get::<_, Option<String>>(10)?,
                             r.get::<_, i64>(11)?,
                             r.get::<_, Option<String>>(12)?,
+                            r.get::<_, Option<String>>(13)?,r.get::<_, Option<i64>>(14)?,
                         ))
                     })
                     .optional()?;
-                let Some((leg, step, line, body, run, job, number, repo, workflow, branch, conclusion, created_at, step_name)) = row else {
+                let Some((leg, step, line, body, run, job, number, repo, workflow, branch, conclusion, created_at, step_name,view,accepted_revision)) = row else {
                     continue;
                 };
                 bytes = bytes.saturating_add(body.len());
@@ -188,6 +194,8 @@ pub fn search(c: &Connection, q: &Query) -> anyhow::Result<Vec<Hit>> {
                         line,
                         text,
                         at,
+                        source_qualification:if view.is_some(){crate::logs::accepted::QUALIFICATION.into()}else{"historical_file_delivery_unqualified".into()},
+                        accepted_revision,
                     });
                     if out.len() >= limit {
                         return Ok(out);
@@ -210,6 +218,8 @@ pub(crate) fn stage_finished(c: &Connection, leg: &str) -> anyhow::Result<()> {
 }
 /// U05: deletion and its derived-index cleanup intent commit together.
 pub(crate) fn stage_pruned(c: &Connection, leg: &str) -> anyhow::Result<()> {
+    c.execute("UPDATE ci_log_accepted_views SET retired=1 WHERE job=?1 AND NOT EXISTS(SELECT 1 FROM jobs WHERE id=?1)",[leg])?;
+    c.execute("INSERT OR IGNORE INTO ci_log_accepted_retired(view) SELECT view FROM ci_log_accepted_views WHERE job=?1 AND retired=1",[leg])?;
     index::request_prune(c, leg)
 }
 
@@ -247,6 +257,10 @@ struct Scan {
     background_leg: Option<String>,
     texts: std::collections::VecDeque<(String, String, u32, Arc<StepText>, u64)>,
     grams: std::collections::VecDeque<(index::Document, Arc<Vec<i64>>)>,
+    retired_view:Option<String>,
+    unpublished_view:Option<String>,
+    deleted_file:Option<String>,
+    accepted_reads:std::collections::VecDeque<(String,String,u32,crate::logs::accepted::Reader)>,
     legacy_done: bool,
     serviced: std::collections::BTreeSet<i64>,
 }
@@ -345,6 +359,7 @@ async fn visit_leg(hub: &Hub, scan: &mut Scan, leg: String) -> anyhow::Result<bo
     let result = visit_leg_work(hub, scan, leg).await;
     if result.is_err() {
         scan.texts.retain(|(l, _, _, _, _)| l != &key);
+        scan.accepted_reads.retain(|(l,_,_,_)|l!=&key);
         scan.grams.retain(|(d, _)| d.leg != key);
     }
     result
@@ -358,10 +373,12 @@ async fn visit_leg_work(hub: &Hub, scan: &mut Scan, leg: String) -> anyhow::Resu
     match work {
         index::Work::Complete => {
             scan.texts.retain(|(l, _, _, _, _)| l != &key);
+        scan.accepted_reads.retain(|(l,_,_,_)|l!=&key);
             Ok(true)
         }
         index::Work::Idle => {
             scan.texts.retain(|(l, _, _, _, _)| l != &key);
+        scan.accepted_reads.retain(|(l,_,_,_)|l!=&key);
             Ok(false)
         }
         index::Work::Post(id) => post_document(hub, scan, id).await,
@@ -377,12 +394,25 @@ async fn visit_leg_work(hub: &Hub, scan: &mut Scan, leg: String) -> anyhow::Resu
                 let (text, bytes) = if let Some((_, _, _, text, bytes)) = cached {
                     (text, bytes)
                 } else {
-                    let transient = scan.texts.len() >= 4;
-                    let Some((text, bytes)) = hub.logs.index_text(&plan.leg, plan.actual_step, MAX_INDEXED, if transient { 64 << 10 } else { u64::MAX }).await? else {
-                        return Ok(false);
+                    let transient = scan.texts.len()+scan.accepted_reads.len()>=4;
+                    let (text,bytes)=if let Some(prefix)=&plan.prefix {
+                        scan.accepted_reads.retain(|(leg,version,step,_)|leg!=&plan.leg || (version==&plan.version && *step==plan.actual_step));
+                        let pending=scan.accepted_reads.iter().position(|(leg,version,step,_)|leg==&plan.leg && version==&plan.version && *step==plan.actual_step).and_then(|at|scan.accepted_reads.remove(at));
+                        let reader=if let Some((_,_,_,reader))=pending {reader}else{
+                            if transient {return Ok(false)}
+                            crate::logs::accepted::Reader::open(&hub.store,prefix.clone(),plan.actual_step,MAX_INDEXED).await?
+                        };
+                        match reader.advance(&hub.store,&hub.blobs.blobs).await? {
+                            crate::logs::accepted::ReadTurn::Pending(reader)=>{
+                                scan.accepted_reads.push_back((plan.leg.clone(),plan.version.clone(),plan.actual_step,*reader));return Ok(true)
+                            }
+                            crate::logs::accepted::ReadTurn::Ready(text,bytes)=>(text,bytes),
+                        }
+                    }else{
+                        let Some(text)=hub.logs.index_text(&plan.leg,plan.actual_step,MAX_INDEXED,if transient {64<<10}else{u64::MAX}).await? else {return Ok(false)};text
                     };
                     let text = Arc::new(crate::rt::blocking(move || StepText::new(text)).await?);
-                    if !transient {
+                    if scan.texts.len()+scan.accepted_reads.len()<4 {
                         scan.texts.push_back((plan.leg.clone(), plan.version.clone(), plan.actual_step, text.clone(), bytes));
                     }
                     (text, bytes)
@@ -398,7 +428,8 @@ async fn visit_leg_work(hub: &Hub, scan: &mut Scan, leg: String) -> anyhow::Resu
             .await;
             if result.is_err() {
                 let (leg, version, step) = failed_key;
-                scan.texts.retain(|(l, v, s, _, _)| l != &leg || v != &version || *s != step)
+                scan.texts.retain(|(l, v, s, _, _)| l != &leg || v != &version || *s != step);
+                scan.accepted_reads.retain(|(l,v,s,_)|l!=&leg || v!=&version || *s!=step)
             }
             result
         }
@@ -411,6 +442,25 @@ async fn pass(hub: &Hub, scan: &mut Scan) -> anyhow::Result<bool> {
     let mut changed = false;
     let mut failed = false;
     scan.serviced.clear();
+    match crate::logs::accepted::repair_unpublished(&hub.store,&mut scan.unpublished_view).await {
+        Ok(more)=>changed|=more,
+        Err(error)=>{failed=true;tracing::warn!(error=%format!("{error:#}"),"original unpublished log suffix remains fenced; later work still receives a turn");}
+    }
+    match crate::logs::accepted::retirement_view(&hub.store,scan.retired_view.clone()).await {
+        Ok(Some(view))=>{
+            scan.retired_view=Some(view.clone());
+            match crate::logs::accepted::retire_turn(&hub.logs,&hub.store,&hub.blobs.blobs,view).await {
+                Ok(more)=>changed|=more,
+                Err(error)=>{failed=true;tracing::warn!(error=%format!("{error:#}"),"accepted log key/pin retention incomplete; next view remains eligible");}
+            }
+        }
+        Ok(None)=>scan.retired_view=None,
+        Err(error)=>{failed=true;tracing::warn!(error=%format!("{error:#}"),"accepted log retirement cursor unavailable");}
+    }
+    match crate::logs::accepted::retire_file_turn(&hub.logs,&mut scan.deleted_file).await {
+        Ok(more)=>changed|=more,
+        Err(error)=>{failed=true;tracing::warn!(error=%format!("{error:#}"),"owned log-file retention remains incomplete");}
+    }
     // Finish the existing prepared package without re-reading/re-sorting its body when
     // a pending-queue page happens not to contain it.
     let prepared: Vec<_> = scan.grams.iter().map(|(d, _)| d.id).collect();
@@ -468,6 +518,7 @@ async fn pass(hub: &Hub, scan: &mut Scan) -> anyhow::Result<bool> {
     for (leg, v) in prunes {
         scan.texts.retain(|(l, _, _, _, _)| l != &leg);
         scan.grams.retain(|(d, _)| d.leg != leg);
+        scan.accepted_reads.retain(|(l,_,_,_)|l!=&leg);
         scan.prune = Some(leg.clone());
         match hub.store.call_local(move |c| index::prune(c, &leg, &v)).await {
             Ok(done) => changed |= done,
@@ -576,7 +627,7 @@ pub async fn forget(hub: &Hub, legs: Vec<String>) {
             .store
             .call_local(move |c| {
                 for leg in chunk {
-                    index::request_prune(c, &leg)?
+                    stage_pruned(c, &leg)?
                 }
                 Ok(())
             })
@@ -774,6 +825,7 @@ mod tests {
         )?;
         c.execute_batch(include_str!("../store/migrations/20261029-1110_u05_log_search.sql"))?;
         c.execute_batch(include_str!("../store/migrations/20261030-0200_u05_log_index_progress.sql"))?;
+        c.execute_batch(include_str!("../store/migrations/20261031-0100_u05_accepted_log_prefix.sql"))?;
         Ok(())
     }
 
@@ -860,8 +912,69 @@ mod tests {
 
 
     async fn bounded_indexing() -> anyhow::Result<()> {
+        // Exercise the actual borrowed decoder with the existing encoder, including
+        // empty application chunks and a legal frame exactly at the transport bound.
+        let mut largest=vec![b'x';crate::logs::accepted::CHUNK];
+        let oversize=crate::proto::encode(&crate::proto::LogChunk{job:"accepted-prefix".into(),idx:u32::MAX,data:largest.clone()})?;
+        let overhead=oversize.len()-crate::logs::accepted::CHUNK;largest.truncate(largest.len()-overhead);
+        for raw in [Vec::new(),b"legacy observed bytes\n".to_vec(),largest] {
+            let encoded=crate::proto::encode(&crate::proto::LogChunk{job:"accepted-prefix".into(),idx:u32::MAX,data:raw.clone()})?;
+            assert!(encoded.len()<=crate::logs::accepted::CHUNK);
+            let borrowed=crate::proto::read_whole::<crate::logs::accepted::LegacyChunk<'_>>(&encoded).map_err(|e|anyhow::anyhow!("legacy borrowed fixture: {}",e.why("LogChunk")))?;
+            assert_eq!((borrowed.job,borrowed.idx,borrowed.data),("accepted-prefix",u32::MAX,raw.as_slice()));
+        }
+        // One local fault decorator inside this existing fixture: the real configured
+        // Blobs commits input, loses its PUT acknowledgment, then temporarily cannot read.
+        // Every unrelated API delegates unchanged; no alternative journal/controller.
+        use kiln_seams::blobs::{self,Blobs};
+        use std::sync::atomic::{AtomicBool,AtomicU8,AtomicUsize,Ordering};
+        struct LostPut {
+            inner:Arc<dyn Blobs>,mode:Arc<AtomicU8>,attempts:Arc<AtomicUsize>,
+            original:parking_lot::Mutex<Option<(String,String,usize)>>,exact:Arc<AtomicBool>,read_bytes:Arc<AtomicUsize>,blocked_key:Arc<parking_lot::Mutex<Option<String>>>,
+        }
+        impl Blobs for LostPut {
+            fn put<'a>(&'a self,key:&'a str,bytes:Vec<u8>,put:blobs::Put)->futures::future::BoxFuture<'a,Result<blobs::Meta,blobs::Refusal>> {
+                Box::pin(async move {
+                    let mode=self.mode.load(Ordering::SeqCst);
+                    if mode!=0 {
+                        self.attempts.fetch_add(1,Ordering::SeqCst);
+                        let mut original=self.original.lock();
+                        let descriptor=(key.to_owned(),crate::util::sha256_hex(&bytes),bytes.len());
+                        if let Some(first)=original.as_ref() {
+                            if first.0==key && (first!=&descriptor || !matches!(&put.cond,blobs::Cond::IfNoneMatch) || put.sha256.as_deref()!=Some(first.1.as_str())) {self.exact.store(false,Ordering::SeqCst);}
+                        }else{*original=Some(descriptor)}
+                    }
+                    if mode==2 {return Err(blobs::Refusal::Unavailable("fixture retains original bytes while PUT outcome is unknown".into()))}
+                    let result=self.inner.put(key,bytes,put).await;
+                    if mode==1 && result.is_ok() {self.mode.store(2,Ordering::SeqCst);return Err(blobs::Refusal::Unavailable("fixture lost committed PUT acknowledgment".into()))}
+                    result
+                })
+            }
+            fn get<'a>(&'a self,key:&'a str,range:Option<blobs::Range>)->futures::future::BoxFuture<'a,Result<(blobs::Meta,Vec<u8>),blobs::Refusal>> {
+                Box::pin(async move {
+                    let mode=self.mode.load(Ordering::SeqCst);
+                    if mode==2 || (mode==4 && self.blocked_key.lock().as_deref()==Some(key)) {return Err(blobs::Refusal::Unavailable("fixture retains original operation while selected immutable input is unavailable".into()))}
+                    let result=self.inner.get(key,range).await;
+                    if let Ok((_,bytes))=&result {self.read_bytes.fetch_add(bytes.len(),Ordering::SeqCst);}
+                    result
+                })
+            }
+            fn head<'a>(&'a self,key:&'a str)->futures::future::BoxFuture<'a,Result<blobs::Meta,blobs::Refusal>> {self.inner.head(key)}
+            fn delete<'a>(&'a self,key:&'a str)->futures::future::BoxFuture<'a,Result<(),blobs::Refusal>> {self.inner.delete(key)}
+            fn list<'a>(&'a self,prefix:&'a str,after:Option<&'a str>,limit:usize)->futures::future::BoxFuture<'a,Result<blobs::Listing,blobs::Refusal>> {self.inner.list(prefix,after,limit)}
+            fn start_upload<'a>(&'a self,key:&'a str)->futures::future::BoxFuture<'a,Result<String,blobs::Refusal>> {self.inner.start_upload(key)}
+            fn upload_part<'a>(&'a self,upload:&'a str,part:u32,bytes:Vec<u8>)->futures::future::BoxFuture<'a,Result<String,blobs::Refusal>> {self.inner.upload_part(upload,part,bytes)}
+            fn complete_upload<'a>(&'a self,upload:&'a str,parts:Vec<(u32,String)>)->futures::future::BoxFuture<'a,Result<blobs::Meta,blobs::Refusal>> {self.inner.complete_upload(upload,parts)}
+            fn abort_upload<'a>(&'a self,upload:&'a str)->futures::future::BoxFuture<'a,Result<(),blobs::Refusal>> {self.inner.abort_upload(upload)}
+            fn presign<'a>(&'a self,key:&'a str,access:blobs::Access,expires:Duration)->futures::future::BoxFuture<'a,Result<String,blobs::Refusal>> {self.inner.presign(key,access,expires)}
+        }
+        let read_bytes=Arc::new(AtomicUsize::new(0));
+        let blocked_key=Arc::new(parking_lot::Mutex::new(None));
+        let fault=Arc::new(AtomicU8::new(0));let attempts=Arc::new(AtomicUsize::new(0));let exact=Arc::new(AtomicBool::new(true));
         let mut hub = crate::hub::tests::scratch_hub().await?;
         let logs = crate::logs::Logs::new(hub.cfg.data("logs"), u64::try_from(MAX_INDEXED)? + 4096);
+        let fault_blobs:Arc<dyn Blobs>=Arc::new(LostPut{inner:hub.blobs.blobs.clone(),mode:fault.clone(),attempts:attempts.clone(),exact:exact.clone(),read_bytes:read_bytes.clone(),blocked_key:blocked_key.clone(),original:parking_lot::Mutex::new(None)});
+        logs.bind_accepted(hub.store.clone(),fault_blobs,"bounded-indexing".into());
         Arc::get_mut(&mut hub).ok_or_else(|| anyhow::anyhow!("fresh scratch Hub is already shared"))?.logs = logs;
         hub.store.call(|c|{
                 c.execute("INSERT INTO repos (id,name,clone_url,created_at) VALUES ('log-repo','log-repo','file:///logs',1)",[])?;
@@ -890,10 +1003,10 @@ mod tests {
         );
         body.extend(std::iter::repeat_n('x', MAX_INDEXED - body.len()));
         assert_eq!(body.len(), MAX_INDEXED, "real largest permitted single-line document");
-        hub.logs.append("older", 1, body.as_bytes());
-        hub.logs.append("older", 2, b"chronologyneedle older last segment");
+        hub.logs.historical_fixture_append("older", 1, body.as_bytes());
+        hub.logs.historical_fixture_append("older", 2, b"chronologyneedle older last segment");
         hub.logs.finish("older");
-        hub.logs.append("newer", 1, later.as_bytes());
+        hub.logs.historical_fixture_append("newer", 1, later.as_bytes());
         hub.logs.finish("newer");
         let mut scan = Scan::default();
         pass(&hub, &mut scan).await?;
@@ -1146,7 +1259,7 @@ mod tests {
             .store
             .call(|c| Ok(c.query_row("SELECT after_finished,after_order FROM ci_log_index_backfill WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?)))?))
             .await?;
-        hub.logs.append("backdated", 1, b"fresh backdated needle");
+        hub.logs.historical_fixture_append("backdated", 1, b"fresh backdated needle");
         hub.logs.finish("backdated");
         hub.store
             .call(|c| {
@@ -1184,6 +1297,293 @@ mod tests {
                 Ok(())
             })
             .await?;
+        // U05: extend this SAME product fixture through the real retained Logs owner.
+        // R1 captures complete old file history; late R2 must invalidate ready R1 without
+        // changing its terminal tuple or claiming a producer/attempt close frontier.
+        hub.store.call(|c|{
+            c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt) VALUES('accepted-prefix','log-run','accepted','accepted','failed','[]','[]','{}',300,1)",[])?;
+            c.execute("INSERT INTO steps(job_id,idx,name,status) VALUES('accepted-prefix',1,'historical','failed')",[])?;
+            stage_finished(c,"accepted-prefix")?;Ok(())
+        }).await?;
+        hub.logs.historical_fixture_append("accepted-prefix",1,b"historicalneedle retained before migration\n");
+        hub.logs.finish("accepted-prefix");
+        let mut accepted_scan=Scan::default();
+        for _ in 0..16 {pass(&hub,&mut accepted_scan).await?;}
+        fault.store(1,Ordering::SeqCst);
+        hub.logs.observe_server("accepted-prefix".into(),2,b"firstacceptedneedle R1\n".to_vec())?;
+        for _ in 0..128 {
+            if fault.load(Ordering::SeqCst)==2 {break}
+            // Cancellation does not discard the original future/raw body: it lives in
+            // Logs, while unrelated Hub controls may continue polling.
+            let _=crate::rt::timeout(Duration::from_millis(50),hub.logs.accepted_completion()).await;
+        }
+        assert_eq!(fault.load(Ordering::SeqCst),2,"fixture did not reach its ambiguous committed PUT");
+        hub.store.call(|c|{
+            assert!(crate::logs::accepted::prefix(c,"accepted-prefix")?.is_none(),"ambiguous PUT alone cannot publish accepted head");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM ci_log_accepted_ops WHERE job='accepted-prefix' AND status='pending'",[],|r|r.get::<_,i64>(0))?,1,"same original operation retained");Ok(())
+        }).await?;
+        fault.store(3,Ordering::SeqCst);
+        let r1=hub.logs.accepted_completion().await?;
+        assert!(r1.accepted,"first observed append includes historical prefix: {r1:?}");
+        assert!(attempts.load(Ordering::SeqCst)>=2 && exact.load(Ordering::SeqCst),"ambiguous immutable PUT retries preserve exact original key/body/digest/condition");
+        fault.store(0,Ordering::SeqCst);
+        let original=r1.clone();
+        hub.store.call(move |c|{
+            let before=crate::logs::accepted::prefix(c,"accepted-prefix")?;
+            // Discard an exact own CAS receipt and ask for the SAME operation again.
+            // This checks transition idempotence, not a synthetic shared-actor reset.
+            let _=crate::logs::accepted::publish(c,&original.operation)?;
+            assert_eq!(crate::logs::accepted::publish(c,&original.operation)?,original);
+            assert_eq!(crate::logs::accepted::completed(c,&original.operation)?,Some(original));
+            assert_eq!(crate::logs::accepted::prefix(c,"accepted-prefix")?,before);Ok(())
+        }).await?;
+        let mut stale_read=None;let mut stale_post=None;
+        for _ in 0..64 {
+            let work=hub.store.call(|c|index::leg(c,"accepted-prefix")).await?;
+            match work {
+                index::Work::Read(plan)=>{if stale_read.is_none(){stale_read=Some(plan)}},
+                index::Work::Post(id) if stale_post.is_none()=>{
+                    stale_post=hub.store.call(move |c|Ok(index::load(c,id)?.map(|(doc,body)|(doc,trigrams(&body).into_iter().take(index::GRAMS_PER_BATCH).collect::<Vec<_>>())))).await?;
+                }
+                _=>{}
+            }
+            pass(&hub,&mut accepted_scan).await?;
+        }
+        let captured=(stale_read.ok_or_else(||anyhow::anyhow!("R1 did not expose read work"))?,stale_post.ok_or_else(||anyhow::anyhow!("R1 did not expose posting work"))?);
+        hub.store.call(|c|{
+            let hits=search(c,&Query{q:"historicalneedle".into(),..Query::default()})?;
+            assert_eq!(hits.iter().filter(|h|h.leg=="accepted-prefix").count(),1,"first append cannot shadow historical file lines");
+            assert!(hits.iter().all(|h|h.source_qualification==crate::logs::accepted::QUALIFICATION));Ok(())
+        }).await?;
+        hub.logs.observe_server("accepted-prefix".into(),u32::MAX,b"lateacceptedneedle R2\n".to_vec())?;
+        let r2=hub.logs.accepted_completion().await?;
+        assert!(r2.accepted && r2.prefix.view==r1.prefix.view && r2.prefix.revision>r1.prefix.revision);
+        let expected=r2.prefix.clone();
+        hub.store.call(move |c|{
+            assert_eq!(crate::logs::accepted::prefix(c,"accepted-prefix")?,Some(expected));
+            assert!(search(c,&Query{q:"historicalneedle".into(),..Query::default()})?.iter().all(|h|h.leg!="accepted-prefix"),"old readiness hides immediately at R2 commit");
+            assert!(!index::stage(c,&captured.0,"stale R1",true,0)?,"stale R1 read cannot publish into R2");
+            assert!(!index::post(c,&captured.1.0,&captured.1.1,false)?,"stale R1 posting cannot publish into R2");Ok(())
+        }).await?;
+        // Discard transient readers/grams as on indexer restart; SQL head/cursors retain R2.
+        accepted_scan=Scan::default();
+        for _ in 0..128 {pass(&hub,&mut accepted_scan).await?;}
+        let revision=r2.prefix.revision;
+        hub.store.call(move |c|{
+            for query in ["historicalneedle","firstacceptedneedle","lateacceptedneedle"] {
+                let hits=search(c,&Query{q:query.into(),..Query::default()})?;
+                let own=hits.iter().filter(|h|h.leg=="accepted-prefix").collect::<Vec<_>>();
+                assert_eq!(own.len(),1,"no duplicate or missing old/new lines: {query}");
+                assert_eq!(own.first().and_then(|h|h.accepted_revision),Some(revision));
+            }
+            let hit=search(c,&Query{q:"lateacceptedneedle".into(),..Query::default()})?;
+            assert_eq!(hit.first().map(|h|h.step),Some(u32::MAX),"legal legacy maximum step advances without overflow");Ok(())
+        }).await?;
+        // One healthy history verification reads each captured step once, even when the
+        // OLD ready index has many segments. Count observed Blob bytes, not internal loops
+        // or wall time; the former whole-step-per-doc algorithm exceeds this allowance.
+        hub.store.call(|c|{
+            c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt) VALUES('history-linear','log-run','linear','linear','failed','[]','[]','{}',301,1)",[])?;
+            c.execute("INSERT INTO steps(job_id,idx,name,status) VALUES('history-linear',1,'old history','failed')",[])?;stage_finished(c,"history-linear")
+        }).await?;
+        let history=(0..1000).map(|line|format!("linearityneedle {line:04} {}\n","z".repeat(480))).collect::<String>();
+        let history_size=history.len();hub.logs.historical_fixture_append("history-linear",1,history.as_bytes());hub.logs.finish("history-linear");
+        let mut linear_scan=Scan::default();for _ in 0..1024{pass(&hub,&mut linear_scan).await?;}
+        hub.store.call(|c|{assert!(c.query_row("SELECT COUNT(*) FROM ci_log_docs WHERE leg='history-linear'",[],|r|r.get::<_,u64>(0))?>=8);Ok(())}).await?;
+        let before=read_bytes.load(Ordering::SeqCst);
+        let linear=hub.logs.append_server("history-linear".into(),2,b"afterhistoryneedle\n".to_vec()).await?;
+        assert!(linear.accepted);assert!(read_bytes.load(Ordering::SeqCst).saturating_sub(before)<=history_size*3+4096,"historical verification reread the step per old document");
+
+        // A >4MiB canonical raw source (including bytes Plain would change) copies through
+        // the SAME retained owner into a target that already has accepted live output.
+        hub.store.call(|c|{
+            for job in ["large-source","large-copy","fifth-reader"] {
+                c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt) VALUES(?1,'log-run','raw','raw','failed','[]','[]','{}',302,1)",[job])?;
+            }Ok(())
+        }).await?;
+        let mut raw=vec![b'x';crate::logs::accepted::CHUNK];
+        for (at,byte) in [0xff,0,27,b'[',b'3',b'1',b'm'].into_iter().enumerate(){if let Some(slot)=raw.get_mut(at){*slot=byte;}}
+        let tail=[b"rawcopytailneedle\n".as_slice(),vec![b'y';1024].as_slice()].concat();
+        hub.logs.append_server("large-source".into(),1,raw.clone()).await?;
+        hub.logs.append_server("large-source".into(),1,tail.clone()).await?;
+        hub.logs.append_server("large-copy".into(),1,b"beforecopyneedle\n".to_vec()).await?;
+        let effect=crate::util::sha256_hex(b"large-original-memo-effect");
+        let first=b"FIRST SavedHit fixture payload".to_vec();
+        let result=hub.logs.copy_step(crate::logs::accepted::CopyStep{job:"large-copy".into(),step:2,target_attempt:1,effect:effect.clone(),source_job:"large-source".into(),source_step:1,result:first.clone(),output_tree:None}).await?;
+        assert_eq!(result,first);
+        let check=effect.clone();let target_head=hub.store.call(move|c|{
+            let op=crate::logs::accepted::copy_metadata_operation(c,"large-copy",2,1,&check)?.ok_or_else(||anyhow::anyhow!("first metadata unexpectedly applied"))?;
+            assert!(c.query_row("SELECT active FROM ci_log_accepted_copy WHERE operation=?1",[op],|r|r.get::<_,bool>(0))?,"source lease must survive target head until metadata receipt");
+            Ok(crate::logs::accepted::prefix(c,"large-copy")?)
+        }).await?;
+        hub.logs.append_server("large-source".into(),1,b"later source must not duplicate target copy\n".to_vec()).await?;
+        let replay=hub.logs.copy_step(crate::logs::accepted::CopyStep{job:"large-copy".into(),step:2,target_attempt:1,effect:effect.clone(),source_job:"large-source".into(),source_step:1,result:b"NEWER selected result must not replace FIRST".to_vec(),output_tree:None}).await?;
+        assert_eq!(replay,first);
+        hub.store.call(move|c|{assert_eq!(crate::logs::accepted::prefix(c,"large-copy")?,target_head);Ok(())}).await?;
+        // Real existing Store/provider retention paths honor the original source SQL
+        // lease, while unrelated eligible work proceeds. Release in the metadata tx then
+        // permits the next ordinary pass; no synthetic second retention owner is used.
+        hub.store.call(|c|{
+            c.execute("INSERT INTO runs(id,repo_id,number,pipeline,event,branch,sha,status,created_at,provider,external_id,attempt) VALUES('lease-provider-run','log-repo',2,'ci','push','main','abc','failed',1,'kiln','lease-provider-ext',1)",[])?;
+            c.execute("INSERT INTO runs(id,repo_id,number,pipeline,event,branch,sha,status,created_at) VALUES('eligible-retention-run','log-repo',3,'ci','push','main','abc','failed',1)",[])?;
+            for (job,run) in [("lease-provider-source","lease-provider-run"),("lease-provider-unheld","lease-provider-run"),("eligible-retention-job","eligible-retention-run")] {
+                c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt,run_attempt) VALUES(?1,?2,'lease','lease','failed','[]','[]','{}',304,1,1)",params![job,run])?;
+            }Ok(())
+        }).await?;
+        hub.logs.append_server("lease-provider-source".into(),1,b"leased provider source\n".to_vec()).await?;
+        let lease_effect=crate::util::sha256_hex(b"retention-source-effect");
+        hub.logs.copy_step(crate::logs::accepted::CopyStep{job:"large-copy".into(),step:3,target_attempt:1,effect:lease_effect.clone(),source_job:"lease-provider-source".into(),source_step:1,result:b"original retention result".to_vec(),output_tree:None}).await?;
+        let deleted=hub.store.prune(0).await?;
+        assert!(deleted.iter().any(|id|id=="eligible-retention-job"),"unheld old run progresses while original source is leased");
+        hub.store.call(|c|{assert!(c.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id='lease-provider-source')",[],|r|r.get::<_,bool>(0))?);Ok(())}).await?;
+        assert!(hub.store.delete_repo("log-repo".into()).await.is_err(),"repo cascade must refuse before deleting leased source metadata");
+        let repository=hub.store.repos().await?.into_iter().find(|repo|repo.id=="log-repo").ok_or_else(||anyhow::anyhow!("leased repository disappeared"))?;
+        let provider_run=crate::ci::providers::ExtRun{external_id:"lease-provider-ext".into(),status:"failed".into(),attempt:1,created_at:1,..Default::default()};
+        crate::ci::providers::record(&hub,&repository,"kiln",&provider_run,Some(&[])).await?;
+        hub.store.call(|c|{
+            assert!(c.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id='lease-provider-source')",[],|r|r.get::<_,bool>(0))?);
+            assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id='lease-provider-unheld')",[],|r|r.get::<_,bool>(0))?,"unheld omitted provider job progresses");Ok(())
+        }).await?;
+        let release=lease_effect.clone();hub.store.call(move|c|{let tx=crate::store::tx(c)?;let op=crate::logs::accepted::copy_metadata_operation(&tx,"large-copy",3,1,&release)?.ok_or_else(||anyhow::anyhow!("retention metadata receipt missing"))?;crate::logs::accepted::mark_copy_metadata(&tx,&op)?;tx.commit()?;Ok(())}).await?;
+        crate::ci::providers::record(&hub,&repository,"kiln",&provider_run,Some(&[])).await?;
+        // Preserve this fixture's still-active main run while proving a released source run
+        // is now eligible. This is fixture chronology, not a retention flag/default waiver.
+        hub.store.call(|c|{c.execute("UPDATE runs SET created_at=?1 WHERE id='log-run'",[crate::util::now_unix()+86_400])?;Ok(())}).await?;
+        hub.store.prune(0).await?;
+        hub.store.call(|c|{assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE id='lease-provider-run')",[],|r|r.get::<_,bool>(0))?);Ok(())}).await?;
+        let check=effect.clone();hub.store.call(move|c|{
+            let tx=crate::store::tx(c)?;let op=crate::logs::accepted::copy_metadata_operation(&tx,"large-copy",2,1,&check)?.ok_or_else(||anyhow::anyhow!("missing metadata operation"))?;
+            crate::logs::accepted::mark_copy_metadata(&tx,&op)?;
+            assert!(crate::logs::accepted::copy_metadata_operation(&tx,"large-copy",2,1,&check)?.is_none());tx.commit()?;Ok(())
+        }).await?;
+        let keys=hub.store.call(|c|Ok(c.prepare("SELECT x.key FROM ci_log_accepted_chunks x JOIN ci_log_accepted_views v ON v.view=x.view WHERE v.job='large-copy' AND x.step=2 AND x.revision<=v.revision ORDER BY x.step_ordinal")?.query_map([],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?)).await?;
+        let mut copied=Vec::new();for key in keys{let (_,bytes)=hub.blobs.blobs.get(&key,None).await?;copied.extend(bytes);}
+        let mut expected=raw.clone();expected.extend(tail.clone());assert_eq!(copied,expected,"raw copy must retain bytes beyond a frame and bytes Plain would change");
+        hub.logs.mark("large-copy",2,"attempt 2 boundaryneedle").await;
+        let mut copy_scan=Scan::default();for _ in 0..128{pass(&hub,&mut copy_scan).await?;}
+        hub.store.call(|c|{assert!(search(c,&Query{q:"boundaryneedle".into(),..Query::default()})?.iter().any(|h|h.leg=="large-copy"));Ok(())}).await?;
+
+        // Four forgotten partial accepted readers cannot permanently consume all four
+        // bounded indexer slots. Exercise real large-copy/read/prune work, then a fifth leg.
+        let mut reader_scan=Scan::default();
+        for n in 0..4u32 {
+            let job=format!("forgotten-reader-{n}");let own=job.clone();
+            hub.store.call(move|c|{c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt) VALUES(?1,'log-run','reader','reader','failed','[]','[]','{}',303,1)",[own])?;Ok(())}).await?;
+            let effect=crate::util::sha256_hex(job.as_bytes());
+            hub.logs.copy_step(crate::logs::accepted::CopyStep{job:job.clone(),step:1,target_attempt:1,effect:effect.clone(),source_job:"large-source".into(),source_step:1,result:b"reader-result".to_vec(),output_tree:None}).await?;
+            let id=job.clone();hub.store.call(move|c|{let tx=crate::store::tx(c)?;let op=crate::logs::accepted::copy_metadata_operation(&tx,&id,1,1,&effect)?.ok_or_else(||anyhow::anyhow!("reader copy metadata"))?;crate::logs::accepted::mark_copy_metadata(&tx,&op)?;tx.commit()?;Ok(())}).await?;
+            visit_leg(&hub,&mut reader_scan,job).await?;
+        }
+        assert_eq!(reader_scan.accepted_reads.len(),4,"fixture must retain four genuinely partial readers");
+        hub.store.call(|c|{
+            let tx=crate::store::tx(c)?;for n in 0..4{let job=format!("forgotten-reader-{n}");tx.execute("DELETE FROM jobs WHERE id=?1",[&job])?;stage_pruned(&tx,&job)?;tx.execute("INSERT INTO ci_log_deferred_delete(job) VALUES(?1) ON CONFLICT(job) DO NOTHING",[job])?;}tx.commit()?;Ok(())
+        }).await?;
+        for _ in 0..64{pass(&hub,&mut reader_scan).await?;}
+        assert!(reader_scan.accepted_reads.is_empty(),"pruning forgotten readers releases transient capacity");
+        hub.logs.append_server("fifth-reader".into(),1,b"fifthreaderneedle\n".to_vec()).await?;
+        for _ in 0..128{pass(&hub,&mut reader_scan).await?;}
+        hub.store.call(|c|{assert!(search(c,&Query{q:"fifthreaderneedle".into(),..Query::default()})?.iter().any(|h|h.leg=="fifth-reader"));Ok(())}).await?;
+
+        // Revocation during actual retained copy I/O cannot publish the old effect into
+        // a replacement target attempt, or turn its Unknown into a fresh cache selection.
+        hub.store.call(|c|{c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt) VALUES('stale-copy','log-run','stale','stale','failed','[]','[]','{}',305,1)",[])?;Ok(())}).await?;
+        // End is a compatibility projection boundary after already-observed FIFO inputs,
+        // not producer delivery closure. No Hub storage await/CPU lease is introduced.
+        hub.store.call(|c|{c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt) VALUES('finish-order','log-run','finish','finish','failed','[]','[]','{}',305,1)",[])?;Ok(())}).await?;
+        let mut viewer=hub.logs.subscribe("finish-order");
+        hub.logs.observe_server("finish-order".into(),1,b"first observed\n".to_vec())?;
+        hub.logs.observe_server("finish-order".into(),1,b"second observed\n".to_vec())?;
+        hub.logs.finish("finish-order");hub.logs.finish("finish-order");
+        assert!(hub.logs.is_live("finish-order"),"queued original inputs must keep the existing viewer channel open");
+        // Own reply also drives unrelated successful append completions without relying
+        // on a concurrently polling Hub; the whole exercise has a real finite timeout.
+        crate::rt::timeout(Duration::from_secs(10),hub.logs.append_server("stale-copy".into(),1,b"current original prefix\n".to_vec())).await??;
+        let shown=crate::rt::timeout(Duration::from_secs(10),async {
+            use futures::FutureExt as _;
+            let mut shown=Vec::new();
+            loop {
+                futures::select_biased! {
+                    event=viewer.recv().fuse()=>match event? {
+                        crate::logs::LogEvent::Data{data,..}=>shown.extend_from_slice(&data),
+                        crate::logs::LogEvent::End=>return Ok::<_,anyhow::Error>(shown),
+                        crate::logs::LogEvent::Step{..}=>{},
+                    },
+                    completion=hub.logs.accepted_completion().fuse()=>{completion?;},
+                }
+            }
+        }).await??;
+        assert_eq!(shown,b"first observed\nsecond observed\n");
+        assert!(!hub.logs.is_live("finish-order"));
+        assert!(viewer.recv().await.is_err(),"duplicate finish emits only one End on the original channel");
+        let original_head=hub.store.call(|c|crate::logs::accepted::prefix(c,"stale-copy")).await?;
+        let stale_effect=crate::util::sha256_hex(b"stale-copy-effect");
+        *blocked_key.lock()=Some(hub.store.call(|c|Ok(c.query_row("SELECT x.key FROM ci_log_accepted_chunks x JOIN ci_log_accepted_views v ON v.view=x.view WHERE v.job='large-source' AND x.step=1 AND x.step_ordinal=2",[],|r|r.get::<_,String>(0))?)).await?);
+        fault.store(4,Ordering::SeqCst);
+        let pending=hub.logs.copy_step(crate::logs::accepted::CopyStep{job:"stale-copy".into(),step:2,target_attempt:1,effect:stale_effect.clone(),source_job:"large-source".into(),source_step:1,result:b"original stale result".to_vec(),output_tree:None});
+        futures::pin_mut!(pending);
+        let mut admitted=false;
+        for _ in 0..128 {
+            let result=crate::rt::timeout(Duration::from_millis(50),pending.as_mut()).await;
+            assert!(result.is_err(),"unavailable original source bytes cannot produce success/refusal before target authority changes");
+            admitted=hub.store.call(|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_ops WHERE job='stale-copy' AND status='pending' AND staged_revision>expected_revision)",[],|r|r.get::<_,bool>(0))?)).await?;
+            if admitted{break}
+        }
+        assert!(admitted,"copy fixture never reached its retained original operation");
+        hub.store.call(|c|{c.execute("UPDATE jobs SET attempt=2 WHERE id='stale-copy'",[])?;Ok(())}).await?;
+        fault.store(0,Ordering::SeqCst);
+        assert!(crate::rt::timeout(Duration::from_secs(10),pending).await?.is_err(),"revoked target attempt cannot receive copied bytes/result200");
+        hub.store.call(move|c|{
+            assert_eq!(crate::logs::accepted::prefix(c,"stale-copy")?,original_head,"old effect cannot advance the new attempt's job view");
+            assert_eq!(c.query_row("SELECT status FROM ci_log_accepted_ops WHERE job='stale-copy' AND origin='server-memo-copy'",[],|r|r.get::<_,String>(0))?,"refused");
+            assert!(!c.query_row("SELECT active FROM ci_log_accepted_copy x JOIN ci_log_accepted_ops o ON o.operation=x.operation WHERE o.job='stale-copy'",[],|r|r.get::<_,bool>(0))?,"own refusal releases source use while retaining its target pins");Ok(())
+        }).await?;
+        assert!(hub.logs.resume_copy("stale-copy",2,1,&stale_effect).await.is_err(),"old attempt cannot be mistaken for no original slot");
+        let retained_pins=hub.store.call(|c|Ok(c.query_row("SELECT COUNT(*) FROM ci_log_accepted_pins p JOIN ci_log_accepted_ops o ON o.operation=p.operation WHERE o.job='stale-copy' AND o.status='refused'",[],|r|r.get::<_,u64>(0))?)).await?;
+        assert!(retained_pins>0,"staged refusal keeps original immutable custody");
+        let successor=hub.logs.append_server("stale-copy".into(),2,b"afterrefusedcopyneedle\n".to_vec());
+        futures::pin_mut!(successor);
+        assert!(crate::rt::timeout(Duration::from_millis(50),successor.as_mut()).await.is_err(),"recoverable suffix fence retains an already-admitted successor instead of refusing/dropping it");
+        let mut suffix_scan=Scan::default();let mut progressed=false;
+        for _ in 0..128 {
+            pass(&hub,&mut suffix_scan).await?;
+            if let Ok(result)=crate::rt::timeout(Duration::from_millis(50),successor.as_mut()).await {result?;progressed=true;break}
+        }
+        assert!(progressed,"same owner/indexer must unlink refused unpublished suffix and admit the retained successor");
+        for _ in 0..128 {pass(&hub,&mut suffix_scan).await?;}
+        hub.store.call(move|c|{
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM ci_log_accepted_pins p JOIN ci_log_accepted_ops o ON o.operation=p.operation WHERE o.job='stale-copy' AND o.status='refused'",[],|r|r.get::<_,u64>(0))?,retained_pins,"repair must not release any original Blob pin");
+            assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_chunks x JOIN ci_log_accepted_ops o ON o.operation=x.operation WHERE o.job='stale-copy' AND o.status='refused')",[],|r|r.get::<_,bool>(0))?);
+            assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_unpublished u JOIN ci_log_accepted_views v ON v.view=u.view WHERE v.job='stale-copy')",[],|r|r.get::<_,bool>(0))?);
+            assert_eq!(search(c,&Query{q:"afterrefusedcopyneedle".into(),..Query::default()})?.iter().filter(|h|h.leg=="stale-copy").count(),1);
+            assert!(search(c,&Query{q:"current original prefix".into(),..Query::default()})?.iter().any(|h|h.leg=="stale-copy"),"published prefix survives refused suffix cleanup");Ok(())
+        }).await?;
+
+        // Known admission failure and missing immutable bytes never acquire readiness.
+        assert!(hub.logs.observe_server("accepted-prefix".into(),3,vec![0;crate::logs::accepted::CHUNK+1]).is_err());
+        let missing=hub.store.call(|c|Ok(c.query_row("SELECT key FROM ci_log_accepted_chunks x JOIN ci_log_accepted_views v ON v.view=x.view WHERE v.job='accepted-prefix' ORDER BY x.revision DESC LIMIT 1",[],|r|r.get::<_,String>(0))?)).await?;
+        hub.blobs.blobs.delete(&missing).await?;
+        hub.store.call(|c|{c.execute("DELETE FROM ci_log_indexed WHERE leg='accepted-prefix'",[])?;stage_finished(c,"accepted-prefix")}).await?;
+        // This fixture's explicit corruption is NOT a production retry policy. The same
+        // bounded indexer refuses missing owned bytes and keeps derived work incomplete.
+        accepted_scan=Scan::default();
+        let mut refused_read=false;
+        for _ in 0..128 {if pass(&hub,&mut accepted_scan).await.is_err(){refused_read=true;break}}
+        assert!(refused_read,"missing accepted object must fail the read instead of accepted empty data");
+        hub.store.call(|c|{assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_indexed WHERE leg='accepted-prefix')",[],|r|r.get::<_,bool>(0))?);Ok(())}).await?;
+        // Ambiguous PUT lifetime remains pinned on retirement; later settled views still
+        // get their own turn. Tombstoned IDs cannot be INSERT OR IGNORE/upserted back.
+        let held=hub.store.call(|c|Ok(c.query_row("SELECT key FROM ci_log_accepted_pins p JOIN ci_log_accepted_views v ON v.view=p.view WHERE v.job='accepted-prefix' AND p.ambiguous=1 LIMIT 1",[],|r|r.get::<_,String>(0))?)).await?;
+        hub.store.call(|c|{let tx=crate::store::tx(c)?;for job in ["accepted-prefix","fifth-reader"]{tx.execute("DELETE FROM jobs WHERE id=?1",[job])?;stage_pruned(&tx,job)?;tx.execute("INSERT INTO ci_log_deferred_delete(job) VALUES(?1) ON CONFLICT(job) DO NOTHING",[job])?;}tx.commit()?;Ok(())}).await?;
+        let mut retirement=Scan::default();for _ in 0..128{let _=pass(&hub,&mut retirement).await?;}
+        let retained=held.clone();hub.store.call(move|c|{
+            assert!(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_pins WHERE key=?1 AND ambiguous=1)",[retained],|r|r.get::<_,bool>(0))?);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM ci_log_accepted_pins p JOIN ci_log_accepted_views v ON v.view=p.view WHERE v.job='fifth-reader'",[],|r|r.get::<_,u64>(0))?,0,"later eligible retirement must not starve behind held oldest view");
+            assert!(c.execute("INSERT OR IGNORE INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('fifth-reader','log-run','reuse','reuse','queued','[]','[]','{}')",[]).is_err(),"retired ID cannot bypass fence with INSERT OR IGNORE");
+            assert!(c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('fifth-reader','log-run','reuse','reuse','queued','[]','[]','{}') ON CONFLICT(id) DO UPDATE SET status='queued'",[]).is_err(),"retired ID cannot bypass fence with upsert");Ok(())
+        }).await?;
+        assert!(hub.blobs.blobs.head(&held).await.is_ok(),"ambiguous retained key cannot be physically removed");
+        hub.store.delete_repo("log-repo".into()).await?;
+        hub.store.call(|c|{assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM repos WHERE id='log-repo')",[],|r|r.get::<_,bool>(0))?,"released source lease permits later explicit repo deletion");Ok(())}).await?;
         Ok(())
     }
 

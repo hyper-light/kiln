@@ -486,13 +486,13 @@ mod tests {
             input.send(NetEvent::Connected { admission:crate::net::ApplicationPermit::fixture(), peer: 7, epoch: 1, name: Some("runner-a".into()), binding: None }).await?;
             let connected = crate::rt::timeout(Duration::from_secs(5), application.recv()).await??;
             anyhow::ensure!(matches!(connected, NetEvent::Connected { peer: 7, .. }), "standby lost authenticated application connection");
-            input.send(NetEvent::Frame { admission:crate::net::ApplicationPermit::fixture(), connection: None, peer: 7, lane: proto::LANE_CONTROL, kind: Kind::Control, data: vec![1, 2] }).await?;
+            input.send(NetEvent::Frame { admission:crate::net::ApplicationPermit::fixture(), connection: None, peer: 7, lane: proto::LANE_CONTROL, kind: Kind::Control, data: vec![1, 2].into() }).await?;
             let frame = crate::rt::timeout(Duration::from_secs(5), application.recv()).await??;
             anyhow::ensure!(matches!(frame, NetEvent::Frame { peer: 7, data, .. } if data == vec![1, 2]), "standby did not pass application traffic while its owner probe waited");
             selected.send(9).map_err(|_| anyhow::anyhow!("owner selection ended before application passthrough"))?;
             // Owner selection is ready before Caps enters the input. Connected was already
             // consumed during standby, so this frame must await a fresh connection after reset.
-            input.send(NetEvent::Frame { admission:crate::net::ApplicationPermit::fixture(), connection: None, peer: 7, lane: proto::LANE_CONTROL, kind: Kind::Control, data: proto::encode(&AgentMsg::Caps { caps: proto::CAP_AMPHORA | proto::CAP_UNIFIED_LAYOUT })? }).await?;
+            input.send(NetEvent::Frame { admission:crate::net::ApplicationPermit::fixture(), connection: None, peer: 7, lane: proto::LANE_CONTROL, kind: Kind::Control, data: proto::encode(&AgentMsg::Caps { caps: proto::CAP_AMPHORA | proto::CAP_UNIFIED_LAYOUT })?.into() }).await?;
             let (selected, remaining) = crate::rt::timeout(Duration::from_secs(5), pending).await???;
             assert_eq!(selected, Some(9));
             let event = crate::rt::timeout(Duration::from_secs(5), remaining.recv()).await??;

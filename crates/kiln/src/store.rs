@@ -550,10 +550,20 @@ impl Store {
     pub async fn delete_repo(&self, id: String) -> anyhow::Result<()> {
         self.call(move |c| {
             let tx=crate::store::tx(c)?;
+            // U05/W24-R07: parent cascades cannot remove an original copy's source metadata.
+            let source_held: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM repos p JOIN runs r ON r.repo_id=p.id JOIN jobs j ON j.run_id=r.id
+                 JOIN ci_log_accepted_copy x ON x.source_job=j.id WHERE (p.id=?1 OR p.name=?1) AND x.active=1)",
+                [&id], |r| r.get(0),
+            )?;
+            anyhow::ensure!(!source_held, "repository has an active memo source lease; retry deletion after its metadata copy settles");
             let legs:Vec<String>=tx.prepare("SELECT j.id FROM jobs j JOIN runs r ON r.id=j.run_id JOIN repos p ON p.id=r.repo_id WHERE p.id=?1 OR p.name=?1")?
                 .query_map([&id],|r|r.get(0))?.collect::<Result<_,_>>()?;
             tx.execute("DELETE FROM repos WHERE id = ?1 OR name = ?1", [&id])?;
-            for leg in legs {crate::ci::logsearch::stage_pruned(&tx,&leg)?;}
+            for leg in legs {
+                tx.execute("INSERT INTO ci_log_deferred_delete(job) VALUES(?1) ON CONFLICT(job) DO NOTHING", [&leg])?;
+                crate::ci::logsearch::stage_pruned(&tx,&leg)?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -1364,16 +1374,25 @@ impl Store {
             let tx = crate::store::tx(c)?;
             let ids: Vec<String> = {
                 let mut st = tx.prepare(
-                    "SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id
-                     WHERE r.created_at < ?1 AND r.status NOT IN ('queued','running','pending')",
+                    "SELECT j.id FROM jobs j WHERE j.run_id IN (
+                     SELECT r.id FROM runs r WHERE r.created_at < ?1 AND r.status NOT IN ('queued','running','pending')
+                     AND NOT EXISTS(SELECT 1 FROM jobs source JOIN ci_log_accepted_copy x ON x.source_job=source.id
+                                    WHERE source.run_id=r.id AND x.active=1))",
                 )?;
                 st.query_map([cutoff], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
             };
             tx.execute(
-                "DELETE FROM runs WHERE created_at < ?1 AND status NOT IN ('queued','running','pending')",
+                "DELETE FROM runs WHERE created_at < ?1 AND status NOT IN ('queued','running','pending')
+                 AND NOT EXISTS(SELECT 1 FROM jobs source JOIN ci_log_accepted_copy x ON x.source_job=source.id
+                                WHERE source.run_id=runs.id AND x.active=1)",
                 [cutoff],
             )?;
-            for leg in &ids {crate::ci::logsearch::stage_pruned(&tx,leg)?;}
+            // U05/W24-R07: the same committed deletion records the existing log owner's work.
+            // A leased run is skipped before selection, so other eligible runs still progress.
+            for leg in &ids {
+                tx.execute("INSERT INTO ci_log_deferred_delete(job) VALUES(?1) ON CONFLICT(job) DO NOTHING", [leg])?;
+                crate::ci::logsearch::stage_pruned(&tx,leg)?;
+            }
             tx.commit()?;
             Ok(ids)
         })

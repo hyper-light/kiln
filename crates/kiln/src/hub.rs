@@ -584,6 +584,7 @@ impl Hub {
         // U17: terminal control names share this host's existing database; PTYs remain local.
         let terminal_namespace = format!("machine.{}", crate::util::sha256_hex(machine_name.as_bytes()).chars().take(56).collect::<String>());
         let terminals = crate::termsess::Sessions::from_records(Arc::new(crate::records::from_database(&store.database(), &terminal_namespace)?), Some(&cfg.server.data_dir.join("terminal-names.json")))?;
+        logs.bind_accepted(store.clone(), blobs.blobs.clone(), machine_name.clone());
         Ok(Arc::new(Self {
             cfg,
             store,
@@ -1538,11 +1539,25 @@ impl Hub {
 
     /// Consume transport events forever (supervised).
     pub async fn net_loop(self: Arc<Self>, rx: async_channel::Receiver<NetEvent>) -> anyhow::Result<()> {
-        while let Ok(ev) = rx.recv().await {
-            // What can't be read is refused and noted where it's read (`unreadable`); what's left is
-            // a message read whole that couldn't be applied.
-            if let Err(e) = self.on_net(ev).await {
-                tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
+        loop {
+            // U05: the existing FIFO remains canonical delivery. Retained I/O futures
+            // live in Logs across this loop's cancellation; storage is never awaited by
+            // the job-log handler. This is no universal bound on unrelated handlers.
+            futures::select_biased! {
+                // Ready retained I/O gets one turn before another FIFO item. A continuously
+                // ready control/other-Bulk stream cannot starve an already durable receipt.
+                done = self.logs.accepted_completion().fuse() => match done {
+                    Ok(receipt) if receipt.accepted => tracing::debug!(operation=receipt.operation, revision=receipt.prefix.revision, "observed log-prefix operation has its own durable receipt"),
+                    Ok(receipt) => tracing::warn!(operation=receipt.operation,job=receipt.job,reason=receipt.refusal.as_deref().unwrap_or("original operation refused"),"observed log append refused; no new acceptance or projection"),
+                    Err(error) => tracing::warn!(error=%format!("{error:#}"), "observed log ingest remains incomplete"),
+                },
+                event = rx.recv().fuse() => {
+                    let Ok(event) = event else { break };
+                    if let Err(error) = self.on_net(event).await {
+                        tracing::warn!(error=%format!("{error:#}"), "a runner's message couldn't be applied");
+                    }
+                }
+
             }
         }
         anyhow::bail!("transport event stream ended")
@@ -1605,14 +1620,22 @@ impl Hub {
             }
             // Bulk frames are job output, but on the conversation feed's and the files' lanes
             // (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
-                Ok(chunk) => {
-                    if self.owns_job(peer, &chunk.job) {
-                        self.logs.append(&chunk.job, chunk.idx, &chunk.data);
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => {
+                // Same append-only legacy wire shape, borrowed from the original charged
+                // frame. Neither this receive nor latest jobs.attempt invents delivery
+                // identity/closure. Empty legacy chunks remain legal no-ops.
+                match proto::read_whole::<crate::logs::accepted::LegacyChunk<'_>>(&data) {
+                    Ok(chunk) if self.owns_job(peer, chunk.job) && !chunk.data.is_empty() => {
+                        anyhow::ensure!(data.retained(), "job-log frame has no original receive custody; acceptance refused");
+                        let from=(chunk.data.as_ptr() as usize).checked_sub(data.as_ptr() as usize).ok_or_else(||anyhow::anyhow!("borrowed log body is outside its retained frame"))?;
+                        let end=from.checked_add(chunk.data.len()).filter(|end|*end<=data.len()).ok_or_else(||anyhow::anyhow!("borrowed log body exceeds its retained frame"))?;
+                        let (job,step,origin)=(chunk.job.to_owned(),chunk.idx,data.origin());
+                        self.logs.observe_frame(crate::logs::accepted::Observed{job,step,input:crate::logs::accepted::Input::Frame(data,from..end),origin,answer:None});
                     }
+                    Ok(_) => {}
+                    Err(error) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), error.code(), error.why("LogChunk"), true).await,
                 }
-                Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,
-            },
+            }
             NetEvent::Frame { peer, lane, data, connection, .. } => match proto::read_agent(&data) {
                 // Anything on its control lane before its Hello is out of order: Hello comes first
                 // there. On its other lanes a frame may come before its Hello is read (it sends them
@@ -1939,7 +1962,11 @@ impl Hub {
                 }
             }
             self.release_slot(name, &j);
-            self.logs.append(&j, 0, format!("\r\n\x1b[33m[kiln] {reason}; job requeued\x1b[0m\r\n").as_bytes());
+            // Compatibility/unavailable-CI fallback only: canonical plans above dispatch
+            // immediately. Physical grant release does not wait for retained log custody.
+            if let Err(error)=self.logs.observe_server(j.clone(),0,format!("\r\n\x1b[33m[kiln] {reason}; job requeued\x1b[0m\r\n").into_bytes()) {
+                tracing::warn!(job=j,error=%format!("{error:#}"),"server log append not admitted; no durable acceptance or compatibility projection");
+            }
             self.emit_job(&j).await;
         }
         self.update_slot_gauges();
@@ -3758,7 +3785,7 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             hub.peers.lock().insert(1, "fedora".into());
             hub.agents.lock().insert("fedora".into(), live_runner("fedora", "linux", "x86_64"));
-            let frame = |data: Vec<u8>, lane: u32| NetEvent::Frame { peer: 1, lane, kind: Kind::Control, data, connection: None, admission: crate::net::ApplicationPermit::fixture() };
+            let frame = |data: Vec<u8>, lane: u32| NetEvent::Frame { peer: 1, lane, kind: Kind::Control, data:data.into(), connection: None, admission: crate::net::ApplicationPermit::fixture() };
             // A newer runner's variant, and a known one cut short.
             hub.on_net(frame(vec![0xc8, 0x01, 7], proto::LANE_CONTROL)).await?;
             let adopted = proto::encode(&AgentMsg::HarnessAdopted { session: "s1".into(), error: None })?;
@@ -3774,8 +3801,8 @@ pub(crate) mod tests {
             // go as before (it may come before the Hello does).
             hub.pending_peers.lock().insert(2, "newbox".into());
             let facts = proto::encode(&AgentMsg::NetDrops { dropped: Vec::new() })?;
-            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_TERM, kind: Kind::Term, data: facts.clone(), connection: None, admission: crate::net::ApplicationPermit::fixture() }).await.ok();
-            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_CONTROL, kind: Kind::Control, data: facts, connection: None, admission: crate::net::ApplicationPermit::fixture() }).await?;
+            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_TERM, kind: Kind::Term, data: facts.clone().into(), connection: None, admission: crate::net::ApplicationPermit::fixture() }).await.ok();
+            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_CONTROL, kind: Kind::Control, data: facts.into(), connection: None, admission: crate::net::ApplicationPermit::fixture() }).await?;
             let early: Vec<(String, String, String)> = hub
                 .store
                 .call(|c| {
@@ -4027,7 +4054,7 @@ pub(crate) mod tests {
 
     /// `msg`, from runner process `peer` on `lane`, as the net loop hears it.
     pub(crate) async fn hear(hub: &Arc<Hub>, peer: PeerId, lane: u32, msg: &AgentMsg) -> anyhow::Result<()> {
-        hub.on_net(NetEvent::Frame { peer, lane, kind: Kind::Control, data: proto::encode(msg)?, connection: None, admission: crate::net::ApplicationPermit::fixture() }).await
+        hub.on_net(NetEvent::Frame { peer, lane, kind: Kind::Control, data: proto::encode(msg)?.into(), connection: None, admission: crate::net::ApplicationPermit::fixture() }).await
     }
 
     /// `msg`, item `seq` of runner process `peer`'s channel stream `stream`, as the hub hears it.

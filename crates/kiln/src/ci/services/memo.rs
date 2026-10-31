@@ -48,7 +48,7 @@ use kiln_ci::work::tests::{self as test_results, Choice};
 use kiln_ci::work::flight;
 use kiln_ci::work::memo::{self, Digest, Replay};
 use crate::sql::{OptionalExtension as _, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{blob, cas};
@@ -301,8 +301,9 @@ struct LookupIn {
 async fn lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
     let l: LookupIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
     let unit = leg.unit(l.unit);
-    if let Some(found) = found(hub, leg, &unit, l.max_age).await.map_err(internal)? {
-        return hit(hub, leg, l.step, found).await;
+    let effect = memo_effect(leg, &unit);
+    if let Some(found) = settled_hit(hub, leg, &unit, l.step, &effect, l.max_age).await.map_err(internal)? {
+        return hit(hub, leg, l.step, effect, found).await;
     }
     if !l.flight {
         return Ok(srv::status(StatusCode::NO_CONTENT));
@@ -316,9 +317,10 @@ async fn wait(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fai
     let l: LookupIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
     let unit = leg.unit(l.unit);
     let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let effect = memo_effect(leg, &unit);
     loop {
-        if let Some(found) = found(hub, leg, &unit, l.max_age).await.map_err(internal)? {
-            return hit(hub, leg, l.step, found).await;
+        if let Some(found) = settled_hit(hub, leg, &unit, l.step, &effect, l.max_age).await.map_err(internal)? {
+            return hit(hub, leg, l.step, effect, found).await;
         }
         let answer = turn(hub, leg, &unit, l.step).await?;
         if answer.status() != StatusCode::ACCEPTED || std::time::Instant::now() >= until {
@@ -356,24 +358,67 @@ async fn found(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, max_age: Option<u64>) -
         .await
 }
 
-/// A hit: the leg's step takes its source's log over, and is told what it left and where from,
-/// and through which class when equivalence found it (W24-R30, R28).
-async fn hit(hub: &Arc<Hub>, leg: &LegOf, step: u32, (key, rec, number, class): (Key, Recorded, i64, Option<String>)) -> Result<Response, Fail> {
-    // A hit through equivalence says so, and counts by layer (W24-R30, R28).
+/// U05/W24-R07: one target effect keeps its first selected result and source, even when
+/// the ledger's newest reproduction changes or the HTTP answer is lost. Scope and the unit's
+/// canonical weak key identify the request; the owner also binds the target row, attempt and step.
+fn memo_effect(leg: &LegOf, unit: &Unit) -> String {
+    crate::util::sha256_hex(format!("u05-memo-v1|{}{}", leg.scope, kiln_ci::work::key::weak(unit).hex()).as_bytes())
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedHit {
+    key: String,
+    recorded: Recorded,
+    number: i64,
+    class: Option<String>,
+    workflow: Option<String>,
+}
+
+fn saved_hit(bytes: &[u8]) -> anyhow::Result<SavedHit> {
+    anyhow::ensure!(bytes.len() <= 16 << 20, "the original memo result exceeds its 16 MiB bound");
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+async fn settled_hit(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, step: u32, effect: &str, max_age: Option<u64>) -> anyhow::Result<Option<SavedHit>> {
+    // A pending original selection must settle or remain Unknown. It cannot become a cache miss
+    // and execute again merely because the current ledger no longer selects its source.
+    if let Some(bytes) = hub.logs.resume_copy(&leg.id, step, leg.attempt, effect).await? {
+        return Ok(Some(saved_hit(&bytes)?));
+    }
+    let Some((key, recorded, number, class)) = found(hub, leg, unit, max_age).await? else { return Ok(None) };
+    let run = recorded.provenance.run.clone();
+    let workflow = hub.store.call(move |c| Ok(c.query_row("SELECT workflow_id FROM runs WHERE id = ?1", [&run], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await?;
+    let chosen = SavedHit { key: key.hex(), recorded, number, class, workflow };
+    let replay = Replay::decode(&chosen.recorded.outputs).map_err(anyhow::Error::msg)?;
+    let output_tree = replay.files.map(|tree| crate::logs::accepted::OutputTree {
+        scope: leg.scope.clone(), digest: tree.hash, bytes: tree.size_bytes,
+    });
+    let result = serde_json::to_vec(&chosen)?;
+    anyhow::ensure!(result.len() <= 16 << 20, "the original memo result exceeds its 16 MiB bound");
+    let request = crate::logs::accepted::CopyStep {
+        job: leg.id.clone(), step, target_attempt: leg.attempt, effect: effect.to_owned(),
+        source_job: chosen.recorded.provenance.leg.clone(), source_step: chosen.recorded.provenance.step.unwrap_or(0),
+        result, output_tree,
+    };
+    // A competing original reservation may already exist. Only its returned payload can name
+    // the result whose raw log prefix was actually accepted for this target effect.
+    Ok(Some(saved_hit(&hub.logs.copy_step(request).await?)?))
+}
+
+/// A hit: the leg's step takes its source's log over, and is told the original result and
+/// provenance only after the copy's own durable receipt and its metadata transaction.
+async fn hit(hub: &Arc<Hub>, leg: &LegOf, step: u32, effect: String, chosen: SavedHit) -> Result<Response, Fail> {
+    let SavedHit { key, recorded: rec, number, class, workflow } = chosen;
+    take_over(hub, leg, step, effect, &rec).await.map_err(internal)?;
     crate::metrics::global().work_lookups.inc(&["step", if class.is_some() { "class" } else { "hit" }]);
     if class.is_some() {
         crate::metrics::global().work_classes.inc(&["step", "hit"]);
     }
-    take_over(hub, leg, step, &rec).await.map_err(internal)?;
     let p = &rec.provenance;
-    let workflow: Option<String> = {
-        let run = p.run.clone();
-        hub.store.call(move |c| Ok(c.query_row("SELECT workflow_id FROM runs WHERE id = ?1", [&run], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await.map_err(internal)?
-    };
     Ok(srv::json(
         StatusCode::OK,
         &json!({
-            "key": key.hex(),
+            "key": key,
             "outputs": rec.outputs,
             "class": class,
             "source": { "run": p.run, "number": number, "workflow": workflow, "leg": p.leg, "step": p.step, "attempt": p.attempt, "runner": p.runner, "commit": p.commit, "finished_at": p.finished_at, "ms": p.ms },
@@ -474,22 +519,17 @@ impl Flights {
 }
 
 /// The leg's step `idx` takes its source's over: its log, summary, annotations and test reports.
-async fn take_over(hub: &Arc<Hub>, leg: &LegOf, idx: u32, rec: &Recorded) -> anyhow::Result<()> {
+async fn take_over(hub: &Arc<Hub>, leg: &LegOf, idx: u32, effect: String, rec: &Recorded) -> anyhow::Result<()> {
     let (source, from) = (rec.provenance.leg.clone(), rec.provenance.step.unwrap_or(0));
-    let log = hub.logs.read(&source, from).await;
-    if !log.is_empty() {
-        let (logs, id) = (hub.logs.clone(), leg.id.clone());
-        crate::rt::blocking(move || {
-            for piece in log.chunks(crate::proto::LOG_CHUNK) {
-                logs.append(&id, idx, piece);
-            }
-        })
-        .await?;
-    }
     let (id, run, key, attempt, branch, sha) = (leg.id.clone(), leg.run.clone(), leg.key.clone(), leg.run_attempt, leg.branch.clone(), leg.sha.clone());
-    hub.store
+    let target_attempt = leg.attempt;
+    let copied = hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
+            let Some(operation) = crate::logs::accepted::copy_metadata_operation(&tx, &id, idx, target_attempt, &effect)? else {
+                tx.commit()?;
+                return Ok(false);
+            };
             let now = crate::util::now_unix();
             tx.execute("INSERT OR REPLACE INTO ci_summaries (leg_id, step_idx, markdown) SELECT ?1, ?2, markdown FROM ci_summaries WHERE leg_id = ?3 AND step_idx = ?4", params![id, idx, source, from])?;
             tx.execute(
@@ -510,11 +550,14 @@ async fn take_over(hub: &Arc<Hub>, leg: &LegOf, idx: u32, rec: &Recorded) -> any
                     params![run, id, key, attempt, branch, sha, copy, now, report],
                 )?;
             }
+            crate::logs::accepted::mark_copy_metadata(&tx, &operation)?;
             tx.commit()?;
-            Ok(())
+            Ok(true)
         })
         .await?;
-    hub.emit_job(&leg.id).await;
+    if copied {
+        hub.emit_job(&leg.id).await;
+    }
     Ok(())
 }
 
@@ -650,6 +693,7 @@ async fn missing(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, 
         return Ok(msg(StatusCode::BAD_REQUEST, &format!("`digests` lists at most {MAX_ASKED} SHA-256s, as hex")));
     }
     let (scope, asked, now) = (leg.scope.clone(), m.digests, crate::util::now_unix());
+    let (target, target_attempt) = (leg.id.clone(), leg.attempt);
     let mut need: Vec<String> = hub
         .store
         .call(move |c| {
@@ -659,7 +703,8 @@ async fn missing(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, 
             let mut need = Vec::new();
             for d in asked {
                 let held: bool = q.query_row(params![Family::Object.name(), format!("{scope}{d}"), now, d], |r| r.get(0))?;
-                if !held {
+                let copied = crate::logs::accepted::copy_has_object(c, &target, target_attempt, &scope, &d)?;
+                if !held && !copied {
                     need.push(d);
                 }
             }
@@ -714,7 +759,11 @@ async fn get_blob(hub: &Arc<Hub>, leg: &LegOf, digest: &str) -> Result<Response,
         return Ok(msg(StatusCode::NOT_FOUND, "no such object"));
     }
     let k = format!("{}{digest}", leg.scope);
-    let referred = hub.store.call(move |c| Ok(work::get(c, Family::Object, &k)?.is_some())).await.map_err(internal)?;
+    let (target, target_attempt, scope, object) = (leg.id.clone(), leg.attempt, leg.scope.clone(), digest.to_owned());
+    let referred = hub.store.call(move |c| {
+        Ok(work::get(c, Family::Object, &k)?.is_some()
+            || crate::logs::accepted::copy_has_object(c, &target, target_attempt, &scope, &object)?)
+    }).await.map_err(internal)?;
     if !referred {
         return Ok(msg(StatusCode::NOT_FOUND, "no such object"));
     }
@@ -793,7 +842,11 @@ pub(crate) mod tests {
             let untrusted = leg(&hub, "acme/app", "run3", "leg3", false).await?;
             let other = leg(&hub, "acme/other", "run4", "leg4", true).await?;
             let base = serve(Arc::clone(&hub))?;
-            hub.logs.append("leg1", 2, b"built 1\r\n");
+            let accepted = hub.logs.append_server("leg1".into(), 2, b"built 1\r\n".to_vec()).await?;
+            anyhow::ensure!(accepted.accepted, "source append must have its own receipt");
+            let live = hub.logs.append_server("leg2".into(), 9, b"earlier live step\n".to_vec()).await?;
+            anyhow::ensure!(live.accepted, "a mixed live/memo target starts with a published prefix");
+            hub.store.call(|c| Ok(c.execute("INSERT INTO ci_annotations (leg_id, step_idx, level, message) VALUES ('leg1', 2, 'notice', 'original source')", [])?)).await?;
             let unit = step_unit("ab");
             let outputs = Replay { outputs: BTreeMap::from([("v".to_owned(), "1".to_owned())]), ..Replay::default() }.encode();
             let (st, v) = post(&base, &first, "lookup", &json!({ "unit": unit, "step": 2 })).await?;
@@ -804,6 +857,7 @@ pub(crate) mod tests {
             anyhow::ensure!(st == 200, "{st} {v}");
             anyhow::ensure!(v.pointer("/source/run") == Some(&json!("run1")) && v.pointer("/source/number") == Some(&json!(1)) && v.pointer("/source/step") == Some(&json!(2)) && v.pointer("/source/ms") == Some(&json!(1500)), "{v}");
             anyhow::ensure!(v.pointer("/outputs/output.v") == Some(&json!("1")), "{v}");
+            let original = v.clone();
             let log = hub.logs.read("leg2", 0).await;
             anyhow::ensure!(log == b"built 1\r\n", "the source's log: {}", String::from_utf8_lossy(&log));
             for (who, t) in [("an untrusted leg", &untrusted), ("another repository", &other)] {
@@ -812,6 +866,24 @@ pub(crate) mod tests {
             }
             let (st, _) = post(&base, &second, "lookup", &json!({ "unit": step_unit("cd"), "step": 0 })).await?;
             anyhow::ensure!(st == 204, "another key");
+            // U05: a newer reproduction changes future selections, but an earlier target effect
+            // replays the first result and copies neither its bytes nor annotations a second time.
+            let newer = leg(&hub, "acme/app", "run5", "leg5", true).await?;
+            let accepted = hub.logs.append_server("leg5".into(), 2, b"newer source\n".to_vec()).await?;
+            anyhow::ensure!(accepted.accepted, "new source append");
+            let (st, v) = post(&base, &newer, "record", &json!({ "unit": unit, "step": 2, "ms": 2500, "outputs": outputs })).await?;
+            anyhow::ensure!(st == 201, "{st} {v}");
+            let (st, replayed) = post(&base, &second, "lookup", &json!({ "unit": unit, "step": 0 })).await?;
+            anyhow::ensure!(st == 200 && replayed == original, "the original response survives a changed selection: {st} {replayed}");
+            anyhow::ensure!(hub.logs.read("leg2", 0).await == log, "replay appends no second copy");
+            let (st, v) = post(&base, &second, "lookup", &json!({ "unit": unit, "step": 1 })).await?;
+            anyhow::ensure!(st == 200 && v.pointer("/source/run") == Some(&json!("run5")), "the same memo at a different step is a distinct effect: {st} {v}");
+            anyhow::ensure!(hub.logs.read("leg2", 1).await == b"newer source\n", "a new effect copies the selected source");
+            hub.store.call(|c| Ok(c.execute("DELETE FROM work_records WHERE family = 'work.result'", [])?)).await?;
+            let (st, replayed) = post(&base, &second, "wait", &json!({ "unit": unit, "step": 0 })).await?;
+            anyhow::ensure!(st == 200 && replayed == original, "an absent current selection never erases the original effect: {st} {replayed}");
+            let annotations: i64 = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ci_annotations WHERE leg_id = 'leg2' AND step_idx = 0 AND message = 'original source'", [], |r| r.get(0))?)).await?;
+            anyhow::ensure!(annotations == 1, "retries copy ancillary metadata once: {annotations}");
             // An untrusted leg's record lands in its own domain, whatever it says.
             let (st, v) = post(&base, &untrusted, "record", &json!({ "unit": step_unit("ef"), "step": 0, "outputs": {}, "trusted": true })).await?;
             anyhow::ensure!(st == 201, "{st} {v}");
@@ -891,11 +963,24 @@ pub(crate) mod tests {
             // Once no result can be reused, the lookup finds nothing and the upkeep lets the files go.
             hub.store.call(|c| Ok(c.execute("UPDATE work_records SET at = 0 WHERE family = 'work.object'", [])?)).await?;
             let (st, _) = post(&base, &second, "lookup", &json!({ "unit": unit, "step": 0 })).await?;
-            anyhow::ensure!(st == 204, "its files are due to go: {st}");
+            anyhow::ensure!(st == 200, "the original accepted effect replays after current eligibility expires: {st}");
+            let (st, _) = post(&base, &second, "lookup", &json!({ "unit": unit, "step": 3 })).await?;
+            anyhow::ensure!(st == 204, "its files are due to go for an unserved target step: {st}");
             anyhow::ensure!(sweep(&hub).await? == 3, "the tree and its two files");
+            let (_, v) = post(&base, &first, "missing", &json!({ "digests": digests })).await?;
+            anyhow::ensure!(missing(&v) == 3, "the expired source no longer owns these objects: {v}");
+            anyhow::ensure!(get(&base, &first, &td.hash).await?.0 == 404, "no longer the source's");
             let (_, v) = post(&base, &second, "missing", &json!({ "digests": digests })).await?;
-            anyhow::ensure!(missing(&v) == 3, "{v}");
-            anyhow::ensure!(get(&base, &second, &td.hash).await?.0 == 404, "no longer the scope's");
+            anyhow::ensure!(missing(&v) == 0, "the original target's effect still owns every output: {v}");
+            hub.store.call(|c| Ok(c.execute("UPDATE cas_index SET last_used_at = 0", [])?)).await?;
+            let collected = cas::collect(&hub).await?;
+            anyhow::ensure!(collected.objects == 0, "the existing collector must retain target-owned outputs");
+            let (st, replayed) = post(&base, &second, "wait", &json!({ "unit": unit, "step": 0 })).await?;
+            anyhow::ensure!(st == 200 && replayed.pointer("/outputs/files") == Some(&json!(td.to_string())), "the first result remains usable after source expiry and collection: {st} {replayed}");
+            for (digest, bytes) in &objects {
+                anyhow::ensure!(get(&base, &second, &digest.hash).await? == (200, bytes.clone()), "the target retains {}", digest.hash);
+            }
+            anyhow::ensure!(get(&base, &other, &td.hash).await?.0 == 404, "a different scope gains no authority from another target's pins");
             Ok(())
         })
     }

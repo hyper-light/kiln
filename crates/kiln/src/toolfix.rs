@@ -587,7 +587,7 @@ mod tests {
             let job = hub.store.jobs("run1".into(), false).await?.first().map(|j| j.id.clone()).unwrap_or_default();
             hub.agents.lock().insert("adas-mac-studio-3".into(), crate::hub::tests::live_runner("adas-mac-studio-3", "macos", "aarch64"));
             assert!(hub.store.claim_job(job.clone(), "adas-mac-studio-3".into(), "baremetal".into()).await?);
-            hub.logs.append(&job, 0, b"$ npm ci\nbash: line 1: npm: command not found\n");
+            hub.logs.append_server(job.clone(), 0, b"$ npm ci\nbash: line 1: npm: command not found\n".to_vec()).await?;
             hub.logs.finish(&job);
             hub.store.step_update(job.clone(), 0, Status::Failed, Some(127)).await?;
             hub.store.finish_job(job.clone(), Status::Failed, Some(127), None, None, None).await?;
