@@ -405,12 +405,22 @@ impl Store {
 
     /// Limits bound safe admitted input, not historical migration calls or engine RSS.
     pub fn start_with_limits(engine: Box<dyn Engine>, upkeep: Upkeep, limits: AdmissionLimits) -> anyhow::Result<Self> {
+        Self::start_initialized(engine, upkeep, limits, i64::MAX)
+    }
+
+    /// The existing archive owner installs its initial hold before the writer can run.
+    /// Ordinary constructors retain their unbounded initial cutoff and original upkeep.
+    pub(crate) fn start_with_initial_hold(engine: Box<dyn Engine>, upkeep: Upkeep, initial_hold: i64) -> anyhow::Result<Self> {
+        Self::start_initialized(engine, upkeep, AdmissionLimits::default(), initial_hold)
+    }
+
+    fn start_initialized(engine: Box<dyn Engine>, upkeep: Upkeep, limits: AdmissionLimits, initial_hold: i64) -> anyhow::Result<Self> {
         anyhow::ensure!(limits.batches > 0 && limits.bytes > 0, "conversation admission limits must be positive");
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE.min(limits.batches));
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let meter: Arc<Meter> = Arc::default();
-        let hold = Arc::new(AtomicI64::new(i64::MAX));
+        let hold = Arc::new(AtomicI64::new(initial_hold));
         let failure: Failure = Arc::default();
         let capacity = Arc::new(Capacity { limits, used: Mutex::default(), changed: event_listener::Event::new(), meter: meter.clone() });
         let identity = Arc::new(());
@@ -1140,14 +1150,17 @@ mod tests {
     #[test]
     fn a_hold_keeps_the_records_of_sessions_that_ended_at_or_after_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None })?;
+        let host = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        let mut engine = super::super::amphora::Amphora::from_database(host.database())?;
         let now = crate::util::now_ms();
         let held = now - 3_600_000;
-        store.hold_prune(held);
         let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
         let line = |s: &str, n: u64| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: "{}".into(), kept: None }));
-        store.put(vec![session("before"), line("before", 0), Row::Closed { session: "before".into(), at: held - 60_000 }]);
-        store.put(vec![session("held"), line("held", 0), Row::Closed { session: "held".into(), at: held }]);
+        // Rows already exist at startup. No caller-side hold update can protect them
+        // after this actor starts: its initial hold must precede the first prune turn.
+        engine.apply(&[session("before"), line("before", 0), Row::Closed { session: "before".into(), at: held - 60_000 },
+            session("held"), line("held", 0), Row::Closed { session: "held".into(), at: held }])?;
+        let store = Store::start_with_initial_hold(Box::new(engine), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None }, held)?;
         let until = Instant::now() + Duration::from_secs(15);
         while !store.marks("before")?.is_empty() {
             anyhow::ensure!(Instant::now() < until, "the record of a session that ended before the hold was kept");

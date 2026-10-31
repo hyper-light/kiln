@@ -536,6 +536,51 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let convo = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            // A replicated runner shares these canonical rows, but not this actor's
+            // archive hold. Its actual maintenance must leave old unarchived bytes alone.
+            let old = crate::util::now_ms().saturating_sub(31 * 86_400_000);
+            let mut rows = vec![crate::convo::rows::Row::Session {
+                session: "replica-held".into(), info: Some("{}".into()), meta: None,
+                state: None, changes: None, epoch: None, open: true, at: old,
+            }];
+            rows.extend(record("replica-held", 0..3));
+            rows.push(crate::convo::rows::Row::Closed { session: "replica-held".into(), at: old });
+            let c = convo.clone();
+            assert!(crate::rt::blocking(move || c.put_wait(rows)).await?);
+            due(&hub.store, "replica-held").await;
+            hub.store.call(move |c| Ok(c.execute("UPDATE transcript_archives SET closed_ms = ?1, due_ms = 0 WHERE session = 'replica-held'", [old])?)).await?;
+            hold(&hub, &convo).await?;
+            assert_eq!(convo.held(), Some(old - HOLD_SLACK_MS));
+            let database = hub.store.database();
+            let replica = crate::rt::blocking(move || {
+                crate::records::SessionStorage::from_host_database(database, "replica-fixture", &[], crate::agent::runner_conversation_upkeep(true))
+                    .map(|storage| storage.conversations())
+            }).await??;
+            let r = replica.clone();
+            crate::rt::blocking(move || -> anyhow::Result<()> {
+                let until = std::time::Instant::now() + Duration::from_secs(15);
+                // report() reads existing telemetry, so it cannot keep this actor busy.
+                // Observe idle worker progress before checking the shared transcript.
+                while r.report().waits.iter().sum::<u64>() < 3 {
+                    anyhow::ensure!(std::time::Instant::now() < until, "replica maintenance did not run");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert_eq!(r.record("replica-held", "cc", 0, 10)?.len(), 3, "replica maintenance pruned unarchived canonical bytes despite the server's hold");
+                Ok(())
+            }).await??;
+            pass(&hub, &convo).await?;
+            assert_eq!(read_back(&hub, "replica-held").await?, texts("replica-held", 0..3));
+            assert_eq!(convo.held(), None, "the archive owner releases its hold only after archival");
+            let c = convo.clone();
+            crate::rt::blocking(move || -> anyhow::Result<()> {
+                let until = std::time::Instant::now() + Duration::from_secs(30);
+                while !c.marks("replica-held")?.is_empty() {
+                    anyhow::ensure!(std::time::Instant::now() < until, "server retention did not progress after archival released its hold");
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+                Ok(())
+            }).await??;
+            assert_eq!(read_back(&hub, "replica-held").await?, texts("replica-held", 0..3), "archive remains readable after canonical record pruning");
             let c = convo.clone();
             assert!(crate::rt::blocking(move || c.put_wait(record("s1", 0..3))).await?);
             due(&hub.store, "s1").await;

@@ -17,8 +17,13 @@ pub struct SessionStorage {
 }
 impl SessionStorage {
     pub fn from_host_database(database: Database, host: &str, legacy_conversations: &[PathBuf], upkeep: Upkeep) -> anyhow::Result<Self> {
+        Self::from_host_database_with_initial_hold(database, host, legacy_conversations, upkeep, i64::MAX)
+    }
+
+    /// Archive startup chooses its hold before the same actor is spawned or exposed.
+    pub(crate) fn from_host_database_with_initial_hold(database: Database, host: &str, legacy_conversations: &[PathBuf], upkeep: Upkeep, initial_hold: i64) -> anyhow::Result<Self> {
         anyhow::ensure!(crate::convo::enabled(), "U05 session batch capability requires conversation storage");
-        let conversations = crate::convo::from_host_sources(database.clone(), host, legacy_conversations, upkeep)?;
+        let conversations = crate::convo::from_host_sources_with_initial_hold(database.clone(), host, legacy_conversations, upkeep, initial_hold)?;
         Ok(Self { database, conversations })
     }
 

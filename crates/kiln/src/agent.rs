@@ -1198,6 +1198,14 @@ fn configured_host_database(config: &crate::config::Config, state: &Path, work: 
     Ok(config.server.data_dir.join("kiln.db"))
 }
 
+/// Replicated runners share the server's canonical transcript rows. Only the existing
+/// server archive owner may prune them; an ordinary standalone runner keeps its policy.
+pub(crate) fn runner_conversation_upkeep(replicated_transport: bool) -> crate::convo::store::Upkeep {
+    let mut upkeep = crate::config::Conversations::default().upkeep();
+    if replicated_transport { upkeep.keep_closed = None; }
+    upkeep
+}
+
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> { run_in(o, shutdown, crate::runner::processes::Admission::production()).await }
 
 pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::runner::processes::Admission) -> anyhow::Result<()> {
@@ -1665,6 +1673,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
         let conversations_on = crate::convo::enabled();
         let conversation_sources = if conversations_on { crate::server::legacy_conversation_sources(&o.state_dir)? } else { Vec::new() };
         let conversation_host = name.clone();
+        let conversation_upkeep = runner_conversation_upkeep(replicated_transport);
         let scope = format!("runner/{name}/{instance_id}");
         let namespace = runner_records_namespace(&name, o.instance.as_deref());
         let machine_namespace = runner_machine_namespace(&name);
@@ -1675,7 +1684,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
         let (st, h) = crate::rt::blocking(move || -> anyhow::Result<_> {
             crate::records::import_host_namespace(&db, &dir.join(crate::records::FILE), &namespace)?;
             let storage = if conversations_on {
-                Some(crate::records::SessionStorage::from_host_database(db.clone(), &conversation_host, &conversation_sources, crate::config::Conversations::default().upkeep())?)
+                Some(crate::records::SessionStorage::from_host_database(db.clone(), &conversation_host, &conversation_sources, conversation_upkeep)?)
             } else { None };
             let st = storage.as_ref().map(crate::records::SessionStorage::conversations);
             let sink = match &st {

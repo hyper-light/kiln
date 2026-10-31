@@ -918,10 +918,9 @@ impl Registry {
             sources.push(dir.join(crate::convo::FILE));
             sources.sort();
             sources.dedup();
-            Some(crate::records::SessionStorage::from_host_database(database, machine_name, &sources, conversations.upkeep())?)
+            Some(crate::records::SessionStorage::from_host_database_with_initial_hold(database, machine_name, &sources, conversations.upkeep(), 0)?)
         };
         let convo = storage.as_ref().map(crate::records::SessionStorage::conversations);
-        if let Some(store) = &convo { store.hold_prune(0); }
         let (tx, rx) = async_channel::bounded(8192);
         let local = match storage {
             Some(storage) => Host::try_with_session_namespace(tx, Some(dir.join("local.json")), Limits::default(), clock, storage.bind_namespace(&local_namespace, None)?, machine, &scope)?,
