@@ -4183,13 +4183,16 @@ mod tests {
     }
 
     /// W05-R34: `[sched] lease` and `lock_delay` are read as durations, kiln's 60 s and 15 s when
-    /// unset; a lease shorter than two heartbeats, or a duration that doesn't read, is refused.
+    /// unset; a lease under 3 s (renewed three times a lease, twice a second at most), or a
+    /// duration that doesn't read, is refused.
     #[test]
     fn w05_r34_lease_and_lock_delay_are_read() -> anyhow::Result<()> {
         assert_eq!(crate::config::Config::default().sched.leases()?, (60_000, 15_000));
         let cfg: crate::config::Config = toml::from_str("[sched]\nlease = \"2m\"\nlock_delay = \"40s\"\n")?;
         assert_eq!(cfg.sched.leases()?, (120_000, 40_000));
-        for bad in ["[sched]\nlease = \"10s\"\n", "[sched]\nlease = \"soon\"\n", "[sched]\nlock_delay = \"later\"\n"] {
+        let short: crate::config::Config = toml::from_str("[sched]\nlease = \"5s\"\n")?;
+        assert_eq!(short.sched.leases()?, (5_000, 15_000), "as short as a test's");
+        for bad in ["[sched]\nlease = \"2s\"\n", "[sched]\nlease = \"soon\"\n", "[sched]\nlock_delay = \"later\"\n"] {
             let cfg: crate::config::Config = toml::from_str(bad)?;
             assert!(cfg.sched.leases().is_err(), "{bad}");
         }

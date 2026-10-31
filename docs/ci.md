@@ -1913,7 +1913,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   fence: the epoch it was made in, then its number among that epoch's grants. A later grant's fence
   is greater, and no two grants share one, not even an attempt granted again after a refusal
   (W05-R02 keeps the attempt). A grant expires a lease after it's made (`[sched] lease`, 60 s by
-  default, at least 20 s) unless its runner renews it, every 10 s, for a lease from then: a runner
+  default, at least 3 s) unless its runner renews it, three times a lease and at most every 10 s,
+  for a lease from then: a runner
   that says `CAP_LEASES` (docs/wire.md) names each grant it holds by its fence (`Renew`), and is
   answered with those that aren't its own any more (`Renewed`); an older runner's heartbeat names
   the legs it runs, each renewed by the fence of the grant it was sent. A lease runner's leg comes
@@ -1955,7 +1956,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   (`kiln_ci_refused_writes_total`), said once a grant, and its runner told once to stop that grant
   (`Stop`).
 - **W05-R37 A runner keeps its own leases** (docs/needs.md §8, E3.5). A lease runner sends `Renew`
-  every 10 s in place of its heartbeat, and keeps each grant's lease end by its own clock: from
+  in place of its heartbeat, three times a lease (as its grants and the server's answers say it)
+  and at most every 10 s, and keeps each grant's lease end by its own clock: from
   when it sent the last `Renew` naming the grant that the server answered, the lease less a tenth
   (Chubby's conservative local lease: the server's began no earlier than the request was sent). A
   grant assigned on a connection counts from the last `Renew` answered on it, or from its `Hello`,
@@ -1964,9 +1966,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   continuous timebase `CLOCK_MONOTONIC_RAW` reads, Windows interrupt time) and never goes back, so
   a machine waking from sleep finds its leases ended. It checks every half second, so within a
   second of a lease's end a grant whose lease ended unrenewed and that stops on losing it
-  (`on_lease_loss: stop`) is stopped as a `Cancel` stops it, and ends failed, `runner-lost`
-  (`lease lost`), as its runner's loss is (W05-R16); a grant the server's answer says isn't the runner's any more
-  ends at once. A `finish` grant runs on, and what it writes is refused once its grant is gone
+  (`on_lease_loss: stop`) is stopped: killed, without a `Cancel`'s grace, its running step's
+  processes sent SIGKILL and nothing more of it run (not its `always()` or post steps), since past
+  its lease it may not act; a leg in a microVM is stopped as a `Cancel` stops it. It ends failed,
+  `runner-lost` (`lease lost`), as its runner's loss is (W05-R16); a grant the server's answer
+  says isn't the runner's any more ends at once. A `finish` grant runs on, and what it writes is refused once its grant is gone
   (W05-R36). The runner doesn't apply an `Assign`, a `Stop` or a `Renewed` from an epoch older
   than the newest it has seen (`StaleEpoch`). Self-fencing narrows the window: the guarantee
   rests on fencing (G2), since a runner that is itself paused can't stop anything.
@@ -2059,6 +2063,18 @@ W20.
   `batch` holds its floor; a work-in-progress leg behind gate work starts as the runner next frees;
   a class served at one signature is still promoted where it's passed over. *Simulation tests
   (`w05_ac15_…`, `w05_r31_…`, `w28_r65_…`).*
+- **W05-AC16 A runner cut off past its lease** (W05-R34, R36, R37, W10-R03; docs/needs.md E3.9).
+  A server whose grants live 5 s and two runner processes. A leg starts on runner A, which is
+  paused (SIGSTOP, as a GC pause or a machine's sleep pauses it) past its lease, its connection
+  dropped meanwhile: the grant is lost and attempt 2 starts on runner B. Nothing A writes about
+  attempt 1 once attempt 2 has started is taken: the lines its step prints, its step's end and its
+  result are refused under attempt 1's grant, and the leg's result, steps, log and artifacts are
+  attempt 2's (the lines attempt 1 printed while its grant was live stay as they were taken). Its
+  tokens are refused once its grant is lost: an artifact's upload with its runtime token, kiln's
+  git API with its `GITHUB_TOKEN`, an ID token with its request token; attempt 2's are taken. A is
+  told to stop attempt 1. And a stop item on a runner cut off stops itself: its process is gone
+  within a second of the runner's lease end, by the runner's clock. On Linux and macOS.
+  *End-to-end tests (`w05_ac16_…`, `crates/kiln/tests/leases.rs`).*
 
 **Scenarios**
 

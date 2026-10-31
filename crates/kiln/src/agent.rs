@@ -230,6 +230,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Running {
     cancel: Shutdown,
+    /// Its lease lost, it's killed (docs/ci.md W05-R37): no cancel's grace, nothing more run.
+    kill: Shutdown,
     /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
     pooled: bool,
     /// What it holds of this runner (docs/ci.md W05-R03): a share of its CPUs and memory, the
@@ -286,6 +288,16 @@ pub(crate) fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>,
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
 const CANCEL_GRACE: Duration = Duration::from_secs(120);
 
+/// A lease runner renews what it holds at most this far apart: its heartbeat's period.
+const RENEW_MOST: Duration = Duration::from_secs(10);
+
+/// How often a lease runner renews what it holds (docs/ci.md W05-R34): three times a lease of
+/// `lease_ms`, so a `Renew` lost leaves the grant two more before it runs out; at most every 10 s,
+/// and not more often than twice a second.
+fn renew_every(lease_ms: u64) -> Duration {
+    Duration::from_millis(lease_ms / 3).clamp(Duration::from_millis(500), RENEW_MOST)
+}
+
 /// What a job stopped for its lease ends with (docs/ci.md W05-R37).
 const LEASE_LOST: &str = "lease lost: this runner's lease on it ended unrenewed, and it stops on losing it";
 
@@ -334,6 +346,8 @@ enum Ev {
     Net(Option<NetEvent>),
     Done(JobResult),
     Heartbeat,
+    /// A lease runner's renewal of what it holds: three times a lease, at most every 10 s.
+    Renew,
     /// The leases' check, every half second: a grant is stopped within a second of its lease's
     /// end, the loop's own delays besides (docs/ci.md W05-R37).
     Lease,
@@ -1433,6 +1447,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
+    // Paced by the lease its grants and the server's answers carry (W05-R34).
+    let (mut renew, mut renew_period) = (Interval::new(RENEW_MOST), RENEW_MOST);
     let mut lease_check = Interval::new(Duration::from_millis(500));
     let mut watchdog = Interval::new(Duration::from_secs(5));
     let mut served_dedicated = false;
@@ -1493,6 +1509,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
+            () = renew.tick().fuse() => Ev::Renew,
             () = lease_check.tick().fuse() => Ev::Lease,
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
@@ -2406,7 +2423,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), kill: Shutdown::new(), pooled: false, holds });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -2475,6 +2492,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Renewed { seq, lease_ms, epoch, lost } => {
                         for g in &lost {
                             tracing::warn!(job = %g.leg, attempt = g.attempt, "the server says this runner's grant for the leg isn't its own any more");
+                        }
+                        if lease_ms > 0 && !leases.stale(epoch) && renew_every(lease_ms) != renew_period {
+                            renew_period = renew_every(lease_ms);
+                            renew = Interval::new(renew_period);
                         }
                         leases.renewed(seq, lease_ms, epoch, &named(&lost));
                     }
@@ -3115,7 +3136,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         };
                         // Its lease, by this machine's clock (W05-R37).
                         match (a.fence, a.lease_ms) {
-                            (Some(fence), Some(ms)) if server_leases => leases.granted(&id, fence, ms, a.on_lease_loss == kiln_ci::sched::LeaseLoss::Stop),
+                            (Some(fence), Some(ms)) if server_leases => {
+                                leases.granted(&id, fence, ms, a.on_lease_loss == kiln_ci::sched::LeaseLoss::Stop);
+                                if renew_every(ms) != renew_period {
+                                    renew_period = renew_every(ms);
+                                    renew = Interval::new(renew_period);
+                                }
+                            }
                             _ => leases.ended(&id),
                         }
                         // Server-relative URLs go through the address this runner reached the server
@@ -3145,9 +3172,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 act.url = format!("{base}{}", act.url);
                             }
                         }
-                        let cancel = Shutdown::new();
+                        let (cancel, kill) = (Shutdown::new(), Shutdown::new());
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), kill: kill.clone(), pooled, holds });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
                         // Its pool's executor, when the leg can run in it as it is; else the leg
                         // runs the usual way and the executor goes all the same.
@@ -3160,7 +3187,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             None => None,
                         };
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, kill, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
                         let done = done_tx.clone();
                         // On the `firecracker` executor, in a microVM of its own (W13-R05).
                         #[cfg(target_os = "linux")]
@@ -3497,6 +3524,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let Some(r) = jobs.get(&job) else { continue };
                     let end = leases.end(&job).unwrap_or_default();
                     tracing::warn!(%job, "its lease ended unrenewed (at {end} ms by this machine's clock, now {now} ms), and it stops on losing it: stopping it");
+                    // Killed, not cancelled: no grace past its lease, nothing more run.
+                    r.kill.cancel();
                     r.cancel.cancel();
                     lease_lost.insert(job.clone());
                     let tx = done_tx.clone();
@@ -3505,6 +3534,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let error = format!("{LEASE_LOST}; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
                         let _ = tx.send(JobResult { job, status: Status::Failed, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
                     });
+                }
+            }
+            // A lease runner renews the grants it holds (W05-R34), each lease counted from now
+            // (W05-R37): three times a lease, at most every 10 s, in place of its heartbeat.
+            Ev::Renew => {
+                grants.retain(|job, _| jobs.contains_key(job) || unreceived.contains_key(job));
+                if connected && server_leases {
+                    renew_seq += 1;
+                    let held = held_grants(&grants, &jobs, &unreceived);
+                    leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
+                    uplink.msg(AgentMsg::Renew { seq: renew_seq, held }).await;
                 }
             }
             Ev::Heartbeat => {
@@ -3522,15 +3562,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
                     }
                 }
-                grants.retain(|job, _| jobs.contains_key(job) || unreceived.contains_key(job));
-                if connected && server_leases {
-                    // A lease runner's heartbeat renews the grants it holds (W05-R34), each lease
-                    // counted from now (W05-R37).
-                    renew_seq += 1;
-                    let held = held_grants(&grants, &jobs, &unreceived);
-                    leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
-                    uplink.msg(AgentMsg::Renew { seq: renew_seq, held }).await;
-                } else if connected {
+                // A lease runner's heartbeat is its `Renew` (`Ev::Renew`).
+                if connected && !server_leases {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
                 }
@@ -4152,6 +4185,16 @@ mod tests {
     }
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
+
+    /// W05-R34: a lease runner renews three times a lease, at most every 10 s (its heartbeat), and
+    /// no more than twice a second: 10 s for kiln's 60 s lease, a third of a test's 5 s.
+    #[test]
+    fn w05_r34_a_lease_runner_renews_three_times_a_lease() {
+        assert_eq!(renew_every(60_000), Duration::from_secs(10));
+        assert_eq!(renew_every(15_000), Duration::from_secs(5));
+        assert_eq!(renew_every(5_000), Duration::from_millis(1_666));
+        assert_eq!(renew_every(600), Duration::from_millis(500));
+    }
 
     /// The runner admits by the rule its dispatchers use, counting what jobs from either hold: on
     /// a 32-CPU, 64 GiB runner of 4 slots, a bench holding 16 CPUs leaves two slots, refusals say

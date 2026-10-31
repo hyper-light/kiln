@@ -244,8 +244,8 @@ pub struct Sched {
     /// ```
     pub classes: BTreeMap<kiln_ci::sched::Class, ClassSettings>,
     /// How long a grant lives unless its runner renews it (docs/needs.md §8, docs/ci.md W05-R34):
-    /// one not renewed by then is lost, and its item's next attempt queued. Runners renew with
-    /// their heartbeat, every 10 s. 60 s by default (`90s`, `2m`), at least 20 s.
+    /// one not renewed by then is lost, and its item's next attempt queued. Runners renew three
+    /// times a lease, at most every 10 s. 60 s by default (`90s`, `2m`), at least 3 s.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<String>,
     /// How long past a lost grant's expiry an item that stops on losing its lease waits before its
@@ -295,7 +295,7 @@ impl Sched {
             set.map_or(Ok(default), |v| Ok(kiln_ci::work::reap::parse_duration(v).map_err(|e| anyhow::anyhow!("[sched] {name}: {e}"))?.saturating_mul(1000)))
         };
         let lease = read("lease", self.lease.as_deref(), 60_000)?;
-        anyhow::ensure!(lease >= 20_000, "[sched] lease: at least 20s, as runners renew every 10s");
+        anyhow::ensure!(lease >= 3_000, "[sched] lease: at least 3s, as runners renew three times a lease");
         Ok((lease, read("lock_delay", self.lock_delay.as_deref(), 15_000)?))
     }
 }

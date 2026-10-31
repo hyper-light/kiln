@@ -250,9 +250,9 @@ pub enum AgentMsg {
     AgentLimit { json: String },
     /// CI (docs/ci.md W05-R34): the grants this runner holds (each leg it runs or whose result the
     /// server hasn't said it has), renewed for a lease from when the server takes this, which
-    /// answers [`ServerMsg::Renewed`] under `seq`. A lease runner's heartbeat, every 10 s, and sent
-    /// as the server welcomes it; only to a server announcing [`CAP_LEASES`]. Appended last:
-    /// postcard encodes variants by index.
+    /// answers [`ServerMsg::Renewed`] under `seq`. A lease runner's heartbeat, three times a lease
+    /// and at most every 10 s, and sent as the server welcomes it; only to a server announcing
+    /// [`CAP_LEASES`]. Appended last: postcard encodes variants by index.
     Renew { seq: u64, held: Vec<Grant> },
     /// CI: [`AgentMsg::Reject`] naming the grant it refuses (W05-R34): one refused before that
     /// leg's grant now refuses nothing. Only to a server announcing [`CAP_LEASES`]. Appended last:
