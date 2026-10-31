@@ -10,7 +10,8 @@
 //!   conclusion.
 //! - **Read back** ([`read`]) from a statement kiln took, and **judged** ([`judge`]) against what
 //!   kiln keeps of the leg. Each break is said: a step's end that isn't the leg's, a log kiln
-//!   changed or lost, a report that isn't the one the leg uploaded or that either side lacks.
+//!   changed or lost, or keeps as the leg's though the leg signed none of it, a report that isn't
+//!   the one the leg uploaded or that either side lacks.
 //! - **Provenance** ([`provenance_is_the_legs`], [`materials_are_received`]): the statement kiln
 //!   writes of what a leg built is the leg's to sign only when its subjects are what the leg's
 //!   attest step reported (its hand-ons) and its materials are among what it received.
@@ -24,7 +25,7 @@
 //!
 //! No clock, disk or network.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -144,11 +145,18 @@ pub struct Kept {
     pub reports: Vec<Report>,
     /// The leg's end as kiln recorded it.
     pub conclusion: Option<(String, Option<i32>)>,
+    /// Each step whose log kiln keeps chunks of, as taken from the leg (its latest attempt's, how
+    /// many), that the leg signed no log of.
+    pub unsigned_logs: BTreeMap<u32, u64>,
+    /// The steps whose results the leg received reused ([`reused`]): their reports are their
+    /// source leg's, which kiln copied over, not the leg's to sign.
+    pub reused: BTreeSet<u32>,
 }
 
 /// Each break between what a leg signed and what kiln keeps of it, said; none when they agree.
 /// Steps kiln ended itself and the leg didn't (a leg cancelled before them) aren't the leg's to
-/// sign, so they aren't held against it.
+/// sign, so they aren't held against it, nor are a reused step's reports (its source leg's). A log
+/// kiln keeps as taken from the leg is, signed or not: one the leg signed none of isn't the leg's.
 pub fn judge(signed: &Results, kept: &Kept) -> Vec<String> {
     let mut out = Vec::new();
     for s in signed.steps.values() {
@@ -170,6 +178,9 @@ pub fn judge(signed: &Results, kept: &Kept) -> Vec<String> {
             None => {}
         }
     }
+    for (idx, chunks) in kept.unsigned_logs.iter().filter(|(idx, n)| **n > 0 && !signed.logs.contains_key(idx)) {
+        out.push(format!("step {idx}'s log: kiln keeps {chunks} chunk{} of it as the leg's, and the leg signed none", if *chunks == 1 { "" } else { "s" }));
+    }
     for r in &signed.reports {
         match kept.reports.iter().find(|k| k.idx == r.idx && k.path == r.path) {
             None => out.push(format!("report {} of step {}: kiln has none", r.path, r.idx)),
@@ -177,7 +188,7 @@ pub fn judge(signed: &Results, kept: &Kept) -> Vec<String> {
             Some(_) => {}
         }
     }
-    for k in &kept.reports {
+    for k in kept.reports.iter().filter(|k| !kept.reused.contains(&k.idx)) {
         if !signed.reports.iter().any(|r| r.idx == k.idx && r.path == k.path) {
             out.push(format!("report {} of step {}: kiln has it, and the leg didn't sign it", k.path, k.idx));
         }
@@ -404,6 +415,12 @@ pub fn kind(c: &statement::Checked) -> &str {
     c.statement.body.get("kind").and_then(Value::as_str).unwrap_or_default()
 }
 
+/// The steps whose results a leg's custody records say it received reused (`reused/<step>`, W24's
+/// replays): what kiln copied into them is their source leg's.
+pub fn reused(records: &[&statement::Checked]) -> BTreeSet<u32> {
+    records.iter().filter(|c| kind(c) == "received").flat_map(|c| c.statement.subject.iter()).filter_map(|s| s.name.strip_prefix("reused/")?.parse().ok()).collect()
+}
+
 /// Each break in a leg's custody, said: a record missing from its stream (or numbered twice); a
 /// hand-on of what it made that isn't there, isn't one, or doesn't name its results; one kiln
 /// signed no receipt of, or a receipt of kiln's that follows none; and a receipt of the leg's that
@@ -549,17 +566,23 @@ mod tests {
         Ok(())
     }
 
+    /// What kiln keeps of a leg that is what it signed of `r`.
+    fn kept_of(r: &Results) -> Kept {
+        Kept {
+            steps: r.steps.values().map(|s| (s.idx, (s.status.clone(), s.exit_code))).collect(),
+            logs: r.logs.keys().map(|idx| (*idx, logs::Verdict::Verified { kept: 10, dropped: 0 })).collect(),
+            reports: r.reports.clone(),
+            conclusion: Some(("success".into(), Some(0))),
+            ..Kept::default()
+        }
+    }
+
     /// W27-R05: what kiln keeps is held against what the leg signed, and each break is said: a
     /// step's end, a log changed or short, a report swapped or added, the leg's end.
     #[test]
     fn w27_r05_each_break_between_the_leg_and_kiln_is_said() {
         let r = results();
-        let mut kept = Kept {
-            steps: r.steps.values().map(|s| (s.idx, (s.status.clone(), s.exit_code))).collect(),
-            logs: r.logs.keys().map(|idx| (*idx, logs::Verdict::Verified { kept: 10, dropped: 0 })).collect(),
-            reports: r.reports.clone(),
-            conclusion: Some(("success".into(), Some(0))),
-        };
+        let mut kept = kept_of(&r);
         assert_eq!(judge(&r, &kept), Vec::<String>::new());
         // A step kiln ended itself and the leg didn't sign isn't held against it.
         kept.steps.insert(2, ("skipped".into(), None));
@@ -575,6 +598,26 @@ mod tests {
         assert!(breaks.iter().any(|b| b.contains("kiln took 1 of the 2 chunks")), "{breaks:#?}");
         assert!(breaks.iter().any(|b| b.contains("extra.xml") && b.contains("didn't sign")), "{breaks:#?}");
         assert!(breaks.iter().any(|b| b.starts_with("the leg's end: kiln has it cancelled")), "{breaks:#?}");
+    }
+
+    /// W27-R05: a log kiln keeps as taken from the leg, of a step the leg signed no log of, is a
+    /// break, saying how much of it kiln keeps; a reused step's reports, its source leg's that kiln
+    /// copied over, aren't held against the leg.
+    #[test]
+    fn w27_r05_a_log_the_leg_signed_none_of_is_a_break() {
+        let r = results();
+        let mut kept = kept_of(&r);
+        // The logs it signed are checked as they are, not counted again.
+        kept.unsigned_logs = r.logs.keys().map(|idx| (*idx, 3)).collect();
+        assert_eq!(judge(&r, &kept), Vec::<String>::new());
+        kept.unsigned_logs.insert(7, 2);
+        kept.unsigned_logs.insert(8, 0);
+        assert_eq!(judge(&r, &kept), ["step 7's log: kiln keeps 2 chunks of it as the leg's, and the leg signed none"]);
+        kept.unsigned_logs.clear();
+        kept.reports.push(Report { idx: 5, path: "junit.xml".into(), sha256: "cd".repeat(32) });
+        assert!(judge(&r, &kept).iter().any(|b| b.starts_with("report junit.xml of step 5: kiln has it, and the leg didn't sign it")), "{:#?}", judge(&r, &kept));
+        kept.reused.insert(5);
+        assert_eq!(judge(&r, &kept), Vec::<String>::new(), "step 5's result was reused: its report is its source leg's");
     }
 
     /// W27-R05: a leg's receipt of its assignment is over what it says the leg is to do, whatever

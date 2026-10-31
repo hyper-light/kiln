@@ -1091,6 +1091,48 @@ fn leg_on_a_test_runner_with(dir: &Path, workflow: &str, env: &[(&str, &str)], c
     let s = start(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" })?;
     let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", chaos, TALK, env)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
+    let sha = push_e2e(dir, &s, workflow)?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
+        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(r) = runs.iter().find(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let said = || format!("{r}\n{}\n{}", s.log(), std::fs::read_to_string(&log).unwrap_or_default());
+            anyhow::ensure!(r.get("conclusion").and_then(Value::as_str) == Some("success"), "the run failed: {}", said());
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no finished run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(LegRun { s, runner, sha })
+}
+
+/// [`leg_on_a_test_runner`] on v1: the server takes `.kiln/` workflows to v1, having no `[ci]
+/// kiln_workflows` (as production's has none), and its job `e2e` runs on the test runner to its end.
+fn v1_job_on_a_test_runner(dir: &Path, workflow: &str) -> anyhow::Result<LegRun> {
+    let s = start(dir, &Options { agent: false, ci: "", extra: "" })?;
+    let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", None, TALK, &[])?;
+    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
+    // Pushed at once: the job waits for the runner's `Build` as v1 places it, since one written
+    // before went to it out of step and passed without running (W05-R22).
+    let sha = push_e2e(dir, &s, workflow)?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+        let status: Option<String> = db.query_row("SELECT status FROM jobs WHERE key = 'e2e' ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0)).ok().flatten();
+        match status.as_deref() {
+            Some("succeeded") => break,
+            Some(end @ ("failed" | "cancelled" | "skipped" | "timed_out")) => anyhow::bail!("the job {end}: {}\n{}", s.log(), std::fs::read_to_string(&log).unwrap_or_default()),
+            _ => {}
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the job never ended: {status:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(LegRun { s, runner, sha })
+}
+
+/// Repository acme/app on `s`, pushed once polled, then `workflow` as `.kiln/e2e.yaml`: its commit.
+fn push_e2e(dir: &Path, s: &Server, workflow: &str) -> anyhow::Result<String> {
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
     let (home, work) = (dir.join("githome"), dir.join("tree"));
@@ -1113,19 +1155,7 @@ fn leg_on_a_test_runner_with(dir: &Path, workflow: &str, env: &[(&str, &str)], c
     git(&home, &work, &["commit", "-qm", "the workflow"])?;
     let sha = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
     git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
-        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
-        if let Some(r) = runs.iter().find(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
-            let said = || format!("{r}\n{}\n{}", s.log(), std::fs::read_to_string(&log).unwrap_or_default());
-            anyhow::ensure!(r.get("conclusion").and_then(Value::as_str) == Some("success"), "the run failed: {}", said());
-            break;
-        }
-        anyhow::ensure!(Instant::now() < deadline, "no finished run: {body}\n{}", s.log());
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Ok(LegRun { s, runner, sha })
+    Ok(sha)
 }
 
 /// The leg's certificate as kiln issued it (its store's record of it), and kiln's root: DER.
@@ -1591,8 +1621,63 @@ fn w27_r05_a_legs_results_verify_as_the_leg() -> anyhow::Result<()> {
     std::fs::write(&built, &bytes)?;
     let v = signed()?;
     assert_eq!(field(&v, "state"), "broken", "{v:#}");
-    let breaks: Vec<String> = v.get("breaks").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-    assert!(breaks.iter().any(|b| b.contains("isn't what the leg sent")), "{breaks:#?}");
+    let breaks = |v: &Value| -> Vec<String> { v.get("breaks").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect() };
+    assert!(breaks(&v).iter().any(|b| b.contains("isn't what the leg sent")), "{:#?}", breaks(&v));
+    // A log kiln keeps as the leg's, of a step the leg signed no log of: found too.
+    let forged: &[u8] = b"forged\n";
+    std::fs::write(logs_dir.join("7.log"), forged)?;
+    let piece = kiln_ci::logs::Piece { at: Some(0), len: forged.len() as u64, digest: kiln_ci::logs::digest(forged) };
+    std::fs::write(logs_dir.join("7.digests"), format!("{}\n", kiln_ci::logs::line(&piece)))?;
+    let v = signed()?;
+    assert!(breaks(&v).iter().any(|b| b == "step 7's log: kiln keeps 1 chunk of it as the leg's, and the leg signed none"), "{:#?}", breaks(&v));
+    Ok(())
+}
+
+/// W27-R05: a v1 job's results (a `.kiln/` workflow on v1, as production runs them) are signed as
+/// the leg on its runner, as a v2 leg's are: they verify under kiln's delegation of the job, which
+/// names the commit it was given, its steps' ends and logs among them.
+#[test]
+fn w27_r05_a_v1_jobs_results_verify_as_the_leg() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pipeline = "name: e2e\non:\n  push: { branches: [main] }\njobs:\n  e2e:\n    runs-on: [self-hosted]\n    steps:\n      - run: echo building\n      - run: echo tested\n";
+    let run = v1_job_on_a_test_runner(dir.path(), pipeline)?;
+    let leg = the_leg(dir.path())?;
+    let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    let uri = field(&v, "uri");
+    assert!(uri.starts_with("kiln://hyper-light/person/admin/machine/fedora-2/instance/main/run/") && uri.ends_with("/attempt/1/leg/e2e"), "{v:#}");
+    let ends = v.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(ends.len() >= 2 && ends.iter().all(|s| field(s, "status") == "succeeded"), "{v:#}");
+    let logs = v.get("logs").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(!logs.is_empty() && logs.iter().all(|l| l.pointer("/verdict/state").and_then(Value::as_str) == Some("verified")), "{v:#}");
+    assert_eq!(v.pointer("/under/uri").and_then(Value::as_str), Some("kiln://hyper-light/server"), "{v:#}");
+    // kiln's delegation of the job names its commit.
+    let delegation = v.pointer("/under/bundle/dsseEnvelope/payload").and_then(Value::as_str).unwrap_or_default();
+    let said = String::from_utf8(base64::Engine::decode(&base64::engine::general_purpose::STANDARD, delegation)?)?;
+    assert!(said.contains(&run.sha), "the delegation names the job's commit {}: {said}", run.sha);
+    Ok(())
+}
+
+/// W27-R05: a runner behind its legs, as a busy machine's falls behind (a test build's `lag`),
+/// still signs all a leg sent. A leg's end that comes while its last sends wait their turn (its test
+/// step's report line, that step's end) goes after them: its results verify, that step's end among
+/// them.
+/// `cargo test -p kiln --features chaos --test identities w27_r05_a_runner_behind_its_legs_signs_all_they_sent`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r05_a_runner_behind_its_legs_signs_all_they_sent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let steps = "      - run: echo building\n      - test-results: { path: report.xml }\n        run: |\n          printf '%s' '<?xml version=\"1.0\"?><testsuite name=\"calc\" tests=\"1\"><testcase classname=\"calc\" name=\"adds\"/></testsuite>' > report.xml\n          echo tested\n";
+    let run = leg_on_a_test_runner_with(dir.path(), &legs_steps_workflow(steps), &[], Some("lag=300ms"))?;
+    let leg = the_leg(dir.path())?;
+    let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    let ends: Vec<u64> = v.get("steps").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.get("idx").and_then(Value::as_u64)).collect();
+    assert!(ends.contains(&0) && ends.contains(&1), "both steps' ends are signed: {v:#}");
     Ok(())
 }
 
@@ -1608,7 +1693,7 @@ fn w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why() -> anyhow::Result<
     anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
     let v: Value = serde_json::from_str(&body)?;
     assert_eq!(field(&v, "state"), "unsigned", "{v:#}");
-    assert_eq!(field(&v, "why"), "kiln gave it no identity: its runner fedora-2 asked for none (a kiln from before them), or it isn't a leg of a run kiln planned", "{v:#}");
+    assert_eq!(field(&v, "why"), "kiln gave it no identity: its runner fedora-2 asked for none (a kiln from before them)", "{v:#}");
     Ok(())
 }
 
@@ -1863,7 +1948,7 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     std::fs::write(
         &act,
         format!(
-            "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in review\\ *) KILN_SESSION=${{text#review }} ;; *) exit 0 ;; esac\nexport KILN_SESSION\n{{ printf '%s\\n' '{init}' '{call}'; while ! grep -q '\"id\":2' mcp.out 2>/dev/null; do sleep 0.2; done; }} | '{}' reach mcp > mcp.out 2> mcp.err\necho done >> mcp.out\n",
+            "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in review\\ *) KILN_SESSION=${{text#review }} ;; *) exit 0 ;; esac\nexport KILN_SESSION\n{{ printf '%s\\n' '{init}' '{call}'; while ! grep -q '\"id\":2' mcp.out 2>/dev/null; do sleep 0.2; done; }} | '{}' reach mcp > mcp.out 2> mcp.err\nprintf '\\n#act-ended\\n' >> mcp.out\n",
             env!("CARGO_BIN_EXE_kiln")
         ),
     )?;
@@ -1878,9 +1963,8 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     anyhow::ensure!((200..300).contains(&st), "send: {st} {sent}");
     let out = || std::fs::read_to_string(cwd.join("mcp.out")).unwrap_or_default();
     let deadline = Instant::now() + Duration::from_secs(60);
-    // The line the script writes once its call is answered: kiln's instructions say "goals_done"
-    // in the first answer already.
-    while !out().lines().any(|l| l.trim() == "done") {
+    // The act's own end, a line no answer is (kiln's MCP instructions say `done`, in `goals_done`).
+    while !out().lines().any(|l| l == "#act-ended") {
         anyhow::ensure!(Instant::now() < deadline, "the agent's MCP server never answered: {}\n{}", out(), std::fs::read_to_string(cwd.join("mcp.err")).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1967,7 +2051,8 @@ fn w27_r07_a_land_is_signed_by_its_queue() -> anyhow::Result<()> {
     let checked = statement::verify(&bundle, &root(&s)?, &revocations_now(&s)?, signed.get("signed_at").and_then(Value::as_i64).unwrap_or_default())?;
     assert_eq!(checked.custodian, "kiln://hyper-light/server", "signed as kiln's server, whose queue it is");
     let land = landing::read(&checked.payload_type, &checked.statement).map_err(|e| anyhow::anyhow!(e))?;
-    assert_eq!((land.queue(), land.candidate.as_str()), ("acme/landed:main".to_owned(), tip.as_str()), "the candidate that landed: {land:?}");
+    assert_eq!((land.queue(), land.to.as_str(), land.candidate.as_str()), ("acme/landed:main".to_owned(), tip.as_str(), tip.as_str()), "the trunk moved to the candidate tested: {land:?}");
+    assert!(!land.rebased && land.from == land.base && field(&signed, "head") == tip, "from the candidate's base, never applied again: {land:?}");
     let kims = get("/api/diffs/D1/verdicts")?.get("verdicts").and_then(Value::as_array).and_then(|l| l.first()).map(|v| field(v, "digest").to_owned()).unwrap_or_default();
     // Both in the trail (W27-R09): Kim's verdict, then the land that names it.
     let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;

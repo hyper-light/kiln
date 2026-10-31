@@ -263,7 +263,7 @@ struct Lands {
     by_commit: HashMap<String, String>,
     /// Each diff landed: the commit that carries it on the trunk.
     by_diff: HashMap<String, String>,
-    /// Where the trunk was when its first land began: kiln's queue landed none of what came before.
+    /// The tip the trunk's first land moved it from: kiln's queue landed none of what came before.
     first_base: Option<String>,
 }
 
@@ -416,12 +416,12 @@ impl Walk<'_> {
             let mut lands = Lands::default();
             for (digest, bundle) in rows {
                 let Some(land) = land_of(&bundle) else { continue };
-                lands.first_base.get_or_insert_with(|| land.base.to_ascii_lowercase());
+                lands.first_base.get_or_insert_with(|| land.from.to_ascii_lowercase());
                 for b in &land.batch {
                     lands.by_commit.insert(b.commit.to_ascii_lowercase(), digest.clone());
                     lands.by_diff.insert(b.diff.clone(), b.commit.to_ascii_lowercase());
                 }
-                lands.by_commit.insert(land.candidate.to_ascii_lowercase(), digest);
+                lands.by_commit.insert(land.to.to_ascii_lowercase(), digest);
             }
             self.lands.insert(key.clone(), lands);
         }
@@ -478,9 +478,9 @@ impl Walk<'_> {
             Ok(said) => Link::holds(format!("{} {said}", short(sha))),
             Err(why) => Link::broken(words, why),
         });
-        // The diffs it carries: its own in the batch; the whole batch for a candidate that's none's.
+        // The diffs it carries: its own in the batch; the whole batch for a head that's none's.
         let mut carried: Vec<&Landed> = land.batch.iter().filter(|l| l.commit.eq_ignore_ascii_case(sha)).collect();
-        if carried.is_empty() && land.candidate.eq_ignore_ascii_case(sha) {
+        if carried.is_empty() && land.to.eq_ignore_ascii_case(sha) {
             carried = land.batch.iter().collect();
         }
         if carried.is_empty() {

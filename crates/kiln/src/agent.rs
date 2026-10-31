@@ -1057,6 +1057,14 @@ async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
     }
 }
 
+/// The next event taken ahead of its turn, or never when there's none.
+async fn next_taken(taken: &mut VecDeque<Ev>) -> Ev {
+    match taken.pop_front() {
+        Some(ev) => ev,
+        None => futures::future::pending().await,
+    }
+}
+
 /// The next of `rx`, or never when there's none.
 async fn recv_opt<T>(rx: Option<&async_channel::Receiver<T>>) -> Option<T> {
     match rx {
@@ -1578,6 +1586,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         running,
         terminal: o.terminal,
     };
+    // Events taken off their channels ahead of their turn: each goes before anything else but
+    // what the network says (a job's end waits behind what its job sent before it, `Ev::Done`).
+    let mut taken: VecDeque<Ev> = VecDeque::new();
 
     'events: loop {
         if let Some((stream, seq, refusal)) = answer_after.take() {
@@ -1620,9 +1631,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::browser::driven::stop_all().await;
             return Ok(());
         }
+        // Whether this turn's event comes off its own channel (none was taken ahead of its turn): a
+        // job's end that does waits behind what its job sent (`Ev::Done`).
+        let in_turn = taken.is_empty();
         let ev = futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
+            e = next_taken(&mut taken).fuse() => e,
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
             () = sample_tick.tick().fuse() => Ev::Sample,
@@ -2645,6 +2660,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
                             served_dedicated = true;
                         }
+                        // Its own identity, as a leg's: a key made here, outside anything its steps
+                        // can reach, that signs what it sent at its end, as a v2 leg's does
+                        // (docs/ci.md W27-R01, R05).
+                        if server_identity {
+                            match crate::runner::identity::ask("leg", Some(&id), None) {
+                                Ok(json) => uplink.msg(AgentMsg::Identity { json }).await,
+                                Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                        }
+                        crate::runner::signed::forget(&id);
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
@@ -3661,6 +3686,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Up(mut up) => {
+                // A test build's runner behind its jobs (`lag=`): what they send, taken late.
+                if let Some(lag) = chaos.and_then(|c| c.lag)
+                    && matches!(up, Up::Log(_) | Up::Msg(AgentMsg::JobEvent { .. } | AgentMsg::StepFinished { .. }))
+                {
+                    crate::rt::sleep(lag).await;
+                }
                 // A job's event: numbered, and kept until the job's result is received.
                 let mut journaled = None;
                 if let Up::Msg(AgentMsg::JobEvent { job, json }) = &mut up {
@@ -3796,6 +3827,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Done(r) => {
+                // What its job sent before it ended (its log's last chunks, its last step's end)
+                // may still wait on their own channel, this loop behind its jobs: they go first, so
+                // the leg signs all it sent (docs/ci.md W27-R05), then its end.
+                if in_turn && !up_rx.is_empty() {
+                    for _ in 0..up_rx.len() {
+                        let Ok(up) = up_rx.try_recv() else { break };
+                        taken.push_back(Ev::Up(up));
+                    }
+                    taken.push_back(Ev::Done(r));
+                    continue 'events;
+                }
                 if retiring {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }

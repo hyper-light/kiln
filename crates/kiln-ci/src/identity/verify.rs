@@ -177,17 +177,23 @@ pub fn signed_commit(body: &Value) -> Result<String, String> {
     }
 }
 
-/// The land link: `land` (signed as the queue) landed `commit`, the candidate it tested or a diff's
-/// commit under it in the batch tested, every check on the candidate passing.
+/// The land link: `land` (signed as the queue) landed `commit`: the commit it moved the trunk to, or
+/// a diff's commit under it in the batch, every check on the candidate it tested passing. That's
+/// the candidate itself, unless the queue applied the batch again onto a tip that moved since only
+/// for changes it shares nothing with (`rebased`), which the link says.
 pub fn landed(commit: &str, land: &Land) -> Result<String, String> {
-    let top = land.candidate.eq_ignore_ascii_case(commit);
+    let top = land.to.eq_ignore_ascii_case(commit);
     if !top && !land.batch.iter().any(|l| l.commit.eq_ignore_ascii_case(commit)) {
-        return Err(format!("the queue tested {}, not {}", short(&land.candidate), short(commit)));
+        return Err(format!("the queue moved {} to {}, which doesn't carry {}", land.trunk, short(&land.to), short(commit)));
     }
     if let Some(c) = land.checks.iter().find(|c| c.conclusion != "success") {
         return Err(format!("its check {} concluded {}", c.name, c.conclusion));
     }
-    let tested = if top { "the candidate tested".to_owned() } else { format!("in a batch of {} under the candidate tested, {}", land.batch.len(), short(&land.candidate)) };
+    let tested = match (top, land.rebased) {
+        (true, false) => "the candidate tested".to_owned(),
+        (false, false) => format!("in a batch of {} under the candidate tested, {}", land.batch.len(), short(&land.candidate)),
+        (_, true) => format!("in a batch of {} applied again onto {} after the candidate tested, {}", land.batch.len(), short(&land.from), short(&land.candidate)),
+    };
     Ok(format!("landed on {} by its queue, {tested} ({} checks passed)", land.trunk, land.checks.len()))
 }
 
@@ -499,9 +505,21 @@ mod tests {
         assert_eq!(signed_commit(&json!({ "check": "made", "by": "kiln://hyper-light/server" })), Ok("made and signed by kiln's server".into()));
         assert_eq!(signed_commit(&json!({ "check": "signature", "seen": "unsigned" })), Err("it isn't signed".into()));
 
-        let land = Land { repo: "acme/app".into(), trunk: "main".into(), base: "b".repeat(40), candidate: commit.clone(), batch: vec![Landed { diff: "D1".into(), version: 2, commit: commit.clone(), verdicts: vec![] }], checks: vec![Ran { name: "gate".into(), conclusion: "success".into(), results: vec![] }] };
+        let land = Land {
+            repo: "acme/app".into(),
+            trunk: "main".into(),
+            from: "b".repeat(40),
+            to: commit.clone(),
+            candidate: commit.clone(),
+            base: "b".repeat(40),
+            rebased: false,
+            batch: vec![Landed { diff: "D1".into(), version: 2, commit: commit.clone(), verdicts: vec![] }],
+            checks: vec![Ran { name: "gate".into(), conclusion: "success".into(), results: vec![] }],
+        };
         assert_eq!(landed(&commit, &land), Ok("landed on main by its queue, the candidate tested (1 checks passed)".into()));
-        assert_eq!(landed(&"d".repeat(40), &land), Err("the queue tested ccccccc, not ddddddd".into()), "a commit that wasn't tested");
+        assert_eq!(landed(&"d".repeat(40), &land), Err("the queue moved main to ccccccc, which doesn't carry ddddddd".into()), "a commit that wasn't tested");
+        let again = Land { from: "e".repeat(40), to: "f".repeat(40), rebased: true, batch: vec![Landed { diff: "D1".into(), version: 2, commit: "f".repeat(40), verdicts: vec![] }], ..land.clone() };
+        assert_eq!(landed(&"f".repeat(40), &again), Ok("landed on main by its queue, in a batch of 1 applied again onto eeeeeee after the candidate tested, ccccccc (1 checks passed)".into()), "applied again, it says so");
         let batch = Land { batch: vec![Landed { diff: "D0".into(), version: 1, commit: "a".repeat(40), verdicts: vec![] }, Landed { diff: "D1".into(), version: 2, commit: commit.clone(), verdicts: vec![] }], ..land.clone() };
         assert_eq!(landed(&"a".repeat(40), &batch), Ok("landed on main by its queue, in a batch of 2 under the candidate tested, ccccccc (1 checks passed)".into()), "a diff's commit under the candidate");
         let failed = Land { checks: vec![Ran { name: "gate".into(), conclusion: "failure".into(), results: vec![] }], ..land.clone() };

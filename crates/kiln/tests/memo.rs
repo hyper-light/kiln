@@ -159,11 +159,20 @@ fn w24_r07_steps_are_reused_on_an_unchanged_tree() -> anyhow::Result<()> {
     // The same tree again: neither memo step runs, each reused from the first run, its log that
     // run's; the failed check runs again.
     commit("again")?;
-    let (_, two) = finished(&s, 2)?;
+    let (second, two) = finished(&s, 2)?;
     let (build, test, check2) = (step(&two, "build/0"), step(&two, "build/1"), step(&two, "check/0"));
     anyhow::ensure!(build.conclusion == "success" && build.reused_from(&first) && build.line("built ") == built, "{two:#?}");
     anyhow::ensure!(test.conclusion == "success" && test.reused_from(&first) && test.line("tested ") == tested, "{two:#?}");
     anyhow::ensure!(check2.conclusion == "failure" && !check2.log.contains("Reused") && !check2.line("checked as ").is_empty() && check2.line("checked as ") != check.line("checked as "), "a failure is never reused: {two:#?}");
+    // W27-R05: each leg of it verifies as the leg, a leg whose steps were reused too. What kiln
+    // copied from the first run is that run's leg's, not taken from this one; this one signed the rest.
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{second}"), &s.admin, None)?;
+    for l in serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let leg = l.get("id").and_then(Value::as_str).unwrap_or_default();
+        let (st, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body)?;
+        anyhow::ensure!(st == 200 && v.get("state").and_then(Value::as_str) == Some("verified"), "leg {leg} verifies as the leg: {st} {v:#}");
+    }
 
     // A changed input of `test` alone: `build` is reused, `test` runs on the files the first run's
     // build kept, put in place for it.

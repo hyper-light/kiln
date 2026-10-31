@@ -2491,6 +2491,13 @@ impl Hub {
         inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| i.caps)
     }
 
+    /// Whether a machine's newest runner process has said its build and what it can do (`Build`,
+    /// which every runner but a pod sends as it connects, once it's worked its build out).
+    pub fn runner_built(&self, name: &str) -> bool {
+        let inst = self.instances.lock();
+        inst.newest(name).and_then(|p| inst.get(p)).is_some_and(|i| i.build.is_some())
+    }
+
     /// What a machine's newest runner can do in 64 bits: `Build`'s 32 and the rest
     /// ([`proto::AgentMsg::Caps`]: [`proto::CAP_WIRE`] ...).
     pub fn runner_wide_caps(&self, name: &str) -> u64 {
@@ -2893,6 +2900,14 @@ impl Hub {
 
     fn pick_agent(&self, job: &Job) -> Option<String> {
         let declined = self.declined.lock().clone();
+        // A v1 job is written for what its runner can do, so a runner that hasn't said yet (it
+        // connected a moment ago) waits for its `Build`: one written before, its capabilities
+        // reading none, went to it out of step, read with no steps and passed without running
+        // (W05-R22). A pod never says, and its jobs are written for this build's own.
+        let built: std::collections::HashSet<String> = {
+            let names: Vec<String> = self.agents.lock().values().map(|a| a.name.clone()).collect();
+            names.into_iter().filter(|n| self.runner_built(n)).collect()
+        };
         let g = self.agents.lock();
         let incoming = job.spec.as_ref().map_or(kiln_ci::sched::state::Incoming::Ordinary, |s| v1_incoming(s.exclusive, &s.resources));
         let asked = job.spec.as_ref().map(|s| v1_asked(&s.resources)).unwrap_or_default();
@@ -2900,6 +2915,7 @@ impl Hub {
         let found = g
             .values()
             .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
+            .filter(|a| a.ephemeral || built.contains(&a.name))
             .filter(|a| !a.running.contains(&job.id))
             .filter(|a| {
                 declined

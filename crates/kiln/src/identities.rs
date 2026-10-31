@@ -966,23 +966,38 @@ pub async fn agent_at(hub: &Hub, session: &str, epoch: u64) -> anyhow::Result<St
 /// A CI leg's identity, for the runner process of `machine` it was given to: its run's number,
 /// its attempt and key, on that runner (and through it who enrolled the machine); as facts, W10's
 /// claims for it in Fulcio's extensions, as Fulcio puts a CI job's (its workflow's ref and digest,
-/// its repository, commit and ref, the event, its run and attempt); and how long it lasts.
+/// its repository, commit and ref, the event, its run and attempt), a v1 job's from its run;
+/// and how long it lasts.
 async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> anyhow::Result<(Identity, Vec<(u64, String)>, time::Duration)> {
     use kiln_ci::identity::chain::fulcio;
     let id = leg.to_owned();
-    type Row = (i64, i64, String, Option<String>, Option<String>);
+    type Row = (i64, i64, String, Option<String>, Option<String>, serde_json::Map<String, serde_json::Value>);
     let row: Option<Row> = hub
         .store
         .call(move |c| {
-            Ok(c.query_row("SELECT r.number, j.attempt, j.key, j.agent, j.leg FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1", [&id], |x| {
-                Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))
+            let sql = "SELECT r.number, j.attempt, j.key, j.agent, j.leg, r.id, r.sha, r.pipeline, r.event, r.branch, p.name
+                       FROM jobs j JOIN runs r ON r.id = j.run_id LEFT JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1";
+            Ok(c.query_row(sql, [&id], |x| {
+                let text = |i: usize| x.get::<_, Option<String>>(i).map(Option::unwrap_or_default);
+                let (attempt, repo, sha, branch) = (x.get::<_, i64>(1)?, text(10)?, text(6)?, text(9)?);
+                // A v1 job's claims, as W10 words a planned run's: its `.kiln/` pipeline at its commit.
+                let at = format!("refs/heads/{branch}");
+                let workflow = format!("{repo}/.kiln/{}.yaml@{at}", text(7)?);
+                let v1 = serde_json::json!({
+                    "job_workflow_ref": workflow, "job_workflow_sha": sha, "workflow_ref": workflow, "workflow_sha": sha, "repository": repo,
+                    "sha": sha, "ref": at, "event_name": text(8)?, "run_id": text(5)?, "run_attempt": attempt.max(1).to_string(),
+                });
+                Ok((x.get(0)?, attempt, x.get(2)?, x.get(3)?, x.get(4)?, v1.as_object().cloned().unwrap_or_default()))
             })
             .optional()?)
         })
         .await?;
-    let (number, attempt, key, agent, spec) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
+    let (number, attempt, key, agent, spec, v1) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
     anyhow::ensure!(agent.as_deref() == Some(machine), "leg {leg} was given to {}, not {machine}", agent.unwrap_or_else(|| "no runner".into()));
-    let claims = crate::ci::oidc::leg_claims(hub, leg).await?.ok_or_else(|| anyhow::anyhow!("leg {leg} is of no run kiln planned"))?;
+    // A run kiln planned: W10's claims for it. A v1 job's run has no plan: its claims are its
+    // pipeline's, at its commit, so its results sign as the leg all the same (W27-R05).
+    let claims = crate::ci::oidc::leg_claims(hub, leg).await?.unwrap_or(v1);
+    let facts = fulcio::from_claims(&claims, &hub.cfg.server.public_url);
     // Its spec's timeout, as the scheduler reads it (360 minutes when it has none).
     let timeout = spec
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -1000,7 +1015,7 @@ async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> an
             leg: leg_name(&key),
         },
     );
-    Ok((identity, fulcio::from_claims(&claims, &hub.cfg.server.public_url), leg_lifetime(timeout)))
+    Ok((identity, facts, leg_lifetime(timeout)))
 }
 
 /// A leg's key as its identity names it: its letters, digits, `.`, `_` and `-` (the rest `-`), at

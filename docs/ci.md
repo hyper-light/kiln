@@ -602,7 +602,10 @@ type JobEventV2 =
 
 A runner without `CAP_CI2` keeps getting `Assign` (v1) for v1-shaped kiln jobs, so a fleet can be
 upgraded one machine at a time. A leg that needs `CAP_CI2` is never routed to such a runner; its
-wait reason says so (W05).
+wait reason says so (W05). A v1 job is written for what its runner says it can do, so it goes to no
+runner that hasn't said yet (its `Build`, sent as it connects, a pod's aside): one written before,
+its capabilities reading none, reached a runner of today's build out of step and was read with no
+steps, passing without running (W05-R22).
 
 ### 2.6 Server endpoints
 
@@ -9080,27 +9083,35 @@ research `01a17947fdad71e5a4f15866e3541c41`.
 **Built: each land, signed as the queue that tested it (R07).** Plan
 `01a17856b1b273268adf6ce8c4f78410` step 6.
 
-- *What's signed.* When the land queue moves a trunk to the candidate it tested (its
-  compare-and-swap), kiln signs the land as its server, whose queue it is. The statement
-  (`kiln_ci::identity::landing`, `application/vnd.kiln.land+json`) is about the trunk at the
-  candidate that landed (`<repo>@refs/heads/<trunk>`, by `gitCommit`). It names its queue
-  (`<repo>:<trunk>`) and where the trunk was (`base`). It names the batch's diffs, each at the
-  version that landed, with the commit that carries it on the candidate and the signed accepts that
-  hold on it (their statements' digests, R04). And it names the checks run on the candidate, each
-  with its conclusion and its legs' signed results (their statements' digests, R05). A leg that
-  signs sends those as it ends, a moment before its job does, so the queue can see a check pass
-  first: the land's signing waits for them up to 10 seconds, then signs with what kiln has.
-- *Kept and read.* It's kept in `land_signatures` (migration `w27_land_signatures`). `GET
-  /api/repos/:repo/lands/:commit` reads it back: its trunk, base, signer, digest, when, what it says,
-  and its envelope. A land kiln can't sign stands, unsigned, and the log says so.
+- *What's signed.* When a land queue moves a trunk (its compare-and-swap), kiln signs the land as
+  its server, whose queue it is (`ci::lands::sign`). The statement (`kiln_ci::identity::landing`,
+  `application/vnd.kiln.land+json`) is about the trunk at the commit it moved to (`to`;
+  `<repo>@refs/heads/<trunk>`, by `gitCommit`). It names its queue (`<repo>:<trunk>`), the tip it
+  was applied onto (`from`), the candidate the queue tested and that candidate's `base`.
+  - `to` is the candidate itself, unless the trunk moved since the candidate's base only for
+    changes it shares nothing with and the queue applied the batch again onto the tip (`rebased`, a
+    queue's that does: the Merge Queues agent's). A land not applied again that moved the trunk
+    anywhere but its candidate isn't taken.
+  - It names the batch's diffs, each at the version that landed, with the commit that carries it on
+    `to` and the signed accepts that hold on it (their statements' digests, R04).
+  - It names the checks run on the candidate, each with its conclusion and its legs' signed results
+    (their statements' digests, R05). A leg that signs sends those as it ends, a moment before its
+    job does, so the queue can see a check pass first: the land's signing waits for them up to 10
+    seconds, then signs with what kiln has.
+- *Kept and read.* It's kept in `land_signatures` by the commit the trunk moved to (migration
+  `w27_land_signatures`). `GET /api/repos/:repo/lands/:commit` reads it back: its trunk, head,
+  candidate, base, signer, digest, when, what it says, and its envelope. A land kiln can't sign
+  stands, unsigned, and the log says so.
 - *Tests.* kiln-ci's `identity::landing` (`w27_r07_a_lands_statement_reads_back`,
+  `w27_r07_a_land_applied_again_is_about_the_commit_the_trunk_moved_to`,
   `w27_r07_a_land_that_doesnt_hold_together_is_refused`), and integration
   `w27_r07_a_land_is_signed_by_its_queue`. In it D1, approved by Kim on her laptop, lands through
   main's queue with its `gate` run on the candidate. The statement verifies as kiln's server and
   names main's queue, the candidate that landed, D1 at v1 with Kim's verdict, and `gate` with its
   legs' signed results.
-- *Not yet.* The Merge Queues agent's queue signs its lands the same way (it has the statement's
-  shape). A land's statement isn't posted to hosts.
+- *Not yet.* The Merge Queues agent's queue signs its lands the same way, from its `landed()`, right
+  after its compare-and-swap (it has the statement's shape). A land's statement isn't posted to
+  hosts.
 
 **Built: a leg's results and provenance, signed as the leg (R05, R06).** Plan
 `01a17856b1b273268adf6ce8c4f78410` step 5, planned as `01a18b12f931749d83a2acdfbf55e67a` (research
@@ -9142,11 +9153,13 @@ delegation of it.
 - *Its results* (`application/vnd.kiln.ci.results+json`): one statement, numbered 1 on its
   `results` stream. Its body is each step's end and the leg's conclusion; its subjects are its logs
   and reports.
-- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it.
-  `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and again with it until
-  it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg signs too: its runner
-  says nothing of itself past `Build`'s caps, so it says so of the leg as it asks for the leg's
-  identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
+- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it. What the leg
+  sent before it ended goes first, however far its runner is behind: an end that comes while its
+  last log chunks or step ends still wait on the runner's uplink waits behind them, so its records
+  cover all it sent. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
+  again with it until it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg
+  signs too: its runner says nothing of itself past `Build`'s caps, so it says so of the leg as it
+  asks for the leg's identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
 - *Taken*: the server checks each record as it takes it, at that time, through its records
   (`verify_under`).
   - Each must be the leg's, signed by the leg it gave that job on that runner, under its delegation
@@ -9158,6 +9171,11 @@ delegation of it.
 - *Judged when read*: `GET /api/ci/legs/:id/signed` holds the records against what kiln keeps.
   - The results: each step's end, each log's verdict, each report by its CAS digest, and the leg's
     end.
+  - A log kiln keeps as taken from the leg, of a step the leg signed no log of, is a break too.
+    What kiln copies into a reused step's log (W24-R07, its source leg's) it keeps as no chunk of
+    the leg's (`Logs::append_copy`), so the step's log checks against what the leg itself sent.
+    That step's reports are its source's too, and aren't held against the leg (its receipt of
+    `reused/<step>` says it was reused).
   - The custody (`leg::judge_custody`): its stream whole, and its hand-on naming its results and
     received by kiln. Its receipts of its assignment and commit must be of what kiln handed, and a
     checkout by tarball of the tarball kiln served it, by the bytes kiln sent (`ci_leg_served`).
@@ -9182,12 +9200,18 @@ delegation of it.
     `w27_r06_provenance_is_signed_as_the_leg_only_when_its_subjects_are_the_legs`;
   - `proto`'s `w27_r05_leg_signing_is_appended_after_every_older_variant`;
   - integration: `identities`'s `w27_r05_a_legs_results_verify_as_the_leg`,
+    `w27_r05_a_v1_jobs_results_verify_as_the_leg`,
     `w27_r06_provenance_verifies_as_the_leg_that_built_it` and (with `chaos`)
-    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why`; `k8s_pool`'s
-    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`.
+    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why` and
+    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`; `k8s_pool`'s
+    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`; `memo`'s `w24_r07` (a leg with reused steps).
+- *v1 jobs too*: a `.kiln/` workflow on v1, as production runs them, signs as the leg on its
+  runner. Its runner asks for the job's identity as it takes it (`ServerMsg::Assign`), as a v2
+  leg's does. kiln issues it from the job's run: its run has no plan, so its claims are its
+  pipeline's (`<repo>/.kiln/<pipeline>.yaml@refs/heads/<branch>`, at its commit).
 - *Not yet*:
-  - v1 jobs have no leg identity (W27-R01 issues one only to the legs of runs kiln planned), nor do
-    legs on runners from before identities. Their records stay unsigned, and the API says why.
+  - Legs on runners from before identities, and v1 jobs on runners from before v1 jobs signed, have
+    no leg identity. Their records stay unsigned, and the API says why.
   - kiln signs no hand-on of what it gives a leg. The delegation names its assignment and commit,
     but a leg's inputs (artifacts, caches, actions, images) are received with no hand-on of kiln's
     to follow. Only the assignment, the commit and the tarball are judged against what kiln
