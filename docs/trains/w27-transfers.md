@@ -21,7 +21,11 @@ reaching a process it isn't for.
   - in a release build with the `chaos` faults, every test of `tests/transfers.rs` and
     `tests/custody.rs`: the 14:18 drop and the twin played again among them;
   - the transfers simulation's 200 seeds.
-  The gate is in docs/ci.md W27's tests line once it has run.
+  - `ci/gate.sh` at f9adba9e62 (2026-10-31, on fedora-2: adacachy's disk was too short of room for
+    it): GATE: PASS. That's clippy for Linux, Windows and macOS, and the workspace's 4,109 tests, 0
+    failed. The gate before it, at 75e3c7d7f3, failed only `plans::stack::end_to_end::p_ac1`: a
+    library's test binary written as git's update hook. 1868928967 fixed it on `w27-trail`, and it's
+    cherry-picked here as f9adba9e62.
 
 ## What it delivers
 
