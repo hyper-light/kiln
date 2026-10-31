@@ -423,7 +423,6 @@ a.plan-row-main:hover {
   gap: 12px;
   min-width: 0;
 }
-.ph-lead,
 .ph-meta {
   margin: 0;
   color: #8d9099;
@@ -1003,4 +1002,172 @@ button.ptree-node {
 }
 .ip-todos .ptree-bar {
   margin-top: 2px;
+}
+
+/* An agent's Plans (browser.tsx): the plan under way on a slate with a prism's edge, then every
+   plan kept, to search, each a slate of its own with a segment a step under its title, opened in
+   place. */
+.pb {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 24px;
+}
+.pb-active,
+.pb-browse {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+.pb-active {
+  position: relative;
+  overflow: hidden;
+  padding: 12px 14px 14px;
+  border: 1px solid #24242c;
+  border-radius: 9px;
+  background: #101015;
+}
+.pb-active::before {
+  position: absolute;
+  top: 0;
+  right: 18%;
+  left: 18%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #a7aed070, #b9a6c560, transparent);
+  content: "";
+}
+.pb-eyebrow {
+  margin: 0;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.pb-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pb-row {
+  min-width: 0;
+}
+.pb-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 7px 12px;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid #262a31;
+  border-radius: 9px;
+  background: #0d0f12;
+  text-align: left;
+}
+.pb-row[data-open] .pb-head {
+  border-bottom: 0;
+  border-radius: 9px 9px 0 0;
+}
+.pb-title {
+  grid-column: 1;
+  overflow: hidden;
+  color: var(--color-bright);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pb-row[data-open] .pb-title {
+  white-space: normal;
+}
+.pb-line {
+  display: flex;
+  grid-column: 1;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.pb-bar {
+  flex: none;
+  width: 64px;
+}
+.pb-bar .ptree-bar {
+  height: 3px;
+  margin: 0;
+}
+.pb-mono {
+  overflow: hidden;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.pb-chev {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  color: #7b7e88;
+}
+.pb-head:hover .pb-title {
+  color: #fff;
+}
+.pb-head:hover .pb-chev {
+  color: var(--color-bright);
+}
+.pb-body {
+  padding: 4px 12px 14px;
+  border: 1px solid #262a31;
+  border-top: 0;
+  border-radius: 0 0 9px 9px;
+  background: #0d0f12;
+}
+.pb-recall {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+.pb-overview {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-line;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+.pb-steps {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pb-steps li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.pb-step-n {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.7;
+  text-align: right;
+}
+.pb-steps li.pb-steps-more {
+  display: block;
+  padding-left: 26px;
+  color: #8d9099;
+  font-size: 12px;
 }

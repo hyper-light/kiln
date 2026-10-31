@@ -98,6 +98,23 @@ export interface PlanReviewed {
   at: number;
 }
 
+/** A plan in brief (`brief`), as an agent's Plan tab lists every plan: without its words, items or steps' titles. */
+export interface PlanBrief {
+  id: string;
+  title: string;
+  tags: string[];
+  source: PlanSource | null;
+  share: string | null;
+  version: number;
+  created_at: number;
+  updated_at: number;
+  /** How many steps it has: its items, else its text's list items. */
+  step_count: number;
+  runs: number;
+  phase: Plan["phase"];
+  research: string | null;
+}
+
 export interface PlanVersion {
   version: number;
   title: string;
@@ -261,6 +278,8 @@ export const plansApi = {
   list: (signal?: AbortSignal) => request<Plan[]>("GET", "/api/plans", undefined, { signal }),
   /** The plans kept with agent `session`: made in its Plan tab, by it, from its goals, or proposed by it. */
   of: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}`, undefined, { signal }),
+  /** Every plan in brief, newest change first; `q`: those whose title, text, steps or tags hold it. */
+  briefs: (q: string, signal?: AbortSignal) => request<PlanBrief[]>("GET", `/api/plans?brief=1${q ? `&q=${enc(q)}` : ""}`, undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<Plan>("GET", `/api/plans/${enc(id)}`, undefined, { signal }),
   /** The plan agent `session` proposed (plan mode), as kiln keeps it: one at most. */
   proposedBy: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}&proposed=1`, undefined, { signal }),
