@@ -20,6 +20,8 @@
 //!   tlog-tiles), from which anyone who may read the trail computes any proof. Each tile a leaf
 //!   completes is kept as a node of the level above as it's appended, so a tile, a root or a proof
 //!   is a few reads however long the trail.
+//! - **Held** ([`holding`], [`statements_about`]): a statement as kiln verify reads it (W27-R10),
+//!   with each signature kept beside it and its entry's proof against a checkpoint.
 
 use std::sync::Arc;
 
@@ -175,6 +177,47 @@ pub async fn checkpoints(store: &Store, limit: u64) -> anyhow::Result<Vec<Kept>>
         })
         .await?;
     rows.into_iter().map(|(size, root, note, certificate, signed_at)| Ok(Kept { size: u64::try_from(size)?, root: unhex(&root)?, note, certificate: B64.decode(certificate)?, signed_at })).collect()
+}
+
+/// A statement as the trail holds it (docs/ci.md W27-R10): its entry, what it says (its payload
+/// type and payload), each signature kept beside it (a Sigstore bundle, and when kiln took it), and
+/// the entry's proof in the tree of a checkpoint's size (none: the entry came after it, or the
+/// tiles up to it aren't all kept).
+pub struct Holding {
+    pub entry: Entry,
+    pub payload_type: String,
+    pub payload: Vec<u8>,
+    pub signatures: Vec<(Value, i64)>,
+    pub proof: Option<Vec<Hash>>,
+}
+
+/// Statement `digest` as the trail holds it, its proof in the tree of size `size` hashed up from the
+/// tiles as kept. None when the trail hasn't it.
+pub async fn holding(store: &Store, digest: &str, size: u64) -> anyhow::Result<Option<Holding>> {
+    let d = digest.to_owned();
+    store
+        .call(move |c| {
+            let row = c.query_row(&format!("SELECT {COLUMNS}, payload_type, payload FROM trail WHERE statement = ?1"), [&d], |r| Ok((raw(r)?, r.get::<_, String>(7)?, r.get::<_, Vec<u8>>(8)?))).optional()?;
+            let Some((row, payload_type, payload)) = row else { return Ok(None) };
+            let (entry, _) = entry(row)?;
+            let kept: Vec<(String, i64)> = c.prepare("SELECT bundle, taken_at FROM trail_signatures WHERE statement = ?1 ORDER BY taken_at")?.query_map([&d], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            let signatures = kept.into_iter().filter_map(|(b, at)| serde_json::from_str(&b).ok().map(|v| (v, at))).collect();
+            let proof = if entry.index < size { trail::inclusion_by(size, entry.index, &mut |lo, hi| trail::mth_from(size, lo, hi, &mut |t| tile_hashes(c, t).ok())) } else { None };
+            Ok(Some(Holding { entry, payload_type, payload, signatures, proof }))
+        })
+        .await
+}
+
+/// The digests of the statements of `payload_type` the trail holds about `subject`
+/// (`gitCommit:<sha>`), in the order kiln took them.
+pub async fn statements_about(store: &Store, subject: &str, payload_type: &str) -> anyhow::Result<Vec<String>> {
+    let (s, t) = (subject.to_owned(), payload_type.to_owned());
+    store
+        .call(move |c| {
+            let sql = "SELECT t.statement FROM trail_subjects s JOIN trail t ON t.idx = s.idx WHERE s.subject = ?1 AND t.payload_type = ?2 ORDER BY t.idx";
+            Ok(c.prepare(sql)?.query_map(params![s, t], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .await
 }
 
 /// Signs a checkpoint of the trail as kiln's server when one is due ([`trail::due`]; `now`: as

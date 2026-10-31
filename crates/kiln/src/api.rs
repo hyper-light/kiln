@@ -735,6 +735,16 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             Ok(srv::json(StatusCode::OK, &json!({ "size": size })))
         })
         .await,
+        // kiln verify (W27-R10): the chain back from a deploy, an artifact, a commit or a change,
+        // each link with whether it holds, the first that doesn't named.
+        (&Method::GET, ["api", "verify"]) => {
+            let q = srv::query(&req);
+            boxed(|| async {
+                let target = crate::verify::Target::of(&q).map_err(|(s, e)| err(s, e))?;
+                crate::verify::verify(&hub, &target).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+            })
+            .await
+        }
         // Custody of what changes hands (W27-R08): a signed record taken, a thing's chain walked
         // now, the breaks kiln found and what it refused.
         (&Method::POST, ["api", "custody"]) => {

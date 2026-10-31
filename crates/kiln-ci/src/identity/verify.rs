@@ -143,39 +143,53 @@ pub fn built_by(signer: &Identity) -> Result<String, String> {
     }
 }
 
+/// Who `id` is, in words: a person by name, an agent for its person, kiln's server or CD.
+pub fn who(id: &Identity) -> String {
+    match &id.actor {
+        Actor::Person { name } => name.clone(),
+        Actor::Agent { person, agent, .. } => format!("agent {agent} for {person}"),
+        Actor::Server => "kiln's server".into(),
+        Actor::Cd => "kiln's CD".into(),
+        _ => id.to_string(),
+    }
+}
+
+/// Identity `uri` in words, as [`who`] says it; as it's written when it isn't one.
+fn named(uri: &str) -> String {
+    Identity::parse(uri).map_or_else(|_| uri.to_owned(), |id| who(&id))
+}
+
 /// The commit's signature, as kiln's own statement of it says (`check`: `signature`, what a push's
 /// check found; `made`, a commit kiln made and signed itself): who signed it, in words.
 pub fn signed_commit(body: &Value) -> Result<String, String> {
     let field = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or_default();
     match (field("check"), field("seen")) {
-        ("made", _) => Ok(format!("made and signed by {}", field("by"))),
-        ("signature", "by") => Ok(format!("signed by {}", field("words"))),
+        ("made", _) => Ok(format!("made and signed by {}", named(field("by")))),
+        ("signature", "by") => Ok(format!("signed by {}", named(field("words")))),
         ("signature", "unsigned") => Err("it isn't signed".into()),
         ("signature", "unverified") => Err(format!("its signature doesn't verify: {}", field("words"))),
         _ => Err("kiln's word on its signature says neither".into()),
     }
 }
 
-/// The land link: `land` (signed as the queue) landed `commit`, the candidate it tested, every check
-/// on it passing.
+/// The land link: `land` (signed as the queue) landed `commit`, the candidate it tested or a diff's
+/// commit under it in the batch tested, every check on the candidate passing.
 pub fn landed(commit: &str, land: &Land) -> Result<String, String> {
-    if !land.candidate.eq_ignore_ascii_case(commit) {
+    let top = land.candidate.eq_ignore_ascii_case(commit);
+    if !top && !land.batch.iter().any(|l| l.commit.eq_ignore_ascii_case(commit)) {
         return Err(format!("the queue tested {}, not {}", short(&land.candidate), short(commit)));
     }
     if let Some(c) = land.checks.iter().find(|c| c.conclusion != "success") {
         return Err(format!("its check {} concluded {}", c.name, c.conclusion));
     }
-    Ok(format!("landed on {} by its queue, the candidate tested ({} checks passed)", land.trunk, land.checks.len()))
+    let tested = if top { "the candidate tested".to_owned() } else { format!("in a batch of {} under the candidate tested, {}", land.batch.len(), short(&land.candidate)) };
+    Ok(format!("landed on {} by its queue, {tested} ({} checks passed)", land.trunk, land.checks.len()))
 }
 
 /// The review link: verdict `b`, signed by `signer`, holds on version `landed` of its diff (kept as
 /// `versions`): given there, or carried there by verbatim patch-id.
 pub fn approved(b: &Body, signer: &Identity, versions: &[Kept], landed: u32) -> Result<String, String> {
-    let who = match &signer.actor {
-        Actor::Person { name } => name.clone(),
-        Actor::Agent { person, agent, .. } => format!("agent {agent} for {person}"),
-        _ => signer.to_string(),
-    };
+    let who = who(signer);
     match verdict::holds_on(&b.revision, versions, landed) {
         Holds::Given => Ok(format!("approved by {who} (v{landed})")),
         Holds::Carried { from } => Ok(format!("approved by {who} (v{from}, carried to v{landed})")),
@@ -297,13 +311,15 @@ mod tests {
         let leg = Identity::parse("kiln://hyper-light/person/admin/machine/fedora-2/instance/main/run/1/attempt/1/leg/image").map_err(|e| anyhow::anyhow!("{e}"))?;
         assert_eq!(built_by(&leg), Ok("build leg 'image' of run 1 (attempt 1) on fedora-2".into()));
         assert!(built_by(&Identity::new(ORG, Actor::Server)).is_err());
-        assert_eq!(signed_commit(&json!({ "check": "signature", "seen": "by", "words": "kiln://hyper-light/person/sam" })), Ok("signed by kiln://hyper-light/person/sam".into()));
-        assert_eq!(signed_commit(&json!({ "check": "made", "by": "kiln://hyper-light/server" })), Ok("made and signed by kiln://hyper-light/server".into()));
+        assert_eq!(signed_commit(&json!({ "check": "signature", "seen": "by", "words": "kiln://hyper-light/person/sam" })), Ok("signed by sam".into()));
+        assert_eq!(signed_commit(&json!({ "check": "made", "by": "kiln://hyper-light/server" })), Ok("made and signed by kiln's server".into()));
         assert_eq!(signed_commit(&json!({ "check": "signature", "seen": "unsigned" })), Err("it isn't signed".into()));
 
         let land = Land { repo: "acme/app".into(), trunk: "main".into(), base: "b".repeat(40), candidate: commit.clone(), batch: vec![Landed { diff: "D1".into(), version: 2, commit: commit.clone(), verdicts: vec![] }], checks: vec![Ran { name: "gate".into(), conclusion: "success".into(), results: vec![] }] };
         assert_eq!(landed(&commit, &land), Ok("landed on main by its queue, the candidate tested (1 checks passed)".into()));
         assert_eq!(landed(&"d".repeat(40), &land), Err("the queue tested ccccccc, not ddddddd".into()), "a commit that wasn't tested");
+        let batch = Land { batch: vec![Landed { diff: "D0".into(), version: 1, commit: "a".repeat(40), verdicts: vec![] }, Landed { diff: "D1".into(), version: 2, commit: commit.clone(), verdicts: vec![] }], ..land.clone() };
+        assert_eq!(landed(&"a".repeat(40), &batch), Ok("landed on main by its queue, in a batch of 2 under the candidate tested, ccccccc (1 checks passed)".into()), "a diff's commit under the candidate");
         let failed = Land { checks: vec![Ran { name: "gate".into(), conclusion: "failure".into(), results: vec![] }], ..land.clone() };
         assert!(landed(&commit, &failed).is_err_and(|e| e.contains("gate concluded failure")));
 

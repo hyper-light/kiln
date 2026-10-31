@@ -88,6 +88,7 @@ pub mod updates;
 pub mod updates_cli;
 pub mod upgrade;
 pub mod util;
+pub mod verify;
 pub mod voice;
 pub mod wire;
 pub mod workspace;
