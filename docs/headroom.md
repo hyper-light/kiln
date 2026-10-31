@@ -131,7 +131,7 @@ decides.
   have gone wrong;
 - each target's tolerance: how slow it may get before it's harmed. A target that declares one
   (a Kubernetes probe's timeout, a systemd watchdog) brings its own;
-- the probe-load share: how much of a served target's time its probes may take.
+- the probe-load share: how much of each target's time its probes may take.
 
 **Everything else:**
 
@@ -142,7 +142,7 @@ decides.
 | The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
 | Harm | a sample, or a probe still out, at the tolerance |
 | A new regime | a fall below the calm the lower CUSUM detects with the same calibration |
-| The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), never under the probe's own measured cost, and for a served target never under its service time / load share |
+| The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), leaving the lag out once it reaches the tolerance (no probe rate wins that time back); never under the probe's own measured cost / load share, for a disk as for a server |
 | The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut; each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
 | A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains |
 | A bound tried | once the bisection's gap is finer than the pacer applies (a share is whole percent: what's wanted / 100), the bound itself; held calm there, it was wrong and the next bound up (any higher level trouble began at) takes its place |
@@ -248,6 +248,13 @@ check meant to (all of kiln's work idle for longer than the slowest recovery, 22
 never holds with hundreds of sessions, so about 290 sessions and every gate stayed stopped for two
 hours, until the runner was rolled back. Now a cut that doesn't speed the probes up is undone and
 not repeated while kiln writes no more, and the night is a trace.
+
+That night's 221 s lag stayed in adacachy's learned state, and on 10-30 it showed what it did to
+probing: with the lag past the 1 s tolerance, the time left to act came out at nothing, so every
+probe ran as fast as its floor let it. Production's server was probed about 270 times a second,
+and each runner's disk back to back, since a disk had no load share to hold it. Now a lag past the
+tolerance leaves the interval as it is without one, and a disk is held to the load share like a
+server.
 
 ## Debug builds
 
