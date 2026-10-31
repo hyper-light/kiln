@@ -275,7 +275,7 @@ mod tests {
             snapshot(c)
         })?;
         assert_eq!(after,before,"reopen changed the shipped schema or migration receipts");
-        assert!(!path.exists(),"a fresh Store must not create another SQLite database");
+        assert!(path.is_dir(),"a fresh Store must keep the legacy SQLite pathname fenced by a directory");
         assert!(directory.path().join(crate::store::FILE).is_file());
         Ok(())
     }
