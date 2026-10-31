@@ -1445,6 +1445,8 @@ impl Hub {
         match ev {
             NetEvent::Connected { peer, name, binding } => {
                 self.tunnels.connected(peer, binding);
+                // A runner connecting again comes back under the peer id it joined with.
+                self.instances.lock().connected(peer);
                 if let Some(n) = name {
                     self.pending_peers.lock().insert(peer, n);
                 }

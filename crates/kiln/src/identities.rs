@@ -837,26 +837,29 @@ async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     }
 }
 
+/// Which of `machine`'s runner processes asked, as it said when it joined. One that isn't joined
+/// now (gone while its ask waited for its session to open) is named in no certificate, rather than
+/// certified as a process kiln can't say it is (docs/ci.md W27-R01).
+fn asker(hub: &Hub, peer: PeerId, machine: &str) -> anyhow::Result<String> {
+    hub.instances.lock().get(peer).map(crate::instances::Instance::label).ok_or_else(|| anyhow::anyhow!("the runner process of {machine} that asked is no longer connected"))
+}
+
 /// The identity `ask` asks for, certified and recorded: its URI and certificate, and for a leg the
 /// server's delegation of it, by digest ([`delegate_leg`]). A leg's identity comes with its
 /// delegation or not at all, since its records are taken only under it.
 async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String, Option<String>)> {
     let mut facts: Vec<(u64, String)> = Vec::new();
+    let instance = asker(hub, peer, machine)?;
     let (identity, lifetime) = match ask.kind.as_str() {
-        "runner" => {
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-            (runner_identity(hub, machine, &instance).await?, time::Duration::hours(RUNNER_HOURS))
-        }
+        "runner" => (runner_identity(hub, machine, &instance).await?, time::Duration::hours(RUNNER_HOURS)),
         "agent" => {
             let session = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("an agent's identity names its session"))?;
             let epoch = ask.epoch.ok_or_else(|| anyhow::anyhow!("an agent's identity names its epoch"))?;
             // The runner process asking holds the session's key at this epoch: named in its certificate.
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
             (agent_identity(hub, machine, &instance, session, epoch).await?, time::Duration::hours(AGENT_HOURS))
         }
         "leg" => {
             let leg = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("a leg's identity names its leg"))?;
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
             let (identity, f, lifetime) = leg_identity(hub, machine, &instance, leg).await?;
             facts = f;
             (identity, lifetime)
@@ -874,7 +877,6 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
     // A hand-over's (docs/ci.md W27-R08): its hand-on and the receipt for it kept first, so the
     // epoch rises with them; the key isn't certified without them.
     if let (Actor::Agent { .. }, Some(hand_on)) = (&identity.actor, ask.hand_on.as_deref()) {
-        let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
         let came_from = format!("runner {machine} (instance {instance})");
         let epoch = ask.epoch.unwrap_or_default();
         if let Err(why) = crate::custody::transfer(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &came_from, &uri, epoch, hand_on, ask.receipt.as_ref(), &pem, now).await? {

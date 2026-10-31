@@ -238,6 +238,35 @@ fn w27_r01_each_runner_process_its_own_identity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R01: a runner killed and started again connects before the server sees its last connection
+/// close (QUIC hears no close from a killed process), under the same peer id, its certificate's.
+/// It's certified again as the instance it says, never as "legacy".
+#[test]
+fn w27_r01_a_runner_started_again_is_certified_as_its_instance() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (mut first, log) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
+    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
+    let main_uri = "kiln://hyper-light/person/admin/machine/fedora-2/instance/main";
+    until_identities(&s, "runner", Duration::from_secs(30), |l| l.iter().any(|i| field(i, "subject") == main_uri))?;
+    first.0.kill()?;
+    first.0.wait()?;
+    let upto = std::fs::read_to_string(&log)?.len();
+    let (_again, _) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
+    let certified = "identity certified identity=kiln://hyper-light/person/admin/machine/fedora-2/instance/";
+    let since = || std::fs::read_to_string(&log).unwrap_or_default().get(upto..).unwrap_or_default().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !since().contains(certified) {
+        anyhow::ensure!(Instant::now() < deadline, "the runner started again was never certified:\n{}", since());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let lines: Vec<String> = since().lines().filter(|l| l.contains(certified)).map(str::to_owned).collect();
+    assert!(lines.iter().all(|l| l.trim_end().ends_with("/instance/main")), "certified as another instance: {lines:?}");
+    let all = identities(&s, "runner")?;
+    assert!(all.iter().all(|i| field(i, "subject") == main_uri), "{all:?}");
+    Ok(())
+}
+
 /// Every file under `dir`.
 /// Whether `bytes` hold a PEM private key: its BEGIN line, a base64 body and the END line that
 /// matches it, as the leg's scan (SCAN) takes one. The words alone aren't one: the UI server kiln
