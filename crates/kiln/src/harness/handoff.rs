@@ -1236,6 +1236,7 @@ fn mode_at(kind: &str, l: Latitude, offered: &[String]) -> Option<String> {
 /// mode that already did, and only if the target offers it (`offered`); else the next one down.
 /// A mode kiln doesn't know asks. None: the target offers none that low (an ACP agent that says
 /// its own modes only once started has nothing below ask), and starts in its own default.
+/// Mission control's composer carries a new agent's the same way (ui `spawn-setup.ts`, `carryMode`).
 pub fn mode_for(from_kind: &str, mode: &str, to_kind: &str, offered: &[String]) -> Option<String> {
     let mut l = latitude(from_kind, mode).unwrap_or(Latitude::Ask);
     loop {
@@ -1267,7 +1268,8 @@ fn effort_rank(e: &str) -> Option<u8> {
 }
 
 /// The target's effort level for the source's: the same one if it takes it, else the nearest by
-/// rank (the lower of two as near). None: no effort (the model's own default).
+/// rank (the lower of two as near). None: no effort (the model's own default). Mission control's
+/// composer carries a new agent's the same way (ui `spawn-setup.ts`, `carryEffort`).
 pub fn effort_for(effort: &str, levels: &[String]) -> Option<String> {
     if effort.is_empty() {
         return None;

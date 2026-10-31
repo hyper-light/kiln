@@ -967,7 +967,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agents.start", body)).await
         }
-        (&Method::GET, ["api", "harness", "agents", "wait"]) => boxed(|| own_op(&hub, &caller, "agents.wait", query_value(&q))).await,
+        (&Method::POST, ["api", "harness", "agents", "wait"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agents.wait", body)).await
+        }
+        // It takes delivery of the waiter's messages: a change, so not a GET (where an agent's id
+        // would be read).
+        (&Method::GET, ["api", "harness", "agents", "wait"]) => Err(err(StatusCode::METHOD_NOT_ALLOWED, "agents.wait takes delivery of your messages, so it's a POST: send its input as a JSON body")),
         (&Method::GET, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.get", json!({ "agent": id }))).await,
         (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => {
             let op = format!("agents.{what}");

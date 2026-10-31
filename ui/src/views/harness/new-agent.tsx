@@ -21,7 +21,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
+import { errorMessage, readLocal, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { atOf, doingOf, findAgents } from "./broadcast";
@@ -33,7 +33,26 @@ import { usePrefill, type Prefill } from "./new-agent-draft";
 import { machineName } from "./parts";
 import { RunSettings, WordRow } from "./run-settings";
 import { effortsFor, resumeEffort } from "./spawn-efforts";
-import { harnessesOf, kindOf, machineLabel, machinesWithAny, shortMachineLabel, modeOf, modelOf, modesFor, onMachine, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "./spawn-setup";
+import {
+  carryEffort,
+  carryMode,
+  harnessesOf,
+  kindOf,
+  machineLabel,
+  machinesWithAny,
+  shortMachineLabel,
+  modeOf,
+  modelOf,
+  modesFor,
+  onMachine,
+  oneOf,
+  reachChoices,
+  specOf,
+  speedsFor,
+  targetOf,
+  withDir,
+  type Chosen,
+} from "./spawn-setup";
 import { useHeld } from "./state";
 import { MicButton } from "./voice";
 
@@ -77,8 +96,21 @@ const fine = () => window.matchMedia?.("(pointer: fine)").matches;
 function useChoices() {
   const [kind, setKind] = useLocalStorage("kiln.agents.kind", "claude");
   const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
-  const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
-  const [effortByKind, setEffortByKind] = useLocalStorage<Record<string, string>>("kiln.agents.efforts", {});
+  // The permissions and effort chosen last, whichever harness: every harness starts at them, carried
+  // to its own as an agent's switch carries them. Until they're chosen again, what was kept for the
+  // harness used last (each harness kept its own before).
+  const [chosenMode, setMode] = useLocalStorage<Chosen | null>("kiln.agents.mode", null);
+  const [chosenEffort, setEffort] = useLocalStorage<string | null>("kiln.agents.effort", null);
+  const keptMode = readLocal<Record<string, string>>("kiln.agents.modes", {})[kind];
+  const keptEffort = readLocal<Record<string, string>>("kiln.agents.efforts", {})[kind];
+  const mode = chosenMode ?? (keptMode ? { kind, id: keptMode } : null);
+  const effort = chosenEffort ?? keptEffort ?? "";
+  /** The agent picked in another harness: what the one used last kept is chosen from now on, so it goes along. */
+  const switchTo = (other: string) => {
+    if (!chosenMode && mode) setMode(mode);
+    if (chosenEffort === null && keptEffort !== undefined) setEffort(keptEffort);
+    setKind(other);
+  };
   const [modelByKind, setModelByKind] = useLocalStorage<Record<string, string>>("kiln.agents.models", {});
   const [speedByKind, setSpeedByKind] = useLocalStorage<Record<string, string>>("kiln.agents.speeds", {});
   /** `volume`: a Slates volume of its own over the folder, where the machine can make one. */
@@ -92,18 +124,19 @@ function useChoices() {
   const [reach, setReach] = React.useState("");
   const [shell, setShell] = React.useState("");
   /** A mode that turns checks off, confirmed (in the line) for this start only. */
-  const [unchecked, setUnchecked] = React.useState("");
+  const [unchecked, setUnchecked] = React.useState<Chosen | null>(null);
   const [open, setOpen] = React.useState<Part>(null);
   // What another page handed over (new-agent-draft.ts): this start's choices, each until you change it.
+  // Its mode is the harness's it came with (else this one's), whichever the agent then starts in.
   const handed = usePrefill((s) => s.prefill);
-  const [seed, setSeed] = React.useState<Prefill | null>(null);
+  const [seed, setSeed] = React.useState<(Prefill & { modeIn?: string }) | null>(null);
   if (handed && handed.at !== seed?.at) {
-    setSeed(handed);
+    setSeed({ ...handed, modeIn: handed.kind ?? kind });
     setPicked(null);
     setFolder(null);
     setShell(handed.shell ?? "");
     setCount(1);
-    setUnchecked("");
+    setUnchecked(null);
   }
   const drop = (k: keyof Prefill) => setSeed((s) => (s ? { ...s, [k]: undefined } : s));
   const clearSeed = () => {
@@ -116,18 +149,18 @@ function useChoices() {
     clearSeed();
     setName("");
     setCount(1);
-    setUnchecked("");
+    setUnchecked(null);
     setOpen(null);
   };
   return {
     kind,
-    setKind,
+    switchTo,
     lastTarget,
     setLastTarget,
-    modeByKind,
-    setModeByKind,
-    effortByKind,
-    setEffortByKind,
+    mode,
+    setMode,
+    effort,
+    setEffort,
     modelByKind,
     setModelByKind,
     speedByKind,
@@ -173,10 +206,18 @@ function resolve(c: Choices, m: Machines) {
   const cwd = (c.folder?.target === target ? c.folder.cwd : undefined) ?? (c.seed?.target === target ? c.seed.cwd : undefined) ?? recent[0] ?? "~";
   const info = onMachine(m.byTarget, target, kind) ?? all.find((x) => x.id === kind);
   const modes = modesFor(info);
-  const mode = modeOf(modes, { unchecked: c.unchecked, remembered: c.seed?.mode ?? c.modeByKind[kind], fallback: info?.default_mode });
+  // The permissions chosen (confirmed for this start where they turn checks off; else handed over,
+  // else kept) and the effort, as this harness and model name them: a harness switch carries them.
+  const offered = modes.map((x) => x.id);
+  const carried = (x: Chosen | null) => (x ? carryMode(x.kind, x.id, kind, offered) : undefined);
+  const handedMode = c.seed?.mode ? { kind: c.seed.modeIn ?? kind, id: c.seed.mode } : null;
+  const mode = modeOf(modes, { unchecked: carried(c.unchecked) ?? "", remembered: carried(handedMode ?? c.mode), fallback: info?.default_mode });
   const model = modelOf(info, c.seed?.model ?? c.modelByKind[kind] ?? "");
   const efforts = effortsFor(info, model.chosen);
-  const effort = oneOf(efforts, c.seed?.effort ?? c.effortByKind[kind]);
+  const effort = carryEffort(
+    c.seed?.effort ?? c.effort,
+    efforts.map((x) => x.id),
+  );
   const speeds = speedsFor(info, model.chosen);
   const speed = oneOf(speeds, c.speedByKind[kind]);
   const canVolume = m.workspaces[target]?.available === true;
@@ -231,18 +272,18 @@ function HowLine({ c }: { c: Choices }) {
       mode={s.mode}
       onMode={(m) => {
         if (s.modes.find((x) => x.id === m)?.dangerous) {
-          c.setUnchecked(m);
+          c.setUnchecked({ kind: s.kind, id: m });
           return;
         }
-        c.setUnchecked("");
-        c.setModeByKind({ ...c.modeByKind, [s.kind]: m });
+        c.setUnchecked(null);
+        c.setMode({ kind: s.kind, id: m });
         c.drop("mode");
       }}
       models={s.info?.models ?? []}
       model={s.model.shown}
       onModel={(m, other) => {
         if (other && other !== s.kind) {
-          c.setKind(other);
+          c.switchTo(other);
           c.drop("kind");
           c.setModelByKind({ ...c.modelByKind, [other]: m });
           return;
@@ -256,7 +297,7 @@ function HowLine({ c }: { c: Choices }) {
       efforts={efforts}
       effort={s.effort}
       onEffort={(e) => {
-        c.setEffortByKind({ ...c.effortByKind, [s.kind]: e });
+        c.setEffort(e);
         c.drop("effort");
       }}
       speeds={s.speeds}
