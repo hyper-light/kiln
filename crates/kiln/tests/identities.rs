@@ -1891,3 +1891,86 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     assert!(matches!(&signer.actor, kiln_ci::identity::chain::Actor::Agent { agent, held_by: Some(h), person, .. } if *agent == id && h.machine == "box-a" && person == "admin"), "as the agent, on its runner, for its person: {signer}");
     Ok(())
 }
+
+/// W27-R07: a land is signed by its queue. D1, its `gate` check required, is approved by Kim (signed
+/// on her laptop) and landed through main's queue, which runs `gate` on the candidate. The land's
+/// statement verifies to kiln's root as kiln's server, names main's queue, the candidate that
+/// landed (main's new head) as its subject, D1 at its version with Kim's verdict, and the `gate`
+/// run with its legs' signed results.
+#[test]
+fn w27_r07_a_land_is_signed_by_its_queue() -> anyhow::Result<()> {
+    use kiln_ci::identity::{landing, statement};
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": "acme/landed", "mode": "native"})))?;
+    anyhow::ensure!(st == 200, "a repository kiln hosts: {st} {body}");
+    for name in ["sam", "kim"] {
+        add_person(&s, name)?;
+    }
+    let (sam, kim) = (token_of(&s, "sam")?, token_of(&s, "kim")?);
+    let laptop = Device::new(dir.path(), "kim-laptop")?;
+    let (ok, said) = laptop.kiln(&["login", "--link", &sign_in_link(&s, "kim")?], None)?;
+    anyhow::ensure!(ok, "kiln login --link: {said}");
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = format!("http://x:{sam}@127.0.0.1:{}/git/acme/landed.git", s.port);
+    let git = |at: &Path, args: &[&str]| -> anyhow::Result<String> {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=sam", "-c", "user.email=sam@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper="])
+            .args(args)
+            .current_dir(at)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()?;
+        let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        anyhow::ensure!(o.status.success(), "git {args:?}: {said}");
+        Ok(said)
+    };
+    git(dir.path(), &["clone", "-q", &url, "work"])?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  checks: [gate]\n")?;
+    std::fs::write(work.join(".github/workflows/gate.yml"), "name: gate\non: [pull_request, merge_group]\njobs:\n  gate:\n    runs-on: local\n    steps:\n      - run: echo gated\n")?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 1\n")?;
+    git(&work, &["add", "."])?;
+    git(&work, &["commit", "-qm", "first"])?;
+    git(&work, &["push", "-q", "origin", "main"])?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 2\n")?;
+    git(&work, &["commit", "-qam", "f returns two\n\nChange-Id: I7777777777777777777777777777777777777777\n"])?;
+    let said = git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+    anyhow::ensure!(said.contains("D1 v1"), "D1: {said}");
+    let (ok, said) = laptop.kiln(&["review", "--url", &format!("http://127.0.0.1:{}", s.port), "--token", &kim, "D1", "--accept"], None)?;
+    anyhow::ensure!(ok, "kiln review: {said}");
+    let get = |path: &str| -> anyhow::Result<Value> {
+        let (st, body) = http(s.port, "GET", path, &s.admin, None)?;
+        anyhow::ensure!(st == 200, "{path}: {st} {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while get("/api/diffs/D1/land")?.get("blockers") != Some(&serde_json::json!([])) {
+        anyhow::ensure!(Instant::now() < deadline, "D1's gate: {}", get("/api/diffs/D1/land")?);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/land", &s.admin, Some(&serde_json::json!({})))?;
+    anyhow::ensure!(st == 200, "land: {st} {body}");
+    while field(&get("/api/diffs/D1")?, "state") != "landed" {
+        anyhow::ensure!(Instant::now() < deadline, "D1 never landed: {}", get("/api/repos/acme%2Flanded/queue")?);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let tip = git(&work, &["ls-remote", "origin", "refs/heads/main"])?.split_whitespace().next().unwrap_or_default().to_owned();
+    let signed = get(&format!("/api/repos/acme%2Flanded/lands/{tip}"))?;
+    let bundle = signed.get("bundle").cloned().unwrap_or_default();
+    let checked = statement::verify(&bundle, &root(&s)?, &revocations_now(&s)?, signed.get("signed_at").and_then(Value::as_i64).unwrap_or_default())?;
+    assert_eq!(checked.custodian, "kiln://hyper-light/server", "signed as kiln's server, whose queue it is");
+    let land = landing::read(&checked.payload_type, &checked.statement).map_err(|e| anyhow::anyhow!(e))?;
+    assert_eq!((land.queue(), land.candidate.as_str()), ("acme/landed:main".to_owned(), tip.as_str()), "the candidate that landed: {land:?}");
+    let kims = get("/api/diffs/D1/verdicts")?.get("verdicts").and_then(Value::as_array).and_then(|l| l.first()).map(|v| field(v, "digest").to_owned()).unwrap_or_default();
+    let d1 = land.batch.first().ok_or_else(|| anyhow::anyhow!("an empty batch: {land:?}"))?;
+    assert_eq!((d1.diff.as_str(), d1.version, &d1.verdicts), ("D1", 1, &vec![kims]), "{land:?}");
+    let gate = land.checks.iter().find(|c| c.name == "gate").ok_or_else(|| anyhow::anyhow!("no gate run: {land:?}"))?;
+    assert_eq!(gate.conclusion, "success", "{land:?}");
+    assert!(!gate.results.is_empty(), "the gate's legs' signed results: {land:?}");
+    Ok(())
+}

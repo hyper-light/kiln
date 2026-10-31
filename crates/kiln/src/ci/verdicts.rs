@@ -293,6 +293,23 @@ pub async fn list(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     Ok(json!({ "diff": d.name, "latest": latest, "verdicts": out }))
 }
 
+/// The digests of the signed accepts on `d` that hold on its latest version, oldest first: what
+/// lets it land where signatures count, as its land's statement names them (W27-R07).
+pub async fn holding_accepts(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Vec<String>, Fail> {
+    let holds = holding(hub, d, versions).await?;
+    let id = d.id.clone();
+    let rows: Vec<(String, String)> = hub
+        .store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT r.id, s.digest FROM reviews r JOIN review_signatures s ON s.kind = 'verdict' AND s.id = r.id WHERE r.diff_id = ?1 AND r.action = 'accept' ORDER BY r.created_at, r.rowid")?;
+            let rows = q.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(fail)?;
+    Ok(rows.into_iter().filter(|(review, _)| holds.get(review).is_some_and(Holds::holds)).map(|(_, digest)| digest).collect())
+}
+
 /// Where each signed verdict on `d` stands on its latest version, by its review's id: each
 /// checked again as of when kiln took it, then held to that version (its own, or a later one with
 /// its verbatim patch-id).

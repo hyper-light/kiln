@@ -401,6 +401,7 @@ pub static ROUTES: &[Rule] = &[
     // The caller's own notifications, marked read (W19-R06).
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    r("GET", "/api/repos/*/lands/*", "diffs.read", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
     r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),

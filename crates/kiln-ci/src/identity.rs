@@ -15,10 +15,12 @@
 //! signature in git's x509 form, [`gitsig`], and in its SSH form, [`sshsig`], against keys people
 //! bound to their identities (W27-R03); whether a push's commits are signed as a repository's
 //! policy says, [`push`] (W27-R03); a review's verdicts and comments, signed over their revision,
-//! and where a verdict holds, [`verdict`] (W27-R04).
+//! and where a verdict holds, [`verdict`] (W27-R04); a land, signed as the queue that tested it,
+//! [`landing`] (W27-R07).
 
 pub mod chain;
 pub mod gitsig;
+pub mod landing;
 pub mod push;
 pub mod sshsig;
 pub mod statement;
