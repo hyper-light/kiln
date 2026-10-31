@@ -9080,27 +9080,35 @@ research `01a17947fdad71e5a4f15866e3541c41`.
 **Built: each land, signed as the queue that tested it (R07).** Plan
 `01a17856b1b273268adf6ce8c4f78410` step 6.
 
-- *What's signed.* When the land queue moves a trunk to the candidate it tested (its
-  compare-and-swap), kiln signs the land as its server, whose queue it is. The statement
-  (`kiln_ci::identity::landing`, `application/vnd.kiln.land+json`) is about the trunk at the
-  candidate that landed (`<repo>@refs/heads/<trunk>`, by `gitCommit`). It names its queue
-  (`<repo>:<trunk>`) and where the trunk was (`base`). It names the batch's diffs, each at the
-  version that landed, with the commit that carries it on the candidate and the signed accepts that
-  hold on it (their statements' digests, R04). And it names the checks run on the candidate, each
-  with its conclusion and its legs' signed results (their statements' digests, R05). A leg that
-  signs sends those as it ends, a moment before its job does, so the queue can see a check pass
-  first: the land's signing waits for them up to 10 seconds, then signs with what kiln has.
-- *Kept and read.* It's kept in `land_signatures` (migration `w27_land_signatures`). `GET
-  /api/repos/:repo/lands/:commit` reads it back: its trunk, base, signer, digest, when, what it says,
-  and its envelope. A land kiln can't sign stands, unsigned, and the log says so.
+- *What's signed.* When a land queue moves a trunk (its compare-and-swap), kiln signs the land as
+  its server, whose queue it is (`ci::lands::sign`). The statement (`kiln_ci::identity::landing`,
+  `application/vnd.kiln.land+json`) is about the trunk at the commit it moved to (`to`;
+  `<repo>@refs/heads/<trunk>`, by `gitCommit`). It names its queue (`<repo>:<trunk>`), the tip it
+  was applied onto (`from`), the candidate the queue tested and that candidate's `base`.
+  - `to` is the candidate itself, unless the trunk moved since the candidate's base only for
+    changes it shares nothing with and the queue applied the batch again onto the tip (`rebased`, a
+    queue's that does: the Merge Queues agent's). A land not applied again that moved the trunk
+    anywhere but its candidate isn't taken.
+  - It names the batch's diffs, each at the version that landed, with the commit that carries it on
+    `to` and the signed accepts that hold on it (their statements' digests, R04).
+  - It names the checks run on the candidate, each with its conclusion and its legs' signed results
+    (their statements' digests, R05). A leg that signs sends those as it ends, a moment before its
+    job does, so the queue can see a check pass first: the land's signing waits for them up to 10
+    seconds, then signs with what kiln has.
+- *Kept and read.* It's kept in `land_signatures` by the commit the trunk moved to (migration
+  `w27_land_signatures`). `GET /api/repos/:repo/lands/:commit` reads it back: its trunk, head,
+  candidate, base, signer, digest, when, what it says, and its envelope. A land kiln can't sign
+  stands, unsigned, and the log says so.
 - *Tests.* kiln-ci's `identity::landing` (`w27_r07_a_lands_statement_reads_back`,
+  `w27_r07_a_land_applied_again_is_about_the_commit_the_trunk_moved_to`,
   `w27_r07_a_land_that_doesnt_hold_together_is_refused`), and integration
   `w27_r07_a_land_is_signed_by_its_queue`. In it D1, approved by Kim on her laptop, lands through
   main's queue with its `gate` run on the candidate. The statement verifies as kiln's server and
   names main's queue, the candidate that landed, D1 at v1 with Kim's verdict, and `gate` with its
   legs' signed results.
-- *Not yet.* The Merge Queues agent's queue signs its lands the same way (it has the statement's
-  shape). A land's statement isn't posted to hosts.
+- *Not yet.* The Merge Queues agent's queue signs its lands the same way, from its `landed()`, right
+  after its compare-and-swap (it has the statement's shape). A land's statement isn't posted to
+  hosts.
 
 **Built: a leg's results and provenance, signed as the leg (R05, R06).** Plan
 `01a17856b1b273268adf6ce8c4f78410` step 5, planned as `01a18b12f931749d83a2acdfbf55e67a` (research

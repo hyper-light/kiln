@@ -1,10 +1,12 @@
 //! Each land, signed as the queue that tested it (docs/ci.md W27-R07). Once a land queue moves a
-//! trunk to the candidate it tested (its compare-and-swap), kiln signs the land as its server, whose
-//! queue it is ([`sign`]). The statement (`kiln_ci::identity::landing`) is about the trunk at the
-//! candidate that landed, from its base. It names the batch's diffs, each at the version that
-//! landed with the commit that carries it and the signed accepts that hold on it, and the checks
-//! the queue ran on the candidate, each with its conclusion and its legs' signed results. It's kept
-//! in `land_signatures`, and `GET /api/repos/:repo/lands/:commit` reads it back ([`get`]).
+//! trunk (its compare-and-swap), kiln signs the land as its server, whose queue it is ([`sign`]).
+//! The statement (`kiln_ci::identity::landing`) is about the trunk at the commit it moved to, from
+//! the tip it was applied onto, and names the candidate the queue tested (that commit, unless the
+//! batch was applied again onto a tip that moved meanwhile) and its base. It names the batch's
+//! diffs, each at the version that landed with the commit that carries it and the signed accepts
+//! that hold on it, and the checks the queue ran on the candidate, each with its conclusion and its
+//! legs' signed results. It's kept in `land_signatures`, and `GET /api/repos/:repo/lands/:commit`
+//! reads it back ([`get`]).
 
 use std::time::Duration;
 
@@ -65,9 +67,21 @@ async fn awaits_results(hub: &Hub, repo_id: &str, candidate: &str) -> anyhow::Re
         .await
 }
 
-/// The land of `carried` (each diff's id and the commit that carries it on the candidate) on
-/// `trunk` of `repo`, from `base` to `candidate`, signed as kiln's server and kept. Its digest.
-pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, base: &str, candidate: &str, carried: &[(String, String)]) -> anyhow::Result<String> {
+/// How a land moved its trunk: from the tip it was applied onto to the commit it moved it to; the
+/// candidate the queue tested and its base; and whether the batch was applied again onto `from`
+/// (`to` is then a commit of its own, `candidate` where the checks ran).
+pub struct Moved<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub candidate: &'a str,
+    pub base: &'a str,
+    pub rebased: bool,
+}
+
+/// The land of `carried` (each diff's id and the commit that carries it on `moved.to`) on `trunk`
+/// of `repo`, as it `moved` it, signed as kiln's server and kept. Its digest.
+pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, moved: &Moved<'_>, carried: &[(String, String)]) -> anyhow::Result<String> {
+    let candidate = moved.candidate;
     let mut batch = Vec::new();
     for (id, commit) in carried {
         let Some(d) = super::diffs::find(hub, id).await? else { continue };
@@ -81,18 +95,28 @@ pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, base: &str, candidate: &s
     while waited.elapsed() < RESULTS_WAIT && awaits_results(hub, &repo.id, candidate).await? {
         crate::rt::sleep(Duration::from_millis(250)).await;
     }
-    let land = Land { repo: repo.name.clone(), trunk: trunk.to_owned(), base: base.to_owned(), candidate: candidate.to_owned(), batch, checks: checks_on(hub, &repo.id, candidate).await? };
+    let land = Land {
+        repo: repo.name.clone(),
+        trunk: trunk.to_owned(),
+        from: moved.from.to_owned(),
+        to: moved.to.to_owned(),
+        candidate: candidate.to_owned(),
+        base: moved.base.to_owned(),
+        rebased: moved.rebased,
+        batch,
+        checks: checks_on(hub, &repo.id, candidate).await?,
+    };
     let payload = statement::payload(&landing::statement(&land)).map_err(|e| anyhow::anyhow!("{e}"))?;
     let bundle = crate::identities::sign_as(&hub.pki, "server", landing::PAYLOAD_LAND, &payload)?;
     let digest = statement::digest(landing::PAYLOAD_LAND, &payload);
     let signer = kiln_ci::identity::chain::Identity::new(hub.pki.organization(), kiln_ci::identity::chain::Actor::Server).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (repo_id, trunk, base, candidate, d, at) = (repo.id.clone(), trunk.to_owned(), base.to_owned(), candidate.to_owned(), digest.clone(), crate::util::now_unix());
+    let (repo_id, trunk, head, candidate, base, d, at) = (repo.id.clone(), trunk.to_owned(), moved.to.to_owned(), candidate.to_owned(), moved.base.to_owned(), digest.clone(), crate::util::now_unix());
     hub.store
         .call(move |c| {
             c.execute(
-                "INSERT INTO land_signatures (repo_id, trunk, candidate, base, digest, signer, signed_at, bundle) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT (repo_id, trunk, candidate) DO UPDATE SET base = excluded.base, digest = excluded.digest, signer = excluded.signer, signed_at = excluded.signed_at, bundle = excluded.bundle",
-                params![repo_id, trunk, candidate, base, d, signer, at, bundle.to_string()],
+                "INSERT INTO land_signatures (repo_id, trunk, head, candidate, base, digest, signer, signed_at, bundle) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (repo_id, trunk, head) DO UPDATE SET candidate = excluded.candidate, base = excluded.base, digest = excluded.digest, signer = excluded.signer, signed_at = excluded.signed_at, bundle = excluded.bundle",
+                params![repo_id, trunk, head, candidate, base, d, signer, at, bundle.to_string()],
             )?;
             Ok(())
         })
@@ -101,21 +125,22 @@ pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, base: &str, candidate: &s
 }
 
 /// `GET /api/repos/:repo/lands/:commit`: the land that put `commit` at the head of a trunk of
-/// `repo`, as its queue signed it: its trunk, base, signer, digest, when, what it says, and its
-/// envelope.
+/// `repo`, as its queue signed it: its trunk, the candidate it tested and that candidate's base,
+/// its signer, digest, when, what it says, and its envelope.
 pub async fn get(hub: &Hub, repo: &str, commit: &str) -> Result<Value, Fail> {
     let repos = hub.store.repos().await.map_err(fail)?;
     let r = repos.into_iter().find(|x| x.name == repo || x.id == repo).ok_or((StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
     let (id, sha) = (r.id.clone(), commit.to_owned());
-    let row: Option<(String, String, String, String, i64, String)> = hub
+    type Row = (String, String, String, String, String, i64, String);
+    let row: Option<Row> = hub
         .store
         .call(move |c| {
-            let sql = "SELECT trunk, base, digest, signer, signed_at, bundle FROM land_signatures WHERE repo_id = ?1 AND candidate = ?2 ORDER BY signed_at DESC LIMIT 1";
-            Ok(c.query_row(sql, params![id, sha], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?))).optional()?)
+            let sql = "SELECT trunk, candidate, base, digest, signer, signed_at, bundle FROM land_signatures WHERE repo_id = ?1 AND head = ?2 ORDER BY signed_at DESC LIMIT 1";
+            Ok(c.query_row(sql, params![id, sha], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?, x.get(6)?))).optional()?)
         })
         .await
         .map_err(fail)?;
-    let (trunk, base, digest, signer, signed_at, bundle) = row.ok_or((StatusCode::NOT_FOUND, format!("no land of {repo} put {commit} at a trunk's head")))?;
+    let (trunk, candidate, base, digest, signer, signed_at, bundle) = row.ok_or((StatusCode::NOT_FOUND, format!("no land of {repo} put {commit} at a trunk's head")))?;
     let bundle: Value = serde_json::from_str(&bundle).unwrap_or(Value::Null);
     let said = bundle
         .pointer("/dsseEnvelope/payload")
@@ -124,5 +149,5 @@ pub async fn get(hub: &Hub, repo: &str, commit: &str) -> Result<Value, Fail> {
         .and_then(|p| serde_json::from_slice::<statement::Statement>(&p).ok())
         .map(|s| s.body)
         .unwrap_or(Value::Null);
-    Ok(json!({ "repo": r.name, "trunk": trunk, "candidate": commit, "base": base, "signer": signer, "digest": digest, "signed_at": signed_at, "land": said, "bundle": bundle }))
+    Ok(json!({ "repo": r.name, "trunk": trunk, "head": commit, "candidate": candidate, "base": base, "signer": signer, "digest": digest, "signed_at": signed_at, "land": said, "bundle": bundle }))
 }

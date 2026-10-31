@@ -2062,7 +2062,8 @@ fn w27_r07_a_land_is_signed_by_its_queue() -> anyhow::Result<()> {
     let checked = statement::verify(&bundle, &root(&s)?, &revocations_now(&s)?, signed.get("signed_at").and_then(Value::as_i64).unwrap_or_default())?;
     assert_eq!(checked.custodian, "kiln://hyper-light/server", "signed as kiln's server, whose queue it is");
     let land = landing::read(&checked.payload_type, &checked.statement).map_err(|e| anyhow::anyhow!(e))?;
-    assert_eq!((land.queue(), land.candidate.as_str()), ("acme/landed:main".to_owned(), tip.as_str()), "the candidate that landed: {land:?}");
+    assert_eq!((land.queue(), land.to.as_str(), land.candidate.as_str()), ("acme/landed:main".to_owned(), tip.as_str(), tip.as_str()), "the trunk moved to the candidate tested: {land:?}");
+    assert!(!land.rebased && land.from == land.base && field(&signed, "head") == tip, "from the candidate's base, never applied again: {land:?}");
     let kims = get("/api/diffs/D1/verdicts")?.get("verdicts").and_then(Value::as_array).and_then(|l| l.first()).map(|v| field(v, "digest").to_owned()).unwrap_or_default();
     let d1 = land.batch.first().ok_or_else(|| anyhow::anyhow!("an empty batch: {land:?}"))?;
     assert_eq!((d1.diff.as_str(), d1.version, &d1.verdicts), ("D1", 1, &vec![kims]), "{land:?}");
