@@ -209,7 +209,8 @@ test("messaging those picked, the composer has starting's rows: its line, the bo
   await expect(to).toContainText("Release prep");
   // Its line says what they're held to once they've said what they understand (its room there meanwhile).
   await expect(page.locator(".mc-mode .ms-tuner .rs-v").first()).toBeVisible();
-  expect(await composerRows(page), "messaging them, the composer's rows aren't starting's").toEqual(starting);
+  // Once the turn's crossfade has eased it into place (it starts 2 px low).
+  await expect.poll(() => composerRows(page), { message: "messaging them, the composer's rows aren't starting's" }).toEqual(starting);
   // The To line is under the box, not in it.
   await expect(page.locator(".mc-mode .hx-compose-box .ms-to")).toHaveCount(0);
 });
