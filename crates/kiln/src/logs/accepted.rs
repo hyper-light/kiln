@@ -935,7 +935,7 @@ async fn verify_history(ctx:&Context,mut op:Operation)->anyhow::Result<Operation
                     let history=if cached.as_ref().is_some_and(|history|history.step==step) {cached.take().ok_or_else(||anyhow::anyhow!("historical cache disappeared"))?}else{
                         let prefix=Prefix{view:op.view.clone(),revision:op.staged_revision,root:op.staged_root.clone()};
                         let mut reader=Reader::open(&ctx.store,prefix,step,crate::ci::logsearch::MAX_INDEXED).await?;
-                        let text=loop {match reader.advance(&ctx.store,&ctx.blobs).await?{ReadTurn::Pending(next)=>reader=*next,ReadTurn::Ready(text,_)=>break text}};
+                        let text=loop {match reader.advance(&ctx.store,&ctx.blobs).await?{ReadTurn::Pending(next)=>reader = *next,ReadTurn::Ready(text,_)=>break text}};
                         HistoryText{step,text,line:1,at:0}
                     };
                     let (agrees,history)=crate::rt::blocking(move ||history.matches(body,line)).await??;cached=Some(history);

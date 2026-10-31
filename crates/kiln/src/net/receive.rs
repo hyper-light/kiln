@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet,HashMap};
 use std::sync::Arc;
 
-use hyper_transport::{Budget as _,Lane,Reservation};
+use hyper_transport::{Lane,Reservation};
 use parking_lot::Mutex;
 
 use super::{ApplicationPermit,Class,Connection,Out,PeerId};

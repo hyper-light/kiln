@@ -145,7 +145,7 @@ fn directory_identity(path:&std::path::Path)->anyhow::Result<CapturedDir> {
     };
     anyhow::ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(),"historical log directory is not a regular owned directory");
     let mut options=std::fs::OpenOptions::new();options.read(true);
-    #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt as _;options.custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW);}
+    #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt as _;options.custom_flags(nix::libc::O_DIRECTORY|nix::libc::O_NOFOLLOW);}
     #[cfg(windows)] {use std::os::windows::fs::OpenOptionsExt as _;options.custom_flags(0x02000000|0x00200000);}
     let file=options.open(path)?;let metadata=file.metadata()?;
     anyhow::ensure!(metadata.is_dir() && !reparse(&metadata),"historical directory handle is not a plain directory");
@@ -156,7 +156,7 @@ fn directory_identity(path:&std::path::Path)->anyhow::Result<CapturedDir> {
 fn open_capture(path:&std::path::Path)->anyhow::Result<std::fs::File> {
     anyhow::ensure!(!std::fs::symlink_metadata(path)?.file_type().is_symlink(),"historical log is a symlink");
     let mut options=std::fs::OpenOptions::new();options.read(true);
-    #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt as _;options.custom_flags(libc::O_NOFOLLOW);}
+    #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt as _;options.custom_flags(nix::libc::O_NOFOLLOW);}
     #[cfg(windows)] {use std::os::windows::fs::OpenOptionsExt as _;options.custom_flags(0x00200000);}
     let file=options.open(path)?;let metadata=file.metadata()?;
     anyhow::ensure!(metadata.is_file() && !reparse(&metadata),"historical capture requires a plain regular file");Ok(file)
