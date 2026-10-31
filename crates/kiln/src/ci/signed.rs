@@ -395,8 +395,8 @@ async fn unsigned(hub: &Hub, job: &str) -> anyhow::Result<Option<String>> {
     Ok(Some(match (delegated, signs) {
         (true, true) => format!("its runner {a} sent none: the leg hasn't ended, or what it sent was lost on the way"),
         (true, false) => format!("its runner {a} signs no legs' records: a kiln from before them"),
-        (false, true) => "kiln gave it no identity: kiln gives one only to the legs of runs it planned".to_owned(),
-        (false, false) => format!("kiln gave it no identity: its runner {a} asked for none (a kiln from before them), or it isn't a leg of a run kiln planned"),
+        (false, true) => format!("kiln gave it no identity: its runner {a} asked for none for it (a kiln from before v1 jobs signed theirs), or kiln couldn't give one"),
+        (false, false) => format!("kiln gave it no identity: its runner {a} asked for none (a kiln from before them)"),
     }))
 }
 

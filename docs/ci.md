@@ -9189,12 +9189,18 @@ delegation of it.
     `w27_r06_provenance_is_signed_as_the_leg_only_when_its_subjects_are_the_legs`;
   - `proto`'s `w27_r05_leg_signing_is_appended_after_every_older_variant`;
   - integration: `identities`'s `w27_r05_a_legs_results_verify_as_the_leg`,
+    `w27_r05_a_v1_jobs_results_verify_as_the_leg`,
     `w27_r06_provenance_verifies_as_the_leg_that_built_it` and (with `chaos`)
-    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why`; `k8s_pool`'s
-    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`.
+    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why` and
+    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`; `k8s_pool`'s
+    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`; `memo`'s `w24_r07` (a leg with reused steps).
+- *v1 jobs too*: a `.kiln/` workflow on v1, as production runs them, signs as the leg on its
+  runner. Its runner asks for the job's identity as it takes it (`ServerMsg::Assign`), as a v2
+  leg's does. kiln issues it from the job's run: its run has no plan, so its claims are its
+  pipeline's (`<repo>/.kiln/<pipeline>.yaml@refs/heads/<branch>`, at its commit).
 - *Not yet*:
-  - v1 jobs have no leg identity (W27-R01 issues one only to the legs of runs kiln planned), nor do
-    legs on runners from before identities. Their records stay unsigned, and the API says why.
+  - Legs on runners from before identities, and v1 jobs on runners from before v1 jobs signed, have
+    no leg identity. Their records stay unsigned, and the API says why.
   - kiln signs no hand-on of what it gives a leg. The delegation names its assignment and commit,
     but a leg's inputs (artifacts, caches, actions, images) are received with no hand-on of kiln's
     to follow. Only the assignment, the commit and the tarball are judged against what kiln

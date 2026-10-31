@@ -2547,6 +2547,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
                             served_dedicated = true;
                         }
+                        // Its own identity, as a leg's: a key made here, outside anything its steps
+                        // can reach, that signs what it sent at its end, as a v2 leg's does
+                        // (docs/ci.md W27-R01, R05).
+                        if server_identity {
+                            match crate::runner::identity::ask("leg", Some(&id), None) {
+                                Ok(json) => uplink.msg(AgentMsg::Identity { json }).await,
+                                Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                        }
+                        crate::runner::signed::forget(&id);
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });

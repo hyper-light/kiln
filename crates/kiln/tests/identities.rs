@@ -1091,6 +1091,59 @@ fn leg_on_a_test_runner_with(dir: &Path, workflow: &str, env: &[(&str, &str)], c
     let s = start(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" })?;
     let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", chaos, TALK, env)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
+    let sha = push_e2e(dir, &s, workflow)?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
+        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(r) = runs.iter().find(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            let said = || format!("{r}\n{}\n{}", s.log(), std::fs::read_to_string(&log).unwrap_or_default());
+            anyhow::ensure!(r.get("conclusion").and_then(Value::as_str) == Some("success"), "the run failed: {}", said());
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no finished run: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(LegRun { s, runner, sha })
+}
+
+/// [`leg_on_a_test_runner`] on v1: the server takes `.kiln/` workflows to v1, having no `[ci]
+/// kiln_workflows` (as production's has none), and its job `e2e` runs on the test runner to its end.
+fn v1_job_on_a_test_runner(dir: &Path, workflow: &str) -> anyhow::Result<LegRun> {
+    let s = start(dir, &Options { agent: false, ci: "", extra: "" })?;
+    let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", None, TALK, &[])?;
+    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
+    // Its runner's build known first, so v1 writes the job for what the runner can do. A job given
+    // to it before (its capabilities reading none) goes out of step: read with no steps, and
+    // passed without running (W05-R22).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/updates", &s.admin, None)?;
+        let runners = serde_json::from_str::<Value>(&body)?.get("runners").and_then(Value::as_array).cloned().unwrap_or_default();
+        if runners.iter().any(|r| field(r, "name") == "fedora-2" && r.get("build").is_some_and(|b| !b.is_null())) {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "fedora-2's build never known: {body}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let sha = push_e2e(dir, &s, workflow)?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+        let status: Option<String> = db.query_row("SELECT status FROM jobs WHERE key = 'e2e' ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0)).ok().flatten();
+        match status.as_deref() {
+            Some("succeeded") => break,
+            Some(end @ ("failed" | "cancelled" | "skipped" | "timed_out")) => anyhow::bail!("the job {end}: {}\n{}", s.log(), std::fs::read_to_string(&log).unwrap_or_default()),
+            _ => {}
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the job never ended: {status:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(LegRun { s, runner, sha })
+}
+
+/// Repository acme/app on `s`, pushed once polled, then `workflow` as `.kiln/e2e.yaml`: its commit.
+fn push_e2e(dir: &Path, s: &Server, workflow: &str) -> anyhow::Result<String> {
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
     let (home, work) = (dir.join("githome"), dir.join("tree"));
@@ -1113,19 +1166,7 @@ fn leg_on_a_test_runner_with(dir: &Path, workflow: &str, env: &[(&str, &str)], c
     git(&home, &work, &["commit", "-qm", "the workflow"])?;
     let sha = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
     git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=10", &s.admin, None)?;
-        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
-        if let Some(r) = runs.iter().find(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) {
-            let said = || format!("{r}\n{}\n{}", s.log(), std::fs::read_to_string(&log).unwrap_or_default());
-            anyhow::ensure!(r.get("conclusion").and_then(Value::as_str) == Some("success"), "the run failed: {}", said());
-            break;
-        }
-        anyhow::ensure!(Instant::now() < deadline, "no finished run: {body}\n{}", s.log());
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Ok(LegRun { s, runner, sha })
+    Ok(sha)
 }
 
 /// The leg's certificate as kiln issued it (its store's record of it), and kiln's root: DER.
@@ -1603,6 +1644,33 @@ fn w27_r05_a_legs_results_verify_as_the_leg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R05: a v1 job's results (a `.kiln/` workflow on v1, as production runs them) are signed as
+/// the leg on its runner, as a v2 leg's are: they verify under kiln's delegation of the job, which
+/// names the commit it was given, its steps' ends and logs among them.
+#[test]
+fn w27_r05_a_v1_jobs_results_verify_as_the_leg() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pipeline = "name: e2e\non:\n  push: { branches: [main] }\njobs:\n  e2e:\n    runs-on: [self-hosted]\n    steps:\n      - run: echo building\n      - run: echo tested\n";
+    let run = v1_job_on_a_test_runner(dir.path(), pipeline)?;
+    let leg = the_leg(dir.path())?;
+    let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    let uri = field(&v, "uri");
+    assert!(uri.starts_with("kiln://hyper-light/person/admin/machine/fedora-2/instance/main/run/") && uri.ends_with("/attempt/1/leg/e2e"), "{v:#}");
+    let ends = v.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(ends.len() >= 2 && ends.iter().all(|s| field(s, "status") == "succeeded"), "{v:#}");
+    let logs = v.get("logs").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(!logs.is_empty() && logs.iter().all(|l| l.pointer("/verdict/state").and_then(Value::as_str) == Some("verified")), "{v:#}");
+    assert_eq!(v.pointer("/under/uri").and_then(Value::as_str), Some("kiln://hyper-light/server"), "{v:#}");
+    // kiln's delegation of the job names its commit.
+    let delegation = v.pointer("/under/bundle/dsseEnvelope/payload").and_then(Value::as_str).unwrap_or_default();
+    let said = String::from_utf8(base64::Engine::decode(&base64::engine::general_purpose::STANDARD, delegation)?)?;
+    assert!(said.contains(&run.sha), "the delegation names the job's commit {}: {said}", run.sha);
+    Ok(())
+}
+
 /// W27-R05: a runner behind its legs, as a busy machine's falls behind (a test build's `lag`),
 /// still signs all a leg sent. A leg's end that comes while its last sends wait their turn (its test
 /// step's report line, that step's end) goes after them: its results verify, that step's end among
@@ -1636,7 +1704,7 @@ fn w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why() -> anyhow::Result<
     anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
     let v: Value = serde_json::from_str(&body)?;
     assert_eq!(field(&v, "state"), "unsigned", "{v:#}");
-    assert_eq!(field(&v, "why"), "kiln gave it no identity: its runner fedora-2 asked for none (a kiln from before them), or it isn't a leg of a run kiln planned", "{v:#}");
+    assert_eq!(field(&v, "why"), "kiln gave it no identity: its runner fedora-2 asked for none (a kiln from before them)", "{v:#}");
     Ok(())
 }
 
