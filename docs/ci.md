@@ -9198,6 +9198,90 @@ delegation of it.
     step fetches one refuses, saying which; kiln's own bundle is kept either way.
   - Ship shows none of this yet (the CI/CD Integration plan's).
 
+**Built: the trail, and kiln verify (R09, R10; AC06, AC07).** Plan
+`01a17856b1b670deb829ec1600f2c2fd`, its steps 1 to 4 and 6; research
+`01a17856b1b670deb829ec1763cc1245`.
+
+- *The trail* (`kiln_ci::identity::trail`, pure): an entry names the statement it records by digest,
+  its kind and subjects, when kiln took it, its index and the hash of the entry before it (as
+  gittuf's reference state log chains its entries); the entries are the leaves of an RFC 6962
+  Merkle tree, so an inclusion or consistency proof is at most ⌈log₂ n⌉ + 1 hashes. Checking a run
+  of entries names an edited, dropped, inserted or reordered one. A checkpoint is a C2SP signed
+  note (origin `kiln://<org>/trail`, size, root; an ECDSA signature, key ID the first four bytes of
+  the SHA-256 of its SubjectPublicKeyInfo), signed with the server's key; kiln never signs one that
+  doesn't extend the one before, saying why.
+- *Kept* (migration `w27_trail`; `crate::trail`): each statement kiln takes goes in, in the
+  transaction that takes it, once by digest, every signature of it kept beside it (a leg's of the
+  provenance kiln wrote, beside kiln's): W18's attestations, a leg's records and the server's
+  delegations of legs, custody records, verdicts and comments, lands; and what kiln checked that
+  isn't a statement itself as kiln's own words (a push's commits' signatures, the commits kiln makes,
+  what a host verified, revocations), which the checkpoints over them vouch for. Nothing is pruned.
+  A checkpoint is signed every `[ci.trail] checkpoint_every` entries (256) or `checkpoint_minutes`
+  (10), whichever comes first, once the entries since the last hold as a chain and hash as kept.
+- *Served and anchored*: `GET /api/trail` (entries), `/api/trail/checkpoints`, and the trail as a
+  tiled log (`/api/trail/log/…`, C2SP tlog-tiles: its checkpoint, tiles and entry bundles, each
+  whole tile kept as a node above as its last leaf comes, so a proof is a few reads); each
+  checkpoint logged in the Rekor `[ci.attest] rekor_url` names (v1, or v2's rekor-tiles by
+  `rekor_api`, through the Sigstore seam) as a hashedrekord of its note, and `GET
+  /api/trail/anchors` holds the trail to what Rekor saw.
+- *kiln verify* (`kiln verify <deploy | artifact | commit | change> <id>`, `GET /api/verify`, the
+  `ci.verify` operation): the chain back from a release (`prod/api@1.4.2` or its number), an
+  artifact's digest, `<repository>@<commit>` or a diff, a link at a time, the first that doesn't
+  hold named. The release as kiln's deploy records have it (deploys sign with Ship's plan); each
+  artifact's provenance, which names it and the commit it was built from, signed as the leg that
+  built it; every commit on the trunk it brings (since the commit the release before ran, else since
+  the trunk's first land), each on the trunk and signed as kiln checked it; the land that put it
+  there, signed as the queue that tested it (the candidate tested is what landed, each check
+  passing); each verdict the land names, signed by whom it names, an accept holding on the version
+  that landed (given there or carried by verbatim patch-id), people and agents apart, as many as
+  the trunk's policy asked where the land began; each revision's author; a change's custody where
+  it changed hands; kiln's root. Each link rests on a statement checked as of when kiln took it
+  (its signer's chain to kiln's root, the revocations as of then) and found in the trail by an
+  inclusion proof against the newest checkpoint, signed first when any entry came after the last.
+  A deploy of 10 commits, each reviewed, tested and landed, verifies in about 170 ms on a warm
+  server (AC07 asks 2 s).
+- *For an auditor* (`kiln verify export <kind> <id>`, `GET /api/verify/export`): the same walk with
+  every statement each link rested on (its payload, its entry, the entry's proof, each signature
+  as kiln kept it and whom the walk found it signed by), kiln's own statement of each revocation
+  under the checkpoint, and that checkpoint; `kiln verify --offline <file> --root <kiln's root>`
+  checks it with no server (`kiln_ci::identity::verify::offline`): it fails where any statement,
+  signature, proof or the checkpoint was changed, or the trail says a signer's key was revoked
+  before kiln took what it signed. A revision's Source VSA (`kiln verify vsa <repository>@<commit>`,
+  `POST /api/verify/vsa`; SLSA v1.2's source track): an in-toto statement of
+  `https://slsa.dev/verification_summary/v1` about its `gitCommit` (`sourceRefs` the trunk that
+  holds it), `resourceUri` `git+<kiln>/<repository>`, verifier `<kiln>/api/verify`, its trunk's
+  review policy as the policy, PASSED with `SLSA_SOURCE_LEVEL_3` where its chain verifies (FAILED,
+  `SLSA_SOURCE_LEVEL_1`, where it doesn't), signed as kiln's server and kept in the trail.
+- *Tests*: `kiln_ci::identity::trail`'s `w27_ac06_an_edited_dropped_or_reordered_entry_is_found`
+  and `w27_r09_*` (RFC 6962's tree and proofs, at most ⌈log₂ n⌉ + 1 hashes over 1 to 10,000
+  leaves; checkpoints as Rekor's signed notes, never contradicting the one before; tiles);
+  `identity::verify`'s `w27_r10_*` (a statement held, each link's words, the Source VSA's fields, an
+  export offline and changed); `tests/trail.rs`'s `w27_r09_*` (every kind kiln takes, in order;
+  restart and concurrent appends; the tiled log; a rewritten trail caught against its anchor);
+  `tests/verify.rs`'s `w27_ac07_a_deploy_verifies_end_to_end` (10 commits, timed),
+  `w27_ac07_kiln_verify_names_each_broken_link` (an artifact rebuilt, a forged review, a trail
+  entry edited, a commit pushed to main without the queue) and
+  `w27_r10_an_exported_trail_verifies_offline`; `ci::signing`'s `w27_r12_kilns_rekor_v2_*`.
+- *Not yet.* Deploys aren't signed (Ship's plan), so kiln verify rests a release on kiln's record
+  of it; it takes each check's conclusion from the land its queue signed, not from each leg's own
+  signed results; a change's custody is walked by its change's identity, as the hand-offs of a
+  change name it; no witness cosigns the checkpoints; an export carries the revocations the trail
+  holds, those recorded since it began; Ship's What happened and commit page draw the links from
+  `GET /api/verify` (the CI/CD Integration agent's).
+
+**Built: a verified chain to deploy (R11, AC08).** Plan `01a17856b1b670deb829ec1600f2c2fd`, step 5.
+
+- The deploy gate `chain` (docs/deploy-api.md §9.1) walks what a new version deploys, or a
+  rollback puts back, as kiln verify does, as the release is asked for. `gates.require_chain: true`
+  refuses one whose chain breaks, naming the link; elsewhere the release says whether its chain
+  verifies. An environment made as `production` requires it from the start; one from before keeps
+  what it has until its settings change it, as a repository's signatures do.
+- *Tests*: `tests/verify.rs`'s `w27_ac08_production_refuses_an_unverified_chain` (made as
+  production, the rebuilt image refused at its artifact and main's build taken; from before, the
+  rebuilt one taken, saying its chain doesn't verify).
+- *Not yet.* The environment's page doesn't show `require_chain` or `production` (an edit there
+  keeps them).
+
 **Built: custody, and agent sessions handed over signed (R08, in part).** Plan
 `01a17856b1b477eda14a574ae312a123`, its steps 1 to 5; research `01a18abf2d28762d92104dca2fbfbf89`.
 
@@ -9896,6 +9980,7 @@ kiln metrics criterion|hyperfine|gobench|pytest-benchmark|gbench|k6 PATH
 kiln store verify|gc                    kiln ci bench [--scheduler|--expr|--parse|--cache|--logs]
 kiln tokens create|list|revoke          kiln login
 kiln repo provider <repo> [provider…]
+kiln verify <deploy|artifact|commit|change> <id>   kiln verify export|vsa …   kiln verify --offline FILE --root PEM
 kiln work why <run|leg|step>            kiln work status|warm|verify|gc|reap   kiln rerun <run> --cold
 kiln gocacheprog                        kiln rustc   (W24: the runner's cache helpers)
 ```

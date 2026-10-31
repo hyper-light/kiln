@@ -84,6 +84,17 @@ kiln hosts that requires signatures (`.kiln/review.yaml`'s `signatures:`, new re
 default) refuses a push whose commits aren't signed by someone kiln verifies, saying which commit
 and why. docs/ci.md W27 (R03 to R07) says what each signs, over what, and how it's checked.
 
+**Checking a trail.** Every signed statement kiln takes goes into one append-only trail, its
+checkpoints signed by kiln's server (docs/ci.md W27-R09). `kiln verify <deploy | artifact | commit |
+change> <id>` walks a chain back to whoever made it, each link resting on a statement in the trail,
+and names the first that doesn't hold (anyone with `audit.read`). An auditor needs no server and no
+kiln account: `kiln verify export deploy prod/api@1.4.2 > trail.json` (by whoever may read the
+audit) carries every statement the walk rested on, with its proof and the checkpoint the proofs
+lead to, and `kiln verify --offline trail.json --root kiln-root.pem` checks it against kiln's root
+(`/ca.pem`, taken from kiln once and kept): it fails where any statement, signature or proof was
+changed. A revision's Source VSA (SLSA's source track), `kiln verify vsa <repository>@<commit>`, is
+the same check's verdict signed as kiln's server.
+
 **Jobs ask for what they need** with a new pipeline key, so no pipeline needs the admin token in
 a secret:
 
