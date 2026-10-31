@@ -55,6 +55,13 @@ pub fn trailer(message: &str) -> Option<String> {
     })
 }
 
+/// Who pushed, as [`Push::pusher`] takes it, from what kiln kept of the push: the agent whose token
+/// it came with (`agent:<id>`, the first word of the caller kiln kept for it, `agent:<id> for
+/// <whom>`), else the event's actor.
+pub fn pusher(started_by: Option<&str>, actor: &str) -> String {
+    started_by.and_then(|name| name.split(' ').next()).filter(|w| w.strip_prefix("agent:").is_some_and(|id| !id.is_empty())).map_or_else(|| actor.to_owned(), str::to_owned)
+}
+
 /// Whose `push` is.
 pub fn attribute(push: &Push, changes: &[Change]) -> Actor {
     if let Some(id) = push.pusher.strip_prefix("agent:").filter(|i| !i.is_empty()) {
@@ -75,7 +82,21 @@ pub fn attribute(push: &Push, changes: &[Change]) -> Actor {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, Push, Source, attribute, trailer};
+    use super::{Change, Push, Source, attribute, pusher, trailer};
+
+    /// W28-R67: a push made with an agent's token is the agent's, whatever the commit's author;
+    /// anything else is its event's actor.
+    #[test]
+    fn w28_r67_the_pusher_is_the_token_s_agent() {
+        assert_eq!(pusher(Some("agent:01a1eeee for user:ada"), "Test"), "agent:01a1eeee");
+        assert_eq!(pusher(Some("agent:01a1eeee for admin"), "Test"), "agent:01a1eeee");
+        assert_eq!(pusher(Some("user:ada"), "Test"), "Test");
+        assert_eq!(pusher(Some("pat:01a1ffff of user:ada"), "ada"), "ada");
+        assert_eq!(pusher(Some("agent: for admin"), "ada"), "ada");
+        assert_eq!(pusher(None, "ada"), "ada");
+        let a = attribute(&Push { sha: "abc", pusher: &pusher(Some("agent:01a1eeee for admin"), "Test"), message: "plain" }, &[]);
+        assert_eq!((a.id.as_str(), a.source), ("agent:01a1eeee", Source::Token));
+    }
 
     /// W28-R67: each commit gets the actor of the first source that names one, and says which.
     #[test]

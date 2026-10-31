@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { KindInfo } from "../src/api/harness.ts";
-import { harnessesOf, kindOf, machinesWith, modeOf, modelOf, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "../src/views/harness/spawn-setup.ts";
+import { carryEffort, carryMode, harnessesOf, kindOf, machinesWith, modeOf, modelOf, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "../src/views/harness/spawn-setup.ts";
 
 const claude = (over: Partial<KindInfo> = {}): KindInfo => ({ id: "claude", name: "Claude Code", verified: true, available: true, ...over });
 const codex = (over: Partial<KindInfo> = {}): KindInfo => ({ id: "codex", name: "Codex", verified: true, available: true, ...over });
@@ -157,4 +157,77 @@ test("fast mode: as the model lists it; a machine that lists no model's speeds g
   assert.deepEqual(speedsFor(listed, ""), []);
   // Another harness gets none it doesn't list.
   assert.deepEqual(speedsFor(codex({ models: [{ id: "gpt-6.1-sol", label: "GPT-6.1 Sol", default: true }] }), ""), []);
+});
+
+// The modes each harness offers, as their runners list them.
+const CLAUDE = ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"];
+const CODEX = ["auto", "read-only", "untrusted", "full-access"];
+const DEVIN = ["accept-edits", "smart", "ask", "plan", "bypass"];
+const AGY = ["default", "accept-edits", "plan", "bypass"];
+
+test("a harness switch carries the permissions at the same latitude, never more, as an agent's switch does (handoff.rs)", () => {
+  // Read only stays read only; ask stays ask; Claude Code's accept edits is Codex's auto, and back.
+  assert.equal(carryMode("claude", "plan", "codex", CODEX), "read-only");
+  assert.equal(carryMode("claude", "dontAsk", "codex", CODEX), "read-only");
+  assert.equal(carryMode("claude", "default", "codex", CODEX), "untrusted");
+  assert.equal(carryMode("claude", "acceptEdits", "codex", CODEX), "auto");
+  assert.equal(carryMode("codex", "auto", "claude", CLAUDE), "acceptEdits");
+  // Codex has nothing at Claude Code's auto: the next one down.
+  assert.equal(carryMode("claude", "auto", "codex", CODEX), "auto");
+  // Skipping every check carries only where it's offered; else the most there is below it.
+  assert.equal(carryMode("codex", "full-access", "claude", CLAUDE), "bypassPermissions");
+  assert.equal(
+    carryMode(
+      "codex",
+      "full-access",
+      "claude",
+      CLAUDE.filter((m) => m !== "bypassPermissions"),
+    ),
+    "auto",
+  );
+  // Into Devin and Antigravity by their own modes; out of them as well.
+  assert.equal(carryMode("claude", "auto", "devin", DEVIN), "smart");
+  assert.equal(carryMode("devin", "smart", "antigravity", AGY), "accept-edits");
+  assert.equal(carryMode("devin", "plan", "claude", CLAUDE), "plan");
+  // Nothing that low there (an agent that names no modes before it starts): its own default.
+  assert.equal(carryMode("claude", "plan", "gemini", []), "");
+  // A mode kiln doesn't know asks; in its own harness a mode is itself.
+  assert.equal(carryMode("gemini", "", "codex", CODEX), "untrusted");
+  assert.equal(carryMode("claude", "dontAsk", "claude", CLAUDE), "dontAsk");
+  assert.equal(
+    carryMode(
+      "claude",
+      "bypassPermissions",
+      "claude",
+      CLAUDE.filter((m) => m !== "bypassPermissions"),
+    ),
+    "auto",
+  );
+});
+
+test("a harness switch carries the effort to the nearest level the model takes (handoff.rs)", () => {
+  const all = ["low", "medium", "high", "xhigh", "max", "ultra"];
+  assert.equal(carryEffort("max", all), "max");
+  assert.equal(carryEffort("max", ["low", "medium", "high", "xhigh"]), "xhigh");
+  assert.equal(carryEffort("ultra", ["low", "medium", "high", "xhigh", "max"]), "max");
+  assert.equal(carryEffort("minimal", ["low", "high"]), "low");
+  // The lower of two as near; none chosen is none; none to take is none.
+  assert.equal(carryEffort("xhigh", ["high", "max"]), "high");
+  assert.equal(carryEffort("", ["low"]), "");
+  assert.equal(carryEffort("max", []), "");
+  assert.equal(carryEffort("thorough", ["low", "high"]), "");
+});
+
+test("a mode carried from another harness that turns checks off still waits for a confirmation for this start", () => {
+  const codex = [
+    { id: "auto", label: "Auto", description: "" },
+    { id: "untrusted", label: "Ask", description: "" },
+    { id: "full-access", label: "Full access", description: "", dangerous: true },
+  ];
+  const ids = codex.map((m) => m.id);
+  // Confirmed for this start in Claude Code: confirmed in Codex too.
+  assert.equal(modeOf(codex, { unchecked: carryMode("claude", "bypassPermissions", "codex", ids) }), "full-access");
+  // Kept (never a mode that turns checks off) or handed over: never carried into one.
+  assert.equal(modeOf(codex, { unchecked: "", remembered: carryMode("claude", "bypassPermissions", "codex", ids), fallback: "auto" }), "auto");
+  assert.equal(modeOf(codex, { unchecked: "", remembered: carryMode("claude", "default", "codex", ids), fallback: "auto" }), "untrusted");
 });

@@ -27,6 +27,7 @@ export type { CdPlanMade } from "./CdPlanMade";
 export type { CdStatus } from "./CdStatus";
 export type { Checkpoint } from "./Checkpoint";
 export type { ChoiceAnswer } from "./ChoiceAnswer";
+export type { CiVerdict } from "./CiVerdict";
 export type { Cmd } from "./Cmd";
 export type { Command } from "./Command";
 export type { Comment } from "./Comment";

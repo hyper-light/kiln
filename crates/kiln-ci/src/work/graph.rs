@@ -115,6 +115,19 @@ pub struct Package {
     pub deps: BTreeSet<String>,
 }
 
+impl Package {
+    /// The files every package of its workspace reads besides its folder's (as [`affected`] has
+    /// them): the root workspace's manifests and lockfiles, a deeper workspace's manifest, none
+    /// outside a workspace. The land queue's units read them (docs/ci.md W28-R100).
+    pub fn workspace_files(&self) -> Vec<String> {
+        match self.workspace.as_deref() {
+            Some("") => self.ecosystem.root_files().iter().map(|f| (*f).to_owned()).collect(),
+            Some(w) => vec![file(w, self.ecosystem.manifest())],
+            None => Vec::new(),
+        }
+    }
+}
+
 /// A manifest that couldn't be read, or that names what isn't there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {

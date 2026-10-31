@@ -537,7 +537,7 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiTestsHistory>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "tests", &text(v, "test")?, "history"]), query(v, &["branch", "limit"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::results::history(&cx.hub, &text(&v, "repo")?, &text(&v, "test")?, &query(&v, &["branch", "limit"])).await).await }),
-            op!("ci.runs.bisect", "Bisect a failure: the run's job (the one that failed, by default), run again on the commits between the last it passed on (`good`: the last green run of its workflow on its branch before it, by default) and the run's (`bad`), the range halved each time, until the first commit it fails on is found. Each try is a run of that job at that commit, trusted as the run was. Follow it with ci.runs.bisects.", ro: false, destructive: false,
+            op!("ci.runs.bisect", "Bisect a failure: the run's job (the one that failed, by default), run again on the commits between the last it passed on (`good`: the last green run of its workflow on its branch before it, by default) and the run's (`bad`), until the first commit it fails on is found: a binary search, flake-aware when the check is flaky (W28-R56). Each try is a run of that job at that commit, trusted as the run was. With `test`, only the commits whose diffs could affect the test's unit are tried, each judged by the test's own result (W28-R57). Follow it with ci.runs.bisects.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsBisect>(),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "bisect"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::bisect::start(&cx.hub, &text(&v, "run")?, &v, &by(&cx)).await).await }),
@@ -545,10 +545,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiRunsBisects>(),
                 route: |v| Ok((Method::GET, match v.get("bisect").and_then(Value::as_str) { Some(b) => path(&["runs", &text(v, "run")?, "bisects", b]), None => path(&["runs", &text(v, "run")?, "bisects"]) }, HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::bisect::list(&cx.hub, &text(&v, "run")?, v.get("bisect").and_then(Value::as_str)).await).await }),
-            op!("experiments.start", "Start an experiment (W20-R11): options measured against each other and together on a base commit (the default branch's head by default). Each option is a `commit`, a `branch` or a `diff`; `strategy` makes the variants: each, all (every combination), pairs, greedy, or custom (`variants`); the baseline is one unless `baseline: false`. `criteria`: each `{name, kind: pipeline (workflow) | command (command, runs-on) | metric (metric, better: lower | higher), required, threshold: {at_most | at_least | better}}`, a metric read from the pipelines' and commands' runs. Each variant is measured `repetitions` times (3), interleaved, `max_parallel` at once (4), within `budget_minutes`. `decide`: ask (bring the results back) or auto (take the clear winner); the agent that asks is told.", base: "", ro: false, destructive: false,
+            op!("experiments.start", "Start an experiment (W20-R11): options measured against each other and together on a base commit (the default branch's head by default). Each option is a `commit`, a `branch` or a `diff`; `strategy` makes the variants: each, all (every combination), pairs, greedy, or custom (`variants`); the baseline is one unless `baseline: false`. `criteria`: each `{name, kind: command (command) | pipeline (workflow) | metric (metric, better: lower | higher), required, threshold: {at_most | at_least | better}}`, a metric read from what the commands and pipelines write to `$KILN_METRICS` (a JSON line each: {\"name\", \"value\"}). A command runs in each variant's own worktree beside the agent that asks, on its machine, without CI; a pipeline (or a command given `runs-on`) is a CI run, and needs CI's engine. Each variant is measured `repetitions` times (3), interleaved, `max_parallel` at once (4), within `budget_seconds` (or `budget_minutes`). `decide`: ask (bring the results back) or auto (take the clear winner); the agent that asks is told.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::ExperimentsStart>(),
                 route: |_| Ok((Method::POST, path(&["experiments"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::experiments::start(&cx.hub, &cx.caller, v).await).await }),
+            op!("experiments.suggest", "Before you ask the person to choose between options whose difference can be measured (faster, smaller, less memory, the tests still pass), say how to measure them: the person can run an experiment instead of answering (W20-R11), and its setup starts with what you suggest here, for them to change. `question`: as you'll ask it. `criteria`: each `{name, kind: command (command: run in each variant's own worktree; it passes when it exits 0) | metric (metric, better: lower | higher: a number your commands write to $KILN_METRICS, a JSON line each: {\"name\": \"p95_ms\", \"value\": 12.3}), required, threshold: {at_most | at_least | better (a fraction better than the baseline: 0.05 is 5%)}}`, at least one command among them.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::ExperimentsSuggest>(),
+                route: |_| Ok((Method::POST, path(&["experiments", "suggest"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::suggest(&cx.hub, &cx.caller, v).await).await }),
             op!("experiments.list", "Experiments you may read, newest first (one repository's with `repo`): each one's state, how many of its runs are measured, and its recommendation and decision.", base: "", ro: true, destructive: false,
                 input: Input::of::<input::ExperimentsList>(),
                 route: |v| Ok((Method::GET, path(&["experiments"]), query(v, &["repo"]))),
@@ -801,6 +805,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiProvidersChecks>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "commits", &text(v, "sha")?, "checks"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { super::providers::checks(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?).await }),
+            op!("ci.verdict", "A commit's verdict on each workflow's lane it is on (W28-R55): per unit and test, direct (its own result), covered by a later commit's (optimistic, never passed), suspect (a later commit newly failed what its diff could affect) or culprit, each with why; and the commit's, the weakest of them. `workflow` for one lane.", ro: true, destructive: false,
+                input: Input::of::<input::CiVerdict>(),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "commits", &text(v, "sha")?, "verdict"]), query(v, &["workflow"]))),
+                run: |cx: Cx, v: Value| async move { super::verdict::of_commit(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?, &query(&v, &["workflow"])).await }),
+            op!("ci.verdict.wait", "Wait for a commit's verdict to be final (`until: final`, the default: every lane direct, covered or culprit) or to change at all (`until: any`), for at most `timeout_s` seconds (600 at most): the verdict then (as ci.verdict gives it), whether it is final, and whether the time ran out (W28-R58).", ro: true, destructive: false,
+                input: Input::of::<input::CiVerdictWait>(),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "commits", &text(v, "sha")?, "verdict", "wait"]), query(v, &["workflow", "until", "timeout_s"]))),
+                run: |cx: Cx, v: Value| async move { super::verdict::wait(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?, &query(&v, &["workflow", "until", "timeout_s"])).await }),
             op!("host.pulls.list", "A repository's open pull requests (merge requests) on its host, GitHub, GitLab or Bitbucket: as you, when you signed in with that host.", ro: true, destructive: false,
                 input: Input::of::<input::HostPullsList>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "pulls"]), HashMap::new())),
@@ -877,6 +889,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiQueueList>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "queue"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::GET, &["repos", r.as_str(), "queue"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.queue.enqueue", "Put a host's changes (its pull requests) in its host's own queue, a merge queue or merge train, bottom first, each at the head Review cleared: refused if one moved since, is merged or closed, or the host has no queue for the repository.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiQueueEnqueue>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "queue"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::POST, &["repos", r.as_str(), "queue"], &HashMap::new(), &v).await }),
             op!("ci.queue.remove", "Take an entry out of the land queue (its id, from ci.queue.list).", base: "", ro: false, destructive: true,
                 input: Input::of::<input::CiQueueRemove>(),
                 route: |v| Ok((Method::DELETE, path(&["queue", &text(v, "entry")?]), HashMap::new())),
@@ -1763,6 +1779,9 @@ pub mod input {
         pub run: String,
         /// The job's id.
         pub job: Option<String>,
+        /// A test the job reports (W16's `suite name`): only the commits whose diffs could affect
+        /// its unit are tried, each judged by the test's own result (W28-R57).
+        pub test: Option<String>,
         /// A commit it passes on.
         pub good: Option<String>,
         /// A commit it fails on.
@@ -1822,11 +1841,23 @@ pub mod input {
         #[schemars(range(min = 1, max = 16))]
         pub max_parallel: Option<i64>,
         pub budget_minutes: Option<i64>,
+        /// Its time limit in seconds (instead of `budget_minutes`).
+        pub budget_seconds: Option<i64>,
         pub decide: Option<ExperimentsStartDecide>,
         /// The agent to tell (you, by default).
         pub agent: Option<String>,
         /// Where the agents implementing options run: {kind, on?, cwd?, model?}; yours by default.
         pub harness: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ExperimentsSuggest {
+        /// The question it's for, as you'll ask it (your next, when left out).
+        pub question: Option<String>,
+        pub criteria: Vec<serde_json::Map<String, serde_json::Value>>,
+        /// The agent whose question it is (you, by default).
+        pub agent: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2424,6 +2455,53 @@ pub mod input {
     pub struct CiQueueList {
         /// The repository, `owner/name`.
         pub repo: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiQueueEnqueue {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The branch they land on (the repository's default when left out).
+        pub trunk: Option<String>,
+        /// Bottom first: each `{ number, head }`, the head Review cleared.
+        pub changes: Vec<CiQueueEnqueueChange>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct CiQueueEnqueueChange {
+        pub number: i64,
+        pub head: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiVerdict {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        pub sha: String,
+        /// Only this workflow's lane.
+        pub workflow: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CiVerdictWaitUntil {
+        Final,
+        Any,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiVerdictWait {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        pub sha: String,
+        /// Only this workflow's lane.
+        pub workflow: Option<String>,
+        pub until: Option<CiVerdictWaitUntil>,
+        #[schemars(range(min = 1, max = 600))]
+        pub timeout_s: Option<i64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

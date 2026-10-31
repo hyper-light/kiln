@@ -395,7 +395,13 @@ pub static ROUTES: &[Rule] = &[
     // The caller's own notifications, marked read (W19-R06).
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    // A host's changes into its host's own queue (docs/ci.md W28-R109): landing them.
+    r("POST", "/api/repos/*/queue", "diffs.land", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
+    // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
+    r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),
+    r("POST", "/api/queue/*/release", "diffs.review", At::Entry(2)),
+    r("POST", "/api/queue/*/withdraw", "diffs.review", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
     r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),
     r("POST", "/api/repos/*/change-requests", "diffs.submit", At::Repo(2)),
@@ -419,6 +425,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/experiments", "runs.read", At::Anywhere),
     r("GET", "/api/experiments/*", "runs.read", At::Anywhere),
     r("POST", "/api/experiments", "experiments.run", At::Anywhere),
+    r("POST", "/api/experiments/suggest", "experiments.run", At::Anywhere),
     r("POST", "/api/experiments/*/*", "experiments.run", At::Anywhere),
     // Lists narrowed row by row to the repositories the caller may read (W10).
     r("GET", "/api/runs", "runs.read", At::Anywhere),

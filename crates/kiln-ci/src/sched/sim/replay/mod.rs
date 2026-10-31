@@ -87,7 +87,16 @@ pub struct Policy {
     pub share: Option<f64>,
     /// P4: bisection runs are speculative demands of their lane, under its AIMD window (W28-R68).
     pub window: Option<admit::Window>,
+    /// W28-R80's overflow: a k8s job whose pod hasn't started this many seconds after the quota
+    /// took it runs on a slot of a Linux machine instead, once one has room (looking again every
+    /// [`OVERFLOW_AGAIN_S`]); `None`, it waits for its pod as the week's did.
+    pub overflow: Option<i64>,
 }
+
+/// How often a k8s job past its overflow's `after` looks again for a Linux machine with room.
+pub const OVERFLOW_AGAIN_S: i64 = 30;
+/// The overflow's `after`, the scheduler's default (`sched::pools::OVERFLOW_AFTER_MS`).
+pub const OVERFLOW_AFTER_S: i64 = crate::sched::pools::OVERFLOW_AFTER_MS / 1000;
 
 /// The defaults W25's later steps take, from the sweeps in ci/sim/README.md: finish work no one
 /// wants when it has 5 min left (less waste than 2 min, within a point of its verdicts); a warm
@@ -101,7 +110,7 @@ pub const MAX_WAIT: i64 = 600;
 
 impl Policy {
     fn demands(name: &str) -> Policy {
-        Policy { name: name.into(), groups: None, finish_within: FINISH_WITHIN, warm_credit: WARM_CREDIT, verdicts: false, coalesce: None, cadence: false, share: None, window: None }
+        Policy { name: name.into(), groups: None, finish_within: FINISH_WITHIN, warm_credit: WARM_CREDIT, verdicts: false, coalesce: None, cadence: false, share: None, window: None, overflow: None }
     }
 
     /// P0: today, as recorded (cancel-in-progress where the workflows said so).
@@ -135,8 +144,19 @@ impl Policy {
     }
 
     /// P0 to P5.
+    /// P3 with W28-R80's overflow at its default `after`: a k8s job whose pod hasn't started in
+    /// 2 min runs on a Linux machine's slot.
+    pub fn p3_overflow() -> Policy {
+        Policy { overflow: Some(OVERFLOW_AFTER_S), ..Policy::p3() }.named("P3 + overflow")
+    }
+
+    /// P4 with W28-R80's overflow.
+    pub fn p4_overflow() -> Policy {
+        Policy { overflow: Some(OVERFLOW_AFTER_S), ..Policy::p4() }.named("P4 + overflow")
+    }
+
     pub fn all() -> Vec<Policy> {
-        vec![Policy::p0(), Policy::p1(), Policy::p2(), Policy::p3(), Policy::p4(), Policy::p5()]
+        vec![Policy::p0(), Policy::p1(), Policy::p2(), Policy::p3(), Policy::p4(), Policy::p5(), Policy::p3_overflow(), Policy::p4_overflow()]
     }
 
     pub fn named(mut self, name: &str) -> Policy {
@@ -241,7 +261,8 @@ pub struct JobOut {
     pub failed_step: Option<String>,
 }
 
-/// A bisection over the commits a new failure may have come from (P3).
+/// A bisection over the commits a new failure may have come from (P3): its suspects, the runs
+/// whose commits could affect the job (W28-R52).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bisection {
     pub lane: String,
@@ -249,6 +270,11 @@ pub struct Bisection {
     pub suspects: Vec<usize>,
     /// When its last run finished.
     pub done: Option<i64>,
+    /// The run it names once done: where the planner's tries (each suspect's job doing what its
+    /// draw says) put the culprit (W28-R56).
+    pub culprit: Option<usize>,
+    /// It ended with no culprit: the failure was a flake.
+    pub flake: bool,
 }
 
 /// Something the replay decided, and why (as docs/ci.md §0.3 asks of what kiln decides).
@@ -296,6 +322,8 @@ enum ExecSt {
 enum Ev {
     Finish(usize),
     Launched(usize),
+    /// A k8s job's pod is past its overflow's `after` (W28-R80).
+    Overflow(usize),
     /// Admission's timer (P4): what it held may go.
     Review,
     Arrive(usize),
@@ -305,7 +333,7 @@ impl Ev {
     fn order(self) -> u8 {
         match self {
             Ev::Finish(_) => 0,
-            Ev::Launched(_) => 1,
+            Ev::Launched(_) | Ev::Overflow(_) => 1,
             Ev::Review => 2,
             Ev::Arrive(_) => 3,
         }
@@ -339,7 +367,10 @@ struct RunSt {
 struct BisectSt {
     run: usize,
     job: usize,
-    left: u32,
+    /// The planner (W28-R56), and where its try in flight runs: the suspect, and its run and job.
+    search: crate::verdict::culprit::Search,
+    at: Option<crate::verdict::culprit::At>,
+    try_at: Option<(usize, usize)>,
 }
 
 /// A k8s job's requests when it gives none (the server's default_cpu and default_memory).
@@ -388,7 +419,9 @@ struct Engine<'a> {
     bisect_admit: BTreeMap<usize, String>,
     steps_done: BTreeMap<(String, String), i64>,
     steps_inflight: BTreeMap<(String, String), (usize, i64)>,
-    results: BTreeMap<(String, String), Vec<(usize, End, Option<String>)>>,
+    /// Each lane's verdicts as its results come (P3 and later, W28-R53), and each run's place in it.
+    books: BTreeMap<String, crate::verdict::Book>,
+    pos: Vec<Option<usize>>,
     bisections: Vec<Bisection>,
     bisect_st: Vec<BisectSt>,
     in_bisect: BTreeSet<(String, String, usize)>,
@@ -437,7 +470,8 @@ pub fn replay(trace: &Trace, policy: &Policy, seed: u64) -> Outcome {
         bisect_admit: BTreeMap::new(),
         steps_done: BTreeMap::new(),
         steps_inflight: BTreeMap::new(),
-        results: BTreeMap::new(),
+        books: BTreeMap::new(),
+        pos: vec![None; trace.runs.len()],
         bisections: Vec::new(),
         bisect_st: Vec::new(),
         in_bisect: BTreeSet::new(),
@@ -500,6 +534,7 @@ impl Engine<'_> {
                 Ev::Arrive(r) => self.arrive(r),
                 Ev::Review => self.review_admit(),
                 Ev::Launched(x) => self.launched(x),
+                Ev::Overflow(x) => self.overflow(x),
                 Ev::Finish(x) => {
                     self.finish(x);
                     // Capacity freed: a burst held only while its pools were saturated may go.
@@ -571,6 +606,17 @@ impl Engine<'_> {
             for o in olds {
                 self.check_concluded(o);
             }
+            if self.policy.verdicts {
+                let prev = self.lanes.get(&lane).and_then(|v| v.last()).copied();
+                let book = self.books.entry(lane.clone()).or_default();
+                for s in verdict::specs(run) {
+                    book.spec(s);
+                }
+                let p = book.push(crate::verdict::Commit { id: format!("run {r}"), at: run.at, affects: verdict::affects(trace, r, prev) });
+                if let Some(slot) = self.pos.get_mut(r) {
+                    *slot = Some(p);
+                }
+            }
             self.lanes.entry(lane.clone()).or_default().push(r);
             if run.jobs.is_empty() {
                 self.conclude(r, false);
@@ -627,7 +673,7 @@ impl Engine<'_> {
             match d {
                 admit::Decision::Admit { id } => {
                     if let Some(b) = id.strip_prefix("bisect").and_then(|rest| rest.split('.').next()).and_then(|b| b.parse::<usize>().ok()) {
-                        if let Some((r, j)) = self.bisect_st.get(b).map(|st| (st.run, st.job)) {
+                        if let Some((r, j)) = self.bisect_st.get(b).map(|st| st.try_at.unwrap_or((st.run, st.job))) {
                             self.new_exec(r, j, format!("bisect{b}"), 1, Some(b));
                         }
                         continue;
@@ -688,9 +734,15 @@ impl Engine<'_> {
         }
     }
 
+    /// Whether a live demand waits on the execution, or (P3 and later) it is what answers its
+    /// lane's older commits.
+    fn wanted(&self, x: usize) -> bool {
+        self.live(x) || (self.policy.verdicts && self.answers(x))
+    }
+
     /// Whether a live demand waits on the execution, as the demand table has it (a bisection's
     /// always is).
-    fn wanted(&self, x: usize) -> bool {
+    fn live(&self, x: usize) -> bool {
         self.execs.get(x).is_some_and(|e| e.bisect.is_some()) || self.demands.wanted(&self.leg_of(x))
     }
 
@@ -698,6 +750,10 @@ impl Engine<'_> {
     /// decides it: dropped if it hasn't started, kept or run on otherwise.
     fn decide(&mut self, exec: &str) {
         let Some(x) = self.exec_of.get(exec).copied() else { return };
+        // P3 (W28-R53): what answers its lane's older commits is kept.
+        if self.policy.verdicts && self.answers(x) {
+            return;
+        }
         let left = (self.exec_st.get(x) == Some(&ExecSt::Running)).then(|| self.expected_left(x));
         if let Some(f @ Fate::Drop { .. }) = self.demands.fate(exec, left, false, self.policy.finish_within) {
             let r = self.execs.get(x).map_or(0, |e| e.run);
@@ -718,7 +774,7 @@ impl Engine<'_> {
                 Next::Reuse { .. } => {
                     if let Some(end) = end {
                         self.set_job(r, j, JobSt::Done { at: now, end, how: How::Adopted });
-                        self.record_result(r, j, end);
+                        self.record_result(r, j, end, How::Adopted);
                     }
                 }
                 Next::Execute => {
@@ -744,6 +800,43 @@ impl Engine<'_> {
                 self.check_concluded(r);
             }
         }
+    }
+
+    /// Whether `y`, kept only as what answers its lane's older commits, gives way to `x`: a live
+    /// demand of the same job on the same lane, whose result answers them too (P3).
+    fn gives_way(&self, y: usize, x: usize) -> bool {
+        let (Some(a), Some(b)) = (self.execs.get(y), self.execs.get(x)) else { return false };
+        !self.live(y) && self.lane_of(a.run) == self.lane_of(b.run) && self.job_of(a.run, a.job).map(|j| &j.key) == self.job_of(b.run, b.job).map(|j| &j.key)
+    }
+
+    /// P3 (W28-R53): a covered verdict needs a later commit's result, so the newest execution of
+    /// each job of a lane under way (its pod launching, or running) is kept when newer pushes
+    /// withdraw its demand: it answers the lane's commits before it. Dropped, a burst of pushes
+    /// each faster than a pod's start would leave every commit of the burst waiting for the next
+    /// quiet spell.
+    fn answers(&self, x: usize) -> bool {
+        let trace = self.trace;
+        let under_way = |y: usize| matches!(self.exec_st.get(y), Some(ExecSt::Launching | ExecSt::Running));
+        let Some(e) = self.execs.get(x) else { return false };
+        if e.bisect.is_some() || !under_way(x) {
+            return false;
+        }
+        let (lane, key) = (self.lane_of(e.run), self.job_of(e.run, e.job).map(|j| j.key.clone()));
+        let order = |r: usize| (trace.runs.get(r).map_or(0, |x| x.at), r);
+        !self.execs.iter().enumerate().any(|(y, o)| y != x && under_way(y) && o.bisect.is_none() && order(o.run) > order(e.run) && self.lane_of(o.run) == lane && self.job_of(o.run, o.job).map(|j| j.key.clone()) == key)
+    }
+
+    /// P3 (W28-R53): whether run `r`'s own work has begun: an execution of its own launched or
+    /// running, or a job it ran done (not a result reused or adopted). Withdrawn, such a run still
+    /// runs its jobs as they come ready, which answer its commit and cover the lane's before it.
+    fn begun(&self, r: usize) -> bool {
+        self.runs.get(r).is_some_and(|rs| {
+            rs.jobs.iter().any(|st| match st {
+                JobSt::Done { how: How::Ran, .. } => true,
+                JobSt::Attached(x) => self.execs.get(*x).is_some_and(|e| e.run == r) && matches!(self.exec_st.get(*x), Some(ExecSt::Launching | ExecSt::Running)),
+                _ => false,
+            })
+        })
     }
 
     fn start_run(&mut self, r: usize) {
@@ -903,7 +996,7 @@ impl Engine<'_> {
         if let Some((end, _)) = self.ledger.get(&key).cloned() {
             self.note(r, format!("job {j} reuses the finished result of {key}"));
             self.set_job(r, j, JobSt::Done { at: self.now, end, how: How::Reused });
-            self.record_result(r, j, end);
+            self.record_result(r, j, end, How::Reused);
             return;
         }
         // W28-R48: adopt the execution in flight, or run, as the scheduler's demand table has it.
@@ -918,6 +1011,13 @@ impl Engine<'_> {
                 }
                 None => self.set_job(r, j, JobSt::Cancelled),
             },
+            // P3 (W28-R53): a run whose own work has begun runs its jobs as they come ready,
+            // though withdrawn: they answer its commit and cover the lane's before it.
+            Ask::Drop if self.policy.verdicts && self.begun(r) => {
+                let x = self.new_exec(r, j, key, 0, None);
+                self.exec_of.insert(leg, x);
+                self.set_job(r, j, JobSt::Attached(x));
+            }
             Ask::Drop => self.set_job(r, j, JobSt::Cancelled),
             Ask::Execute => {
                 let x = self.new_exec(r, j, key, 0, None);
@@ -1061,6 +1161,10 @@ impl Engine<'_> {
                 *s = ExecSt::Launching;
             }
             self.at(self.now + delay, Ev::Launched(x));
+            // W28-R80: a pod later than the overflow's `after` may be overtaken by a machine's slot.
+            if let Some(after) = self.policy.overflow.filter(|a| delay > *a) {
+                self.at(self.now + after, Ev::Overflow(x));
+            }
         } else {
             self.begin(x);
         }
@@ -1094,7 +1198,14 @@ impl Engine<'_> {
                 .filter(|y| self.execs.get(**y).and_then(|o| self.job_of(o.run, o.job)).is_some_and(|oj| !self.on_cadence(oj)))
                 .filter_map(|y| {
                     let left = self.expected_left(*y);
-                    matches!(self.demands.fate(&self.leg_of(*y), Some(left), true, self.policy.finish_within), Some(Fate::Cancel { .. })).then_some((left, *y))
+                    // P3 (W28-R53): what answers its lane's older commits gives way only to a live
+                    // demand of the same job there.
+                    let cancel = if self.policy.verdicts && !self.live(*y) && self.answers(*y) {
+                        self.gives_way(*y, x) && left > self.policy.finish_within
+                    } else {
+                        matches!(self.demands.fate(&self.leg_of(*y), Some(left), true, self.policy.finish_within), Some(Fate::Cancel { .. }))
+                    };
+                    cancel.then_some((left, *y))
                 })
                 .collect();
             preemptible.sort_by(|a, b| b.cmp(a));
@@ -1165,6 +1276,49 @@ impl Engine<'_> {
         if self.exec_st.get(x) == Some(&ExecSt::Launching) {
             self.begin(x);
         }
+    }
+
+    /// W28-R80: a k8s job whose pod still hasn't started goes to a slot of a Linux machine (a pool
+    /// labelled `linux` with room, the least busy first), giving its quota back; with none free it
+    /// looks again in [`OVERFLOW_AGAIN_S`], until its pod starts.
+    fn overflow(&mut self, x: usize) {
+        if self.exec_st.get(x) != Some(&ExecSt::Launching) {
+            return;
+        }
+        let trace = self.trace;
+        let Some(e) = self.execs.get(x) else { return };
+        let (r, j, from) = (e.run, e.job, e.pool);
+        let req = self.job_of(r, j).and_then(|job| job.req).unwrap_or(DEFAULT_REQ);
+        let mut best: Option<(usize, u32, u32)> = None;
+        for (i, spec) in trace.pools.iter().enumerate() {
+            let (Some(slots), true) = (spec.slots, spec.labels.iter().any(|l| l == "linux")) else { continue };
+            let Some(ps) = self.pools.get(i) else { continue };
+            if ps.exclusive || ps.busy >= slots {
+                continue;
+            }
+            let better = best.is_none_or(|(_, b_busy, b_slots)| u64::from(ps.busy) * u64::from(b_slots) < u64::from(b_busy) * u64::from(slots));
+            if better {
+                best = Some((i, ps.busy, slots));
+            }
+        }
+        let Some((to, _, _)) = best else {
+            self.at(self.now + OVERFLOW_AGAIN_S, Ev::Overflow(x));
+            return;
+        };
+        if let Some(ps) = from.and_then(|p| self.pools.get_mut(p)) {
+            ps.cpu = ps.cpu.saturating_sub(req.0);
+            ps.mem = ps.mem.saturating_sub(req.1);
+            ps.pods = ps.pods.saturating_sub(1);
+        }
+        if let Some(ps) = self.pools.get_mut(to) {
+            ps.busy += 1;
+        }
+        if let Some(e) = self.execs.get_mut(x) {
+            e.pool = Some(to);
+        }
+        let name = trace.pools.get(to).map_or("", |p| p.name.as_str());
+        self.note(r, format!("execution {x}'s pod hadn't started: it runs on {name} (W28-R80)"));
+        self.begin(x);
     }
 
     fn begin(&mut self, x: usize) {
@@ -1310,7 +1464,7 @@ impl Engine<'_> {
         }
         if self.job_st(r, j) == Some(&JobSt::Attached(x)) {
             self.set_job(r, j, JobSt::Done { at: now, end, how: How::Ran });
-            self.record_result(r, j, end);
+            self.record_result(r, j, end, How::Ran);
         }
         // W28-R48: its adopters take the result over, or carry on without it, as the scheduler
         // has them: a timeout isn't theirs.
@@ -1326,83 +1480,106 @@ impl Engine<'_> {
         self.follow(nexts, Some(end));
     }
 
-    /// Keeps a job's result for its lane (P3): a new failure starts a bisection over the commits
-    /// it may have come from.
-    fn record_result(&mut self, r: usize, j: usize, end: End) {
+    /// Keeps a job's result for its lane (P3): a new failure starts a bisection over its suspects,
+    /// the commits since its base whose diffs could affect the job (W28-R52), each try where
+    /// `kiln_ci::verdict::culprit` says (W28-R56, R57); one suspect is the culprit at once.
+    fn record_result(&mut self, r: usize, j: usize, end: End, how: How) {
         if !self.policy.verdicts {
             return;
         }
-        let lane = self.lane_of(r);
-        let Some(key) = self.job_of(r, j).map(|job| job.key.clone()) else { return };
-        let step = if end.passed() { None } else { self.draw(r, j).and_then(|d| d.failed_step.clone()) };
-        let lk = (lane.clone(), key.clone());
-        let list = self.results.entry(lk.clone()).or_default();
-        let base = list.iter().filter(|(o, _, _)| *o < r).max_by_key(|(o, _, _)| *o).cloned();
-        list.push((r, end, step.clone()));
-        if end.passed() {
-            return;
-        }
-        if let Some((_, b_end, b_step)) = &base
-            && !b_end.passed()
-            && *b_step == step
-        {
-            return;
-        }
-        let from = base.map_or(0, |(o, _, _)| o + 1);
         let trace = self.trace;
-        let suspects: Vec<usize> = self
-            .lanes
-            .get(&lane)
-            .map(|v| v.iter().copied().filter(|o| *o >= from && *o < r).collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|o| trace.runs.get(*o).is_some_and(|run| run.jobs.iter().any(|oj| oj.key == key)))
-            .filter(|o| !self.results.get(&lk).is_some_and(|l| l.iter().any(|(q, _, _)| q == o)))
-            .filter(|o| !self.in_bisect.contains(&(lane.clone(), key.clone(), *o)))
-            .collect();
+        let lane = self.lane_of(r);
+        let (Some(run), Some(key), Some(p)) = (trace.runs.get(r), self.job_of(r, j).map(|job| job.key.clone()), self.pos.get(r).copied().flatten()) else { return };
+        let step = if end.passed() { None } else { self.draw(r, j).and_then(|d| d.failed_step.clone()) };
+        let check = verdict::check(run, &key);
+        let Some(book) = self.books.get_mut(&lane) else { return };
+        book.see(crate::verdict::Seen { commit: p, check: check.clone(), outcome: verdict::ended(end, step.as_deref()), how: verdict::how(how), at: self.now });
+        let Some(failure) = book.failure(&check, p) else { return };
+        let runs = self.lanes.get(&lane).cloned().unwrap_or_default();
+        let suspects: Vec<usize> = failure.suspects.iter().filter_map(|q| runs.get(*q).copied()).filter(|o| !self.in_bisect.contains(&(lane.clone(), key.clone(), *o))).collect();
         if suspects.is_empty() {
             return;
         }
-        let n = u32::try_from(suspects.len()).unwrap_or(u32::MAX);
-        let steps = u32::BITS - n.leading_zeros();
         for o in &suspects {
             self.in_bisect.insert((lane.clone(), key.clone(), *o));
         }
         let b = self.bisections.len();
-        self.note(r, format!("job {j} newly failed: bisecting {} commits in {steps} runs", suspects.len()));
-        self.bisections.push(Bisection { lane, key, suspects, done: None });
-        self.bisect_st.push(BisectSt { run: r, job: j, left: steps });
-        self.bisect_run(b);
+        let search = crate::verdict::culprit::Search::new(suspects.len(), 0.0, false);
+        self.note(r, format!("job {j} newly failed: bisecting {} commits, at most {} tries", suspects.len(), crate::verdict::culprit::bound(suspects.len())));
+        self.bisections.push(Bisection { lane, key, suspects, done: None, culprit: None, flake: false });
+        self.bisect_st.push(BisectSt { run: r, job: j, search, at: None, try_at: None });
+        self.bisect_next(b);
     }
 
-    /// A bisection's next run: at once, or under its lane's speculation window (P4, W28-R68).
-    fn bisect_run(&mut self, b: usize) {
+    /// The bisection's next try, where the planner says, or its end: the culprit named, or none.
+    fn bisect_next(&mut self, b: usize) {
+        use crate::verdict::culprit::{At, Next};
+        let trace = self.trace;
         let Some(st) = self.bisect_st.get(b) else { return };
-        let (r, j, left) = (st.run, st.job, st.left);
-        if self.policy.window.is_none() {
-            self.new_exec(r, j, format!("bisect{b}"), 1, Some(b));
-            return;
+        let (r, next) = (st.run, st.search.next());
+        let Some(bi) = self.bisections.get(b) else { return };
+        let suspects = bi.suspects.clone();
+        let key = bi.key.clone();
+        let (culprit, flake) = match next {
+            Next::Try { at } => {
+                let tried = match at {
+                    At::Suspect(k) => suspects.get(k).copied(),
+                    At::Failing => Some(r),
+                };
+                let job = tried.and_then(|t| trace.runs.get(t).and_then(|run| run.jobs.iter().position(|x| x.key == key)).map(|js| (t, js)));
+                if let Some((t, js)) = job {
+                    let tries = self.bisect_st.get(b).map_or(0, |st| st.search.tries.len());
+                    if let Some(st) = self.bisect_st.get_mut(b) {
+                        (st.at, st.try_at) = (Some(at), Some((t, js)));
+                    }
+                    // At once, or under its lane's speculation window (P4, W28-R68).
+                    if self.policy.window.is_none() {
+                        self.new_exec(t, js, format!("bisect{b}"), 1, Some(b));
+                    } else {
+                        let lane = self.bisections.get(b).map_or_else(String::new, |bi| bi.lane.clone());
+                        let id = format!("bisect{b}.{tries}");
+                        self.bisect_admit.insert(b, id.clone());
+                        let d = Demand { lane, unit: format!("bisect{b}"), order: b as u64, coalesce: None, cadence: None, speculative: true };
+                        let ds = self.admit.arrive(&id, d, false, self.now);
+                        self.admit_decisions(ds);
+                    }
+                    return;
+                }
+                (None, false)
+            }
+            Next::Culprit { suspect, .. } => (suspects.get(suspect).copied(), false),
+            Next::NoCulprit { .. } => (None, true),
+            Next::Inconclusive { .. } => (None, false),
+        };
+        let now = self.now;
+        if let Some(bi) = self.bisections.get_mut(b) {
+            bi.done = Some(now);
+            bi.culprit = culprit;
+            bi.flake = flake;
         }
-        let lane = self.bisections.get(b).map_or_else(String::new, |bi| bi.lane.clone());
-        let id = format!("bisect{b}.{left}");
-        self.bisect_admit.insert(b, id.clone());
-        let d = Demand { lane, unit: format!("bisect{b}"), order: b as u64, coalesce: None, cadence: None, speculative: true };
-        let ds = self.admit.arrive(&id, d, false, self.now);
-        self.admit_decisions(ds);
     }
 
-    /// One bisection run finished: the next, or the culprit named.
+    /// One bisection try finished: its outcome for the check (its job's draw failing the way the
+    /// failing run's did), then the next.
     fn bisect_step(&mut self, b: usize) {
-        let Some(st) = self.bisect_st.get_mut(b) else { return };
-        st.left = st.left.saturating_sub(1);
-        if st.left == 0 {
-            let now = self.now;
-            if let Some(bi) = self.bisections.get_mut(b) {
-                bi.done = Some(now);
-            }
-        } else {
-            self.bisect_run(b);
+        use crate::verdict::culprit::At;
+        let trace = self.trace;
+        let Some(st) = self.bisect_st.get(b) else { return };
+        let (r, j, at) = (st.run, st.job, st.at);
+        let Some(at) = at else { return };
+        let key = self.bisections.get(b).map(|bi| bi.key.clone()).unwrap_or_default();
+        let tried = match at {
+            At::Suspect(k) => self.bisections.get(b).and_then(|bi| bi.suspects.get(k).copied()),
+            At::Failing => Some(r),
+        };
+        let failed_as = |rr: usize, jj: usize| self.draw(rr, jj).filter(|d| !d.end.passed()).map(|d| d.failed_step.clone());
+        let how = failed_as(r, j);
+        let failed = tried.and_then(|t| trace.runs.get(t).and_then(|run| run.jobs.iter().position(|x| x.key == key)).map(|js| (t, js))).is_some_and(|(t, js)| how.is_some() && failed_as(t, js) == how);
+        if let Some(st) = self.bisect_st.get_mut(b) {
+            st.search.observe(at, failed);
+            st.at = None;
         }
+        self.bisect_next(b);
     }
 
     fn check_concluded(&mut self, r: usize) {
