@@ -20,9 +20,11 @@ use super::Fail;
 use crate::hub::Hub;
 use crate::store::Repo;
 
-/// How long a land's signing waits for the signed results of the legs that sign: a leg sends them
-/// as it ends, a moment before its job does, so the queue can see the check pass first.
-const RESULTS_WAIT: Duration = Duration::from_secs(10);
+/// How long a land's signing waits for the signed results of the legs that sign. A leg sends them
+/// at its end, after the events its conclusion comes from, so the queue can see a check pass first:
+/// a moment first, or longer on a loaded machine (10 seconds wasn't enough under a gate's load,
+/// 10-31). Bounded, for a leg whose records never come (its runner gone).
+const RESULTS_WAIT: Duration = Duration::from_secs(60);
 
 fn fail(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))

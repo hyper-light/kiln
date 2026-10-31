@@ -9095,9 +9095,10 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   - It names the batch's diffs, each at the version that landed, with the commit that carries it on
     `to` and the signed accepts that hold on it (their statements' digests, R04).
   - It names the checks run on the candidate, each with its conclusion and its legs' signed results
-    (their statements' digests, R05). A leg that signs sends those as it ends, a moment before its
-    job does, so the queue can see a check pass first: the land's signing waits for them up to 10
-    seconds, then signs with what kiln has.
+    (their statements' digests, R05). A leg that signs sends those at its end, after the events its
+    conclusion comes from, so the queue can see a check pass first (a moment first, or longer on a
+    loaded machine): the land's signing waits for them up to a minute, then signs with what kiln
+    has.
 - *Kept and read.* It's kept in `land_signatures` by the commit the trunk moved to (migration
   `w27_land_signatures`). `GET /api/repos/:repo/lands/:commit` reads it back: its trunk, head,
   candidate, base, signer, digest, when, what it says, and its envelope. A land kiln can't sign
