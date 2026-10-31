@@ -203,13 +203,56 @@ run until it's ready.
      goal saying the step it's made from (`goals_split` turns one into its acceptance criteria and
      tests), the steps that don't wait for each other side by side on subagents of the agent's own
      (docs/goals.md, "A plan's steps side by side");
-   - `review`: the same, and the goal stack pauses for a person to look at the plan first; resuming
-     it carries on;
+   - `review`: the same, and the goal stack pauses for a person to review the plan first
+     ("Reviewing a plan", below);
    - `agents`: the plan runs with an agent per step, as its graph says; the goal waits for the run
      (a part held for it, nothing sent to its agent for it).
 
 Once every step is met (or the run is done), the goal is met too, at once, with no check of its
 own: "Met with its plan: its 4 steps are met."
+
+## Reviewing a plan
+
+A plan waiting on you is read and answered where its agent is: at the top of the agent's **Plan**
+tab, beside its conversation (the tab says so with a mark, on a desktop's tray and a phone's
+tabs). Two kinds come there: a plan an agent's goal stack waits on (readied with `then: review`),
+and one it proposed in plan mode, its harness asking. Every **Review** in kiln opens it there
+(`/agents/:id?tab=plan`): Mission control's row, the card on other pages, the plan's card in the
+conversation, and the goal on its stack ("waits for your review"). A row or a card approves it at
+once too.
+
+The review says where the plan came from (the goal it was made from, or the agent proposing it),
+then its steps, a line each, those that run side by side together ("2 at once · after 2"). A step
+opens in place to what to do, when it's done and how it's tested, and what it rests on, each
+long part a few lines first and the rest on asking. **Comment on step n** starts an answer in
+your own words with the step named.
+
+However much research a plan has, the review shows a fixed few lines of it: how many findings
+and sources, how many of each grade, and the findings its steps rest on that are worth a look
+before answering, worst first: weak (graded D or F, what `plans_ready` warns of), contested
+(counterclaims weighing a quarter or more), or quoted where kiln couldn't find the words. Three
+show; the rest on asking. A step resting on no finding says so. Every finding is there on asking,
+a line each (its grade, id and claim), one opened at a time to why kiln graded it so, what's
+against it and its quotes. An open step says how many findings it rests on and how they're
+graded, and lists those worth a look, every one on asking. Under the review, the agent's research
+shows in brief.
+
+Then the answer, one of three (keys 1 to 3, then ⌘↵):
+
+| | A plan its goals wait on | A plan proposed in plan mode |
+|---|---|---|
+| **Approve** | its steps go to the agent as the goal's parts: the stack resumes | it leaves plan mode and starts (with what its harness offers to allow from now on, if you tick it) |
+| **Reject** | its steps come off the stack, the goal is skipped, the agent is told, and the stack waits, paused, until you resume it | it stops there and waits (a denial with no words) |
+| **Other…** | your words go to the agent as a part of the goal: it changes the plan and says it's ready again, and it comes back to you, whatever `then` it says | it stays in plan mode with your words (a denial with them) and proposes again |
+
+A plan that comes back after **Other…** says what changed since you looked: what you asked, and
+each step added, taken out, rewritten or changed (and in what: what to do, when it's done, what
+it rests on…), from the versions kiln keeps. Answered, the review gives way to what you answered,
+for a while. An answer being written is kept in this browser until it's sent.
+
+A plan its goals wait on is answered by a person (`plans.review`, `POST /api/plans/:id/review`),
+for the version they looked at: one that changed since, or that nothing waits on any more, is
+refused. Each answer is kept, the last with the plan (`reviewed`).
 
 ## Sharing one
 
@@ -231,9 +274,10 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | --- | --- | --- |
 | GET | `/api/plans` | every plan, newest change first; `session`: an agent's (made in its conversation), `proposed=1`: the plans agents proposed (plan mode), kept by kiln |
 | POST | `/api/plans` | `{title?, body, tags?, source?}` |
-| GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
+| GET / PATCH / DELETE | `/api/plans/:id` | one plan (with `reviewed`: the last answer to its review, `{answer, words?, version, by, at}`); `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
+| POST | `/api/plans/:id/review` | `{answer: approve \| reject \| revise, words?, version?, key?}`: a person's answer to the plan its agent's goal stack waits on, for `version` (none: as it is now); `words` with `revise`; answers `{plan, stack}`; refused (409) when nothing waits on its review or it changed since; asked again under `key` (or `Idempotency-Key`), answered as things stand (CP-T3.2) |
 | POST | `/api/plans/:id/ready` | `{then?: goals \| review \| agents, skipped?: {internal?, external?}}`: its planning phase ended (a plan made from a goal goes on as `then` says); answers `{plan, warnings, research?, say?, then?, goal?, run?, stack?}` (`research`: its research's markdown, for the agent to show) |
 | POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}`; any mode but `message` takes `only` (step numbers from 1: just those, each keeping its number, the steps they wait for outside them taken as done), and `goals` takes `split` (each step a goal stack of its acceptance criteria and tests; answers `split`: how many were) |
 | GET | `/api/plans/:id/runs` | runs, newest first |

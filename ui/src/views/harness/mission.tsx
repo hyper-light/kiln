@@ -11,6 +11,7 @@ import { Link, useNavigate } from "@/lib/router";
 import { ArrowUpRight, ChevronRight, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import { plansApi } from "@/api/plans";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -103,7 +104,8 @@ function Decide({ a, ap, to }: { a: AgentInfo; ap: ApprovalBrief; to: string }) 
         <Link to={to}>Answer</Link>
       </Button>
     );
-  // A plan it proposes is approved here; to keep it planning (with what to change), review it on its page.
+  // A plan it proposes is approved here; read, rejected or answered in your own words in its Plan tab (views/plans/review.tsx).
+  const review = ap.tool === "plan" && to === `/agents/${a.id}` ? `${to}?tab=plan` : to;
   return (
     <>
       <Button size="xs" onClick={() => decide("allow")}>
@@ -114,36 +116,42 @@ function Decide({ a, ap, to }: { a: AgentInfo; ap: ApprovalBrief; to: string }) 
           Deny
         </Button>
       )}
-      <Link to={to} className="ms-link">
+      <Link to={review} className="ms-link">
         Review
       </Link>
     </>
   );
 }
 
-/** Goals it paused for you: the plan they wait on to look at, and Resume. */
+/** Goals it paused for you: a plan they wait on approved here, or reviewed in its Plan tab (views/plans/review.tsx); else Resume. */
 function HeldDecide({ a }: { a: AgentInfo }) {
-  // Asked again (its answer lost, or it failed), the same resume under its key (CP-T3.2).
+  // Asked again (its answer lost, or it failed), the same resume (or approval) under its key (CP-T3.2).
   const [tries] = React.useState(() => new Tries(clientId));
   const resume = () =>
     void harnessApi.goalAction(a.id, "start", undefined, tries.keyFor(a.id)).then(
       () => tries.done(),
       (e: unknown) => toast.error("Couldn't resume its goals", errorMessage(e)),
     );
-  if (!a.held?.plan)
+  const plan = a.held?.plan;
+  if (!plan)
     return (
       <Button size="xs" onClick={resume}>
         Resume
       </Button>
     );
+  const approve = () =>
+    void plansApi.review(plan, { answer: "approve", key: tries.keyFor(`approve ${plan} ${a.held?.since ?? 0}`) }).then(
+      () => tries.done(),
+      (e: unknown) => toast.error("Couldn't approve its plan", errorMessage(e)),
+    );
   return (
     <>
-      <Button size="xs" asChild>
-        <Link to={`/agents/plans/${a.held.plan}`}>Review the plan</Link>
+      <Button size="xs" onClick={approve}>
+        Approve
       </Button>
-      <Button size="xs" variant="secondary" onClick={resume}>
-        Resume
-      </Button>
+      <Link to={`/agents/${a.id}?tab=plan`} className="ms-link">
+        Review
+      </Link>
     </>
   );
 }
@@ -169,10 +177,12 @@ const Row = React.memo(function Row({
   onSelect: (id: string, on: boolean) => void;
 }) {
   const navigate = useNavigate();
-  const open = () => navigate(`/agents/${a.id}`);
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
   const who = asking ?? a;
   const ap = who.approvals[0];
+  // A plan of its own waiting on your review: opened where it's reviewed, its Plan tab (a phone's row has no Review).
+  const review = stand === "needs" && !asking && (ap ? ap.tool === "plan" : Boolean(a.held?.plan));
+  const open = () => navigate(review ? `/agents/${a.id}?tab=plan` : `/agents/${a.id}`);
   // A subagent's thread straight, not by its own address: that one's redirect into its agent's chat never lands.
   const answerAt = asking ? `/agents/${a.id}?task=${encodeURIComponent(asking.id)}` : `/agents/${a.id}`;
   const actions = useAgentActions(a);
