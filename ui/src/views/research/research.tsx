@@ -304,17 +304,29 @@ function ResearchCardLoaded({ id }: { id: string }) {
   );
 }
 
-/** The research agent `agent` did, newest first: the newest in full, the rest in brief. None, nothing. */
-export function AgentResearch({ agent }: { agent: string }) {
+/**
+ * The research agent `agent` did, newest first: the newest in full, the rest in brief. None, nothing.
+ * `brief`: a plan under review above has the newest's digest already (views/plans/review.tsx), so
+ * here it's in brief too, every finding on asking.
+ */
+export function AgentResearch({ agent, brief }: { agent: string; brief?: boolean }) {
+  const [open, setOpen] = React.useState(false);
   const all = useSuspenseResource(`research/of/${agent}`, (s) => researchApi.list({ agent }, s), { pollMs: 5000 }).data.research;
   const newest = all[0];
   if (!newest) return null;
+  const full = !brief || open;
   return (
     <Fold id="research" title="Its research" count={all.length > 1 ? all.length : undefined}>
       <div className="rs-list">
         <div className="rs-card">
-          <ResearchView r={newest} live={newest.summary.checking > 0} />
-          <ResearchLinks r={newest} />
+          {full ? <ResearchView r={newest} live={newest.summary.checking > 0} /> : <ResearchBrief r={newest} live={newest.summary.checking > 0} />}
+          <ResearchLinks r={newest}>
+            {brief && (
+              <button type="button" className="rs-link" aria-expanded={open} onClick={() => setOpen(!open)}>
+                {open ? "Less" : "Each finding, its grade and sources"}
+              </button>
+            )}
+          </ResearchLinks>
         </div>
         {all.slice(1).map((r) => (
           <div key={r.id} className="rs-card">
