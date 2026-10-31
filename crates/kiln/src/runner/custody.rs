@@ -400,7 +400,7 @@ pub fn word_for_me(session: &str, json: &str, signs: bool, root: &[u8], machine:
     let checked = match word {
         None if !signs => return Ok(()),
         None => Err("it isn't signed: kiln signs every word it says of a hand-over".to_owned()),
-        Some(w) => addressed(session, &v, w, root, machine, instance, epoch),
+        Some(w) => addressed(session, &v, w, root, machine, instance, epoch, crate::util::now_unix()),
     };
     if let Err(why) = &checked {
         refused_word(session, word, why);
@@ -408,10 +408,14 @@ pub fn word_for_me(session: &str, json: &str, signs: bool, root: &[u8], machine:
     checked
 }
 
-fn addressed(session: &str, v: &Value, word: &str, root: &[u8], machine: &str, instance: &str, epoch: Option<u64>) -> Result<(), String> {
+/// Whether `word`, the signature beside hand-over's word `v` about session `session`, makes it this
+/// process's as of `at` ([`word_for_me`]'s check; the transfers simulation, `crate::sim::transfers`,
+/// runs it too). Why not, when it doesn't.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn addressed(session: &str, v: &Value, word: &str, root: &[u8], machine: &str, instance: &str, epoch: Option<u64>, at: i64) -> Result<(), String> {
     use kiln_ci::identity::chain::{Actor, Identity};
     let bundle: Value = serde_json::from_str(word).map_err(|e| format!("its signature can't be read: {e}"))?;
-    let c = statement::verify(&bundle, root, &[], crate::util::now_unix()).map_err(|e| e.to_string())?;
+    let c = statement::verify(&bundle, root, &[], at).map_err(|e| e.to_string())?;
     // kiln's server alone signs words, under kiln's root.
     let server = if Identity::parse(&c.custodian).is_ok_and(|i| matches!(i.actor, Actor::Server)) { c.custodian.clone() } else { String::new() };
     kiln_ci::identity::custody::addressed(&c, &server, session, crate::custody::unworded(v).as_bytes(), machine, instance, epoch).map(|_| ()).map_err(|e| e.to_string())

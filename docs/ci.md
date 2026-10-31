@@ -9278,8 +9278,19 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `w27_r08_change_hands` (D1 given by kim, taken by sam, commandeered by lee: two transfers, each
   with both sides; sam's version pushed afterwards, and his abandon, refused and recorded with the
   transfer) and `w27_r08_review_passed_on` (passed on and taken, the request moves with both sides;
-  passed on again and never taken, it stays). Nightly:
-  `.kiln/custody-lab.yaml`.
+  passed on again and never taken, it stays). Simulation (the Transfers plan's step 9, W27-AC05):
+  `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
+  moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
+  acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under
+  kiln-sim's nemesis, through the server's act check, its signed words and the runner's check of
+  them, and the custody chain's hop and walk: over its 200 seeds, no act of a copy left behind
+  applied, no word applied by a process it isn't for, one holder per epoch, every transfer with both
+  sides, and once the world calms every holder runs its session and no copy left behind does),
+  `w27_ac05_the_transfers_model_finds_each_planted_bug` (an act check by machine, a word passed on
+  applied unchecked, a resume that keeps the epoch it leaves, a release only on the copy's own
+  announcement, no addressee check: each found by a seed that passes without it) and
+  `w27_ac05_a_transfers_seed_replays_exactly`. Nightly: `.kiln/custody-lab.yaml`, and the transfers
+  model's 20,000 seeds in `.kiln/sim.yaml`.
 - *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
   the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
   registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
@@ -9289,8 +9300,8 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
   handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
   (its signed act verified), not yet a hand-on its runner signs; approvals carried over a
-  rebase-only revision (step 7's last part, on the signing plan's signed verdicts); promotions,
-  replant, artifacts, machines and intermediaries (steps 8 to 16).
+  rebase-only revision (step 7's last part, on the signing plan's signed verdicts); promotions and
+  replant (step 8); artifacts, machines and intermediaries (steps 11 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

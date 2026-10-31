@@ -239,12 +239,18 @@ fn server_signed_as(pki: &crate::pki::Pki, payload_type: &str, s: &statement::St
 /// it and whom it's for (`kiln_ci::identity::custody::Word`) beside it, as `word`. A runner from
 /// before reads the command alone. What's signed is the command as [`unworded`] writes it.
 pub fn word(pki: &crate::pki::Pki, session: &str, command: &str, machine: &str, instance: &str, epoch: u64) -> anyhow::Result<String> {
+    word_signed(&|payload_type, s| server_signed_as(pki, payload_type, s), session, command, machine, instance, epoch)
+}
+
+/// [`word`], signed by `sign` (kiln's server's key: a payload type and a statement to its bundle),
+/// as the transfers simulation (`crate::sim::transfers`) signs one with its own server's.
+pub fn word_signed(sign: &dyn Fn(&str, &statement::Statement) -> anyhow::Result<Value>, session: &str, command: &str, machine: &str, instance: &str, epoch: u64) -> anyhow::Result<String> {
     use sha2::Digest as _;
     let mut v: Value = serde_json::from_str(command)?;
     let digest: String = sha2::Sha256::digest(unworded(&v).as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
     let body = serde_json::to_value(custody::Word { v: statement::VERSION, by: String::new(), session: session.to_owned(), machine: machine.to_owned(), instance: instance.to_owned(), epoch })?;
     let subject = statement::Subject { name: format!("a hand-over's word about session {session}"), digest: BTreeMap::from([("sha256".to_owned(), digest)]), ..statement::Subject::default() };
-    let bundle = server_signed_as(pki, custody::PAYLOAD_WORD, &statement::Statement { subject: vec![subject], ..statement::Statement::new(body) })?;
+    let bundle = sign(custody::PAYLOAD_WORD, &statement::Statement { subject: vec![subject], ..statement::Statement::new(body) })?;
     if let Some(o) = v.as_object_mut() {
         o.insert("word".into(), Value::String(bundle.to_string()));
     }
@@ -311,30 +317,36 @@ pub async fn act_counts(hub: &crate::hub::Hub, machine: &str, instance: &str, si
     };
     let what = without(ask, "act");
     let revocations = crate::identities::revocations(&hub.store).await?;
-    let checked = match statement::verify(&act, &hub.pki.ca_der, &revocations, at) {
+    match act_check(&act, &hub.pki.ca_der, &revocations, &held, what.as_bytes(), at) {
+        Ok(()) => Ok(Ok(())),
+        Err((signer, why)) => {
+            refuse(&hub.store, record(signer.clone(), epoch_of(&signer), why.clone(), Some(&act))).await?;
+            Ok(Err(why))
+        }
+    }
+}
+
+/// The server's check of a signed act (`act`, a bundle) of agent session `held.session` (docs/ci.md
+/// W27-R08): signed under kiln's root (`root`) by an identity not revoked as of `at`
+/// (`revocations`), and the act of its holder now ([`custody::acted`], as of `what`: the ask it
+/// was signed beside, without it). [`act_counts`] runs it, and so does the transfers simulation
+/// (`crate::sim::transfers`). Who signed it (revocations aside) and why not, when it doesn't count.
+pub fn act_check(act: &Value, root: &[u8], revocations: &[Revocation], held: &custody::Held, what: &[u8], at: i64) -> Result<(), (String, String)> {
+    let checked = match statement::verify(act, root, revocations, at) {
         Ok(c) => c,
         Err(e) => {
             // Its signer's identity revoked: a copy left behind signs at the epoch it left, which
             // kiln revoked as the session went on. Who signed it, revocations aside, and why the
             // fence says it doesn't count.
-            let signed = statement::verify(&act, &hub.pki.ca_der, &[], at).ok();
-            let why = match signed.as_ref().map(|c| custody::acted(c, &held, what.as_bytes())) {
+            let signed = statement::verify(act, root, &[], at).ok();
+            let why = match signed.as_ref().map(|c| custody::acted(c, held, what)) {
                 Some(Err(fenced @ custody::Unacted::Fenced(_))) => fenced.to_string(),
-                _ => format!("session {session}'s act isn't signed as its holder now: {e}"),
+                _ => format!("session {}'s act isn't signed as its holder now: {e}", held.session),
             };
-            let signer = signed.map(|c| c.custodian).unwrap_or_default();
-            refuse(&hub.store, record(signer.clone(), epoch_of(&signer), why.clone(), Some(&act))).await?;
-            return Ok(Err(why));
+            return Err((signed.map(|c| c.custodian).unwrap_or_default(), why));
         }
     };
-    match custody::acted(&checked, &held, what.as_bytes()) {
-        Ok(_) => Ok(Ok(())),
-        Err(e) => {
-            let why = e.to_string();
-            refuse(&hub.store, record(checked.custodian.clone(), epoch_of(&checked.custodian), why.clone(), Some(&act))).await?;
-            Ok(Err(why))
-        }
-    }
+    custody::acted(&checked, held, what).map(|_| ()).map_err(|e| (checked.custodian.clone(), e.to_string()))
 }
 
 /// Act `ask` of agent session `session`, from runner process `instance` of `machine`, refused
@@ -853,6 +865,17 @@ async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
     store.call(move |c| Ok(c.query_row("SELECT 1 FROM custody WHERE digest = ?1", [&d], |_| Ok(())).optional()?.is_some())).await
 }
 
+/// Whether hand-on `b` (a custody record's body) hands an agent session on to `issued`, the identity
+/// kiln certifies it at at `epoch` ([`transfer`]; the transfers simulation, `crate::sim::transfers`,
+/// checks one so too). Why not, when it doesn't.
+pub fn hands_on_to(b: &custody::Body, issued: &str, epoch: u64) -> Result<(), String> {
+    if !b.kind.gives() || b.epoch != Some(epoch) || !b.to.as_deref().is_some_and(|to| custody::names(to, issued)) {
+        let to = b.to.as_deref().unwrap_or("no one");
+        return Err(format!("its hand-on ({}) is to {to} at epoch {}, not to {issued}", kind_name(b.kind), b.epoch.map_or_else(|| "none".to_owned(), |e| e.to_string())));
+    }
+    Ok(())
+}
+
 /// A hand-over's records, taken as the session's process at its new epoch `epoch` asks for its
 /// certificate (docs/ci.md W27-R08; the Transfers plan's step 3), at `at`: the hand-on its
 /// package carried (`hand_on`, a bundle as JSON), then its receipt, signed with the key being
@@ -871,9 +894,8 @@ pub async fn transfer(store: &Store, root: &[u8], org: &str, came_from: &str, is
     };
     // Kept, so checked when kiln took it: read again, revocations aside.
     let b = statement::verify(&given, root, &[], at).map_err(|e| anyhow::anyhow!("{e}")).and_then(|c| custody::body(&c).map_err(|e| anyhow::anyhow!("{e}")))?;
-    if !b.kind.gives() || b.epoch != Some(epoch) || !b.to.as_deref().is_some_and(|to| custody::names(to, issued)) {
-        let to = b.to.as_deref().unwrap_or("no one");
-        return Ok(Err(format!("its hand-on ({}) is to {to} at epoch {}, not to {issued}", kind_name(b.kind), b.epoch.map_or_else(|| "none".to_owned(), |e| e.to_string()))));
+    if let Err(why) = hands_on_to(&b, issued, epoch) {
+        return Ok(Err(why));
     }
     let Some(r) = receipt else { return Ok(Err("no receipt came with its hand-on".into())) };
     let b64 = base64::engine::general_purpose::STANDARD;
