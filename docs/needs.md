@@ -170,7 +170,7 @@ its tokens.
 | | The engine guarantees | Checked by |
 | --- | --- | --- |
 | G1 | No runner's grants exceed its budget in a dimension that can't overcommit, or budget × overcommit in one that can | an assertion after every input; the simulator |
-| G2 | An attempt runs under at most one grant, and what a stale attempt writes (status, results, events, logs, artifacts, a deployment's apply) is refused | fencing (§8); the simulator, with partitions |
+| G2 | An attempt runs under at most one grant, and what a stale attempt writes (status, results, events, logs, artifacts, a deployment's apply) is refused | fencing (§8); the scheduler model (docs/sim.md), a million seeds; W05-AC16, live |
 | G3 | A whole or quiet grant shares its runner with nothing else kiln placed; a resource's holders never exceed its count; a rate is never overdrawn | assertion; simulator |
 | G4 | Nothing starts before its `after` conditions hold; a gang starts whole or not at all | assertion; simulator |
 | G5 | Concurrency groups' and quotas' limits hold | W05-AC01; simulator |
@@ -178,7 +178,7 @@ its tokens.
 | G7 | Under saturation, each tenant gets its weighted share of dominant-resource time within 10 % over any 10-minute window, whatever the order work arrived in and whatever its shape | W05-AC04, grown: staggered arrivals, mixed shapes |
 | G8 | Every waiting item has exactly one reason, a place and an estimate; every grant, refusal and preemption says why | W05-AC10; a property test |
 | G9 | Decisions are a pure function of the inputs: replayed on any node, of any architecture, the same commands come out | replay on x86-64 and arm64 |
-| G10 | A grant is in the store before anything acts on it; through any failover nothing granted is lost or granted twice | W05-AC09, grown; simulator |
+| G10 | A grant is in the store before anything acts on it; through any failover nothing granted is lost or granted twice | W05-AC09, grown to running legs; the scheduler model (docs/sim.md), a million seeds |
 
 ## 5. How it decides
 
@@ -294,28 +294,50 @@ above its floor. An item is preempted at most twice, never in its first minute, 
 
 ## 8. Grants, leases and fencing
 
-1. The engine commits a grant to the store, with its epoch, the attempt and an expiry, before
-   anything acts on it: to the cluster group, so a quorum's disks have it, batched within 5 ms
-   (W05-R05; today each assignment is a transaction of its own on one disk).
-2. It sends `Assign`, carrying the epoch and expiry. The runner admits it (§6) and answers
-   `Accepted` or `Rejected`; a rejected grant is withdrawn in the store as in the engine, so a restart
-   doesn't find it running.
-3. The runner renews all its grants with its heartbeat. A runner whose connection is lost is
-   reported to the engine itself (`RunnerLost`, whatever it held), and one that's draining is too
-   (`RunnerDraining`). A grant not renewed by its expiry is lost; after a lock-delay the engine queues
-   the item's next attempt.
-4. **Fencing.** Every write an attempt makes (its status, results, events, logs, artifacts, a
-   deployment's apply, what a claim guards) carries its attempt and the engine's epoch, and the
-   store refuses an older one. The tokens a grant hands out (its upload token, `GITHUB_TOKEN`, its
-   ID tokens) name its attempt and die with the grant, ended or lost. A runner that can't renew stops
-   a grant at its expiry, by its own monotonic clock, when the item's kind says `on_lease_loss: stop`
-   (deployments, whole and quiet holds); a `finish` item (a CI leg) runs to its end, and what it
-   writes is refused once another attempt has started.
-5. **Failover.** The engine's epoch is the cluster group's term. When the group elects a new leader,
-   its engine rebuilds from the group's rows (the queue, grants, reservations and fair-share state:
-   under 2 s at 10,000 items, W05-AC09) and reconciles what runners announce (`Hello.running`):
-   grants the rows hold are adopted; the rest are stopped, and what they send is refused by its
-   attempt.
+As E3 built it (docs/ci.md W05-R05, R25, R34 to R37 and W10-R03), and as docs/sim.md's scheduler
+model checks it, G2 and G10 at every step over a million seeds:
+
+1. **The grant.** The engine makes each grant with a fence: the epoch it's made in (the cluster
+   group's term, or one past the last epoch taken if that's greater, so every start and every new
+   leader raises it), then its number among that epoch's grants. A later grant's fence is greater,
+   and no two share one, not even an attempt granted again after a refusal, which keeps its
+   attempt: so a grant is named by its fence, not by its attempt and epoch. The dispatcher writes
+   the grant to the store (its runner, attempt and fence, on the leg and on the attempt) before
+   anything acts on it (G10); one it couldn't write sends no `Assign`, and its leg goes back to its
+   queue. Each grant is a transaction of its own on one disk; written to the cluster group's quorum,
+   batched within 5 ms, it is E9's (W05-R05).
+2. **The lease.** `Assign` carries the grant, its lease (`[sched] lease`, 60 s by default, at least
+   3 s) and what its runner does once it loses it (`on_lease_loss`: `finish`, a CI leg's, or
+   `stop`). The runner admits it (§6) or refuses it naming the grant (`Refused`), and a refused
+   grant ends in the store as in the engine. The runner renews what it holds three times a lease,
+   at most every 10 s (`Renew`, each grant by its fence); the server answers with those that aren't
+   its own any more (`Renewed`) and tells it once to stop each (`Stop`). A grant not renewed by its
+   expiry is lost (`Lost`), as is every grant of a runner lost (its connection gone past its grace,
+   no process of it left) and of a machine's runner process gone; a draining runner takes no new
+   grant and keeps its own. A `stop` item's next attempt waits a lock-delay (15 s) past the lost
+   grant's expiry.
+3. **Fencing, one rule.** What a runner writes about an item (its steps, events, result, refusals,
+   and its output, on a lane of its own) is taken only under the item's live grant, that runner's.
+   From the grant's loss on, what it writes is refused, counted, and its runner told once to stop
+   that grant: nothing it writes after the next attempt starts is taken. The tokens the grant hands
+   out (its runtime token, for uploads and ID tokens; its `GITHUB_TOKEN`) are taken by the same
+   rule, one lookup in memory, and die with the grant, ended or lost. What kiln can't take back
+   lives out its own TTL: an ID token minted while the grant was live, and a registry token a job
+   token was exchanged for. A runner from before leases is fenced by runner: what it writes about a
+   leg is taken while the leg is its own.
+4. **Self-fencing.** The runner keeps each grant's lease by its own clock, which counts sleep
+   (Linux `CLOCK_BOOTTIME`, macOS's continuous time, Windows' interrupt time): from when it sent the
+   last `Renew` naming it that the server answered, less a tenth (Chubby's local lease). Checking
+   every half second, it kills a `stop` item whose lease ended (no cancel's grace, nothing more of
+   it run); a `finish` item runs to its end, its writes refused. A runner that is itself paused
+   stops nothing: the guarantee is fencing's (G2).
+5. **Failover.** A start takes the next epoch and rebuilds from the store (W05-AC09: 10,000 queued
+   legs in about 1.2 s, 10,000 running in about 0.5 s). Each grant the store has running comes back
+   as it was made, with a lease from then; each queued item comes back at the attempt the store has,
+   and a `stop` item queued at a later attempt waits a whole lease and the lock-delay first, since
+   the store doesn't keep when its retry was due. A runner back says what it runs (`Hello.running`)
+   and renews what it holds: the grants the store has are adopted; anything else it's told to stop,
+   and what it sends under it is refused.
 
 ## 9. Where it runs: inside p2p's kiln
 
@@ -704,7 +726,7 @@ at once; A1 only measures.
 | --- | --- | --- |
 | E1 (built) | The ground: integer amounts, no decision on hash-map order, the replay test, the reference engine, the kiln-sim model's skeleton | the same inputs give the same commands on x86-64 and arm64; the reference and real engines agree on 10,000 random small cases |
 | E2 (built) | Fair share that holds: classes with floors and promotion, W05-R09's aging within a tenant, the tenant tree, dominant-share costs | G7 with staggered arrivals and mixed shapes; W05-AC03 within a tenant; a `background` item under a steady stream of `batch` starts within its bound |
-| E3 | Grants as fenced leases end to end: epoch and expiry, renewal, runners' loss and draining told to the engine, self-fencing, the store refusing stale writes, tokens that die with their grant, reconciling after failover | G2 and G10 in the simulator under the nemesis, a million seeds; live, a runner cut off past its lease: nothing it writes after the next attempt starts is taken, and its tokens no longer work |
+| E3 (built) | Grants as fenced leases end to end: epoch and expiry, renewal, runners' loss and draining told to the engine, self-fencing, the store refusing stale writes, tokens that die with their grant, reconciling after failover | G2 and G10 in the simulator under the nemesis, a million seeds; live, a runner cut off past its lease: nothing it writes after the next attempt starts is taken, and its tokens no longer work |
 | E4 | Reservations and gangs | G6: a 12-CPU item among a stream of 1-CPU ones starts by its bound; a gang of 3 never half-starts |
 | E5 | Every kind on the engine: commands and sessions held, slices for local work, budgets, rooms measured, heavy units from Headroom | an agent's command with no room is queued, not refused; CI legs, commands and sessions on one runner never exceed its budget together (G1) |
 | E6 | Estimates and keys: requests from history, the same work once, places and estimates in answers | a second gate for the same tree runs nothing; estimates within 25 % at p50 over a day's work |
@@ -747,3 +769,56 @@ tenant's own work. Building it changed three of its rules, each for a test it fa
 
 Its limits are named in W05-AC14: small items refilling the room a big one needs (1-GiB legs
 against 8-GiB ones where memory runs out first) are E4's, measured at a third rather than half.
+
+**E3 is built** (branch `needs-engine`, 2026-10-30; docs/ci.md W05-R34 to R37 and W05-AC16,
+W05-R05, R25 and W10-R03 amended; §8 says how it works). Grants are fenced leases end to end: the
+engine makes each with a fence and a lease, the epoch the store group's term, raised by every start
+(E3.1, E3.7); leases go on the wire, the runner renewing what it holds and naming a leg's grant in
+what it sends (E3.2); the server refuses what a grant writes from its loss on, and its tokens die
+with it (E3.3, E3.4); the runner keeps its own leases by a clock that counts sleep, and kills a
+`stop` item at its lease's end (E3.5, E3.9); every runner's loss and drain reach the engine, by the
+process that held what (E3.6); and a restart rebuilds the grants it finds running and reconciles
+what runners hold (E3.7). What it measured:
+
+- **G2 and G10 over a million seeds:** docs/sim.md's scheduler model, with the server crashing,
+  runners paused past their lease and asleep, and frames lost, doubled and late, holds both at every
+  step and settles every leg, seeds 0 to 999,999 in release: 0 failed. On the way it found three
+  bugs (docs/sim.md's 11 to 13). Four planted ones are each caught within the 200 seeds `cargo test`
+  runs.
+- **Live (W05-AC16):** `w05_ac16_a_runner_cut_off_past_its_lease_writes_nothing_after_the_next_attempt_starts`
+  and `w05_ac16_a_stop_grant_cut_off_stops_itself` (`crates/kiln/tests/leases.rs`), on Linux and
+  macOS: a runner paused past a 5 s lease has nothing it writes taken once the next attempt starts
+  on another, its tokens refused; a `stop` item's process is gone 315 to 335 ms after its runner's
+  lease end.
+- **W05-AC09, grown to running legs:** 10,000 running legs rebuilt through a restart, each as the
+  grant it ran under and none granted again, in 516 to 550 ms.
+- **W05-AC08 against E2:** E3's bench (its grants leased, 60 s) and E2's at 17710407e, run by
+  turns on one Mac beside its other work, 160 rounds each, three runs a round: 46,946 assignments/s
+  at the median against E2's 47,494, 1.2% fewer (a bootstrap's 95% interval: 4.0% fewer to 1.8%
+  more). Each build's runs spread from about 41,500 to 52,000 between their quartiles, so a few
+  rounds can show a gap of 6% either way; E3 retires 1.6% more instructions.
+- **The gate:** `ci/gate.sh` through `kiln run --needs cpus=12,mem=40g,linux/amd64`, at E3.9's
+  commit with these docs: clippy for Linux, Windows and macOS with `-D warnings`, and `cargo test
+  --workspace`, 3,147 tests passed in 110 binaries, 0 failed, 34 ignored. `GATE: PASS`.
+
+Building it changed five of its rules, each for a test or a seed it failed:
+
+- **A grant is named by its fence, not by its attempt and epoch:** a refused grant keeps its
+  attempt (W05-R02), so a refusal that came late could have released the leg's next grant of the
+  same attempt.
+- **A runner keeps a lease end per grant, not per connection:** a reconnect's hello renews nothing
+  granted before it.
+- **Renewals follow the lease** (three times a lease, at most every 10 s), not the heartbeat's
+  10 s, which held a lease to 20 s at least: the live test's 5 s lease is renewed every 1.7 s.
+- **A `stop` item past its lease is killed, not cancelled:** GitHub's cancel gave its step up to
+  10 s more to act.
+- **A restart keeps a queued leg's attempt, and a `stop` item's wait** (docs/sim.md's bugs 11 and
+  13): the store held the attempt, the engine began each leg at its first; and a lock-delay kept in
+  memory went with the process.
+
+Its limits: grants aren't batched within 5 ms (W05-R05), nor written to the cluster group's quorum
+(E9's). An ID token minted while its grant was live, and a registry token a job token was exchanged
+for, live out their TTL. A leg in a microVM is stopped as a cancel stops it. A runner refuses a
+`Stop` naming a grant of an older epoch than it has seen, though a newer server sent it: such a
+`finish` leg runs to its end, its writes refused, and a `stop` one still ends at its lease's end. A
+restart forgets a leg's retry backoff, which the store doesn't keep.

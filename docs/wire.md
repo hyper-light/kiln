@@ -376,6 +376,29 @@ takes a new bit, never one that means something already, even in the other direc
 
 Bits from 39 are free. Take the next one, and add its row here in the same change.
 
+## Grants on the wire
+
+A runner and a server that both announce `CAP_LEASES` (bit 38) treat each CI leg as a grant
+(ci.md W05-R34, docs/needs.md §8), and name the grant in everything about the leg:
+
+- **The grant** (`proto::Grant`): its leg, its attempt, and its fence: the epoch it was made in,
+  then `n`, its number among that epoch's grants. `AssignV2` carries it (`fence`, `lease_ms`,
+  `on_lease_loss`); `Stop` and `Refused` name one; `Renew` names each the runner holds, and
+  `Renewed` the ones of those that aren't the runner's any more.
+- **What the runner sends about a leg it holds a grant for**: its steps, events and result go whole
+  inside `Fenced`, named by the grant; its output goes on a lane of its own, `fenced-logs` (lane
+  10), as `FencedLog` frames (the grant, the step's index, the bytes), bulk as `logs`' frames are.
+  The server tells fenced output from a `LogChunk` by its lane. What's kept to send again after a
+  reconnect goes so too, to whichever server that is.
+- **The server** takes what a grant sends only while it's the leg's live grant, that runner's
+  (W05-R36), and the grant's tokens only then (W10-R03); the rest it refuses, counts
+  (`kiln_ci_refused_writes_total`), and tells the runner once to `Stop` that grant. A runner
+  without `CAP_LEASES` is fenced by runner: what it sends about a leg is taken while the leg is
+  its own.
+- **Epochs**: a runner doesn't apply an `AssignV2` or a `Stop` whose grant's epoch is older than
+  the newest it has seen (it answers `StaleEpoch`), and doesn't take a `Renewed` from one
+  (W05-R37).
+
 ## The lab
 
 `tests/wire_lab.rs` puts it all together. It runs a server and three runners, with kiln's real net
@@ -475,7 +498,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
 | `WorkState` | state | What the runner holds warm: each lane's workspaces and how long its legs took there, for placement (ci.md W24-R18). Each supersedes the last. | New: with its samples once it changed, and every 10 minutes, to a server announcing `CAP_WORK`. |
 | `AgentLimit` | state | The most agent sessions the machine has at work at once, and where that comes from: set from the server, its config, or kiln's default (agents.md, "How many agents a machine runs"). Each supersedes the last. | New: as it's welcomed and whenever it changes, to a server announcing `CAP_AGENT_LIMIT`. |
-| `Renew` | telemetry | The grants the runner holds, each named by its leg, attempt and fence (ci.md W05-R34): every leg it runs, or whose result the server hasn't said it has. Each lives a lease from when the server takes this; the next stands in for a lost one. | New: as it's welcomed and every 10 s in place of `Heartbeat`, to a server announcing `CAP_LEASES`; answered by `Renewed`. |
+| `Renew` | telemetry | The grants the runner holds, each named by its leg, attempt and fence (ci.md W05-R34): every leg it runs, or whose result the server hasn't said it has. Each lives a lease from when the server takes this; the next stands in for a lost one. | New: as it's welcomed and three times a lease, at most every 10 s (the lease its grants and `Renewed` say), in place of `Heartbeat`, to a server announcing `CAP_LEASES`; answered by `Renewed`. |
 | `Refused` | answer | `Reject` naming the grant it refuses (W05-R34): a refusal that comes late, after the leg was granted again, refuses nothing. | New: to a server announcing `CAP_LEASES`. |
 | `Fenced` | stream | What the runner sends about a leg it holds a grant for (its steps, events and result), carried whole and named by its grant (W05-R34), so what a grant that isn't the leg's sends is told from what its grant sends. | New: to a server announcing `CAP_LEASES`, kept and sent again after a reconnect as what it carries is. |
 
@@ -506,7 +529,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessHistory` | ask | Answered by `HarnessHistory`. | As its class says. |
 | `Sync` | carried (repo sync's Raft) | Repo sync. | As its class says. |
 | `FrontDoor` | state | The front door's settings and certificate. | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent on connect and change. |
-| `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
+| `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. To a runner announcing `CAP_LEASES`, with its grant (ci.md W05-R34) in JSON fields an older runner doesn't read: `fence` (`epoch`, `n`), `lease_ms`, `on_lease_loss` (`finish`, a CI leg's, or `stop`). | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
 | `SecretsFor` | command, parked | A running leg's secrets. A leg still running when its runner is back needs them. | Fire-and-forget. |
 | `JobTerminalOpen` | command, refused while away | A terminal into a leg. | On the channel ("Commands"): answered once applied; refused at once while away. |
 | `KeepRelease` | command, parked | A kept leg may be cleaned up. | On the channel ("Commands"): answered once applied. |

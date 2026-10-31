@@ -1662,13 +1662,15 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
   ascending). Assigning on new capacity looks only at the signatures that runner is eligible for;
   queuing a leg looks only at that signature's eligible runners. Both are O(log n).
-- **W05-R05 Durability.** The dispatcher records an assignment in SQLite (batched transactions,
-  flushed at most every 5 ms) before it sends `Assign`, so a crash never runs a leg twice
-  unknowingly; runners re-announce running legs on reconnect (today's `Hello.running`), which
-  re-adopts them. The record is the grant (W05-R34): its runner, its attempt and its fence, on the
-  leg and on the attempt; a restart takes each running leg's grant back with its fence. A grant
-  that couldn't be written sends no `Assign`: it ends, and the leg goes back to its queue, the
-  same attempt, 15 s later, kept off no runner.
+- **W05-R05 Durability** (docs/needs.md §8, G10). The dispatcher records each grant in SQLite
+  before it sends `Assign`, so a crash never runs a leg twice unknowingly. The record is the grant
+  (W05-R34): its runner, its attempt and its fence (the epoch it was made in, then its number), on
+  the leg and on the attempt. `Assign` carries the fence, the grant's lease (`lease_ms`) and what
+  its runner does once it loses it (`on_lease_loss`). Each grant is a transaction of its own:
+  batching them, flushed at most every 5 ms, isn't built. A grant that couldn't be written sends
+  no `Assign`: it ends, and the leg goes back to its queue, the same attempt, 15 s later, kept off
+  no runner. Runners say what they run when they reconnect (`Hello.running`) and renew what they
+  hold, and a restart takes each running leg's grant back with its fence (W05-R25).
 
 **Requirements: concurrency, priorities, fairness**
 
@@ -1857,6 +1859,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
     the grant, once), and what it sends under it is refused (W05-R36). A runner from before
     leases is reconciled by leg, as before. A grant nobody renews is lost at its lease's end:
     there's no other grace for a runner that doesn't come back.
+  - A leg the store has queued comes back at the attempt the store has, so an attempt that ended
+    is never granted again (docs/sim.md's bug 11). One that stops on losing its lease, queued at a
+    later attempt, waits a whole lease and the lock-delay first (W05-R34): the store doesn't keep
+    when its retry was due, and that wait runs past the end of any lease from before the restart
+    (docs/sim.md's bug 13).
 - **W05-R26 Speed.** The targets of §1.5: ready → `Assign` p99 < 50 ms with capacity, ≥ 2,000
   assignments per second, 10,000 queued legs, 1,000 runners.
 - **W05-R27 Pools.** The scheduler asks W13's pool manager to scale up when the legs waiting for a
@@ -1914,10 +1921,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   is greater, and no two grants share one, not even an attempt granted again after a refusal
   (W05-R02 keeps the attempt). A grant expires a lease after it's made (`[sched] lease`, 60 s by
   default, at least 3 s) unless its runner renews it, three times a lease and at most every 10 s,
-  for a lease from then: a runner
-  that says `CAP_LEASES` (docs/wire.md) names each grant it holds by its fence (`Renew`), and is
-  answered with those that aren't its own any more (`Renewed`); an older runner's heartbeat names
-  the legs it runs, each renewed by the fence of the grant it was sent. A lease runner's leg comes
+  for a lease from then: a runner that says `CAP_LEASES` (docs/wire.md) names each grant it holds
+  by its fence (`Renew`), and is answered with those that aren't its own any more (`Renewed`); an
+  older runner's heartbeat names the legs it runs, each renewed by the fence of the grant it was
+  sent. A lease runner's leg comes
   with its grant (`AssignV2`'s `fence`, `lease_ms`, `on_lease_loss`), and what the runner sends
   about the leg names it: its steps, events and result (`Fenced`), a refusal (`Refused`), its
   output (the `fenced-logs` lane); the server stops one by its grant (`Stop`). A grant
@@ -1926,9 +1933,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `runner-lost`, "its lease ran out", and is retried as W05-R16 says. An item that stops on losing
   its lease (`on_lease_loss: stop`; a CI leg runs to its end) waits `[sched] lock_delay` (15 s by
   default) past its grant's expiry, or its runner's loss if that's later, before its retry is
-  queued: its runner has stopped it by then. A refusal naming a grant that isn't the leg's now, a
-  renewal naming one that isn't that runner's, and the end of an attempt the leg isn't at change
-  nothing.
+  queued: its runner has stopped it by then (after a restart, W05-R25). A refusal naming a grant
+  that isn't the leg's now, a renewal naming one that isn't that runner's, and the end of an
+  attempt the leg isn't at change nothing.
 - **W05-R35 Runners lost and draining** (docs/needs.md §8, E3.1, E3.6). A runner lost, whatever it
   held, leaves the fleet until it's back, and each grant it held is lost, said so (`Lost`). A
   draining runner takes no new grant, its grants run to their end, and its capacity leaves the
@@ -1954,7 +1961,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   recorded only while that grant is the leg's, running, so one that races a new grant changes
   nothing. A refused write is taken as a frame (not sent again), counted
   (`kiln_ci_refused_writes_total`), said once a grant, and its runner told once to stop that grant
-  (`Stop`).
+  (`Stop`). The grant's tokens hold to the same rule: taken only while it's the leg's live grant
+  (W10-R03).
 - **W05-R37 A runner keeps its own leases** (docs/needs.md §8, E3.5). A lease runner sends `Renew`
   in place of its heartbeat, three times a lease (as its grants and the server's answers say it)
   and at most every 10 s, and keeps each grant's lease end by its own clock: from
@@ -3467,7 +3475,8 @@ elsewhere (G-24, G-33).
     no grant and is taken as before.
   - An ID token minted while its grant was live lives out its own TTL (5 minutes by default, an hour
     at most, W10-R08): clouds check it offline against the issuer's keys, so kiln can't take it
-    back.
+    back. So does a registry token a job token was exchanged for (W12's `/v2/token`, 5 minutes):
+    it's signed, not looked up.
 - **W10-R04 Job permissions.** A job token carries the job's resolved `permissions` (W04-R06) and
   kiln's additions (`permissions: { binaries: publish, environments: deploy, registry: push }`).
   The facade (W14), the registry (W12), the API and runtime services check it.
