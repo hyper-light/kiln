@@ -35,6 +35,7 @@ import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleShip } from "./ship.ts";
+import { handleDeploys, setDeploysEmit } from "./deploys.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -500,6 +501,7 @@ function emit(ev: ServerEvent) {
 }
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
+setDeploysEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
@@ -1500,6 +1502,8 @@ const server = http.createServer(async (req, res) => {
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
+    // Ship's Deploys, and the CD routes its panes read for its apps (W26-R24), before the rest of CD's.
+    if (await handleDeploys(req, res, url, { json })) return;
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

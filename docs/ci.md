@@ -8646,6 +8646,17 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     any commit; stop; follow git again; promote, abort, approve and deny a rollout; auto-sync and
     auto-rollback), as that operation's route would let the caller, and audited in the request's
     one row.
+  - Ship's tabs are Commits and Deploys: the runs' list and the apps' list are gone from it (/runs
+    lands on Ship, /deployments on Deploys; a run's and an app's pages keep their addresses). Deploys
+    draws them as Ada's approved stills do (v5, v6): apps as Ship's rows by project, the stand word,
+    the edge, the pips, no buttons; an opened app the jobs pane's anatomy. Its strip has Sync (what's
+    picked of what differs), Refresh (asking Refresh or Hard refresh), Roll back and Stop; Promote and
+    Abort while a rollout runs; a setting's change when one is picked. Roll back, Stop and Abort ask
+    again. Under it are its objects by owner, its rollout, its history and its settings. The picked
+    one's detail is beside them, or under its line on a phone with the strip again: an object's Logs
+    (the commits' Output, its LogViewer following CD's log), Events and Manifest, or its Diff; a
+    commit, where it sits among the deploys and what syncing it would change against what runs
+    (`cd.plans.get`). Flat, every height held.
 - **W26-R25 Roll back to any commit.** A deploy can go back to any commit of its app's sources, not
   only one it deployed: rendered with that source at the commit and the others at their heads,
   synced as a rollback, recorded as a deployment, and held there until trunk changes what the app
@@ -8725,6 +8736,15 @@ repository):
   `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
   `w26_r22_freeze_is_appended_after_every_older_variant`; contain
   `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC19 The Deploys tab.** In Chromium and WebKit, at a desktop's width and a phone's: Ship's tabs
+  are Commits and Deploys, /runs landing on Ship and /deployments on Deploys; the apps by project,
+  needs-you first, with no buttons; an opened app as approved (the strip, its objects by owner, its
+  rollout, history and settings, the picked one's detail beside them or under its line with the strip
+  again); each action reaching `POST /api/ship/deploys` with its body (Sync with what's picked of
+  what differs, Refresh and Hard refresh, Roll back to a deploy or any commit, Stop, Promote, Abort,
+  a setting), Refresh, Roll back, Stop and Abort asking again and Keep sending nothing, a refusal's
+  why in the strip; no layout shift through picking, acting and CD's events; nothing sideways at
+  320, 390 and 1280. *`ui/e2e/ship-deploys.spec.ts`; `ui/e2e/ship-routes.spec.ts`; every Ship e2e.*
 - **W26-AC18 Deploys in Ship.** On a server with KilnCD, apps of two repositories list under them
   as CD holds each (sync, health, auto-sync, environment), and an app's pane has its settings and
   its source's commits; each verb reaches its operation: done and audited as a maintainer's, the

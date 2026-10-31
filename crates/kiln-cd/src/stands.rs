@@ -197,6 +197,17 @@ fn first_line(s: &str) -> String {
     if l.chars().count() > 90 { format!("{}…", l.chars().take(89).collect::<String>()) } else { l.to_owned() }
 }
 
+/// How a deploy failed, as its line says it: its message where that says so itself (`failed its
+/// health check`), else `failed: …`, else `failed`.
+fn failed(message: &str) -> String {
+    let why = first_line(message);
+    match why.as_str() {
+        "" => "failed".to_owned(),
+        w if w.starts_with("failed") => w.to_owned(),
+        w => format!("failed: {w}"),
+    }
+}
+
 /// How long, in the fewest words: `40s`, `3m`, `12h`, `6d`.
 pub fn span(ms: u64) -> String {
     let s = ms / 1000;
@@ -262,7 +273,14 @@ pub fn standing(a: &App<'_>, now_ms: u64) -> Standing {
         let n = latest.map(|d| format!("#{}", d.id())).unwrap_or_else(|| r.revision.as_deref().map(short).unwrap_or_default());
         let back = r.back_to.map(|b| format!(" · #{b} runs")).unwrap_or_default();
         if let State::Paused { why } = &r.rollout.state {
-            return out(Stand::NeedsYou, "Needs you", format!("{n} is {}{back}", first_line(why)), pips(Glyph::Requested, Glyph::None, Glyph::None, None));
+            // What it waits for, in a person's words: an approval, a promote, else the rollout's own.
+            let waits = match (r.rollout.plan.steps.get(r.rollout.step), r.rollout.held) {
+                (_, true) => "is paused: Resume lets it go on".to_owned(),
+                (Some(Step::Approve), _) => "waits for your approval".to_owned(),
+                (Some(Step::Pause { ms: None }), _) => "waits for you to promote it".to_owned(),
+                _ => format!("waits for you: {}", first_line(why)),
+            };
+            return out(Stand::NeedsYou, "Needs you", format!("{n} {waits}{back}"), pips(Glyph::Requested, Glyph::None, Glyph::None, None));
         }
         let steps = r.rollout.plan.steps.len();
         let at = (r.rollout.step + 1).min(steps.max(1));
@@ -274,8 +292,7 @@ pub fn standing(a: &App<'_>, now_ms: u64) -> Standing {
         let cause = all.iter().rev().find(|d| !d.succeeded() && d.sync.trigger != "rollback" && (pin.to == 0 || d.id() > pin.to));
         let (line, p) = match cause {
             Some(c) => {
-                let why = first_line(&c.last().message);
-                let line = if why.is_empty() { format!("#{} failed · back on {target}", c.id()) } else { format!("#{} failed: {why} · back on {target}", c.id()) };
+                let line = format!("#{} {} · back on {target}", c.id(), failed(&c.last().message));
                 (line, pips(if c.sync.succeeded { Glyph::Passed } else { Glyph::Failed }, if c.sync.succeeded { Glyph::Failed } else { Glyph::None }, Glyph::None, None))
             }
             None => (format!("back on {target} · held there until git changes it"), latest_pips()),
@@ -287,8 +304,7 @@ pub fn standing(a: &App<'_>, now_ms: u64) -> Standing {
     }
     if let Some(l) = latest.filter(|d| !d.succeeded()) {
         let word = if l.sync.succeeded { "Failed its checks" } else { "Sync failed" };
-        let why = first_line(&l.last().message);
-        let mut line = if why.is_empty() { format!("#{} failed", l.id()) } else { format!("#{} failed: {why}", l.id()) };
+        let mut line = format!("#{} {}", l.id(), failed(&l.last().message));
         if let Some(c) = current {
             line = format!("{line} · #{} runs", c.id());
         }
@@ -998,7 +1014,7 @@ mod tests {
         let mut a = app(&h);
         a.pin = Some(&pin);
         let s = standing(&a, NOW);
-        assert_eq!((s.stand, s.word.as_str(), s.line.as_str()), (Stand::RolledBack, "Rolled back", "#2 failed: failed its health check · back on #1"));
+        assert_eq!((s.stand, s.word.as_str(), s.line.as_str()), (Stand::RolledBack, "Rolled back", "#2 failed its health check · back on #1"));
         assert_eq!(glyphs(&s), [Glyph::Passed, Glyph::Failed, Glyph::None]);
         assert_eq!(s.by.as_deref(), Some("auto-rollback"));
         // Rolled back by a person to a commit none ran: held there.
@@ -1015,7 +1031,7 @@ mod tests {
         let mut a = app(&h);
         a.rollout = Some(&waiting);
         let s = standing(&a, NOW);
-        assert_eq!((s.stand, s.word.as_str(), s.line.as_str()), (Stand::NeedsYou, "Needs you", "#3 is waiting for approval · #2 runs"));
+        assert_eq!((s.stand, s.word.as_str(), s.line.as_str()), (Stand::NeedsYou, "Needs you", "#3 waits for your approval · #2 runs"));
         assert_eq!(glyphs(&s), [Glyph::Requested, Glyph::None, Glyph::None]);
         let going = record(vec![Step::Weight { weight: 20 }, Step::Checks { names: vec!["errors".into()], against: crate::rollout::Against::Production, parallel: false }, Step::Weight { weight: 50 }, Step::Weight { weight: 100 }], State::Running, 1, 20);
         a.rollout = Some(&going);

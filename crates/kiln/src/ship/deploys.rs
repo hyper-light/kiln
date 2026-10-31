@@ -393,7 +393,7 @@ pub(crate) fn pane_json(f: &Facts, o: &Opened, now_ms: u64) -> Value {
     ];
     json!({
         "app": row_json(f, &s),
-        "about": { "cluster": f.cluster, "namespace": f.namespace, "objects": f.objects, "source": f.source },
+        "about": { "cluster": f.cluster, "namespace": f.namespace, "objects": f.objects, "source": f.source, "repo": f.own.as_ref().map(|(_, r, _)| r) },
         "groups": groups,
         "tree": { "live": o.live, "errors": o.errors },
         "rollout": rollout,
@@ -720,9 +720,9 @@ mod tests {
             [
                 row("kiln-production", "needs_you", "Out of sync", "#153 runs 2222222 · trunk is 2 ahead · healthy"),
                 row("kube-prometheus-stack-production", "shipped", "Synced", "chart 92.2.0 · healthy"),
-                row("quiver-production", "needs_you", "Needs you", "#39 is waiting for approval · #38 runs"),
+                row("quiver-production", "needs_you", "Needs you", "#39 waits for your approval · #38 runs"),
                 row("quiver-staging", "shipping", "Syncing", "syncing 3333333"),
-                row("site-production", "rolled_back", "Rolled back", "#19 failed: failed its health check · back on #18"),
+                row("site-production", "rolled_back", "Rolled back", "#19 failed its health check · back on #18"),
             ]
         );
         let kiln = at(&v, "/projects/0/apps/0");
@@ -790,7 +790,7 @@ mod tests {
         };
         let v = pane_json(&kiln, &o, NOW);
         assert_eq!(at(&v, "/app/word"), &json!("Out of sync"));
-        assert_eq!(at(&v, "/about"), &json!({ "cluster": "in-cluster", "namespace": "kiln-production", "objects": 22, "source": "deploy/helm/kiln @ main" }));
+        assert_eq!(at(&v, "/about"), &json!({ "cluster": "in-cluster", "namespace": "kiln-production", "objects": 22, "source": "deploy/helm/kiln @ main", "repo": "https://example/hyper-light/kiln" }));
         let groups: Vec<(String, String)> = at(&v, "/groups").as_array().into_iter().flatten().map(|g| (at(g, "/name").as_str().unwrap_or_default().to_owned(), at(g, "/note").as_str().unwrap_or_default().to_owned())).collect();
         assert_eq!(groups, [("Deployment kiln".to_owned(), "1/1 ready".to_owned()), ("Config".to_owned(), "1 differs from git".to_owned())]);
         assert_eq!(at(&v, "/groups/0/items/0/key"), &json!("~Pod~kiln~kiln-cd9dc7b7-rsmwz"));
@@ -1046,7 +1046,7 @@ mod tests {
                 [
                     (json!("kiln-production"), json!("needs_you"), json!("Out of sync"), json!(format!("#1 runs {} · trunk is 1 ahead · healthy", short(&k1)))),
                     (json!("kiln-staging"), json!("shipped"), json!("Synced"), json!(format!("#1 runs {} · healthy", short(&k2)))),
-                    (json!("quiver-canary"), json!("needs_you"), json!("Needs you"), json!("#2 is waiting for approval · #1 runs")),
+                    (json!("quiver-canary"), json!("needs_you"), json!("Needs you"), json!("#2 waits for your approval · #1 runs")),
                     (json!("quiver-production"), json!("rolled_back"), json!("Rolled back"), json!("back on #1 · held there until git changes it")),
                 ]
             );

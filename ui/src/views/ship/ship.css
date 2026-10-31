@@ -917,3 +917,221 @@
   margin: 0 0 8px;
   overflow-wrap: anywhere;
 }
+
+/* Ship's Deploys (docs/ci.md W26-R24, Ada's approved stills of 2026-10-30, v5 and v6): apps as Ship's
+   rows by project, each project's heading saying what it needs; an opened app the jobs pane's
+   anatomy. Flat: no box around any of it, hairlines between; every height held. */
+.dp-proj {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 4px 6px;
+  color: #e4e5e7;
+  font-size: 12.5px;
+  list-style: none;
+}
+.dp-proj span:last-child {
+  color: #8b8e96;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.dp-proj span[data-needs] {
+  color: #e2cfae;
+}
+/* No buttons on a row: its track is held, so its columns line up with the commits'. */
+.dp-row .ship-acts {
+  visibility: hidden;
+}
+.dp-open {
+  padding: 6px 4px 14px 16px;
+}
+.dp-slot {
+  min-height: 640px;
+}
+.dp .ship-sech__ctl {
+  min-width: 0;
+  overflow: hidden;
+  color: #8b8e96;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dp-verbs {
+  grid-template-columns: repeat(4, 80px);
+}
+/* What answers an ask spans as it says (Refresh's two side by side). */
+.dp-verbs button[data-go] {
+  grid-column: auto;
+}
+.dp-verbs button[data-go="ask"] {
+  border-color: #e2cfae;
+  background: #e2cfae;
+  color: #171107;
+}
+.jp-say[data-tone="ask"] .jp-said {
+  color: #e2b9bd;
+}
+.jp-q[data-off] {
+  opacity: 0.35;
+}
+.jp-q button:disabled {
+  cursor: default;
+}
+/* The list and the picked one's detail at one height, each scrolling inside itself. */
+.dp-body {
+  height: 556px;
+}
+.dp .jp-list {
+  height: 100%;
+  overflow: auto;
+}
+.dp-side {
+  height: 100%;
+  overflow: auto;
+}
+.jp-j .n em {
+  margin-right: 6px;
+  color: #8b8e96;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.jp-j .n s {
+  margin-right: 6px;
+  color: #a6c4ed;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  text-decoration: none;
+}
+.jp-j[data-dim] {
+  color: #6d7078;
+}
+.jp-j[data-dim] .n s {
+  color: #6f86a6;
+}
+/* A workload's head picks the workload: the group's words, a line of its own. */
+.jp-g.dp-head {
+  padding: 0;
+}
+.dp-head .jp-line {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  padding: 9px 8px 4px;
+}
+.jp-g[data-sel] {
+  background: rgb(205 198 234 / 0.1);
+}
+.jp-g[data-at] {
+  box-shadow: inset 2px 0 0 #cdc6ea;
+}
+/* The picked object's detail: the commits' Output's frame, its views where its streams were. */
+.dp-w {
+  display: inline-flex;
+  gap: 10px;
+  margin-left: auto;
+  color: #6d7078;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.dp-w button {
+  all: unset;
+  cursor: pointer;
+}
+.dp-w button[aria-pressed="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.dp-w button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.dp-op {
+  box-sizing: border-box;
+  height: 500px;
+  margin: 0;
+  overflow: auto;
+  padding: 8px 4px 8px 12px;
+  background: #08090a;
+  color: #c9cbd1;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.18;
+  white-space: pre;
+}
+.dp-op i {
+  color: #6d7078;
+  font-style: normal;
+}
+.dp-op .rm {
+  color: #e2b9bd;
+}
+.dp-op .ad {
+  color: #bfdccf;
+}
+.dp-op .wn {
+  color: #e2cfae;
+}
+/* A commit, a rollout or a setting picked: what it is, flat. */
+.jp-cm {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding: 10px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+}
+.jp-cm h4 {
+  margin: 0;
+  color: #97999f;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.jp-cm .dim {
+  color: #8b8e96;
+}
+.jp-cm ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.jp-cm .row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+@media (max-width: 700px) {
+  .dp-open {
+    padding: 6px 0 14px;
+  }
+  .dp .ship-sech {
+    padding-left: 8px;
+  }
+  .dp .ship-sech__ctl {
+    display: none;
+  }
+  .dp-verbs {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .dp-body {
+    height: auto;
+  }
+  .dp .jp-list {
+    height: auto;
+    overflow: visible;
+  }
+  .dp-op {
+    height: 230px;
+  }
+}
