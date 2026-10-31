@@ -263,12 +263,20 @@ server says, and counts every session it has, ended ones included, until it's up
   opened in place with the same controls. The agent is picked as its page switches one: by a model
   of another harness the machine runs, each listed under its name (one that hasn't listed its
   models yet, as "Default"; a machine that hasn't listed a harness's models takes another
-  machine's list). The box is the agent page's composer, the field and its bar. Under it, More
+  machine's list). Its permissions and effort go along as the page's switch carries them (the
+  same latitude, never wider; the effort as near as the model takes): the composer keeps them as
+  chosen last, with the harness they were chosen in, so a switch back finds them as they were, and
+  a mode that skips every check goes along only as confirmed for this start. The box is the agent
+  page's composer, the field and its bar. Under it, More
   options opens to one row each: the machine, the folder, how many, its name, its workspace, where
   its commands run, a shell to run in and the machine's past sessions to continue (closed, it says
   what isn't as it starts out). Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
   soon as its first snapshot is in (a moment at most), one view transition carrying each part of
-  the composer to its place on the page. Several stay on Mission control: the line under the box
+  the composer to its place on the page. That snapshot names its settings as the composer did,
+  before its harness says anything (it may wait for room on its machine, then take seconds to
+  start): its permissions, model, effort and speed, by its harness's lists as the machine knows
+  them; what the harness says once it runs takes their place, as it does when a switch starts
+  another. Several stay on Mission control: the line under the box
   says what started, and they come into the list. Files go with the first message, sent once the
   agent can take it. Everything else that started agents (Duplicate, a message's "Start new agent
   on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
