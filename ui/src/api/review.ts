@@ -531,6 +531,42 @@ export const conflictsApi = {
 
 export const conflictsRes = (key: string): Res<Conflicts> => ({ key: `review/conflicts/${key}`, fetch: (s) => conflictsApi.list(key, s), opts: { on: ["conflict", "diff_version", "diff"] } });
 
+/** A verdict carried to a rebase-only version, as kiln signs it (docs/ci.md W27-R08): from the version it was given on to the one it reached, the shared verbatim patch-id, each one's base, kiln's record of it, and its words ("carried from v2: rebase only, …"). */
+export interface VerdictCarried {
+  from: number;
+  to: number;
+  patch_id?: string;
+  base_from?: string;
+  base_to?: string;
+  record?: string;
+  said?: string;
+  error?: string;
+}
+
+/** Where a verdict's signature stands on a change's latest version (W27-R04): given there, carried there, not, or unsigned. */
+export interface VerdictStanding {
+  id: string;
+  reviewer: string;
+  version: number;
+  action: string;
+  standing: "given" | "carried" | "not" | "unsigned";
+  why?: string | null;
+  signer?: string | null;
+  carried?: VerdictCarried;
+}
+
+export interface Verdicts {
+  diff: string;
+  latest: number;
+  verdicts: VerdictStanding[];
+}
+
+export const verdictsRes = (key: string): Res<Verdicts> => ({
+  key: `review/verdicts/${key}`,
+  fetch: (s) => request<Verdicts>("GET", `/api/diffs/${enc(key)}/verdicts`, undefined, { signal: s }),
+  opts: { on: ["review", "diff_version"] },
+});
+
 /** The threads of a change, with the gate as it stands for the caller approving (W26-R11). */
 export interface Comments {
   threads: Thread[];

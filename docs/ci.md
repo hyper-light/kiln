@@ -203,7 +203,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08, but for an approval carried across a rebase-only revision; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
 
 ---
 
@@ -9286,7 +9286,14 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   (`…/reviewers/take`), and stays the first reviewer's until then. A person's side without a key is
   kiln's for them, as for work; an agent taker's receipt is asked of its runner. Once a change has
   changed hands, what its former author does as its author (a version pushed, an abandon, a give) is
-  refused, saying who its author is now, and recorded with the transfer that superseded them.
+  refused, saying who its author is now, and recorded with the transfer that superseded them. An
+  approval carried to a rebase-only version (the signing plan's `holds_on`: the same verbatim
+  patch-id) is a transfer kiln signs as it reads the verdicts: its hand-on for the version the
+  approval was given on and its receipt for the one it reached, each naming its version's commit
+  and base, about the verdict (its statement's digest) and the patch-id
+  (`custody::carry`). `GET /api/diffs/:id/verdicts` says so ("carried from v2: rebase only, patch-id
+  9f3c41a…, base a1b2c3d to c3d4e5f") and names the record, and Ship's review shows it under
+  Approve.
 - *Promotions and the replant* (step 8): a deploy promoted from an environment of this server's
   (its `after` passed there, or `promote_from` named it) is a transfer signed by CD for each
   environment (`deploy::promotion`, docs/deploy-api.md §9.2): CD's hand-on for the one it leaves as
@@ -9346,7 +9353,11 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   passed on again and never taken, it stays); `deploy::flow::tests::w27_r08_promotion` (web 1.2.0
   at digest A, ten minutes in staging, promoted to production: CD's hand-on for staging and receipt
   for production, one transfer walking unbroken, both naming A; then 1.2.0 at digest B refused as a
-  promotion and recorded with both digests) and, in a release build, `w27_r08_replant` (box-a
+  promotion and recorded with both digests); `w27_ac04_approval_carried` (Kim's signed approval of
+  v2 carried to v5 across two rewords and a rebase: kiln's carry walks unbroken from v5 back to v2,
+  saying so, and her verdict still hers; v6, a code change, and v7, whitespace only, carry it to
+  neither, saying why) and, in the UI, `e2e/ship-carried.spec.ts` (the carried line under Approve,
+  in Chromium and WebKit at desktop and phone widths); and, in a release build, `w27_r08_replant` (box-a
   upgraded blue/green with two sessions: its job lists the runner role, from the process replaced to
   its new build, and both sessions, each a verified transfer, nothing without one). Simulation (the
   Transfers plan's step 9, W27-AC05):
@@ -9370,8 +9381,7 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   person signs on their device only through the CLI until the browser has a key of its own (the
   signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
   handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
-  (its signed act verified), not yet a hand-on its runner signs; approvals carried over a
-  rebase-only revision (step 7's last part, on the signing plan's signed verdicts); a promotion
+  (its signed act verified), not yet a hand-on its runner signs; a promotion
   from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'
   syncs, which take no `after`; Ship's journey listing a replant's transfers beside its runners
   (its job does); artifacts, machines and intermediaries (steps 11 to 16).

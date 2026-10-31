@@ -278,19 +278,51 @@ pub async fn list(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
         .await
         .map_err(fail)?;
     let latest = versions.last().map_or(0, |v| v.n);
-    let out: Vec<Value> = rows
-        .into_iter()
-        .map(|(review, reviewer, version, action, body, at, signer, taken_at, digest)| {
-            let (standing, why) = match holding.get(&review) {
-                None => ("unsigned", None),
-                Some(Holds::Given) => ("given", None),
-                Some(Holds::Carried { .. }) => ("carried", None),
-                Some(Holds::Not(why)) => ("not", Some(why.clone())),
-            };
-            json!({ "id": review, "reviewer": reviewer, "version": version, "action": action, "body": body, "at": at, "signer": signer, "digest": digest, "taken_at": taken_at, "on": latest, "standing": standing, "why": why })
-        })
-        .collect();
+    let mut patch: Option<Option<String>> = None;
+    let mut out: Vec<Value> = Vec::new();
+    for (review, reviewer, version, action, body, at, signer, taken_at, digest) in rows {
+        let (standing, why) = match holding.get(&review) {
+            None => ("unsigned", None),
+            Some(Holds::Given) => ("given", None),
+            Some(Holds::Carried { .. }) => ("carried", None),
+            Some(Holds::Not(why)) => ("not", Some(why.clone())),
+        };
+        let mut v = json!({ "id": review, "reviewer": reviewer, "version": version, "action": action, "body": body, "at": at, "signer": signer, "digest": digest, "taken_at": taken_at, "on": latest, "standing": standing, "why": why });
+        // Carried to a rebase-only version: a transfer kiln signs, saying so (docs/ci.md W27-R08).
+        if let (Some(Holds::Carried { from }), Some(digest)) = (holding.get(&review), digest.as_deref()) {
+            if patch.is_none() {
+                let (_, path) = super::diffs::home(hub, d).await?;
+                patch = Some(match versions.last() {
+                    Some(l) => verbatim(hub, &path, &l.commit).await,
+                    None => None,
+                });
+            }
+            let carried = carried(hub, d, versions.as_slice(), *from, digest, patch.clone().flatten().as_deref()).await;
+            if let Some(o) = v.as_object_mut() {
+                o.insert("carried".into(), carried);
+            }
+        }
+        out.push(v);
+    }
     Ok(json!({ "diff": d.name, "latest": latest, "verdicts": out }))
+}
+
+/// A verdict (by its statement's `digest`) given on version `from` of `d`, carried to its latest,
+/// a rebase-only version with the same verbatim patch-id `patch_id`, as kiln signs it: a transfer
+/// from the version it was given on to the one it reached (`crate::custody::carry`). What the
+/// verdicts say of it: the versions, the patch-id, each one's base, the receipt, and the words.
+async fn carried(hub: &Hub, d: &Diff, versions: &[Version], from: u32, digest: &str, patch_id: Option<&str>) -> Value {
+    let (Some(f), Some(t), Some(p)) = (versions.iter().find(|v| v.n == from), versions.last(), patch_id) else { return Value::Null };
+    let (given, reached) = (crate::custody::Side { n: f.n, commit: &f.commit, base: &f.base }, crate::custody::Side { n: t.n, commit: &t.commit, base: &t.base });
+    let name = format!("{} {}", d.repo, d.name);
+    match crate::custody::carry(hub, &name, digest, &given, &reached, p).await {
+        Ok(Ok((record, said))) => json!({ "from": from, "to": t.n, "patch_id": p, "base_from": f.base, "base_to": t.base, "record": record, "said": said }),
+        Ok(Err(why)) => json!({ "from": from, "to": t.n, "error": why }),
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", diff = %d.name, error = %format!("{e:#}"), "an approval's carry wasn't signed");
+            json!({ "from": from, "to": t.n, "error": format!("{e:#}") })
+        }
+    }
 }
 
 /// Where each signed verdict on `d` stands on its latest version, by its review's id: each

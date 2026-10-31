@@ -1138,6 +1138,48 @@ pub async fn head_named(store: &Store, name: &str) -> anyhow::Result<Option<Stri
         .await
 }
 
+/// One side of an approval carried across a rebase-only version ([`carry`]): the version, its
+/// commit and the base it's on.
+pub struct Side<'a> {
+    pub n: u32,
+    pub commit: &'a str,
+    pub base: &'a str,
+}
+
+/// An approval carried across a rebase-only version, as a transfer (docs/ci.md W27-R08, with
+/// W27-R04; the Transfers plan's step 7): verdict `verdict` (its statement's digest), given on
+/// version `from` of `diff` (`acme/review D1`), holds on `to`, a later one with the same verbatim
+/// patch-id `patch_id`. kiln's server hands it on for the version it was given on and receives it
+/// for the one it reached, each record naming its version's commit and base (`component`), and
+/// why: "carried from v2: rebase only, patch-id 9f3c41a…, base a1b2c3d to c3d4e5f". Both are kept;
+/// what comes back is the receipt's digest and that why. Its bodies are what the versions say, no
+/// time of their own, so carrying it again (the verdicts read again) gives the same records, kept
+/// once.
+pub async fn carry(hub: &crate::hub::Hub, diff: &str, verdict: &str, from: &Side<'_>, to: &Side<'_>, patch_id: &str) -> anyhow::Result<Result<(String, String), String>> {
+    let short = |s: &str| s.get(..7).unwrap_or(s).to_owned();
+    let why = format!("carried from v{}: rebase only, patch-id {}…, base {} to {}", from.n, short(patch_id), short(from.base), short(to.base));
+    let hex = verdict.strip_prefix("sha256:").unwrap_or(verdict);
+    let things = vec![
+        statement::Subject { name: format!("verdict {} on {diff}", short(hex)), digest: BTreeMap::from([("sha256".to_owned(), hex.to_owned())]), ..statement::Subject::default() },
+        statement::Subject { name: format!("{diff}'s patch"), digest: BTreeMap::from([(kiln_ci::identity::verdict::PATCH_ID.to_owned(), patch_id.to_owned())]), ..statement::Subject::default() },
+    ];
+    let (org, at) = (hub.pki.organization(), crate::util::now_unix());
+    let (server, came_from) = (server_uri(&org), format!("kiln's review of {diff}"));
+    let version = |v: &Side<'_>| format!("v{} at {} on base {}", v.n, short(v.commit), short(v.base));
+    let b = custody::Body { to: Some(server.clone()), component: Some(version(from)), why: why.clone(), ..custody::Body::new(Kind::HandedOn, "") };
+    let hand_on = server_signed(&hub.pki, &statement::Statement { subject: things.clone(), ..statement::Statement::new(custody::to_value(&b)) })?;
+    let handed = match take(&hub.store, &hub.pki.ca_der, &org, &hand_on, &came_from, at).await? {
+        Ok(t) => t.digest,
+        Err(why) => return Ok(Err(format!("its hand-on wasn't kept: {why}"))),
+    };
+    let b = custody::Body { from: Some(server), component: Some(version(to)), why: why.clone(), ..custody::Body::new(Kind::Received, "") };
+    let receipt = server_signed(&hub.pki, &statement::Statement { subject: things, follows: vec![handed], ..statement::Statement::new(custody::to_value(&b)) })?;
+    Ok(match take(&hub.store, &hub.pki.ca_der, &org, &receipt, &came_from, at).await? {
+        Ok(t) => Ok((t.digest, why)),
+        Err(why) => Err(format!("its receipt wasn't kept: {why}")),
+    })
+}
+
 /// What a runner's blue/green upgrade on `machine`, under way since `since` (unix seconds), handed
 /// on, as a replant's record of it lists them (docs/ci.md W27-R08; the Transfers plan's step 8):
 /// the machine's runner role, from the process it replaced to its new build, and each of

@@ -916,6 +916,18 @@ interface MockConflict {
   resolution: { take: string; lines: string[] | null; by: string | null; at: number | null } | null;
 }
 
+/**
+ * Where each verdict's signature stands on a diff's latest version (W27-R04). D41's: lee's
+ * approval, given on v1 and carried to v2, a rebase-only version, as kiln signs the carry (W27-R08).
+ */
+function verdictsOf(d: MockDiff) {
+  if (d.name !== "D41" || d.versions < 2) return [];
+  const [from, to] = [sha("main-1"), sha("main-2")];
+  const said = `carried from v1: rebase only, patch-id 9f3c41a…, base ${from.slice(0, 7)} to ${to.slice(0, 7)}`;
+  const carried = { from: 1, to: d.versions, patch_id: "9f3c41a2".repeat(5), base_from: from, base_to: to, record: `sha256:${"c".repeat(64)}`, said };
+  return [{ id: "r41", reviewer: "user:lee", version: 1, action: "accept", standing: "carried", why: null, signer: "kiln://hyper-light/person/lee", on: d.versions, carried }];
+}
+
 /** D41's conflicts with main when a test turns them on (`POST /api/mock/review/conflicts`). */
 const conflictState = { on: false };
 const takenResolutions = new Map<string, { take: string; lines: string[] | null; by: string; at: number }>();
@@ -1165,6 +1177,7 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
       true
     );
   }
+  if (c === "verdicts" && m === "GET") return (ctx.json(res, 200, { diff: d.name, latest: d.versions, verdicts: verdictsOf(d) }), true);
   if (c === "comments" && m === "GET") return (ctx.json(res, 200, { threads: threadsOf(d), gate: gateOf(d) }), true);
   if (c === "comments" && m === "POST") {
     const body = await ctx.body<{ body?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number }>(req);

@@ -12,7 +12,8 @@ reaching a process it isn't for.
 
 **Where it stands (2026-10-30, when written):**
 - **Merged:** no. It's the local branch `w27-custody`, built on the signing plan's `w27-sign`
-  (merged in at aa163ed7f3), which lands first. Landing, pushing and deploying wait for Ada's word.
+  (merged in at aa163ed7f3) and its signed verdicts (532d8a031a, from `w27-verdicts`), which land
+  first. Landing, pushing and deploying wait for Ada's word.
 - **Deployed:** no.
 - **Checked:**
   - clippy for kiln with all targets, clean;
@@ -34,6 +35,7 @@ reaching a process it isn't for.
 - Words addressed to one process. The server signs the process each word is for, and any other
   process refuses it.
 - Work, changes, review requests and promotions handed on, and the replant's runner role.
+- An approval carried to a rebase-only version, signed by kiln as a transfer and shown in Ship.
 - The simulation (`sim::transfers`): no stale act is ever applied, and each of five planted bugs is
   found.
 
@@ -73,7 +75,5 @@ reaching a process it isn't for.
 
 ## Open
 
-- An approval carried across a rebase-only revision (step 7's last part). It waits on the signing
-  plan's signed verdicts, 532d8a031a on `w27-verdicts`.
 - Steps 11–16: artifacts, machines and intermediaries. They start once Ada has seen plan v7.
 - A session's `Open` at a later epoch isn't signed itself (docs/reach.md, "Not yet").

@@ -98,6 +98,11 @@ submit again. Only the diffs that changed get new versions.
   over authorship. Each of these hand-overs is signed by both sides (docs/ci.md W27-R08), kiln
   signing for a side that isn't there or has no key, and a former author's acts as its author
   afterwards are refused.
+- **Approvals carried**: a signed approval holds on a later version that only rebased or reworded
+  the diff (the same verbatim patch-id), and kiln signs that carry as a transfer from the version
+  it was given on to the one it reached. The verdicts (`GET /api/diffs/:id/verdicts`) and Ship's
+  review say so: "kim's approval carried from v2: rebase only, patch-id 9f3c41a…, base a1b2c3d to
+  c3d4e5f". A code change, whitespace included, carries no approval.
 - Reviews and comments are drafted privately and published together, like a review in other tools.
 
 ### Conflicts in the diff (W26-R12)

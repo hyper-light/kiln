@@ -562,6 +562,20 @@
 .rv-note[data-k="ok"] {
   color: #bfdccf;
 }
+/* an approval carried to this version: a flat line, kiln's words (W27-R08) */
+.rv-carried {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 8px;
+  color: #bfdccf;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.rv-carried svg {
+  flex: none;
+  align-self: center;
+}
 
 /* the vorpal search: a boxed field, as the mockup draws it (the app's .field) */
 .rv-search {

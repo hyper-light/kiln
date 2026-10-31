@@ -1024,3 +1024,100 @@ fn w27_r08_review_passed_on() -> anyhow::Result<()> {
     assert!(v.get("open") == Some(&json!(true)), "the pass to rev3 waits, answered by no one: {v}");
     Ok(())
 }
+
+/// W27-R08, with W27-R04 (the Transfers plan's step 7): an approval carried across a rebase-only
+/// revision is a transfer that says so. Kim approves D1's v2, signed with her own key. Two rewords
+/// and a rebase onto a moved trunk keep its verbatim patch-id, so at v5 her approval is carried:
+/// kiln signs the carry from v2 to v5 (its hand-on and its receipt, each naming its version's
+/// commit and base) and says "carried from v2: rebase only, patch-id …, base … to …", her verdict
+/// still hers and verifying. v6 changes the code and v7 only its whitespace: carried to neither,
+/// each saying why.
+#[test]
+fn w27_ac04_approval_carried() -> anyhow::Result<()> {
+    use base64::Engine as _;
+    use rcgen::SigningKey as _;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin, repo) = (s.port, s.admin.as_str(), "acme/review");
+    let (home, work) = native(dir.path(), port, admin, repo)?;
+    let kim = developer(port, admin, "kim", repo)?;
+    let kims_key = certified(port, Auth::Token(&kim))?;
+    let origin = format!("http://x:{admin}@127.0.0.1:{port}/git/{repo}.git");
+    let message = "f returns two\n\nChange-Id: I4242424242424242424242424242424242424242\n";
+    let push = |n: u32| -> anyhow::Result<()> {
+        let said = git(&home, &work, &["push", &origin, "HEAD:refs/for/main"])?;
+        anyhow::ensure!(said.contains(&format!("D1 v{n}")), "v{n}: {said}");
+        Ok(())
+    };
+    std::fs::write(work.join("a.py"), "def f():\n    return 1\n")?;
+    std::fs::write(work.join("z.txt"), "far away\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "f, and a file far away"])?;
+    git(&home, &work, &["push", "-q", &origin, "HEAD:main"])?;
+    git(&home, &work, &["checkout", "-qb", "d1"])?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 2\n")?;
+    git(&home, &work, &["commit", "-qam", message])?;
+    push(1)?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 2  # two\n")?;
+    git(&home, &work, &["commit", "-q", "--amend", "-a", "-m", message])?;
+    push(2)?;
+    // Kim approves v2, signed with her own key.
+    let (st, body) = http(port, "POST", "/api/diffs/D1/statement", &kim, Some(&json!({ "kind": "verdict", "action": "accept", "body": "looks right" })))?;
+    anyhow::ensure!(st == 200, "what kim signs: {st} {body}");
+    let asked: Value = serde_json::from_str(&body)?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (payload, pae) = (b64.decode(field(&asked, "payload"))?, b64.decode(field(&asked, "pae"))?);
+    let signed = kiln_ci::identity::statement::bundle(field(&asked, "payload_type"), &payload, &kims_key.key.sign(&pae)?, &kims_key.der);
+    let (st, body) = http(port, "POST", "/api/diffs/D1/review", &kim, Some(&json!({ "action": "accept", "body": "looks right", "signed": signed })))?;
+    anyhow::ensure!(st == 200, "kim's signed approval: {st} {body}");
+    let kims = || -> anyhow::Result<Value> {
+        let (st, body) = http(port, "GET", "/api/diffs/D1/verdicts", admin, None)?;
+        anyhow::ensure!(st == 200, "verdicts: {st} {body}");
+        let verdicts = serde_json::from_str::<Value>(&body)?.get("verdicts").and_then(Value::as_array).cloned().unwrap_or_default();
+        verdicts.into_iter().rev().find(|v| field(v, "reviewer") == "user:kim").ok_or_else(|| anyhow::anyhow!("no verdict of kim's: {body}"))
+    };
+    assert_eq!(field(&kims()?, "standing"), "given");
+    // Two rewords, then a rebase onto a moved trunk: the same verbatim patch-id.
+    for (n, words) in [(3, "f returns 2"), (4, "f returns two, as asked")] {
+        git(&home, &work, &["commit", "-q", "--amend", "-m", &format!("{words}\n\nChange-Id: I4242424242424242424242424242424242424242\n")])?;
+        push(n)?;
+    }
+    git(&home, &work, &["checkout", "-q", "main"])?;
+    std::fs::write(work.join("z.txt"), "far away, moved\n")?;
+    git(&home, &work, &["commit", "-qam", "the trunk moves"])?;
+    git(&home, &work, &["push", "-q", &origin, "HEAD:main"])?;
+    git(&home, &work, &["checkout", "-q", "d1"])?;
+    git(&home, &work, &["rebase", "-q", "main"])?;
+    push(5)?;
+    let v = kims()?;
+    assert_eq!((field(&v, "standing"), v.get("on")), ("carried", Some(&json!(5))), "{v}");
+    let carried = v.get("carried").cloned().unwrap_or_default();
+    let (from_base, to_base) = (field(&carried, "base_from"), field(&carried, "base_to"));
+    assert!(carried.get("from") == Some(&json!(2)) && !from_base.is_empty() && from_base != to_base, "carried from v2 across the rebase: {v}");
+    let short = |s: &str| s.get(..7).unwrap_or(s).to_owned();
+    let said = field(&carried, "said");
+    assert_eq!(said, format!("carried from v2: rebase only, patch-id {}…, base {} to {}", short(field(&carried, "patch_id")), short(from_base), short(to_base)), "{v}");
+    // The carry is a transfer: kiln's hand-on for v2 and its receipt for v5, walking unbroken.
+    let (st, body) = http(port, "GET", &format!("/api/custody?digest={}", field(&carried, "record")), admin, None)?;
+    anyhow::ensure!(st == 200, "the carry's chain: {st} {body}");
+    let chain: Value = serde_json::from_str(&body)?;
+    assert!(chain.get("unbroken") == Some(&json!(true)) && half_named(&chain) == 0, "{chain}");
+    let hops = chain.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+    let sides: Vec<(&str, &str, &str)> = hops.iter().map(|h| (field(h, "kind"), field(h, "component"), field(h, "why"))).collect();
+    assert!(matches!(sides.as_slice(), [(r, to, w1), (h, from, w2)] if *r == "received" && *h == "handed-on" && to.starts_with("v5 at ") && from.starts_with("v2 at ") && *w1 == said && *w2 == said), "{sides:?}");
+    // Her verdict is still hers, as kiln checked it again as it carried it.
+    assert_eq!(field(&v, "signer"), kims_key.uri, "{v}");
+    // v6 changes the code: not carried, saying why.
+    std::fs::write(work.join("a.py"), "def f():\n    return 3\n")?;
+    git(&home, &work, &["commit", "-q", "--amend", "-a", "-m", message])?;
+    push(6)?;
+    let v = kims()?;
+    assert!(field(&v, "standing") == "not" && field(&v, "why").contains("v6 changed the code") && v.get("carried").is_none(), "{v}");
+    // v7 puts back v5's code but for a space at a line's end: whitespace is code here too.
+    std::fs::write(work.join("a.py"), "def f():\n    return 2  # two \n")?;
+    git(&home, &work, &["commit", "-q", "--amend", "-a", "-m", message])?;
+    push(7)?;
+    let v = kims()?;
+    assert!(field(&v, "standing") == "not" && field(&v, "why").contains("v7 changed the code") && v.get("carried").is_none(), "{v}");
+    Ok(())
+}
