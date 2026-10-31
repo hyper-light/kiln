@@ -296,14 +296,11 @@ fn admit(c:&Connection,binding:&JobLogBindingV1,prepared:&Prepared,host:&str)->a
             if v.previous_root!=r.root {return decided(tx,Admission::Refused(JobLogRefusalV1::Conflict,"producer previous root conflicts".into()))}
             let offset:u64=tx.query_row("SELECT bytes FROM ci_log_producer_steps WHERE binding=?1 AND step=?2",params![id,v.step],|r|r.get(0)).optional()?.unwrap_or(0);
             if v.offset!=offset {return decided(tx,Admission::Refused(JobLogRefusalV1::Conflict,"producer step offset conflicts".into()))}
-            if offset==0 {
-                if r.steps>=STEPS {return decided(tx,Admission::Refused(JobLogRefusalV1::Full,"producer step metadata bound reached".into()))}
-            }
+            if offset==0 && r.steps>=STEPS {return decided(tx,Admission::Refused(JobLogRefusalV1::Full,"producer step metadata bound reached".into()))}
             if r.bytes.checked_add(u64::try_from(v.data.len())?).is_none_or(|n|n>binding.contract.capture_limit) {return decided(tx,Admission::Refused(JobLogRefusalV1::Full,"producer exceeds the original negotiated capture limit".into()))}
         }
-        if let Item::End(v)=item {
-            if v.final_seq<=r.through && (v.final_seq!=r.through || v.captured_bytes!=r.bytes || v.root!=r.root) {return decided(tx,Admission::Refused(JobLogRefusalV1::Conflict,"producer End contradicts the original accepted cursor".into()))}
-        }
+        if let Item::End(v)=item
+            && v.final_seq<=r.through && (v.final_seq!=r.through || v.captured_bytes!=r.bytes || v.root!=r.root) {return decided(tx,Admission::Refused(JobLogRefusalV1::Conflict,"producer End contradicts the original accepted cursor".into()))}
         let (kind,offset,previous,root,end)=match item {
             Item::Chunk(v)=>{
                 let root=match &prepared.ledger {LedgerItem::Chunk{root,..}=>*root,_=>anyhow::bail!("prepared producer kind changed")};
@@ -674,7 +671,7 @@ pub(crate) struct ProducerSnapshot {
 #[derive(Clone,Debug)]
 pub(crate) struct ProducerRead {
     pub bytes:Vec<u8>,pub complete:bool,pub prefix:Option<Prefix>,
-    pub qualification:&'static str,pub capture:Option<JobLogCaptureV1>,pub max_bytes:u64,
+    pub qualification:&'static str,pub capture:Option<JobLogCaptureV1>,
 }
 
 fn snapshot(c:&Connection,job:&str,require_complete:bool,max_bytes:u64)->anyhow::Result<Option<ProducerSnapshot>> {
@@ -802,7 +799,7 @@ impl crate::logs::Logs {
                 Err(why)=>return Err(ReadError::Unavailable(why).into()),
             }
         }
-        Ok(Some(ProducerRead{bytes,complete:snapshot.complete,prefix:snapshot.prefix,qualification:snapshot.qualification,capture:snapshot.capture,max_bytes:snapshot.max_bytes}))
+        Ok(Some(ProducerRead{bytes,complete:snapshot.complete,prefix:snapshot.prefix,qualification:snapshot.qualification,capture:snapshot.capture}))
     }
     pub(crate) async fn producer_step_page(&self,prefix:Prefix,after:Option<i64>)->anyhow::Result<Vec<(i64,u32)>> {
         let ctx=self.accepted_context()?;RawReader::steps(&ctx.store,prefix,after).await

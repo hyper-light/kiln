@@ -1353,9 +1353,14 @@ mod tests {
         assert_eq!(body.first().copied(), old.first().map(|tag| tag + 1));
         let frame = encode(&crate::wire::channel::Frame::Item { stream: job_log::stream(&binding)?, seq: 1, low: 0, body: body.clone() })?;
         let item = job_log::borrow_item(&frame)?;
-        assert_eq!((item.stream, item.seq, item.low, item.body), (job_log::stream(&binding)?.as_str(), 1, 0, body.as_slice()));
+        assert_eq!((item.stream, item.seq, item.body), (job_log::stream(&binding)?.as_str(), 1, body.as_slice()));
         let offset = item.body.as_ptr() as usize - frame.as_ptr() as usize;
         assert_eq!(frame.get(offset..offset + item.body.len()), Some(body.as_slice()));
+        // Low stays a validated scalar, never an exported acceptance frontier.
+        for low in [1, 2] {
+            let invalid = encode(&crate::wire::channel::Frame::Item { stream: job_log::stream(&binding)?, seq: 1, low, body: body.clone() })?;
+            assert!(job_log::borrow_item(&invalid).is_err(), "low >= seq cannot enter the retained producer route");
+        }
         let mut trailing = frame.clone(); trailing.push(0); assert!(job_log::borrow_item(&trailing).is_err());
         // Variant, stream length, seq, low and body length each reject redundant
         // varints without allocating/re-encoding the retained body.

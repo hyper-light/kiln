@@ -152,6 +152,10 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
   Their HTTP GET accepts `require_complete=1` (409 `log_pending`, 503 `log_unavailable`),
   serves raw accepted bytes with `x-kiln-log-complete`, `x-kiln-log-qualification` and captured
   view/revision/root headers, and never substitutes another job merely because bytes are empty.
+  Once the original End is captured, `x-kiln-log-capture` distinguishes `complete` from
+  `truncated`; truncated captures also carry the original job-wide `x-kiln-log-capture-limit`
+  and `x-kiln-log-discarded-bytes`. These headers apply to raw and timing responses. Delivery
+  can be complete while the original capture was truncated; raw bytes are not rewritten.
   Times remain compatibility offsets; strict `size` is the captured raw size, or null while no
   head is captured. Logs without a registered producer contract retain their legacy behavior.
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.

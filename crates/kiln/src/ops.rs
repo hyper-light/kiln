@@ -857,7 +857,7 @@ mod tests {
             let owner = Cx { hub: Arc::clone(&hub), caller: Caller::owner() };
             let pool = json!({"executor": "docker", "image": "fixture", "labels": ["u12-pool"], "hosts": "label no-u12-runner", "resources": {"cpu": "1", "memory": "512Mi"}});
             let mut named = pool.clone();
-            named["name"] = json!("u12-named");
+            named.as_object_mut().ok_or_else(|| anyhow::anyhow!("pool fixture input is not an object"))?.insert("name".into(), json!("u12-named"));
             call(owner.clone(), "ci.pools.set", named).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
             let matched = match_http(&Method::PUT, &["api", "ci", "pools", "u12-http"])
                 .map_err(|(_, why)| anyhow::anyhow!(why))?.ok_or_else(|| anyhow::anyhow!("pool HTTP route"))?;

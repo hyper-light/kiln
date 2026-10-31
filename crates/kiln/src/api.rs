@@ -2519,7 +2519,7 @@ async fn job_logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     match hub.logs.read_producer(id, step, q.get("require_complete").is_some_and(|v| v == "1")).await {
         Ok(Some(read)) => {
             let mut response = srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(read.bytes));
-            producer_log_headers(&mut response, read.complete, read.qualification, read.prefix.as_ref())?;
+            producer_log_headers(&mut response, read.complete, read.qualification, read.prefix.as_ref(), read.capture.as_ref())?;
             return Ok(response);
         }
         Ok(None) => {}, // No registered contract: preserve the legacy/reused-job path.
@@ -2562,7 +2562,7 @@ async fn job_log_times(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
                 "size": size, "size_qualification": snapshot.qualification,
                 "complete": snapshot.complete, "prefix": &snapshot.prefix,
             }));
-            producer_log_headers(&mut response, snapshot.complete, snapshot.qualification, snapshot.prefix.as_ref())?;
+            producer_log_headers(&mut response, snapshot.complete, snapshot.qualification, snapshot.prefix.as_ref(), snapshot.capture.as_ref())?;
             return Ok(response);
         }
         Ok(None) => {},
@@ -2592,7 +2592,8 @@ fn producer_log_error(error: &anyhow::Error) -> Response {
     srv::json(status, &json!({"error": code, "message": format!("{error:#}")}))
 }
 
-fn producer_log_headers(response: &mut Response, complete: bool, qualification: &str, prefix: Option<&crate::logs::accepted::Prefix>) -> anyhow::Result<()> {
+fn producer_log_headers(response: &mut Response, complete: bool, qualification: &str, prefix: Option<&crate::logs::accepted::Prefix>, capture: Option<&crate::proto::JobLogCaptureV1>) -> anyhow::Result<()> {
+    use crate::proto::JobLogCaptureV1;
     let headers = response.headers_mut();
     headers.insert("x-kiln-log-complete", header::HeaderValue::from_static(if complete { "1" } else { "0" }));
     headers.insert("x-kiln-log-qualification", header::HeaderValue::from_str(qualification)?);
@@ -2600,6 +2601,20 @@ fn producer_log_headers(response: &mut Response, complete: bool, qualification: 
         headers.insert("x-kiln-log-view", header::HeaderValue::from_str(&prefix.view)?);
         headers.insert("x-kiln-log-revision", header::HeaderValue::from_str(&prefix.revision.to_string())?);
         headers.insert("x-kiln-log-root", header::HeaderValue::from_str(&prefix.root)?);
+    }
+    // U05: delivery completion and capture completeness differ. Carry only the original
+    // bounded enum/counts; an untrusted free-form refusal reason never enters a header.
+    if let Some(capture) = capture {
+        let kind = match capture {
+            JobLogCaptureV1::Complete => "complete",
+            JobLogCaptureV1::Truncated { limit, discarded_bytes } => {
+                headers.insert("x-kiln-log-capture-limit", header::HeaderValue::from_str(&limit.to_string())?);
+                headers.insert("x-kiln-log-discarded-bytes", header::HeaderValue::from_str(&discarded_bytes.to_string())?);
+                "truncated"
+            },
+            JobLogCaptureV1::Incomplete { .. } => "incomplete",
+        };
+        headers.insert("x-kiln-log-capture", header::HeaderValue::from_static(kind));
     }
     Ok(())
 }

@@ -14,7 +14,6 @@ pub(crate) const WHY_MAX: usize = 4096;
 pub(crate) struct JobLogItem<'a> {
     pub stream: &'a str,
     pub seq: u64,
-    pub low: u64,
     pub body: &'a [u8],
 }
 
@@ -39,7 +38,7 @@ pub(crate) fn borrow_item(bytes: &[u8]) -> anyhow::Result<JobLogItem<'_>> {
     let (length, body) = scalar(tail)?;
     anyhow::ensure!(usize::try_from(length)? == body.len() && body.len() <= END_MAX, "job-log Item has trailing, truncated or oversized body bytes");
     anyhow::ensure!(seq > 0 && seq < u64::MAX && low < seq, "job-log Item has an invalid sequence window");
-    Ok(JobLogItem { stream, seq, low, body })
+    Ok(JobLogItem { stream, seq, body })
 }
 
 fn hash(parts: &[&[u8]]) -> [u8; 32] {

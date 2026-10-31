@@ -912,6 +912,8 @@ mod tests {
 
 
     async fn bounded_indexing() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        use http_body_util::BodyExt as _;
         // Exercise the actual borrowed decoder with the existing encoder, including
         // empty application chunks and a legal frame exactly at the transport bound.
         let mut largest=vec![b'x';crate::logs::accepted::CHUNK];
@@ -1656,6 +1658,15 @@ mod tests {
         assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(conflict))?).await?,JobLogReplyV1::Refused{code:JobLogRefusalV1::Conflict,..}));
         let partial=hub.logs.read_producer(&binding.owner.job,1,false).await?.ok_or_else(||anyhow::anyhow!("registered producer became legacy"))?;
         assert!(!partial.complete && partial.bytes.ends_with(&first.data));
+        let api = Arc::new(crate::api::Api { hub: Arc::clone(&hub) });
+        let mut request = http::Request::builder().uri(format!("/api/jobs/{}/logs?step=1", binding.owner.job))
+            .header(http::header::AUTHORIZATION, format!("Bearer {}", hub.admin_token)).body(kiln_http::Incoming::empty())?;
+        request.extensions_mut().insert(crate::http::server::Secure);
+        let response = Arc::clone(&api).handle(request).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers().get("x-kiln-log-complete").and_then(|v| v.to_str().ok()), Some("0"));
+        assert!(response.headers().get("x-kiln-log-capture").is_none(), "a partial read cannot invent a captured End disposition");
+        assert_eq!(response.into_body().collect().await?.to_bytes().as_ref(), partial.bytes.as_slice());
         let initial_prefix=partial.prefix.clone().ok_or_else(||anyhow::anyhow!("first producer receipt lacks captured history"))?;
         let mut raw=producer::RawReader::open(&hub.store,initial_prefix,1).await?.ok_or_else(||anyhow::anyhow!("captured first step is missing"))?;
         let mut observed=Vec::new();loop {
@@ -1766,6 +1777,32 @@ mod tests {
         assert!(matches!(producer::fixture_input(&hub.logs,truncated.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogEndV1(cap_end))?).await?,JobLogReplyV1::Committed(_)));
         let capped=hub.logs.read_producer(&truncated.owner.job,1,true).await?.ok_or_else(||anyhow::anyhow!("truncated producer became legacy"))?;
         assert!(capped.complete && capped.bytes==b"cap" && matches!(capped.capture,Some(JobLogCaptureV1::Truncated{limit:3,discarded_bytes:2})),"closed capture preserves its explicit truncation qualification");
+        // The actual API handlers preserve capture truth on both raw output and timing
+        // metadata, while the body remains the exact accepted bytes for this step.
+        for (job, capture, counts, expected) in [
+            (&binding.owner.job, "complete", None, captured.bytes.as_slice()),
+            (&truncated.owner.job, "truncated", Some(("3", "2")), capped.bytes.as_slice()),
+        ] {
+            for times in [false, true] {
+                let mut request = http::Request::builder().uri(format!("/api/jobs/{job}/logs{}?step=1&require_complete=1", if times { "/times" } else { "" }))
+                    .header(http::header::AUTHORIZATION, format!("Bearer {}", hub.admin_token)).body(kiln_http::Incoming::empty())?;
+                request.extensions_mut().insert(crate::http::server::Secure);
+                let response = Arc::clone(&api).handle(request).await;
+                assert_eq!(response.status(), http::StatusCode::OK);
+                assert_eq!(response.headers().get("x-kiln-log-complete").and_then(|v| v.to_str().ok()), Some("1"));
+                assert_eq!(response.headers().get("x-kiln-log-capture").and_then(|v| v.to_str().ok()), Some(capture));
+                assert_eq!(response.headers().get("x-kiln-log-capture-limit").and_then(|v| v.to_str().ok()), counts.map(|(limit, _)| limit));
+                assert_eq!(response.headers().get("x-kiln-log-discarded-bytes").and_then(|v| v.to_str().ok()), counts.map(|(_, discarded)| discarded));
+                let bytes = response.into_body().collect().await?.to_bytes();
+                if times {
+                    let value: Value = serde_json::from_slice(&bytes)?;
+                    assert_eq!(value.get("size").and_then(Value::as_u64), Some(u64::try_from(expected.len())?));
+                    assert_eq!(value.get("complete").and_then(Value::as_bool), Some(true));
+                } else {
+                    assert_eq!(bytes.as_ref(), expected);
+                }
+            }
+        }
 
         let rejected=bindings.get(6).cloned().ok_or_else(||anyhow::anyhow!("negative replay binding missing"))?;
         let denied=JobLogChunkV1{binding:rejected.clone(),seq:1,step:1,offset:0,previous_root:crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&rejected)?),data:b"original input refused before PUT\n".to_vec()};

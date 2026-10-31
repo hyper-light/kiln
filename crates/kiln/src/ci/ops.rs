@@ -1418,7 +1418,7 @@ pub mod input {
     // U12/W13: actual canonical Deserialize types retain default and typo rules.
     // These schema-only bridges avoid a schema dependency in the deterministic core.
     fn pool_resources_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({"type":["object","null"],"additionalProperties":false,"properties":{"cpu":{"type":["string","null"]},"memory":{"type":["string","null"]},"disk":{"type":["string","null"]},"gpu":{"type":["integer","null"],"minimum":0,"maximum":4294967295}}})
+        schemars::json_schema!({"type":["object","null"],"additionalProperties":false,"properties":{"cpu":{"type":["string","null"]},"memory":{"type":["string","null"]},"disk":{"type":["string","null"]},"gpu":{"type":["integer","null"],"minimum":0,"maximum":u32::MAX}}})
     }
     fn pool_reserve_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({"type":["object","null"],"additionalProperties":false,"properties":{"name":{"type":"string"},"runners":{"type":["string","null"]},"pool":{"type":["string","null"]},"for":{"type":"string"},"cron":{"type":"string"},"duration":{"type":"string"},"timezone":{"type":["string","null"]}}})
