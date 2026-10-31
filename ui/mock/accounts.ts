@@ -375,6 +375,36 @@ export function handleDemoSession(ws: WebSocket, id: string): boolean {
   return true;
 }
 
+/** What each harness says it has, as the demos' own meta: what messaging those picked reads, merged (the preview below). */
+const UNDERSTOOD: Record<string, Pick<Meta, "modes" | "models" | "efforts" | "speeds">> = {
+  claude: {
+    modes: [
+      { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
+      { id: "default", label: "Ask", description: "Asks before edits and commands" },
+      { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
+      { id: "auto", label: "Auto", description: "Decides for itself what needs asking" },
+      { id: "bypassPermissions", label: "Don't ask", description: "Runs every command and edit without asking", dangerous: true },
+    ],
+    models: [
+      { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
+      { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
+      { id: "claude-sonnet-5-5", label: "claude-sonnet-5-5", description: "" },
+    ],
+    efforts: ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })),
+    speeds: [{ id: "fast", label: "Fast", description: "Up to 2.5x faster, at a higher price per token" }],
+  },
+  codex: {
+    modes: [
+      { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
+      { id: "default", label: "Ask", description: "Asks before edits and commands" },
+      { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
+    ],
+    models: [{ id: "gpt-6.1-sol", label: "GPT-6.1 Sol", description: "" }],
+    efforts: [],
+    speeds: [{ id: "priority", label: "Fast", description: "2x speed, increased usage" }],
+  },
+};
+
 /* ------------------------------------------------------------------ routes */
 
 /** The accounts API and the demo agents' list. True when it answered. */
@@ -426,6 +456,37 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
   }
   if (p === "/api/harness/sessions" && m === "GET") {
     json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos(), ...reviewInfos()]);
+    return true;
+  }
+  // What those picked understand, for the line over Mission control's box as it messages them: each
+  // setting with how many of them have it and which, as the server merges their meta (api.rs).
+  if (p === "/api/harness/broadcast/preview" && m === "POST") {
+    const b = await body<{ to?: { ids?: string[] } }>(req);
+    const every = [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos(), ...reviewInfos()];
+    const picked = (b.to?.ids ?? []).flatMap((id) => every.filter((a) => a.id === id).slice(0, 1));
+    const counted = <T extends { id: string }>(of: (u: (typeof UNDERSTOOD)[string] | undefined) => T[] | undefined) => {
+      const seen = new Map<string, T & { count: number; agents: string[] }>();
+      for (const a of picked)
+        for (const o of of(UNDERSTOOD[a.kind]) ?? []) {
+          const was = seen.get(o.id);
+          if (!was) seen.set(o.id, { ...o, count: 1, agents: [a.id] });
+          else {
+            was.count += 1;
+            was.agents.push(a.id);
+          }
+        }
+      return [...seen.values()];
+    };
+    const machine = (a: AgentInfo) => a.target.replace(/^agent:/, "");
+    json(res, 200, {
+      agents: picked.map((a) => ({ id: a.id, name: a.name, machine: machine(a), kind: a.kind, status: a.status })),
+      machines: [...new Set(picked.map(machine))],
+      commands: [],
+      modes: counted((u) => u?.modes),
+      models: counted((u) => u?.models),
+      efforts: counted((u) => u?.efforts),
+      speeds: counted((u) => u?.speeds),
+    });
     return true;
   }
 

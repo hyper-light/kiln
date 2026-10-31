@@ -658,8 +658,10 @@ a.ms-why:hover {
   position: relative;
   margin-bottom: 22px;
 }
+/* The field is the agent composer's own height from the start, as it starts an agent and as it messages
+   them, so nothing moves as it's used or as it turns. */
 .ms-msg .hx-compose-input {
-  min-height: 44px;
+  min-height: 46px;
   max-height: 200px;
   field-sizing: content;
 }
@@ -1205,15 +1207,17 @@ html[data-motion="paused"] .ms-pick::before {
   margin-left: 0;
 }
 
-/* ---------------------------------------------------------------- the message box's To line: those picked
-   (each with its ×; @ in the field finds more), or everyone the list shows */
-/* One line, whatever is picked: the chips that fit, then "+N more" (broadcast.tsx's ToChips), Clear at its end. */
+/* ---------------------------------------------------------------- the To line under the message box: those
+   picked (each with its ×; @ in the field finds more), or everyone the list shows */
+/* One line, whatever is picked: the chips that fit, then "+N more" (broadcast.tsx's ToChips), Clear at its end.
+   It's the row More options is under the box that starts an agent (.mc-under), in its size and place. */
 .ms-to {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-height: 26px;
-  padding: 8px 12px 0;
+  min-height: 34px;
+  margin-top: 6px;
+  padding: 0 4px;
   font-size: 12px;
 }
 .ms-to > * {
@@ -1553,10 +1557,6 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
   .mc-under {
     gap: 0 18px;
   }
-}
-/* The field is the agent composer's own height from the start, so nothing moves as it's used. */
-.mc .hx-compose-input {
-  min-height: 46px;
 }
 /* Opening the agent it started: one view transition, each part landing where it goes on the agent's page (console.css names those). */
 :root[data-opening] .mc .mc-how {
