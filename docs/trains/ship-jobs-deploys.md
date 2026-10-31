@@ -134,9 +134,9 @@ requirements, W26-R21 to W26-R27.
     train's refusal (no provider pauses, so pause stays refused);
   - `job_verbs` takes what the provider allows.
 
-  They also have Ada's asks for Ship's commit rows: Hand off and Retry as icon buttons, Run and
-  Cancel offered clearly. I'm taking those after this train, stills to Ada first. They build the
-  trigger endpoint.
+  Ada asked them for Ship's commit rows (10-31): Hand off and Retry as icon buttons, Run and
+  Cancel offered clearly. They build it on this train, stills to Ada first, with the trigger
+  endpoint behind Run. A job's own actions stay in the jobs pane's strip.
 - **Main's Windows test build.** It fails on crates/kiln/src/ci/review_cli.rs:899, an unused
   `use super::*`. That's main's, not this train's. The gate's Windows clippy checks libraries
   only, so it doesn't see it.
