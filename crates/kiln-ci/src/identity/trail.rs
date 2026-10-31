@@ -59,9 +59,10 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// What's hashed: a line each, under a version. No field holds a newline ([`next`] and
-    /// [`check`] refuse one that does), so no two entries encode alike.
-    fn encoding(&self) -> Vec<u8> {
+    /// What's hashed (the leaf's data, as a tiled log's entry bundles carry it): a line each,
+    /// under a version. No field holds a newline ([`next`] and [`check`] refuse one that does), so
+    /// no two entries encode alike.
+    pub fn encoding(&self) -> Vec<u8> {
         let mut s = format!("kiln trail entry v1\n{}\n{}\n{}\n{}\n{}\n", self.index, chain::hex(&self.prev), self.statement, self.kind, self.taken_at);
         for subject in &self.subjects {
             s.push_str(subject);
@@ -74,6 +75,26 @@ impl Entry {
     /// built over.
     pub fn hash(&self) -> Hash {
         leaf(&self.encoding())
+    }
+
+    /// An entry read back from its encoding (an entry bundle's), or why it isn't one kiln writes.
+    pub fn parse(data: &[u8]) -> Result<Entry, Break> {
+        let bad = |why: &str| Break::Malformed { index: 0, why: why.to_owned() };
+        let text = std::str::from_utf8(data).map_err(|_| bad("it isn't UTF-8"))?;
+        let body = text.strip_suffix('\n').ok_or_else(|| bad("it doesn't end in a newline"))?;
+        let mut lines = body.split('\n');
+        let (Some("kiln trail entry v1"), Some(index), Some(prev), Some(statement), Some(kind), Some(taken_at)) = (lines.next(), lines.next(), lines.next(), lines.next(), lines.next(), lines.next()) else {
+            return Err(bad("it isn't version 1 of kiln's trail entries"));
+        };
+        let index: u64 = index.parse().map_err(|_| bad("its index isn't a number"))?;
+        let prev = unhex(prev).and_then(|p| <Hash>::try_from(p.as_slice()).ok()).ok_or_else(|| bad("its prev isn't a SHA-256 in hex"))?;
+        let taken_at: i64 = taken_at.parse().map_err(|_| bad("when kiln took it isn't a number"))?;
+        let e = Entry { index, prev, statement: statement.to_owned(), kind: kind.to_owned(), subjects: lines.map(str::to_owned).collect(), taken_at };
+        match e.malformed() {
+            Some(why) => Err(Break::Malformed { index, why }),
+            None if e.encoding() != data => Err(Break::Malformed { index, why: "it isn't written as kiln writes it".into() }),
+            None => Ok(e),
+        }
     }
 
     /// Why it isn't an entry kiln writes, when it isn't.
@@ -172,6 +193,13 @@ pub fn check_root(entries: &[Entry], checkpoint: &Checkpoint) -> Result<(), Brea
     Ok(())
 }
 
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect()
+}
+
 fn sha(parts: &[&[u8]]) -> Hash {
     let mut h = Sha256::new();
     for p in parts {
@@ -198,6 +226,14 @@ fn split(n: usize) -> usize {
     k
 }
 
+fn split64(n: u64) -> u64 {
+    let mut k = 1;
+    while k << 1 < n {
+        k <<= 1;
+    }
+    k
+}
+
 /// The root of the tree over `leaves` (RFC 6962's Merkle Tree Hash): SHA-256 of nothing for none.
 pub fn root(leaves: &[Hash]) -> Hash {
     match leaves {
@@ -213,24 +249,37 @@ pub fn root(leaves: &[Hash]) -> Hash {
 /// The proof that leaf `index` is in the tree over `leaves` (RFC 6962's audit path); none for an
 /// index past its end.
 pub fn inclusion(leaves: &[Hash], index: usize) -> Option<Vec<Hash>> {
-    fn walk(m: usize, d: &[Hash], path: &mut Vec<Hash>) {
-        if d.len() <= 1 {
-            return;
+    inclusion_by(leaves.len() as u64, index as u64, &mut of_leaves(leaves))
+}
+
+/// RFC 6962's hash of the leaves `lo..hi` of `leaves`.
+fn of_leaves(leaves: &[Hash]) -> impl FnMut(u64, u64) -> Option<Hash> + '_ {
+    |lo, hi| leaves.get(usize::try_from(lo).ok()?..usize::try_from(hi).ok()?).map(root)
+}
+
+/// [`inclusion`] in a tree of `size`, its hashes from `mth(lo, hi)`, RFC 6962's hash of its leaves
+/// `lo..hi` (from its tiles, say: [`mth_from`]); none for an index past its end, or a hash not
+/// given.
+pub fn inclusion_by(size: u64, index: u64, mth: &mut impl FnMut(u64, u64) -> Option<Hash>) -> Option<Vec<Hash>> {
+    fn walk(m: u64, lo: u64, hi: u64, mth: &mut impl FnMut(u64, u64) -> Option<Hash>, path: &mut Vec<Hash>) -> Option<()> {
+        if hi - lo <= 1 {
+            return Some(());
         }
-        let (l, r) = d.split_at(split(d.len()));
-        if m < l.len() {
-            walk(m, l, path);
-            path.push(root(r));
+        let k = split64(hi - lo);
+        if m < k {
+            walk(m, lo, lo + k, mth, path)?;
+            path.push(mth(lo + k, hi)?);
         } else {
-            walk(m - l.len(), r, path);
-            path.push(root(l));
+            walk(m - k, lo + k, hi, mth, path)?;
+            path.push(mth(lo, lo + k)?);
         }
+        Some(())
     }
-    if index >= leaves.len() {
+    if index >= size {
         return None;
     }
     let mut path = Vec::new();
-    walk(index, leaves, &mut path);
+    walk(index, 0, size, mth, &mut path)?;
     Some(path)
 }
 
@@ -264,30 +313,165 @@ pub fn verify_inclusion(leaf: &Hash, index: u64, size: u64, proof: &[Hash], root
 /// The proof that the tree over `leaves` extends the tree over its first `old` (RFC 6962's
 /// consistency proof); none for an `old` past its end.
 pub fn consistency(leaves: &[Hash], old: usize) -> Option<Vec<Hash>> {
-    fn sub(m: usize, d: &[Hash], whole: bool, proof: &mut Vec<Hash>) {
-        if m == d.len() {
+    consistency_by(leaves.len() as u64, old as u64, &mut of_leaves(leaves))
+}
+
+/// [`consistency`] of a tree of `size` with its first `old`, its hashes from `mth(lo, hi)` as
+/// [`inclusion_by`] has them.
+pub fn consistency_by(size: u64, old: u64, mth: &mut impl FnMut(u64, u64) -> Option<Hash>) -> Option<Vec<Hash>> {
+    fn sub(m: u64, lo: u64, hi: u64, whole: bool, mth: &mut impl FnMut(u64, u64) -> Option<Hash>, proof: &mut Vec<Hash>) -> Option<()> {
+        if m == hi - lo {
             if !whole {
-                proof.push(root(d));
+                proof.push(mth(lo, hi)?);
             }
-            return;
+            return Some(());
         }
-        let (l, r) = d.split_at(split(d.len()));
-        if m <= l.len() {
-            sub(m, l, whole, proof);
-            proof.push(root(r));
+        let k = split64(hi - lo);
+        if m <= k {
+            sub(m, lo, lo + k, whole, mth, proof)?;
+            proof.push(mth(lo + k, hi)?);
         } else {
-            sub(m - l.len(), r, false, proof);
-            proof.push(root(l));
+            sub(m - k, lo + k, hi, false, mth, proof)?;
+            proof.push(mth(lo, lo + k)?);
         }
+        Some(())
     }
-    if old > leaves.len() {
+    if old > size {
         return None;
     }
     let mut proof = Vec::new();
     if old > 0 {
-        sub(old, leaves, true, &mut proof);
+        sub(old, 0, size, true, mth, &mut proof)?;
     }
     Some(proof)
+}
+
+/// How many hashes a full tile holds (C2SP tlog-tiles): a subtree of height 8.
+pub const TILE: u64 = 256;
+
+/// A tile of the tree, or an entry bundle (C2SP tlog-tiles): its level, its index on that level,
+/// and its width, [`TILE`] for a full one. At level 0 its hashes are leaves'; above, each is the
+/// hash of a full tile at the level below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tile {
+    pub level: u8,
+    pub index: u64,
+    pub width: u64,
+}
+
+impl Tile {
+    /// Its path under the log's prefix: `tile/<L>/<N>[.p/<W>]`, an entry bundle's
+    /// `tile/entries/<N>[.p/<W>]`; `<N>` in 3-digit elements, all but the last after an `x`.
+    pub fn path(&self, entries: bool) -> String {
+        let mut elements = vec![self.index % 1000];
+        let mut n = self.index / 1000;
+        while n > 0 {
+            elements.push(n % 1000);
+            n /= 1000;
+        }
+        let last = elements.len().saturating_sub(1);
+        let n: Vec<String> = elements.iter().rev().enumerate().map(|(i, e)| if i < last { format!("x{e:03}") } else { format!("{e:03}") }).collect();
+        let head = if entries { "tile/entries".to_owned() } else { format!("tile/{}", self.level) };
+        let partial = if self.width < TILE { format!(".p/{}", self.width) } else { String::new() };
+        format!("{head}/{}{partial}", n.join("/"))
+    }
+
+    /// A tile's path read back (after the log's prefix): the tile, and whether it's an entry
+    /// bundle. One written otherwise than [`Tile::path`] writes it isn't read.
+    pub fn parse(path: &str) -> Option<(Tile, bool)> {
+        // Read loosely, then held to how it's written: no leading zeroes, no signs.
+        let rest = path.strip_prefix("tile/")?;
+        let (entries, level, rest) = match rest.strip_prefix("entries/") {
+            Some(r) => (true, 0u8, r),
+            None => {
+                let (l, r) = rest.split_once('/')?;
+                (false, l.parse::<u8>().ok().filter(|l| *l <= 63)?, r)
+            }
+        };
+        let (n, width) = match rest.split_once(".p/") {
+            Some((n, w)) => (n, w.parse::<u64>().ok().filter(|w| (1..TILE).contains(w))?),
+            None => (rest, TILE),
+        };
+        let mut index: u64 = 0;
+        for e in n.split('/') {
+            let e = e.strip_prefix('x').unwrap_or(e);
+            index = index.checked_mul(1000)?.checked_add(e.parse::<u64>().ok().filter(|_| e.len() == 3 && e.bytes().all(|b| b.is_ascii_digit()))?)?;
+        }
+        let t = Tile { level, index, width };
+        (t.path(entries) == path).then_some((t, entries))
+    }
+
+    /// The leaves its hashes cover: from its first to past its last.
+    pub fn span(&self) -> Option<(u64, u64)> {
+        let per = TILE.checked_pow(u32::from(self.level))?;
+        let first = self.index.checked_mul(TILE)?;
+        Some((first.checked_mul(per)?, first.checked_add(self.width)?.checked_mul(per)?))
+    }
+}
+
+/// How wide tile `index` at `level` is in a tree of `size`: [`TILE`] while it's full, the partial
+/// width `floor(size / 256^level) mod 256` for the one the tree ends in, none past it (or empty).
+pub fn width_at(size: u64, level: u8, index: u64) -> Option<u64> {
+    let per = TILE.checked_pow(u32::from(level))?;
+    let hashes = size / per;
+    let full = hashes / TILE;
+    match index.cmp(&full) {
+        std::cmp::Ordering::Less => Some(TILE),
+        std::cmp::Ordering::Equal => Some(hashes % TILE).filter(|w| *w > 0),
+        std::cmp::Ordering::Greater => None,
+    }
+}
+
+/// RFC 6962's hash of leaves `lo..hi` of a tree of `size`, from its tiles: `tile(t)` gives tile
+/// `t`'s hashes, all `t.width` of them. The range splits as the tree does from its root, so its
+/// left parts are whole subtrees, read from a tile and hashed up within it. None for a range the
+/// tree hasn't, or a tile not given.
+pub fn mth_from(size: u64, lo: u64, hi: u64, tile: &mut impl FnMut(Tile) -> Option<Vec<Hash>>) -> Option<Hash> {
+    let n = hi.checked_sub(lo).filter(|n| *n > 0 && hi <= size)?;
+    if n.is_power_of_two() && lo.is_multiple_of(n) {
+        // A whole subtree of height h: 2^(h mod 8) hashes of one tile at level h / 8.
+        let height = n.trailing_zeros();
+        let level = u8::try_from(height / 8).ok()?;
+        let count = 1u64 << (height % 8);
+        let first = (lo / n).checked_mul(count)?;
+        let t = Tile { level, index: first / TILE, width: width_at(size, level, first / TILE)? };
+        let at = first % TILE;
+        if at + count > t.width {
+            return None;
+        }
+        let hashes = tile(t)?;
+        return hashes.get(usize::try_from(at).ok()?..usize::try_from(at + count).ok()?).map(root);
+    }
+    let k = split64(n);
+    Some(node(&mth_from(size, lo, lo + k, tile)?, &mth_from(size, lo + k, hi, tile)?))
+}
+
+/// Tile `t`'s hashes from its bytes (32 each); none when they aren't `t.width` of them.
+pub fn hashes_of(t: &Tile, bytes: &[u8]) -> Option<Vec<Hash>> {
+    let want = usize::try_from(t.width).ok()?.checked_mul(32)?;
+    (bytes.len() == want).then(|| bytes.as_chunks::<32>().0.to_vec())
+}
+
+/// An entry bundle (C2SP tlog-tiles): each entry's data, a big-endian 16-bit length before it;
+/// none when one is longer than 65,535 bytes.
+pub fn bundle(entries: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for e in entries {
+        out.extend(u16::try_from(e.len()).ok()?.to_be_bytes());
+        out.extend(e);
+    }
+    Some(out)
+}
+
+/// An entry bundle read back: each entry's data; none when it's cut short.
+pub fn unbundle(mut bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    while let Some((len, rest)) = bytes.split_first_chunk::<2>() {
+        let (entry, rest) = rest.split_at_checked(usize::from(u16::from_be_bytes(*len)))?;
+        out.push(entry.to_vec());
+        bytes = rest;
+    }
+    bytes.is_empty().then_some(out)
 }
 
 /// Whether `proof` shows the tree of `second` leaves (root `second_root`) extends the tree of its
@@ -532,6 +716,9 @@ pub fn due(size: u64, signed: u64, oldest: Option<i64>, now: i64, every: u64, mi
     waiting > 0 && (waiting >= every.max(1) || oldest.is_some_and(|t| now.saturating_sub(t) >= wait))
 }
 
+/// The most subjects an entry names ([`about`]).
+pub const MAX_SUBJECTS: usize = 256;
+
 /// What a trail entry says of a statement, from its payload type and payload: its digest (SHA-256
 /// over its PAE, [`super::statement::digest`]), its kind and its subjects. Its kind is an in-toto
 /// statement's predicate type (W18's attestations), else its payload type, on one line however it
@@ -553,6 +740,8 @@ pub fn about(payload_type: &str, payload: &[u8]) -> (String, String, Vec<String>
         .collect();
     subjects.sort();
     subjects.dedup();
+    // At most MAX_SUBJECTS: an entry fits an entry bundle's 64 KiB; its statement names them all.
+    subjects.truncate(MAX_SUBJECTS);
     (digest, if kind.is_empty() { "unknown".to_owned() } else { kind }, subjects)
 }
 
@@ -883,6 +1072,64 @@ mod tests {
         assert!(Checkpoint::parse("kiln://hyper-light/trail\nten\n").is_err());
         assert!(Checkpoint::parse("kiln://hyper-light/trail\n+10\nAAAA\n").is_err());
         assert!(open("kiln://hyper-light/trail\n10\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn w27_r09_the_tree_reads_as_tiles() -> anyhow::Result<()> {
+        // Paths as C2SP tlog-tiles writes them, and read back; none written otherwise.
+        let t = |level, index, width| Tile { level, index, width };
+        assert_eq!(t(0, 1_234_067, TILE).path(false), "tile/0/x001/x234/067");
+        assert_eq!(t(2, 0, 7).path(false), "tile/2/000.p/7");
+        assert_eq!(t(0, 1000, TILE).path(true), "tile/entries/x001/000");
+        for (tile, entries) in [(t(0, 1_234_067, TILE), false), (t(2, 0, 7), false), (t(0, 1000, 255), true), (t(63, 5, 1), false)] {
+            assert_eq!(Tile::parse(&tile.path(entries)), Some((tile, entries)));
+        }
+        for bad in ["tile/0/1", "tile/01/000", "tile/0/x000/001", "tile/0/000.p/0", "tile/0/000.p/256", "tile/0/000.p/07", "tile/64/000", "tile/0/001/002", "tile/entries/000.p/+5", "tile/+1/000"] {
+            assert_eq!(Tile::parse(bad), None, "{bad}");
+        }
+        // The spec's examples: trees of 70,000 and of 256.
+        assert_eq!((width_at(70_000, 0, 272), width_at(70_000, 0, 273), width_at(70_000, 0, 274)), (Some(256), Some(112), None));
+        assert_eq!((width_at(70_000, 1, 0), width_at(70_000, 1, 1), width_at(70_000, 2, 0)), (Some(256), Some(17), Some(1)));
+        assert_eq!((width_at(256, 0, 0), width_at(256, 0, 1), width_at(256, 1, 0)), (Some(256), None, Some(1)));
+
+        // A tree of 70,000 as tiles: each hash at level l the root of 256^l leaves.
+        let all = leaves(&trail(70_000)?);
+        let size = all.len() as u64;
+        let mut made: std::collections::HashMap<(u8, u64, u64), Vec<Hash>> = std::collections::HashMap::new();
+        let mut tile = |t: Tile| -> Option<Vec<Hash>> {
+            if let Some(h) = made.get(&(t.level, t.index, t.width)) {
+                return Some(h.clone());
+            }
+            let per = TILE.pow(u32::from(t.level));
+            let (first, _) = t.span()?;
+            let hashes: Vec<Hash> = (0..t.width).map(|i| all.get(usize::try_from(first + i * per).ok()?..usize::try_from(first + (i + 1) * per).ok()?).map(root)).collect::<Option<_>>()?;
+            made.insert((t.level, t.index, t.width), hashes.clone());
+            Some(hashes)
+        };
+        for (lo, hi) in [(0, 70_000), (0, 65_536), (65_536, 70_000), (300, 301), (256, 512), (1000, 69_999)] {
+            assert_eq!(mth_from(size, lo, hi, &mut tile), all.get(lo as usize..hi as usize).map(root), "{lo}..{hi}");
+        }
+        assert_eq!(mth_from(size, 0, 70_001, &mut tile), None, "past the tree's end");
+        for m in [0u64, 255, 256, 65_535, 65_536, 69_999] {
+            let from_tiles = inclusion_by(size, m, &mut |lo, hi| mth_from(size, lo, hi, &mut tile));
+            assert_eq!(from_tiles, inclusion(&all, m as usize), "leaf {m}");
+        }
+        for old in [1u64, 1000, 65_536, 69_999] {
+            assert_eq!(consistency_by(size, old, &mut |lo, hi| mth_from(size, lo, hi, &mut tile)), consistency(&all, old as usize), "{old} to 70,000");
+        }
+
+        // An entry bundle: each entry's encoding, read back whole, each hashing to its leaf.
+        let t5 = trail(5)?;
+        let data: Vec<Vec<u8>> = t5.iter().map(Entry::encoding).collect();
+        let bytes = bundle(&data).ok_or_else(|| anyhow::anyhow!("a bundle"))?;
+        let back: Vec<Entry> = unbundle(&bytes).ok_or_else(|| anyhow::anyhow!("read back"))?.iter().map(|d| Entry::parse(d)).collect::<Result<_, _>>()?;
+        assert_eq!(back, t5);
+        assert!(unbundle(bytes.get(..bytes.len() - 1).unwrap_or_default()).is_none(), "cut short");
+        assert!(bundle(&[vec![0; 65_536]]).is_none(), "an entry too long for a bundle");
+        // Written otherwise than kiln writes it: not an entry.
+        let odd = String::from_utf8(data.first().cloned().unwrap_or_default())?.replacen("kiln trail entry v1\n0\n0000", "kiln trail entry v1\n0\n0Z00", 1);
+        assert!(Entry::parse(odd.as_bytes()).is_err());
         Ok(())
     }
 
